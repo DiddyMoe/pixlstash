@@ -445,6 +445,18 @@ def create_router(server) -> APIRouter:
                 "the owner's."
             ),
         )
+        lanes: Optional[dict] = Field(
+            default=None,
+            description=(
+                "Whether the task runner's workers are there to run what is "
+                "queued (`TaskRunner.lane_health`): running, degraded (a "
+                "worker exited while the runner is meant to run), "
+                "last_failure ({worker, error, at} or null), "
+                "waiting_for_gpu_memory, and per lane (cpu, gpu) alive, "
+                "total, restarts and queued. Null for any token but the "
+                "owner's."
+            ),
+        )
 
     class WatchFoldersResponse(BaseModel):
         model_config = ConfigDict(extra="allow")
@@ -1221,12 +1233,15 @@ def create_router(server) -> APIRouter:
             "downloads lists the model downloads running or just ended "
             "(`POST /model-downloads`), likewise for the owner only. "
             "resources is the VRAM arbiter's snapshot, null for any token but "
-            "the owner's."
+            "the owner's. lanes says whether the task runner's CPU and GPU "
+            "workers are alive (degraded when one has exited), likewise null "
+            "for any token but the owner's."
         ),
     )
     def get_workers_progress(request: Request):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
+        task_runner = getattr(server.vault, "_task_runner", None)
         return {
             "status": "success",
             "workers": server.vault.get_worker_progress(),
@@ -1256,6 +1271,14 @@ def create_router(server) -> APIRouter:
             "resources": (
                 arbiter().snapshot()
                 if server.auth.is_unscoped_owner_request(request)
+                else None
+            ),
+            # The owner's alone, like the resources: a failure names a worker
+            # and what it raised.
+            "lanes": (
+                task_runner.lane_health()
+                if server.auth.is_unscoped_owner_request(request)
+                and task_runner is not None
                 else None
             ),
         }

@@ -43,6 +43,32 @@ def test_workers_progress_has_expected_keys():
         process = data["process"]
         assert "ram_used_gb" in process
         assert "ram_total_gb" in process
+        # Whether the task runner's workers are there: the owner's alone.
+        lanes = data["lanes"]
+        assert lanes is not None, "the owner was not told of the task workers"
+        assert set(lanes) == {
+            "running",
+            "degraded",
+            "last_failure",
+            "waiting_for_gpu_memory",
+            "cpu",
+            "gpu",
+        }
+        for lane in ("cpu", "gpu"):
+            assert set(lanes[lane]) == {"alive", "total", "restarts", "queued"}
+        assert lanes["degraded"] is False
+        assert lanes["gpu"]["total"] == 1
+        resp = client.post(
+            "/users/me/token", json={"description": "test-read", "scope": "READ"}
+        )
+        assert resp.status_code == 200, resp.text
+        reader = TestClient(server.api)
+        resp = reader.get(
+            "/workers/progress",
+            headers={"Authorization": f"Bearer {resp.json()['token']}"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["lanes"] is None, "a READ token was told of the workers"
         # Asserted on a warm server rather than in a file of its own: the GPU
         # out-of-memory retry announces itself through this notifier, and
         # without the wiring the toast never leaves the machine
