@@ -1,6 +1,7 @@
 """Task that computes text_score for pictures."""
 
 import time
+from typing import Collection
 
 from sqlalchemy import func
 from sqlmodel import Session, select
@@ -10,6 +11,7 @@ from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.quality import Quality
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.pixl_logging import get_logger
 
 logger = get_logger(__name__)
@@ -97,13 +99,19 @@ class TextScoreTask(BaseTask):
         return changed
 
     @staticmethod
-    def find_pictures_missing_text_score(session: Session, limit: int) -> list:
-        """Return non-deleted pictures whose text_score is NULL."""
+    def find_pictures_missing_text_score(
+        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+    ) -> list:
+        """Return non-deleted pictures whose text_score is NULL.
+
+        *exclude_ids* are left out ahead of the ``LIMIT``.
+        """
         return session.exec(
             select(Picture)
             .where(Picture.text_score.is_(None))
             .where(Picture.deleted.is_(False))
             .where(Picture.file_path.is_not(None))
+            .where(not_in_json(Picture.id, exclude_ids))
             .limit(limit)
         ).all()
 

@@ -6,10 +6,13 @@ reset to NULL, driving a one-time regeneration of the whole-frame AR bitmap
 through :class:`ThumbnailGenerationTask`.
 """
 
+from typing import Collection
+
 from sqlmodel import Session, select
 from sqlalchemy.orm import load_only, selectinload
 
 from pixlstash.db_models import Face, Picture
+from pixlstash.utils.sql_chunking import not_in_json
 
 from .base_task_finder import BaseTaskFinder
 from .thumbnail_generation_task import ThumbnailGenerationTask
@@ -35,7 +38,7 @@ class MissingThumbnailFinder(BaseTaskFinder):
         )
         # Exclude undecodable pictures (issue #585) at the query so they cannot
         # crowd the candidate window and stall real work behind them.
-        suppressed_ids = self._db.unprocessable_images.active_suppressed_ids()
+        suppressed_ids = self._suppressed_picture_ids()
         pictures = self._db.run_immediate_read_task(
             lambda session: self._fetch_missing(session, limit, suppressed_ids)
         )
@@ -51,15 +54,16 @@ class MissingThumbnailFinder(BaseTaskFinder):
         )
 
     @staticmethod
-    def _fetch_missing(session: Session, limit: int, suppressed_ids=None):
+    def _fetch_missing(
+        session: Session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ):
         stmt = (
             select(Picture)
             .where(Picture.thumbnail_width.is_(None))
             .where(Picture.deleted.is_(False))
             .where(Picture.file_path.is_not(None))
+            .where(not_in_json(Picture.id, suppressed_ids))
         )
-        if suppressed_ids:
-            stmt = stmt.where(Picture.id.notin_(tuple(suppressed_ids)))
         return session.exec(
             stmt.options(
                 # This probe runs on every planning sweep, so it must never drag

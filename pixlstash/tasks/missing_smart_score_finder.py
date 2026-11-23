@@ -1,3 +1,5 @@
+from typing import Collection
+
 from pixlstash.worker_config import SMART_SCORE_MAX_INFLIGHT
 from .base_task_finder import SimpleMissingFinder
 from .smart_score_task import SmartScoreTask
@@ -28,8 +30,12 @@ class MissingSmartScoreFinder(SimpleMissingFinder):
     def _batch_size(self) -> int:
         return SmartScoreTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session, limit: int) -> list:
-        return SmartScoreTask.find_pictures_missing_smart_score(session, limit)
+    def _fetch_candidates(
+        self, session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ) -> list:
+        return SmartScoreTask.find_pictures_missing_smart_score(
+            session, limit, suppressed_ids
+        )
 
     def _create_task(self, pictures: list):
         return SmartScoreTask(vault=self._vault, pictures=pictures)

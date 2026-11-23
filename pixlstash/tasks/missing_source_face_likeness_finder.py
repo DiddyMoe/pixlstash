@@ -1,7 +1,10 @@
+from typing import Collection
+
 from sqlalchemy import exists as sa_exists
 from sqlmodel import Session, select
 
 from pixlstash.db_models import Face, Picture
+from pixlstash.utils.sql_chunking import not_in_json
 from .base_task_finder import SimpleMissingFinder
 from .source_face_likeness_task import SourceFaceLikenessTask
 
@@ -21,7 +24,12 @@ class MissingSourceFaceLikenessCharacterFinder(SimpleMissingFinder):
     def _batch_size(self) -> int:
         return SourceFaceLikenessTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session: Session, limit: int) -> list:
+    def _fetch_candidates(
+        self,
+        session: Session,
+        limit: int,
+        suppressed_ids: Collection[int] = frozenset(),
+    ) -> list:
         return session.exec(
             select(Picture)
             .where(Picture.source_picture_id.is_not(None))
@@ -33,6 +41,7 @@ class MissingSourceFaceLikenessCharacterFinder(SimpleMissingFinder):
                     )
                 )
             )
+            .where(not_in_json(Picture.id, suppressed_ids))
             .limit(limit)
         ).all()
 

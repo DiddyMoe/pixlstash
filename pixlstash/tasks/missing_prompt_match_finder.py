@@ -1,12 +1,13 @@
 """Finder for pictures with a prompt whose prompt match is not scored yet."""
 
-from typing import Callable
+from typing import Callable, Collection
 
 from sqlalchemy.orm import load_only
 from sqlmodel import Session, select
 
 from pixlstash.db_models.picture import Picture
 from pixlstash.task_runner import TaskCancelledError
+from pixlstash.utils.sql_chunking import not_in_json
 
 from .base_task_finder import BaseDeferringFinder, SimpleMissingFinder
 from .prompt_match_task import PromptMatchTask
@@ -39,9 +40,15 @@ class MissingPromptMatchFinder(SimpleMissingFinder, BaseDeferringFinder):
     def _batch_size(self) -> int:
         return PromptMatchTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session: Session, limit: int) -> list:
-        pictures = session.exec(self.candidate_query(limit + len(self._deferred))).all()
-        return [pic for pic in pictures if pic.id not in self._deferred]
+    def _fetch_candidates(
+        self,
+        session: Session,
+        limit: int,
+        suppressed_ids: Collection[int] = frozenset(),
+    ) -> list:
+        return session.exec(
+            self.candidate_query(limit, set(suppressed_ids) | self._deferred)
+        ).all()
 
     @staticmethod
     def candidate_filter() -> tuple:
@@ -55,13 +62,15 @@ class MissingPromptMatchFinder(SimpleMissingFinder, BaseDeferringFinder):
         )
 
     @staticmethod
-    def candidate_query(limit: int):
+    def candidate_query(limit: int, exclude_ids: Collection[int] = frozenset()):
         """The probe. Served by ix_picture_prompt_match_missing, whose WHERE
-        the filter's first two terms repeat exactly so SQLite can use it."""
+        the filter's first two terms repeat exactly so SQLite can use it.
+        *exclude_ids* are left out ahead of the ``LIMIT``."""
         return (
             select(Picture)
             .options(load_only(Picture.id))
             .where(*MissingPromptMatchFinder.candidate_filter())
+            .where(not_in_json(Picture.id, exclude_ids))
             .order_by(Picture.id)
             .limit(limit)
         )

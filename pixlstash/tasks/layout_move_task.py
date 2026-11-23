@@ -17,6 +17,7 @@ true"; the stamp is spent and the file never moved.
 """
 
 import time
+from typing import Collection
 
 from sqlmodel import Session, select, update as sa_update
 
@@ -40,6 +41,7 @@ from pixlstash.services.operation_log_service import (
     record_operation_in_session,
 )
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
+from pixlstash.utils.sql_chunking import not_in_json
 
 logger = get_logger(__name__)
 
@@ -63,12 +65,18 @@ class LayoutMoveTask(BaseTask):
         self._notifier = notifier
 
     @staticmethod
-    def find_due_pictures(session: Session, limit: int, now: float) -> list:
+    def find_due_pictures(
+        session: Session,
+        limit: int,
+        now: float,
+        exclude_ids: Collection[int] = frozenset(),
+    ) -> list:
         """Return pictures whose layout check has come due.
 
         One indexed predicate over a column that is NULL for everything the
         owner has not just touched, which is what makes this cheap to ask on
-        every planning cycle.
+        every planning cycle. *exclude_ids* are left out ahead of the
+        ``LIMIT``.
         """
         return list(
             session.exec(
@@ -76,6 +84,7 @@ class LayoutMoveTask(BaseTask):
                 .where(Picture.layout_check_due_at.is_not(None))
                 .where(Picture.layout_check_due_at <= now)
                 .where(Picture.deleted.is_(False))
+                .where(not_in_json(Picture.id, exclude_ids))
                 .order_by(Picture.layout_check_due_at)
                 .limit(limit)
             ).all()

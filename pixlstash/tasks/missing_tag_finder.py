@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Collection
 
 from sqlmodel import Session, select
 from sqlalchemy.orm import selectinload
@@ -11,6 +11,7 @@ from pixlstash.db_models import (
     parse_tag_engine_from_sentinel,
 )
 from pixlstash.services.set_lock_service import locked_picture_id_subquery
+from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.worker_config import IMAGE_TASK_PIXEL_BUDGET, TAGGER_MAX_INFLIGHT
 from .base_task_finder import BaseTaskFinder
 from .tag_task import TagTask, taggable_picture_clauses
@@ -76,7 +77,7 @@ class MissingTagFinder(BaseTaskFinder):
         # "no work" and answers with a growing backoff. That is tagging
         # starving library-wide on a handful of bad files, the same shape
         # `MissingFaceExtractionFinder` documents on its own query.
-        suppressed_ids = self._db.unprocessable_images.active_suppressed_ids()
+        suppressed_ids = self._suppressed_picture_ids()
         # Before the read: a reset landing between the two must make the task
         # older than the reset, never newer (#1361).
         reset_generation = self._db.tag_resets.current()
@@ -115,7 +116,9 @@ class MissingTagFinder(BaseTaskFinder):
         )
 
     @staticmethod
-    def _fetch_missing_tags(session: Session, limit: int, suppressed_ids=None):
+    def _fetch_missing_tags(
+        session: Session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ):
         pending = select(Tag.picture_id).where(
             Tag.tag >= TAG_PENDING_SENTINEL, Tag.tag < _SENTINEL_RANGE_END
         )
@@ -156,9 +159,8 @@ class MissingTagFinder(BaseTaskFinder):
             faces_known,
             locked_member,
             *taggable_picture_clauses(),
+            not_in_json(Picture.id, suppressed_ids),
         )
-        if suppressed_ids:
-            stmt = stmt.where(Picture.id.notin_(tuple(suppressed_ids)))
         return session.exec(
             stmt.options(
                 selectinload(Picture.tags),

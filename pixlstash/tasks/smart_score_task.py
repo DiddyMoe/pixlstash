@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import Collection
 
 from sqlalchemy import bindparam, desc, func, update
 from sqlalchemy.orm import load_only
@@ -22,6 +23,7 @@ from pixlstash.scoring.smart_score import (
 from pixlstash.utils.quality.smart_score_utils import SmartScoreUtils
 from pixlstash.utils.service.anomaly_thresholds import resolve_anomaly_apply_thresholds
 from pixlstash.utils.service.smart_score_invalidation import anomaly_state_signature
+from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask
 
@@ -367,8 +369,13 @@ class SmartScoreTask(BaseTask):
         return result or 0
 
     @staticmethod
-    def find_pictures_missing_smart_score(session: Session, limit: int) -> list:
+    def find_pictures_missing_smart_score(
+        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+    ) -> list:
         """Fetch pictures that need smart score computation.
+
+        *exclude_ids* are left out ahead of the ``LIMIT``, so pictures held
+        out of the pipeline cannot fill the window.
 
         Only the ids are loaded. This is an idle probe the WorkPlanner runs on
         every sweep, and the full-ORM form read every column of every candidate -
@@ -388,6 +395,7 @@ class SmartScoreTask(BaseTask):
             .where(Picture.image_embedding.is_not(None))
             .where(Picture.smart_score.is_(None))
             .where(Picture.deleted.is_(False))
+            .where(not_in_json(Picture.id, exclude_ids))
             .options(load_only(Picture.id))
             .order_by(Picture.id)
             .limit(limit)

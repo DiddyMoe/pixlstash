@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Collection
 
 from sqlmodel import Session, select
 from sqlalchemy import or_
@@ -11,6 +11,7 @@ from pixlstash.db_models import (
     is_description_sentinel,
 )
 from pixlstash.services.set_lock_service import locked_picture_id_subquery
+from pixlstash.utils.sql_chunking import not_in_json
 
 from .description_task import DescriptionTask
 from .task_type import TaskType
@@ -54,8 +55,9 @@ class MissingDescriptionFinder(BaseTaskFinder):
             int(engine.description_batch_size()),
         )
 
+        suppressed_ids = self._suppressed_picture_ids()
         pictures = self._db.run_immediate_read_task(
-            lambda session: self._fetch_missing_descriptions(session, batch_limit * 3)
+            self._fetch_missing_descriptions, batch_limit * 3, suppressed_ids
         )
         if not pictures:
             return None
@@ -90,7 +92,12 @@ class MissingDescriptionFinder(BaseTaskFinder):
         )
 
     @staticmethod
-    def _fetch_missing_descriptions(session: Session, limit: int):
+    def _fetch_missing_descriptions(
+        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+    ):
+        # *exclude_ids* (the suppressed pictures) are left out here, ahead of
+        # the LIMIT, so they cannot fill the window.
+        #
         # A picture frozen by a locked set has a read-only description (rule 3):
         # never re-queue it for machine (re)description. Parity with the tagger's
         # MissingTagFinder exclusion; the description_task write-side also skips
@@ -114,6 +121,7 @@ class MissingDescriptionFinder(BaseTaskFinder):
                     ),
                 ),
                 not_locked,
+                not_in_json(Picture.id, exclude_ids),
             )
             # Sentinels (a reset) ahead of NULLs (never captioned), then by id,
             # so a request never waits behind the backlog.

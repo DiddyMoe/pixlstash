@@ -1,15 +1,21 @@
-"""One definition of the SQLite bound-parameter cap and the chunker that respects it.
+"""One definition of the SQLite bound-parameter cap and the ways to stay under it.
 
 SQLite limits how many bound parameters a single statement may carry
 (``SQLITE_LIMIT_VARIABLE_NUMBER``: 32766 on current builds, 999 on older ones).
 Any ``WHERE col IN (:a, :b, ...)`` built from a caller-sized id list can cross
-that cap and fail at execution time, so those loads are chunked.
+that cap and fail at execution time. A load is chunked; an exclusion cannot be
+(``NOT IN`` over one chunk says nothing about the others), so it binds the
+whole set as one JSON array instead.
 
 The limit and the chunker used to be redeclared in five modules, each with its
 own copy of this rationale and no shared value to change. They live here now.
 """
 
-from typing import Iterator, Sequence, TypeVar
+import json
+from typing import Collection, Iterator, Sequence, TypeVar
+
+from sqlalchemy import func, select
+from sqlalchemy.sql.elements import ColumnElement
 
 T = TypeVar("T")
 
@@ -35,3 +41,25 @@ def chunked(seq: Sequence[T], size: int = SQLITE_ID_CHUNK) -> Iterator[Sequence[
         raise ValueError(f"chunk size must be positive, got {size}")
     for start in range(0, len(seq), size):
         yield seq[start : start + size]
+
+
+def not_in_json(column, values: Collection[int]) -> ColumnElement:
+    """``column NOT IN values`` with *values* bound as ONE JSON array.
+
+    Compiles to ``column NOT IN (SELECT value FROM json_each(:param))``, so the
+    statement carries a single parameter however many values there are. SQLite
+    evaluates the uncorrelated subquery once into an ephemeral index and probes
+    it per row, which keeps the exclusion ahead of an ``ORDER BY ... LIMIT``
+    without a scan per value.
+
+    Args:
+        column: The column to test, e.g. ``Picture.id``.
+        values: Integer ids to exclude. Sorted before encoding so equal sets
+            bind byte-identical text.
+
+    Returns:
+        The predicate. An empty *values* excludes nothing and is a valid
+        clause, so callers need no special case for it.
+    """
+    rows = func.json_each(json.dumps(sorted(values))).table_valued("value")
+    return column.not_in(select(rows.c.value))

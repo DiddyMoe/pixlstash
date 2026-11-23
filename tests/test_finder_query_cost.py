@@ -38,21 +38,39 @@ and for all of the vault's own bookkeeping, so a raw total would measure
 something other than the query under test.
 """
 
+import json
+import sqlite3
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from PIL import Image
 from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm.exc import DetachedInstanceError
-from sqlmodel import Session
+from sqlmodel import Session, select
 
-from pixlstash.db_models import Face, Picture
+from pixlstash.db_models import Face, Picture, Tag
+from pixlstash.db_models.tag import make_tag_sentinel
 from pixlstash.tasks.base_task import QueueType
 from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
+from pixlstash.tasks.missing_description_finder import MissingDescriptionFinder
+from pixlstash.tasks.missing_face_extraction_finder import MissingFaceExtractionFinder
+from pixlstash.tasks.missing_face_model_refresh_finder import (
+    MissingFaceModelRefreshFinder,
+)
+from pixlstash.tasks.missing_pixel_sha_finder import MissingPixelShaFinder
+from pixlstash.tasks.missing_quality_finder import MissingQualityFinder
 from pixlstash.tasks.missing_smart_score_finder import MissingSmartScoreFinder
+from pixlstash.tasks.missing_tag_finder import MissingTagFinder
 from pixlstash.tasks.missing_thumbnail_finder import MissingThumbnailFinder
 from pixlstash.tasks.smart_score_task import SmartScoreTask
 from pixlstash.tasks.thumbnail_generation_task import ThumbnailGenerationTask
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.unprocessable_image_registry import UnprocessableImageRegistry
 from pixlstash.vault import Vault
 
 # Substrings that identify each probe's statement among everything else the
@@ -905,3 +923,423 @@ def test_likeness_parameters_wait_per_picture_for_quality(tmp_path):
             "the finder must not wait for the other two pictures' quality"
         )
         assert no_row not in _likeness_candidates(vault)
+
+
+# ── suppressed pictures are left out ahead of every finder's LIMIT ──────────
+#
+# A suppressed picture (undecodable, or on an unmounted volume) still matches
+# every stage's query, because its target column stays unset. Dropping it only
+# after the LIMIT lets a run of them fill the window: the finder claims nothing,
+# reports no work, and the eligible pictures behind the run wait for as long as
+# it lasts. One library serves every test below; none of them writes to it, and
+# each builds its own finders, so no claim carries over between tests.
+
+_SUPPRESSED_COUNT = 10  # longer than every candidate window used below
+_ELIGIBLE_COUNT = 5
+_STALE_FACED_COUNT = 3  # the first eligible pictures carry a stale-pack face
+_CURRENT_PACK = "auraface"
+_STOCK_VARIABLE_LIMIT = 32766  # SQLITE_LIMIT_VARIABLE_NUMBER on stock builds
+_PHANTOM_IDS = range(1_000_000, 1_040_000)  # never a row; only their number counts
+
+
+class _CaptionEngine:
+    """Only what `MissingDescriptionFinder` reads off the engine."""
+
+    def __init__(self, batch_size: int):
+        self.tagger_settings = {"active_description_plugin": "fake-captioner"}
+        self.description_workflow = None
+        self._batch_size = batch_size
+
+    def description_batch_size(self) -> int:
+        return self._batch_size
+
+
+class _FacePackEngine:
+    """Only what `MissingFaceModelRefreshFinder` reads off the engine."""
+
+    insightface_model_pack = _CURRENT_PACK
+
+
+@pytest.fixture(scope="module")
+def suppressed_library(tmp_path_factory):
+    """Ten suppressed pictures ahead of five eligible ones, in every finder's order.
+
+    The suppressed run has the lowest ids and the narrowest width, so it comes
+    first whether a finder orders by id or, like quality, by format and size.
+    Every picture lacks a description, a quality row, a pixel hash and a
+    thumbnail, and waits for tagging; the suppressed run and the first three
+    eligible pictures carry a face embedded by an older pack, and the last two
+    have no face yet.
+    """
+    root = tmp_path_factory.mktemp("suppressed-library")
+
+    def seed(session: Session):
+        rows = []
+        for index in range(_SUPPRESSED_COUNT + _ELIGIBLE_COUNT):
+            suppressed = index < _SUPPRESSED_COUNT
+            name = _write_image(root, f"fake-{index}.png", size=(8, 8))
+            picture = Picture(
+                file_path=name,
+                format="png",
+                width=100 if suppressed else 400,
+                height=300,
+                deleted=False,
+            )
+            session.add(picture)
+            session.flush()
+            if index < _SUPPRESSED_COUNT + _STALE_FACED_COUNT:
+                session.add(
+                    Face(
+                        picture_id=picture.id,
+                        frame_index=0,
+                        face_index=0,
+                        bbox=[1, 1, 6, 6],
+                        features=b"\x00" * 512,
+                        model_pack="buffalo_l",
+                    )
+                )
+            session.add(Tag(picture_id=picture.id, tag=make_tag_sentinel()))
+            rows.append((picture.id, str(root / name)))
+        session.commit()
+        return rows
+
+    with Vault(image_root=str(root)) as vault:
+        rows = vault.db.run_task(seed)
+        suppressed = [pid for pid, _ in rows[:_SUPPRESSED_COUNT]]
+        eligible = [pid for pid, _ in rows[_SUPPRESSED_COUNT:]]
+        paths = dict(rows)
+        for picture_id in suppressed:
+            assert vault.db.unprocessable_images.mark_unprocessable(
+                picture_id, paths[picture_id], reason="test: undecodable"
+            )
+        yield SimpleNamespace(
+            vault=vault,
+            root=root,
+            paths=paths,
+            suppressed=suppressed,
+            eligible=eligible,
+            stale_faced=eligible[:_STALE_FACED_COUNT],
+            faceless=eligible[_STALE_FACED_COUNT:],
+        )
+
+
+def _pixel_sha_finder(library, monkeypatch):
+    # One of the eleven finders that share `SimpleMissingFinder.find_task`.
+    finder = MissingPixelShaFinder(library.vault.db)
+    finder._batch_size = lambda: 2  # window: 2 x (1 in flight + 1) = 4 rows
+    return finder, set(library.eligible), 2
+
+
+def _description_finder(library, monkeypatch):
+    # Window: batch 2 x 3 = 6 rows.
+    finder = MissingDescriptionFinder(library.vault.db, lambda: _CaptionEngine(2))
+    return finder, set(library.eligible), 2
+
+
+def _quality_finder(library, monkeypatch):
+    finder = MissingQualityFinder(library.vault.db)
+    finder._FETCH_LIMIT = 1  # window: 1 x 8 = 8 rows; claims up to 32
+    return finder, set(library.eligible), len(library.eligible)
+
+
+def _face_model_refresh_finder(library, monkeypatch):
+    # The window IS the batch here, with no headroom at all.
+    monkeypatch.setattr(
+        "pixlstash.tasks.missing_face_model_refresh_finder.FACE_EXTRACTION_BATCH_LIMIT",
+        2,
+    )
+    finder = MissingFaceModelRefreshFinder(library.vault.db, lambda: _FacePackEngine())
+    return finder, set(library.stale_faced), 2
+
+
+_WINDOWED_FINDERS = {
+    "pixel_sha": _pixel_sha_finder,
+    "description": _description_finder,
+    "quality": _quality_finder,
+    "face_model_refresh": _face_model_refresh_finder,
+}
+
+
+@pytest.mark.parametrize("path", sorted(_WINDOWED_FINDERS))
+def test_a_suppressed_run_longer_than_the_window_hides_nothing(
+    suppressed_library, monkeypatch, path
+):
+    """The first sweep reaches the eligible pictures behind ten suppressed ones."""
+    finder, pool, batch = _WINDOWED_FINDERS[path](suppressed_library, monkeypatch)
+
+    task = finder.find_task()
+
+    assert task is not None, (
+        f"{path}: the suppressed run filled the candidate window, so the finder "
+        f"reported no work with {sorted(pool)} still waiting"
+    )
+    handed_out = task.params["picture_ids"]
+    assert set(handed_out) <= pool, (
+        f"{path}: handed out {handed_out}, expected only ids from {sorted(pool)}"
+    )
+    assert len(handed_out) == min(batch, len(pool)), handed_out
+
+
+def test_a_full_batch_still_fits_beside_every_in_flight_claim(suppressed_library):
+    """With each in-flight slot claimed, the next sweep fills a whole new batch.
+
+    The window holds one batch per in-flight slot plus one. The suppressed run is
+    longer than the whole window, so this holds only if the run takes none of
+    that headroom and the claims alone use it.
+    """
+    finder = MissingPixelShaFinder(suppressed_library.vault.db)
+    finder._batch_size = lambda: 2
+    in_flight = [finder.find_task() for _ in range(finder.max_inflight_tasks())]
+    assert None not in in_flight
+    claimed = {pid for task in in_flight for pid in task.params["picture_ids"]}
+
+    task = finder.find_task()
+
+    assert task is not None, f"with {sorted(claimed)} in flight, nothing else"
+    handed_out = task.params["picture_ids"]
+    assert len(handed_out) == 2, handed_out
+    assert set(handed_out) <= set(suppressed_library.eligible) - claimed, handed_out
+
+
+def test_a_repaired_file_is_offered_again_once_the_cached_set_expires(
+    suppressed_library, monkeypatch
+):
+    """Rewriting a suppressed file lifts it after one cache window, not never."""
+    library = suppressed_library
+    registry = library.vault.db.unprocessable_images
+    repaired = library.suppressed[0]
+    path = Path(library.paths[repaired])
+    clock = [time.monotonic()]
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                "pixlstash.utils.unprocessable_image_registry.time",
+                SimpleNamespace(monotonic=lambda: clock[0]),
+            )
+            assert repaired in registry.active_suppressed_ids()
+            _write_image(path.parent, path.name, size=(64, 64))
+            clock[0] += registry.ACTIVE_CACHE_TTL_S + 1
+
+            finder = MissingDescriptionFinder(
+                library.vault.db, lambda: _CaptionEngine(2)
+            )
+            task = finder.find_task()
+
+        assert task is not None
+        assert task.params["picture_ids"] == [repaired, library.eligible[0]], (
+            "the rewritten picture was still held out after the cache expired"
+        )
+    finally:
+        # Suppressed again at its new signature, as the other tests expect.
+        registry.mark_unprocessable(repaired, str(path), reason="test: undecodable")
+
+
+@pytest.mark.parametrize("stage", ["description", "quality"])
+def test_the_remaining_count_is_what_the_finder_will_hand_out(
+    suppressed_library, stage
+):
+    """A count that includes suppressed pictures never reaches zero.
+
+    One sweep claims everything here (a batch of eight; quality claims 32), so
+    what it hands out is all the finder will ever hand out.
+    """
+    vault = suppressed_library.vault
+    if stage == "description":
+        finder = MissingDescriptionFinder(vault.db, lambda: _CaptionEngine(8))
+        count = vault._count_missing_descriptions
+    else:
+        finder = MissingQualityFinder(vault.db)
+        count = vault._count_missing_quality
+
+    task = finder.find_task()
+
+    assert task is not None
+    handed_out = task.params["picture_ids"]
+    assert sorted(handed_out) == sorted(suppressed_library.eligible)
+    assert vault.db.run_immediate_read_task(count) == len(handed_out)
+
+
+@contextmanager
+def _stock_variable_limit(engine):
+    """Hold every connection *engine* executes on to the stock parameter limit.
+
+    This build allows far more parameters than a stock SQLite, so a statement
+    that would fail for a user passes here. The limit is lowered per connection
+    as it is first used, and every connection gets its own value back.
+    """
+    previous = {}
+
+    def lower(conn, cursor, statement, parameters, context, executemany):
+        dbapi = cursor.connection
+        if id(dbapi) not in previous:
+            previous[id(dbapi)] = (
+                dbapi,
+                dbapi.setlimit(
+                    sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, _STOCK_VARIABLE_LIMIT
+                ),
+            )
+
+    event.listen(engine, "before_cursor_execute", lower)
+    try:
+        yield
+    finally:
+        event.remove(engine, "before_cursor_execute", lower)
+        for dbapi, limit in previous.values():
+            dbapi.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+
+
+def _task_ids(task) -> set[int]:
+    assert task is not None, "the finder found no work"
+    return set(task.params["picture_ids"])
+
+
+# site -> (library, excluded ids) -> (what it returned, what it must return).
+# The finders read the excluded ids from the registry; the rest take them.
+_EXCLUDING_SITES = {
+    "pixel_sha": lambda lib, ids: (
+        _task_ids(MissingPixelShaFinder(lib.vault.db).find_task()),
+        set(lib.eligible),
+    ),
+    "description": lambda lib, ids: (
+        _task_ids(
+            MissingDescriptionFinder(
+                lib.vault.db, lambda: _CaptionEngine(8)
+            ).find_task()
+        ),
+        set(lib.eligible),
+    ),
+    "quality": lambda lib, ids: (
+        _task_ids(MissingQualityFinder(lib.vault.db).find_task()),
+        set(lib.eligible),
+    ),
+    "face_model_refresh": lambda lib, ids: (
+        _task_ids(
+            MissingFaceModelRefreshFinder(
+                lib.vault.db, lambda: _FacePackEngine()
+            ).find_task()
+        ),
+        set(lib.stale_faced),
+    ),
+    "thumbnail": lambda lib, ids: (
+        _task_ids(MissingThumbnailFinder(lib.vault.db).find_task()),
+        set(lib.eligible),
+    ),
+    "face_extraction": lambda lib, ids: (
+        _task_ids(
+            MissingFaceExtractionFinder(lib.vault.db, lambda: _StubEngine()).find_task()
+        ),
+        set(lib.faceless),
+    ),
+    "tag": lambda lib, ids: (
+        {
+            p.id
+            for p in lib.vault.db.run_immediate_read_task(
+                MissingTagFinder._fetch_missing_tags, 64, ids
+            )
+        },
+        set(lib.stale_faced),
+    ),
+    "count_thumbnails": lambda lib, ids: (
+        lib.vault.db.run_immediate_read_task(lib.vault._count_missing_thumbnails),
+        len(lib.eligible),
+    ),
+    "count_descriptions": lambda lib, ids: (
+        lib.vault.db.run_immediate_read_task(lib.vault._count_missing_descriptions),
+        len(lib.eligible),
+    ),
+    "count_quality": lambda lib, ids: (
+        lib.vault.db.run_immediate_read_task(lib.vault._count_missing_quality),
+        len(lib.eligible),
+    ),
+    "image_embedding": lambda lib, ids: (
+        {
+            row[0]
+            for row in lib.vault.db.run_immediate_read_task(
+                lambda session: ImageEmbeddingTask.fetch_work(
+                    session, aesthetic_disabled=True, limit=64, suppressed_ids=ids
+                )
+            )
+        },
+        set(lib.eligible),
+    ),
+    "count_image_embeddings": lambda lib, ids: (
+        lib.vault.db.run_immediate_read_task(lib.vault._count_missing_image_embeddings),
+        len(lib.eligible),
+    ),
+    "worker_progress": lambda lib, ids: (
+        lib.vault.get_worker_progress()["ImageEmbeddingTask"]["remaining"],
+        len(lib.eligible),
+    ),
+}
+
+
+@pytest.mark.parametrize("site", sorted(_EXCLUDING_SITES))
+def test_more_excluded_ids_than_sqlite_takes_parameters(
+    suppressed_library, monkeypatch, site
+):
+    """Forty thousand excluded ids still run, as one bound JSON array."""
+    library = suppressed_library
+    registry = library.vault.db.unprocessable_images
+    excluded = registry.active_suppressed_ids() | set(_PHANTOM_IDS)
+    assert len(excluded) > _STOCK_VARIABLE_LIMIT
+    monkeypatch.setattr(registry, "active_suppressed_ids", lambda: set(excluded))
+    engine = library.vault.db._engine
+
+    with (
+        _stock_variable_limit(engine),
+        _StatementRecorder(engine, "json_each") as rec,
+    ):
+        # The lowered limit is in force: one parameter per id is refused.
+        with pytest.raises(OperationalError, match="too many SQL variables"):
+            library.vault.db.run_immediate_read_task(
+                lambda session: session.exec(
+                    select(Picture.id).where(Picture.id.not_in(sorted(excluded)))
+                ).all()
+            )
+        got, want = _EXCLUDING_SITES[site](library, excluded)
+
+    assert got == want
+    bound_arrays = [
+        json.loads(value)
+        for parameters in rec.parameters
+        for value in parameters
+        if isinstance(value, str) and value.startswith("[")
+    ]
+    assert sorted(excluded) in bound_arrays, (
+        f"{site} did not bind the excluded ids as one JSON array"
+    )
+
+
+def test_a_sweep_does_not_stat_the_suppressed_run_again(
+    suppressed_library, monkeypatch
+):
+    """While the cached set is fresh, sweeping past the run costs no ``stat``.
+
+    A suppressed picture's entry is re-validated with a ``stat``, which on an
+    unmounted volume waits for the mount's timeout. Rows that reach
+    ``_filter_and_claim`` are each checked that way, so a run left in the window
+    is re-statted on every sweep of every finder.
+    """
+    library = suppressed_library
+    registry = library.vault.db.unprocessable_images
+    # A frozen clock: the cached set cannot expire part-way through.
+    monkeypatch.setattr(
+        "pixlstash.utils.unprocessable_image_registry.time",
+        SimpleNamespace(monotonic=lambda: 0.0),
+    )
+    stats: list[str] = []
+
+    def counting_stat(file_path: str):
+        stats.append(file_path)
+        return UnprocessableImageRegistry._stat_signature(file_path)
+
+    monkeypatch.setattr(registry, "_stat_signature", counting_stat)
+    assert set(library.suppressed) <= registry.active_suppressed_ids()
+    stats.clear()
+
+    finders = [build(library, monkeypatch)[0] for build in _WINDOWED_FINDERS.values()]
+    for _ in range(3):
+        for finder in finders:
+            finder.find_task()
+
+    assert stats == [], f"re-statted during sweeps: {sorted(set(stats))}"

@@ -3,6 +3,7 @@ import os
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Collection
 
 import numpy as np
 from sqlmodel import Session, select
@@ -14,6 +15,7 @@ from pixlstash.utils.quality.quality_utils import QualityUtils
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask
+from pixlstash.utils.sql_chunking import not_in_json
 
 
 logger = get_logger(__name__)
@@ -266,7 +268,11 @@ class QualityTask(BaseTask):
         }
 
     @staticmethod
-    def _find_pictures_missing_quality(session: Session, limit: int):
+    def _find_pictures_missing_quality(
+        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+    ):
+        """Up to *limit* pictures without a quality score, *exclude_ids* (the
+        suppressed pictures) left out ahead of the ``LIMIT``."""
         return session.exec(
             select(Picture)
             .outerjoin(
@@ -276,12 +282,17 @@ class QualityTask(BaseTask):
             .where(Quality.sharpness.is_(None))
             .where(Picture.deleted.is_(False))
             .where(Picture.file_path.is_not(None))
+            .where(not_in_json(Picture.id, exclude_ids))
             .order_by(Picture.format, Picture.width, Picture.height)
             .limit(limit)
         ).all()
 
     @staticmethod
-    def count_missing_quality(session: Session) -> int:
+    def count_missing_quality(
+        session: Session, exclude_ids: Collection[int] = frozenset()
+    ) -> int:
+        """How many pictures still lack a quality score, not counting
+        *exclude_ids*, which the finder will not hand out."""
         result = session.exec(
             select(func.count())
             .select_from(Picture)
@@ -292,6 +303,7 @@ class QualityTask(BaseTask):
             .where(Quality.sharpness.is_(None))
             .where(Picture.deleted.is_(False))
             .where(Picture.file_path.is_not(None))
+            .where(not_in_json(Picture.id, exclude_ids))
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]

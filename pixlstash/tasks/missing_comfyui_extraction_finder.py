@@ -1,8 +1,11 @@
+from typing import Collection
+
 from sqlalchemy.orm import load_only
 from sqlmodel import Session, select
 
 from pixlstash.db_models import Picture
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.sql_chunking import not_in_json
 
 from .base_task_finder import SimpleMissingFinder
 from .comfyui_extraction_task import ComfyUIExtractionTask
@@ -45,7 +48,12 @@ class MissingComfyUIExtractionFinder(SimpleMissingFinder):
     def _batch_size(self) -> int:
         return ComfyUIExtractionTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session: Session, limit: int) -> list[Picture]:
+    def _fetch_candidates(
+        self,
+        session: Session,
+        limit: int,
+        suppressed_ids: Collection[int] = frozenset(),
+    ) -> list[Picture]:
         # comfyui_models IS NULL means never checked; "[]" is the checked-but-empty
         # sentinel. workflow_hash_version says the same thing for the workflow
         # scan, and needs its own column because a hash column has no such string.
@@ -59,6 +67,7 @@ class MissingComfyUIExtractionFinder(SimpleMissingFinder):
             .options(load_only(Picture.id, Picture.file_path, Picture.comfyui_models))
             .where(unscanned)
             .where(Picture.deleted.is_(False))
+            .where(not_in_json(Picture.id, suppressed_ids))
             .order_by(Picture.id)
             .limit(limit)
         ).all()

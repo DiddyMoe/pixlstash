@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Collection
 
 from sqlalchemy import func
 from sqlalchemy.orm import load_only
@@ -18,6 +18,7 @@ from pixlstash.tagger_plugins.florence2 import FLORENCE_OCR_NUM_BEAMS
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.media_files import SUPPORTED_IMAGE_EXTS
+from pixlstash.utils.sql_chunking import not_in_json
 
 if TYPE_CHECKING:
     from pixlstash.inference.engine import InferenceEngine
@@ -177,12 +178,15 @@ class OcrTask(BaseTask):
         )
 
     @staticmethod
-    def find_unread_pictures(session: Session, limit: int) -> list:
+    def find_unread_pictures(
+        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+    ) -> list:
         """Return pictures that look like they carry text and have not been read.
 
         Loads only what the task reads: the planner runs this probe continuously,
         and a whole row drags the embedding blobs along (§7, probe cost).
         ``ix_picture_ocr_unread`` serves both the filter and the order.
+        *exclude_ids* are left out ahead of the ``LIMIT``.
         """
         # Most text first, so a batch holds pages of similar length: batched
         # generation runs every picture until the longest one finishes.
@@ -190,6 +194,7 @@ class OcrTask(BaseTask):
             OcrTask._unread_query(
                 select(Picture).options(load_only(Picture.id, Picture.file_path))
             )
+            .where(not_in_json(Picture.id, exclude_ids))
             .order_by(Picture.text_score.desc())
             .limit(limit)
         ).all()

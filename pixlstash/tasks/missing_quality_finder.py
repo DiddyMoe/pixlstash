@@ -85,9 +85,11 @@ class MissingQualityFinder(BaseTaskFinder):
             self._ema_preload_rate = a * raw_rate + (1 - a) * self._ema_preload_rate
 
     def find_task(self):
+        suppressed_ids = self._suppressed_picture_ids()
         pictures = self._db.run_immediate_read_task(
             QualityTask._find_pictures_missing_quality,
             self._FETCH_LIMIT * 8,
+            suppressed_ids,
         )
         if not pictures:
             self._ema_preload_rate = None

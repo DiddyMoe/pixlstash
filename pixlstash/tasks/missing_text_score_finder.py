@@ -1,5 +1,7 @@
 """Finder for pictures missing a text_score value."""
 
+from typing import Collection
+
 from pixlstash.worker_config import TEXT_SCORE_MAX_INFLIGHT
 from .base_task_finder import SimpleMissingFinder
 from .text_score_task import TextScoreTask
@@ -22,8 +24,12 @@ class MissingTextScoreFinder(SimpleMissingFinder):
     def _batch_size(self) -> int:
         return TextScoreTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session, limit: int) -> list:
-        return TextScoreTask.find_pictures_missing_text_score(session, limit)
+    def _fetch_candidates(
+        self, session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ) -> list:
+        return TextScoreTask.find_pictures_missing_text_score(
+            session, limit, suppressed_ids
+        )
 
     def _create_task(self, pictures: list):
         return TextScoreTask(database=self._db, pictures=pictures)

@@ -11,7 +11,7 @@ initial face extraction: brand-new pictures (which have no faces yet) are always
 processed first and never starved by a refresh.
 """
 
-from typing import Callable
+from typing import Callable, Collection
 
 from sqlalchemy import or_
 from sqlmodel import Session, select
@@ -19,6 +19,7 @@ from sqlalchemy.orm import selectinload
 
 from pixlstash.db_models import Picture
 from pixlstash.db_models.face import Face
+from pixlstash.utils.sql_chunking import not_in_json
 
 from .base_task_finder import BaseTaskFinder
 from .face_model_refresh_task import FaceModelRefreshTask
@@ -54,8 +55,9 @@ class MissingFaceModelRefreshFinder(BaseTaskFinder):
         if not current_pack:
             return None
 
+        suppressed_ids = self._suppressed_picture_ids()
         pictures = self._db.run_immediate_read_task(
-            lambda session: self._fetch_stale_pack_pictures(session, current_pack)
+            self._fetch_stale_pack_pictures, current_pack, suppressed_ids
         )
         if not pictures:
             return None
@@ -71,7 +73,15 @@ class MissingFaceModelRefreshFinder(BaseTaskFinder):
         )
 
     @staticmethod
-    def _fetch_stale_pack_pictures(session: Session, current_pack: str):
+    def _fetch_stale_pack_pictures(
+        session: Session,
+        current_pack: str,
+        exclude_ids: Collection[int] = frozenset(),
+    ):
+        # *exclude_ids* (the suppressed pictures) are left out ahead of the
+        # LIMIT: the window has no headroom, so a full batch of them would
+        # otherwise hide every stale picture behind it.
+        #
         # A picture is stale if any of its faces *carries an embedding* produced by
         # a different pack (or has no recorded pack - defensive; the 0053 migration
         # backfills pre-existing rows to buffalo_l so NULL should not normally
@@ -95,6 +105,7 @@ class MissingFaceModelRefreshFinder(BaseTaskFinder):
         return session.exec(
             select(Picture)
             .where(Picture.id.in_(stale_face_subq))
+            .where(not_in_json(Picture.id, exclude_ids))
             .options(selectinload(Picture.faces))
             .order_by(Picture.id)
             .limit(FACE_EXTRACTION_BATCH_LIMIT)

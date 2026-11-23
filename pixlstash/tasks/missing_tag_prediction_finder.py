@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Collection
 
 from sqlalchemy import and_
 from sqlalchemy.orm import load_only
@@ -11,6 +11,7 @@ from pixlstash.db_models import (
     TAG_SENTINEL_ESCAPE_CHAR,
 )
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.sql_chunking import not_in_json
 from .base_task_finder import SimpleMissingFinder
 from .tag_prediction_backfill_task import TagPredictionBackfillTask
 from .task_type import TaskType
@@ -93,11 +94,18 @@ class MissingTagPredictionFinder(SimpleMissingFinder):
         self._reset_generation = self._db.tag_resets.current()
         return super().find_task()
 
-    def _fetch_candidates(self, session: Session, limit: int) -> list:
-        return self._fetch_missing_predictions(session, limit)
+    def _fetch_candidates(
+        self,
+        session: Session,
+        limit: int,
+        suppressed_ids: Collection[int] = frozenset(),
+    ) -> list:
+        return self._fetch_missing_predictions(session, limit, suppressed_ids)
 
     @staticmethod
-    def _fetch_missing_predictions(session: Session, limit: int) -> list:
+    def _fetch_missing_predictions(
+        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+    ) -> list:
         has_sentinel = Tag.tag.like(
             TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
         )
@@ -110,6 +118,7 @@ class MissingTagPredictionFinder(SimpleMissingFinder):
                 no_prediction,
                 Picture.deleted.is_(False),
                 Picture.file_path.is_not(None),
+                not_in_json(Picture.id, exclude_ids),
             )
             .options(load_only(Picture.id, Picture.file_path))
             .order_by(Picture.id)

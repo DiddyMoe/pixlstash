@@ -1,5 +1,7 @@
 """Finder for pictures whose mirrored EXIF orientation has not been read yet."""
 
+from typing import Collection
+
 from pixlstash.tasks.base_task_finder import SimpleMissingFinder
 from pixlstash.tasks.orientation_task import OrientationTask
 
@@ -23,8 +25,12 @@ class MissingOrientationFinder(SimpleMissingFinder):
     def _batch_size(self) -> int:
         return OrientationTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session, limit: int) -> list:
-        return OrientationTask.find_pictures_missing_orientation(session, limit)
+    def _fetch_candidates(
+        self, session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ) -> list:
+        return OrientationTask.find_pictures_missing_orientation(
+            session, limit, suppressed_ids
+        )
 
     def _create_task(self, pictures: list):
         return OrientationTask(database=self._db, pictures=pictures)
