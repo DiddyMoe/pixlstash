@@ -70,6 +70,11 @@ from pixlstash.services.set_lock_service import (
     locked_picture_id_subquery,
 )
 from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.quality.tag_exclusion import (
+    excluded_spellings,
+    exclusion_generation,
+    exclusions_from_tagger_settings,
+)
 from pixlstash.services.scrapheap_service import DEFAULT_RETENTION_DAYS
 from pixlstash.services.workflow_ghost_service import DEFAULT_GHOST_RETENTION
 from pixlstash.services.snapshot_service import SnapshotService
@@ -1604,6 +1609,10 @@ class Vault:
         threshold_offset = pixl_cfg.get("params", {}).get("threshold_offset")
         if threshold_offset is not None:
             self._pixlstash_tagger_threshold_offset = float(threshold_offset)
+        self.db.set_tag_exclusions(
+            exclusions_from_tagger_settings(settings),
+            generation=exclusion_generation(settings),
+        )
         if self._engine:
             self._engine.set_tagger_settings(settings)
 
@@ -2728,7 +2737,12 @@ class Vault:
         has_sentinel = Tag.tag.like(
             TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
         )
-        has_real_tag = Picture.tags.any(and_(Tag.tag.is_not(None), ~has_sentinel))
+        real_tag = [Tag.tag.is_not(None), ~has_sentinel]
+        # Mirrors the finder: only removed-from-tagging tags is nothing to do.
+        removed = excluded_spellings(session, Tag.tag)
+        if removed:
+            real_tag.append(~Tag.tag.in_(removed))
+        has_real_tag = Picture.tags.any(and_(*real_tag))
         no_prediction = ~Picture.tag_predictions.any()
         result = session.exec(
             select(func.count())

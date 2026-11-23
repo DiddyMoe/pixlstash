@@ -1196,7 +1196,7 @@ class Server(
                 DEFAULT_SMART_SCORE_PENALIZED_TAGS,
             )
             library_settings_service.reconcile_settings_fingerprint(
-                vault.db, library.settings_salt, penalised
+                vault.db, library.settings_salt, penalised, vault.db.tag_exclusions
             )
         except Exception:
             # A failed reconcile leaves scores as they were, which is the state
