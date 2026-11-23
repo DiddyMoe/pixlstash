@@ -24,6 +24,8 @@ import { errorDetail } from "../../utils/apiError";
 
 const props = defineProps({
   open: { type: Boolean, default: false },
+  // True while the pane holding this section is the shown tab.
+  active: { type: Boolean, default: false },
 });
 
 const store = useSnapshotsStore();
@@ -40,16 +42,23 @@ const editingLabel = ref({});
 const savingLabel = ref({});
 const saveLabelError = ref({});
 
-// ── Fetch on open ──────────────────────────────────────────────────────────
+// ── Fetch on first view ────────────────────────────────────────────────────
+// Read when the section is first shown, and not again on a return to the tab.
+// The settings dialog remounts its content when it opens, but a reopen during
+// the close animation keeps the mount and does not read again, so this is once
+// per mount, not once per open. The section is mounted with `open` already
+// true, which is why the watcher is immediate.
+let loaded = false;
 watch(
-  () => props.open,
-  (isOpen) => {
-    if (isOpen) {
-      store.fetchSnapshots();
-      store.fetchStatus();
-      store.fetchSnapshotSettings();
-    }
+  () => props.open && props.active,
+  (shown) => {
+    if (!shown || loaded) return;
+    loaded = true;
+    store.fetchSnapshots();
+    store.fetchStatus();
+    store.fetchSnapshotSettings();
   },
+  { immediate: true },
 );
 
 // ── Computed ──────────────────────────────────────────────────────────────
@@ -195,6 +204,7 @@ function handleRestore(cp) {
       <template #action>
         <v-switch
           :model-value="store.dailySnapshotsEnabled"
+          :disabled="store.snapshotSettingsLoading"
           label="Automatic snapshots"
           density="compact"
           hide-details

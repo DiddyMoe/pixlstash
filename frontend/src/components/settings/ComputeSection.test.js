@@ -10,6 +10,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
+import { nextTick } from "vue";
 
 vi.mock("../../utils/apiClient", () => ({
   API_BASE_URL: "/api/v1",
@@ -46,6 +47,11 @@ vi.mock("../../api/config", () => ({
 }));
 
 import ComputeSection from "./ComputeSection.vue";
+import AppStepper from "../widgets/AppStepper.vue";
+
+// As the settings dialog mounts a pane whose tab is showing: the pane reads
+// nothing until it is first shown.
+const SHOWN = { open: true, active: true };
 
 function installDesktop(accelState) {
   const desktop = {
@@ -62,7 +68,7 @@ function installDesktop(accelState) {
 
 async function mountCompute(accelState) {
   const desktop = installDesktop(accelState);
-  const wrapper = mount(ComputeSection, { props: { view: "compute" } });
+  const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
   await flushPromises();
   return { wrapper, desktop };
 }
@@ -230,7 +236,7 @@ describe("Desktop › Shell command", () => {
     const desktop = installDesktop({ runtime: null, accelerators: [] });
     desktop.getDesktopPrefs = vi.fn().mockResolvedValue(prefs);
     desktop.setDesktopPrefs = vi.fn().mockResolvedValue(prefs);
-    const wrapper = mount(ComputeSection, { props: { view: "backend" } });
+    const wrapper = mount(ComputeSection, { props: { view: "backend", ...SHOWN } });
     await flushPromises();
     return { wrapper, desktop };
   }
@@ -384,7 +390,7 @@ describe("Which GPU PixlStash uses", () => {
   });
 
   it("is on a headless install, with Auto first and an integrated GPU listed but not pickable", async () => {
-    const wrapper = mount(ComputeSection, { props: { view: "compute" } });
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
     await flushPromises();
     const radios = wrapper.findAll('input[name="gpu-pick"]');
     expect(radios.map((r) => r.attributes("value"))).toEqual(["auto", "GPU-4090", "GPU-3060", "GPU-UHD"]);
@@ -395,7 +401,7 @@ describe("Which GPU PixlStash uses", () => {
   });
 
   it("is not committed until a different GPU is chosen, then Apply & restart is the one write", async () => {
-    const wrapper = mount(ComputeSection, { props: { view: "compute" } });
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
     await flushPromises();
     const apply = () => wrapper.findAll("button").find((b) => b.text() === "Apply & restart");
     expect(apply().attributes("disabled")).toBeDefined();
@@ -416,7 +422,7 @@ describe("Which GPU PixlStash uses", () => {
       bundled: { accel: "cpu", label: "Built-in (CPU)", active: false },
       items: [{ accel: "cuda", label: "NVIDIA GPU (CUDA)", installed: true, active: true, recommended: true }],
     });
-    const wrapper = mount(ComputeSection, { props: { view: "compute" } });
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
     await flushPromises();
     await wrapper.find('input[value="GPU-3060"]').setValue(true);
     await wrapper.findAll("button").find((b) => b.text() === "Apply & restart").trigger("click");
@@ -434,7 +440,7 @@ describe("Which GPU PixlStash uses", () => {
     compute.getComputeGpus
       .mockResolvedValueOnce(gpuAnswer())
       .mockResolvedValue(gpuAnswer({ selected: "GPU-3060" }));
-    const wrapper = mount(ComputeSection, { props: { view: "compute" } });
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
     await flushPromises();
     await wrapper.find('input[value="GPU-3060"]').setValue(true);
     const apply = () => wrapper.findAll("button").find((b) => b.text() === "Apply & restart");
@@ -447,7 +453,7 @@ describe("Which GPU PixlStash uses", () => {
 
   it("disables the VRAM limit when the settings it saves into cannot be read", async () => {
     compute.getUserConfig.mockReset().mockRejectedValue(new Error("offline"));
-    const wrapper = mount(ComputeSection, { props: { view: "compute" } });
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
     await flushPromises();
     expect(wrapper.text()).toContain("Failed to load the sharing settings.");
     expect(wrapper.findComponent({ name: "v-slider" }).attributes("disabled")).toBe("true");
@@ -459,7 +465,7 @@ describe("Which GPU PixlStash uses", () => {
   });
 
   it("writes the run-alone switch through the user config", async () => {
-    const wrapper = mount(ComputeSection, { props: { view: "compute" } });
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
     await flushPromises();
     const sw = wrapper.findAllComponents({ name: "v-switch" }).find(
       (c) => c.attributes("aria-label") === "Run a workflow alone after it runs out of memory",
@@ -471,3 +477,118 @@ describe("Which GPU PixlStash uses", () => {
   });
 });
 
+// The settings dialog keeps every pane mounted while it is open and only shows
+// one. A pane reads when it is first shown and never again in that mount, so a
+// tab switch cannot overwrite what the user has not applied or saved yet.
+describe("a hidden pane reads nothing and a tab switch keeps its edits", () => {
+  beforeEach(() => {
+    compute.getComputeGpus.mockReset().mockResolvedValue(gpuAnswer());
+    compute.getUserConfig.mockReset().mockResolvedValue({ auto_exclusive_after_oom: true, max_vram_gb: 8 });
+    compute.patchUserConfig.mockReset().mockResolvedValue({});
+    delete window.pixlstashDesktop;
+  });
+
+  function installBackendDesktop() {
+    const desktop = installDesktop(bundledActiveState());
+    desktop.getServerSettings = vi.fn().mockResolvedValue({ enabled: true, port: 9537, ssl: false, urls: [] });
+    desktop.getDesktopPrefs = vi.fn().mockResolvedValue({ hideToTrayOnClose: true, shellCommand: null });
+    return desktop;
+  }
+
+  it("reads the compute settings once, on first being shown", async () => {
+    const desktop = installDesktop(bundledActiveState());
+    const reads = () => [
+      desktop.listAccelerators.mock.calls.length,
+      compute.getComputeGpus.mock.calls.length,
+      compute.getUserConfig.mock.calls.length,
+    ];
+    const wrapper = mount(ComputeSection, { props: { view: "compute", open: true, active: false } });
+    await flushPromises();
+    expect(reads()).toEqual([0, 0, 0]);
+
+    await wrapper.setProps({ active: true });
+    await flushPromises();
+    expect(reads()).toEqual([1, 1, 1]);
+
+    await wrapper.setProps({ active: false });
+    await wrapper.setProps({ active: true });
+    await flushPromises();
+    expect(reads()).toEqual([1, 1, 1]);
+  });
+
+  it("reads the server settings once, on first being shown", async () => {
+    const desktop = installBackendDesktop();
+    const reads = () => [
+      desktop.getServerSettings.mock.calls.length,
+      desktop.getDesktopPrefs.mock.calls.length,
+    ];
+    const wrapper = mount(ComputeSection, { props: { view: "backend", open: true, active: false } });
+    await flushPromises();
+    expect(reads()).toEqual([0, 0]);
+
+    await wrapper.setProps({ active: true });
+    await flushPromises();
+    expect(reads()).toEqual([1, 1]);
+
+    await wrapper.setProps({ active: false });
+    await wrapper.setProps({ active: true });
+    await flushPromises();
+    expect(reads()).toEqual([1, 1]);
+  });
+
+  it("keeps a port that has not been applied when the tab is left and shown again", async () => {
+    installBackendDesktop();
+    const wrapper = mount(ComputeSection, { props: { view: "backend", ...SHOWN } });
+    await flushPromises();
+    wrapper.findComponent(AppStepper).vm.$emit("update:modelValue", "9600");
+
+    await wrapper.setProps({ active: false });
+    await wrapper.setProps({ active: true });
+    await flushPromises();
+    expect(wrapper.findComponent(AppStepper).props("modelValue")).toBe("9600");
+  });
+
+  async function moveVramSliderTo(gb) {
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
+    await flushPromises();
+    // The debounce timer is armed by the move, after the fake clock is in.
+    vi.useFakeTimers();
+    wrapper.findComponent({ name: "v-slider" }).vm.$emit("update:modelValue", gb);
+    await nextTick();
+    expect(compute.patchUserConfig).not.toHaveBeenCalled();
+    return wrapper;
+  }
+
+  it("still saves a VRAM change inside its debounce when the tab is left", async () => {
+    try {
+      const wrapper = await moveVramSliderTo(6);
+      await wrapper.setProps({ active: false });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(compute.patchUserConfig).toHaveBeenCalledWith({ max_vram_gb: 6 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still saves a VRAM change inside its debounce when the dialog closes", async () => {
+    try {
+      const wrapper = await moveVramSliderTo(6);
+      await wrapper.setProps({ open: false, active: false });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(compute.patchUserConfig).toHaveBeenCalledWith({ max_vram_gb: 6 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("saves a VRAM change inside its debounce at once when the pane unmounts", async () => {
+    try {
+      const wrapper = await moveVramSliderTo(6);
+      // Closing Settings unmounts the dialog's content.
+      wrapper.unmount();
+      expect(compute.patchUserConfig.mock.calls).toEqual([[{ max_vram_gb: 6 }]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -371,7 +371,10 @@ watch(
           <ScrapheapSection :open="dialogOpen" />
         </div>
         <div id="settings-anchor-snapshots" class="settings-pane__grow">
-          <SnapshotsSection :open="dialogOpen" />
+          <SnapshotsSection
+            :open="dialogOpen"
+            :active="dialogOpen && settingsTab === 'recovery'"
+          />
         </div>
         <!-- A plain block around the section: SettingsRow's `height: 100%`
              would otherwise resolve against a flex item and stretch. -->
@@ -387,7 +390,10 @@ watch(
         role="region"
         aria-labelledby="settings-nav-behaviour"
       >
-        <BehaviourSection :open="dialogOpen" />
+        <BehaviourSection
+          :open="dialogOpen"
+          :active="dialogOpen && settingsTab === 'behaviour'"
+        />
       </div>
       <div
         v-if="!isReadOnly"
@@ -447,7 +453,11 @@ watch(
         role="region"
         aria-labelledby="settings-nav-compute"
       >
-        <ComputeSection :open="dialogOpen" view="compute" />
+        <ComputeSection
+          :open="dialogOpen"
+          :active="dialogOpen && settingsTab === 'compute'"
+          view="compute"
+        />
       </div>
       <div
         v-if="isDesktop && !isReadOnly"
@@ -457,7 +467,11 @@ watch(
         role="region"
         aria-labelledby="settings-nav-backend"
       >
-        <ComputeSection :open="dialogOpen" view="backend" />
+        <ComputeSection
+          :open="dialogOpen"
+          :active="dialogOpen && settingsTab === 'backend'"
+          view="backend"
+        />
       </div>
       <div
         v-if="!isReadOnly"

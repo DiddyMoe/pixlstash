@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { getUserConfig, patchUserConfig } from "../../api/config";
 import { listTaggers, listTaggerPluginDiagnostics } from "../../api/taggers";
 import { VSwitch } from "vuetify/components";
@@ -14,6 +14,9 @@ import { errorDetail } from "../../utils/apiError";
 
 const props = defineProps({
   open: { type: Boolean, default: false },
+  // True while this pane is the shown tab. `open` still owns the once-per-open
+  // reads; `active` only gates the loaded-state poll.
+  active: { type: Boolean, default: false },
 });
 
 const keepModelsInMemory = ref(true);
@@ -125,8 +128,20 @@ async function refreshTaggerLoaded() {
 
 let taggerPollTimer = null;
 
-function startTaggerPoll() {
-  stopTaggerPoll();
+// The loaded-state poll runs only while someone can see it: the dialog is
+// open, this is the shown tab, and the page is visible. It writes nothing but
+// `is_loaded`, so pausing and resuming it cannot touch an unsaved edit.
+// `catchUp` reads straight away when the pane comes back into view; on an
+// open the full list has just been read, so that path passes false.
+function syncTaggerPoll(catchUp) {
+  const wanted =
+    props.open && props.active && document.visibilityState === "visible";
+  if (!wanted) {
+    stopTaggerPoll();
+    return;
+  }
+  if (taggerPollTimer !== null) return;
+  if (catchUp) refreshTaggerLoaded();
   taggerPollTimer = setInterval(refreshTaggerLoaded, 5000);
 }
 
@@ -137,7 +152,16 @@ function stopTaggerPoll() {
   }
 }
 
+function onVisibilityChange() {
+  syncTaggerPoll(true);
+}
+
+onMounted(() => {
+  document.addEventListener("visibilitychange", onVisibilityChange);
+});
+
 onUnmounted(() => {
+  document.removeEventListener("visibilitychange", onVisibilityChange);
   stopTaggerPoll();
 });
 
@@ -147,12 +171,15 @@ watch(
     if (isOpen) {
       fetchBehaviourSettings();
       fetchTaggerPlugins();
-      startTaggerPoll();
-    } else {
-      stopTaggerPoll();
     }
+    syncTaggerPoll(false);
   },
   { immediate: true },
+);
+
+watch(
+  () => props.active,
+  () => syncTaggerPoll(true),
 );
 </script>
 
