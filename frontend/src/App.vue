@@ -641,7 +641,6 @@ const buildingSet = computed(() =>
 );
 
 function onTrainingSetFinished(set) {
-  entityLists.invalidate(["sets"]);
   refreshSidebar();
   noticeStore.push({
     level: "success",

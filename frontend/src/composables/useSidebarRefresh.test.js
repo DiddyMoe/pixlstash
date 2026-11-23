@@ -86,7 +86,12 @@ describe("useSidebarRefresh", () => {
 
     api.refreshSidebar();
     expect(sidebar.refreshSidebar).toHaveBeenCalledTimes(1);
-    expect(stores.invalidate).toHaveBeenCalledTimes(1);
+    // The mounted sidebar refetches the shared lists itself; a second
+    // invalidation here would read each list twice.
+    expect(stores.invalidate).not.toHaveBeenCalled();
+    // The stores the sidebar does not own still ride the same refresh.
+    expect(stores.fetchLocked).toHaveBeenCalledTimes(1);
+    expect(stores.refreshCounts).toHaveBeenCalledTimes(1);
 
     // Delivered directly, so nothing is owed to a later instance.
     const remounted = { refreshSidebar: vi.fn() };

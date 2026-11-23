@@ -5,6 +5,7 @@ import {
   ref,
   onBeforeUnmount,
   onMounted,
+  onUnmounted,
   onUpdated,
   watch,
   nextTick,
@@ -3617,18 +3618,36 @@ function sidebarCountRequestKey() {
   });
 }
 
+// Per-project counts arrive ON the shared project list (`include_counts`), so
+// they follow that list whenever it is written. Copying them inside
+// `fetchSidebarData` instead would publish the numbers of the read that pass
+// joined, and miss a trailing read queued behind it by a later change. The
+// unassigned bucket is not a row in that list, so it stays a single summary
+// request in `fetchSidebarData`.
+watch(
+  projects,
+  (rows) => {
+    for (const { id, count } of projectCountUpdates(rows)) {
+      projectCounts.value[id] = count;
+    }
+  },
+  { immediate: true },
+);
+
 async function fetchSidebarData() {
   const requestEpoch = (sidebarCountEpoch += 1);
-  // The per-character and per-project counts arrive ON the shared lists
-  // (`include_counts`), so this pass has to hold those lists before it can read
-  // a count off them, and before it can compute a request key that describes
-  // what it is about to write. `refreshSidebar` fires `fetchCharacters()` /
-  // `fetchProjects()` unawaited a tick earlier, and `useEntityListsStore.refresh`
-  // de-duplicates on the kind while a request is in flight, so awaiting here
-  // JOINS those reads rather than issuing a second pair. (Awaiting them after
-  // computing the key instead would be a bug: a cold list landing mid-flight
-  // changes the key and every count write would be discarded as stale.)
-  const [characterRows, projectRows] = await Promise.all([
+  // The per-character counts arrive ON the shared people list
+  // (`include_counts`), so this pass has to hold that list before it can read
+  // a count off it, and both the people and the project lists before it can
+  // compute a request key that describes what it is about to write (the
+  // project counts follow their list through the watcher above).
+  // `refreshSidebar` fires `fetchCharacters()` / `fetchProjects()` unawaited a
+  // tick earlier, and `useEntityListsStore.refresh` de-duplicates on the kind
+  // while a request is in flight, so awaiting here JOINS those reads rather
+  // than issuing a second pair. (Awaiting them after computing the key instead
+  // would be a bug: a cold list landing mid-flight changes the key and every
+  // count write would be discarded as stale.)
+  const [characterRows] = await Promise.all([
     entityLists.refresh("characters"),
     entityLists.refresh("projects"),
   ]);
@@ -3652,13 +3671,6 @@ async function fetchSidebarData() {
       showsTree.value ? PROJECT_VIEW_MODE : "global",
     )) {
       setCategoryCount(id, count, shouldFlash);
-    }
-  }
-  // Same for the projects. The unassigned bucket is not a row in that list, so
-  // it stays a single summary request (below).
-  if (isCurrentRequest()) {
-    for (const { id, count } of projectCountUpdates(projectRows)) {
-      projectCounts.value[id] = count;
     }
   }
   // Fetch total image count for END key logic
@@ -3746,25 +3758,109 @@ function refreshSidebar(options = {}) {
   fetchLibraryFolders();
 }
 
-async function fetchCharacterThumbnail(characterId) {
-  try {
-    // No cache-buster: a fresh `?cb=` per call re-downloaded every character
-    // thumbnail on every sidebar refresh, against an already-expensive route
-    // (#651). Freshness is the *response's* job instead - the route sends
-    // `Cache-Control: private, no-cache` with an ETag and answers a conditional
-    // request with a 304, so the browser revalidates every time but transfers
-    // bytes only when the thumbnail actually changed. Re-adding a buster here
-    // would defeat that (integration_architecture.md §9).
-    const blob = await getCharacterThumbnail(characterId);
+// --- Character thumbnails ---
+// Each thumbnail is an object URL over a fetched blob, and the blob stays in
+// memory until its URL is revoked. Only the newest request for a person may
+// install a URL (its ticket), every URL that is replaced or dropped is revoked,
+// and the requests share a bounded number of slots instead of one per person
+// at once - the browser's per-host connection limit, so the bound costs no
+// throughput.
+const CHARACTER_THUMBNAIL_CONCURRENCY = 6;
+const characterThumbnailTickets = new Map();
+let lastCharacterThumbnailTicket = 0;
+let freeCharacterThumbnailSlots = CHARACTER_THUMBNAIL_CONCURRENCY;
+const characterThumbnailSlotWaiters = [];
+let characterThumbnailsDisposed = false;
 
-    // Create an object URL for the blob
-    const blobUrl = URL.createObjectURL(blob);
-    characterThumbnails.value[characterId] = blobUrl;
-  } catch (e) {
-    console.error(`Failed to fetch thumbnail for character ${characterId}:`, e);
-    characterThumbnails.value[characterId] = null;
+function revokeCharacterThumbnailAfterRender(url) {
+  // The rows here and the toolbar's similarity-sort avatars (a copy through
+  // the sort store) keep showing `url` until the next render swaps it out.
+  if (url) nextTick(() => URL.revokeObjectURL(url));
+}
+
+function setCharacterThumbnail(characterId, url) {
+  const previous = characterThumbnails.value[characterId];
+  characterThumbnails.value[characterId] = url;
+  if (previous !== url) revokeCharacterThumbnailAfterRender(previous);
+}
+
+/** Drop the thumbnails, and cancel the requests, of people no longer listed. */
+function forgetCharacterThumbnailsExcept(characters) {
+  const listed = new Set(characters.map((char) => String(char.id)));
+  for (const id of characterThumbnailTickets.keys()) {
+    if (!listed.has(id)) characterThumbnailTickets.delete(id);
+  }
+  for (const id of Object.keys(characterThumbnails.value)) {
+    if (listed.has(id)) continue;
+    revokeCharacterThumbnailAfterRender(characterThumbnails.value[id]);
+    delete characterThumbnails.value[id];
   }
 }
+
+// The prune follows the people list as it is written, not the result a
+// `fetchCharacters` call awaited: a read that started before a session reset
+// resolves to an empty result without writing the list, so it cannot drop the
+// thumbnails a newer read has installed, while the reset's own empty list
+// cancels every request still out and revokes every URL. `sync` runs the prune
+// inside the write itself, so a reset has cancelled the previous session's
+// requests before any of their responses, even one already settled, can
+// install a URL.
+watch(() => entityLists.characters, forgetCharacterThumbnailsExcept, {
+  flush: "sync",
+});
+
+async function withCharacterThumbnailSlot(task) {
+  if (freeCharacterThumbnailSlots > 0) {
+    freeCharacterThumbnailSlots -= 1;
+  } else {
+    await new Promise((resolve) => characterThumbnailSlotWaiters.push(resolve));
+  }
+  try {
+    return await task();
+  } finally {
+    const next = characterThumbnailSlotWaiters.shift();
+    if (next) next();
+    else freeCharacterThumbnailSlots += 1;
+  }
+}
+
+function fetchCharacterThumbnail(characterId) {
+  const key = String(characterId);
+  const ticket = ++lastCharacterThumbnailTicket;
+  characterThumbnailTickets.set(key, ticket);
+  // False once a newer request for this person, their removal or the
+  // sidebar's unmount has taken over.
+  const isCurrent = () =>
+    !characterThumbnailsDisposed &&
+    characterThumbnailTickets.get(key) === ticket;
+  return withCharacterThumbnailSlot(async () => {
+    if (!isCurrent()) return;
+    try {
+      // No cache-buster: a fresh `?cb=` per call re-downloaded every character
+      // thumbnail on every sidebar refresh, against an already-expensive route
+      // (#651). Freshness is the *response's* job instead - the route sends
+      // `Cache-Control: private, no-cache` with an ETag and answers a conditional
+      // request with a 304, so the browser revalidates every time but transfers
+      // bytes only when the thumbnail actually changed. Re-adding a buster here
+      // would defeat that (integration_architecture.md §9).
+      const blob = await getCharacterThumbnail(characterId);
+      if (!isCurrent()) return;
+      setCharacterThumbnail(characterId, URL.createObjectURL(blob));
+    } catch (e) {
+      console.error(`Failed to fetch thumbnail for character ${characterId}:`, e);
+      // The route answers 404 for a person with no usable face, so the face
+      // shown before is not kept: the row falls back to the placeholder.
+      if (isCurrent()) setCharacterThumbnail(characterId, null);
+    }
+  });
+}
+
+onUnmounted(() => {
+  characterThumbnailsDisposed = true;
+  for (const url of Object.values(characterThumbnails.value)) {
+    if (url) URL.revokeObjectURL(url);
+  }
+});
 
 // --- Sorting & Pagination ---
 async function fetchSortOptions() {
