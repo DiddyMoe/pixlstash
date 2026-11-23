@@ -1642,6 +1642,7 @@ def _unique_edit_filename(output_dir: str, stem: str, ext: str) -> str:
         n += 1
 
 
+@import_dedup_service.serialised_import()
 def _import_comfyui_outputs(
     server,
     image_entries: list[tuple[bytes, str]],

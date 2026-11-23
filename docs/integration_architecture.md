@@ -2603,10 +2603,13 @@ import runs on.
 `committing` (the brief hand-over), `importing`, `completed`, `failed` or
 `cancelled`. While `importing`, `phase` is `queued` (waiting for a worker),
 `processing` (checking and reading in each file; `processed` counts these),
-`persisting` (writing every new picture in one transaction, then its project,
-set and character membership) or `finalizing` (restoring Scrapheap matches,
-removing the staged files); otherwise `null`. No new picture exists before
-`persisting`.
+`persisting` (writing one batch of up to 64 new pictures in one transaction,
+then their project, set and character membership) or `finalizing` (restoring
+Scrapheap matches, removing the staged files); otherwise `null`. `processing`
+and `persisting` alternate once per batch, so pictures from earlier batches are
+already in the library while a later batch is `processing`. They stay if the
+import then fails, and the failed status's `error` then begins "The import
+stopped after N new picture(s) were added".
 
 **Lifetime.** The reaper runs each time a staging session is opened. A session
 idle for an hour, or finished and unpolled for five minutes, is reaped with its

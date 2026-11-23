@@ -21,11 +21,13 @@ These tests pin both directions:
 import io
 import os
 import tempfile
+import threading
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from sqlalchemy.orm import Session
 from sqlmodel import select
 
 from pixlstash.db_models import (
@@ -35,9 +37,12 @@ from pixlstash.db_models import (
     PictureSet,
     PictureSetMember,
 )
+from pixlstash.event_types import EventType
 from pixlstash.server import Server
-from pixlstash.services import scrapheap_service
+from pixlstash.services import import_dedup_service, scrapheap_service
 from pixlstash.services.comfyui_service import _import_comfyui_outputs
+from pixlstash.tasks import picture_import_task
+from pixlstash.tasks.watch_folder_import_task import WatchFolderImportTask
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from tests.authz_guard import no_spa_fallback  # noqa: F401
 
@@ -95,7 +100,7 @@ def _wait_for_stage(client, staging_id, target=("completed", "failed"), timeout_
     raise AssertionError(f"Staging {staging_id} did not reach {target}: {last}")
 
 
-def _staging_import(client, files):
+def _staging_import(client, files, keys=None, target=("completed",)):
     """Run the streaming-staging import over ``files`` and return its status."""
     staging_id = client.post(f"{API}/pictures/import/staging", json={}).json()[
         "staging_id"
@@ -103,11 +108,12 @@ def _staging_import(client, files):
     r = client.post(
         f"{API}/pictures/import/staging/{staging_id}/files",
         files=[("file", (name, data, "image/png")) for name, data in files],
+        data={"key": keys} if keys else None,
     )
     assert r.status_code == 200, r.text
     r = client.post(f"{API}/pictures/import/staging/{staging_id}/commit")
     assert r.status_code == 200, r.text
-    return _wait_for_stage(client, staging_id, target=("completed",))
+    return _wait_for_stage(client, staging_id, target=target)
 
 
 def _wait_for_import_task(client, task_id, timeout_s=30):
@@ -145,6 +151,26 @@ def _picture_ids(srv, deleted=None):
 
 def _row_count(srv) -> int:
     return srv.vault.db.run_task(lambda s: s.query(Picture).count())
+
+
+def _picture_named(srv, original_file_name) -> int:
+    def _do(session):
+        return session.exec(
+            select(Picture.id).where(Picture.original_file_name == original_file_name)
+        ).one()
+
+    return int(srv.vault.db.run_task(_do))
+
+
+def _vault_path(srv, picture_id) -> str:
+    file_path = srv.vault.db.run_task(
+        lambda s: s.exec(
+            select(Picture.file_path).where(Picture.id == picture_id)
+        ).one()
+    )
+    return os.path.normpath(
+        ImageUtils.resolve_picture_path(srv.vault.image_root, file_path)
+    )
 
 
 def _scrapheap(client, picture_id):
@@ -826,3 +852,512 @@ def test_restore_announces_exactly_the_pictures_it_restored(owner_server):
         assert emitted == []
     finally:
         srv.vault.notify = real_notify
+
+
+# ---------------------------------------------------------------------------
+# A staged import settles its files in batches
+# ---------------------------------------------------------------------------
+
+
+def test_staging_import_looks_up_matches_once_per_batch_on_the_writer(
+    owner_server, monkeypatch
+):
+    """One writer-queued lookup per batch, and each sees the batches before it."""
+    srv, client = owner_server
+    monkeypatch.setattr(picture_import_task, "_DEDUP_BATCH", 4, raising=False)
+    real_lookup = import_dedup_service.load_match_candidates_in_session
+    lookups = []
+
+    def _spy(session, keys, *args, **kwargs):
+        keys = list(keys)
+        lookups.append(
+            {
+                "on_writer": threading.current_thread() is srv.vault.db._task_worker,
+                "keys": len(keys),
+                "rows_visible": len(session.exec(select(Picture.id)).all()),
+            }
+        )
+        return real_lookup(session, keys, *args, **kwargs)
+
+    monkeypatch.setattr(import_dedup_service, "load_match_candidates_in_session", _spy)
+    files = [(f"p{i}.png", _png_bytes((20 * i, 90, 200))) for i in range(9)]
+
+    status = _staging_import(client, files)
+
+    assert status["imported_count"] == 9, status
+    assert [lookup["keys"] for lookup in lookups] == [4, 4, 1], lookups
+    assert all(lookup["on_writer"] for lookup in lookups), lookups
+    assert [lookup["rows_visible"] for lookup in lookups] == [0, 4, 8], lookups
+
+
+def test_staging_import_reads_each_candidate_once_per_batch(owner_server, monkeypatch):
+    """Several staged files sharing one candidate read its vault file once."""
+    srv, client = owner_server
+    first = _bmp_bytes((15, 25, 35))
+    other = _bmp_bytes((35, 25, 15))
+    assert len(first) == len(other)
+    monkeypatch.setattr(
+        ImageUtils,
+        "calculate_hash_from_file_path",
+        staticmethod(lambda _path: "forced-staging-collision"),
+    )
+    assert _staging_import(client, [("first.bmp", first)])["imported_count"] == 1
+    candidate_path = _vault_path(srv, _picture_ids(srv)[0])
+
+    real_full_hash = ImageUtils.calculate_full_hash_from_file_path
+    candidate_reads = []
+
+    def _spy(path):
+        if os.path.normpath(path) == candidate_path:
+            candidate_reads.append(path)
+        return real_full_hash(path)
+
+    monkeypatch.setattr(
+        ImageUtils, "calculate_full_hash_from_file_path", staticmethod(_spy)
+    )
+    status = _staging_import(
+        client,
+        [("copy-1.bmp", first), ("copy-2.bmp", first), ("other.bmp", other)],
+    )
+
+    assert status["duplicate_count"] == 2, status
+    assert status["imported_count"] == 1, status
+    assert len(candidate_reads) == 1, candidate_reads
+
+
+def test_staging_import_names_the_earlier_batch_picture_a_file_duplicates(
+    owner_server, monkeypatch
+):
+    """A repeat in a later batch is a duplicate OF the picture already added."""
+    srv, client = owner_server
+    monkeypatch.setattr(picture_import_task, "_DEDUP_BATCH", 2, raising=False)
+    x = _png_bytes((1, 120, 240))
+    y = _png_bytes((240, 120, 1))
+
+    status = _staging_import(
+        client,
+        [("x.png", x), ("y.png", y), ("x-again.png", x)],
+        keys=["tile-x", "tile-y", "tile-x-again"],
+    )
+
+    assert status["imported_count"] == 2, status
+    assert status["duplicate_count"] == 1, status
+    assert _row_count(srv) == 2
+    assert status["outcomes"] == [
+        {"key": "tile-x", "outcome": "new", "picture_id": None},
+        {"key": "tile-y", "outcome": "new", "picture_id": None},
+        {
+            "key": "tile-x-again",
+            "outcome": "duplicate",
+            "picture_id": _picture_named(srv, "x.png"),
+        },
+    ], status
+
+
+def test_staging_batches_keep_a_sampled_collision_split_across_them_distinct(
+    owner_server, monkeypatch
+):
+    """A picture added by an earlier batch is matched on full content, not key."""
+    srv, client = owner_server
+    monkeypatch.setattr(picture_import_task, "_DEDUP_BATCH", 1, raising=False)
+    first = _bmp_bytes((44, 55, 66))
+    second = _bmp_bytes((66, 55, 44))
+    assert len(first) == len(second)
+    monkeypatch.setattr(
+        ImageUtils,
+        "calculate_hash_from_file_path",
+        staticmethod(lambda _path: "forced-staging-collision"),
+    )
+
+    status = _staging_import(client, [("a.bmp", first), ("b.bmp", second)])
+
+    assert status["imported_count"] == 2, status
+    assert status["duplicate_count"] == 0, status
+    assert _row_count(srv) == 2
+
+
+def test_staging_import_failure_after_a_batch_says_what_was_added(
+    owner_server, monkeypatch
+):
+    """Earlier batches stay imported, and the failure says how many there are."""
+    srv, client = owner_server
+    monkeypatch.setattr(picture_import_task, "_DEDUP_BATCH", 2, raising=False)
+    real_run_task = srv.vault.db.run_task
+    inserts = []
+
+    def _failing_second_insert(func, *args, **kwargs):
+        if getattr(func, "__name__", "") == "insert_pictures":
+            inserts.append(func)
+            if len(inserts) == 2:
+                raise RuntimeError("test-insert-failure")
+        return real_run_task(func, *args, **kwargs)
+
+    monkeypatch.setattr(srv.vault.db, "run_task", _failing_second_insert)
+    files = [(f"f{i}.png", _png_bytes((70, 70 + 40 * i, 9))) for i in range(3)]
+
+    status = _staging_import(
+        client,
+        files,
+        keys=["tile-0", "tile-1", "tile-2"],
+        target=("completed", "failed"),
+    )
+
+    assert status["stage"] == "failed", status
+    assert "2 new picture" in status["error"], status
+    assert "test-insert-failure" in status["error"], status
+    assert [o["outcome"] for o in status["outcomes"]] == ["new", "new", "failed"], (
+        status
+    )
+    assert _row_count(srv) == 2
+
+
+def _fail_the_second_insert(srv, monkeypatch):
+    """Make the second batch's insert raise; the first one runs as usual."""
+    real_run_task = srv.vault.db.run_task
+    inserts = []
+
+    def _failing_second_insert(func, *args, **kwargs):
+        if getattr(func, "__name__", "") == "insert_pictures":
+            inserts.append(func)
+            if len(inserts) == 2:
+                raise RuntimeError("test-insert-failure")
+        return real_run_task(func, *args, **kwargs)
+
+    monkeypatch.setattr(srv.vault.db, "run_task", _failing_second_insert)
+
+
+def test_staging_import_failure_reports_an_in_batch_copy_as_failed(
+    owner_server, monkeypatch
+):
+    """A copy of a file the failed batch would have added is not in the library."""
+    srv, client = owner_server
+    monkeypatch.setattr(picture_import_task, "_DEDUP_BATCH", 2, raising=False)
+    _fail_the_second_insert(srv, monkeypatch)
+    c = _png_bytes((9, 200, 90))
+    files = [
+        ("a.png", _png_bytes((200, 9, 90))),
+        ("b.png", _png_bytes((90, 9, 200))),
+        ("c.png", c),
+        ("c-copy.png", c),
+    ]
+
+    status = _staging_import(
+        client,
+        files,
+        keys=["a", "b", "c", "c-copy"],
+        target=("completed", "failed"),
+    )
+
+    assert status["stage"] == "failed", status
+    assert [o["outcome"] for o in status["outcomes"]] == [
+        "new",
+        "new",
+        "failed",
+        "failed",
+    ], status
+    assert _row_count(srv) == 2
+
+
+def test_staging_import_failure_announces_the_pictures_it_added(
+    owner_server, monkeypatch
+):
+    """Open views learn about the earlier batches' pictures, failure or not."""
+    srv, client = owner_server
+    monkeypatch.setattr(picture_import_task, "_DEDUP_BATCH", 2, raising=False)
+    _fail_the_second_insert(srv, monkeypatch)
+    events = []
+    real_notify = srv.vault.notify
+
+    def _capture(event_type, data=None):
+        events.append((event_type, data))
+        return real_notify(event_type, data)
+
+    monkeypatch.setattr(srv.vault, "notify", _capture)
+    files = [(f"g{i}.png", _png_bytes((9, 70 + 40 * i, 70))) for i in range(3)]
+
+    status = _staging_import(client, files, target=("completed", "failed"))
+
+    assert status["stage"] == "failed", status
+    added = _picture_ids(srv, deleted=False)
+    assert len(added) == 2, added
+    assert [
+        data["ids"]
+        for event_type, data in events
+        if event_type == EventType.PICTURE_IMPORTED and isinstance(data, dict)
+    ] == [added], events
+    assert [
+        data["picture_ids"]
+        for event_type, data in events
+        if event_type == EventType.CHANGED_PICTURES
+        and isinstance(data, dict)
+        and data.get("change_kind") == "added"
+    ] == [added], events
+
+
+def test_staging_import_counts_a_picture_whose_refresh_fails_after_commit(
+    owner_server, monkeypatch
+):
+    """A picture whose insert committed is new, whatever fails after the commit."""
+    srv, client = owner_server
+    real_refresh = Session.refresh
+
+    def _refresh(self, instance, *args, **kwargs):
+        # Only while an import holds the lock, so other server work is untouched.
+        if isinstance(instance, Picture) and import_dedup_service._IMPORT_LOCK.locked():
+            raise RuntimeError("test-refresh-failure")
+        return real_refresh(self, instance, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "refresh", _refresh)
+
+    status = _staging_import(
+        client,
+        [("r.png", _png_bytes((33, 66, 99)))],
+        target=("completed", "failed"),
+    )
+
+    assert status["stage"] == "completed", status
+    assert [o["outcome"] for o in status["outcomes"]] == ["new"], status
+    assert _row_count(srv) == 1
+
+
+# ---------------------------------------------------------------------------
+# Overlapping imports of the same new content add it once
+# ---------------------------------------------------------------------------
+
+
+class _SignallingLock:
+    """The import lock, saying when a second import has to wait for it."""
+
+    def __init__(self, on_contended):
+        self._inner = threading.Lock()
+        self._on_contended = on_contended
+
+    def __enter__(self):
+        if not self._inner.acquire(blocking=False):
+            self._on_contended()
+            self._inner.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._inner.release()
+        return False
+
+
+def _staged_import_task(srv, tmp_path, name, data):
+    staging_dir = tmp_path / f"staging-{name}"
+    staging_dir.mkdir()
+    file_path = staging_dir / name
+    file_path.write_bytes(data)
+    return picture_import_task.PictureImportTask(
+        srv.vault,
+        [{"file_path": str(file_path), "original_file_name": name}],
+        staging_id=f"test-{name}",
+        staging_dir=str(staging_dir),
+    )
+
+
+def _hold_first_decision(monkeypatch):
+    """Pause the first import right after it decided its file is new.
+
+    The first import waits until the second one has gone as far as it can
+    without the first one finishing: up to its own decision when nothing
+    orders them, or up to the import lock when the lock does. Returns the
+    events and the list the first import's wait results land in.
+    """
+    first_decided = threading.Event()
+    second_progressed = threading.Event()
+    first_waits: list[bool] = []
+    state = {"first_thread": None}
+    real_partition = import_dedup_service.partition_confirmed_matches
+
+    def _partition(*args, **kwargs):
+        result = real_partition(*args, **kwargs)
+        if threading.current_thread() is state["first_thread"] and not first_waits:
+            first_decided.set()
+            first_waits.append(second_progressed.wait(timeout=30))
+        else:
+            second_progressed.set()
+        return result
+
+    monkeypatch.setattr(import_dedup_service, "partition_confirmed_matches", _partition)
+    monkeypatch.setattr(
+        import_dedup_service,
+        "_IMPORT_LOCK",
+        _SignallingLock(second_progressed.set),
+        raising=False,
+    )
+    return state, first_decided, first_waits
+
+
+def _run_overlapping(state, first_decided, first, second):
+    results = {}
+    errors = []
+
+    def _runner(label, func):
+        def _run():
+            try:
+                results[label] = func()
+            except Exception as exc:  # surfaced by the assertion below
+                errors.append(exc)
+
+        return threading.Thread(target=_run, name=f"test-import-{label}")
+
+    first_thread = _runner("first", first)
+    state["first_thread"] = first_thread
+    first_thread.start()
+    assert first_decided.wait(timeout=30), "the first import never decided"
+    second_thread = _runner("second", second)
+    second_thread.start()
+    first_thread.join(timeout=60)
+    second_thread.join(timeout=60)
+    assert not first_thread.is_alive() and not second_thread.is_alive()
+    assert errors == []
+    return results
+
+
+def test_overlapping_staged_imports_of_new_content_add_one_picture(
+    owner_server, monkeypatch, tmp_path
+):
+    srv, _client = owner_server
+    data = _png_bytes((5, 150, 250))
+    first = _staged_import_task(srv, tmp_path, "first.png", data)
+    second = _staged_import_task(srv, tmp_path, "second.png", data)
+    state, first_decided, first_waits = _hold_first_decision(monkeypatch)
+
+    results = _run_overlapping(state, first_decided, first._run_task, second._run_task)
+
+    assert first_waits == [True], "the second import never got going"
+    assert _row_count(srv) == 1
+    assert results["first"]["imported_count"] == 1, results
+    assert results["second"]["imported_count"] == 0, results
+    assert results["second"]["duplicate_count"] == 1, results
+    assert second.outcomes == [
+        {
+            "key": None,
+            "outcome": "duplicate",
+            "picture_id": results["first"]["imported_picture_ids"][0],
+        }
+    ]
+
+
+def test_generation_import_overlapping_a_staged_import_adds_one_picture(
+    owner_server, monkeypatch, tmp_path
+):
+    srv, _client = owner_server
+    data = _png_bytes((250, 150, 5))
+    staged = _staged_import_task(srv, tmp_path, "staged.png", data)
+    state, first_decided, first_waits = _hold_first_decision(monkeypatch)
+
+    results = _run_overlapping(
+        state,
+        first_decided,
+        staged._run_task,
+        lambda: _import_comfyui_outputs(srv, [(data, ".png")]),
+    )
+
+    assert first_waits == [True], "the generation import never got going"
+    assert _row_count(srv) == 1
+    staged_ids = results["first"]["imported_picture_ids"]
+    assert len(staged_ids) == 1, results
+    assert results["second"] == ([], staged_ids), results
+
+
+# ---------------------------------------------------------------------------
+# A watch folder skips only a file whose full content is already there
+# ---------------------------------------------------------------------------
+
+
+def _watch_folder_pass(srv, tmp_path, name, data) -> dict:
+    """Run one watch-folder pass over a single file and return its result."""
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir(exist_ok=True)
+    file_path = watch_dir / name
+    file_path.write_bytes(data)
+    task = WatchFolderImportTask(srv.vault.db, [{"file_path": str(file_path)}], 1)
+    return task._run_task()
+
+
+@pytest.mark.parametrize(
+    "incoming_size, same_size",
+    [((48, 48), True), ((49, 48), False)],
+    ids=["same-size", "different-size"],
+)
+def test_watch_folder_imports_a_file_whose_sampled_hash_collides(
+    owner_server, monkeypatch, tmp_path, incoming_size, same_size
+):
+    """A sampled hash shared with a different picture does not skip the file."""
+    srv, client = owner_server
+    existing = _bmp_bytes((12, 34, 56))
+    incoming = _bmp_bytes((56, 34, 12), incoming_size)
+    assert (len(incoming) == len(existing)) is same_size
+    monkeypatch.setattr(
+        ImageUtils,
+        "calculate_hash_from_file_path",
+        staticmethod(lambda _path: "forced-watch-collision"),
+    )
+    assert _staging_import(client, [("existing.bmp", existing)])["imported_count"] == 1
+
+    result = _watch_folder_pass(srv, tmp_path, "incoming.bmp", incoming)
+
+    assert len(result["imported_picture_ids"]) == 1, result
+    assert _row_count(srv) == 2
+
+
+def test_watch_folder_still_skips_a_file_already_in_the_library(owner_server, tmp_path):
+    srv, client = owner_server
+    data = _bmp_bytes((21, 43, 65))
+    assert _staging_import(client, [("kept.bmp", data)])["imported_count"] == 1
+
+    result = _watch_folder_pass(srv, tmp_path, "kept-copy.bmp", data)
+
+    assert result["imported_picture_ids"] == [], result
+    assert _row_count(srv) == 1
+
+
+def test_watch_folder_skips_a_scrapheaped_match_and_leaves_it_there(
+    owner_server, tmp_path
+):
+    """A kept watch-folder file comes round again after every restart.
+
+    Restoring its scrapheaped picture would undo the owner's cleanup on each
+    start, and importing it again would add a second row, so it is skipped.
+    """
+    srv, client = owner_server
+    data = _bmp_bytes((65, 43, 21))
+    assert _staging_import(client, [("heaped.bmp", data)])["imported_count"] == 1
+    heaped_id = _picture_ids(srv)[0]
+    _scrapheap(client, heaped_id)
+
+    result = _watch_folder_pass(srv, tmp_path, "heaped-copy.bmp", data)
+
+    assert result["imported_picture_ids"] == [], result
+    assert _picture_ids(srv) == [heaped_id]
+    assert _picture_ids(srv, deleted=True) == [heaped_id]
+
+
+def test_watch_folder_reads_a_file_in_full_only_when_a_picture_shares_its_key(
+    owner_server, monkeypatch, tmp_path
+):
+    """A file no picture shares a sampled hash and size with is never read whole."""
+    srv, client = owner_server
+    assert (
+        _staging_import(client, [("other.bmp", _bmp_bytes((99, 1, 1)))])[
+            "imported_count"
+        ]
+        == 1
+    )
+    real_full_hash = ImageUtils.calculate_full_hash_from_file_path
+    full_reads = []
+
+    def _spy(path):
+        full_reads.append(path)
+        return real_full_hash(path)
+
+    monkeypatch.setattr(
+        ImageUtils, "calculate_full_hash_from_file_path", staticmethod(_spy)
+    )
+
+    result = _watch_folder_pass(srv, tmp_path, "fresh.bmp", _bmp_bytes((1, 1, 99)))
+
+    assert len(result["imported_picture_ids"]) == 1, result
+    assert full_reads == []
