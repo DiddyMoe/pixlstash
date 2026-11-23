@@ -136,6 +136,7 @@ import {
   keepGroupSeparate,
   applyVerdictBatch,
   reopenGroup,
+  autoStackExact,
   listStackMembers,
   listMixedStacks,
   splitMixedStack,
@@ -2502,6 +2503,156 @@ describe("DuplicateQueue - a read-only session", () => {
     expect(
       wrapper.findComponent({ name: "DedupCompareDialog" }).props("readOnly"),
     ).toBe(true);
+    wrapper.unmount();
+  });
+});
+
+describe("DuplicateQueue - the Auto-stack dry run", () => {
+  // The dry run can be slow on a large library, and the dialog it answers can
+  // be closed, reopened or left behind before it lands. Its figures are the
+  // user's consent, so they must belong to the dialog on screen, and the run
+  // that consent starts must act on the scope those figures described.
+  const dialog = (wrapper) =>
+    wrapper.findComponent({ name: "DedupAutoStackDialog" });
+  const trigger = (wrapper) =>
+    wrapper.find('[data-testid="auto-stack-trigger"]');
+
+  /** A promise the test settles by hand, to order two replies at will. */
+  function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  const mountWithExactGroups = () =>
+    mountQueue([group("g1")], { byTier: { exact: 3 } });
+
+  beforeEach(() => {
+    autoStackExact.mockReset();
+  });
+
+  it("keeps the newer opening's figures when the older reply lands last", async () => {
+    const first = deferred();
+    const second = deferred();
+    autoStackExact
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const { wrapper } = await mountWithExactGroups();
+
+    await trigger(wrapper).trigger("click");
+    await trigger(wrapper).trigger("click");
+    // The newer opening cancels the request it replaced.
+    expect(autoStackExact.mock.calls[0][0].signal.aborted).toBe(true);
+    expect(autoStackExact.mock.calls[1][0].signal.aborted).toBe(false);
+
+    second.resolve({ dry_run: true, groups: 2, pictures: 4 });
+    await flushPromises();
+    first.resolve({ dry_run: true, groups: 99, pictures: 999 });
+    await flushPromises();
+
+    expect(dialog(wrapper).props("preview")).toEqual({
+      dry_run: true,
+      groups: 2,
+      pictures: 4,
+    });
+    expect(dialog(wrapper).props("loading")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("cancels the dry run when the dialog closes and ignores what lands after", async () => {
+    const pending = deferred();
+    autoStackExact.mockReturnValueOnce(pending.promise);
+    const { wrapper } = await mountWithExactGroups();
+
+    await trigger(wrapper).trigger("click");
+    const { signal } = autoStackExact.mock.calls[0][0];
+    expect(signal.aborted).toBe(false);
+
+    dialog(wrapper).vm.$emit("close");
+    await flushPromises();
+    expect(signal.aborted).toBe(true);
+
+    pending.resolve({ dry_run: true, groups: 5, pictures: 10 });
+    await flushPromises();
+    expect(dialog(wrapper).props("open")).toBe(false);
+    expect(dialog(wrapper).props("preview")).toBe(null);
+    expect(dialog(wrapper).props("loading")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("cancels the dry run when the queue is left", async () => {
+    autoStackExact.mockReturnValueOnce(deferred().promise);
+    const { wrapper } = await mountWithExactGroups();
+
+    await trigger(wrapper).trigger("click");
+    const { signal } = autoStackExact.mock.calls[0][0];
+    wrapper.unmount();
+    expect(signal.aborted).toBe(true);
+  });
+
+  it("stacks the scope it previewed after the queue moved to another", async () => {
+    autoStackExact
+      .mockResolvedValueOnce({ dry_run: true, groups: 3, pictures: 6 })
+      .mockResolvedValueOnce({ batch_id: "srv-1", groups: 3 });
+    const { wrapper, store } = await mountWithExactGroups();
+
+    await trigger(wrapper).trigger("click");
+    await flushPromises();
+    expect(autoStackExact).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        dryRun: true,
+        scopeType: "global",
+        scopeId: null,
+      }),
+    );
+
+    // The sidebar's "Find duplicates in..." moves the queue while the dialog
+    // still shows the library-wide figures.
+    routeMock.query = { scope: "project", scope_id: "7" };
+    await flushPromises();
+    expect([store.scopeType, store.scopeId]).toEqual(["project", "7"]);
+
+    dialog(wrapper).vm.$emit("confirm");
+    await flushPromises();
+    expect(autoStackExact).toHaveBeenCalledTimes(2);
+    expect(autoStackExact).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        dryRun: false,
+        scopeType: "global",
+        scopeId: null,
+      }),
+    );
+    expect(dialog(wrapper).props("open")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("hands a failed dry run to the dialog as the reason it failed", async () => {
+    autoStackExact.mockRejectedValueOnce(
+      Object.assign(new Error("Request failed with status code 422"), {
+        response: {
+          status: 422,
+          data: {
+            detail: [{ msg: "fake-reason", input: "fake-echoed-input" }],
+          },
+        },
+      }),
+    );
+    const { wrapper } = await mountWithExactGroups();
+
+    await trigger(wrapper).trigger("click");
+    await flushPromises();
+
+    expect(dialog(wrapper).props("previewError")).toEqual({
+      kind: "validation",
+      status: 422,
+      detail: "fake-reason",
+    });
+    expect(dialog(wrapper).props("preview")).toBe(null);
+    expect(dialog(wrapper).props("loading")).toBe(false);
     wrapper.unmount();
   });
 });

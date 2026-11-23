@@ -171,6 +171,17 @@ function buttonWith(wrapper, text) {
   return wrapper.findAll("button").find((b) => b.text().includes(text));
 }
 
+/** A count the test answers by hand, to choose the order replies land in. */
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("LibraryLayoutDialog", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
@@ -659,6 +670,169 @@ describe("LibraryLayoutDialog", () => {
     ).toBeUndefined();
     expect(runLayoutMigrationPass).not.toHaveBeenCalled();
   });
+
+  // ---- a count that lands after the one asked for since ---------------------
+
+  it.each([
+    [
+      "answers",
+      (reply) => reply.resolve({ ...WOULD_MOVE, picture_count: 9999 }),
+    ],
+    ["fails", (reply) => reply.reject(new Error("fake-count-failed"))],
+  ])(
+    "keeps the count for the sweep on screen when the older count %s last",
+    async (_outcome, land) => {
+      const wrapper = mountDialog();
+      await flushPromises();
+      const older = deferred();
+      const newer = deferred();
+      getLayoutMigrationPreview
+        .mockReturnValueOnce(older.promise)
+        .mockReturnValueOnce(newer.promise);
+
+      const sweep = wrapper.find(".layout-unfiled input[type=checkbox]");
+      await sweep.setValue(true);
+      await sweep.setValue(false);
+      newer.resolve(WOULD_MOVE);
+      await flushPromises();
+      land(older);
+      await flushPromises();
+
+      expect(wrapper.find(".layout-consequence__num").text()).toContain(
+        "4,109",
+      );
+      expect(wrapper.text()).not.toContain("9,999");
+      expect(wrapper.text()).not.toContain("fake-count-failed");
+    },
+  );
+
+  it("keeps counting while the newer count is out, when the older lands first", async () => {
+    getLayoutMigrationPreview.mockResolvedValueOnce(NOTHING_TO_MOVE);
+    const wrapper = mountDialog();
+    await flushPromises();
+    const older = deferred();
+    const newer = deferred();
+    getLayoutMigrationPreview
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+
+    const sweep = wrapper.find(".layout-unfiled input[type=checkbox]");
+    await sweep.setValue(true);
+    await sweep.setValue(false);
+    older.resolve({ ...NOTHING_TO_MOVE, picture_count: 9999 });
+    await flushPromises();
+
+    expect(wrapper.find(".layout-tree__more").text()).toBe(
+      "Reading your folders…",
+    );
+    expect(wrapper.find(".layout-consequence__num").text()).toBe("counting…");
+    expect(buttonWith(wrapper, "Move them now").attributes("disabled")).toBe(
+      "",
+    );
+
+    newer.resolve(WOULD_MOVE);
+    await flushPromises();
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+  });
+
+  it("keeps counting when a count read before an edit lands after it", async () => {
+    vi.useFakeTimers();
+    const wrapper = mountDialog();
+    await flushPromises();
+    const beforeEdit = deferred();
+    getLayoutMigrationPreview.mockReturnValueOnce(beforeEdit.promise);
+
+    await wrapper.find(".layout-unfiled input[type=checkbox]").setValue(true);
+    editLevel(wrapper, 0, ["tag"]);
+    await flushPromises();
+    beforeEdit.resolve({ ...WOULD_MOVE, picture_count: 9999 });
+    await flushPromises();
+
+    expect(wrapper.find(".layout-consequence__num").text()).toBe("counting…");
+    expect(wrapper.text()).not.toContain("9,999");
+    expect(buttonWith(wrapper, "Move them now").attributes("disabled")).toBe(
+      "",
+    );
+
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+  });
+
+  it("is not left reading when an edit drops a count and the save is refused", async () => {
+    vi.useFakeTimers();
+    getLayoutMigrationPreview.mockResolvedValueOnce(NOTHING_TO_MOVE);
+    const wrapper = mountDialog();
+    await flushPromises();
+    const dropped = deferred();
+    getLayoutMigrationPreview.mockReturnValueOnce(dropped.promise);
+    setLayoutSettings.mockRejectedValueOnce(new Error("fake-save-refused"));
+
+    await wrapper.find(".layout-unfiled input[type=checkbox]").setValue(true);
+    expect(wrapper.find(".layout-tree__more").text()).toBe(
+      "Reading your folders…",
+    );
+    editLevel(wrapper, 0, ["tag"]);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    dropped.resolve(NOTHING_TO_MOVE);
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("fake-save-refused");
+    expect(wrapper.find(".layout-tree__more").text()).toBe(
+      "No folders to draw.",
+    );
+  });
+
+  it.each([
+    ["waiting out its debounce", false],
+    ["on its way to the server", true],
+  ])(
+    "keeps Move inert after a sweep toggle while the layout save is %s",
+    async (_state, saveSent) => {
+      vi.useFakeTimers();
+      const wrapper = mountDialog();
+      await flushPromises();
+      const saving = deferred();
+      setLayoutSettings.mockReturnValueOnce(saving.promise);
+
+      editLevel(wrapper, 0, ["tag"]);
+      if (saveSent) vi.advanceTimersByTime(1000);
+      await flushPromises();
+      expect(setLayoutSettings).toHaveBeenCalledTimes(saveSent ? 1 : 0);
+
+      // The server still holds the old layout, so a count it gives now is for
+      // that layout, not the one on screen.
+      await wrapper.find(".layout-unfiled input[type=checkbox]").setValue(true);
+      await flushPromises();
+
+      expect(wrapper.find(".layout-consequence__num").text()).toBe("counting…");
+      const move = buttonWith(wrapper, "Move them now");
+      expect(move.attributes("disabled")).toBe("");
+      await move.trigger("click");
+      await flushPromises();
+      expect(runLayoutMigrationPass).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(1000);
+      saving.resolve({ ...WITH_LAYOUT, layout: "tag/person,set" });
+      await flushPromises();
+
+      // Move comes back on a count asked for after the save, with the sweep on
+      // screen.
+      expect(setLayoutSettings).toHaveBeenCalledTimes(1);
+      const counts = getLayoutMigrationPreview.mock;
+      expect(counts.calls.at(-1)).toEqual([{ sweepUnfiled: true }]);
+      expect(counts.invocationCallOrder.at(-1)).toBeGreaterThan(
+        setLayoutSettings.mock.invocationCallOrder[0],
+      );
+      expect(wrapper.find(".layout-consequence__num").text()).toContain(
+        "4,109",
+      );
+      expect(
+        buttonWith(wrapper, "Move them now").attributes("disabled"),
+      ).toBeUndefined();
+    },
+  );
 
   // ---- the consequence bar --------------------------------------------------
 

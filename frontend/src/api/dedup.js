@@ -475,6 +475,8 @@ export async function reopenGroup(signature, { batchId } = {}) {
  * @param {number|string} [options.scopeId]
  * @param {string} [options.batchId] - omit to have the server mint one.
  * @param {number} [options.limit] - cap the groups acted on, for a paged run.
+ * @param {AbortSignal} [options.signal] - cancels the request, so a preview the
+ *   dialog has moved past (closed, or reopened on another scope) stops waiting.
  * @returns {Promise<Object>} the response body:
  *   `{ batch_id, dry_run, groups, pictures, scope, dry_run_summary, results,
  *   failures }`. `dry_run_summary` is present on a dry run only and carries
@@ -494,11 +496,15 @@ export async function autoStackExact({
   scopeId = null,
   batchId,
   limit,
+  signal,
 } = {}) {
   const body = { scope: scopeBody(scopeType, scopeId), dry_run: dryRun };
   if (batchId) body.batch_id = batchId;
   if (Number.isFinite(limit)) body.limit = limit;
-  return unwrap(apiClient.post(dedupUrl("/auto-stack"), body));
+  const url = dedupUrl("/auto-stack");
+  return unwrap(
+    signal ? apiClient.post(url, body, { signal }) : apiClient.post(url, body),
+  );
 }
 
 // ── Mixed stacks (design D5) ────────────────────────────────────────────────

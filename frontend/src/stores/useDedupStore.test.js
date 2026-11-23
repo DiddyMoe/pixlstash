@@ -2878,11 +2878,125 @@ describe("useDedupStore - scans and bulk auto-stack", () => {
   it("previews the auto-stack without writing", async () => {
     autoStackExact.mockResolvedValue({ dry_run: true, groups: 1204 });
     const store = useDedupStore();
-    const preview = await store.previewAutoStack();
+    const result = await store.previewAutoStack();
     expect(autoStackExact).toHaveBeenCalledWith(
-      expect.objectContaining({ dryRun: true }),
+      expect.objectContaining({
+        dryRun: true,
+        scopeType: "global",
+        scopeId: null,
+      }),
     );
-    expect(preview.groups).toBe(1204);
+    expect(result.ok).toBe(true);
+    expect(result.data.groups).toBe(1204);
+  });
+
+  // The dialog freezes the scope when it opens and owns the request's abort,
+  // so both have to reach the wire rather than be re-read from the store.
+  it("previews the scope it is handed, under the caller's abort signal", async () => {
+    servePage([]);
+    autoStackExact.mockResolvedValue({ dry_run: true, groups: 3 });
+    const store = useDedupStore();
+    await store.openQueue({ type: "set", id: 12, label: "Set B" });
+    const controller = new AbortController();
+    await store.previewAutoStack({
+      scope: { scopeType: "project", scopeId: 7 },
+      signal: controller.signal,
+    });
+    expect(autoStackExact).toHaveBeenCalledWith({
+      dryRun: true,
+      scopeType: "project",
+      scopeId: 7,
+      signal: controller.signal,
+    });
+  });
+
+  // A bare null used to stand for every failure, so the dialog could only say
+  // "could not be read". Each case below is one the dialog words differently.
+  it.each([
+    [
+      "a refused body, by its first message and never the echoed input",
+      {
+        response: {
+          status: 422,
+          data: {
+            detail: [
+              {
+                loc: ["body", "dry_run"],
+                msg: "Input should be a valid boolean",
+                type: "bool_parsing",
+                input: "fake-echoed-input",
+              },
+            ],
+          },
+        },
+      },
+      {
+        kind: "validation",
+        status: 422,
+        detail: "Input should be a valid boolean",
+      },
+    ],
+    [
+      "a refused request with the server's own sentence",
+      { response: { status: 400, data: { detail: " fake-bad-scope " } } },
+      { kind: "validation", status: 400, detail: "fake-bad-scope" },
+    ],
+    [
+      "a missing permission",
+      { response: { status: 403, data: { detail: "Not allowed" } } },
+      { kind: "forbidden", status: 403, detail: "Not allowed" },
+    ],
+    [
+      "a lapsed session",
+      { response: { status: 401, data: {} } },
+      { kind: "forbidden", status: 401, detail: "" },
+    ],
+    [
+      "a server fault",
+      { response: { status: 500 } },
+      { kind: "server", status: 500, detail: "" },
+    ],
+    [
+      "the client's timeout",
+      { code: "ECONNABORTED", message: "timeout of 60000ms exceeded" },
+      { kind: "timeout", status: null, detail: "" },
+    ],
+    [
+      "an unreachable server",
+      { code: "ERR_NETWORK", message: "Network Error" },
+      { kind: "network", status: null, detail: "" },
+    ],
+    [
+      "a cancelled request",
+      { code: "ERR_CANCELED", name: "CanceledError" },
+      { kind: "cancelled", status: null, detail: "" },
+    ],
+  ])("says why the preview failed: %s", async (_label, rejection, expected) => {
+    autoStackExact.mockRejectedValue(
+      Object.assign(new Error("fake-failure"), rejection),
+    );
+    const store = useDedupStore();
+    const result = await store.previewAutoStack();
+    expect(result).toEqual({ ok: false, error: expected });
+    expect(JSON.stringify(result)).not.toContain("fake-echoed-input");
+  });
+
+  // The dialog closing is what cancels a preview, so a cancel is not a fault
+  // worth a console line; every other failure is.
+  it("logs a failed preview but not a cancelled one", async () => {
+    const store = useDedupStore();
+    console.warn.mockClear();
+    autoStackExact.mockRejectedValue(
+      Object.assign(new Error("canceled"), { code: "ERR_CANCELED" }),
+    );
+    await store.previewAutoStack();
+    expect(console.warn).not.toHaveBeenCalled();
+    autoStackExact.mockRejectedValue(
+      Object.assign(new Error("fake-failure"), { response: { status: 500 } }),
+    );
+    await store.previewAutoStack();
+    expect(console.warn).toHaveBeenCalledTimes(1);
+    expect(console.warn.mock.calls[0][0]).toContain("global (server 500)");
   });
 
   // The whole run reverses with one Ctrl+Z, so the batch id has to reach the
@@ -2903,6 +3017,23 @@ describe("useDedupStore - scans and bulk auto-stack", () => {
     const store = useDedupStore();
     expect(await store.runAutoStack()).toBe(null);
     expect(store.busy).toBe(false);
+  });
+
+  // The run stacks the scope the user consented to in the dialog, not whatever
+  // the queue was navigated to while the dialog was open.
+  it("runs the scope it was previewed on after the queue moved", async () => {
+    servePage([]);
+    const store = useDedupStore();
+    await store.openQueue({ type: "set", id: 12, label: "Set B" });
+    const previewed = store.currentScope();
+    await store.openQueue({ type: "set", id: 99, label: "Set C" });
+    autoStackExact.mockResolvedValue({ batch_id: "b-1", groups: 2 });
+    await store.runAutoStack({ scope: previewed });
+    expect(autoStackExact).toHaveBeenCalledWith({
+      dryRun: false,
+      scopeType: "set",
+      scopeId: 12,
+    });
   });
 });
 

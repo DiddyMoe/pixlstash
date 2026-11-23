@@ -378,6 +378,19 @@ describe("api/dedup - bulk auto-stack", () => {
       limit: 500,
     });
   });
+
+  // The dialog aborts a preview it has moved past; the signal has to reach the
+  // request or the abort cancels nothing.
+  it("autoStackExact hands an abort signal to the request", async () => {
+    apiClient.post.mockResolvedValue({ data: {} });
+    const controller = new AbortController();
+    await autoStackExact({ signal: controller.signal });
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/dedup/auto-stack",
+      { scope: { scope_type: GLOBAL_SCOPE }, dry_run: true },
+      { signal: controller.signal },
+    );
+  });
 });
 
 describe("api/dedup: the deck expansion's lazy members", () => {

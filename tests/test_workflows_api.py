@@ -18183,6 +18183,44 @@ def test_a_replacement_that_is_not_a_model_file_is_a_422(cloneable):
     assert _clone(cloneable, {_SHELF_FILENAME: "krea2"}).status_code == 422
 
 
+def test_a_refused_clone_is_logged_by_field_name_never_by_the_text_it_sent(
+    workflow_env, caplog
+):
+    """The 422 log line names the fields and error types, not the submitted text.
+
+    The clone body is where a caller's own text reaches a validation error: the
+    swaps validator formats the replacement filename into its message, and a
+    swap whose value is not a string puts the graph filename, a mapping key the
+    caller chose, into the error's location. The response still tells the caller
+    which entry was refused; the server log keeps only the names the route
+    declares and writes ``*`` for anything else.
+    """
+    with caplog.at_level(logging.WARNING, logger="pixlstash.server"):
+        not_a_model = _clone(workflow_env, {"fake-a.safetensors": "fake-name.txt"})
+        not_a_string = _clone(workflow_env, {"fake-key.safetensors": 5})
+
+    assert not_a_model.status_code == 422, not_a_model.text
+    assert not_a_string.status_code == 422, not_a_string.text
+    # The response is unchanged: both values were in the errors to be logged.
+    assert "fake-name.txt" in not_a_model.text
+    assert "fake-key.safetensors" in not_a_string.text
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "pixlstash.server"
+        and record.levelno == logging.WARNING
+        and "Request validation failed" in record.getMessage()
+    ]
+    assert len(lines) == 2, caplog.text
+    assert all(line.startswith("Request validation failed: POST ") for line in lines)
+    assert all(line.split()[4].endswith("/clone-with-models") for line in lines)
+    assert str((("body", "swaps"), "value_error")) in lines[0], lines[0]
+    assert str((("body", "swaps", "*"), "string_type")) in lines[1], lines[1]
+    for value in ("fake-a.safetensors", "fake-name.txt", "fake-key.safetensors"):
+        assert value not in caplog.text
+
+
 def _plans(env, **sets):
     r = env.owner.post(
         f"{API}/workflows/{RUN_WF}/set-clone-plans",
