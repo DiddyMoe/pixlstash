@@ -27,6 +27,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import event
 from sqlmodel import select
 
 from pixlstash.database import DBPriority
@@ -482,6 +483,122 @@ def test_exact_tier_narrows_to_a_scope(server):
     assert len(scoped) == 1
     assert sorted(scoped[0].picture_ids) == sorted(ids[:2])
     assert len(_run(server, tiers.find_exact_groups_in_session, None)) == 2
+
+
+def _group_shapes(groups):
+    return [
+        (group.signature, sorted(group.picture_ids), group.cover_picture_id)
+        for group in groups
+    ]
+
+
+def test_paged_exact_groups_match_the_unpaged_result(server, monkeypatch):
+    """Pages bound one writer slice; they must not change which groups exist.
+
+    The keys come back oldest picture first (the queue serves equal-confidence
+    groups in creation order), a key is never split across pages however large
+    it is, and building page by page gives exactly the groups one build of every
+    key gives.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "pair", "size_bytes": 100},
+            {"pixel_sha": "pair", "size_bytes": 100},
+            {"pixel_sha": "pair", "size_bytes": 200},
+            {"pixel_sha": "pair", "size_bytes": 200},
+            {"pixel_sha": "nosize", "size_bytes": None},
+            {"pixel_sha": "nosize", "size_bytes": None},
+            *({"pixel_sha": "big", "size_bytes": 100} for _ in range(5)),
+            {"pixel_sha": "big", "size_bytes": 100, "deleted": True},
+            {"pixel_sha": "lone", "size_bytes": 100},
+            {"pixel_sha": "lone", "size_bytes": 100, "deleted": True},
+        ],
+    )
+
+    keys = _run(server, tiers.find_exact_keys_in_session, None)
+    # Ordered by each key's lowest picture id, not by hash: alphabetically
+    # "big" would come first and "pair" last.
+    assert keys == [
+        tiers.ExactKey("pair", 100, 2),
+        tiers.ExactKey("pair", 200, 2),
+        tiers.ExactKey("nosize", None, 2),
+        tiers.ExactKey("big", 100, 5),
+    ]
+    unpaged = _run(server, tiers.build_exact_groups_for_keys_in_session, keys, None)
+
+    monkeypatch.setattr(tiers, "EXACT_PAGE_MAX_KEYS", 2)
+    monkeypatch.setattr(tiers, "EXACT_PAGE_MAX_MEMBERS", 4)
+    pages = tiers.page_exact_keys(keys)
+    # The five-member key is over the member bound and gets a page to itself.
+    assert pages == [keys[0:2], keys[2:3], keys[3:4]]
+    paged = [
+        group
+        for page in pages
+        for group in _run(
+            server, tiers.build_exact_groups_for_keys_in_session, page, None
+        )
+    ]
+
+    assert _group_shapes(paged) == _group_shapes(unpaged)
+    assert _group_shapes(
+        _run(server, tiers.find_exact_groups_in_session, None)
+    ) == _group_shapes(unpaged)
+    assert [sorted(group.picture_ids) for group in paged] == [
+        ids[0:2],
+        ids[2:4],
+        ids[4:6],
+        ids[6:11],
+    ]
+
+
+def test_the_exact_member_lookup_is_planned_on_the_pixel_sha_index(server):
+    """The member lookup must stay an index probe, not a read of the live table.
+
+    PixlStash never runs ``ANALYZE``, and without statistics SQLite prefers a
+    ``deleted`` equality to the ``pixel_sha IN (...)`` list, which made every
+    lookup one full pass over the library. The statement is captured as it is
+    executed and explained against the same database.
+    """
+    _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},
+            {"pixel_sha": "aaa", "size_bytes": 100},
+        ],
+    )
+
+    def explain_member_lookup(session):
+        executed = []
+
+        def capture(_conn, _cursor, statement, parameters, _context, _many):
+            if "pixel_sha IN" in statement:
+                executed.append((statement, parameters))
+
+        engine = session.get_bind()
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            groups = tiers.build_exact_groups_for_keys_in_session(
+                session, [("aaa", 100)]
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        plans = [
+            " | ".join(
+                str(row[-1])
+                for row in session.connection()
+                .exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)
+                .all()
+            )
+            for statement, parameters in executed
+        ]
+        return len(groups), plans
+
+    group_count, plans = _run(server, explain_member_lookup)
+    assert group_count == 1
+    assert len(plans) == 1, plans
+    assert "ix_picture_pixel_sha" in plans[0], plans
+    assert "ix_picture_deleted" not in plans[0], plans
 
 
 # ── tier 2: bucketed near ─────────────────────────────────────────────────────
@@ -1330,7 +1447,6 @@ def test_task_runner_shutdown_stops_scan_after_current_slice():
                     "scope_type": "global",
                     "scope_id": None,
                     "total_pictures": 100,
-                    "groups_found": 1,
                 }
             if func.__name__ == "_mark_pending_after_cancel":
                 assert priority == DBPriority.IMMEDIATE
@@ -1395,7 +1511,6 @@ def test_legacy_exact_plus_embedding_scan_has_defined_phase_progress(monkeypatch
                     "scope_type": "global",
                     "scope_id": None,
                     "total_pictures": 1,
-                    "groups_found": 0,
                 }
             if func.__name__ == "_embedding_scope_slice":
                 return None
@@ -1411,6 +1526,11 @@ def test_legacy_exact_plus_embedding_scan_has_defined_phase_progress(monkeypatch
                 }
             raise AssertionError(f"unexpected slice {func.__name__}")
 
+        def run_immediate_read_task(self, func, *args):
+            if func.__name__ in ("_exact_keys_read", "_obsolete_groups_read"):
+                return []
+            raise AssertionError(f"unexpected read {func.__name__}")
+
     task = DedupScanTask(FakeDatabase(), scan_id=1)
     assert task._run_task()["scan_id"] == 1
     assert task.task_progress() == (3, 3)
@@ -1425,7 +1545,6 @@ def test_near_scan_with_no_buckets_keeps_finalisation_remaining():
                     "scope_type": "global",
                     "scope_id": None,
                     "total_pictures": 0,
-                    "groups_found": 0,
                 }
             if func.__name__ == "_prepare_near_slice":
                 return []
@@ -1438,6 +1557,11 @@ def test_near_scan_with_no_buckets_keeps_finalisation_remaining():
                     "groups_found": 0,
                 }
             raise AssertionError(f"unexpected slice {func.__name__}")
+
+        def run_immediate_read_task(self, func, *args):
+            if func.__name__ in ("_exact_keys_read", "_obsolete_groups_read"):
+                return []
+            raise AssertionError(f"unexpected read {func.__name__}")
 
     task = DedupScanTask(FakeDatabase(), scan_id=1)
     task._run_task()
@@ -1637,6 +1761,194 @@ def test_the_upsert_takes_the_stronger_tier_in_either_arrival_order(server):
     rows = _run(server, upsert, weak, strong)
     assert [row.tier for row in rows] == [DedupTier.EXACT.value]
     assert rows[0].confidence == 1.0
+
+
+def _stored_members(session, group_id):
+    return sorted(
+        session.exec(
+            select(tiers.DedupGroupMember.picture_id).where(
+                tiers.DedupGroupMember.group_id == group_id
+            )
+        ).all()
+    )
+
+
+def test_the_set_based_upsert_keeps_every_per_group_rule(server):
+    """One call inserts, refreshes, resolves and applies tier precedence per group.
+
+    The upsert writes whole sets of rows at once; each group must still end up
+    exactly as the one-row-at-a-time upsert left it.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "new", "size_bytes": 100},
+            {"pixel_sha": "new", "size_bytes": 100},
+            {"pixel_sha": "moved", "size_bytes": 100},
+            {"pixel_sha": "moved", "size_bytes": 100},
+            {"pixel_sha": "moved", "size_bytes": 100},
+            {"pixel_sha": "decided", "size_bytes": 100},
+            {"pixel_sha": "decided", "size_bytes": 100},
+            {"pixel_sha": "strong", "size_bytes": 100},
+            {"pixel_sha": "strong", "size_bytes": 100},
+            {"pixel_sha": "twice", "size_bytes": 100},
+            {"pixel_sha": "twice", "size_bytes": 100},
+        ],
+    )
+    exact, near = (DedupTier.EXACT, 1.0), (DedupTier.NEAR, 0.93)
+
+    def build(session, specs):
+        groups = []
+        for (tier, confidence), picture_ids in specs:
+            members = tiers.load_candidates(session, picture_ids)
+            groups.append(
+                tiers.assemble_group(
+                    tier, confidence, [members[pid] for pid in picture_ids]
+                )
+            )
+        return groups
+
+    def prior(session):
+        groups = build(session, [(exact, ids[2:4]), (exact, ids[7:9])])
+        tiers.persist_groups_in_session(session, groups)
+        return {
+            group.signature: session.exec(
+                select(DedupGroup.id).where(DedupGroup.signature == group.signature)
+            ).one()
+            for group in groups
+        }
+
+    prior_ids = _run(server, prior)
+
+    def decide(session):
+        signature = build(session, [(exact, ids[5:7])])[0].signature
+        session.add(
+            DedupVerdict(
+                signature=signature,
+                verdict=VERDICT_KEEP_SEPARATE,
+                picture_ids="[]",
+                excluded_picture_ids="[]",
+            )
+        )
+        session.commit()
+
+    _run(server, decide)
+
+    def upsert(session, specs):
+        groups = build(session, specs)
+        unresolved = tiers.persist_groups_in_session(session, groups, 42)
+        return unresolved, [group.signature for group in groups]
+
+    unresolved, (new, moved, decided, strong) = _run(
+        server,
+        upsert,
+        [
+            (exact, ids[0:2]),
+            # Same content keys as the stored group, so the same signature: the
+            # row is refreshed in place with today's member ids.
+            (exact, [ids[2], ids[4]]),
+            (exact, ids[5:7]),
+            (near, ids[7:9]),
+        ],
+    )
+    assert unresolved == 3
+    # One signature twice in one call: the later, weaker occurrence must not
+    # undo the earlier, stronger one.
+    _unresolved, (twice, _twice_again) = _run(
+        server, upsert, [(exact, ids[9:11]), (near, ids[9:11])]
+    )
+
+    def stored(session):
+        rows = {row.signature: row for row in session.exec(select(DedupGroup)).all()}
+        return rows, {
+            signature: _stored_members(session, row.id)
+            for signature, row in rows.items()
+        }
+
+    rows, members = _run(server, stored)
+    assert len(rows) == 5
+    assert rows[decided].resolved is True
+    assert not any(rows[sig].resolved for sig in (new, moved, strong, twice))
+    assert all(row.scan_id == 42 for row in rows.values())
+
+    assert rows[new].created_at is not None
+    assert rows[new].member_count == 2
+    assert members[new] == ids[0:2]
+
+    assert rows[moved].id == prior_ids[moved]
+    assert rows[moved].member_count == 2
+    assert members[moved] == [ids[2], ids[4]]
+
+    assert rows[strong].id == prior_ids[strong]
+    assert (rows[strong].tier, rows[strong].confidence) == ("exact", 1.0)
+    assert (rows[twice].tier, rows[twice].confidence) == ("exact", 1.0)
+    assert members[twice] == ids[9:11]
+
+
+def test_prune_keeps_exactly_the_groups_with_two_live_members(server):
+    """A group survives a prune only while two of its members are live.
+
+    Member rows of a pruned group go with it through their cascading key.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "a", "size_bytes": 100},
+            {"pixel_sha": "b", "size_bytes": 100, "deleted": True},
+            {"pixel_sha": "c", "size_bytes": 100},
+            {"pixel_sha": "d", "size_bytes": 100},
+            {"pixel_sha": "e", "size_bytes": 100},
+            {"pixel_sha": "f", "size_bytes": 100},
+            {"pixel_sha": "g", "size_bytes": 100, "deleted": True},
+        ],
+    )
+    layout = {
+        "no-members": [],
+        "one-live": [ids[0], ids[1]],
+        "two-live": [ids[2], ids[3]],
+        "two-of-three-live": [ids[4], ids[5], ids[6]],
+    }
+
+    def seed_groups(session):
+        for signature, picture_ids in layout.items():
+            group = DedupGroup(
+                signature=signature,
+                tier="exact",
+                confidence=1.0,
+                member_count=len(picture_ids),
+            )
+            session.add(group)
+            session.flush()
+            for position, picture_id in enumerate(picture_ids):
+                session.add(
+                    tiers.DedupGroupMember(
+                        group_id=int(group.id),
+                        picture_id=picture_id,
+                        position=position,
+                    )
+                )
+        session.commit()
+
+    _run(server, seed_groups)
+    assert _run(server, tiers.prune_stale_groups_in_session) == 2
+
+    def survivors(session):
+        rows = session.exec(select(DedupGroup)).all()
+        member_group_ids = set(
+            session.exec(select(tiers.DedupGroupMember.group_id)).all()
+        )
+        return (
+            {row.signature: _stored_members(session, row.id) for row in rows},
+            member_group_ids == {row.id for row in rows},
+        )
+
+    remaining, members_match_groups = _run(server, survivors)
+    assert remaining == {
+        "two-live": [ids[2], ids[3]],
+        "two-of-three-live": [ids[4], ids[5], ids[6]],
+    }
+    assert members_match_groups, "a pruned group left member rows behind"
+    assert _run(server, tiers.prune_stale_groups_in_session) == 0
 
 
 # ── keyset cursor ────────────────────────────────────────────────────────────
@@ -2105,7 +2417,7 @@ def test_failed_and_cancelled_rescans_preserve_prior_complete_evidence(
     def fail_exact(_session, _scope):
         raise RuntimeError("forced exact scan failure")
 
-    monkeypatch.setattr(tiers, "find_exact_groups_in_session", fail_exact)
+    monkeypatch.setattr(tiers, "find_exact_keys_in_session", fail_exact)
     with pytest.raises(RuntimeError, match="forced exact scan failure"):
         DedupScanTask(server.vault.db, failed["scan_id"])._run_task()
     progress = _run(server, tiers.scan_progress_in_session, None)
@@ -2238,3 +2550,336 @@ def test_pair_cap_marks_scan_partial_and_preserves_near_evidence(server, monkeyp
         row.tier == "near"
         for row in _run(server, lambda s: s.exec(select(DedupGroup)).all())
     )
+
+
+# ── tier 1 in bounded writer slices ──────────────────────────────────────────
+
+
+def _stored_memberships(server):
+    """Every stored group's member ids, each sorted, in order of lowest member."""
+
+    def read(session):
+        by_group: dict[int, list[int]] = {}
+        for group_id, picture_id in session.exec(
+            select(tiers.DedupGroupMember.group_id, tiers.DedupGroupMember.picture_id)
+        ).all():
+            by_group.setdefault(int(group_id), []).append(int(picture_id))
+        return sorted(sorted(picture_ids) for picture_ids in by_group.values())
+
+    return _run(server, read)
+
+
+def _rehash(server, picture_id, pixel_sha):
+    """Give one picture new content, as a re-import over the same row would."""
+
+    def go(session):
+        picture = session.get(Picture, picture_id)
+        picture.pixel_sha = pixel_sha
+        session.add(picture)
+        session.commit()
+
+    _run(server, go)
+
+
+def test_the_exact_tier_holds_the_writer_one_page_at_a_time(server, monkeypatch):
+    """Tier 1 never holds the database writer for the whole library.
+
+    The start slice only prunes, counts and marks the scan running. The keys are
+    read once on a concurrent reader; then each page is its own writer slice,
+    publishes the running count, and lets an interactive callback queued after
+    it run before the next page.
+    """
+    _seed(
+        server,
+        [{"pixel_sha": f"sha-{index // 2}", "size_bytes": 100} for index in range(14)],
+    )
+    monkeypatch.setattr(tiers, "EXACT_PAGE_MAX_KEYS", 3)
+    scan_id = _run(server, tiers.request_scan_in_session, TierPolicy(), None)["scan_id"]
+    task = DedupScanTask(server.vault.db, scan_id)
+    order: list[str] = []
+    published: list[tuple[int, int]] = []
+    original_persist = tiers.persist_groups_in_session
+
+    def counted_persist(session, groups, scan_id=None):
+        order.append(f"persist:{len(groups)}")
+        return original_persist(session, groups, scan_id)
+
+    monkeypatch.setattr(tiers, "persist_groups_in_session", counted_persist)
+
+    def scan_counts(session):
+        scan = session.get(DedupScan, scan_id)
+        return scan.groups_found, scan.scanned_pictures
+
+    original_low_slice = task._run_low_slice
+    original_read_slice = task._run_read_slice
+
+    def run_low_slice(func, *args):
+        order.append(f"writer:{func.__name__}")
+        result = original_low_slice(func, *args)
+        if func.__name__ == "_persist_exact_page_slice":
+            published.append(_run(server, scan_counts))
+            if len(published) == 1:
+                server.vault.db.submit_task(
+                    lambda _session: order.append("interactive"),
+                    priority=DBPriority.IMMEDIATE,
+                )
+        return result
+
+    def run_read_slice(read, *args):
+        order.append(f"reader:{read.__name__}")
+        return original_read_slice(read, *args)
+
+    monkeypatch.setattr(task, "_run_low_slice", run_low_slice)
+    monkeypatch.setattr(task, "_run_read_slice", run_read_slice)
+    summary = task._run_task()
+
+    assert summary["status"] == "complete"
+    assert summary["groups_found"] == 7
+    assert order[:2] == ["writer:_start_scan_slice", "reader:_exact_keys_read"], order
+    persists = [i for i, item in enumerate(order) if item.startswith("persist:")]
+    assert [order[i] for i in persists] == ["persist:3", "persist:3", "persist:1"]
+    assert persists[0] < order.index("interactive") < persists[1], order
+    # The running count after each page, and the scope counted as seen only
+    # once the last page of an exact-only scan is in.
+    assert published == [(3, 0), (6, 0), (7, 14)]
+    assert order[-2:] == [
+        "reader:_obsolete_groups_read",
+        "writer:_finish_scan_slice",
+    ], order
+    assert len(_stored_memberships(server)) == 7
+
+
+def test_each_exact_page_is_built_from_the_pictures_as_they_are_now(
+    server, monkeypatch
+):
+    """A picture scrapheaped after the keys were read is not stored as a member.
+
+    The keys are read once per scan and each page re-reads its members, so a
+    change in between gives the group as it is now, and the group it replaced
+    is retired with the scan.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "pair", "size_bytes": 100},
+            {"pixel_sha": "pair", "size_bytes": 100},
+            {"pixel_sha": "trio", "size_bytes": 100},
+            {"pixel_sha": "trio", "size_bytes": 100},
+            {"pixel_sha": "trio", "size_bytes": 100},
+        ],
+    )
+    assert _run_requested_scan(server)["status"] == "complete"
+    assert _stored_memberships(server) == [ids[0:2], ids[2:5]]
+    original_page_exact_keys = tiers.page_exact_keys
+
+    def scrapheap_then_page(keys, *args, **kwargs):
+        _soft_delete(server, ids[4])
+        return original_page_exact_keys(keys, *args, **kwargs)
+
+    monkeypatch.setattr(tiers, "page_exact_keys", scrapheap_then_page)
+    second = _run_requested_scan(server)
+
+    assert second["status"] == "complete"
+    assert second["groups_found"] == 2
+    assert second["retired_groups"] == 1
+    assert _stored_memberships(server) == [ids[0:2], ids[2:4]]
+
+
+def test_a_cancel_after_retirements_are_chosen_retires_nothing(server, monkeypatch):
+    """Retirement lands with the terminal status or not at all.
+
+    The obsolete groups are chosen on a reader. A cancel that arrives then
+    must leave the last complete scan's evidence in place and the scan
+    restartable.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "same", "size_bytes": 100},
+            {"pixel_sha": "same", "size_bytes": 100},
+        ],
+    )
+    _run_requested_scan(server)
+    prior = _run(server, lambda s: [row.id for row in s.exec(select(DedupGroup))])
+    assert len(prior) == 1
+    _rehash(server, ids[1], "different")
+
+    progress = _run(server, tiers.request_scan_in_session, TierPolicy(), None)
+    task = DedupScanTask(server.vault.db, progress["scan_id"])
+    chosen: list[int] = []
+    original_choose = tiers.obsolete_scan_group_ids_in_session
+
+    def choose_then_cancel(*args):
+        chosen.extend(original_choose(*args))
+        task.on_cancel()
+        return list(chosen)
+
+    monkeypatch.setattr(tiers, "obsolete_scan_group_ids_in_session", choose_then_cancel)
+    summary = task._run_task()
+
+    assert summary == {
+        "scan_id": progress["scan_id"],
+        "status": SCAN_PENDING,
+        "cancelled": True,
+    }
+    assert chosen == prior
+    assert _run(server, lambda s: [row.id for row in s.exec(select(DedupGroup))]) == (
+        prior
+    )
+    assert _run(server, tiers.scan_progress_in_session, None)["status"] == SCAN_PENDING
+
+
+def test_a_reader_step_honours_a_cancel_on_either_side():
+    """A cancel before a reader step skips it; one during it stops the scan."""
+
+    class FakeDatabase:
+        def run_immediate_read_task(self, func, *args):
+            return func(None, *args)
+
+    task = DedupScanTask(FakeDatabase(), scan_id=1)
+    reads: list[str] = []
+
+    def read(_session, label):
+        reads.append(label)
+        return label
+
+    def cancelling_read(_session, label):
+        reads.append(label)
+        task.on_cancel()
+        return label
+
+    assert task._run_read_slice(read, "before") == "before"
+    with pytest.raises(dedup_scan_task_module._DedupScanCancelled):
+        task._run_read_slice(cancelling_read, "during")
+    with pytest.raises(dedup_scan_task_module._DedupScanCancelled):
+        task._run_read_slice(read, "after")
+    assert reads == ["before", "during"]
+
+
+def test_a_group_another_scan_refreshes_before_the_final_slice_is_kept(
+    server, monkeypatch
+):
+    """Ids chosen on the reader are deleted only while this scan still owns them.
+
+    A sibling or global scan can refresh one of them between the read and the
+    final writer slice; from then on the group is that scan's evidence.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "same", "size_bytes": 100},
+            {"pixel_sha": "same", "size_bytes": 100},
+        ],
+    )
+    _run_requested_scan(server)
+    _rehash(server, ids[1], "different")
+
+    def add_other_scan(session):
+        scan = DedupScan(scope_key="set:99", scope_type="set", scope_id="99")
+        session.add(scan)
+        session.commit()
+        return int(scan.id)
+
+    other_scan_id = _run(server, add_other_scan)
+
+    def hand_over(session, group_ids):
+        for group_id in group_ids:
+            group = session.get(DedupGroup, group_id)
+            group.scan_id = other_scan_id
+            session.add(group)
+        session.commit()
+
+    progress = _run(server, tiers.request_scan_in_session, TierPolicy(), None)
+    task = DedupScanTask(server.vault.db, progress["scan_id"])
+    handed: list[int] = []
+    original_read_slice = task._run_read_slice
+
+    def run_read_slice(read, *args):
+        result = original_read_slice(read, *args)
+        if read.__name__ == "_obsolete_groups_read":
+            handed.extend(result)
+            _run(server, hand_over, result)
+        return result
+
+    monkeypatch.setattr(task, "_run_read_slice", run_read_slice)
+    summary = task._run_task()
+
+    assert len(handed) == 1
+    assert summary["status"] == "complete"
+    assert summary["retired_groups"] == 0
+    assert _run(
+        server, lambda s: [(row.id, row.scan_id) for row in s.exec(select(DedupGroup))]
+    ) == [(handed[0], other_scan_id)]
+
+
+def test_a_scan_counts_the_live_pictures_in_its_scope(server):
+    ids = _seed(
+        server,
+        [
+            {},
+            {},
+            {},
+            {"deleted": True},
+            {},
+            {},
+        ],
+    )
+
+    def add_set(session):
+        picture_set = PictureSet(name="Counted")
+        session.add(picture_set)
+        session.commit()
+        session.refresh(picture_set)
+        for picture_id in ids[1:5]:
+            session.add(
+                PictureSetMember(set_id=int(picture_set.id), picture_id=picture_id)
+            )
+        session.commit()
+        return int(picture_set.id)
+
+    scope = DedupScope(scope_type=ScopeType.SET, scope_id=str(_run(server, add_set)))
+
+    assert _run(server, DedupScanTask._count_live_pictures, scope) == 3
+    assert _run(server, DedupScanTask._count_live_pictures, DedupScope()) == 5
+    scan_id = _run(server, tiers.request_scan_in_session, TierPolicy(), scope)[
+        "scan_id"
+    ]
+    assert _run(server, DedupScanTask._start_scan_slice, scan_id)["total_pictures"] == 3
+
+
+def test_the_synchronous_scan_pages_tier_one_and_retires_what_it_lost(
+    server, monkeypatch
+):
+    """``run_scan_in_session``, the end-to-end fixture's path, does the same work."""
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "pair", "size_bytes": 100},
+            {"pixel_sha": "pair", "size_bytes": 100},
+            {"pixel_sha": "trio", "size_bytes": 100},
+            {"pixel_sha": "trio", "size_bytes": 100},
+            {"pixel_sha": "trio", "size_bytes": 100},
+        ],
+    )
+    monkeypatch.setattr(tiers, "EXACT_PAGE_MAX_KEYS", 1)
+
+    def scan(session):
+        progress = tiers.request_scan_in_session(session, TierPolicy(), None)
+        return DedupScanTask.run_scan_in_session(session, progress["scan_id"])
+
+    first = _run(server, scan)
+    assert (first["status"], first["total_pictures"], first["groups_found"]) == (
+        "complete",
+        5,
+        2,
+    )
+    assert _stored_memberships(server) == [ids[0:2], ids[2:5]]
+
+    _rehash(server, ids[1], "different")
+    second = _run(server, scan)
+    assert (second["status"], second["groups_found"], second["retired_groups"]) == (
+        "complete",
+        1,
+        1,
+    )
+    assert _stored_memberships(server) == [ids[2:5]]

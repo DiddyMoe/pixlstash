@@ -18,12 +18,14 @@ share a ``pixel_sha`` while differing in an unsampled region.
 
 That is why tier 1 groups on ``(pixel_sha, size_bytes)`` rather than
 ``pixel_sha`` alone: the sample offsets are derived from the file size, so equal
-size plus equal sampled digest is a far stronger claim than the digest alone,
-and the extra column costs nothing (the ``pixel_sha`` index already narrows the
-group). It is still not a cryptographic identity proof, which is exactly why the
-design routes exact matches through a bulk auto-stack **dialog** with a dry-run
-count rather than stacking them at import without consent, and why no tier ever
-deletes anything.
+size plus equal sampled digest is a far stronger claim than the digest alone.
+Finding the duplicated keys is not an index lookup, though: no index covers the
+live ``(pixel_sha, size_bytes)`` key, so the aggregate reads every live picture
+row once (see :func:`find_exact_keys_in_session` for how the scan keeps that
+read off the database writer). Tier 1 is still not a cryptographic identity
+proof, which is exactly why the design routes exact matches through a bulk
+auto-stack **dialog** with a dry-run count rather than stacking them at import
+without consent, and why no tier ever deletes anything.
 
 A new full-file hash column was considered and rejected: it would mean re-reading
 every byte of every file in the library on upgrade to buy a guarantee the feature
@@ -87,10 +89,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, NamedTuple, Optional
 
 import numpy as np
-from sqlalchemy import case, func
+from sqlalchemy import case, delete, func, update
 from sqlmodel import Session, select
 
 from pixlstash.db_models import Picture, PictureStack
@@ -184,6 +186,22 @@ the same picture the grid shows as the stack's leader. A stack whose positions
 have been normalised has its leader at position 0, which is the design's
 statement of the rule; this constant is what makes the answer honest for a stack
 that has not been normalised yet."""
+
+EXACT_PAGE_MAX_KEYS = 500
+"""Most duplicated keys one tier-1 writer slice builds and persists.
+
+The background scan discovers every duplicated ``(pixel_sha, size_bytes)`` key
+in one read off the writer, then builds and persists the groups page by page,
+each page in its own short writer slice so imports and edits interleave with a
+large scan. See :func:`page_exact_keys`."""
+
+EXACT_PAGE_MAX_MEMBERS = 5000
+"""Most member pictures one tier-1 writer slice builds and persists.
+
+A key is never split across pages (one key is one complete group), so a single
+key with more members than this gets a page of its own. This bounds the live
+members a slice builds, not the rows its member read returns: see
+:func:`page_exact_keys`."""
 
 MAX_BUCKET_MEMBERS = 4000
 """Cap on one tier-2 bucket. The within-bucket comparison is O(k^2) popcounts,
@@ -1395,50 +1413,139 @@ def assemble_group(
 # --- Tier 1: exact ----------------------------------------------------------
 
 
-def find_exact_groups_in_session(
+class ExactKey(NamedTuple):
+    """One duplicated tier-1 key and how many live pictures shared it.
+
+    ``member_count`` is the count when the key was discovered. It only sizes the
+    pages (:func:`page_exact_keys`); the page re-reads the members, so a picture
+    imported or scrapheaped since discovery is seen.
+    """
+
+    pixel_sha: str
+    size_bytes: Optional[int]
+    member_count: int
+
+
+def find_exact_keys_in_session(
     session: Session, scope: Optional[DedupScope] = None
-) -> list[DetectedGroup]:
-    """Tier 1. ``GROUP BY pixel_sha, size_bytes HAVING count(*) > 1``.
+) -> list[ExactKey]:
+    """Tier-1 discovery: ``GROUP BY pixel_sha, size_bytes HAVING count(*) > 1``.
 
-    Two indexed-column queries: one aggregate to find the duplicated hashes, one
-    to pull the member ids for exactly those hashes. No image is decoded, no
-    model runs, and the whole tier is milliseconds on a library-sized table
-    because ``picture.pixel_sha`` is indexed.
+    No index covers the live ``(pixel_sha, size_bytes)`` key, so this reads every
+    live picture row in *scope* once (SQLite walks ``ix_picture_deleted`` and
+    groups through a temporary B-tree). That is why the background scan runs it
+    exactly once per scan, on a concurrent WAL reader rather than the database
+    writer (:meth:`~pixlstash.database.VaultDatabase.run_immediate_read_task`).
+    Paging this aggregate by key would not make it cheaper: every page would
+    re-read the whole table.
 
-    See the module docstring for why ``size_bytes`` is a co-key.
+    The keys come back ordered by the lowest picture id that carries each, so new
+    exact groups are created, and queued at equal confidence, oldest picture
+    first, whatever plan SQLite picks. The result is one small tuple per
+    duplicated key; the members are read per page by
+    :func:`build_exact_groups_for_keys_in_session`.
     """
     scope = scope or DedupScope()
     predicate = scope.picture_predicate()
-
     duplicated = (
-        select(Picture.pixel_sha, Picture.size_bytes)
+        select(Picture.pixel_sha, Picture.size_bytes, func.count(Picture.id))
         .where(
             Picture.pixel_sha.is_not(None),
             Picture.deleted.is_(False),
         )
         .group_by(Picture.pixel_sha, Picture.size_bytes)
         .having(func.count(Picture.id) > 1)
+        .order_by(func.min(Picture.id))
     )
     if predicate is not None:
         duplicated = duplicated.where(predicate)
-    keys = [(row[0], row[1]) for row in session.exec(duplicated).all()]
-    if not keys:
+    return [
+        ExactKey(str(sha), size_bytes, int(count))
+        for sha, size_bytes, count in session.exec(duplicated).all()
+    ]
+
+
+def page_exact_keys(
+    keys: Iterable[ExactKey],
+    max_keys: Optional[int] = None,
+    max_members: Optional[int] = None,
+) -> list[list[ExactKey]]:
+    """Split *keys* into pages for one writer slice each, keeping their order.
+
+    A page holds at most *max_keys* keys and *max_members* members (defaults
+    :data:`EXACT_PAGE_MAX_KEYS` and :data:`EXACT_PAGE_MAX_MEMBERS`, read at call
+    time). A key is never split: its members are one complete group, and part of
+    a group would be persisted under a different signature. A key with more
+    members than the bound is therefore a page on its own. Paging bounds the
+    keys and the live members of a slice, not the rows its member read
+    returns: that read also returns every scrapheaped copy, and every other
+    file size, of the page's hashes.
+    """
+    key_limit = max(1, int(EXACT_PAGE_MAX_KEYS if max_keys is None else max_keys))
+    member_limit = max(
+        1, int(EXACT_PAGE_MAX_MEMBERS if max_members is None else max_members)
+    )
+    pages: list[list[ExactKey]] = []
+    page: list[ExactKey] = []
+    page_members = 0
+    for key in keys:
+        count = max(0, int(key.member_count))
+        if page and (len(page) >= key_limit or page_members + count > member_limit):
+            pages.append(page)
+            page = []
+            page_members = 0
+        page.append(key)
+        page_members += count
+    if page:
+        pages.append(page)
+    return pages
+
+
+def build_exact_groups_for_keys_in_session(
+    session: Session,
+    keys: Iterable[tuple[str, Optional[int]]],
+    scope: Optional[DedupScope] = None,
+) -> list[DetectedGroup]:
+    """Build the tier-1 groups for *keys* from the pictures as they are now.
+
+    *keys* is one page of :func:`find_exact_keys_in_session` (an
+    :class:`ExactKey` or a plain ``(pixel_sha, size_bytes)`` pair). The members
+    are re-read here rather than carried over from discovery, so a picture
+    imported, scrapheaped or rehashed in between is seen, and a key that no
+    longer has two live members produces no group. Groups come back in the order
+    of *keys*; each key's members are kept whole (see :func:`page_exact_keys`).
+    """
+    scope = scope or DedupScope()
+    predicate = scope.picture_predicate()
+    by_key: dict[tuple[str, Optional[int]], list[int]] = {}
+    for key in keys:
+        by_key.setdefault((str(key[0]), key[1]), [])
+    if not by_key:
         return []
 
-    shas = sorted({key[0] for key in keys})
-    wanted = set(keys)
-    by_key: dict[tuple[Optional[str], Optional[int]], list[int]] = defaultdict(list)
+    shas = sorted({sha for sha, _size in by_key})
     for start in range(0, len(shas), ID_CHUNK):
         chunk = shas[start : start + ID_CHUNK]
-        member_query = select(Picture.id, Picture.pixel_sha, Picture.size_bytes).where(
-            Picture.pixel_sha.in_(chunk), Picture.deleted.is_(False)
-        )
+        # ``deleted`` is selected and filtered in Python, never put in the WHERE.
+        # PixlStash never runs ``ANALYZE`` (the index rule in
+        # docs/backend_architecture.md), and without ``sqlite_stat1`` SQLite
+        # prefers the ``deleted=?`` equality on ``ix_picture_deleted`` to this
+        # ``IN`` list: one full read of the live table per chunk, which made the
+        # lookup quadratic in library size. With ``pixel_sha IN (...)`` as the
+        # only indexed term the plan is ``ix_picture_pixel_sha``; the price is
+        # reading every scrapheaped copy, and every other file size, of the
+        # page's hashes, dropped here.
+        member_query = select(
+            Picture.id, Picture.pixel_sha, Picture.size_bytes, Picture.deleted
+        ).where(Picture.pixel_sha.in_(chunk))
         if predicate is not None:
             member_query = member_query.where(predicate)
-        for picture_id, sha, size_bytes in session.exec(member_query).all():
-            key = (sha, size_bytes)
-            if key in wanted:
-                by_key[key].append(int(picture_id))
+        for picture_id, sha, size_bytes, deleted in session.exec(member_query).all():
+            if deleted:
+                continue
+            ids = by_key.get((sha, size_bytes))
+            if ids is not None:
+                ids.append(int(picture_id))
 
     member_ids = [ids for ids in by_key.values() if len(ids) > 1]
     candidates = load_candidates(session, [pid for ids in member_ids for pid in ids])
@@ -1448,6 +1555,30 @@ def find_exact_groups_in_session(
         if len(members) < 2:
             continue
         groups.append(assemble_group(DedupTier.EXACT, 1.0, members))
+    return groups
+
+
+def find_exact_groups_in_session(
+    session: Session, scope: Optional[DedupScope] = None
+) -> list[DetectedGroup]:
+    """Tier 1 in one session: every exact group in *scope*.
+
+    :func:`find_exact_keys_in_session`, then
+    :func:`build_exact_groups_for_keys_in_session` for each
+    :func:`page_exact_keys` page. The background scan
+    (:class:`~pixlstash.tasks.dedup_scan_task.DedupScanTask`) runs the same steps
+    split across a reader and one short writer slice per page; this form is for
+    callers that hold a single session anyway. No image is decoded and no model
+    runs, but the key discovery reads every live picture row in the scope, so it
+    is not a cheap call on a large library.
+
+    See the module docstring for why ``size_bytes`` is a co-key.
+    """
+    scope = scope or DedupScope()
+    keys = find_exact_keys_in_session(session, scope)
+    groups: list[DetectedGroup] = []
+    for page in page_exact_keys(keys):
+        groups.extend(build_exact_groups_for_keys_in_session(session, page, scope))
     logger.info(
         "[dedup-tier1] scope=%s produced %d exact group(s) from %d hash key(s)",
         scope.key,
@@ -1869,33 +2000,59 @@ def persist_groups_in_session(
     files produce the same signature, so the row is refreshed in place and the
     queue does not grow duplicates of its own. A group whose signature already
     carries a live verdict is stored ``resolved=True`` and never re-asked.
+
+    The writes are set-based: one lookup per chunk of signatures, one
+    multi-row insert for new groups, one update by primary key for refreshed
+    ones, and one delete and one insert for their members. A per-group ORM
+    round trip cost about a millisecond a group, which on a library with a
+    hundred thousand exact groups held the database writer for minutes. These
+    statements bypass the session's identity map, so a caller must not rely on
+    a ``DedupGroup`` it loaded before the call for a touched row; the commit
+    here expires it, and the next attribute access reloads it.
     """
     if not groups:
         return 0
     resolved_signatures = verdict_signatures_in_session(
         session, (group.signature for group in groups)
     )
+
+    signatures = sorted({group.signature for group in groups})
+    group_ids: dict[str, int] = {}
+    stored_tiers: dict[str, str] = {}
+    for start in range(0, len(signatures), ID_CHUNK):
+        chunk = signatures[start : start + ID_CHUNK]
+        for group_id, signature, tier in session.exec(
+            select(DedupGroup.id, DedupGroup.signature, DedupGroup.tier).where(
+                DedupGroup.signature.in_(chunk)
+            )
+        ).all():
+            group_ids[str(signature)] = int(group_id)
+            stored_tiers[str(signature)] = str(tier)
+
+    # Fold the groups in order, exactly as the one-at-a-time upsert applied
+    # them: the first occurrence of a new signature creates the row, every later
+    # occurrence (or a stored row) is refreshed under tier precedence, and the
+    # last occurrence's members are the ones kept.
+    rows: dict[str, dict[str, Any]] = {}
+    members: dict[str, list[int]] = {}
     unresolved = 0
     for group in groups:
-        existing = session.exec(
-            select(DedupGroup).where(DedupGroup.signature == group.signature)
-        ).first()
         resolved = group.signature in resolved_signatures
-        if existing is None:
-            row = DedupGroup(
-                signature=group.signature,
-                tier=group.tier.value,
-                confidence=group.confidence,
-                member_count=len(group.members),
-                cover_picture_id=group.cover_picture_id,
-                evidence=json.dumps(group.evidence),
-                resolved=resolved,
-                scan_id=scan_id,
-            )
-            session.add(row)
-            session.flush()
+        row = rows.get(group.signature)
+        if row is None and group.signature not in group_ids:
+            row = rows[group.signature] = {
+                "signature": group.signature,
+                "tier": group.tier.value,
+                "confidence": group.confidence,
+                "cover_picture_id": group.cover_picture_id,
+                "evidence": json.dumps(group.evidence),
+            }
         else:
-            row = existing
+            if row is None:
+                row = rows[group.signature] = {
+                    "id": group_ids[group.signature],
+                    "tier": stored_tiers[group.signature],
+                }
             # Tier precedence: a stronger tier is never downgraded by a weaker
             # one rediscovering the same signature. Exact pairs are perceptually
             # identical too, so a near-enabled rescan finds every one of them
@@ -1904,39 +2061,65 @@ def persist_groups_in_session(
             # Tier, confidence and evidence describe the *same* finding, so they
             # move together - mixing a stored exact tier with a near
             # confidence would misreport both.
-            if tier_strength(group.tier.value) >= tier_strength(row.tier):
-                row.tier = group.tier.value
-                row.confidence = group.confidence
-                row.evidence = json.dumps(group.evidence)
-                row.cover_picture_id = group.cover_picture_id
+            if tier_strength(group.tier.value) >= tier_strength(row["tier"]):
+                row["tier"] = group.tier.value
+                row["confidence"] = group.confidence
+                row["evidence"] = json.dumps(group.evidence)
+                row["cover_picture_id"] = group.cover_picture_id
             else:
                 logger.debug(
                     "[dedup] keeping tier %s for signature %s; %s rediscovered "
                     "the same group with weaker evidence",
-                    row.tier,
+                    row["tier"],
                     group.signature,
                     group.tier.value,
                 )
-            # Membership is pinned by the signature (it hashes the sorted member
-            # content keys), so it is refreshed either way: a re-import can give
-            # the same content new picture ids.
-            row.member_count = len(group.members)
-            row.resolved = resolved
-            row.scan_id = scan_id
-            session.add(row)
-            session.exec(
-                DedupGroupMember.__table__.delete().where(
-                    DedupGroupMember.__table__.c.group_id == row.id
-                )
-            )
-        for position, member in enumerate(group.members):
-            session.add(
-                DedupGroupMember(
-                    group_id=int(row.id), picture_id=member.id, position=position
-                )
-            )
+        # Membership is pinned by the signature (it hashes the sorted member
+        # content keys), so it is refreshed either way: a re-import can give
+        # the same content new picture ids.
+        row["member_count"] = len(group.members)
+        row["resolved"] = resolved
+        row["scan_id"] = scan_id
+        members[group.signature] = [member.id for member in group.members]
         if not resolved:
             unresolved += 1
+
+    created_at = datetime.now(timezone.utc)
+    new_rows = [
+        {**row, "created_at": created_at} for row in rows.values() if "id" not in row
+    ]
+    if new_rows:
+        session.execute(DedupGroup.__table__.insert(), new_rows)
+        new_signatures = sorted(row["signature"] for row in new_rows)
+        for start in range(0, len(new_signatures), ID_CHUNK):
+            chunk = new_signatures[start : start + ID_CHUNK]
+            for group_id, signature in session.exec(
+                select(DedupGroup.id, DedupGroup.signature).where(
+                    DedupGroup.signature.in_(chunk)
+                )
+            ).all():
+                group_ids[str(signature)] = int(group_id)
+
+    refreshed = [row for row in rows.values() if "id" in row]
+    if refreshed:
+        session.execute(update(DedupGroup), refreshed)
+        refreshed_ids = sorted(int(row["id"]) for row in refreshed)
+        for start in range(0, len(refreshed_ids), ID_CHUNK):
+            session.execute(
+                DedupGroupMember.__table__.delete().where(
+                    DedupGroupMember.__table__.c.group_id.in_(
+                        refreshed_ids[start : start + ID_CHUNK]
+                    )
+                )
+            )
+
+    member_rows = [
+        {"group_id": group_ids[signature], "picture_id": picture_id, "position": index}
+        for signature, picture_ids in members.items()
+        for index, picture_id in enumerate(picture_ids)
+    ]
+    if member_rows:
+        session.execute(DedupGroupMember.__table__.insert(), member_rows)
     session.commit()
     return unresolved
 
@@ -1947,24 +2130,103 @@ def prune_stale_groups_in_session(session: Session) -> int:
     Called after any verdict and at the start of a rescan. Without it a group
     whose members were soft-deleted would keep inflating the sidebar badge, and
     the badge is the whole reason the verdict memory exists.
+
+    One set-based ``DELETE``: a group survives only if at least two of its
+    members are live pictures, so a group with no member rows at all goes too.
+    Member rows follow through their ``ON DELETE CASCADE`` key. Loading every
+    group to test it in Python cost a read of every row's evidence JSON per
+    call, and the auto-stack loop calls this once per batch.
     """
-    live_counts = dict(
-        session.exec(
-            select(DedupGroupMember.group_id, func.count(DedupGroupMember.picture_id))
-            .join(Picture, Picture.id == DedupGroupMember.picture_id)
-            .where(Picture.deleted.is_(False))
-            .group_by(DedupGroupMember.group_id)
-        ).all()
+    live_groups = (
+        select(DedupGroupMember.group_id)
+        .join(Picture, Picture.id == DedupGroupMember.picture_id)
+        .where(Picture.deleted.is_(False))
+        .group_by(DedupGroupMember.group_id)
+        .having(func.count(DedupGroupMember.picture_id) >= 2)
     )
-    removed = 0
-    for row in session.exec(select(DedupGroup)).all():
-        if live_counts.get(int(row.id), 0) >= 2:
-            continue
-        session.delete(row)
-        removed += 1
+    # ORM-enabled so pending changes are flushed first, as the row-by-row
+    # version's SELECT did; nothing is synchronised because the rows are gone.
+    removed = int(
+        session.execute(
+            delete(DedupGroup)
+            .where(DedupGroup.id.not_in(live_groups))
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        or 0
+    )
     if removed:
         session.commit()
         logger.info("[dedup] pruned %d stale group(s)", removed)
+    return removed
+
+
+def obsolete_scan_group_ids_in_session(
+    session: Session,
+    scan_id: int,
+    signatures_by_tier: dict[str, set[str]],
+    complete_tiers: Iterable[str],
+) -> list[int]:
+    """Return the ids of groups one completed scan generation no longer found.
+
+    A group is obsolete when this scan was the last to produce it
+    (``DedupGroup.scan_id``), its tier ran to completion, and its signature is
+    not in that tier's set from this run. Only ``(id, tier, signature)`` is
+    read, never the evidence, so the background scan can run this on a
+    concurrent reader and leave the deletion to its final writer slice
+    (:func:`delete_scan_groups_in_session`).
+    """
+    completed = {str(tier) for tier in complete_tiers}
+    if not completed:
+        return []
+    current = {
+        tier: {str(signature) for signature in signatures_by_tier.get(tier, set())}
+        for tier in completed
+    }
+    rows = session.exec(
+        select(DedupGroup.id, DedupGroup.tier, DedupGroup.signature).where(
+            DedupGroup.scan_id == int(scan_id),
+            DedupGroup.tier.in_(sorted(completed)),
+        )
+    ).all()
+    return [
+        int(group_id)
+        for group_id, tier, signature in rows
+        if signature not in current.get(tier, set())
+    ]
+
+
+def delete_scan_groups_in_session(
+    session: Session, scan_id: int, group_ids: Iterable[int]
+) -> int:
+    """Delete *group_ids* that scan *scan_id* still owns; return how many went.
+
+    The ``scan_id`` guard is what makes it safe to choose the ids on a reader
+    and delete them later on the writer: a global or sibling scoped scan that
+    refreshed one of these rows in between now owns it, and it is kept. Member
+    rows follow through their ``ON DELETE CASCADE`` key. Left uncommitted so
+    the caller commits it atomically with the terminal scan status.
+    """
+    wanted = sorted({int(group_id) for group_id in group_ids})
+    removed = 0
+    for start in range(0, len(wanted), ID_CHUNK):
+        removed += int(
+            session.execute(
+                delete(DedupGroup)
+                .where(
+                    DedupGroup.id.in_(wanted[start : start + ID_CHUNK]),
+                    DedupGroup.scan_id == int(scan_id),
+                )
+                .execution_options(synchronize_session=False)
+            ).rowcount
+            or 0
+        )
+    if len(wanted) > removed:
+        logger.info(
+            "[dedup-scan] %d group(s) scan %s chose to retire were already gone "
+            "or now belong to another scan; left as they are",
+            len(wanted) - removed,
+            scan_id,
+        )
     return removed
 
 
@@ -1984,35 +2246,24 @@ def retire_obsolete_scan_groups_in_session(
     here. Failed/cancelled tasks never call this function, and partial tiers are
     omitted from ``complete_tiers`` so their prior complete evidence survives.
 
-    Deletions are left uncommitted so the caller can commit them atomically with
-    the terminal scan status.
+    This is :func:`obsolete_scan_group_ids_in_session` followed by
+    :func:`delete_scan_groups_in_session` in one session; the background scan
+    runs the two halves on a reader and in its final writer slice. Deletions
+    are left uncommitted so the caller can commit them atomically with the
+    terminal scan status.
     """
-    completed = {str(tier) for tier in complete_tiers}
-    if not completed:
-        return 0
-    current = {
-        tier: {str(signature) for signature in signatures_by_tier.get(tier, set())}
-        for tier in completed
-    }
-    rows = session.exec(
-        select(DedupGroup).where(
-            DedupGroup.scan_id == int(scan_id),
-            DedupGroup.tier.in_(sorted(completed)),
-        )
-    ).all()
-    removed = 0
-    for row in rows:
-        if row.signature in current.get(row.tier, set()):
-            continue
-        session.delete(row)
-        removed += 1
+    completed = sorted({str(tier) for tier in complete_tiers})
+    obsolete = obsolete_scan_group_ids_in_session(
+        session, scan_id, signatures_by_tier, completed
+    )
+    removed = delete_scan_groups_in_session(session, scan_id, obsolete)
     if removed:
         logger.info(
             "[dedup-scan] retiring %d obsolete group(s) from scan %s across "
             "complete tiers %s",
             removed,
             scan_id,
-            sorted(completed),
+            completed,
         )
     return removed
 
@@ -3132,6 +3383,8 @@ __all__ = [
     "DEFAULT_PAGE_SIZE",
     "DEFAULT_STACK_MEMBER_PAGE_SIZE",
     "DEFAULT_THRESHOLD",
+    "EXACT_PAGE_MAX_KEYS",
+    "EXACT_PAGE_MAX_MEMBERS",
     "MAX_BUCKET_MEMBERS",
     "MAX_PAGE_SIZE",
     "MAX_STACK_MEMBER_PAGE_SIZE",
@@ -3151,12 +3404,14 @@ __all__ = [
     "DedupTier",
     "DedupVerdictKind",
     "DetectedGroup",
+    "ExactKey",
     "NearBucket",
     "ScopeType",
     "StackFacts",
     "TierPolicy",
     "assemble_group",
     "build_candidate_evidence",
+    "build_exact_groups_for_keys_in_session",
     "build_group_evidence",
     "build_group_stacks",
     "build_near_buckets",
@@ -3167,9 +3422,11 @@ __all__ = [
     "counts_response",
     "cover_order_key",
     "decode_queue_cursor",
+    "delete_scan_groups_in_session",
     "encode_queue_cursor",
     "find_embedding_groups_in_session",
     "find_exact_groups_in_session",
+    "find_exact_keys_in_session",
     "find_near_groups_in_session",
     "group_signature",
     "groups_from_pairs",
@@ -3177,6 +3434,8 @@ __all__ = [
     "load_candidates",
     "load_stack_facts",
     "near_pairs_in_bucket",
+    "obsolete_scan_group_ids_in_session",
+    "page_exact_keys",
     "page_queue",
     "page_queue_in_session",
     "persist_groups_in_session",
