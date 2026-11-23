@@ -39,6 +39,16 @@ function answer(runs) {
   return { status: "success", workers: {}, process: {}, ...(runs ? { runs } : {}) };
 }
 
+// `lanes` on the poll: the backend's task workers, one GPU worker lost.
+const LANES = {
+  running: true,
+  degraded: true,
+  last_failure: { worker: "gpu", error: "ValueError: test-broken-item", at: 1 },
+  waiting_for_gpu_memory: 0,
+  cpu: { alive: 2, total: 2, restarts: 0, queued: 0 },
+  gpu: { alive: 0, total: 1, restarts: 0, queued: 3 },
+};
+
 beforeEach(() => {
   setActivePinia(createPinia());
   vi.clearAllMocks();
@@ -50,14 +60,17 @@ describe("a credential change", () => {
     getWorkerProgress.mockResolvedValue({
       ...answer([RUN]),
       resources: { devices: [], leases: [] },
+      lanes: LANES,
     });
     store.startPolling();
     await flushPromises();
     try {
       expect(store.comfyuiRuns).toEqual([RUN]);
+      expect(store.lanes).toEqual(LANES);
       notifySessionReset("test");
       expect(store.comfyuiRuns).toEqual([]);
       expect(store.resources).toBeNull();
+      expect(store.lanes).toBeNull();
     } finally {
       store.stopPolling();
     }
@@ -72,9 +85,26 @@ describe("a credential change", () => {
     store.startPolling();
     try {
       notifySessionReset("test");
-      answerPoll(answer([RUN]));
+      answerPoll({ ...answer([RUN]), lanes: LANES });
       await flushPromises();
       expect(store.comfyuiRuns).toEqual([]);
+      expect(store.lanes).toBeNull();
+    } finally {
+      store.stopPolling();
+    }
+  });
+});
+
+describe("the task workers' health", () => {
+  it("is read from the poll, and null once a poll stops sending it", async () => {
+    const store = await pollWith({ lanes: LANES });
+    try {
+      expect(store.lanes).toEqual(LANES);
+
+      // A read-only answer or an older server says nothing of the workers.
+      getWorkerProgress.mockResolvedValue(answer([]));
+      store.nudge();
+      await vi.waitFor(() => expect(store.lanes).toBeNull());
     } finally {
       store.stopPolling();
     }
