@@ -315,10 +315,22 @@ def fetch_object_info(base_url: str) -> dict:
 
 
 def _get_object_info_text(base_url: str) -> str:
-    """The body of one ``GET /object_info``, unparsed."""
+    """The body of one ``GET /object_info``, unparsed.
+
+    Straight to ComfyUI: no environment proxy, and a redirect is not followed
+    but fails like any other answer from 300 up.
+    """
+    # Local: comfyui_service imports this module.
+    from pixlstash.services.comfyui_service import NO_PROXY
+
     url = f"{base_url}/object_info"
     try:
-        response = requests.get(url, timeout=OBJECT_INFO_TIMEOUT_S)
+        response = requests.get(
+            url,
+            timeout=OBJECT_INFO_TIMEOUT_S,
+            allow_redirects=False,
+            proxies=NO_PROXY,
+        )
     except requests.RequestException as exc:
         logger.warning("ComfyUI object_info request failed (%s): %s", url, exc)
         raise RuntimeError(f"Could not reach ComfyUI at {base_url}") from exc

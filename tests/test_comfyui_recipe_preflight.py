@@ -9,6 +9,8 @@ import json
 
 import pytest
 
+from pixlstash.services import comfyui_recipe_service
+from pixlstash.services.comfyui_service import NO_PROXY
 from pixlstash.services.comfyui_recipe_service import (
     MAX_SEED_64,
     MODEL_FILENAME_FIELDS,
@@ -3291,7 +3293,7 @@ def test_object_info_requests_arriving_together_share_one_get(monkeypatch):
         status_code = 200
         text = json.dumps({"KSampler": {"input": {}}})
 
-    def slow_get(url, timeout=None):
+    def slow_get(url, timeout=None, allow_redirects=True, proxies=None):
         asked.append(url)
         release.wait(5)
         return Answer()
@@ -3334,7 +3336,7 @@ def test_a_shutdown_signal_in_the_shared_get_reaches_waiters_as_a_failure(
 
     release = threading.Event()
 
-    def interrupted_get(url, timeout=None):
+    def interrupted_get(url, timeout=None, allow_redirects=True, proxies=None):
         release.wait(5)
         raise KeyboardInterrupt
 
@@ -3360,3 +3362,24 @@ def test_a_shutdown_signal_in_the_shared_get_reaches_waiters_as_a_failure(
     owner.join(5)
     waiter.join(5)
     assert seen == {"owner": KeyboardInterrupt, "waiter": RuntimeError}
+
+
+def test_the_object_info_read_goes_straight_to_comfyui(monkeypatch):
+    """Never through a proxy set in the environment, and never on to wherever
+    a redirect points: the map it reads decides what a run is sent with."""
+    asked = []
+
+    class Answer:
+        status_code = 200
+        text = json.dumps({"KSampler": {"input": {}}})
+
+    # ``requests`` follows a redirect unless told not to.
+    def get(url, timeout=None, allow_redirects=True, proxies=None):
+        asked.append((url, allow_redirects, proxies))
+        return Answer()
+
+    monkeypatch.setattr(comfyui_recipe_service.requests, "get", get)
+    assert comfyui_recipe_service.fetch_object_info("http://c") == {
+        "KSampler": {"input": {}}
+    }
+    assert asked == [("http://c/object_info", False, NO_PROXY)]

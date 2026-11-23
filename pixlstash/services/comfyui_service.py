@@ -105,10 +105,14 @@ SAVE_NODE_CLASSES = FILE_SAVE_NODE_CLASSES | PIXLSTASH_SAVER_CLASSES
 # lists its own, a video included, under ``images``.
 VHS_FILES_KEY = "gifs"
 
-# Requests that vet or link a ComfyUI go straight to the address asked.
+# Every request sent to a ComfyUI with this goes straight to the address asked
+# and never follows a redirect, a run's as well as those that vet or link one.
 # ``requests`` otherwise honours HTTP_PROXY / HTTPS_PROXY / ALL_PROXY from the
 # environment, and a proxy is a host nobody checked. A ``None`` value drops the
-# environment's entry for that key, so ``all`` must be named as well.
+# environment's entry for that key, so ``all`` must be named as well. A
+# redirect names a host nobody checked too, and ``requests`` takes the
+# environment's proxy again for it (a 307 with the body), so each request
+# passes ``allow_redirects=False`` beside this.
 NO_PROXY = {"http": None, "https": None, "all": None}
 
 # How many followed prompts' endings are kept for GET /workflows/runs/{id}.
@@ -121,8 +125,8 @@ _run_outcomes_lock = threading.Lock()
 # card and spoken as part of its name.
 MAX_FAILURE_REASON = 300
 
-# Bumped each time PixlStash itself has cleared ComfyUI's queue, so every poller
-# asks the queue about its prompt at once instead of at its next check.
+# Bumped each time PixlStash itself has cleared ComfyUI's queue or taken runs
+# off it, so no waiter goes by a queue read sent before that.
 _queue_cleared = 0
 
 # The ComfyUI client every run is submitted under. ComfyUI sends a prompt's
@@ -151,6 +155,14 @@ _run_ids: dict[str, str] = {}
 # Held runs' cancel events, by run id: set by an abort or a lease cancel, and
 # the run then never reaches ComfyUI. Same lock.
 _held_cancels: dict[str, threading.Event] = {}
+# The newest read of each ComfyUI address's queue, done or still out, which
+# every prompt waited on there shares (``_shared_queue_read``), and how many
+# prompts are waited on there. An address is in neither once nothing waits
+# on it and no read of it is out. Same lock.
+_queue_reads: dict[str, "_QueueRead"] = {}
+_queue_waits: dict[str, int] = {}
+# How many queue reads have been sent, which numbers them. Same lock.
+_queue_reads_sent = 0
 # Told of every ending, outside the lock, with what ``run_outcome`` would
 # answer: the run log (``services/run_log.py``) keeps it past a restart. One,
 # set by the workflows routes for the server they serve (``on_run_ended``).
@@ -397,7 +409,13 @@ def cancel_runs(run_ids: list[str]) -> int:
                 calls.insert(0, ("/interrupt", {"prompt_id": prompt_id}))
             refused = False
             for path, body in calls:
-                resp = requests.post(f"{base_url}{path}", json=body, timeout=10)
+                resp = requests.post(
+                    f"{base_url}{path}",
+                    json=body,
+                    timeout=10,
+                    allow_redirects=False,
+                    proxies=NO_PROXY,
+                )
                 if resp.status_code >= 300:
                     refused = True
                     logger.warning(
@@ -419,7 +437,7 @@ def cancel_runs(run_ids: list[str]) -> int:
                 exc,
             )
     if in_flight:
-        # Its poller asks the queue now rather than at its next check.
+        # Its waiter goes by a queue read sent after this, not one before.
         _queue_cleared += 1
     return stopped
 
@@ -438,7 +456,7 @@ def follow_run(
     by ``live_runs`` as ``queued`` until ComfyUI speaks of it. *label* is what
     the Tasks tab calls it. *run_id* is PixlStash's id for the run, which a
     run held for the GPU was known by until now. Starts the listener on
-    *base_url* if none is up.
+    *base_url* if none is up, and raises if its thread cannot start.
     """
     with _run_outcomes_lock:
         if run_id is not None:
@@ -480,9 +498,16 @@ def follow_run(
         if listen:
             _listening.add(base_url)
     if listen:
-        threading.Thread(
-            target=_listen_for_progress, args=(base_url,), daemon=True
-        ).start()
+        try:
+            threading.Thread(
+                target=_listen_for_progress, args=(base_url,), daemon=True
+            ).start()
+        except BaseException:
+            # No listener is up on the address, so the next run must start one
+            # rather than count on this one.
+            with _run_outcomes_lock:
+                _listening.discard(base_url)
+            raise
 
 
 def live_runs(library_uuid: str | None) -> list[dict]:
@@ -560,30 +585,23 @@ def _note_running_prompts(base_url: str) -> None:
 
     Read once a socket is open: the run that started the listener was
     submitted before the socket existed, so ComfyUI may already have said it
-    started on it, and through a long model load it says nothing more.
+    started on it, and through a long model load it says nothing more. The
+    read is the one the runs' waiters share (``_shared_queue_read``).
     """
-    try:
-        response = requests.get(f"{base_url}/queue", timeout=30)
-        response.raise_for_status()
-        queue = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        logger.warning(
-            "ComfyUI's queue at %s could not be read, so a run already "
-            "started reads as queued until ComfyUI next speaks of it: %s",
+    with _run_outcomes_lock:
+        after = _queue_reads_sent
+    read = _shared_queue_read(base_url, after)
+    if read.running is None:
+        # The read has logged why.
+        logger.info(
+            "A run already started at %s reads as queued until ComfyUI next "
+            "speaks of it",
             base_url,
-            exc,
         )
         return
-    running = queue.get("queue_running") if isinstance(queue, dict) else None
-    # Each entry is ``[number, prompt_id, prompt, ...]``.
-    ids = {
-        item[1]
-        for item in running or []
-        if isinstance(item, (list, tuple)) and len(item) > 1
-    }
     with _run_outcomes_lock:
         for prompt_id, run in _live_runs.items():
-            if prompt_id in ids:
+            if prompt_id in read.running:
                 run["status"] = "running"
                 run.setdefault("started", True)
 
@@ -619,9 +637,9 @@ def _listen_for_progress(base_url: str) -> None:
     starting another.
 
     ponytail: with no socket a run reads ``queued`` until it ends, or until
-    the next socket's queue read. The queue read in
-    ``_wait_for_comfyui_outputs`` could say ``running`` if a ComfyUI behind a
-    proxy that drops WebSockets ever matters.
+    the next socket's queue read. The waiters' shared queue read
+    (``_shared_queue_read``) already lists the running prompts, and could say
+    ``running`` if a ComfyUI behind a proxy that drops WebSockets ever matters.
     """
     ws_url = f"{re.sub('^http', 'ws', base_url)}/ws?clientId={RUN_CLIENT_ID}"
     warned = False
@@ -630,12 +648,14 @@ def _listen_for_progress(base_url: str) -> None:
             try:
                 # No pings: a ComfyUI loading a model answers nothing for
                 # minutes. Frames are JSON and previews, far under the cap.
+                # Straight to ComfyUI: ``proxy`` left out is the environment's.
                 with ws_connect(
                     ws_url,
                     ping_interval=None,
                     max_size=LISTEN_MAX_FRAME,
                     open_timeout=10,
                     close_timeout=2,
+                    proxy=None,
                 ) as upstream:
                     warned = False
                     _note_running_prompts(base_url)
@@ -859,6 +879,8 @@ def _upload_image_to_comfyui(
                 files=files,
                 data=data,
                 timeout=30,
+                allow_redirects=False,
+                proxies=NO_PROXY,
             )
         except requests.RequestException as exc:
             logger.warning("ComfyUI upload request failed: %s", exc)
@@ -934,6 +956,8 @@ def _submit_comfyui_prompt(
             f"{base_url}/prompt",
             json=payload,
             timeout=30,
+            allow_redirects=False,
+            proxies=NO_PROXY,
         )
     except requests.RequestException as exc:
         logger.warning("ComfyUI prompt request failed: %s", exc)
@@ -1292,6 +1316,8 @@ def _fetch_comfyui_history(base_url: str, prompt_id: str) -> dict:
         response = requests.get(
             f"{base_url}/history/{prompt_id}",
             timeout=30,
+            allow_redirects=False,
+            proxies=NO_PROXY,
         )
     except requests.RequestException as exc:
         logger.warning("ComfyUI history request failed: %s", exc)
@@ -1409,55 +1435,141 @@ def _extract_comfyui_output_images(
     return images
 
 
-def _comfyui_prompt_queued(base_url: str, prompt_id: str) -> bool:
-    """Whether ComfyUI still holds *prompt_id*, running or waiting its turn.
+class _QueueRead:
+    """One read of a ComfyUI's queue, which every prompt waited on there goes by.
 
-    True when the queue cannot be read: only an answer that does not list the
-    prompt says it is gone, and one slow answer from a busy ComfyUI must not
-    abandon a run that is still going. A ComfyUI that is down ends the wait
-    through the history read instead, which raises.
+    ``running`` is the prompt ids ComfyUI is running and ``listed`` every one
+    it holds, running or waiting its turn; both None when the queue could not
+    be read. ``finished`` once the read was made, whatever it found; ``done``
+    is set once the read is over either way, which is what a waiter sharing it
+    waits on.
     """
+
+    __slots__ = ("number", "cleared", "running", "listed", "finished", "done")
+
+    def __init__(self, number: int, cleared: int) -> None:
+        self.number = number
+        self.cleared = cleared
+        self.running: frozenset[str] | None = None
+        self.listed: frozenset[str] | None = None
+        self.finished = False
+        self.done = threading.Event()
+
+    def answers(self, after: int) -> bool:
+        """Whether a waiter that last went by read number *after* may go by
+        this one: made, newer, and sent since PixlStash last cleared the queue
+        or took runs off it."""
+        return self.finished and self.number > after and self.cleared == _queue_cleared
+
+
+def _read_comfyui_queue(
+    base_url: str,
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    """The prompt ids ComfyUI at *base_url* is running, and those waiting
+    their turn; None, logged, when its queue cannot be read."""
+    url = f"{base_url}/queue"
     try:
-        response = requests.get(f"{base_url}/queue", timeout=30)
-        response.raise_for_status()
+        response = requests.get(
+            url, timeout=30, allow_redirects=False, proxies=NO_PROXY
+        )
+        # A redirect is not the queue: it names another host's address.
+        if response.status_code != 200:
+            raise requests.HTTPError(
+                f"ComfyUI answered HTTP {response.status_code} at {url}"
+            )
         queue = response.json()
     except (requests.RequestException, ValueError) as exc:
         logger.warning(
-            "ComfyUI queue could not be read for prompt %s, so it is taken as "
-            "still queued: %s",
-            prompt_id,
+            "ComfyUI's queue at %s could not be read, so each run waited on "
+            "there reads its own history instead this time: %s",
+            base_url,
             exc,
         )
-        return True
+        return None
     if not isinstance(queue, dict):
         logger.warning(
-            "ComfyUI /queue returned %s, not an object, so prompt %s is taken "
-            "as still queued",
+            "ComfyUI's queue at %s came back as %s, not an object, so each run "
+            "waited on there reads its own history instead this time",
+            base_url,
             type(queue).__name__,
-            prompt_id,
         )
-        return True
+        return None
     # Each entry is ``[number, prompt_id, prompt, ...]``.
-    return any(
-        isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id
+    running, pending = (
+        frozenset(
+            item[1]
+            for item in queue.get(key) or []
+            if isinstance(item, (list, tuple))
+            and len(item) > 1
+            and isinstance(item[1], str)
+        )
         for key in ("queue_running", "queue_pending")
-        for item in queue.get(key) or []
     )
+    return running, pending
+
+
+def _shared_queue_read(base_url: str, after: int) -> _QueueRead:
+    """A read of *base_url*'s queue that ``answers`` a waiter that last went
+    by read number *after*.
+
+    One read at a time per address: a read already out is waited for and
+    shared, and only once the newest read is over and is no answer does this
+    thread send the next. So a read is sent only by a waiter that went by the
+    newest one and has slept since, and however many prompts are waited on,
+    reads of one address come no closer together than the waiters' sleep. A
+    read that raised, rather than finding the queue unreadable, answers
+    nobody: it raises in the thread that sent it, and the next waiter sends
+    its own.
+    """
+    global _queue_reads_sent
+    while True:
+        with _run_outcomes_lock:
+            read = _queue_reads.get(base_url)
+            send = read is None or (read.done.is_set() and not read.answers(after))
+            if send:
+                _queue_reads_sent += 1
+                read = _QueueRead(_queue_reads_sent, _queue_cleared)
+                _queue_reads[base_url] = read
+        if send:
+            try:
+                queue = _read_comfyui_queue(base_url)
+                if queue is not None:
+                    read.running, pending = queue
+                    read.listed = read.running | pending
+                read.finished = True
+            finally:
+                with _run_outcomes_lock:
+                    # Kept only while a waiter may still go by it. Over under
+                    # the same lock, so the last waiter, ending as this read
+                    # ends, finds it over and takes it away.
+                    if _queue_reads.get(base_url) is read and (
+                        not read.finished or not _queue_waits.get(base_url)
+                    ):
+                        del _queue_reads[base_url]
+                    read.done.set()
+        else:
+            read.done.wait()
+        if read.answers(after):
+            return read
 
 
 def _wait_for_comfyui_outputs(
     base_url: str,
     prompt_id: str,
     output_node_ids: list[str] | None,
-    timeout_s: float = 30.0,
     poll_s: float = 1.0,
 ) -> tuple[list[dict], list[int] | None]:
-    """Poll history until the prompt produces output.
+    """Wait for ComfyUI to be done with the prompt, however long that takes.
 
-    *timeout_s* is how often ComfyUI's queue is asked whether it still holds
-    the prompt, not a cap on the run: a video, or a prompt behind others in
-    the queue, takes longer than any fixed budget, so while ComfyUI still lists
-    the prompt as running or pending the wait goes on.
+    Every *poll_s* the wait goes by a read of ComfyUI's queue sent since it
+    began (``_shared_queue_read``): while the queue holds the prompt, running
+    or waiting its turn, the wait goes on, through a video or a long queue
+    alike. One read serves every prompt waited on at that ComfyUI, so a batch
+    of runs asks it no more often than one run does. The prompt's history is
+    read once the queue no longer holds it: ComfyUI moves a prompt from its
+    queue to its history in one step, so the history is then final. A queue
+    that cannot be read says nothing either way; the history is read instead,
+    and a ComfyUI that is down ends the wait there.
 
     Returns the files to download and import, plus the picture ids a PixlStash
     saver node imported on its own (None when no such node ran).
@@ -1466,58 +1578,58 @@ def _wait_for_comfyui_outputs(
     ComfyUI holds neither in its queue nor in its history: taken off the queue
     before its turn, or lost to a restart. Any other failure is a
     ``RuntimeError`` carrying the sentence to show.
-
-    ponytail: one ``GET /queue`` per followed prompt per *timeout_s*, and the
-    answer carries every queued graph. Fine for tens of prompts; a 200-run
-    batch wants one shared queue read instead of one per poller.
     """
-    deadline = time.time() + timeout_s
-    cleared = _queue_cleared
-    while True:
-        # Asked BEFORE the history read, so a prompt that finishes in between
-        # is still collected by this pass rather than given up on.
-        gone = False
-        if cleared != _queue_cleared:
-            # PixlStash's own Abort just emptied the queue: say so now, not
-            # up to *timeout_s* after the owner has moved on to the next run.
-            cleared = _queue_cleared
-            deadline = 0.0
-        if time.time() >= deadline:
-            if _comfyui_prompt_queued(base_url, prompt_id):
-                deadline = time.time() + timeout_s
+    with _run_outcomes_lock:
+        _queue_waits[base_url] = _queue_waits.get(base_url, 0) + 1
+        # A read sent from now on was sent after the prompt was queued.
+        after = _queue_reads_sent
+    try:
+        while True:
+            time.sleep(poll_s)
+            read = _shared_queue_read(base_url, after)
+            after = read.number
+            if read.listed is not None and prompt_id in read.listed:
+                continue
+            history_payload = _fetch_comfyui_history(base_url, prompt_id)
+            images = _extract_comfyui_output_images(
+                history_payload, prompt_id, output_node_ids
+            )
+            pixlstash_ids = _extract_pixlstash_picture_ids(
+                history_payload, prompt_id, output_node_ids
+            )
+            status_str, error_text = _extract_history_status_and_error(
+                history_payload, prompt_id
+            )
+            if images or pixlstash_ids is not None:
+                return images, pixlstash_ids
+            if status_str == "success":
+                # Finished with nothing to import: ComfyUI writes a prompt's
+                # outputs and its status together, so there is nothing to wait
+                # for.
+                return [], None
+            if status_str in {"interrupted", "cancelled"}:
+                raise ComfyUIRunStopped(error_text or "Interrupted")
+            if status_str in {"error", "failed", "failure"}:
+                raise RuntimeError(error_text or f"ComfyUI status={status_str}")
+            if error_text and status_str != "success":
+                raise RuntimeError(error_text)
+            if read.listed is not None:
+                # Out of the queue, so ComfyUI is done with it.
+                if not _extract_history_entry(history_payload, prompt_id):
+                    raise ComfyUIRunStopped(
+                        "ComfyUI no longer has this run: it was taken off the "
+                        "queue, or ComfyUI restarted"
+                    )
+                return [], None
+    finally:
+        with _run_outcomes_lock:
+            waits = _queue_waits.pop(base_url, 1) - 1
+            if waits:
+                _queue_waits[base_url] = waits
             else:
-                gone = True
-        history_payload = _fetch_comfyui_history(base_url, prompt_id)
-        images = _extract_comfyui_output_images(
-            history_payload, prompt_id, output_node_ids
-        )
-        pixlstash_ids = _extract_pixlstash_picture_ids(
-            history_payload, prompt_id, output_node_ids
-        )
-        status_str, error_text = _extract_history_status_and_error(
-            history_payload, prompt_id
-        )
-        if images or pixlstash_ids is not None:
-            return images, pixlstash_ids
-        if status_str == "success":
-            # Finished with nothing to import: ComfyUI writes a prompt's outputs
-            # and its status together, so polling on would only wait out the
-            # timeout before saying the same thing.
-            return [], None
-        if status_str in {"interrupted", "cancelled"}:
-            raise ComfyUIRunStopped(error_text or "Interrupted")
-        if status_str in {"error", "failed", "failure"}:
-            raise RuntimeError(error_text or f"ComfyUI status={status_str}")
-        if error_text and status_str != "success":
-            raise RuntimeError(error_text)
-        if gone:
-            if not _extract_history_entry(history_payload, prompt_id):
-                raise ComfyUIRunStopped(
-                    "ComfyUI no longer has this run: it was taken off the "
-                    "queue, or ComfyUI restarted"
-                )
-            return [], None
-        time.sleep(poll_s)
+                newest = _queue_reads.get(base_url)
+                if newest is not None and newest.done.is_set():
+                    del _queue_reads[base_url]
 
 
 def _emit_comfyui_progress(
@@ -1610,6 +1722,8 @@ def _download_comfyui_image(base_url: str, entry: dict) -> tuple[bytes, str]:
             f"{base_url}/view",
             params=params,
             timeout=30,
+            allow_redirects=False,
+            proxies=NO_PROXY,
         )
     except requests.RequestException as exc:
         logger.warning("ComfyUI image fetch failed: %s", exc)
@@ -2586,7 +2700,12 @@ def _comfyui_abort(base_url: str) -> dict:
     global _queue_cleared
     result = {"interrupted": False, "queue_cleared": False}
     try:
-        resp = requests.post(f"{base_url}/interrupt", timeout=10)
+        resp = requests.post(
+            f"{base_url}/interrupt",
+            timeout=10,
+            allow_redirects=False,
+            proxies=NO_PROXY,
+        )
         result["interrupted"] = resp.status_code < 300
         if not result["interrupted"]:
             logger.warning(
@@ -2598,7 +2717,13 @@ def _comfyui_abort(base_url: str) -> dict:
         logger.warning("ComfyUI /interrupt request failed: %s", exc)
 
     try:
-        resp = requests.post(f"{base_url}/queue", json={"clear": True}, timeout=10)
+        resp = requests.post(
+            f"{base_url}/queue",
+            json={"clear": True},
+            timeout=10,
+            allow_redirects=False,
+            proxies=NO_PROXY,
+        )
         result["queue_cleared"] = resp.status_code < 300
         if not result["queue_cleared"]:
             logger.warning(
@@ -2609,8 +2734,8 @@ def _comfyui_abort(base_url: str) -> dict:
     except requests.RequestException as exc:
         logger.warning("ComfyUI /queue clear request failed: %s", exc)
 
-    # Only a queue that was really emptied: the pollers are told to ask it
-    # about their prompt now, and one that still holds them answers nothing new.
+    # Only a queue that was really emptied: the waiters go by a read sent after
+    # it, and one that still holds their prompts answers nothing new.
     if result["queue_cleared"]:
         _queue_cleared += 1
     # The runs PixlStash is still holding for the GPU are part of "every run
@@ -2628,9 +2753,14 @@ def comfyui_pixlstash_scripts(base_url: str) -> set[str] | None:
     ponytail: matches the pack by a "pixlstash" folder name, which holds for the
     registry and git installs; ask the node for its version if that ever breaks.
     """
+    url = f"{base_url}/extensions"
     try:
-        response = requests.get(f"{base_url}/extensions", timeout=5)
-        response.raise_for_status()
+        response = requests.get(url, timeout=5, allow_redirects=False, proxies=NO_PROXY)
+        # A redirect is not ComfyUI answering: it names another host's address.
+        if response.status_code != 200:
+            raise requests.HTTPError(
+                f"ComfyUI answered HTTP {response.status_code} at {url}"
+            )
         scripts = response.json()
     except (requests.RequestException, ValueError) as exc:
         logger.info("Could not list ComfyUI extensions at %s: %s", base_url, exc)
@@ -2658,11 +2788,14 @@ def comfyui_shelf_loader_current(base_url: str) -> bool | None:
     while ComfyUI restarts after an update. A ComfyUI without the pack's
     loader answers ``{}``, which is not current.
     """
+    url = f"{base_url}/object_info/{PIXLSTASH_CHECKPOINT_LOADER}"
     try:
-        response = requests.get(
-            f"{base_url}/object_info/{PIXLSTASH_CHECKPOINT_LOADER}", timeout=5
-        )
-        response.raise_for_status()
+        response = requests.get(url, timeout=5, allow_redirects=False, proxies=NO_PROXY)
+        # A redirect is not ComfyUI answering: it names another host's address.
+        if response.status_code != 200:
+            raise requests.HTTPError(
+                f"ComfyUI answered HTTP {response.status_code} at {url}"
+            )
         spec = response.json().get(PIXLSTASH_CHECKPOINT_LOADER)
     except (requests.RequestException, ValueError, AttributeError) as exc:
         logger.info(
