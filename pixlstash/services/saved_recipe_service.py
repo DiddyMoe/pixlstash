@@ -335,6 +335,14 @@ def credit_groups_in_session(
     # ``excluded`` keeps its runs out of every variant, so no picture matches
     # two chunks. ``excluded`` goes in every chunk and is one bound JSON array,
     # however many ids.
+    #
+    # Kept is written ``deleted IS NOT 1`` (the same rows: ``deleted`` is NOT
+    # NULL) because SQLite cannot search an index for ``IS NOT``. Beside ``IS
+    # 0``, and without ``sqlite_stat1`` (PixlStash never runs ``ANALYZE``), the
+    # planner rates the key lists below ``ix_picture_deleted`` and walks every
+    # kept picture to find a workflow's few; with ``deleted`` out of the
+    # running the keys search their own indexes (backend_architecture.md,
+    # "Probe cost").
     merged: dict[tuple[Optional[str], Optional[str]], list] = {}
     for chunk in chunked([*variants, *manual]):
         chunk_keys = [*chunk, *excluded]
@@ -347,7 +355,7 @@ def credit_groups_in_session(
             )
             .where(workflow_keys_predicate(chunk_keys))
             .where(Picture.comfyui_loras.is_not(None))
-            .where(Picture.deleted.is_(False))
+            .where(Picture.deleted.is_not(True))
             .group_by(Picture.comfyui_positive_prompt, Picture.comfyui_loras)
         ).all()
         for prompt, loras, count, newest in rows:
