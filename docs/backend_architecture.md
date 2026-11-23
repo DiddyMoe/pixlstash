@@ -7119,7 +7119,8 @@ sibling. A periodic sweep that deleted those rows on a timer would break exactly
 that, which is why there isn't one: the surviving rows are invisible to every
 read and the next verdict or scan clears them. The reads that apply the rule are
 the four in `dedup_tier_service` (`count_unresolved_in_session`,
-`count_by_tier_in_session`, `page_queue_in_session`, `bulk_auto_stack_in_session`)
+`count_by_tier_in_session`, `count_unresolved_and_by_tier_in_session`,
+`page_queue_in_session`), `bulk_auto_stack_in_session` in `dedup_verdict_service`,
 **and** the grid's `stack_state="unresolved"` filter in
 `utils/query/predicate_filter.py`, which was the one that leaked: it keyed on
 `DedupGroup.resolved` alone, so a scrapheaped partner kept marking its survivor
@@ -7363,7 +7364,8 @@ from offering a Stack the verdict would refuse:
   and in a lock helper that difference is a silent admission.
 - **A group with fewer than two stackable members is withheld** (owner call,
   2026-07-30) by `_live_groups_filter`'s third `HAVING`, so the queue, the badge
-  (`count_unresolved_in_session`) and the tier split (`count_by_tier_in_session`)
+  and the tier split (read together by `count_unresolved_and_by_tier_in_session`
+  for `POST /dedup/counts`, which tests live groups once for both)
   all apply one identical rule and cannot disagree, and since **D1**
   (2026-08-01) so does `POST /dedup/auto-stack`, which used to filter on the
   weaker `stackable_groups_filter` (two unfrozen live members, nothing about

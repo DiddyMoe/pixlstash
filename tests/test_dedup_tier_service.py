@@ -37,6 +37,7 @@ from pixlstash.db_models.dedup import (
     SCAN_RUNNING,
     VERDICT_KEEP_SEPARATE,
     DedupGroup,
+    DedupGroupMember,
     DedupScan,
     DedupVerdict,
 )
@@ -1289,6 +1290,208 @@ def test_a_scope_id_is_required_for_a_non_global_scope():
     with pytest.raises(ValueError, match="scope_id is required"):
         DedupScope(scope_type=ScopeType.PROJECT)
     assert DedupScope(scope_type=ScopeType.GLOBAL, scope_id="ignored").key == "global"
+
+
+# (tier, stored confidence, resolved, how the members stand, first member in the
+# set). Written directly rather than scanned so a row can hold a confidence no
+# scan writes: an exact group below the threshold is the one row on which
+# "exact is counted in full" and "the threshold applies" disagree.
+_COUNTED_GROUPS = [
+    (DedupTier.EXACT, 1.0, False, "live", True),
+    (DedupTier.EXACT, 0.8, False, "live", True),
+    (DedupTier.NEAR, 63 / 64, False, "live", False),
+    (DedupTier.NEAR, 0.875, False, "live", True),
+    (DedupTier.EMBEDDING, 0.97, False, "live", True),
+    (DedupTier.EMBEDDING, 0.7, False, "live", False),
+    (DedupTier.EXACT, 1.0, True, "live", True),
+    (DedupTier.NEAR, 0.99, False, "one-scrapheaped", True),
+    (DedupTier.EMBEDDING, 0.99, False, "stacked-together", True),
+]
+
+_COUNT_POLICIES = [
+    pytest.param(TierPolicy(), id="exact-only"),
+    pytest.param(TierPolicy(near_enabled=True), id="near"),
+    pytest.param(
+        TierPolicy(near_enabled=True, embedding_enabled=True), id="near-and-embedding"
+    ),
+    pytest.param(TierPolicy(threshold=tiers.MIN_THRESHOLD), id="exact-only-lowest"),
+    pytest.param(
+        TierPolicy(near_enabled=True, embedding_enabled=True, threshold=0.95),
+        id="near-and-embedding-at-0.95",
+    ),
+    pytest.param(TierPolicy(threshold=tiers.MAX_THRESHOLD), id="exact-only-highest"),
+    pytest.param(
+        TierPolicy(
+            near_enabled=True, embedding_enabled=True, threshold=tiers.MIN_THRESHOLD
+        ),
+        id="near-and-embedding-lowest",
+    ),
+    pytest.param(
+        TierPolicy(near_enabled=True, threshold=tiers.MAX_THRESHOLD),
+        id="near-highest",
+    ),
+    # A threshold equal to a stored confidence: the group on it must count.
+    pytest.param(TierPolicy(threshold=0.8), id="exact-only-on-a-stored-confidence"),
+    pytest.param(
+        TierPolicy(near_enabled=True, embedding_enabled=True, threshold=0.875),
+        id="near-and-embedding-on-a-stored-confidence",
+    ),
+]
+
+# Only the live-groups test groups member rows by group and filters the groups
+# with HAVING, so this text marks a statement that evaluates it.
+_LIVE_GROUPS_SQL = "GROUP BY dedupgroupmember.group_id HAVING"
+
+
+@pytest.fixture(scope="module")
+def counted_library():
+    """One library holding every kind of group the duplicate counts tell apart.
+
+    Yields ``(server, set_id)``; the set holds the first member of the groups
+    marked for it in :data:`_COUNTED_GROUPS`. Read-only for its tests.
+    """
+    temp_dir = tempfile.TemporaryDirectory()
+    config_path = os.path.join(temp_dir.name, "server-config.json")
+    with open(config_path, "w") as fh:
+        fh.write(json.dumps({"port": 8000, "disable_background_workers": True}))
+    Server.DEFAULT_FORCE_CPU = True
+    srv = Server(config_path)
+    try:
+        specs = []
+        for index, (_tier, _confidence, _resolved, standing, _in_set) in enumerate(
+            _COUNTED_GROUPS
+        ):
+            specs.append({"file_path": f"/vault/counted_{index}_a.png"})
+            specs.append(
+                {
+                    "file_path": f"/vault/counted_{index}_b.png",
+                    "deleted": standing == "one-scrapheaped",
+                }
+            )
+        ids = _seed(srv, specs)
+        for index, group_spec in enumerate(_COUNTED_GROUPS):
+            if group_spec[3] == "stacked-together":
+                _stack(srv, ids[2 * index : 2 * index + 2])
+
+        def write_groups(session):
+            picture_set = PictureSet(name="Counted")
+            session.add(picture_set)
+            session.flush()
+            for index, (tier, confidence, resolved, _standing, in_set) in enumerate(
+                _COUNTED_GROUPS
+            ):
+                members = ids[2 * index : 2 * index + 2]
+                group = DedupGroup(
+                    signature=f"test-counted-{index}",
+                    tier=tier.value,
+                    confidence=confidence,
+                    member_count=len(members),
+                    resolved=resolved,
+                )
+                session.add(group)
+                session.flush()
+                for position, picture_id in enumerate(members):
+                    session.add(
+                        DedupGroupMember(
+                            group_id=int(group.id),
+                            picture_id=picture_id,
+                            position=position,
+                        )
+                    )
+                if in_set:
+                    session.add(
+                        PictureSetMember(
+                            set_id=int(picture_set.id), picture_id=members[0]
+                        )
+                    )
+            session.commit()
+            return int(picture_set.id)
+
+        yield srv, _run(srv, write_groups)
+    finally:
+        srv.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def _counted_scope(set_id, scoped):
+    if not scoped:
+        return None
+    return DedupScope(scope_type=ScopeType.SET, scope_id=str(set_id))
+
+
+def test_the_badge_honours_the_tier_switches_and_the_split_does_not(
+    counted_library,
+):
+    """Pins what the counted library holds, so the comparisons below compare
+    real numbers. Exact only: the badge is the one exact group at or above the
+    threshold; the split also shows the exact row below it and the near and
+    embedding groups that pass. Resolved, single-survivor and stacked-together
+    groups count nowhere."""
+    server, set_id = counted_library
+    assert _run(
+        server, tiers.count_unresolved_and_by_tier_in_session, TierPolicy(), None
+    ) == (1, {"exact": 2, "near": 1, "embedding": 1})
+    assert _run(
+        server,
+        tiers.count_unresolved_and_by_tier_in_session,
+        TierPolicy(),
+        _counted_scope(set_id, True),
+    ) == (1, {"exact": 2, "near": 0, "embedding": 1})
+
+
+@pytest.mark.parametrize("scoped", [False, True], ids=["global", "set"])
+@pytest.mark.parametrize("policy", _COUNT_POLICIES)
+def test_one_read_gives_the_badge_and_the_split_the_separate_counts_give(
+    counted_library, policy, scoped
+):
+    server, set_id = counted_library
+    scope = _counted_scope(set_id, scoped)
+    separate = (
+        _run(server, tiers.count_unresolved_in_session, policy, scope),
+        _run(server, tiers.count_by_tier_in_session, policy, scope),
+    )
+    combined = _run(
+        server, tiers.count_unresolved_and_by_tier_in_session, policy, scope
+    )
+    assert combined == separate
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        pytest.param(TierPolicy(), id="exact-only"),
+        pytest.param(
+            TierPolicy(near_enabled=True, embedding_enabled=True, threshold=0.95),
+            id="near-and-embedding-at-0.95",
+        ),
+    ],
+)
+def test_the_counts_response_tests_live_groups_once_for_the_badge_and_the_split(
+    counted_library, policy
+):
+    """The counts are re-read after every verdict, and the live-groups test
+    (members, stack units, locks) is their expensive part: the badge and the
+    tier split share one evaluation of it."""
+    server, _set_id = counted_library
+    statements = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(" ".join(statement.split()))
+
+    engine = server.vault.db._engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        body = tiers.counts_response(server.vault, policy, [])
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    live_group_reads = [s for s in statements if _LIVE_GROUPS_SQL in s]
+    assert len(live_group_reads) == 1, live_group_reads
+    assert body["unresolved_groups"] == _run(
+        server, tiers.count_unresolved_in_session, policy, None
+    )
+    assert body["by_tier"] == _run(server, tiers.count_by_tier_in_session, policy, None)
 
 
 # ── scan progress ─────────────────────────────────────────────────────────────

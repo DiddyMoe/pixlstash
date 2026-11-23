@@ -2611,6 +2611,54 @@ def count_by_tier_in_session(
     return counts
 
 
+def count_unresolved_and_by_tier_in_session(
+    session: Session,
+    policy: Optional[TierPolicy] = None,
+    scope: Optional[DedupScope] = None,
+) -> tuple[int, dict[str, int]]:
+    """The badge and the tier split together, testing which groups are live once.
+
+    Returns exactly what :func:`count_unresolved_in_session` and
+    :func:`count_by_tier_in_session` return for the same arguments, from one
+    grouped read instead of two that each run :func:`live_groups_filter` over
+    every unresolved group.
+
+    The two counts keep their own rules, so they come from two columns:
+
+    * the split counts every tier, switched on or not, with exact counted in
+      full and the threshold applied to the looser tiers;
+    * the badge counts only the switched-on tiers, and applies the threshold to
+      exact as well.
+
+    The badge is therefore not the sum of the split: with near switched off the
+    split still reports near groups the badge leaves out.
+    """
+    policy = policy or TierPolicy()
+    scope = scope or DedupScope()
+    passes_threshold = DedupGroup.confidence >= policy.threshold
+    query = select(
+        DedupGroup.tier,
+        func.count(
+            case(
+                ((DedupGroup.tier == TIER_EXACT) | passes_threshold, DedupGroup.id),
+                else_=None,
+            )
+        ),
+        func.count(case((passes_threshold, DedupGroup.id), else_=None)),
+    ).where(DedupGroup.resolved.is_(False), live_groups_filter())
+    scope_filter = _scope_groups_filter(scope)
+    if scope_filter is not None:
+        query = query.where(scope_filter)
+    by_tier = {tier.value: 0 for tier in DedupTier}
+    above_threshold: dict[str, int] = {}
+    for tier, shown, passing in session.exec(query.group_by(DedupGroup.tier)).all():
+        if shown:
+            by_tier[str(tier)] = int(shown)
+        above_threshold[str(tier)] = int(passing)
+    unresolved = sum(above_threshold.get(tier.value, 0) for tier in policy.tiers)
+    return unresolved, by_tier
+
+
 def page_queue_in_session(
     session: Session,
     policy: Optional[TierPolicy] = None,
@@ -3326,9 +3374,10 @@ def _counts_response_in_session(
     session: Session, policy: TierPolicy, scopes: list[DedupScope]
 ) -> dict[str, Any]:
     """The whole ``POST /dedup/counts`` payload, on one session."""
+    unresolved, by_tier = count_unresolved_and_by_tier_in_session(session, policy)
     return {
-        "unresolved_groups": count_unresolved_in_session(session, policy),
-        "by_tier": count_by_tier_in_session(session, policy),
+        "unresolved_groups": unresolved,
+        "by_tier": by_tier,
         "scopes": scope_counts_in_session(session, scopes, policy),
         "policy": policy.as_dict(),
         "scan": scan_progress_in_session(session),
@@ -3418,6 +3467,7 @@ __all__ = [
     "count_by_tier_in_session",
     "count_decided_by_verdict_in_session",
     "count_unresolved",
+    "count_unresolved_and_by_tier_in_session",
     "count_unresolved_in_session",
     "counts_response",
     "cover_order_key",
