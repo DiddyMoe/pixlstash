@@ -462,7 +462,19 @@ Import folders feed it only because what they bring in is a recent,
 unassigned picture.
 
 `GET /import-folders` adds, per folder, `picture_count`, `last_imported_at`
-(its newest picture's arrival) and `missing` (the folder is not on disk).
+(its newest picture's arrival), `missing` (the folder is not on disk) and
+`unreadable` (it is on disk but the server cannot list it; never true together
+with `missing`). Both come from `watch_folder_state`
+(`tasks/missing_watch_folder_import_finder.py`), which the scan uses too, so
+the listing and the scan agree: nothing at the path, or not a directory, is
+missing; the folder or a parent that cannot be opened, or a folder without
+read and execute permission, is unreadable. It asks the filesystem only - the
+path rules are not consulted and the path is not resolved first. Adding a
+folder checks neither, so a drive or mount that is not there yet, or a folder
+still waiting for its permissions, registers. `MissingWatchFolderImportFinder`
+does not walk an unreadable folder, and logs one warning when the set of
+directories a folder cannot read changes, naming the folder and the first
+error, and one info line when it can be read again.
 
 ### `comfyui.py`
 List and import workflow files; read the workflow a picture carries. Running one is `routes/workflows.py` since #1410.

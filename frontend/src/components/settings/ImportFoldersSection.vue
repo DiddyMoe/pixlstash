@@ -43,8 +43,8 @@
             folder.delete_after_import ? "Delete original" : "Keep original"
           }}</span>
           <span
-            :class="['ifs-meta', { 'ifs-missing': folder.missing }]"
-            :role="folder.missing ? 'status' : undefined"
+            :class="['ifs-meta', { 'ifs-unavailable': unavailable(folder) }]"
+            :role="unavailable(folder) ? 'status' : undefined"
             >{{ latestLabel(folder) }}</span
           >
           <span class="ifs-meta ifs-num">{{
@@ -241,8 +241,15 @@ watch(
   { immediate: true },
 );
 
+// Nothing can be imported from the folder: it is not on disk, or it is and the
+// server is not allowed to list it.
+function unavailable(folder) {
+  return Boolean(folder.missing || folder.unreadable);
+}
+
 function latestLabel(folder) {
   if (folder.missing) return "Folder not found";
+  if (folder.unreadable) return "Folder can't be read";
   if (!folder.last_imported_at) return "Nothing yet";
   return relativeDate(folder.last_imported_at);
 }
@@ -450,7 +457,7 @@ async function removeFolder(folder) {
 
 /* Status words on a surface take the surface status token, with the words
    themselves carrying the meaning. */
-.ifs-missing {
+.ifs-unavailable {
   color: rgb(var(--v-theme-surface-error));
 }
 </style>

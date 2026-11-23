@@ -1,16 +1,29 @@
+import errno
+import logging
 import os
 import shutil
 import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
+import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from pixlstash.server import Server
+from pixlstash.db_models.import_folder import ImportFolder
 from pixlstash.db_models.picture import Picture
+from pixlstash.tasks import missing_watch_folder_import_finder
+from pixlstash.utils import reference_folder_validator
 
 API_PREFIX = "/api/v1"
+
+# A folder is locked with `chmod 000`. Windows does not honour it and root reads
+# through it, so the tests that need a folder the server cannot read skip there.
+_CANNOT_LOCK_A_FOLDER = os.name == "nt" or os.geteuid() == 0
+_LOCK_SKIP_REASON = "chmod 000 does not lock a folder on Windows or for root"
 
 # Upper bound for "the watcher eventually imports the file" polls below. These
 # loops break as soon as the expected pictures appear, so a generous bound costs
@@ -647,6 +660,139 @@ def test_claim_if_settled_requires_a_wall_clock_quiet_window():
     assert finder._claim_if_settled(path, complete, 2 * settle + 60.0) is False
 
 
+@pytest.mark.skipif(_CANNOT_LOCK_A_FOLDER, reason=_LOCK_SKIP_REASON)
+def test_watch_folder_scan_warns_once_per_folder_it_cannot_read(tmp_path, caplog):
+    """A directory the scan cannot list is reported, not skipped in silence.
+
+    ``os.walk`` drops a directory it cannot list unless it is given an
+    ``onerror``, so a locked folder imported nothing and the log said nothing.
+    The scan now logs one warning per watch folder - not one per directory -
+    naming the folder and the error, and only when the set of directories it
+    cannot read changes: the planner scans every cycle, many times a second
+    while it is busy, so a warning per scan repeats the same line without end.
+    One info line says when the folder can be read again.
+
+    A folder behind a parent the server may not enter, and one it may list but
+    not enter, are reported the same way rather than taken for missing or
+    passed over with a debug line per file.
+    """
+    root_locked = tmp_path / "root-locked"
+    part_locked = tmp_path / "part-locked"
+    behind_locked_parent = tmp_path / "gated" / "watch"
+    list_only = tmp_path / "list-only"
+    readable = tmp_path / "readable"
+    unreadable_folders = [root_locked, part_locked, behind_locked_parent, list_only]
+    # Path -> the mode that keeps the scan out of it.
+    locks = {
+        root_locked: 0,
+        part_locked / "locked-a": 0,
+        part_locked / "locked-b": 0,
+        behind_locked_parent.parent: 0,
+        list_only: 0o444,
+    }
+    for path in [*locks, behind_locked_parent, readable / "nested"]:
+        path.mkdir(parents=True, exist_ok=True)
+
+    rows = [
+        ImportFolder(id=index, folder=str(path), label=path.name)
+        for index, path in enumerate([*unreadable_folders, readable], start=1)
+    ]
+    finder = missing_watch_folder_import_finder.MissingWatchFolderImportFinder(
+        database=mock.Mock()
+    )
+    logger_name = missing_watch_folder_import_finder.logger.name
+
+    def ours():
+        return [record for record in caplog.records if record.name == logger_name]
+
+    def logged(level):
+        return [record.getMessage() for record in ours() if record.levelno == level]
+
+    def naming(messages, folder):
+        return [message for message in messages if str(folder) in message]
+
+    def scan(scan_rows=rows):
+        assert finder._find_task_from_db(scan_rows) is None
+
+    denied = os.strerror(errno.EACCES)
+    try:
+        for path, mode in locks.items():
+            path.chmod(mode)
+        assert not os.access(root_locked, os.R_OK), "chmod 000 did not lock it"
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            scan()
+            warnings = logged(logging.WARNING)
+            # One line for each folder it cannot read, none for the readable one.
+            assert {
+                path.name: len(naming(warnings, path))
+                for path in [*unreadable_folders, readable]
+            } == {
+                root_locked.name: 1,
+                part_locked.name: 1,
+                behind_locked_parent.name: 1,
+                list_only.name: 1,
+                readable.name: 0,
+            }
+            for folder in unreadable_folders:
+                (line,) = naming(warnings, folder)
+                assert denied in line
+            # Two locked subdirectories, one line.
+            (part_warning,) = naming(warnings, part_locked)
+            assert "2 directories" in part_warning
+
+            # Nothing changed, so nothing new to say.
+            scan()
+            scan()
+            assert logged(logging.WARNING) == warnings
+            assert logged(logging.INFO) == []
+
+            # One of the two locked subdirectories opens up: that is a change.
+            (part_locked / "locked-a").chmod(0o700)
+            scan()
+            (part_changed,) = logged(logging.WARNING)[len(warnings) :]
+            assert str(part_locked) in part_changed
+            assert "1 directory" in part_changed
+            warnings = logged(logging.WARNING)
+
+            # Everything opens up: one line per folder that was locked, then quiet.
+            for path in locks:
+                path.chmod(0o700)
+            scan()
+            recovered = logged(logging.INFO)
+            for folder in unreadable_folders:
+                (line,) = naming(recovered, folder)
+                assert "can be read again" in line
+            assert naming(recovered, readable) == []
+            assert logged(logging.WARNING) == warnings
+            settled = ours()
+            scan()
+            assert ours() == settled
+
+            # A folder dropped from the list is forgotten, so it warns afresh
+            # when it comes back still locked.
+            root_locked.chmod(0)
+            scan()
+            (relocked,) = logged(logging.WARNING)[len(warnings) :]
+            assert str(root_locked) in relocked
+            settled = ours()
+            scan([row for row in rows if row.folder != str(root_locked)])
+            assert ours() == settled
+            scan()
+            (returned,) = logged(logging.WARNING)[len(warnings) + 1 :]
+            assert str(root_locked) in returned
+            warnings = logged(logging.WARNING)
+
+            # So it does when no folder at all was registered for a while.
+            with mock.patch.object(finder, "_load_db_watch_folders", return_value=[]):
+                assert finder.find_task() is None
+            scan()
+            (after_none,) = logged(logging.WARNING)[len(warnings) :]
+            assert str(root_locked) in after_none
+    finally:
+        for path in locks:
+            path.chmod(0o700)
+
+
 def test_watch_folder_listing_refuses_rather_than_reporting_none():
     """#1177 item 59's import-folder sibling, from the review of #1201.
 
@@ -690,3 +836,89 @@ def test_watch_folder_listing_refuses_rather_than_reporting_none():
                 # And it recovers: the refusal is about this read, not a latch.
                 again = client.get(f"{API_PREFIX}/server-config/watch-folders")
                 assert again.status_code == 200, again.text
+
+
+@pytest.mark.skipif(_CANNOT_LOCK_A_FOLDER, reason=_LOCK_SKIP_REASON)
+def test_import_folder_listing_tells_an_unreadable_folder_from_a_missing_one():
+    """A folder on disk that the server cannot list is listed as unreadable.
+
+    It used to read as healthy: the scan skipped it without a word and the
+    settings row said "Nothing yet" for ever. Adding one stays allowed, as does
+    adding a folder that is not there yet (a drive or mount that comes later),
+    because both can become importable without the owner touching PixlStash.
+
+    Its own server rather than a shared one: locking a folder needs the skip on
+    Windows and for root, which would take the neighbouring test's coverage
+    with it.
+
+    The answer comes from the filesystem alone. A folder whose parent the
+    server may not enter is there but unreadable, not missing; a link into a
+    directory the path rules refuse is still readable, because the scan reads
+    it, so calling it unreadable would be false.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        locked = os.path.join(temp_dir, "locked")
+        readable = os.path.join(temp_dir, "readable")
+        not_there_yet = os.path.join(temp_dir, "not-mounted-yet")
+        gate = os.path.join(temp_dir, "gated")
+        behind_locked_parent = os.path.join(gate, "watch")
+        link_target = os.path.join(temp_dir, "link-target")
+        link = os.path.join(temp_dir, "link")
+        for folder in (locked, readable, behind_locked_parent, link_target):
+            os.makedirs(folder)
+        Image.new("RGB", (1, 1)).save(os.path.join(link_target, "picture.png"))
+        os.symlink(link_target, link)
+        try:
+            os.chmod(locked, 0)
+            assert not os.access(locked, os.R_OK), "chmod 000 did not lock it"
+            with Server(f"{temp_dir}/server-config.json") as server:
+                with TestClient(server.api) as client:
+                    response = client.post(
+                        f"{API_PREFIX}/login",
+                        json={"username": "testuser", "password": "testpassword"},
+                    )
+                    assert response.status_code == 200, response.text
+
+                    for folder in (
+                        locked,
+                        readable,
+                        not_there_yet,
+                        behind_locked_parent,
+                        link,
+                    ):
+                        added = client.post(
+                            f"{API_PREFIX}/import-folders",
+                            json={"folder": folder},
+                        )
+                        assert added.status_code == 200, (folder, added.text)
+
+                    # After registration, as when a parent's permissions change
+                    # or the rules come to refuse where a link points.
+                    os.chmod(gate, 0)
+                    with mock.patch.object(
+                        reference_folder_validator,
+                        "_get_blocklist",
+                        return_value=frozenset({os.path.realpath(link_target)}),
+                    ):
+                        assert (
+                            reference_folder_validator.validate_reference_folder_path(
+                                link
+                            )
+                            is not None
+                        ), "the path rules do not refuse the link's target"
+                        listed = client.get(f"{API_PREFIX}/import-folders")
+                    assert listed.status_code == 200, listed.text
+                    state = {
+                        row["folder"]: (row["missing"], row["unreadable"])
+                        for row in listed.json()["folders"]
+                    }
+                    assert state == {
+                        locked: (False, True),
+                        readable: (False, False),
+                        not_there_yet: (True, False),
+                        behind_locked_parent: (False, True),
+                        link: (False, False),
+                    }
+        finally:
+            os.chmod(locked, 0o700)
+            os.chmod(gate, 0o700)
