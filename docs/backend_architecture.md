@@ -3062,8 +3062,11 @@ people or the faces run out. A face already naming somebody, and that
 somebody, are left out. A picture already extracted is matched at once;
 one not yet extracted gets a `picture_pending_person` row per person (`PicturePendingPerson`, a vault
 table cascading from both `picture` and `character`), which
-`Vault._process_pending_character_assignments` matches and deletes when
-`FaceExtractionTask` completes. A duplicate keeps the people it has, as it
+`Vault._process_pending_character_assignments` matches and deletes once the
+face rows a `FaceExtractionTask` wrote have landed: the task completes with
+them still queued on the writer (`pending_writes`), so the vault chains the
+match, queued at HIGH, on those writes, and a write that failed leaves the
+rows for the next extraction. A duplicate keeps the people it has, as it
 keeps its workflow, and projects are not touched: the run's destination
 decides those. **The request may name the people instead**:
 `RunRequest.character_ids` (the Run popup's *Pictures are of*), when sent, is

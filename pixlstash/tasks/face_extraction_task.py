@@ -1107,8 +1107,11 @@ class FaceExtractionTask(BaseTask):
 
         Called AFTER releasing the inference semaphore so that the SQLite
         commit does not block the next task from starting inference. The
-        caller waits on the returned future before the task completes - see
-        `_run_task` for why that wait is load-bearing.
+        caller does not wait on the returned future: `_run_task` keeps it in
+        ``pending_writes`` and completes with the rows still queued, and
+        whatever needs those rows waits on it instead (the finder releases
+        the pictures' claims, and the vault announces the faces and assigns
+        pending people, only once it has landed).
         """
         if not bulk_faces and not bulk_thumbnail_crops:
             return None
@@ -1121,9 +1124,11 @@ class FaceExtractionTask(BaseTask):
             except IntegrityError:
                 session.rollback()
                 logger.warning(
-                    "Bulk face insert failed (IntegrityError) - skipping batch."
+                    "Bulk face insert failed (IntegrityError) - the batch was "
+                    "rolled back and none of its %s face row(s) were written.",
+                    len(faces),
                 )
-                return
+                raise
 
             for picture_id, crop in crops:
                 picture = session.get(Picture, picture_id)
@@ -1142,8 +1147,11 @@ class FaceExtractionTask(BaseTask):
                 session.rollback()
                 logger.warning("Bulk thumbnail crop update failed: %s", exc)
 
-        # Errors are logged inside bulk_write. HIGH priority so the task's own
-        # completion is not queued behind the LOW writes of other stages.
+        # A face insert that fails fails the returned future, so nothing waiting
+        # on it takes the rows as landed. A crop update that fails is only
+        # logged: the face rows were committed before it. HIGH priority so the
+        # task's own completion is not queued behind the LOW writes of other
+        # stages.
         return self._db.submit_task(
             bulk_write, bulk_faces, bulk_thumbnail_crops, priority=DBPriority.HIGH
         )

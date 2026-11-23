@@ -42,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -60,14 +61,17 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
-from sqlmodel import delete, select, update
+from sqlalchemy import event as sqla_event
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import Session, delete, select, update
 
 from pixlstash import auth, mcp_server
 from pixlstash.authz.policy import AccessPolicy
 from pixlstash.authz.registry import ROUTE_POLICIES
-from pixlstash.database import DBPriority
+from pixlstash.database import DBPriority, WriterState
 from pixlstash.route_inventory import iter_api_route_contexts
 from pixlstash.db_models import (
+    Character,
     Face,
     Picture,
     PicturePendingPerson,
@@ -196,9 +200,12 @@ from pixlstash.services import (
 from pixlstash.server import Server
 from pixlstash.services.comfyui_ui_graph import NO_OBJECT_INFO
 from pixlstash.stacking import parse_workflow_tag_from_filename
+from pixlstash.tasks.base_task import TaskStatus
+from pixlstash.tasks.face_extraction_task import FaceExtractionTask
 from pixlstash.tasks.ghost_cascade_task import GhostCascadeTask
 from pixlstash.tasks.task_type import TaskType
 from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK
+import pixlstash.vault as vault_module
 from tests.authz_guard import (  # noqa: F401
     assert_real_route,
     matched_route_paths,
@@ -20962,6 +20969,448 @@ def test_a_picture_of_two_people_has_its_faces_matched_to_them(runnable, person_
     finally:
         server.vault.db.run_task(clear)
         runnable.owner.delete(f"{API}/characters/{other}")
+
+
+def _finished_face_extraction(vault, *picture_ids):
+    """A ``FaceExtractionTask`` over *picture_ids*, as the runner hands it on.
+
+    Its ``pending_writes`` start empty; a test sets the face writes it left on
+    the writer, which the real task submits and does not wait for.
+    """
+    task = FaceExtractionTask(database=vault.db, engine=None, pictures=[])
+    task.status = TaskStatus.COMPLETED
+    task.result = {
+        "changed_count": len(picture_ids),
+        "changed": [(Picture, picture_id, "faces", None) for picture_id in picture_ids],
+        "picture_ids": list(picture_ids),
+    }
+    return task
+
+
+def test_a_person_waiting_on_faces_gets_one_written_after_extraction_finished(
+    runnable, person_lora
+):
+    """Face extraction finishes before its face rows are written: they wait on
+    the writer behind whatever is running there. Linking the person at that
+    moment found no face and dropped them, and told whoever waited on the
+    faces that they were in. Both have to wait for the rows instead.
+
+    The writer is held by a task of the test's own, so the rows are still
+    queued when the extraction is reported finished, on every run.
+    """
+    server, picture_id = runnable.server, runnable.picture_id
+    vault = server.vault
+    held, release = threading.Event(), threading.Event()
+    queued_by_completion = threading.Event()
+    told: list[bool] = []
+    events: list = []
+
+    def hold(session):
+        held.set()
+        release.wait(timeout=30)
+
+    def pending(session):
+        return session.get(Picture, picture_id).pending_character_id
+
+    def faces(session):
+        return {
+            face.face_index: face.character_id
+            for face in session.exec(
+                select(Face).where(Face.picture_id == picture_id)
+            ).all()
+        }
+
+    def clear(session):
+        session.exec(delete(Face).where(Face.picture_id == picture_id))
+        session.get(Picture, picture_id).pending_character_id = None
+        session.commit()
+
+    try:
+        comfyui_service._assign_outputs_to_lora_people(
+            server, [person_lora], [picture_id]
+        )
+        assert vault.db.run_task(pending) == person_lora
+
+        vault.db.submit_task(hold, priority=DBPriority.LOW)
+        assert held.wait(timeout=10)
+        task = _finished_face_extraction(vault, picture_id)
+        write = task._flush_to_db(
+            [Face(picture_id=picture_id, face_index=0, bbox=[0, 0, 90, 90])], []
+        )
+        task.pending_writes = [write]
+
+        completion = threading.Thread(
+            target=vault._on_task_completed, args=(task, None)
+        )
+        submit = vault.db.submit_task
+
+        def submit_and_mark(func, *args, **kwargs):
+            future = submit(func, *args, **kwargs)
+            if threading.current_thread() is completion:
+                queued_by_completion.set()
+            return future
+
+        told_workers = vault._notify_worker_ids_processed
+
+        def tell_and_record(worker_type, changed):
+            told.append(write.done())
+            told_workers(worker_type, changed)
+
+        runnable.monkeypatch.setattr(vault.db, "submit_task", submit_and_mark)
+        runnable.monkeypatch.setattr(
+            vault, "_notify_worker_ids_processed", tell_and_record
+        )
+        runnable.monkeypatch.setattr(
+            vault, "notify", lambda event, *a, **k: events.append(event)
+        )
+
+        # Until the completion has returned, or has queued work of its own.
+        completion.start()
+        while completion.is_alive() and not queued_by_completion.wait(0.01):
+            continue
+        told_while_queued = list(told)
+        release.set()
+        completion.join(timeout=10)
+        assert not completion.is_alive()
+        write.result(timeout=10)
+        # What the landed rows queued runs ahead of a LOW task.
+        vault.db.run_task(lambda session: None, priority=DBPriority.LOW)
+
+        assert vault.db.run_task(faces) == {0: person_lora}
+        assert vault.db.run_task(pending) is None
+        assert told_while_queued == []
+        assert told == [True]
+        assert events == [EventType.CHANGED_CHARACTERS, EventType.CHANGED_FACES]
+    finally:
+        release.set()
+        vault.db.run_task(clear)
+
+
+def test_a_person_waiting_on_faces_outlasts_a_face_write_that_failed(
+    runnable, person_lora
+):
+    """A write that failed put no face down, so there is nothing to link and
+    nothing to announce: the person waits for the extraction that does."""
+    server, picture_id = runnable.server, runnable.picture_id
+    vault = server.vault
+    told: list = []
+    failed = Future()
+    failed.set_exception(RuntimeError("test-face-write-failed"))
+
+    def pending(session):
+        return session.get(Picture, picture_id).pending_character_id
+
+    def clear(session):
+        session.get(Picture, picture_id).pending_character_id = None
+        session.commit()
+
+    runnable.monkeypatch.setattr(
+        vault,
+        "_notify_worker_ids_processed",
+        lambda worker_type, changed: told.append(changed),
+    )
+    try:
+        comfyui_service._assign_outputs_to_lora_people(
+            server, [person_lora], [picture_id]
+        )
+        task = _finished_face_extraction(vault, picture_id)
+        task.pending_writes = [failed]
+
+        vault._on_task_completed(task, None)
+        vault.db.run_task(lambda session: None, priority=DBPriority.LOW)
+
+        assert vault.db.run_task(pending) == person_lora
+        assert told == []
+    finally:
+        vault.db.run_task(clear)
+
+
+def test_a_person_waiting_on_faces_outlasts_a_face_batch_that_rolled_back(
+    runnable, person_lora
+):
+    """One picture of the batch already has the face it brings, so the batch
+    breaks the unique key and is rolled back whole: the waiting picture got no
+    face either. Its person keeps waiting, nothing is announced, and whoever
+    waits on its faces is not told they are in."""
+    server, picture_id = runnable.server, runnable.picture_id
+    vault = server.vault
+    events: list = []
+    faced: list[int] = []
+    watcher = Future()
+    key = (TaskType.FACE_EXTRACTION, Picture, picture_id, "faces")
+
+    def seed(session):
+        picture = Picture(file_path="test-faced.png", deleted=False)
+        session.add(picture)
+        session.commit()
+        session.add(Face(picture_id=picture.id, face_index=0, bbox=[0, 0, 40, 40]))
+        waiting = session.get(Picture, picture_id)
+        waiting.pending_character_id = person_lora
+        session.add(waiting)
+        session.add(
+            PicturePendingPerson(picture_id=picture_id, character_id=person_lora)
+        )
+        session.commit()
+        faced.append(picture.id)
+
+    def state(session):
+        return {
+            "pending": session.get(Picture, picture_id).pending_character_id,
+            "people": [
+                row.character_id
+                for row in session.exec(
+                    select(PicturePendingPerson).where(
+                        PicturePendingPerson.picture_id == picture_id
+                    )
+                ).all()
+            ],
+            "faces": session.exec(
+                select(Face.id).where(Face.picture_id == picture_id)
+            ).all(),
+        }
+
+    def clear(session):
+        session.exec(delete(Face).where(Face.picture_id.in_([picture_id, *faced])))
+        session.exec(
+            delete(PicturePendingPerson).where(
+                PicturePendingPerson.picture_id == picture_id
+            )
+        )
+        session.exec(delete(Picture).where(Picture.id.in_(faced)))
+        session.get(Picture, picture_id).pending_character_id = None
+        session.commit()
+
+    runnable.monkeypatch.setattr(
+        vault, "notify", lambda event, *a, **k: events.append(event)
+    )
+    try:
+        vault.db.run_task(seed)
+        with vault._planner_watchers_lock:
+            vault._planner_watchers[key] = watcher
+        task = _finished_face_extraction(vault, faced[0], picture_id)
+        write = task._flush_to_db(
+            [
+                Face(picture_id=faced[0], face_index=0, bbox=[0, 0, 90, 90]),
+                Face(picture_id=picture_id, face_index=0, bbox=[0, 0, 90, 90]),
+            ],
+            [],
+        )
+        task.pending_writes = [write]
+
+        vault._on_task_completed(task, None)
+        vault.db.run_task(lambda session: None, priority=DBPriority.LOW)
+
+        assert vault.db.run_task(state) == {
+            "pending": person_lora,
+            "people": [person_lora],
+            "faces": [],
+        }
+        assert not {EventType.CHANGED_CHARACTERS, EventType.CHANGED_FACES} & set(events)
+        assert not watcher.done()
+        assert isinstance(write.exception(timeout=10), IntegrityError)
+    finally:
+        with vault._planner_watchers_lock:
+            vault._planner_watchers.pop(key, None)
+        vault.db.run_task(clear)
+
+
+@pytest.fixture
+def closing_vault(tmp_path):
+    """A vault of the test's own to close: the module's server stays up.
+
+    Without background workers, so closing it releases none of the models the
+    module's server shares. Closed again on the way out, which does nothing
+    once the test has closed it.
+    """
+    vault = vault_module.Vault(
+        image_root=str(tmp_path), disable_background_workers=True
+    )
+    try:
+        yield vault
+    finally:
+        vault.close()
+
+
+def _pictures_waiting_on_a_person(vault):
+    """A person and two faceless pictures waiting on them: by the picture's
+    pending id, and on the second by a ``PicturePendingPerson`` row as well."""
+
+    def add(session):
+        person = Character(name="test-person")
+        session.add(person)
+        session.commit()
+        pictures = [
+            Picture(
+                file_path=f"test-waiting-{i}.png",
+                deleted=False,
+                pending_character_id=person.id,
+            )
+            for i in range(2)
+        ]
+        session.add_all(pictures)
+        session.commit()
+        ids = [picture.id for picture in pictures]
+        session.add(PicturePendingPerson(picture_id=ids[1], character_id=person.id))
+        session.commit()
+        return person.id, ids
+
+    return vault.db.run_task(add)
+
+
+def _hold_face_inserts(engine):
+    """Hold the writer inside its face insert until the returned event is set."""
+    inside, release = threading.Event(), threading.Event()
+
+    def hold(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("INSERT INTO face ") and not release.is_set():
+            inside.set()
+            release.wait(timeout=30)
+
+    sqla_event.listen(engine, "before_cursor_execute", hold)
+    return inside, release
+
+
+def _extraction_writing_faces(vault, picture_ids):
+    """A finished extraction of *picture_ids*, its face rows on the writer."""
+    task = _finished_face_extraction(vault, *picture_ids)
+    task.pending_writes = [
+        task._flush_to_db(
+            [
+                Face(picture_id=picture_id, face_index=0, bbox=[0, 0, 50, 50])
+                for picture_id in picture_ids
+            ],
+            [],
+        )
+    ]
+    return task
+
+
+def _shut(db) -> bool:
+    """True once a close has taken the database: it refuses new work from then
+    on, whether or not the writer has stopped yet."""
+    return db._state in (WriterState.CLOSING, WriterState.CLOSED)
+
+
+def _release_once_closing(db, release, seconds=1.0):
+    """Let the writer go once the close has shut it, or after *seconds* when
+    the close is waiting for it instead."""
+    deadline = time.monotonic() + seconds
+    while not _shut(db) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    release.set()
+
+
+def _faces_and_waiting(engine, picture_ids):
+    with Session(engine) as session:
+        return {
+            "faces": sorted(
+                (face.picture_id, face.character_id)
+                for face in session.exec(
+                    select(Face).where(Face.picture_id.in_(picture_ids))
+                ).all()
+            ),
+            "pending": [
+                session.get(Picture, picture_id).pending_character_id
+                for picture_id in picture_ids
+            ],
+            "people": session.exec(select(PicturePendingPerson.picture_id)).all(),
+        }
+
+
+@pytest.mark.parametrize("busy", ["writing_the_faces", "running_a_task_after_them"])
+def test_a_person_waiting_on_faces_is_matched_before_the_vault_closes(
+    closing_vault, busy
+):
+    """The faces of a finished extraction land, and queue the match of the
+    person waiting on them, while the writer is busy: still writing them, or
+    running a long task queued ahead of the match. Closing the vault then shut
+    the writer with the match still queued, and the person stayed waiting on
+    pictures that have faces. The close waits for the match."""
+    vault = closing_vault
+    db = vault.db
+    engine = db._engine
+    person, ids = _pictures_waiting_on_a_person(vault)
+    inside, release_faces = _hold_face_inserts(engine)
+    task = _extraction_writing_faces(vault, ids)
+    assert inside.wait(timeout=10)
+    busy_until = release_faces
+    if busy == "running_a_task_after_them":
+        running, busy_until = threading.Event(), threading.Event()
+        db.submit_task(
+            lambda session: (running.set(), busy_until.wait(timeout=30)),
+            priority=DBPriority.HIGH,
+        )
+    vault._on_task_completed(task, None)
+    if busy == "running_a_task_after_them":
+        release_faces.set()
+        assert running.wait(timeout=10)
+
+    closer = threading.Thread(target=vault.close)
+    closer.start()
+    _release_once_closing(db, busy_until)
+    closer.join(timeout=30)
+    try:
+        assert not closer.is_alive()
+        assert _faces_and_waiting(engine, ids) == {
+            "faces": [(picture_id, person) for picture_id in ids],
+            "pending": [None, None],
+            "people": [],
+        }
+    finally:
+        engine.dispose()
+    assert vault._face_followups == {}
+
+
+def test_closing_the_vault_waits_for_a_face_match_no_longer_than_its_bound(
+    closing_vault, monkeypatch, caplog
+):
+    """A writer stuck past the bound does not hold the close: it closes anyway,
+    says whose match it left, and lets go of it once the writer is shut."""
+    monkeypatch.setattr(vault_module, "FACE_FOLLOWUP_STOP_WAIT_S", 0.5)
+    vault = closing_vault
+    db = vault.db
+    engine = db._engine
+    _, ids = _pictures_waiting_on_a_person(vault)
+    inside, release_faces = _hold_face_inserts(engine)
+    task = _extraction_writing_faces(vault, ids)
+    assert inside.wait(timeout=10)
+    vault._on_task_completed(task, None)
+
+    closer = threading.Thread(target=vault.close)
+    closer.start()
+    deadline = time.monotonic() + 10
+    while not _shut(db) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    shut_while_held = _shut(db)
+    release_faces.set()
+    closer.join(timeout=30)
+    engine.dispose()
+
+    assert not closer.is_alive()
+    assert shut_while_held
+    assert f"unfinished after 0.5 s, for pictures {ids}" in caplog.text
+    assert vault._face_followups == {}
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled"])
+def test_a_face_write_that_did_not_land_leaves_the_close_nothing_to_wait_for(
+    closing_vault, outcome
+):
+    """Nothing is queued after a write that did not land, so nothing of it is
+    left for the close to wait on."""
+    vault = closing_vault
+    _, ids = _pictures_waiting_on_a_person(vault)
+    write = Future()
+    if outcome == "failed":
+        write.set_exception(RuntimeError("test-face-write-failed"))
+    else:
+        assert write.cancel()
+    task = _finished_face_extraction(vault, *ids)
+    task.pending_writes = [write]
+
+    vault._on_task_completed(task, None)
+
+    assert vault._face_followups == {}
 
 
 def test_an_added_lora_the_graph_already_loads_is_not_added_twice(runnable):
