@@ -1,5 +1,10 @@
+import errno
+import functools
+import hashlib
+import json
 import os
 import shutil
+import stat
 import threading
 import time
 import uuid
@@ -12,6 +17,7 @@ from fastapi import (
     Body,
     File,
     Form,
+    Header,
     HTTPException,
     Request,
     UploadFile,
@@ -76,57 +82,301 @@ _STAGING_MAX_ZIP_DECOMPRESSED_BYTES = 50 * 1024**3  # 50 GB total decompressed
 _STAGING_SESSION_TTL_S = 3600  # evict a session with no activity for this long
 _STAGING_TERMINAL_GRACE_S = 300  # keep a finished session briefly for a last poll
 
+# An ``Idempotency-Key`` longer than this is refused; a UUID needs 36.
+_IDEMPOTENCY_KEY_MAX_LEN = 255
+
+# Write errors that mean the volume holding the staging dir is full or over
+# quota. A batch that hits one is refused with 507 rather than reported as a
+# skipped file, because every later file would fail the same way. EDQUOT is not
+# defined on every platform's errno module.
+_DISK_FULL_ERRNOS = frozenset(
+    {errno.ENOSPC} | ({errno.EDQUOT} if hasattr(errno, "EDQUOT") else set())
+)
+
+# Session stages in which the files belong to an import (or are about to):
+# nothing else may delete them and the session can no longer be cancelled.
+_STAGING_HANDED_OFF_STAGES = ("committing", "importing", "completed", "failed")
+
+
+def _remove_session_dir(server, staging_id: str, session: dict) -> bool:
+    """Remove a session's staging dir; forget the session only once it is gone.
+
+    The caller has claimed the removal by setting ``session["removing"]``
+    under the session lock. A record whose directory could not be removed is
+    kept and the claim dropped, so the reaper still owns the files and retries
+    on its next pass instead of leaving them unreferenced.
+
+    Returns:
+        True when the directory is gone and the record was dropped.
+    """
+    staging_dir = session.get("staging_dir")
+    if staging_dir and os.path.isdir(staging_dir):
+        try:
+            shutil.rmtree(staging_dir)
+        except OSError as exc:
+            logger.warning(
+                "Staging %s: failed to remove staging dir %s (kept for retry): %s",
+                staging_id,
+                staging_dir,
+                exc,
+            )
+    if staging_dir and os.path.lexists(staging_dir):
+        with session["lock"]:
+            session["removing"] = False
+        return False
+    if server.staging_sessions.get(staging_id) is session:
+        server.staging_sessions.pop(staging_id, None)
+    return True
+
+
+def _sweep_orphan_staging_dirs(server, now_ms: int) -> None:
+    """Remove entries under ``.staging/`` that no live session owns.
+
+    Sessions live in memory only, so a restart between upload and import
+    leaves a directory nothing refers to. An entry is removed once it is older
+    than the idle TTL; a fresh one may belong to a session being opened right
+    now. A symlink is unlinked, never followed.
+    """
+    staging_root = os.path.join(server.vault.image_root, ".staging")
+    if os.path.islink(staging_root) or not os.path.isdir(staging_root):
+        return
+    live_ids = set(server.staging_sessions)
+    cutoff_s = now_ms / 1000.0 - _STAGING_SESSION_TTL_S
+    try:
+        names = os.listdir(staging_root)
+    except OSError as exc:
+        logger.warning("Staging reaper: cannot list %s: %s", staging_root, exc)
+        return
+    for name in names:
+        if name in live_ids:
+            continue
+        path = os.path.join(staging_root, name)
+        try:
+            info = os.lstat(path)
+            if info.st_mtime > cutoff_s:
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                # rmtree refuses a path that has become a symlink since lstat.
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+        except OSError as exc:
+            logger.warning(
+                "Staging reaper: failed to remove orphaned entry %s: %s", path, exc
+            )
+            continue
+        logger.info("Staging reaper: removed orphaned staging entry %s", name)
+
 
 def _reap_staging_sessions(server, now_ms: Optional[int] = None) -> None:
     """Evict stale/finished staging sessions and remove their staging dirs.
 
-    * A session whose background import is still running is never touched.
-    * A finished (completed/failed/cancelled) session is popped once it has been
-      idle past ``_STAGING_TERMINAL_GRACE_S`` (leaving a window for a final
-      status poll).
+    * A session that still owns work is never touched: an upload in flight, a
+      commit in progress, or a background import that is pending or running.
+    * A finished session (its import completed, failed or was cancelled, or it
+      was cancelled before commit) is popped once it has been idle past
+      ``_STAGING_TERMINAL_GRACE_S``, counted from its last poll or from when
+      the import finished, whichever is later. That leaves a window for a
+      final status poll.
     * Any other session (e.g. opened but never committed) is popped once idle
-      past ``_STAGING_SESSION_TTL_S``.
+      past ``_STAGING_SESSION_TTL_S``. It is closed under its lock first, so no
+      upload or commit can be admitted while its files are removed.
+    * A session whose directory cannot be removed is kept for the next pass.
+    * Entries under ``.staging/`` that no session owns are swept once older
+      than the idle TTL.
 
     Called opportunistically from the staging routes, so no background thread is
     needed. Safe to call frequently - it only touches disk when it evicts.
     """
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    claimed: list[tuple[str, dict, str, int]] = []
     for staging_id, session in list(server.staging_sessions.items()):
-        task = session.get("task")
-        status_value = (
-            getattr(getattr(task, "status", None), "value", None)
-            if task is not None
-            else None
-        )
-        if status_value in ("pending", "running"):
-            # Active import - never reap it out from under the running task.
-            continue
-        idle_ms = now_ms - int(session.get("last_update_epoch_ms") or 0)
-        terminal = status_value in ("completed", "failed", "cancelled")
-        if terminal and idle_ms > _STAGING_TERMINAL_GRACE_S * 1000:
-            reason = f"finished import (status={status_value})"
-        elif idle_ms > _STAGING_SESSION_TTL_S * 1000:
-            reason = "idle TTL exceeded"
-        else:
-            continue
-        staging_dir = session.get("staging_dir")
-        if staging_dir and os.path.isdir(staging_dir):
-            try:
-                shutil.rmtree(staging_dir)
-            except OSError as exc:
-                logger.warning(
-                    "Staging reaper: failed to remove dir %s for session %s: %s",
-                    staging_dir,
-                    staging_id,
-                    exc,
+        with session["lock"]:
+            if (
+                session["removing"]
+                or session["inflight"] > 0
+                or session["stage"] == "committing"
+            ):
+                continue
+            task = session.get("task")
+            status_value = (
+                getattr(getattr(task, "status", None), "value", None)
+                if task is not None
+                else None
+            )
+            if status_value in ("pending", "running"):
+                # Active import - never reap it out from under the running task.
+                continue
+            last_activity_ms = int(session.get("last_update_epoch_ms") or 0)
+            completed_at = getattr(task, "completed_at", None)
+            if completed_at is not None:
+                last_activity_ms = max(
+                    last_activity_ms, int(completed_at.timestamp() * 1000)
                 )
-        server.staging_sessions.pop(staging_id, None)
-        logger.info(
-            "Staging reaper: evicted session %s (%s, idle=%.0fs)",
-            staging_id,
-            reason,
-            idle_ms / 1000.0,
+            idle_ms = now_ms - last_activity_ms
+            terminal = status_value in ("completed", "failed", "cancelled") or (
+                task is None and session["stage"] == "cancelled"
+            )
+            if terminal and idle_ms > _STAGING_TERMINAL_GRACE_S * 1000:
+                reason = f"finished (stage={session['stage']})"
+            elif idle_ms > _STAGING_SESSION_TTL_S * 1000:
+                reason = "idle TTL exceeded"
+            else:
+                continue
+            session["removing"] = True
+            if session["stage"] == "staging":
+                session["stage"] = "cancelled"
+        claimed.append((staging_id, session, reason, idle_ms))
+
+    for staging_id, session, reason, idle_ms in claimed:
+        if _remove_session_dir(server, staging_id, session):
+            logger.info(
+                "Staging reaper: evicted session %s (%s, idle=%.0fs)",
+                staging_id,
+                reason,
+                idle_ms / 1000.0,
+            )
+
+    _sweep_orphan_staging_dirs(server, now_ms)
+
+
+def _parse_idempotency_key(raw: Optional[str]) -> Optional[str]:
+    """Return the batch identity carried by an ``Idempotency-Key`` header.
+
+    The value is a Structured Field string (RFC 9651), so it normally arrives
+    quoted: ``"8e03978e-40d5-43e8-bc93-6894a57f9324"``. A bare value is
+    accepted too. A value that cannot be a key is refused rather than ignored:
+    a caller that asked for idempotency must never be treated as one that did
+    not.
+
+    Returns:
+        The unquoted key, or ``None`` when the header is absent.
+    """
+    if raw is None:
+        return None
+    value = raw.strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    if (
+        not value
+        or len(value) > _IDEMPOTENCY_KEY_MAX_LEN
+        or any(ch in '"\\' or not 0x20 <= ord(ch) <= 0x7E for ch in value)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_idempotency_key",
+                "message": (
+                    "Idempotency-Key must be a quoted string of 1 to "
+                    f"{_IDEMPOTENCY_KEY_MAX_LEN} printable ASCII characters."
+                ),
+            },
         )
+    return value
+
+
+def _batch_fingerprint(files: list[UploadFile], keys: list[str]) -> str:
+    """Identify a batch's payload: each part's client key, filename and size.
+
+    A retried batch carries the same parts in the same order, so it matches; a
+    different batch sent under a reused key does not. Hashing the content is
+    not needed to tell those apart.
+    """
+    parts = []
+    for index, upload in enumerate(files):
+        handle = upload.file
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(0)
+        parts.append(
+            [keys[index] if index < len(keys) else None, upload.filename or "", size]
+        )
+    encoded = json.dumps(parts, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _staging_conflict(code: str, message: str, session: dict) -> HTTPException:
+    """A 409 that says who owns the session now, so a client can follow the
+    import instead of reporting a failure. Call with the session lock held."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": code,
+            "message": message,
+            "stage": session["stage"],
+            "task_id": session.get("task_id"),
+        },
+    )
+
+
+def _remove_batch_files(staging_id: str, paths: list[str]) -> None:
+    """Delete files an upload wrote that will not be staged: a partial write,
+    or every file of a refused batch, so it leaves nothing behind."""
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning(
+                "Staging %s: failed to remove unstaged file %s: %s",
+                staging_id,
+                path,
+                exc,
+            )
+
+
+def _staging_file_limit(staged: int) -> HTTPException:
+    """The 413 for a batch that would take the session past its file cap.
+
+    The whole batch is refused: none of its files is staged, and the ones
+    already in the session stay as they are.
+    """
+    return HTTPException(
+        status_code=413,
+        detail={
+            "code": "staging_file_limit",
+            "message": (
+                f"Staging session exceeds the maximum of {_STAGING_MAX_FILES:,} files"
+            ),
+            "limit": _STAGING_MAX_FILES,
+            "staged": staged,
+        },
+    )
+
+
+def _staging_disk_full(
+    staging_id: str, staging_dir: str, exc: OSError
+) -> HTTPException:
+    """The 507 for a batch whose write ran out of space on the library volume.
+
+    ``free_bytes`` is what the volume reports now, or ``None`` when it cannot
+    be read.
+    """
+    logger.error(
+        "Staging %s: out of space writing into %s: %s", staging_id, staging_dir, exc
+    )
+    try:
+        free_bytes: Optional[int] = shutil.disk_usage(staging_dir).free
+    except OSError as usage_exc:
+        logger.warning(
+            "Staging %s: cannot read free space of %s: %s",
+            staging_id,
+            staging_dir,
+            usage_exc,
+        )
+        free_bytes = None
+    return HTTPException(
+        status_code=507,
+        detail={
+            "code": "insufficient_storage",
+            "message": (
+                "Not enough disk space to stage the upload. Free up space on "
+                "the library volume and try again."
+            ),
+            "free_bytes": free_bytes,
+        },
+    )
 
 
 class StagingOpenRequest(BaseModel):
@@ -184,6 +434,11 @@ class StagingFilesResponse(BaseModel):
     sidecars: int
     """Total ``.txt`` caption sidecars stored in this session so far."""
 
+    replayed: bool = False
+    """``True`` when this answers a retry of a batch the session already
+    accepted under the same ``Idempotency-Key``: the body is the original
+    answer and nothing was staged again."""
+
 
 class StagingCommitResponse(BaseModel):
     """Response for the safe handoff to the background import task."""
@@ -195,6 +450,10 @@ class StagingCommitResponse(BaseModel):
     """Id of the background ``PictureImportTask`` finishing the import."""
 
     staged_count: int
+
+    replayed: bool = False
+    """``True`` when the session was already handed off: ``task_id`` names the
+    import the first commit started, and no second import was submitted."""
 
 
 class StagingOutcome(BaseModel):
@@ -217,8 +476,24 @@ class StagingStatusResponse(BaseModel):
 
     staging_id: str
     stage: str
-    """One of ``staging`` / ``importing`` / ``completed`` / ``failed`` /
-    ``cancelled``."""
+    """One of ``staging`` / ``committing`` / ``importing`` / ``completed`` /
+    ``failed`` / ``cancelled``. ``committing`` is the short window in which a
+    commit has claimed the session but has not yet started the import."""
+
+    phase: Optional[str] = None
+    """What the import is doing while ``stage`` is ``importing``: ``queued``
+    (waiting for a task worker), ``processing`` (checking each file for
+    duplicates and reading it in), ``persisting`` (writing the new pictures and
+    their project, set and character membership to the library in one go) or
+    ``finalizing`` (restoring Scrapheap matches and removing the staged files).
+    ``None`` in every other stage. ``processed`` stops changing before
+    ``persisting`` starts, and no new picture exists until it ends."""
+
+    cleanup: Optional[str] = None
+    """Set by cancel only: ``done`` when the staged files were removed, or
+    ``deferred`` when they are removed later - by an upload still being
+    received, as it ends, or by the next reaper pass when removal failed now
+    or is already under way."""
 
     staged: int
     total: int
@@ -1182,6 +1457,23 @@ def register_routes(router, server):
             "error": None,
             "created_epoch_ms": now_ms,
             "last_update_epoch_ms": now_ms,
+            # Ownership of the staged files (see the stage rules on the routes
+            # below). The lock guards every read-modify-write of this record
+            # and is only ever held for bookkeeping, never across an await or
+            # disk I/O.
+            "lock": threading.Lock(),
+            # Upload requests admitted and not yet settled. While any is in
+            # flight nobody may commit, reap or delete the files.
+            "inflight": 0,
+            # A cancel arrived while uploads were in flight: the last of them
+            # removes the files as it ends.
+            "cleanup_pending": False,
+            # A cancel, the reaper or the last upload after a cancel has
+            # claimed the removal of this session's files.
+            "removing": False,
+            # Idempotency-Key -> {"fingerprint", "state", "response"} for the
+            # upload batches of this session; they expire with it.
+            "batches": {},
         }
         logger.info(
             "Staging session opened: staging_id=%s declared_total=%d project_id=%s "
@@ -1200,7 +1492,19 @@ def register_routes(router, server):
         description=(
             "Streams one batch of media files into an open staging session. "
             "May be called repeatedly during the unsafe (tab-open) window. "
-            "Unsupported or empty files are skipped and reported."
+            "Unsupported or empty files are skipped and reported. A batch is "
+            "staged whole or not at all: a refused batch (409, 413, 507) leaves "
+            "none of its files behind.\n\n"
+            "Retrying safely: send an `Idempotency-Key` header, a quoted string "
+            "such as a UUID, chosen once per batch and reused by every retry of "
+            "it. A retry of a batch the session already accepted returns the "
+            'original answer with `"replayed": true` and stages nothing again. '
+            "A retry while the first attempt is still being staged gets 409 "
+            "`batch_in_progress`. The same key sent with different files gets "
+            "422 `idempotency_key_mismatch`. Keys are scoped to the staging "
+            "session and expire with it: when the session is reaped (idle for "
+            "an hour, or a few minutes after its import finished) its keys are "
+            "forgotten. Without the header every request stages its files."
         ),
         response_model=StagingFilesResponse,
     )
@@ -1209,48 +1513,105 @@ def register_routes(router, server):
         staging_id: str,
         file: list[UploadFile] = File(None),
         key: list[str] = Form(None),
+        idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     ):
         session = _get_session_or_404(request, staging_id)
-        if session["stage"] != "staging":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Staging session is no longer accepting files "
-                    f"(stage={session['stage']})"
-                ),
-            )
-        if not file:
-            raise HTTPException(status_code=400, detail="No files provided")
-
-        staging_dir = session["staging_dir"]
-        staged_files: list[dict] = session["staged_files"]
-        sidecar_text_by_stem: dict[str, str] = session["sidecar_text_by_stem"]
-        received: list[str] = []
-        skipped: list[str] = []
+        batch_key = _parse_idempotency_key(idempotency_key)
         # The client's own handle for each file, sent as one ``key`` field per
         # ``file`` in the same order. Carried onto the staged entry so the
         # import can say which file each outcome belongs to (#2512). Optional:
         # a caller that sends none gets ``None`` keys.
         keys: list[str] = list(key or [])
+        fingerprint = _batch_fingerprint(file, keys) if batch_key and file else None
+
+        # Admission. An admitted request holds an upload lease (``inflight``)
+        # until its ``finally``: while any is held nobody commits, reaps or
+        # deletes the session's files.
+        record: Optional[dict] = None
+        with session["lock"]:
+            if batch_key is not None and batch_key in session["batches"]:
+                known = session["batches"][batch_key]
+                if known["fingerprint"] != fingerprint:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "code": "idempotency_key_mismatch",
+                            "message": (
+                                "This Idempotency-Key was already used for a "
+                                "different batch in this staging session."
+                            ),
+                        },
+                    )
+                if known["state"] == "in_progress":
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "batch_in_progress",
+                            "message": (
+                                "This batch is still being staged by an earlier "
+                                "request. Retry once that request has finished."
+                            ),
+                        },
+                    )
+                logger.info(
+                    "Staging %s: batch %s already staged; returning its answer",
+                    staging_id,
+                    batch_key,
+                )
+                return {**known["response"], "replayed": True}
+            if session["stage"] != "staging":
+                raise _staging_conflict(
+                    "staging_closed",
+                    "Staging session is no longer accepting files "
+                    f"(stage={session['stage']})",
+                    session,
+                )
+            if not file:
+                raise HTTPException(status_code=400, detail="No files provided")
+            session["inflight"] += 1
+            if batch_key is not None:
+                record = {
+                    "fingerprint": fingerprint,
+                    "state": "in_progress",
+                    "response": None,
+                }
+                session["batches"][batch_key] = record
+
+        staging_dir = session["staging_dir"]
+        # This batch's entries and sidecars join the session only once every
+        # file of the batch is on disk (the publish step below), so a refused
+        # or failed batch never leaves part of itself staged.
+        batch_entries: list[dict] = []
+        batch_sidecars: dict[str, str] = {}
+        # Every file this batch created, removed again if the batch is refused.
+        written_paths: list[str] = []
+        received: list[str] = []
+        skipped: list[str] = []
         current_key: Optional[str] = None
+        published = False
+
+        def _check_file_cap() -> None:
+            # Stops an oversized batch before it writes the rest of its files.
+            # The binding check is the one at publish, under the lock, which
+            # also sees batches staged concurrently.
+            staged = len(session["staged_files"])
+            if staged + len(batch_entries) >= _STAGING_MAX_FILES:
+                raise _staging_file_limit(staged)
 
         def _stage_media_bytes(data: bytes, ext: str, original_name: str) -> bool:
             """Write already-read media bytes into the staging dir (zip entries)."""
             if not data:
                 return False
-            if len(staged_files) >= _STAGING_MAX_FILES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"Staging session exceeds the maximum of "
-                        f"{_STAGING_MAX_FILES:,} files"
-                    ),
-                )
+            _check_file_cap()
             dest_path = os.path.join(staging_dir, f"{uuid.uuid4()}{ext}")
+            written_paths.append(dest_path)
             try:
                 with open(dest_path, "wb") as out:
                     out.write(data)
             except OSError as exc:
+                _remove_batch_files(staging_id, [dest_path])
+                if exc.errno in _DISK_FULL_ERRNOS:
+                    raise _staging_disk_full(staging_id, staging_dir, exc) from exc
                 logger.error(
                     "Staging %s: failed to write extracted file %s: %s",
                     staging_id,
@@ -1258,7 +1619,7 @@ def register_routes(router, server):
                     exc,
                 )
                 return False
-            staged_files.append(
+            batch_entries.append(
                 {
                     "file_path": dest_path,
                     "original_file_name": os.path.basename(original_name),
@@ -1267,223 +1628,248 @@ def register_routes(router, server):
             )
             return True
 
-        for upload_index, upload in enumerate(file):
-            current_key = keys[upload_index] if upload_index < len(keys) else None
-            if not upload.filename:
-                continue
-            ext = os.path.splitext(upload.filename)[1].lower()
+        try:
+            for upload_index, upload in enumerate(file):
+                current_key = keys[upload_index] if upload_index < len(keys) else None
+                if not upload.filename:
+                    continue
+                ext = os.path.splitext(upload.filename)[1].lower()
 
-            # --- Caption sidecar (.txt): stored by stem, matched to an image at
-            # commit; mirrors the one-shot import's sidecar_text_by_stem. ---
-            if ext in STAGING_ALLOWED_CAPTION_EXTS:
-                try:
-                    await upload.seek(0)
-                    raw = await upload.read()
-                    sidecar_text_by_stem.setdefault(
-                        _normalise_sidecar_stem(upload.filename),
-                        raw.decode("utf-8", errors="ignore"),
-                    )
-                    received.append(upload.filename)
-                except Exception as exc:
-                    logger.warning(
-                        "Staging %s: failed to read sidecar %s: %s",
-                        staging_id,
-                        upload.filename,
-                        exc,
-                    )
-                    skipped.append(upload.filename)
-                continue
-
-            # --- Zip archive: extract server-side into the staging area,
-            # mirroring the one-shot import's zip handling (media entries staged,
-            # .txt entries stored as sidecars, same entry/size guards). ---
-            if ext == ".zip":
-                try:
-                    await upload.seek(0)
-                    upload_file = upload.file
-                    upload_file.seek(0, 2)
-                    upload_size = upload_file.tell()
-                    upload_file.seek(0)
-                    if upload_size == 0:
-                        skipped.append(upload.filename)
-                        continue
-                    if upload_size > _STAGING_MAX_FILE_BYTES:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(
-                                f"Zip '{upload.filename}' exceeds the "
-                                f"{_STAGING_MAX_FILE_BYTES // 1024**3} GB limit"
-                            ),
+                # --- Caption sidecar (.txt): stored by stem, matched to an
+                # image at commit; mirrors the one-shot import's
+                # sidecar_text_by_stem. ---
+                if ext in STAGING_ALLOWED_CAPTION_EXTS:
+                    try:
+                        await upload.seek(0)
+                        raw = await upload.read()
+                        batch_sidecars.setdefault(
+                            _normalise_sidecar_stem(upload.filename),
+                            raw.decode("utf-8", errors="ignore"),
                         )
-                    with zipfile.ZipFile(upload_file) as zip_file:
-                        entries = [i for i in zip_file.infolist() if not i.is_dir()]
-                        if len(entries) > _STAGING_MAX_ZIP_ENTRIES:
-                            raise HTTPException(
-                                status_code=413,
-                                detail=(
-                                    f"Zip '{upload.filename}' contains too many "
-                                    f"files (max {_STAGING_MAX_ZIP_ENTRIES:,})."
-                                ),
-                            )
-                        if (
-                            sum(i.file_size for i in entries)
-                            > _STAGING_MAX_ZIP_DECOMPRESSED_BYTES
-                        ):
-                            raise HTTPException(
-                                status_code=413,
-                                detail=(
-                                    f"Zip '{upload.filename}' decompressed size "
-                                    f"exceeds the "
-                                    f"{_STAGING_MAX_ZIP_DECOMPRESSED_BYTES // 1024**3}"
-                                    " GB limit."
-                                ),
-                            )
-                        added = 0
-                        for info in entries:
-                            inner_ext = os.path.splitext(info.filename)[1].lower()
-                            base_name = os.path.basename(info.filename)
-                            if inner_ext in STAGING_ALLOWED_CAPTION_EXTS:
-                                with zip_file.open(info) as handle:
-                                    data = handle.read()
-                                if data:
-                                    sidecar_text_by_stem.setdefault(
-                                        _normalise_sidecar_stem(base_name),
-                                        data.decode("utf-8", errors="ignore"),
-                                    )
-                                continue
-                            if inner_ext not in STAGING_ALLOWED_MEDIA_EXTS:
-                                continue
-                            with zip_file.open(info) as handle:
-                                data = handle.read()
-                            if _stage_media_bytes(data, inner_ext, base_name):
-                                added += 1
-                        if added:
-                            received.append(upload.filename)
-                        else:
-                            logger.warning(
-                                "Staging %s: no valid media in zip %s",
-                                staging_id,
-                                upload.filename,
-                            )
-                            skipped.append(upload.filename)
-                except HTTPException:
-                    raise
-                except zipfile.BadZipFile:
-                    logger.error(
-                        "Staging %s: invalid zip file %s",
-                        staging_id,
-                        upload.filename,
-                    )
-                    skipped.append(upload.filename)
-                continue
+                        received.append(upload.filename)
+                    except Exception as exc:
+                        logger.warning(
+                            "Staging %s: failed to read sidecar %s: %s",
+                            staging_id,
+                            upload.filename,
+                            exc,
+                        )
+                        skipped.append(upload.filename)
+                    continue
 
-            # --- Plain media: stream to disk to avoid buffering a large file. ---
-            if ext not in STAGING_ALLOWED_MEDIA_EXTS:
-                logger.warning(
-                    "Staging %s: skipping unsupported file %s",
-                    staging_id,
-                    upload.filename,
-                )
-                skipped.append(upload.filename)
-                continue
-            if len(staged_files) >= _STAGING_MAX_FILES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"Staging session exceeds the maximum of "
-                        f"{_STAGING_MAX_FILES:,} files"
-                    ),
-                )
-            dest_name = f"{uuid.uuid4()}{ext}"
-            dest_path = os.path.join(staging_dir, dest_name)
-            written = 0
-            try:
-                await upload.seek(0)
-                with open(dest_path, "wb") as out:
-                    while True:
-                        chunk = await upload.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > _STAGING_MAX_FILE_BYTES:
+                # --- Zip archive: extract server-side into the staging area,
+                # mirroring the one-shot import's zip handling (media entries
+                # staged, .txt entries stored as sidecars, same entry/size
+                # guards). ---
+                if ext == ".zip":
+                    try:
+                        await upload.seek(0)
+                        upload_file = upload.file
+                        upload_file.seek(0, 2)
+                        upload_size = upload_file.tell()
+                        upload_file.seek(0)
+                        if upload_size == 0:
+                            skipped.append(upload.filename)
+                            continue
+                        if upload_size > _STAGING_MAX_FILE_BYTES:
                             raise HTTPException(
                                 status_code=413,
                                 detail=(
-                                    f"File '{upload.filename}' exceeds the "
+                                    f"Zip '{upload.filename}' exceeds the "
                                     f"{_STAGING_MAX_FILE_BYTES // 1024**3} GB limit"
                                 ),
                             )
-                        out.write(chunk)
-            except HTTPException:
-                if os.path.isfile(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except OSError as exc:
-                        logger.warning(
-                            "Staging %s: failed to clean up rejected file %s: %s",
+                        with zipfile.ZipFile(upload_file) as zip_file:
+                            entries = [i for i in zip_file.infolist() if not i.is_dir()]
+                            if len(entries) > _STAGING_MAX_ZIP_ENTRIES:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=(
+                                        f"Zip '{upload.filename}' contains too "
+                                        f"many files (max "
+                                        f"{_STAGING_MAX_ZIP_ENTRIES:,})."
+                                    ),
+                                )
+                            if (
+                                sum(i.file_size for i in entries)
+                                > _STAGING_MAX_ZIP_DECOMPRESSED_BYTES
+                            ):
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=(
+                                        f"Zip '{upload.filename}' decompressed "
+                                        f"size exceeds the "
+                                        f"{_STAGING_MAX_ZIP_DECOMPRESSED_BYTES // 1024**3}"
+                                        " GB limit."
+                                    ),
+                                )
+                            added = 0
+                            for info in entries:
+                                inner_ext = os.path.splitext(info.filename)[1].lower()
+                                base_name = os.path.basename(info.filename)
+                                if inner_ext in STAGING_ALLOWED_CAPTION_EXTS:
+                                    with zip_file.open(info) as handle:
+                                        data = handle.read()
+                                    if data:
+                                        batch_sidecars.setdefault(
+                                            _normalise_sidecar_stem(base_name),
+                                            data.decode("utf-8", errors="ignore"),
+                                        )
+                                    continue
+                                if inner_ext not in STAGING_ALLOWED_MEDIA_EXTS:
+                                    continue
+                                with zip_file.open(info) as handle:
+                                    data = handle.read()
+                                if _stage_media_bytes(data, inner_ext, base_name):
+                                    added += 1
+                            if added:
+                                received.append(upload.filename)
+                            else:
+                                logger.warning(
+                                    "Staging %s: no valid media in zip %s",
+                                    staging_id,
+                                    upload.filename,
+                                )
+                                skipped.append(upload.filename)
+                    except HTTPException:
+                        raise
+                    except zipfile.BadZipFile:
+                        logger.error(
+                            "Staging %s: invalid zip file %s",
                             staging_id,
-                            dest_path,
-                            exc,
+                            upload.filename,
                         )
-                raise
-            except Exception as exc:
-                logger.error(
-                    "Staging %s: failed to write %s to %s: %s",
-                    staging_id,
-                    upload.filename,
-                    dest_path,
-                    exc,
-                )
-                skipped.append(upload.filename)
-                if os.path.isfile(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except OSError as cleanup_exc:
-                        logger.warning(
-                            "Staging %s: failed to clean up partial file %s: %s",
-                            staging_id,
-                            dest_path,
-                            cleanup_exc,
-                        )
-                continue
-            if written == 0:
-                skipped.append(upload.filename)
-                if os.path.isfile(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except OSError as exc:
-                        logger.warning(
-                            "Staging %s: failed to remove empty file %s: %s",
-                            staging_id,
-                            dest_path,
-                            exc,
-                        )
-                continue
-            staged_files.append(
-                {
-                    "file_path": dest_path,
-                    "original_file_name": os.path.basename(upload.filename),
-                    "client_key": current_key,
-                }
-            )
-            received.append(upload.filename)
+                        skipped.append(upload.filename)
+                    continue
 
-        session["last_update_epoch_ms"] = int(time.time() * 1000)
+                # --- Plain media: stream to disk to avoid buffering a large
+                # file. ---
+                if ext not in STAGING_ALLOWED_MEDIA_EXTS:
+                    logger.warning(
+                        "Staging %s: skipping unsupported file %s",
+                        staging_id,
+                        upload.filename,
+                    )
+                    skipped.append(upload.filename)
+                    continue
+                _check_file_cap()
+                dest_name = f"{uuid.uuid4()}{ext}"
+                dest_path = os.path.join(staging_dir, dest_name)
+                written_paths.append(dest_path)
+                written = 0
+                try:
+                    await upload.seek(0)
+                    with open(dest_path, "wb") as out:
+                        while True:
+                            chunk = await upload.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            written += len(chunk)
+                            if written > _STAGING_MAX_FILE_BYTES:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=(
+                                        f"File '{upload.filename}' exceeds the "
+                                        f"{_STAGING_MAX_FILE_BYTES // 1024**3} GB "
+                                        "limit"
+                                    ),
+                                )
+                            out.write(chunk)
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    _remove_batch_files(staging_id, [dest_path])
+                    if isinstance(exc, OSError) and exc.errno in _DISK_FULL_ERRNOS:
+                        raise _staging_disk_full(staging_id, staging_dir, exc) from exc
+                    logger.error(
+                        "Staging %s: failed to write %s to %s: %s",
+                        staging_id,
+                        upload.filename,
+                        dest_path,
+                        exc,
+                    )
+                    skipped.append(upload.filename)
+                    continue
+                if written == 0:
+                    skipped.append(upload.filename)
+                    _remove_batch_files(staging_id, [dest_path])
+                    continue
+                batch_entries.append(
+                    {
+                        "file_path": dest_path,
+                        "original_file_name": os.path.basename(upload.filename),
+                        "client_key": current_key,
+                    }
+                )
+                received.append(upload.filename)
+
+            # Publish: the whole batch joins the session at once, and only if
+            # the session is still open and has room for all of it.
+            with session["lock"]:
+                if session["stage"] != "staging":
+                    raise _staging_conflict(
+                        "staging_closed",
+                        "Staging session stopped accepting files while this "
+                        f"batch was uploading (stage={session['stage']})",
+                        session,
+                    )
+                staged_files: list[dict] = session["staged_files"]
+                if len(staged_files) + len(batch_entries) > _STAGING_MAX_FILES:
+                    raise _staging_file_limit(len(staged_files))
+                staged_files.extend(batch_entries)
+                sidecar_text_by_stem: dict[str, str] = session["sidecar_text_by_stem"]
+                for stem, text in batch_sidecars.items():
+                    sidecar_text_by_stem.setdefault(stem, text)
+                response = {
+                    "staging_id": staging_id,
+                    "staged": len(staged_files),
+                    "received": received,
+                    "skipped": skipped,
+                    "sidecars": len(sidecar_text_by_stem),
+                    "replayed": False,
+                }
+                if record is not None:
+                    record["state"] = "done"
+                    record["response"] = dict(response)
+                session["last_update_epoch_ms"] = int(time.time() * 1000)
+                published = True
+        finally:
+            if not published:
+                _remove_batch_files(staging_id, written_paths)
+            with session["lock"]:
+                if (
+                    not published
+                    and record is not None
+                    and session["batches"].get(batch_key) is record
+                ):
+                    # A refused attempt is not remembered: it left nothing
+                    # staged, so the client may simply send it again.
+                    del session["batches"][batch_key]
+                session["inflight"] -= 1
+                finish_cancel = (
+                    session["cleanup_pending"]
+                    and session["inflight"] == 0
+                    and not session["removing"]
+                )
+                if finish_cancel:
+                    session["cleanup_pending"] = False
+                    session["removing"] = True
+            if finish_cancel and _remove_session_dir(server, staging_id, session):
+                logger.info(
+                    "Staging %s: removed the cancelled session's files after its "
+                    "last upload ended",
+                    staging_id,
+                )
+
         logger.debug(
             "Staging %s: received %d, skipped %d, total staged %d, sidecars %d",
             staging_id,
             len(received),
             len(skipped),
-            len(staged_files),
-            len(sidecar_text_by_stem),
+            response["staged"],
+            response["sidecars"],
         )
-        return {
-            "staging_id": staging_id,
-            "staged": len(staged_files),
-            "received": received,
-            "skipped": skipped,
-            "sidecars": len(sidecar_text_by_stem),
-        }
+        return response
 
     @router.post(
         "/pictures/import/staging/{staging_id}/commit",
@@ -1493,68 +1879,129 @@ def register_routes(router, server):
             "background PictureImportTask on the shared task runner. The import "
             "completes server-side (the safe window); the tab may now close. "
             "Progress is reported via GET "
-            "/pictures/import/staging/{staging_id}/status and the task manager."
+            "/pictures/import/staging/{staging_id}/status and the task manager.\n\n"
+            "Commit is idempotent per staging session: once a commit has started "
+            'the import, a repeat returns the same `task_id` with `"replayed": '
+            "true` and starts nothing. A commit while another is still handing "
+            "the session over gets 409 `commit_in_progress`; while an upload is "
+            "still being received, 409 `uploads_in_flight`; after a cancel, 409 "
+            "`staging_closed`. Each 409 body carries the session's `stage` and "
+            "`task_id`. While the import runs it holds the library, so a library "
+            "switch is refused until it ends."
         ),
         response_model=StagingCommitResponse,
     )
     def commit_staging_session(request: Request, staging_id: str):
         session = _get_session_or_404(request, staging_id)
-        if session["stage"] != "staging":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Staging session already handed off (stage={session['stage']})",
-            )
-        staged_files: list[dict] = session["staged_files"]
-        if not staged_files:
-            raise HTTPException(status_code=400, detail="No staged files to import")
-        face_worker_problem = server.vault.worker_unavailable_reason(
-            TaskType.FACE_EXTRACTION
-        )
-        if face_worker_problem:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot import: {face_worker_problem}.",
-            )
+        # The transition to ``committing`` is taken under the lock, so exactly
+        # one commit builds the import; a repeat after it succeeded gets its
+        # task id back.
+        with session["lock"]:
+            if session.get("task_id") is not None:
+                logger.info(
+                    "Staging %s: commit repeated; import %s already started",
+                    staging_id,
+                    session["task_id"],
+                )
+                return {
+                    "staging_id": staging_id,
+                    "task_id": session["task_id"],
+                    "staged_count": len(session["staged_files"]),
+                    "replayed": True,
+                }
+            if session["stage"] == "committing":
+                raise _staging_conflict(
+                    "commit_in_progress",
+                    "This staging session is already being handed to the import.",
+                    session,
+                )
+            if session["stage"] != "staging":
+                raise _staging_conflict(
+                    "staging_closed",
+                    "Staging session can no longer be committed "
+                    f"(stage={session['stage']})",
+                    session,
+                )
+            if session["inflight"] > 0:
+                raise _staging_conflict(
+                    "uploads_in_flight",
+                    "Files are still being uploaded into this staging session. "
+                    "Commit once every upload has finished.",
+                    session,
+                )
+            if not session["staged_files"]:
+                raise HTTPException(status_code=400, detail="No staged files to import")
+            session["stage"] = "committing"
+            staged_files: list[dict] = list(session["staged_files"])
+            sidecar_text_by_stem: dict[str, str] = dict(session["sidecar_text_by_stem"])
 
-        # Re-validate the drop target at handoff (it may have been deleted/locked
-        # since open); still fail loudly rather than silently skip association.
-        _validate_association_targets(
-            session["set_id"], session["character_id"], session["project_id"]
-        )
-
-        # Resolve caption sidecars to their images by basename stem, parsing each
-        # via the one-shot import's tag rule (comma-separated tag lists). Orphan
-        # sidecars (no matching staged image) are logged and skipped, not applied.
-        sidecar_text_by_stem: dict[str, str] = session["sidecar_text_by_stem"]
-        sidecar_tags_by_stem: dict[str, list[str]] = {}
-        if sidecar_text_by_stem:
-            media_stems = {
-                _normalise_sidecar_stem(entry.get("original_file_name") or "")
-                for entry in staged_files
-            }
-            for stem, raw_text in sidecar_text_by_stem.items():
-                if stem not in media_stems:
-                    logger.info(
-                        "Staging %s: caption sidecar '%s' has no matching image; "
-                        "skipping",
-                        staging_id,
-                        stem,
-                    )
-                    continue
-                parsed = _parse_sidecar_tags(raw_text)
-                if parsed:
-                    sidecar_tags_by_stem[stem] = parsed
-
-        # Guard against committing more than the vault can hold: the background
-        # import copies each staged file into the canonical vault location before
-        # the staging dir is removed, so it briefly needs room for both.
+        task: Optional[PictureImportTask] = None
+        library_lease = None
         try:
-            staged_bytes = sum(
-                os.path.getsize(entry["file_path"])
-                for entry in staged_files
-                if entry.get("file_path") and os.path.isfile(entry["file_path"])
+            face_worker_problem = server.vault.worker_unavailable_reason(
+                TaskType.FACE_EXTRACTION
             )
-            free_bytes = shutil.disk_usage(server.vault.image_root).free
+            if face_worker_problem:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot import: {face_worker_problem}.",
+                )
+
+            # Re-validate the drop target at handoff (it may have been
+            # deleted/locked since open); still fail loudly rather than
+            # silently skip association.
+            _validate_association_targets(
+                session["set_id"], session["character_id"], session["project_id"]
+            )
+
+            # Resolve caption sidecars to their images by basename stem, parsing
+            # each via the one-shot import's tag rule (comma-separated tag
+            # lists). Orphan sidecars (no matching staged image) are logged and
+            # skipped, not applied.
+            sidecar_tags_by_stem: dict[str, list[str]] = {}
+            if sidecar_text_by_stem:
+                media_stems = {
+                    _normalise_sidecar_stem(entry.get("original_file_name") or "")
+                    for entry in staged_files
+                }
+                for stem, raw_text in sidecar_text_by_stem.items():
+                    if stem not in media_stems:
+                        logger.info(
+                            "Staging %s: caption sidecar '%s' has no matching "
+                            "image; skipping",
+                            staging_id,
+                            stem,
+                        )
+                        continue
+                    parsed = _parse_sidecar_tags(raw_text)
+                    if parsed:
+                        sidecar_tags_by_stem[stem] = parsed
+
+            # Guard against committing more than the vault can hold: the
+            # background import copies each staged file into the canonical vault
+            # location before the staging dir is removed, so it briefly needs
+            # room for both. A volume whose free space cannot be read is refused
+            # too: starting an import that may not fit is not a safe default.
+            try:
+                staged_bytes = sum(
+                    os.path.getsize(entry["file_path"])
+                    for entry in staged_files
+                    if entry.get("file_path") and os.path.isfile(entry["file_path"])
+                )
+                free_bytes = shutil.disk_usage(server.vault.image_root).free
+            except OSError as exc:
+                logger.error(
+                    "Staging %s: cannot check free space before import: %s",
+                    staging_id,
+                    exc,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Cannot import: could not check free space on the "
+                        f"library volume ({exc.strerror or exc})."
+                    ),
+                ) from exc
             if int(staged_bytes * 1.1) > free_bytes:
                 raise HTTPException(
                     status_code=507,
@@ -1564,34 +2011,52 @@ def register_routes(router, server):
                         f"{free_bytes / 1024**3:.2f} GB free)."
                     ),
                 )
-        except HTTPException:
-            raise
-        except OSError as exc:
-            logger.warning(
-                "Staging %s: disk-space check failed (proceeding): %s",
-                staging_id,
-                exc,
-            )
 
-        task = PictureImportTask(
-            server.vault,
-            list(staged_files),
-            project_id=session["project_id"],
-            set_id=session["set_id"],
-            character_id=session["character_id"],
-            sidecar_tags_by_stem=sidecar_tags_by_stem,
-            staging_id=staging_id,
-            staging_dir=session["staging_dir"],
-            origin_client_id=session["origin_client_id"],
-            restore_context=operation_log_service.request_context(request),
-        )
-        task_id = server.vault.submit_task(task)
-        if task_id is None:
-            raise HTTPException(status_code=503, detail="Task runner is not available")
-        session["task"] = task
-        session["task_id"] = task_id
-        session["stage"] = "importing"
-        session["last_update_epoch_ms"] = int(time.time() * 1000)
+            # The import holds the library until it settles, so a library
+            # switch cannot close the vault under it. The task runner's
+            # completion callback releases the lease (see Vault).
+            library_lease = server.library_coordinator.acquire_read()
+            if library_lease is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="The library is switching or unavailable. Try again.",
+                )
+            task = PictureImportTask(
+                server.vault,
+                staged_files,
+                project_id=session["project_id"],
+                set_id=session["set_id"],
+                character_id=session["character_id"],
+                sidecar_tags_by_stem=sidecar_tags_by_stem,
+                staging_id=staging_id,
+                staging_dir=session["staging_dir"],
+                origin_client_id=session["origin_client_id"],
+                restore_context=operation_log_service.request_context(request),
+                library_lease_release=functools.partial(
+                    server.library_coordinator.release_read, library_lease
+                ),
+            )
+            task_id = server.vault.submit_task(task)
+            if task_id is None:
+                raise HTTPException(
+                    status_code=503, detail="Task runner is not available"
+                )
+        except BaseException:
+            # Refused before the import started: the session goes back to
+            # accepting files and the library is let go.
+            if task is not None:
+                task.release_library_lease()
+            elif library_lease is not None:
+                server.library_coordinator.release_read(library_lease)
+            with session["lock"]:
+                session["stage"] = "staging"
+            raise
+
+        with session["lock"]:
+            session["task"] = task
+            session["task_id"] = task_id
+            session["stage"] = "importing"
+            session["last_update_epoch_ms"] = int(time.time() * 1000)
         logger.info(
             "Staging session committed: staging_id=%s task_id=%s staged_count=%d",
             staging_id,
@@ -1602,6 +2067,7 @@ def register_routes(router, server):
             "staging_id": staging_id,
             "task_id": task_id,
             "staged_count": len(staged_files),
+            "replayed": False,
         }
 
     @router.delete(
@@ -1610,41 +2076,51 @@ def register_routes(router, server):
         description=(
             "Cancels an async import staging session that has not yet been "
             "committed, discarding its streamed files. After commit the import "
-            "runs to completion in the background and cannot be cancelled here."
+            "runs to completion in the background and cannot be cancelled here "
+            "(409 `import_committed`, with the session's `stage` and `task_id`). "
+            "If an upload is still being received, the files are removed when "
+            'it ends and the answer says `"cleanup": "deferred"`; that upload '
+            "is refused with 409 `staging_closed`."
         ),
         response_model=StagingStatusResponse,
     )
     def cancel_staging_session(request: Request, staging_id: str):
         session = _get_session_or_404(request, staging_id)
-        if session["stage"] not in ("staging",):
-            raise HTTPException(
-                status_code=409,
-                detail=(
+        with session["lock"]:
+            if (
+                session.get("task_id") is not None
+                or session["stage"] in _STAGING_HANDED_OFF_STAGES
+            ):
+                raise _staging_conflict(
+                    "import_committed",
                     "Cannot cancel a committed staging session "
-                    f"(stage={session['stage']})"
-                ),
-            )
-        staging_dir = session.get("staging_dir")
-        if staging_dir and os.path.isdir(staging_dir):
-            try:
-                shutil.rmtree(staging_dir)
-            except OSError as exc:
-                logger.warning(
-                    "Staging %s: failed to remove staging dir %s on cancel: %s",
-                    staging_id,
-                    staging_dir,
-                    exc,
+                    f"(stage={session['stage']})",
+                    session,
                 )
-        session["stage"] = "cancelled"
-        session["last_update_epoch_ms"] = int(time.time() * 1000)
-        server.staging_sessions.pop(staging_id, None)
-        logger.info("Staging session cancelled: staging_id=%s", staging_id)
+            session["stage"] = "cancelled"
+            session["last_update_epoch_ms"] = int(time.time() * 1000)
+            staged_count = len(session["staged_files"])
+            remove_now = False
+            if session["inflight"] > 0:
+                # The last upload still being received removes the files as it
+                # ends; deleting them now would pull them from under it.
+                session["cleanup_pending"] = True
+            elif not session["removing"]:
+                session["removing"] = True
+                remove_now = True
+        cleanup = "deferred"
+        if remove_now and _remove_session_dir(server, staging_id, session):
+            cleanup = "done"
+        logger.info(
+            "Staging session cancelled: staging_id=%s cleanup=%s", staging_id, cleanup
+        )
         return {
             "staging_id": staging_id,
             "stage": "cancelled",
-            "staged": len(session.get("staged_files") or []),
-            "total": len(session.get("staged_files") or []),
+            "staged": staged_count,
+            "total": staged_count,
             "processed": 0,
+            "cleanup": cleanup,
         }
 
     @router.get(
@@ -1652,22 +2128,26 @@ def register_routes(router, server):
         summary="Get async import staging status",
         description=(
             "Returns the stage and live progress of a staging session and its "
-            "background import task."
+            "background import task. While the import runs, `phase` says what "
+            "it is doing: `queued`, `processing`, `persisting` or `finalizing`."
         ),
         response_model=StagingStatusResponse,
     )
     def staging_status(request: Request, staging_id: str, outcomes_from: int = 0):
         session = _get_session_or_404(request, staging_id)
-        staged_files: list[dict] = session.get("staged_files") or []
-        task = session.get("task")
-        stage = session["stage"]
+        with session["lock"]:
+            staged_count = len(session["staged_files"])
+            task = session.get("task")
+            stage = session["stage"]
+            error = session.get("error")
+            task_id = session.get("task_id")
         processed = 0
-        total = len(staged_files)
+        total = staged_count
+        phase = None
         imported_count = duplicate_count = failed_count = None
         scrapheaped_count = cancelled_count = None
         scrapheaped_picture_ids: list[int] = []
         outcomes: list[dict] = []
-        error = session.get("error")
 
         if task is not None:
             total = int(getattr(task, "_total_count", total) or total)
@@ -1686,32 +2166,32 @@ def register_routes(router, server):
                 scrapheaped_picture_ids = result.get("scrapheaped_picture_ids") or []
                 failed_count = result.get("failed_count")
                 cancelled_count = result.get("cancelled_count")
-                # Terminal: drop the retained task/dir reference so the session
-                # record no longer pins the finished task object.
-                session["stage"] = "completed"
             elif status_value == "failed":
                 stage = "failed"
                 error = str(getattr(task, "error", None) or "Import failed")
-                session["stage"] = "failed"
-                session["error"] = error
             elif status_value == "cancelled":
                 stage = "cancelled"
-                session["stage"] = "cancelled"
             else:
                 stage = "importing"
+                phase = "queued" if status_value == "pending" else task.phase
             if status_value in ("completed", "failed", "cancelled"):
-                # Keep the reaper's terminal grace window counting from the last
-                # poll, so an actively-polled finished session survives and a
-                # forgotten one ages out.
-                session["last_update_epoch_ms"] = int(time.time() * 1000)
+                with session["lock"]:
+                    session["stage"] = stage
+                    if stage == "failed":
+                        session["error"] = error
+                    # Keep the reaper's terminal grace window counting from the
+                    # last poll, so an actively-polled finished session survives
+                    # and a forgotten one ages out.
+                    session["last_update_epoch_ms"] = int(time.time() * 1000)
 
         return {
             "staging_id": staging_id,
             "stage": stage,
-            "staged": len(staged_files),
+            "phase": phase,
+            "staged": staged_count,
             "total": total,
             "processed": processed,
-            "task_id": session.get("task_id"),
+            "task_id": task_id,
             "imported_count": imported_count,
             "duplicate_count": duplicate_count,
             "scrapheaped_count": scrapheaped_count,

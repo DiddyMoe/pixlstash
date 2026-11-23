@@ -813,6 +813,25 @@ def test_a_relative_path_is_refused_before_anything_is_walked(owner_env):
     assert r.status_code == 400, r.text
 
 
+def test_the_read_is_refused_in_docker_mode_and_runs_outside_it(owner_env, monkeypatch):
+    """In a container the paths are the container's, not the owner's folders."""
+    owner = owner_env["owner"]
+    root = os.path.join(owner_env["tmp"], "docker-mode")
+    _make_tree(root, {"": ["a.jpg"]})
+
+    with monkeypatch.context() as patch:
+        patch.setenv("PIXLSTASH_IN_DOCKER", "1")
+        r = owner.post(_READ, json={"path": root})
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == (
+        "The folder-structure read is not available in Docker mode."
+    )
+
+    started = owner.post(_READ, json={"path": root})
+    assert started.status_code == 200, started.text
+    assert _drain(owner, started.json()["task_id"])["status"] == "completed"
+
+
 def test_an_unknown_task_id_is_a_404_on_status_and_cancel(owner_env):
     owner = owner_env["owner"]
     assert owner.get(_STATUS, params={"task_id": "nope"}).status_code == 404

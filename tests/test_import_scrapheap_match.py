@@ -658,6 +658,10 @@ def test_import_status_is_owner_only_and_leaks_no_out_of_scope_ids(owner_server)
     }, body
     assert all(entry.get("file") for entry in body["results"]), body
 
+    # A status request that names no task is malformed, not "task not found".
+    r = owner.get(status_url)
+    assert r.status_code == 422, r.text
+
 
 def test_staging_status_is_owner_only_and_the_owner_still_polls_it(owner_server):
     """Same contract on the async staging sibling, both directions."""

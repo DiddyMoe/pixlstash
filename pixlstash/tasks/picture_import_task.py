@@ -2,7 +2,7 @@ import os
 import shutil
 import threading
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlmodel import Session, select
 
@@ -43,10 +43,18 @@ class PictureImportTask(BaseTask):
     during the *unsafe* window (the browser tab must stay open). Once staging is
     complete the route hands off to this task, which runs on the shared
     ``TaskRunner`` so the import completes even after the tab closes (the *safe*
-    window). Each staged file is hashed, de-duplicated by ``pixel_sha``, ingested
-    into the vault, and inserted as a ``Picture`` row (with a pending-tag
-    sentinel so the finders pick it up for downstream processing). The staging
-    directory is removed on completion.
+    window). Each staged file is hashed, de-duplicated by ``pixel_sha`` and
+    ingested into the vault. The new ``Picture`` rows (each with a pending-tag
+    sentinel so the finders pick it up for downstream processing) are inserted
+    together once every file has been read, followed by their project, set and
+    character membership; ``phase`` says which of these steps is running. The
+    staging directory is removed when the task ends, whether it completed or
+    failed.
+
+    The commit route hands the task a library read lease. It is released
+    exactly once, by the task runner's completion callback (see
+    ``Vault._release_task_library_lease``), so a library switch cannot close
+    the vault while the import is still queued or running.
 
     **Every staged file lands in exactly one of five disjoint buckets**,
     imported, duplicate (live content already in the vault, including a repeat
@@ -72,6 +80,9 @@ class PictureImportTask(BaseTask):
         _project_id: Optional project the imported pictures are added to.
         _staging_id: The staging-session id (carried into the result/logs).
         _staging_dir: Absolute path of the staging directory to remove when done.
+        _phase: What ``_run_task`` is doing, read through ``phase``.
+        _library_lease_release: Releases the commit's library read lease;
+            ``None`` once released, or when the task holds no lease.
         _origin_client_id: The originating tab's client id (for origin-stamped
             WebSocket events), or ``None`` for an external caller.
         outcomes: Per-file outcomes in the order they were decided, read live
@@ -92,6 +103,7 @@ class PictureImportTask(BaseTask):
         staging_dir: Optional[str] = None,
         origin_client_id: Optional[str] = None,
         restore_context: Optional[dict] = None,
+        library_lease_release: Optional[Callable[[], None]] = None,
     ):
         """Initialise the task.
 
@@ -115,6 +127,8 @@ class PictureImportTask(BaseTask):
                 events, or ``None`` for an external client.
             restore_context: ``operation_log_service.request_context`` of the
                 commit request, recorded on the restore of any Scrapheap match.
+            library_lease_release: Releases the library read lease the commit
+                took for this import; called once, when the task settles.
         """
         staged_files = staged_files or []
         super().__init__(
@@ -144,6 +158,9 @@ class PictureImportTask(BaseTask):
         self._processed_count = 0
         self.outcomes: list[dict] = []
         self._stop_event = threading.Event()
+        self._phase: Optional[str] = None
+        self._library_lease_release = library_lease_release
+        self._lease_lock = threading.Lock()
 
     @property
     def priority(self) -> TaskPriority:
@@ -151,8 +168,29 @@ class PictureImportTask(BaseTask):
         # background lanes, mirroring DetectionTask.
         return TaskPriority.HIGH
 
+    @property
+    def phase(self) -> Optional[str]:
+        """``processing`` while files are checked and read in, ``persisting``
+        while the new pictures and their memberships are written, and
+        ``finalizing`` while Scrapheap matches are restored and the staged files
+        removed. ``None`` before the task starts."""
+        return self._phase
+
     def on_cancel(self) -> None:
         self._stop_event.set()
+
+    def release_library_lease(self) -> None:
+        """Release the commit's library read lease, at most once.
+
+        Called by the task runner's completion callback on every settlement
+        (completed, failed, or cancelled while queued), and by the commit route
+        when the task never reached the runner. A second call does nothing:
+        releasing a read lease twice would undercount the library's readers.
+        """
+        with self._lease_lock:
+            release, self._library_lease_release = self._library_lease_release, None
+        if release is not None:
+            release()
 
     def _record_outcome(
         self, entry: dict, outcome: str, picture_id: Optional[int] = None
@@ -174,6 +212,20 @@ class PictureImportTask(BaseTask):
         )
 
     def _run_task(self):
+        self._phase = "processing"
+        try:
+            return self._import_staged_files()
+        finally:
+            # On failure too: the files belong to this task from commit on, and
+            # nothing else removes them while its session is kept for polling.
+            self._cleanup_staging_dir()
+
+    def _import_staged_files(self) -> dict:
+        """Ingest every staged file and insert the new pictures in one go.
+
+        Returns:
+            The task result read by the staging status route.
+        """
         new_pictures: list[Picture] = []
         duplicate_count = 0
         scrapheaped_count = 0
@@ -340,6 +392,7 @@ class PictureImportTask(BaseTask):
             finally:
                 self._processed_count += 1
 
+        self._phase = "persisting"
         imported_ids: list[int] = []
         if new_pictures:
             sidecar_tags_by_stem = self._sidecar_tags_by_stem
@@ -375,6 +428,7 @@ class PictureImportTask(BaseTask):
                 self._apply_set(imported_ids)
                 self._apply_character(imported_ids)
 
+        self._phase = "finalizing"
         if scrapheaped_picture_ids:
             matched_ids = scrapheaped_picture_ids
             # Report what was restored, not what matched: a match the retention
@@ -389,8 +443,6 @@ class PictureImportTask(BaseTask):
                 matched_ids,
                 self._staging_id,
             )
-
-        self._cleanup_staging_dir()
 
         logger.info(
             "PictureImportTask completed: staging_id=%s imported=%d duplicates=%d "

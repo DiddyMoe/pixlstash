@@ -9,6 +9,7 @@ where the failures live (missing folder, corrupt database, a migration that will
 not apply), and until it succeeds nothing has been given up.
 """
 
+import functools
 import os
 import sqlite3
 import tempfile
@@ -33,6 +34,7 @@ from pixlstash.services.library_switch_service import (
     assert_vault_not_newer,
     known_vault_revisions,
 )
+from pixlstash.tasks.picture_import_task import PictureImportTask
 from pixlstash.hub.registry import LibraryNotFoundError
 
 
@@ -453,6 +455,67 @@ class TestFailingToSwitch:
         thread.join(timeout=20)
         assert not errors
         assert finished.is_set()
+        assert server.vault.image_root == library.path
+        server.library_switch.switch_to(original.uuid)
+
+    def test_a_running_upload_import_refuses_the_switch_until_it_ends(
+        self, server, tmp_path, monkeypatch
+    ):
+        """The import writes into the library it was committed to, to the end."""
+        library = server.library_registry.create(
+            str(tmp_path / "importing"), "Importing"
+        )
+        original = server.library_registry.active_library()
+        coordinator = server.library_coordinator
+        monkeypatch.setattr(
+            coordinator,
+            "begin_switch",
+            functools.partial(coordinator.begin_switch, timeout=0.5),
+        )
+        baseline = coordinator._readers.get(coordinator.generation, 0)
+        started = threading.Event()
+        finish = threading.Event()
+        real_import = PictureImportTask._import_staged_files
+
+        def import_when_told(task):
+            started.set()
+            assert finish.wait(30), "the test never let the import finish"
+            return real_import(task)
+
+        monkeypatch.setattr(PictureImportTask, "_import_staged_files", import_when_told)
+        lease = coordinator.acquire_read()
+        assert lease is not None
+        task = PictureImportTask(
+            server.vault,
+            [],
+            staging_id="test-staging",
+            library_lease_release=functools.partial(coordinator.release_read, lease),
+        )
+        server.staging_sessions["test-staging"] = {
+            "lock": threading.Lock(),
+            "stage": "importing",
+            "task": task,
+            "inflight": 0,
+        }
+        try:
+            assert server.vault.submit_task(task) is not None
+            assert started.wait(10), "the import never started"
+
+            with pytest.raises(LibrarySwitchError, match="an import is still running"):
+                server.library_switch.switch_to(library.uuid)
+            assert server.vault.image_root == original.path
+            assert server.library_switch.state is SwitchState.READY
+
+            finish.set()
+            deadline = time.monotonic() + 10
+            while coordinator._readers.get(coordinator.generation, 0) != baseline:
+                assert time.monotonic() < deadline, "the import kept its lease"
+                time.sleep(0.05)
+        finally:
+            finish.set()
+            server.staging_sessions.pop("test-staging", None)
+
+        server.library_switch.switch_to(library.uuid)
         assert server.vault.image_root == library.path
         server.library_switch.switch_to(original.uuid)
 

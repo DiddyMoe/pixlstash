@@ -11,11 +11,17 @@ scoped token is denied (403) and the owner is allowed (200 / works) - over-block
 the owner would be its own regression.
 """
 
+import errno
+import functools
 import io
 import os
+import shutil
+import sys
 import tempfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,7 +29,9 @@ from PIL import Image
 from sqlmodel import select
 
 from pixlstash.db_models import Character, Picture, PictureSet, PictureSetMember, Tag
+from pixlstash.routes.pictures import _import as import_mod
 from pixlstash.server import Server
+from pixlstash.tasks.picture_import_task import PictureImportTask
 from tests.authz_guard import no_spa_fallback  # noqa: F401
 
 API = "/api/v1"
@@ -564,8 +572,6 @@ def test_direct_import_with_nonexistent_project_errors(owner_server):
 
 
 def test_reaper_evicts_stale_session_and_dir(owner_server):
-    from pixlstash.routes.pictures import _import as import_mod
-
     srv, client = owner_server
     staging_id = client.post(f"{API}/pictures/import/staging", json={}).json()[
         "staging_id"
@@ -588,8 +594,6 @@ def test_reaper_evicts_stale_session_and_dir(owner_server):
 
 
 def test_reaper_keeps_fresh_session(owner_server):
-    from pixlstash.routes.pictures import _import as import_mod
-
     srv, client = owner_server
     staging_id = client.post(f"{API}/pictures/import/staging", json={}).json()[
         "staging_id"
@@ -597,3 +601,727 @@ def test_reaper_keeps_fresh_session(owner_server):
     # A just-opened session is within TTL and must survive the reaper.
     import_mod._reap_staging_sessions(srv)
     assert staging_id in srv.staging_sessions, "Fresh session must not be evicted"
+
+
+# ---------------------------------------------------------------------------
+# Ownership of a staging session: an upload, a commit, a cancel and the reaper
+# each take the session's files only when nothing else holds them.
+# ---------------------------------------------------------------------------
+
+_STAGING = f"{API}/pictures/import/staging"
+
+
+@pytest.fixture(scope="module")
+def shared():
+    """One server for the ownership tests below; each opens its own session.
+
+    The tests hold a request at a known point inside the server (an upload
+    parked between two files, a commit parked before the task runner) while
+    they send others, so every assertion is about the test's own session or a
+    difference it measured, never a total across the module.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        with Server(os.path.join(tmp, "server-config.json")) as srv:
+            client = TestClient(srv.api, raise_server_exceptions=True)
+            r = client.post(
+                f"{API}/login",
+                json={"username": "owner", "password": "example-owner-password"},
+            )
+            assert r.status_code == 200, r.text
+            yield srv, client
+
+
+class _Gate:
+    """Parks the first call of a wrapped function until the test releases it."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+        self._used = False
+
+    def wrap(self, original):
+        @functools.wraps(original)
+        def gated(*args, **kwargs):
+            with self._lock:
+                first, self._used = not self._used, True
+            if first:
+                self.entered.set()
+                if not self.release.wait(60):
+                    raise RuntimeError("test gate was never released")
+            return original(*args, **kwargs)
+
+        return gated
+
+    def wait_entered(self):
+        assert self.entered.wait(30), "the gated call was never reached"
+
+
+def _park_uploads_between_files(monkeypatch) -> _Gate:
+    """Hold the next upload after its image is written, before its caption.
+
+    Send the batch as ``[image, caption]``: the image is on disk but not yet
+    staged when the upload stops.
+    """
+    gate = _Gate()
+    monkeypatch.setattr(
+        import_mod,
+        "_normalise_sidecar_stem",
+        gate.wrap(import_mod._normalise_sidecar_stem),
+    )
+    return gate
+
+
+def _open_session(client) -> str:
+    r = client.post(_STAGING, json={})
+    assert r.status_code == 200, r.text
+    return r.json()["staging_id"]
+
+
+def _staging_dir(srv, staging_id) -> str:
+    return os.path.join(srv.vault.image_root, ".staging", staging_id)
+
+
+def _png_part(name, color):
+    return ("file", (name, _png_bytes(color), "image/png"))
+
+
+def _caption_part(name):
+    return ("file", (name, b"test-tag", "text/plain"))
+
+
+def _key(value) -> dict:
+    return {"Idempotency-Key": f'"{value}"'}
+
+
+def _stage(client, staging_id, parts, headers=None):
+    return client.post(
+        f"{_STAGING}/{staging_id}/files", files=parts, headers=headers or {}
+    )
+
+
+def _staged_paths(srv, staging_id) -> list:
+    session = srv.staging_sessions[staging_id]
+    with session["lock"]:
+        return [entry["file_path"] for entry in session["staged_files"]]
+
+
+def _staged_names(srv, staging_id) -> list:
+    session = srv.staging_sessions[staging_id]
+    with session["lock"]:
+        return [entry["original_file_name"] for entry in session["staged_files"]]
+
+
+def _files_on_disk(staging_dir) -> set:
+    return {os.path.join(staging_dir, name) for name in os.listdir(staging_dir)}
+
+
+def _detail_code(response):
+    return response.json()["detail"]["code"]
+
+
+def _readers(srv) -> int:
+    """Read leases the active library has out right now."""
+    coordinator = srv.library_coordinator
+    return coordinator._readers.get(coordinator.generation, 0)
+
+
+def _wait_for_readers(srv, expected, timeout_s=10):
+    deadline = time.time() + timeout_s
+    while _readers(srv) != expected:
+        assert time.time() < deadline, (
+            f"library has {_readers(srv)} reader(s), expected {expected}"
+        )
+        time.sleep(0.05)
+
+
+def _backdate(srv, staging_id):
+    """Make a session look idle for longer than the reaper's TTL."""
+    session = srv.staging_sessions[staging_id]
+    with session["lock"]:
+        session["last_update_epoch_ms"] = int(time.time() * 1000) - (
+            (import_mod._STAGING_SESSION_TTL_S + 60) * 1000
+        )
+
+
+def test_a_retried_batch_is_staged_once(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+
+    first = _stage(
+        client,
+        staging_id,
+        [_png_part("one.png", (1, 2, 3))],
+        headers=_key("test-batch-1"),
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["replayed"] is False
+    staged = _staged_paths(srv, staging_id)
+
+    again = _stage(
+        client,
+        staging_id,
+        [_png_part("one.png", (1, 2, 3))],
+        headers=_key("test-batch-1"),
+    )
+    assert again.status_code == 200, again.text
+    assert again.json() == {**first.json(), "replayed": True}
+    assert _staged_paths(srv, staging_id) == staged
+    assert _files_on_disk(_staging_dir(srv, staging_id)) == set(staged)
+
+    # A new key is a new batch.
+    other = _stage(
+        client,
+        staging_id,
+        [_png_part("two.png", (4, 5, 6))],
+        headers=_key("test-batch-2"),
+    )
+    assert other.status_code == 200, other.text
+    assert other.json()["replayed"] is False
+    assert _staged_names(srv, staging_id) == ["one.png", "two.png"]
+
+
+def test_an_unusable_idempotency_key_is_refused(shared):
+    """A caller that asked for idempotency is never treated as one that did not."""
+    srv, client = shared
+    staging_id = _open_session(client)
+
+    r = _stage(
+        client,
+        staging_id,
+        [_png_part("blank-key.png", (7, 7, 7))],
+        headers={"Idempotency-Key": '""'},
+    )
+    assert r.status_code == 400, r.text
+    assert _detail_code(r) == "invalid_idempotency_key"
+    assert _staged_paths(srv, staging_id) == []
+
+    r = _stage(
+        client,
+        staging_id,
+        [_png_part("blank-key.png", (7, 7, 7))],
+        headers=_key("test-batch-ok"),
+    )
+    assert r.status_code == 200, r.text
+    assert _staged_names(srv, staging_id) == ["blank-key.png"]
+
+
+def test_a_reused_key_with_different_files_is_refused(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+    r = _stage(
+        client,
+        staging_id,
+        [_png_part("first.png", (8, 9, 10))],
+        headers=_key("test-reused"),
+    )
+    assert r.status_code == 200, r.text
+    staged = _staged_paths(srv, staging_id)
+
+    r = _stage(
+        client,
+        staging_id,
+        [_png_part("second.png", (11, 12, 13))],
+        headers=_key("test-reused"),
+    )
+    assert r.status_code == 422, r.text
+    assert _detail_code(r) == "idempotency_key_mismatch"
+    assert _staged_paths(srv, staging_id) == staged
+    assert _files_on_disk(_staging_dir(srv, staging_id)) == set(staged)
+
+
+def test_a_retry_while_its_batch_is_still_uploading_is_told_to_wait(
+    shared, monkeypatch
+):
+    srv, client = shared
+    staging_id = _open_session(client)
+    gate = _park_uploads_between_files(monkeypatch)
+
+    def batch():
+        return [_png_part("c.png", (14, 15, 16)), _caption_part("c.txt")]
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(_stage, client, staging_id, batch(), _key("test-batch-c"))
+        try:
+            gate.wait_entered()
+            retry = _stage(client, staging_id, batch(), headers=_key("test-batch-c"))
+            assert retry.status_code == 409, retry.text
+            assert _detail_code(retry) == "batch_in_progress"
+        finally:
+            gate.release.set()
+        r = first.result(timeout=30)
+    assert r.status_code == 200, r.text
+    assert _staged_names(srv, staging_id) == ["c.png"]
+
+    # Once the first attempt has finished, a retry gets its answer.
+    replay = _stage(client, staging_id, batch(), headers=_key("test-batch-c"))
+    assert replay.json() == {**r.json(), "replayed": True}
+
+
+def test_a_cancel_during_an_upload_leaves_the_files_to_that_upload(shared, monkeypatch):
+    """The upload still writing owns the directory; the last one out removes it."""
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    gate = _park_uploads_between_files(monkeypatch)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        upload = pool.submit(
+            _stage,
+            client,
+            staging_id,
+            [_png_part("d.png", (17, 18, 19)), _caption_part("d.txt")],
+        )
+        try:
+            gate.wait_entered()
+            cancel = client.delete(f"{_STAGING}/{staging_id}")
+            assert cancel.status_code == 200, cancel.text
+            assert cancel.json()["cleanup"] == "deferred"
+            assert os.listdir(staging_dir), "the parked upload's file must survive"
+        finally:
+            gate.release.set()
+        r = upload.result(timeout=30)
+
+    assert r.status_code == 409, r.text
+    assert _detail_code(r) == "staging_closed"
+    assert r.json()["detail"]["stage"] == "cancelled"
+    assert not os.path.lexists(staging_dir)
+    assert staging_id not in srv.staging_sessions
+
+
+def test_a_commit_waits_for_uploads_still_being_received(shared, monkeypatch):
+    srv, client = shared
+    staging_id = _open_session(client)
+    r = _stage(client, staging_id, [_png_part("e1.png", (20, 21, 22))])
+    assert r.status_code == 200, r.text
+    gate = _park_uploads_between_files(monkeypatch)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        upload = pool.submit(
+            _stage,
+            client,
+            staging_id,
+            [_png_part("e2.png", (23, 24, 25)), _caption_part("e2.txt")],
+        )
+        try:
+            gate.wait_entered()
+            commit = client.post(f"{_STAGING}/{staging_id}/commit")
+            assert commit.status_code == 409, commit.text
+            assert _detail_code(commit) == "uploads_in_flight"
+            assert commit.json()["detail"]["stage"] == "staging"
+        finally:
+            gate.release.set()
+        r = upload.result(timeout=30)
+    assert r.status_code == 200, r.text
+
+    commit = client.post(f"{_STAGING}/{staging_id}/commit")
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["staged_count"] == 2
+    _wait_for_stage(client, staging_id, target=("completed",))
+
+
+def test_concurrent_commits_start_one_import_that_holds_the_library(
+    shared, monkeypatch
+):
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    commit_url = f"{_STAGING}/{staging_id}/commit"
+    status_url = f"{_STAGING}/{staging_id}/status"
+    r = _stage(client, staging_id, [_png_part("f.png", (26, 27, 28))])
+    assert r.status_code == 200, r.text
+    baseline = _readers(srv)
+
+    handing_over = _Gate()
+    monkeypatch.setattr(
+        srv.vault, "submit_task", handing_over.wrap(srv.vault.submit_task)
+    )
+    running = _Gate()
+    monkeypatch.setattr(
+        PictureImportTask,
+        "_import_staged_files",
+        running.wrap(PictureImportTask._import_staged_files),
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(client.post, commit_url)
+            try:
+                handing_over.wait_entered()
+                second = client.post(commit_url)
+                assert second.status_code == 409, second.text
+                assert _detail_code(second) == "commit_in_progress"
+                assert client.get(status_url).json()["stage"] == "committing"
+
+                cancel = client.delete(f"{_STAGING}/{staging_id}")
+                assert cancel.status_code == 409, cancel.text
+                assert _detail_code(cancel) == "import_committed"
+
+                late = _stage(client, staging_id, [_png_part("late.png", (1, 1, 1))])
+                assert late.status_code == 409, late.text
+                assert _detail_code(late) == "staging_closed"
+            finally:
+                handing_over.release.set()
+            committed = first.result(timeout=30)
+        assert committed.status_code == 200, committed.text
+        assert committed.json()["replayed"] is False
+
+        repeat = client.post(commit_url)
+        assert repeat.status_code == 200, repeat.text
+        assert repeat.json() == {**committed.json(), "replayed": True}
+
+        running.wait_entered()
+        # The import holds the library while it runs.
+        _wait_for_readers(srv, baseline + 1)
+        status = client.get(status_url).json()
+        assert status["stage"] == "importing"
+        assert status["phase"] == "processing"
+    finally:
+        handing_over.release.set()
+        running.release.set()
+
+    _wait_for_stage(client, staging_id, target=("completed",))
+    _wait_for_readers(srv, baseline)
+    assert not os.path.lexists(staging_dir)
+
+
+def _face_worker_down(srv, patch):
+    patch.setattr(
+        srv.vault,
+        "worker_unavailable_reason",
+        lambda task_type: "test-face-worker is unavailable",
+    )
+
+
+def _free_space_unreadable(srv, patch):
+    real_disk_usage = import_mod.shutil.disk_usage
+
+    def disk_usage(path):
+        if path == srv.vault.image_root:
+            raise OSError(errno.EIO, "test-unreadable volume", path)
+        return real_disk_usage(path)
+
+    patch.setattr(import_mod.shutil, "disk_usage", disk_usage)
+
+
+def _no_free_space(srv, patch):
+    real_disk_usage = import_mod.shutil.disk_usage
+
+    def disk_usage(path):
+        usage = real_disk_usage(path)
+        return usage._replace(free=0) if path == srv.vault.image_root else usage
+
+    patch.setattr(import_mod.shutil, "disk_usage", disk_usage)
+
+
+def _runner_down(srv, patch):
+    patch.setattr(srv.vault, "submit_task", lambda task: None)
+
+
+@pytest.mark.parametrize(
+    ("refuse", "status_code", "message"),
+    [
+        (_face_worker_down, 400, "test-face-worker is unavailable"),
+        (_free_space_unreadable, 503, "could not check free space"),
+        (_no_free_space, 507, "Not enough disk space"),
+        (_runner_down, 503, "Task runner is not available"),
+    ],
+    ids=["face-worker-down", "free-space-unreadable", "disk-full", "runner-down"],
+)
+def test_a_refused_commit_leaves_the_session_open_and_the_library_free(
+    shared, monkeypatch, refuse, status_code, message
+):
+    srv, client = shared
+    staging_id = _open_session(client)
+    commit_url = f"{_STAGING}/{staging_id}/commit"
+    r = _stage(client, staging_id, [_png_part("g.png", (29, 30, status_code % 256))])
+    assert r.status_code == 200, r.text
+    baseline = _readers(srv)
+
+    with monkeypatch.context() as patch:
+        refuse(srv, patch)
+        r = client.post(commit_url)
+    assert r.status_code == status_code, r.text
+    assert message in r.json()["detail"]
+    status = client.get(f"{_STAGING}/{staging_id}/status").json()
+    assert status["stage"] == "staging"
+    _wait_for_readers(srv, baseline, timeout_s=5)
+
+    # With the cause gone, the same session commits.
+    r = client.post(commit_url)
+    assert r.status_code == 200, r.text
+    _wait_for_stage(client, staging_id, target=("completed",))
+    _wait_for_readers(srv, baseline)
+
+
+def test_a_commit_racing_shutdown_leaves_the_session_open_and_the_library_free(
+    shared, monkeypatch
+):
+    """A commit the stopped task runner refuses gives the session back."""
+    srv, client = shared
+    staging_id = _open_session(client)
+    commit_url = f"{_STAGING}/{staging_id}/commit"
+    r = _stage(client, staging_id, [_png_part("s.png", (41, 43, 47))])
+    assert r.status_code == 200, r.text
+    baseline = _readers(srv)
+
+    def stopped_runner(task):
+        raise RuntimeError("TaskRunner test-runner is stopped.")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(srv.vault, "submit_task", stopped_runner)
+        with pytest.raises(RuntimeError, match="test-runner is stopped"):
+            client.post(commit_url)
+    status = client.get(f"{_STAGING}/{staging_id}/status").json()
+    assert status["stage"] == "staging"
+    _wait_for_readers(srv, baseline, timeout_s=5)
+
+    # With the runner back, the same session commits.
+    r = client.post(commit_url)
+    assert r.status_code == 200, r.text
+    _wait_for_stage(client, staging_id, target=("completed",))
+    _wait_for_readers(srv, baseline)
+
+
+def test_an_empty_commit_is_refused_until_a_file_is_staged(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+    commit_url = f"{_STAGING}/{staging_id}/commit"
+
+    r = client.post(commit_url)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "No staged files to import"
+    status = client.get(f"{_STAGING}/{staging_id}/status").json()
+    assert status["stage"] == "staging"
+
+    r = _stage(client, staging_id, [_png_part("h0.png", (31, 32, 33))])
+    assert r.status_code == 200, r.text
+    r = client.post(commit_url)
+    assert r.status_code == 200, r.text
+    _wait_for_stage(client, staging_id, target=("completed",))
+
+
+def test_the_file_cap_counts_batches_uploaded_at_the_same_time(shared, monkeypatch):
+    srv, client = shared
+    monkeypatch.setattr(import_mod, "_STAGING_MAX_FILES", 3)
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    r = _stage(
+        client,
+        staging_id,
+        [_png_part("h1.png", (34, 35, 36)), _png_part("h2.png", (37, 38, 39))],
+    )
+    assert r.status_code == 200, r.text
+    gate = _park_uploads_between_files(monkeypatch)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        late = pool.submit(
+            _stage,
+            client,
+            staging_id,
+            [_png_part("h-late.png", (40, 41, 42)), _caption_part("h-late.txt")],
+        )
+        try:
+            gate.wait_entered()
+            # This batch fills the session to exactly the cap.
+            fills = _stage(client, staging_id, [_png_part("h3.png", (43, 44, 45))])
+            assert fills.status_code == 200, fills.text
+            assert fills.json()["staged"] == 3
+        finally:
+            gate.release.set()
+        r = late.result(timeout=30)
+
+    assert r.status_code == 413, r.text
+    assert _detail_code(r) == "staging_file_limit"
+    assert r.json()["detail"]["limit"] == 3
+    assert r.json()["detail"]["staged"] == 3
+    assert _staged_names(srv, staging_id) == ["h1.png", "h2.png", "h3.png"]
+    assert _files_on_disk(staging_dir) == set(_staged_paths(srv, staging_id))
+
+
+def _fail_second_write_with_enospc(patch, staging_dir):
+    """Make the second file written into *staging_dir* hit a full volume."""
+    writes = []
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if "w" in mode and os.path.dirname(os.fspath(path)) == staging_dir:
+            writes.append(path)
+            if len(writes) == 2:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), path)
+        return open(path, mode, *args, **kwargs)
+
+    patch.setattr(import_mod, "open", fake_open, raising=False)
+
+
+@pytest.mark.parametrize("as_zip", [False, True], ids=["files", "zip"])
+def test_a_batch_that_runs_out_of_disk_is_refused_whole(shared, monkeypatch, as_zip):
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    images = {
+        "i1.png": _png_bytes((46, 47, 48)),
+        "i2.png": _png_bytes((49, 50, 51)),
+        "i3.png": _png_bytes((52, 53, 54)),
+    }
+    if as_zip:
+        parts = [("file", ("i.zip", _zip_bytes(images), "application/zip"))]
+    else:
+        parts = [("file", (name, data, "image/png")) for name, data in images.items()]
+
+    with monkeypatch.context() as patch:
+        _fail_second_write_with_enospc(patch, staging_dir)
+        r = _stage(client, staging_id, parts)
+    assert r.status_code == 507, r.text
+    assert _detail_code(r) == "insufficient_storage"
+    assert os.listdir(staging_dir) == []
+    assert _staged_paths(srv, staging_id) == []
+
+    # With room again, the same batch stages whole.
+    r = _stage(client, staging_id, parts)
+    assert r.status_code == 200, r.text
+    assert sorted(_staged_names(srv, staging_id)) == sorted(images)
+
+
+def test_the_reaper_leaves_a_session_whose_files_are_in_use(shared, monkeypatch):
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    session = srv.staging_sessions[staging_id]
+    r = _stage(client, staging_id, [_png_part("j1.png", (55, 56, 57))])
+    assert r.status_code == 200, r.text
+
+    # An upload is still being received.
+    gate = _park_uploads_between_files(monkeypatch)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        upload = pool.submit(
+            _stage,
+            client,
+            staging_id,
+            [_png_part("j2.png", (58, 59, 60)), _caption_part("j2.txt")],
+        )
+        try:
+            gate.wait_entered()
+            _backdate(srv, staging_id)
+            import_mod._reap_staging_sessions(srv)
+            assert srv.staging_sessions.get(staging_id) is session
+            assert session["stage"] == "staging"
+        finally:
+            gate.release.set()
+        r = upload.result(timeout=30)
+    assert r.status_code == 200, r.text
+
+    # A commit is handing the session to the import.
+    handing_over = _Gate()
+    monkeypatch.setattr(
+        srv.vault, "submit_task", handing_over.wrap(srv.vault.submit_task)
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        commit = pool.submit(client.post, f"{_STAGING}/{staging_id}/commit")
+        try:
+            handing_over.wait_entered()
+            _backdate(srv, staging_id)
+            import_mod._reap_staging_sessions(srv)
+            assert srv.staging_sessions.get(staging_id) is session
+            assert os.path.isdir(staging_dir)
+        finally:
+            handing_over.release.set()
+        r = commit.result(timeout=30)
+    assert r.status_code == 200, r.text
+    _wait_for_stage(client, staging_id, target=("completed",))
+
+
+def test_the_reaper_keeps_a_session_whose_files_it_could_not_remove(
+    shared, monkeypatch
+):
+    """Nothing else knows the files are there, so the record waits for a retry."""
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    session = srv.staging_sessions[staging_id]
+    r = _stage(client, staging_id, [_png_part("k.png", (61, 62, 63))])
+    assert r.status_code == 200, r.text
+    _backdate(srv, staging_id)
+    real_rmtree = import_mod.shutil.rmtree
+
+    def rmtree(path, *args, **kwargs):
+        if os.fspath(path) == staging_dir:
+            raise PermissionError(errno.EACCES, "test-refused", path)
+        return real_rmtree(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(import_mod.shutil, "rmtree", rmtree)
+        import_mod._reap_staging_sessions(srv)
+    assert srv.staging_sessions.get(staging_id) is session
+    assert os.path.isdir(staging_dir)
+
+    import_mod._reap_staging_sessions(srv)
+    assert staging_id not in srv.staging_sessions
+    assert not os.path.lexists(staging_dir)
+
+
+def test_staging_dirs_no_session_owns_are_swept(shared):
+    """A restart forgets every session; their directories are removed once old."""
+    srv, client = shared
+    live_dir = _staging_dir(srv, _open_session(client))
+    staging_root = os.path.join(srv.vault.image_root, ".staging")
+    old_orphan = os.path.join(staging_root, "test-orphan-old")
+    fresh_orphan = os.path.join(staging_root, "test-orphan-fresh")
+    for path in (old_orphan, fresh_orphan):
+        os.makedirs(path)
+        with open(os.path.join(path, "left.png"), "wb") as fh:
+            fh.write(_png_bytes())
+    stale = time.time() - import_mod._STAGING_SESSION_TTL_S - 60
+    for path in (old_orphan, live_dir):
+        os.utime(path, (stale, stale))
+
+    _open_session(client)
+
+    assert not os.path.lexists(old_orphan)
+    assert os.path.isdir(fresh_orphan), "a fresh directory may be a session opening"
+    assert os.path.isdir(live_dir), "a live session's directory is its own"
+    shutil.rmtree(fresh_orphan)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="creating a symlink needs privileges on Windows"
+)
+def test_the_sweep_unlinks_a_symlink_without_following_it(shared):
+    srv, client = shared
+    _open_session(client)
+    staging_root = os.path.join(srv.vault.image_root, ".staging")
+    with tempfile.TemporaryDirectory() as outside:
+        kept = os.path.join(outside, "keep.png")
+        with open(kept, "wb") as fh:
+            fh.write(_png_bytes())
+        link = os.path.join(staging_root, "test-orphan-link")
+        os.symlink(outside, link)
+        stale = time.time() - import_mod._STAGING_SESSION_TTL_S - 60
+        os.utime(link, (stale, stale), follow_symlinks=False)
+
+        _open_session(client)
+
+        assert not os.path.lexists(link)
+        assert os.path.isfile(kept)
+
+
+def test_a_failed_import_removes_its_staged_files_and_frees_the_library(
+    shared, monkeypatch
+):
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    r = _stage(client, staging_id, [_png_part("l.png", (64, 65, 66))])
+    assert r.status_code == 200, r.text
+    baseline = _readers(srv)
+
+    def fail(task):
+        raise RuntimeError("test-import-failure")
+
+    monkeypatch.setattr(PictureImportTask, "_import_staged_files", fail)
+    r = client.post(f"{_STAGING}/{staging_id}/commit")
+    assert r.status_code == 200, r.text
+
+    status = _wait_for_stage(client, staging_id)
+    assert status["stage"] == "failed", status
+    assert "test-import-failure" in status["error"]
+    assert not os.path.lexists(staging_dir)
+    _wait_for_readers(srv, baseline)

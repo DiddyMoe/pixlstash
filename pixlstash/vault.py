@@ -512,6 +512,8 @@ class Vault:
         self._task_runner.add_task_complete_callback(
             self._work_planner.on_task_complete
         )
+        # Last, so a task's library lease outlives the callbacks above.
+        self._task_runner.add_task_complete_callback(self._release_task_library_lease)
 
         self._ref_folder_watcher = ReferenceFolderWatcher(
             on_folder_changed=self._on_reference_folder_fs_changed,
@@ -1853,6 +1855,17 @@ class Vault:
         if self._task_runner is None:
             return None
         return self._task_runner.submit(task)
+
+    @staticmethod
+    def _release_task_library_lease(task, error):
+        """Give back the library read lease a task holds, however it settled.
+
+        A staged import holds one from commit until it ends, so a library
+        switch waits for it (see ``PictureImportTask.release_library_lease``).
+        """
+        release = getattr(task, "release_library_lease", None)
+        if callable(release):
+            release()
 
     def _on_task_completed(self, task, error):
         if error is not None or task.status != TaskStatus.COMPLETED:
