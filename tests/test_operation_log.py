@@ -50,6 +50,7 @@ from pixlstash.db_models import (
 )
 from pixlstash.server import Server
 from pixlstash.services import operation_log_service, tag_prediction_service
+from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
 from pixlstash.tasks import TaskType
 from pixlstash.tasks.tag_task import TagTask
 from tests.utils import bearer_client, mint_read_token, upload_pictures_and_wait
@@ -1645,6 +1646,56 @@ def test_scrapheap_move_of_a_stack_member_snapshots_the_whole_stack(client, serv
     assert client.post(f"{API}/operations/undo").status_code == 200
     assert server.vault.db.run_task(positions) == before
     assert _lifecycle(server, leader) == (False, None)
+
+
+def test_undo_announces_the_kept_stack_siblings_by_their_stacks(
+    client, server, monkeypatch, key_list_plan
+):
+    """Undoing a move across two stacks re-announces each stack's other kept
+    members, read by stack id, and not a member still in the Scrapheap. The
+    undo's lock check expands the moved pictures to their stacks the same way."""
+    first = [_upload(client) for _ in range(3)]
+    second = [_upload(client) for _ in range(2)]
+    loose = _upload(client)
+    for members in (first, second):
+        stacked = client.post(f"{API}/stacks", json={"picture_ids": members})
+        assert stacked.status_code == 200, stacked.text
+    assert client.delete(f"{API}/pictures/{first[2]}").status_code == 200
+    moved = [first[0], second[0]]
+    resp = client.request("DELETE", f"{API}/pictures", json={"picture_ids": moved})
+    assert resp.status_code == 200, resp.text
+    emitted: list[dict] = []
+    real_notify = server.vault.notify
+
+    def _capture(event_type, data=None):
+        if isinstance(data, dict) and data.get("fields") == ["stack_count"]:
+            emitted.append(data)
+        return real_notify(event_type, data)
+
+    monkeypatch.setattr(server.vault, "notify", _capture)
+
+    with key_list_plan(
+        server.vault.db._engine,
+        "FROM picture \nWHERE picture.stack_id IN",
+        "ix_picture_stack_id",
+    ):
+        assert client.post(f"{API}/operations/undo").status_code == 200
+    assert [data["picture_ids"] for data in emitted] == [[first[1], second[1]]]
+    assert _lifecycle(server, first[2])[0] is True
+
+    seeds = [*moved, loose]
+    kept = sorted([*first[:2], *second, loose])
+    with key_list_plan(
+        server.vault.db._engine,
+        "FROM picture \nWHERE picture.stack_id IN",
+        "ix_picture_stack_id",
+    ):
+        assert server.vault.db.run_task(expand_picture_ids_to_stacks, seeds) == kept
+    assert server.vault.db.run_task(
+        expand_picture_ids_to_stacks, seeds, True
+    ) == sorted([*kept, first[2]])
+    assert server.vault.db.run_task(expand_picture_ids_to_stacks, [loose]) == [loose]
+    assert server.vault.db.run_task(expand_picture_ids_to_stacks, []) == []
 
 
 def test_scrapheap_move_of_a_locked_picture_is_refused_and_records_nothing(

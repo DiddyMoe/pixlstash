@@ -15,6 +15,7 @@ import threading
 import traceback
 import warnings
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 import pixlstash
@@ -22,6 +23,7 @@ import pytest
 from _pytest.config.exceptions import UsageError
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 import pixlstash.startup_checks as startup_checks
 from pixlstash.hub.db import HubDatabase
 from pixlstash.server import Server, _log_install_detection_once
@@ -490,6 +492,47 @@ def patch_runtime(monkeypatch):
         monkeypatch.setattr(startup_checks, "_ort_mod", ort_mod)
 
     return apply
+
+
+@pytest.fixture
+def key_list_plan():
+    """Assert a ``picture`` key-list read searches the key column's index.
+
+    ``with key_list_plan(engine, "picture.stack_id IN", "ix_picture_stack_id"):``
+    runs the block and explains every statement containing the marker, on the
+    connection about to run it (a temporary scope table exists only there). On
+    leaving, at least one statement must have been captured, and every plan
+    must search the named index and none may search ``ix_picture_deleted``
+    or ``ix_picture_grid_score`` by ``deleted`` alone. Without ``sqlite_stat1``
+    (PixlStash never runs ``ANALYZE``) a key list beside ``deleted IS 0`` loses
+    to that index, which walks every kept picture: from two keys for a plain
+    read, and from one for a read grouped (or ``DISTINCT``) by the key, which
+    escapes only at exactly two, so hold a grouped read at one key or at three
+    or more. The index rule is in backend_architecture.md ("Probe cost").
+    Yields the plans.
+    """
+
+    @contextmanager
+    def guard(engine, marker: str, index: str):
+        plans: list[str] = []
+
+        def explain(_conn, cursor, statement, parameters, _context, executemany):
+            if marker in statement and not executemany:
+                rows = cursor.connection.execute(
+                    f"EXPLAIN QUERY PLAN {statement}", parameters
+                ).fetchall()
+                plans.append(" | ".join(str(row[-1]) for row in rows))
+
+        event.listen(engine, "before_cursor_execute", explain)
+        try:
+            yield plans
+        finally:
+            event.remove(engine, "before_cursor_execute", explain)
+        assert plans, f"no statement containing {marker!r} ran"
+        for plan in plans:
+            assert index in plan and "(deleted=?)" not in plan, plan
+
+    return guard
 
 
 @pytest.fixture(autouse=True, scope="session")

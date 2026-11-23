@@ -374,7 +374,8 @@ def create_router(server) -> APIRouter:
                 select(Picture.stack_id, func.count(Picture.id))
                 .where(
                     Picture.stack_id.in_(stack_ids),
-                    Picture.deleted.is_(False),
+                    # Not ``IS 0``: it beats the stack index from one id ("Probe cost").
+                    Picture.deleted.is_not(True),
                 )
                 .group_by(Picture.stack_id)
             ).all()
@@ -1061,10 +1062,16 @@ def create_router(server) -> APIRouter:
             stack_ids = [int(sid) for _pid, sid in id_stack_rows if sid is not None]
             expanded_ids = set(ids)
             if stack_ids:
-                extra_q = select(Picture.id).where(Picture.stack_id.in_(stack_ids))
-                if not include_deleted:
-                    extra_q = extra_q.where(Picture.deleted.is_(False))
-                extra = session.exec(extra_q).all()
+                # Every sibling, scrapheaped or not: the membership read below
+                # drops soft-deleted pictures unless include_deleted is set. A
+                # ``deleted IS 0`` here would also cost: without ``sqlite_stat1``
+                # (PixlStash never runs ``ANALYZE``) the planner rates two or
+                # more stack ids below ``ix_picture_deleted`` and walks every
+                # kept picture; alone, the ids search ``ix_picture_stack_id``
+                # (backend_architecture.md, "Probe cost").
+                extra = session.exec(
+                    select(Picture.id).where(Picture.stack_id.in_(stack_ids))
+                ).all()
                 expanded_ids |= {e for e in extra if e is not None}
 
             # Find all set memberships for the expanded id set.
@@ -1455,13 +1462,22 @@ def create_router(server) -> APIRouter:
             stack_ids = [int(stack_id) for _, stack_id in rows if stack_id is not None]
             if not stack_ids:
                 return ids
-            extra_query = select(Picture.id).where(
-                Picture.stack_id.in_(stack_ids),
-                Picture.deleted.is_(False),
+            # Soft-deleted siblings are dropped here rather than in SQL: beside
+            # ``deleted IS 0``, and without ``sqlite_stat1`` (PixlStash never
+            # runs ``ANALYZE``), the planner rates two or more stack ids below
+            # ``ix_picture_deleted`` and walks every kept picture to find the
+            # stacks' few. Alone, the ids search ``ix_picture_stack_id``
+            # (backend_architecture.md, "Probe cost").
+            extra_query = select(Picture.id, Picture.deleted).where(
+                Picture.stack_id.in_(stack_ids)
             )
             if project_filter is not None:
                 extra_query = extra_query.where(project_filter)
-            extra = session.exec(extra_query).all()
+            extra = [
+                picture_id
+                for picture_id, deleted in session.exec(extra_query).all()
+                if not deleted
+            ]
             return list(set(ids) | set(extra))
 
         picture_ids = server.vault.db.run_immediate_read_task(
@@ -1886,14 +1902,24 @@ def create_router(server) -> APIRouter:
                 if stack_id is not None
             ]
             if stack_ids:
-                extra_query = select(Picture.id).where(
-                    Picture.stack_id.in_(stack_ids),
-                )
-                if not include_deleted:
-                    extra_query = extra_query.where(Picture.deleted.is_(False))
-                extra = session.exec(extra_query).all()
+                # Soft-deleted siblings are dropped here rather than in SQL:
+                # beside ``deleted IS 0``, and without ``sqlite_stat1``
+                # (PixlStash never runs ``ANALYZE``), the planner rates two or
+                # more stack ids below ``ix_picture_deleted`` and walks every
+                # kept picture to find the stacks' few. Alone, the ids search
+                # ``ix_picture_stack_id`` (backend_architecture.md, "Probe cost").
+                extra = session.exec(
+                    select(Picture.id, Picture.deleted).where(
+                        Picture.stack_id.in_(stack_ids)
+                    )
+                ).all()
                 picture_ids = list(
-                    set(picture_ids) | {e for e in extra if e is not None}
+                    set(picture_ids)
+                    | {
+                        picture_id
+                        for picture_id, deleted in extra
+                        if include_deleted or not deleted
+                    }
                 )
 
             return picture_ids

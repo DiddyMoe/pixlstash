@@ -1,6 +1,8 @@
 import asyncio
+import json
 import tempfile
 import os
+from collections import defaultdict
 
 import numpy as np
 import pytest
@@ -10,8 +12,11 @@ from sqlmodel import select, func
 from pixlstash.server import Server
 from pixlstash.db_models.face import Face
 from pixlstash.db_models.picture import Picture
+from pixlstash.db_models.picture_likeness import PictureLikeness
+from pixlstash.db_models.picture_stack import PictureStack
 from pixlstash.db_models.tag import Tag
 from pixlstash.routes.pictures import _likeness_search as _likeness_search_module
+from pixlstash.routes.pictures import _misc as _pictures_misc_module
 from pixlstash.scoring.character_likeness import count_pictures_by_character_likeness
 from pixlstash.services import search_query_service
 from pixlstash.tasks import TaskType
@@ -1293,6 +1298,118 @@ def test_face_cluster_filter_lists_the_cluster_views_clusters(set_env):
             session.commit()
 
         server.vault.db.run_task(_drop)
+
+
+def test_likeness_groups_widen_to_stacks_by_stack_id(key_list_plan, monkeypatch):
+    """A likeness group takes in its pictures' stack siblings of the same
+    lifecycle (kept ones in the grid, scrapheaped ones in the Scrapheap), read
+    by stack id rather than by walking every picture of that lifecycle.
+
+    Background workers are off: the likeness pipeline rewrites hand-placed
+    pairs, and the stack-cohesion task runs the same stack-id read.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server_config_path = os.path.join(temp_dir, "server_config.json")
+        with open(server_config_path, "w") as f:
+            json.dump({"port": 8000, "disable_background_workers": True}, f)
+        with Server(server_config_path=server_config_path) as server:
+            client = TestClient(server.api)
+            resp = client.post(
+                "/login", json={"username": "testuser", "password": "testpassword"}
+            )
+            assert resp.status_code == 200
+
+            # key: (stack, position, scrapheaped)
+            layout = {
+                "one": (0, 0, False),
+                "one_b": (0, 1, False),
+                "one_gone": (0, 2, True),
+                "two": (1, 0, False),
+                "two_gone": (1, 1, True),
+                "loose": (None, None, False),
+                "loose_b": (None, None, False),
+                "loose_gone": (None, None, True),
+                "loose_gone_b": (None, None, True),
+            }
+
+            def seed(session):
+                stacks = [PictureStack(), PictureStack()]
+                session.add_all(stacks)
+                session.flush()
+                ids = {}
+                for key, (stack, position, deleted) in layout.items():
+                    pic = Picture(
+                        file_path=f"{key}.png",
+                        width=64,
+                        height=64,
+                        deleted=deleted,
+                        stack_id=None if stack is None else stacks[stack].id,
+                        stack_position=position,
+                    )
+                    session.add(pic)
+                    session.flush()
+                    ids[key] = pic.id
+                # Each stack is alike to one loose picture, in each lifecycle.
+                for x, y in (
+                    ("loose", "one"),
+                    ("loose_b", "two"),
+                    ("loose_gone", "one_gone"),
+                    ("loose_gone_b", "two_gone"),
+                ):
+                    a, b = sorted((ids[x], ids[y]))
+                    session.add(
+                        PictureLikeness(
+                            picture_id_a=a, picture_id_b=b, likeness=0.95, metric="test"
+                        )
+                    )
+                session.commit()
+                return ids
+
+            ids = server.vault.db.run_task(seed)
+
+            scored = []
+            real_fetch = _pictures_misc_module.fetch_smart_score_data
+
+            def spy_fetch(*args, **kwargs):
+                scored.append(set(kwargs["candidate_ids"]))
+                return real_fetch(*args, **kwargs)
+
+            monkeypatch.setattr(
+                _pictures_misc_module, "fetch_smart_score_data", spy_fetch
+            )
+
+            def groups(**params):
+                resp = client.get(
+                    f"{API_PREFIX}/pictures/likeness-groups",
+                    params={"threshold": 0.9, **params},
+                )
+                assert resp.status_code == 200, resp.text
+                by_index = defaultdict(set)
+                for row in resp.json():
+                    by_index[row["stack_index"]].add(row["id"])
+                return sorted(sorted(group) for group in by_index.values())
+
+            def named(*keys_per_group):
+                return sorted(sorted(ids[k] for k in keys) for keys in keys_per_group)
+
+            with key_list_plan(
+                server.vault.db._engine,
+                "FROM picture \nWHERE picture.stack_id IN (?",
+                "ix_picture_stack_id",
+            ) as plans:
+                kept = groups()
+                scrapheaped = groups(character_id="SCRAPHEAP")
+            assert len(plans) == 2, plans
+            assert kept == named(("loose", "one", "one_b"), ("loose_b", "two"))
+            assert scrapheaped == named(
+                ("loose_gone", "one_gone"), ("loose_gone_b", "two_gone")
+            )
+            # A sibling of the other lifecycle never joins a group, so it is
+            # never scored either.
+            assert scored == [
+                {pid for group in kept for pid in group},
+                {pid for group in scrapheaped for pid in group},
+            ]
 
 
 def _on_event_loop() -> bool:
