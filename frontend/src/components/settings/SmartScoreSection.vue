@@ -1,6 +1,13 @@
 <script setup>
 import { onMounted, ref, watch } from "vue";
 import { getUserConfig, patchUserConfig } from "../../api/config";
+import {
+  deletePenalisedTag,
+  getPenalisedTagCleanup,
+  putPenalisedTag,
+  startPenalisedTagCleanup,
+} from "../../api/users";
+import { useConfirm } from "../../composables/useConfirm";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { VSwitch } from "vuetify/components";
 import SettingsSection from "./SettingsSection.vue";
@@ -20,6 +27,7 @@ const emit = defineEmits(["update:hidden-tags", "update:apply-tag-filter"]);
 // save failure raises a notice as well as the inline error. The notice is a
 // no-op on screen until the maintainer's design pass mounts the notice host.
 const noticeStore = useNoticeStore();
+const { confirm } = useConfirm();
 
 // ── Tag filter (hidden tags) - moved here from Behaviour ──────────────────────
 const hiddenTags = ref([]);
@@ -106,6 +114,22 @@ const smartScoreTagsLoading = ref(false);
 const smartScoreTagsError = ref("");
 const smartScoreTagsSuccess = ref("");
 
+// Removing a penalised tag (X) also takes it off this library's pictures and
+// stops the tagger producing it; the server keeps the removed names
+// (`excluded`) and runs the cleanup as a job this section follows.
+const CLEANUP_POLL_MS = 1000;
+const ACTIVE_CLEANUP_STATES = new Set(["queued", "running"]);
+// One card for "removed tags are still on pictures", whichever job left them.
+const UNFINISHED_KEY = "penalised-cleanup:unfinished";
+const excludedTags = ref([]);
+// The tag whose removal is in flight: its chip says so and the weights hold.
+const removingTag = ref("");
+// One removal or re-add at a time, from the question to the server's answer:
+// a second confirm would replace the first, and an add sent meanwhile would
+// carry the list from before the removal.
+let changeInFlight = false;
+const followedJobs = new Set();
+
 const smartScoreImportanceOptions = [
   { value: 1, label: "Mild" },
   { value: 2, label: "Low" },
@@ -182,6 +206,13 @@ async function fetchData() {
   } finally {
     smartScoreTagsLoading.value = false;
   }
+  try {
+    const status = await getPenalisedTagCleanup();
+    excludedTags.value = status?.excluded || [];
+    if (status?.state === "interrupted") reportResidue(status.remaining);
+  } catch (e) {
+    console.error("Reading the penalised-tag cleanup status failed", e);
+  }
 }
 
 async function saveSmartScoreTags(nextTags) {
@@ -208,8 +239,13 @@ async function saveSmartScoreTags(nextTags) {
 }
 
 async function addSmartScoreTag() {
+  if (changeInFlight) return;
   const trimmed = smartScoreTagInput.value.trim().toLowerCase();
   if (!trimmed) return;
+  if (excludedTags.value.includes(trimmed)) {
+    await addRemovedTagBack(trimmed);
+    return;
+  }
   const next = SmartScoreTags([
     ...smartScorePenalisedTags.value,
     { tag: trimmed, weight: 3 },
@@ -218,11 +254,252 @@ async function addSmartScoreTag() {
   await saveSmartScoreTags(next);
 }
 
+/** Let a removed tag back into tagging, penalised at the default weight. */
+async function addRemovedTagBack(tag) {
+  changeInFlight = true;
+  try {
+    const confirmed = await confirm({
+      title: `Add '${tag}' back?`,
+      message:
+        "The tagger can add it to pictures again. Tags removed earlier are not restored.",
+      confirmLabel: "Add back",
+      cancelLabel: "Cancel",
+    });
+    if (!confirmed) return;
+    smartScoreTagInput.value = "";
+    smartScoreTagsLoading.value = true;
+    smartScoreTagsError.value = "";
+    smartScoreTagsSuccess.value = "";
+    try {
+      const result = await putPenalisedTag(tag, 3);
+      smartScorePenalisedTags.value = SmartScoreTags(
+        result?.smart_score_penalised_tags,
+      );
+      excludedTags.value = result?.excluded || [];
+      smartScoreTagsSuccess.value = "Saved.";
+      if (result?.cleanup) followCleanup(result.cleanup);
+    } catch (e) {
+      console.error(`Adding the removed tag '${tag}' back failed`, e);
+      smartScoreTagsError.value = errorDetail(e) || `Could not add '${tag}' back.`;
+      noticeStore.error(smartScoreTagsError.value);
+    } finally {
+      smartScoreTagsLoading.value = false;
+      if (smartScoreTagsSuccess.value) {
+        setTimeout(() => {
+          smartScoreTagsSuccess.value = "";
+        }, 2000);
+      }
+    }
+  } finally {
+    changeInFlight = false;
+  }
+}
+
+/**
+ * X: remove the tag from the list, from tagging and from this library's
+ * pictures. The chip goes only once the server has done the first two.
+ */
 async function removeSmartScoreTag(tag) {
-  const next = SmartScoreTags(
-    smartScorePenalisedTags.value.filter((t) => t.tag !== tag),
+  // A save still in flight carries the list with this tag in it.
+  if (changeInFlight || smartScoreTagsLoading.value) return;
+  changeInFlight = true;
+  try {
+    const confirmed = await confirm({
+      title: `Remove '${tag}'?`,
+      message:
+        "Removes this tag from all pictures in this library and stops the tagger " +
+        "adding it in any of your libraries. Pictures stay; tags cannot be restored.",
+      confirmLabel: "Remove",
+      cancelLabel: "Cancel",
+      danger: true,
+    });
+    if (!confirmed) return;
+    removingTag.value = tag;
+    smartScoreTagsError.value = "";
+    smartScoreTagsSuccess.value = "";
+    const result = await deletePenalisedTag(tag);
+    smartScorePenalisedTags.value = SmartScoreTags(
+      result?.smart_score_penalised_tags,
+    );
+    excludedTags.value = result?.excluded || [];
+    if (result?.cleanup) followCleanup(result.cleanup);
+  } catch (e) {
+    console.error(`Removing the penalised tag '${tag}' failed`, e);
+    smartScoreTagsError.value = errorDetail(e) || `Could not remove '${tag}'.`;
+    noticeStore.error(smartScoreTagsError.value);
+  } finally {
+    removingTag.value = "";
+    changeInFlight = false;
+  }
+}
+
+function progressKey(job) {
+  return `penalised-cleanup:${job.id}`;
+}
+
+/** 'a'; 'a' and 'b'; 'a' and 2 more tags. */
+function tagsLabel(names) {
+  const sorted = [...names].sort((a, b) => a.localeCompare(b));
+  if (sorted.length === 1) return `'${sorted[0]}'`;
+  if (sorted.length === 2) return `'${sorted[0]}' and '${sorted[1]}'`;
+  return `'${sorted[0]}' and ${sorted.length - 1} more tags`;
+}
+
+function picturesLabel(count) {
+  return `${count.toLocaleString()} picture${count === 1 ? "" : "s"}`;
+}
+
+/** Show a cleanup job's progress until it ends, once per job. */
+function followCleanup(job) {
+  if (followedJobs.has(job.id)) return;
+  followedJobs.add(job.id);
+  noticeStore.dismissByKey(UNFINISHED_KEY);
+  showCleanupProgress(job);
+}
+
+function showCleanupProgress(job) {
+  // Replace whatever card this job has (a failed check) instead of
+  // coalescing onto it.
+  noticeStore.dismissByKey(progressKey(job));
+  noticeStore.push({
+    level: "info",
+    text: `Removing ${tagsLabel(job.names)} from pictures…`,
+    timeout: 0,
+    key: progressKey(job),
+  });
+  setTimeout(() => checkCleanup(job), CLEANUP_POLL_MS);
+}
+
+async function checkCleanup(job) {
+  const label = tagsLabel(job.names);
+  let status;
+  try {
+    status = await getPenalisedTagCleanup();
+  } catch (e) {
+    console.error(`Checking on the cleanup job ${job.id} failed`, e);
+    noticeStore.dismissByKey(progressKey(job));
+    noticeStore.warning(`Could not check on removing ${label}.`, {
+      key: progressKey(job),
+      action: {
+        label: "Check again",
+        handler: () => {
+          showCleanupProgress(job);
+        },
+      },
+    });
+    return;
+  }
+  excludedTags.value = status?.excluded || [];
+  const jobs = status?.jobs || [];
+  const idx = jobs.findIndex((entry) => entry.id === job.id);
+  const current = idx < 0 ? null : jobs[idx];
+  if (current && ACTIVE_CLEANUP_STATES.has(current.state)) {
+    setTimeout(() => checkCleanup(job), CLEANUP_POLL_MS);
+    return;
+  }
+  noticeStore.dismissByKey(progressKey(job));
+  if (current?.state === "completed") {
+    const done = `Removed ${label} from ${picturesLabel(current.pictures)}`;
+    if (current.locked > 0) {
+      const locked = current.locked;
+      noticeStore.warning(
+        `${done}; ${locked.toLocaleString()} locked picture${locked === 1 ? " was" : "s were"} skipped.`,
+      );
+    } else {
+      noticeStore.success(`${done}.`);
+    }
+    return;
+  }
+  // A later removal or re-add stopped this job and a newer one took its
+  // names over (the list is newest first).
+  const names = new Set(job.names);
+  const newer = jobs
+    .slice(0, idx < 0 ? 0 : idx)
+    .filter((entry) => entry.names.some((name) => names.has(name)));
+  if (newer.length) {
+    for (const entry of newer) followCleanup(entry);
+    return;
+  }
+  // A job that failed or was cancelled did not finish, whatever the count of
+  // pictures left says.
+  if (
+    status?.state === "interrupted" ||
+    current?.state === "failed" ||
+    current?.state === "cancelled"
+  ) {
+    reportUnfinished(job.names);
+    return;
+  }
+  // The job is gone (the server restarted) and nothing is left to remove.
+  if (status?.state === "idle" && current?.state !== "superseded") {
+    noticeStore.success(`Removed ${label} from your pictures.`);
+  }
+}
+
+function reportUnfinished(names) {
+  noticeStore.dismissByKey(UNFINISHED_KEY);
+  noticeStore.warning(
+    `Removing ${tagsLabel(names)} from pictures stopped before it finished.`,
+    {
+      key: UNFINISHED_KEY,
+      action: {
+        label: "Retry",
+        handler: () => {
+          retryCleanup();
+        },
+      },
+    },
   );
-  await saveSmartScoreTags(next);
+}
+
+/** Removed tags left on this library's pictures from an earlier session. */
+function reportResidue(count) {
+  noticeStore.dismissByKey(UNFINISHED_KEY);
+  noticeStore.warning(
+    `Removed tags are still on ${picturesLabel(count)} in this library.`,
+    {
+      key: UNFINISHED_KEY,
+      action: {
+        label: "Remove from this library",
+        handler: () => {
+          retryCleanup();
+        },
+      },
+    },
+  );
+}
+
+/** Start removing every removed tag from this library's pictures again. */
+async function retryCleanup() {
+  try {
+    const result = await startPenalisedTagCleanup();
+    followCleanup(result.cleanup);
+  } catch (e) {
+    if (e?.response?.status === 409) {
+      // One is running already: follow it instead.
+      await followActiveCleanups();
+      return;
+    }
+    console.error("Restarting the penalised-tag cleanup failed", e);
+    noticeStore.error(
+      errorDetail(e) || "Could not restart removing tags from pictures.",
+    );
+  }
+}
+
+async function followActiveCleanups() {
+  try {
+    const status = await getPenalisedTagCleanup();
+    excludedTags.value = status?.excluded || [];
+    for (const entry of status?.jobs || []) {
+      if (ACTIVE_CLEANUP_STATES.has(entry.state)) followCleanup(entry);
+    }
+  } catch (e) {
+    console.error("Reading the running penalised-tag cleanup failed", e);
+    noticeStore.error(
+      errorDetail(e) || "Could not check on removing tags from pictures.",
+    );
+  }
 }
 
 async function updateSmartScoreTagWeight(tag, weight) {
@@ -249,7 +526,7 @@ watch(
     <SettingsSection
       class="smart-score__grow"
       title="Penalised Tags"
-      desc="Tags listed here reduce Smart Score when present on a picture. Adjust the importance to control how much they hurt the score."
+      desc="Tags listed here lower Smart Score. Removing one also removes it from your pictures."
       first
     >
       <SettingsChipGrid empty="No penalised tags yet.">
@@ -257,6 +534,7 @@ watch(
           v-for="entry in smartScorePenalisedTags"
           :key="entry.tag"
           :label="entry.tag"
+          :meta="removingTag === entry.tag ? 'Removing…' : ''"
           @remove="removeSmartScoreTag(entry.tag)"
         >
           <div class="smart-score-importance">
@@ -264,7 +542,7 @@ watch(
               compact
               :model-value="entry.weight"
               :options="smartScoreImportanceOptions"
-              :disabled="smartScoreTagsLoading"
+              :disabled="smartScoreTagsLoading || Boolean(removingTag)"
               @update:model-value="
                 (value) => updateSmartScoreTagWeight(entry.tag, value)
               "
