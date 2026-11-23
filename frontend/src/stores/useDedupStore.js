@@ -384,10 +384,26 @@ export const useDedupStore = defineStore("dedup", () => {
   const byTier = ref({});
   const scan = ref({ ...IDLE_SCAN });
   const countsLoaded = ref(false);
+  // One count read on the wire at a time. A caller arriving while one is in
+  // flight waits for ONE trailing read (`countsQueued`, carrying the union of
+  // the waiting callers' scopes) instead of starting its own, so answers land
+  // in the order they were asked for and a burst of callers costs two reads.
+  let countsInFlight = null;
+  let countsQueued = null;
+  // Bumped by `reset()`: a read from the previous session publishes nothing.
+  let countsEpoch = 0;
+  // Bumped by every optimistic change to `openCount`: a read asked for before
+  // it knows nothing of it and must not undo it.
+  let countsWriteSeq = 0;
 
   // --- Per-scope counts, for the context menus ----------------------------
   const scopeCounts = ref({});
   const scopeCountsInFlight = new Map();
+  // Bumped by `invalidateScopeCounts()`: a read asked for before the change
+  // must not refill the cache with the numbers from before it.
+  let scopeCountsEpoch = 0;
+  // The tier gate and threshold the cached scope counts were read under.
+  let scopeCountsPolicyKey = null;
   // Concurrent mounts/router syncs for the same destination share the whole
   // open operation. Without this, both could observe the same completed scan
   // and enqueue two fresh passes before either response reached the store.
@@ -912,25 +928,91 @@ export const useDedupStore = defineStore("dedup", () => {
    * one call feeds the sidebar, the tier menu's per-tier split and the scan
    * banner, and the three can never disagree.
    *
+   * Callers share the wire. While a read is in flight a new caller joins the
+   * one trailing read queued behind it, with its scopes merged in, and gets
+   * that read's answer: the sidebar refresh, a verdict's reconcile, the scan
+   * poll and the queue's reloads can all ask within one frame without the
+   * older answer landing last.
+   *
    * @param {Array<{scopeType: string, scopeId: (number|string|null)}>}
    *   [extraScopes=[]]
-   * @returns {Promise<Object|null>} the response body, or null on failure.
+   * @returns {Promise<Object|null>} the response body, or null on failure or
+   *   when the answer was out of date by the time it landed.
    */
-  async function refreshCounts(extraScopes = []) {
-    try {
-      const data = await getCounts({
-        policy: policyArgs.value,
-        scopes: extraScopes,
+  function refreshCounts(extraScopes = []) {
+    if (!countsInFlight) return startCountsRead(extraScopes);
+    if (!countsQueued) {
+      let resolve;
+      const promise = new Promise((res) => {
+        resolve = res;
       });
-      openCount.value = Number(data?.unresolved_groups) || 0;
+      countsQueued = { scopes: new Map(), promise, resolve };
+    }
+    for (const scope of extraScopes) {
+      countsQueued.scopes.set(scopeKey(scope.scopeType, scope.scopeId), scope);
+    }
+    return countsQueued.promise;
+  }
+
+  /** Put one count read on the wire; when it settles, start the queued one. */
+  function startCountsRead(scopes) {
+    const request = readCounts(scopes).finally(() => {
+      // `reset()` let go of this read: the slot and the queue are not its own.
+      if (countsInFlight !== request) return;
+      countsInFlight = null;
+      const queued = countsQueued;
+      countsQueued = null;
+      if (queued) queued.resolve(startCountsRead([...queued.scopes.values()]));
+    });
+    countsInFlight = request;
+    return request;
+  }
+
+  /**
+   * One count read, published only as far as it is still true when it lands.
+   *
+   * Nothing is published after a session reset or a tier/threshold change,
+   * since the read counted another session's or another gate's groups. After
+   * an optimistic tick-down the read knows nothing of, everything but
+   * `openCount` lands; a read asked for after the change confirms the badge.
+   * After `invalidateScopeCounts()` the scope rows are dropped.
+   *
+   * @param {Array<{scopeType: string, scopeId: (number|string|null)}>} scopes
+   * @returns {Promise<Object|null>}
+   */
+  async function readCounts(scopes) {
+    const epoch = countsEpoch;
+    const writeSeq = countsWriteSeq;
+    const scopeEpoch = scopeCountsEpoch;
+    const policy = policyArgs.value;
+    const policyKey = JSON.stringify(policy);
+    try {
+      const data = await getCounts({ policy, scopes });
+      if (
+        epoch !== countsEpoch ||
+        policyKey !== JSON.stringify(policyArgs.value)
+      ) {
+        return null;
+      }
+      if (writeSeq === countsWriteSeq) {
+        openCount.value = Number(data?.unresolved_groups) || 0;
+      }
       byTier.value = data?.by_tier ?? {};
       scan.value = normalizeScan(data?.scan);
-      for (const row of data?.scopes ?? []) {
-        const key = row.key ?? scopeKey(row.scope_type, row.scope_id);
-        scopeCounts.value = {
-          ...scopeCounts.value,
-          [key]: Number(row.unresolved_groups) || 0,
-        };
+      if (scopeEpoch === scopeCountsEpoch) {
+        // This read counted under the current tier gate and threshold; rows
+        // cached under another one are not true of it.
+        if (policyKey !== scopeCountsPolicyKey) {
+          invalidateScopeCounts();
+          scopeCountsPolicyKey = policyKey;
+        }
+        for (const row of data?.scopes ?? []) {
+          const key = row.key ?? scopeKey(row.scope_type, row.scope_id);
+          scopeCounts.value = {
+            ...scopeCounts.value,
+            [key]: Number(row.unresolved_groups) || 0,
+          };
+        }
       }
       countsLoaded.value = true;
       return data;
@@ -956,26 +1038,57 @@ export const useDedupStore = defineStore("dedup", () => {
    */
   async function fetchScopeCount(type, id, { force = false } = {}) {
     const key = scopeKey(type, id);
+    // A count read under another tier gate or threshold counted other groups.
+    const policyKey = JSON.stringify(policyArgs.value);
+    if (policyKey !== scopeCountsPolicyKey) {
+      invalidateScopeCounts();
+      scopeCountsPolicyKey = policyKey;
+    }
     if (!force && scopeCounts.value[key] !== undefined) {
       return scopeCounts.value[key];
     }
     if (scopeCountsInFlight.has(key)) return scopeCountsInFlight.get(key);
+    const epoch = scopeCountsEpoch;
     const request = refreshCounts([{ scopeType: type, scopeId: id }])
       .then((data) => {
         if (!data) return null;
         const value = scopeCounts.value[key];
-        return value === undefined ? 0 : value;
+        if (value !== undefined) return value;
+        // Invalidated while this read was on the wire: the number it carried
+        // is from before the change, so there is none to report yet.
+        return epoch === scopeCountsEpoch ? 0 : null;
       })
       .finally(() => {
-        scopeCountsInFlight.delete(key);
+        // An invalidation or a reset may have registered a newer request for
+        // this key since; that one is not this request's to remove.
+        if (scopeCountsInFlight.get(key) === request) {
+          scopeCountsInFlight.delete(key);
+        }
       });
     scopeCountsInFlight.set(key, request);
     return request;
   }
 
-  /** Drop the cached per-scope counts after anything that could move them. */
+  /**
+   * Drop the cached per-scope counts after anything that could move them.
+   *
+   * A read already on the wire was asked for before the change: it may not
+   * refill the cache, and a menu opening now asks again instead of joining it.
+   */
   function invalidateScopeCounts() {
+    scopeCountsEpoch += 1;
+    scopeCountsInFlight.clear();
     scopeCounts.value = {};
+  }
+
+  /**
+   * Tick the badge down ahead of the server (a verdict, a removed picture).
+   * A count read already on the wire must not undo it when it lands.
+   * @param {number} by
+   */
+  function tickOpenCountDown(by) {
+    countsWriteSeq += 1;
+    openCount.value = Math.max(0, openCount.value - by);
   }
 
   /**
@@ -1431,10 +1544,14 @@ export const useDedupStore = defineStore("dedup", () => {
   function loadMore(options = {}) {
     if (!hasMore.value || loading.value) return Promise.resolve();
     if (pageInFlight) return pageInFlight;
-    pageInFlight = fetchNextPage(options).finally(() => {
+    const request = fetchNextPage(options).finally(() => {
+      // `reset()` may have handed the slot, and the spinner, to a newer page.
+      if (pageInFlight !== request) return;
       pageInFlight = null;
+      loadingMore.value = false;
     });
-    return pageInFlight;
+    pageInFlight = request;
+    return request;
   }
 
   /** The page request itself. Never called directly - go through `loadMore`. */
@@ -1485,8 +1602,6 @@ export const useDedupStore = defineStore("dedup", () => {
       }
     } catch (err) {
       console.warn("[dedup] failed to page the duplicate queue", err);
-    } finally {
-      loadingMore.value = false;
     }
   }
 
@@ -1507,10 +1622,12 @@ export const useDedupStore = defineStore("dedup", () => {
   function loadPrevious(options = {}) {
     if (windowStart.value <= 0 || loading.value) return Promise.resolve();
     if (prevInFlight) return prevInFlight;
-    prevInFlight = fetchPreviousPage(options).finally(() => {
-      prevInFlight = null;
+    const request = fetchPreviousPage(options).finally(() => {
+      // `reset()` may have handed the slot to a newer page since.
+      if (prevInFlight === request) prevInFlight = null;
     });
-    return prevInFlight;
+    prevInFlight = request;
+    return request;
   }
 
   /** The upward page itself. Never called directly - go through loadPrevious. */
@@ -2044,7 +2161,7 @@ export const useDedupStore = defineStore("dedup", () => {
     // offset and refills an emptied window.
     for (const signature of doomed) removeGroup(signature);
     if (doomed.length) {
-      openCount.value = Math.max(0, openCount.value - doomed.length);
+      tickOpenCountDown(doomed.length);
       invalidateScopeCounts();
     }
     if (!touched) return { action: "ignored", reason: "removed-untouched" };
@@ -2270,7 +2387,7 @@ export const useDedupStore = defineStore("dedup", () => {
     }
     total.value = Math.max(0, total.value - removed);
     stackedCount.value += removed;
-    openCount.value = Math.max(0, openCount.value - removed);
+    tickOpenCountDown(removed);
     invalidateScopeCounts();
     reconcileCounts();
 
@@ -2386,7 +2503,7 @@ export const useDedupStore = defineStore("dedup", () => {
         nextOffset.value = Math.max(0, nextOffset.value - removed);
       }
       total.value = Math.max(0, total.value - removed);
-      openCount.value = Math.max(0, openCount.value - removed);
+      tickOpenCountDown(removed);
     }
     invalidateScopeCounts();
     reconcileCounts();
@@ -3184,6 +3301,8 @@ export const useDedupStore = defineStore("dedup", () => {
    * `windowEpoch` is bumped for the same reason it is bumped on a window
    * rebase: a page request still on the wire must discard its result instead
    * of appending the previous session's rows into an empty window.
+   * `countsEpoch` does the same for a count read, and a caller queued behind
+   * that read is answered with null rather than left waiting on it.
    *
    * `sizeLevel` deliberately stays. It is a persisted VIEW preference backed by
    * localStorage (like the review overlay's sticker shelf), not server data.
@@ -3194,6 +3313,11 @@ export const useDedupStore = defineStore("dedup", () => {
     windowEpoch += 1;
     pageInFlight = null;
     prevInFlight = null;
+    countsEpoch += 1;
+    countsInFlight = null;
+    const waitingForCounts = countsQueued;
+    countsQueued = null;
+    waitingForCounts?.resolve(null);
     scopeCountsInFlight.clear();
     openQueueInFlight.clear();
     scanRequestInFlight.clear();
