@@ -14,6 +14,7 @@ from pixlstash.tasks.base_task_finder import BaseTaskFinder
 from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
 from pixlstash.tasks.smart_score_task import SmartScoreTask
 from pixlstash.tasks.tag_task import TagTask
+from pixlstash.tasks.task_outcome import Outcome, Reason, outcomes_payload
 from pixlstash.vault import Vault
 from pixlstash.work_planner import WorkPlanner
 
@@ -934,9 +935,12 @@ def _one_line(caplog, marker: str) -> str:
 
 
 class _CountedTask:
-    def __init__(self, task_id: str, picture_ids: list):
+    def __init__(self, task_id: str, picture_ids: list, result=None, error=None):
         self.id = task_id
         self.params = {"picture_ids": list(picture_ids)}
+        self.result = result
+        # What the runner reports alongside it: the exception the task raised.
+        self.error = error
 
 
 class _TwoTaskFinder(_OneShotFinder):
@@ -965,10 +969,128 @@ def test_a_finder_burst_emits_exactly_one_pipeline_pass_line(caplog):
         assert planner._run_finders_once() is False
 
     line = _one_line(caplog, "[PIPELINE_PASS]")
-    assert "finder=TestFinder pictures=6 tasks=2" in line
+    # These tasks say nothing about their pictures, so none of the six is
+    # counted as done: they are attempted and unknown.
+    assert "finder=TestFinder pictures=0 tasks=2 " in line
+    assert line.endswith("attempted=6 failed=0 deferred=0 unknown=6"), line
     for field in ("wall_s=", "img_per_s=", "gpu_busy="):
         assert field in line, line
+    assert not [r for r in caplog.records if "[PIPELINE_NO_PROGRESS]" in r.getMessage()]
     assert planner._pass_stats == {}, "the burst's accounting outlived its drain"
+
+
+class _ListedTaskFinder(_OneShotFinder):
+    """Hands out the given tasks in order, then is dry."""
+
+    def __init__(self, tasks: list):
+        self._tasks = list(tasks)
+
+    def find_task(self):
+        return self._tasks.pop(0) if self._tasks else None
+
+    def on_all_tasks_complete(self):
+        return None
+
+
+def _run_burst(tasks: list) -> WorkPlanner:
+    """Submit *tasks* through a planner whose runner completes each at once."""
+    runner = _FastCompleteRunner()
+    planner = WorkPlanner(task_runner=runner, task_finders=[_ListedTaskFinder(tasks)])
+    runner.on_submit = lambda task: planner.on_task_complete(task, task.error)
+    assert planner._run_finders_once() is True
+    assert planner._run_finders_once() is False
+    return planner
+
+
+def test_the_pass_line_counts_only_succeeded_pictures_as_done(caplog):
+    """A picture that failed, was deferred or went unreported is not progress."""
+    t1 = _CountedTask(
+        "t1",
+        [1, 2, 3, 4],
+        result=outcomes_payload(
+            [
+                (1, Outcome.SUCCEEDED, None),
+                (2, Outcome.FAILED_PERMANENT, Reason.UNDECODABLE),
+                (3, Outcome.DEFERRED, Reason.CANCELLED),
+                # 4 is the task's, and it said nothing about it.
+            ]
+        ),
+    )
+    t2 = _CountedTask(
+        "t2",
+        [5, 6],
+        result=outcomes_payload(
+            [
+                (5, Outcome.SUCCEEDED, None),
+                (6, Outcome.FAILED_RETRYABLE, Reason.RESOURCE),
+            ]
+        ),
+    )
+    # A task that raised has no outcomes worth reading, whatever it left behind.
+    t3 = _CountedTask(
+        "t3",
+        [7],
+        result=outcomes_payload([(7, Outcome.SUCCEEDED, None)]),
+        error=RuntimeError("test-task blew up"),
+    )
+    t4 = _CountedTask("t4", [8])
+
+    with caplog.at_level(logging.INFO):
+        _run_burst([t1, t2, t3, t4])
+
+    line = _one_line(caplog, "[PIPELINE_PASS]")
+    assert "finder=TestFinder pictures=2 tasks=4 " in line, line
+    assert line.endswith("attempted=8 failed=2 deferred=1 unknown=3"), line
+    stuck = _one_line(caplog, "[PIPELINE_NO_PROGRESS]")
+    assert (
+        stuck
+        == "[PIPELINE_NO_PROGRESS] finder=TestFinder failed=2 deferred=1 ids=[2, 3, 6]"
+    )
+
+
+def test_the_no_progress_line_names_at_most_twenty_pictures(caplog):
+    failed = [
+        _CountedTask(
+            f"t{n}",
+            ids,
+            result=outcomes_payload(
+                (pid, Outcome.FAILED_RETRYABLE, Reason.IO_TRANSIENT) for pid in ids
+            ),
+        )
+        for n, ids in enumerate([range(100, 115), range(200, 215)])
+    ]
+
+    with caplog.at_level(logging.INFO):
+        _run_burst(failed)
+
+    assert _one_line(caplog, "[PIPELINE_PASS]").endswith(
+        "attempted=30 failed=30 deferred=0 unknown=0"
+    )
+    stuck = _one_line(caplog, "[PIPELINE_NO_PROGRESS]")
+    expected = list(range(100, 115)) + list(range(200, 205))
+    assert stuck.endswith(f"failed=30 deferred=0 ids={expected!r}"), stuck
+
+
+def test_an_outcome_that_is_not_one_is_logged_and_counted_unknown(caplog):
+    bad = _CountedTask(
+        "t1", [1, 2], result={"outcomes": [(1, "test-not-an-outcome", None)]}
+    )
+    good = _CountedTask(
+        "t2", [3], result=outcomes_payload([(3, Outcome.SUCCEEDED, None)])
+    )
+
+    with caplog.at_level(logging.INFO):
+        _run_burst([bad, good])
+
+    errors = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.ERROR and "t1" in r.getMessage()
+    ]
+    assert len(errors) == 1 and "test-not-an-outcome" in errors[0], errors
+    line = _one_line(caplog, "[PIPELINE_PASS]")
+    assert "pictures=1 tasks=2 " in line, line
+    assert line.endswith("attempted=3 failed=0 deferred=0 unknown=2"), line
 
 
 class _FakeClipWorkflow:
