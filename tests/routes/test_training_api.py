@@ -2223,7 +2223,7 @@ def _seed_character_pictures(server, char_id):
     return server.vault.db.run_task(seed)
 
 
-def test_character_set_suggestion_ranks_stills_and_clips_apart():
+def test_character_set_suggestion_ranks_stills_and_clips_apart(key_list_plan):
     temp_dir, owner, server, read_token = _setup()
     try:
         char_id = _make_character(owner, "Anna")
@@ -2311,6 +2311,43 @@ def test_character_set_suggestion_ranks_stills_and_clips_apart():
         assert stills["candidates"] == 4
         assert stills["excluded"]["other_people"] == 0
         assert d in {p["picture_id"] for p in stills["picks"]}
+
+        # Behind a scrapheaped cover, the stack's next live member stands for
+        # it: a over b. The two stacks' members are read by stack id, not by
+        # walking every kept picture.
+        def stack_behind_a_scrapheaped_cover(session):
+            from pixlstash.db_models import Picture, PictureStack
+
+            row = PictureStack()
+            session.add(row)
+            session.flush()
+            session.add(
+                Picture(
+                    file_path="gone.png",
+                    width=100,
+                    height=100,
+                    score=5,
+                    deleted=True,
+                    stack_id=row.id,
+                    stack_position=0,
+                )
+            )
+            for pid, pos in ((a, 1), (b, 2)):
+                pic = session.get(Picture, pid)
+                pic.stack_id, pic.stack_position = row.id, pos
+            session.commit()
+
+        server.vault.db.run_task(stack_behind_a_scrapheaped_cover)
+        with key_list_plan(
+            server.vault.db._engine,
+            "FROM picture \nWHERE picture.stack_id IN (?",
+            "ix_picture_stack_id",
+        ) as plans:
+            stills = owner.get(url, params={"character_id": char_id}).json()["stills"]
+        assert len(plans) == 1, plans
+        assert stills["candidates"] == 3
+        picks = {p["picture_id"] for p in stills["picks"]}
+        assert a in picks and b not in picks
     finally:
         _teardown(temp_dir, server)
 

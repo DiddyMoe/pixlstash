@@ -41,6 +41,7 @@ from pixlstash.event_types import EventType
 from pixlstash.server import Server
 from pixlstash.services import import_dedup_service, scrapheap_service
 from pixlstash.services.comfyui_service import _import_comfyui_outputs
+from pixlstash.services.import_dedup_service import load_match_candidates_in_session
 from pixlstash.tasks import picture_import_task
 from pixlstash.tasks.missing_face_extraction_finder import MissingFaceExtractionFinder
 from pixlstash.tasks.watch_folder_import_task import WatchFolderImportTask
@@ -835,6 +836,53 @@ def test_staging_and_comfy_batches_keep_sampled_collisions_distinct(
     repeated_new, repeated_duplicates = _import_comfyui_outputs(srv, outputs)
     assert repeated_new == []
     assert sorted(repeated_duplicates) == sorted(new_ids)
+
+
+def test_comfy_batch_searches_its_hashes_and_leaves_the_scrapheap_out(
+    owner_server, key_list_plan, tmp_path
+):
+    """A ComfyUI batch looks its files up by content hash, and only among kept
+    pictures: an output matching a scrapheaped picture is a new picture."""
+    srv, client = owner_server
+    kept = _png_bytes((11, 22, 33))
+    heaped = _png_bytes((44, 55, 66))
+    kept_file = tmp_path / "test-kept.png"
+    kept_file.write_bytes(kept)
+    heaped_file = tmp_path / "test-heaped.png"
+    heaped_file.write_bytes(heaped)
+    outputs = [(str(kept_file), ".png"), (str(heaped_file), ".png")]
+    kept_id, heaped_id = _import_comfyui_outputs(srv, outputs)[0]
+    _scrapheap(client, heaped_id)
+    kept_key = (ImageUtils.calculate_hash_from_bytes(kept), len(kept))
+    heaped_key = (ImageUtils.calculate_hash_from_bytes(heaped), len(heaped))
+    plan = (
+        srv.vault.db._engine,
+        "picture.deleted \nFROM picture \nWHERE picture.pixel_sha IN",
+        "ix_picture_pixel_sha",
+    )
+
+    with key_list_plan(*plan):
+        new_ids, duplicate_ids = _import_comfyui_outputs(srv, outputs)
+    assert duplicate_ids == [kept_id]
+    assert len(new_ids) == 1 and new_ids[0] not in (kept_id, heaped_id)
+
+    def matched(include_deleted):
+        candidates = srv.vault.db.run_immediate_read_task(
+            load_match_candidates_in_session,
+            [kept_key, heaped_key, (None, 0)],
+            include_deleted,
+        )
+        return {key: [match.id for match in rows] for key, rows in candidates.items()}
+
+    with key_list_plan(*plan):
+        assert matched(False) == {kept_key: [kept_id], heaped_key: new_ids}
+    assert matched(True) == {kept_key: [kept_id], heaped_key: [heaped_id, *new_ids]}
+    assert (
+        srv.vault.db.run_immediate_read_task(
+            load_match_candidates_in_session, [(None, 0)], False
+        )
+        == {}
+    )
 
 
 def test_restore_announces_exactly_the_pictures_it_restored(owner_server):

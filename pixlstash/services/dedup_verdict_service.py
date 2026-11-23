@@ -701,13 +701,19 @@ def _dry_run_summary_in_session(
         stack_scope = scope_id_subquery(
             session, stack_ids, name="_pixlstash_dry_run_stack_ids"
         )
-        for picture_id, stack_id in session.exec(
-            select(Picture.id, Picture.stack_id).where(
-                Picture.stack_id.in_(stack_scope),
-                Picture.deleted.is_(False),
+        # Soft-deleted members are dropped here rather than in SQL: beside
+        # ``deleted IS 0``, and without ``sqlite_stat1`` (PixlStash never runs
+        # ``ANALYZE``), the planner rates two or more stack ids below
+        # ``ix_picture_deleted`` and walks every kept picture to find the stacks'
+        # few. Alone, the ids search ``ix_picture_stack_id``
+        # (backend_architecture.md, "Probe cost").
+        for picture_id, stack_id, deleted in session.exec(
+            select(Picture.id, Picture.stack_id, Picture.deleted).where(
+                Picture.stack_id.in_(stack_scope)
             )
         ).all():
-            members_by_stack[int(stack_id)].append(int(picture_id))
+            if not deleted:
+                members_by_stack[int(stack_id)].append(int(picture_id))
 
     tags_by_picture: dict[int, set[str]] = defaultdict(set)
     for picture_id, tag in session.exec(

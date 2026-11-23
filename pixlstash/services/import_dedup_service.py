@@ -135,6 +135,11 @@ def load_match_candidates_in_session(
     if not wanted:
         return candidates
 
+    # Soft-deleted rows are dropped here rather than in SQL: beside ``deleted IS
+    # 0``, and without ``sqlite_stat1`` (PixlStash never runs ``ANALYZE``), the
+    # planner rates a list of two or more hashes below ``ix_picture_deleted`` and
+    # walks every kept picture to find a batch's few. Alone, the hashes search
+    # their own index (backend_architecture.md, "Probe cost").
     wanted_shas = sorted({sha for sha, _size in wanted})
     for start in range(0, len(wanted_shas), _SHA_QUERY_CHUNK):
         chunk = wanted_shas[start : start + _SHA_QUERY_CHUNK]
@@ -145,11 +150,11 @@ def load_match_candidates_in_session(
             Picture.file_path,
             Picture.deleted,
         ).where(Picture.pixel_sha.in_(chunk))
-        if not include_deleted:
-            query = query.where(Picture.deleted.is_(False))
         rows = session.exec(query.order_by(Picture.id)).all()
         for row_id, pixel_sha, size_bytes, file_path, deleted in rows:
             if row_id is None or not pixel_sha or size_bytes is None:
+                continue
+            if deleted and not include_deleted:
                 continue
             key = (str(pixel_sha), int(size_bytes))
             if key not in wanted:

@@ -102,11 +102,20 @@ def expand_picture_ids_to_stacks(
         stack_scope = scope_id_subquery(
             session, stack_ids, name="_pixlstash_expand_stack_ids"
         )
-        member_query = select(Picture.id).where(Picture.stack_id.in_(stack_scope))
-        if not include_deleted:
-            member_query = member_query.where(Picture.deleted.is_(False))
-        member_ids = session.exec(member_query).all()
-        ids.update(int(mid) for mid in member_ids if mid is not None)
+        # Soft-deleted members are dropped here rather than in SQL: beside
+        # ``deleted IS 0``, and without ``sqlite_stat1`` (PixlStash never runs
+        # ``ANALYZE``), the planner rates two or more stack ids below
+        # ``ix_picture_deleted`` and walks every kept picture to find the stacks'
+        # few. Alone, the ids search ``ix_picture_stack_id``
+        # (backend_architecture.md, "Probe cost").
+        members = session.exec(
+            select(Picture.id, Picture.deleted).where(Picture.stack_id.in_(stack_scope))
+        ).all()
+        ids.update(
+            int(member_id)
+            for member_id, deleted in members
+            if member_id is not None and (include_deleted or not deleted)
+        )
 
     return sorted(ids)
 

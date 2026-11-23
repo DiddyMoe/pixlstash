@@ -1380,6 +1380,39 @@ def test_used_looks_are_the_stacks_own_pictures_and_no_outsiders(recipe_env):
     ]
 
 
+def test_a_workflows_looks_search_its_keys_not_every_kept_picture(
+    recipe_env, key_list_plan
+):
+    """The looks read searches the index of what a workflow is filed under, its
+    variants and a manual workflow's own runs, and still leaves the Scrapheap
+    out: ``a_binned.png`` carries the busiest look."""
+    engine = recipe_env.server.vault.db._engine
+    marker = "GROUP BY picture.comfyui_positive_prompt"
+
+    def counted(looks):
+        return sorted((look["prompt"], look["pictures"]) for look in looks)
+
+    with key_list_plan(engine, marker, "ix_picture_workflow_structural_hash"):
+        looks = _used(recipe_env.owner, WF_AB)
+    assert counted(looks) == [(PROMPT, 1), (PROMPT, 2), (OTHER_PROMPT, 1)]
+
+    manual = create_manual_workflow(
+        recipe_env.server.hub, "Mine", {"1": {"class_type": "X"}}, "import"
+    )
+    _a_manual_run(recipe_env.server, manual)
+    with key_list_plan(engine, marker, "ix_picture_run_workflow_id"):
+        looks = _used(recipe_env.owner, manual)
+    assert counted(looks) == [(MANUAL_PROMPT, 1)]
+    with key_list_plan(engine, marker, "ix_picture_workflow_structural_hash"):
+        looks = _used(recipe_env.owner, manual, WF_AB)
+    assert counted(looks) == [
+        (PROMPT, 1),
+        (PROMPT, 2),
+        (MANUAL_PROMPT, 1),
+        (OTHER_PROMPT, 1),
+    ]
+
+
 def test_one_look_spelled_two_ways_is_one_row(recipe_env):
     """`a_match` and `b_match` load the same file under different names.
 

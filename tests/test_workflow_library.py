@@ -25,7 +25,7 @@ import random
 import sqlite3
 import struct
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +34,7 @@ import piexif.helper
 import pytest
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
-from sqlalchemy import text as sa_text
+from sqlalchemy import event, text as sa_text
 from sqlalchemy.exc import OperationalError
 from sqlmodel import delete as sqlmodel_delete, select
 
@@ -102,7 +102,12 @@ from pixlstash.services.model_shelf_service import (
 )
 from pixlstash.services.model_workflow_sets import create_set, delete_set, set_declines
 from pixlstash.services.workflow_library_service import (
+    WorkflowActivity,
+    read_best_picture_ids,
     read_card_picture_ids,
+    read_instance_hashes,
+    read_oldest_kept_by_pixel_sha,
+    read_recipe_activity,
     recipe_activity,
     recipe_picture_counts,
 )
@@ -2533,6 +2538,225 @@ def test_counts_exclude_soft_deleted_pictures(store):
     assert kept_recipe not in store.vault.run_immediate_read_task(recipe_picture_counts)
 
 
+def test_a_cards_picture_reads_search_its_variants_not_every_kept_picture(
+    store, key_list_plan
+):
+    """A card's newest pictures, best pictures and run instances search the
+    variant index, and still leave out the Scrapheap and unkeyed pictures.
+
+    The soft-deleted picture is the card's newest and best rated, and the
+    picture with no variant is newer and better again, so a read that let
+    either in, or let one take a place under the limit, shows here.
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def insert(session):
+        rows = [
+            # (name, variant, instance, score, minutes, deleted)
+            ("binned.png", "fake-variant-a", "fake-instance-binned", 5, 9, True),
+            ("newest.png", "fake-variant-b", "fake-instance-1", 2, 8, False),
+            ("best.png", "fake-variant-a", "fake-instance-2", 4, 7, False),
+            ("oldest.png", "fake-variant-a", "fake-instance-1", None, 6, False),
+            ("unkeyed.png", "fake-variant-a", None, 3, 5, False),
+            ("loose.png", None, "fake-instance-3", 5, 11, False),
+            ("elsewhere.png", "fake-variant-c", "fake-instance-3", 5, 10, False),
+        ]
+        ids = {}
+        for name, variant, instance, score, minutes, deleted in rows:
+            picture = Picture(
+                file_path=name,
+                workflow_structural_hash=variant,
+                workflow_instance_hash=instance,
+                score=score,
+                created_at=base + timedelta(minutes=minutes),
+                deleted=deleted,
+            )
+            session.add(picture)
+            session.flush()
+            ids[name] = picture.id
+        session.commit()
+        return ids
+
+    ids = store.vault.run_task(insert)
+    vault = SimpleNamespace(db=store.vault)
+    card = ["fake-variant-a", "fake-variant-b"]
+    plan = (
+        store.vault._engine,
+        "workflow_structural_hash IN",
+        "ix_picture_workflow_structural_hash",
+    )
+
+    with key_list_plan(*plan):
+        newest = read_card_picture_ids(vault, card, 2)
+    assert newest == [ids["newest.png"], ids["best.png"]]
+
+    with key_list_plan(*plan):
+        best = read_best_picture_ids(vault, card, 2)
+    assert best == [ids["best.png"], ids["unkeyed.png"]]
+
+    with key_list_plan(*plan):
+        instances = read_instance_hashes(vault, card, None, 1)
+    assert instances == ["fake-instance-1"]
+    assert read_instance_hashes(vault, card, None, 5) == [
+        "fake-instance-1",
+        "fake-instance-2",
+    ]
+    with key_list_plan(*plan):
+        rated = read_instance_hashes(vault, card, 3, 5)
+    assert rated == ["fake-instance-2"]
+
+
+def test_a_run_filed_workflows_pictures_search_the_kept_pictures(store):
+    """With a run-filed workflow live, a card's pictures are keyed by the
+    ``CASE`` :func:`filed_as` builds, which no index serves, so ``deleted IS 0``
+    is the read's one narrowing and must search ``ix_picture_deleted`` rather
+    than walk the table.
+
+    The soft-deleted run is the newest picture filed under the workflow, so a
+    read that let the Scrapheap in, or gave it a place under the limit, shows.
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def insert(session):
+        rows = [
+            # (name, run workflow, variant, minutes, deleted)
+            ("run-binned.png", "manual:fake-w", "fake-variant-b", 9, True),
+            ("run-kept.png", "manual:fake-w", "fake-variant-b", 8, False),
+            ("variant.png", None, "fake-variant-a", 7, False),
+        ]
+        ids = {}
+        for name, run_workflow_id, variant, minutes, deleted in rows:
+            picture = Picture(
+                file_path=name,
+                run_workflow_id=run_workflow_id,
+                workflow_structural_hash=variant,
+                created_at=base + timedelta(minutes=minutes),
+                deleted=deleted,
+            )
+            session.add(picture)
+            session.flush()
+            ids[name] = picture.id
+        session.commit()
+        return ids
+
+    ids = store.vault.run_task(insert)
+    vault = SimpleNamespace(db=store.vault)
+    engine = store.vault._engine
+    plans = []
+
+    def explain(_conn, cursor, statement, parameters, _context, executemany):
+        if "ORDER BY" in statement and not executemany:
+            rows = cursor.connection.execute(
+                f"EXPLAIN QUERY PLAN {statement}", parameters
+            ).fetchall()
+            plans.append(" | ".join(str(row[-1]) for row in rows))
+
+    event.listen(engine, "before_cursor_execute", explain)
+    try:
+        newest = read_card_picture_ids(
+            vault, ["fake-variant-a", "manual:fake-w"], 5, live=["manual:fake-w"]
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", explain)
+
+    assert len(plans) == 1, plans
+    assert "SEARCH picture USING INDEX ix_picture_deleted (deleted=?)" in plans[0], (
+        plans[0]
+    )
+    assert newest == [ids["run-kept.png"], ids["variant.png"]]
+
+
+def test_a_pinned_inputs_picture_searches_its_pixel_hashes(store, key_list_plan):
+    """The oldest kept copy of each content, read through the pixel hash index.
+
+    The soft-deleted copy of the first content is older than its kept one, so a
+    read that let the Scrapheap in would answer with it; the third content has
+    only a soft-deleted copy and must be absent.
+    """
+
+    def insert(session):
+        rows = [
+            ("a-binned.png", "fake-sha-a", True),
+            ("a-kept.png", "fake-sha-a", False),
+            ("b-oldest.png", "fake-sha-b", False),
+            ("b-newer.png", "fake-sha-b", False),
+            ("c-binned.png", "fake-sha-c", True),
+        ]
+        ids = {}
+        for name, pixel_sha, deleted in rows:
+            picture = Picture(file_path=name, pixel_sha=pixel_sha, deleted=deleted)
+            session.add(picture)
+            session.flush()
+            ids[name] = picture.id
+        session.commit()
+        return ids
+
+    ids = store.vault.run_task(insert)
+    vault = SimpleNamespace(db=store.vault)
+
+    with key_list_plan(
+        store.vault._engine, "picture.pixel_sha IN", "ix_picture_pixel_sha"
+    ):
+        pinned = read_oldest_kept_by_pixel_sha(
+            vault, ["fake-sha-a", "fake-sha-b", "fake-sha-c"]
+        )
+    assert pinned == {
+        "fake-sha-a": ids["a-kept.png"],
+        "fake-sha-b": ids["b-oldest.png"],
+    }
+
+
+def test_a_topologys_recipe_activity_searches_its_variants(store, key_list_plan):
+    """Per-recipe counts and last use, read through the variant index for one
+    recipe and for several, with the Scrapheap left out of both figures.
+
+    The soft-deleted picture is the newest of its recipe, so letting it in
+    would change the recipe's count and its last use; the third recipe has only
+    a soft-deleted picture and must be absent.
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def insert(session):
+        rows = [
+            # (variant, minutes, deleted)
+            ("fake-variant-a", 9, True),
+            ("fake-variant-a", 5, False),
+            ("fake-variant-b", 6, False),
+            ("fake-variant-b", 7, False),
+            ("fake-variant-c", 8, True),
+        ]
+        for n, (variant, minutes, deleted) in enumerate(rows):
+            session.add(
+                Picture(
+                    file_path=f"activity-{n}.png",
+                    workflow_structural_hash=variant,
+                    created_at=base + timedelta(minutes=minutes),
+                    deleted=deleted,
+                )
+            )
+        session.commit()
+
+    store.vault.run_task(insert)
+    vault = SimpleNamespace(db=store.vault)
+    plan = (
+        store.vault._engine,
+        "picture.workflow_structural_hash IN",
+        "ix_picture_workflow_structural_hash",
+    )
+    a = WorkflowActivity(pictures=1, last_used=base + timedelta(minutes=5))
+    b = WorkflowActivity(pictures=2, last_used=base + timedelta(minutes=7))
+
+    with key_list_plan(*plan):
+        one = read_recipe_activity(vault, ["fake-variant-a"])
+    assert one == {"fake-variant-a": a}
+
+    with key_list_plan(*plan):
+        several = read_recipe_activity(
+            vault, ["fake-variant-a", "fake-variant-b", "fake-variant-c"]
+        )
+    assert several == {"fake-variant-a": a, "fake-variant-b": b}
+
+
 def generation(store, picture_id):
     return store.vault.run_immediate_read_task(
         lambda session: session.get(Generation, picture_id)
@@ -4547,6 +4771,54 @@ def test_the_ghost_reads_survive_the_bound_parameter_ceiling(store):
 
     assert candidates == []
     assert surviving == set()
+
+
+def test_the_ghost_coverage_read_searches_the_instance_index(store, key_list_plan):
+    """Which instance hashes a picture still carries, read through the instance
+    index, with the Scrapheap left out unless the caller counts it.
+
+    The third instance's only carrier is soft-deleted: absent by default,
+    present with ``include_deleted``.
+    """
+
+    def insert(session):
+        rows = [
+            ("fake-instance-kept", False),
+            ("fake-instance-mixed", True),
+            ("fake-instance-mixed", False),
+            ("fake-instance-binned", True),
+        ]
+        for n, (instance, deleted) in enumerate(rows):
+            session.add(
+                Picture(
+                    file_path=f"cover-{n}.png",
+                    workflow_instance_hash=instance,
+                    deleted=deleted,
+                )
+            )
+        session.commit()
+
+    store.vault.run_task(insert)
+    hashes = ["fake-instance-kept", "fake-instance-mixed", "fake-instance-binned"]
+    plan = (
+        store.vault._engine,
+        "picture.workflow_instance_hash IN",
+        "ix_picture_workflow_instance_hash",
+    )
+
+    with key_list_plan(*plan):
+        kept = store.vault.run_immediate_read_task(
+            surviving_instance_hashes_in_session, hashes
+        )
+    assert kept == {"fake-instance-kept", "fake-instance-mixed"}
+
+    with key_list_plan(*plan):
+        held = store.vault.run_immediate_read_task(
+            lambda session: surviving_instance_hashes_in_session(
+                session, hashes, include_deleted=True
+            )
+        )
+    assert held == set(hashes)
 
 
 def test_a_workflow_with_no_prompt_still_leaves_a_ghost(store):

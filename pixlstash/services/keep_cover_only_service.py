@@ -445,15 +445,20 @@ def resolve_selection_in_session(
     if not candidates:
         return [], sorted(named)
 
+    # Soft-deleted members are dropped here rather than in SQL: beside
+    # ``deleted IS 0``, and without ``sqlite_stat1`` (PixlStash never runs
+    # ``ANALYZE``), the planner rates two or more stack ids below
+    # ``ix_picture_deleted`` and walks every kept picture to find the stacks'
+    # few. Alone, the ids search ``ix_picture_stack_id``
+    # (backend_architecture.md, "Probe cost").
     live = {
         int(sid)
-        for sid in session.exec(
-            select(Picture.stack_id).where(
-                Picture.stack_id.in_(sorted(candidates)),
-                Picture.deleted.is_(False),
+        for sid, deleted in session.exec(
+            select(Picture.stack_id, Picture.deleted).where(
+                Picture.stack_id.in_(sorted(candidates))
             )
         ).all()
-        if sid is not None
+        if sid is not None and not deleted
     }
     return sorted(live), sorted(named - live)
 
@@ -475,10 +480,16 @@ def _live_members_by_stack(
     if not stack_ids:
         return {}
     members: dict[int, list[Picture]] = {}
+    # ``deleted IS NOT 1`` rather than ``IS 0``: the same rows (``deleted`` is
+    # NOT NULL), but no index can serve ``IS NOT``, so without ``sqlite_stat1``
+    # two or more stack ids still search ``ix_picture_stack_id`` instead of
+    # walking every kept picture through ``ix_picture_deleted``. Filtered in
+    # SQL so scrapheaped rows are never loaded as entities
+    # (backend_architecture.md, "Probe cost").
     for picture in session.exec(
         select(Picture).where(
             Picture.stack_id.in_(stack_ids),
-            Picture.deleted.is_(False),
+            Picture.deleted.is_not(True),
         )
     ).all():
         members.setdefault(int(picture.stack_id), []).append(picture)
@@ -665,16 +676,22 @@ def _staying_reasons_in_session(
     covered: set[str] = set()
     if recipes.ghost_retention == GHOST_RETENTION_COVERED:
         moving_ids = {int(pic.id) for pic in passing}
+        # Soft-deleted pictures are dropped here rather than in SQL: beside
+        # ``deleted IS 0``, and without ``sqlite_stat1`` (PixlStash never runs
+        # ``ANALYZE``), the planner rates two or more instance hashes below
+        # ``ix_picture_deleted`` and walks every kept picture to find the
+        # hashes' few. Alone, the hashes search
+        # ``ix_picture_workflow_instance_hash`` (backend_architecture.md,
+        # "Probe cost").
         for batch in chunked(sorted({pic.workflow_instance_hash for pic in passing})):
             covered.update(
                 instance_hash
-                for picture_id, instance_hash in session.exec(
-                    select(Picture.id, Picture.workflow_instance_hash).where(
-                        Picture.workflow_instance_hash.in_(batch),
-                        Picture.deleted.is_(False),
-                    )
+                for picture_id, instance_hash, deleted in session.exec(
+                    select(
+                        Picture.id, Picture.workflow_instance_hash, Picture.deleted
+                    ).where(Picture.workflow_instance_hash.in_(batch))
                 ).all()
-                if int(picture_id) not in moving_ids
+                if not deleted and int(picture_id) not in moving_ids
             )
     for pic in passing:
         if pic.workflow_instance_hash not in covered:

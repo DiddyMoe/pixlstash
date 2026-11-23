@@ -44,6 +44,7 @@ from pixlstash.db_models import (
     Tag,
 )
 from pixlstash.server import Server
+from pixlstash.utils import sql_chunking
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.services import (
     keep_cover_only_service,
@@ -71,7 +72,8 @@ def _make_stack(server, members: list[dict]) -> tuple[int, list[int]]:
     """Insert one stack. ``members[0]`` becomes the cover (position 0).
 
     Each entry may carry ``tags`` (list[str]), ``score`` (int),
-    ``size_bytes`` (int) and ``reference_folder_id``.
+    ``size_bytes`` (int), ``reference_folder_id`` and ``deleted`` (bool: the
+    member is in the Scrapheap, keeping its ``stack_id`` and position).
     """
 
     def insert(session):
@@ -88,6 +90,7 @@ def _make_stack(server, members: list[dict]) -> tuple[int, list[int]]:
                 size_bytes=spec.get("size_bytes", 1000),
                 score=spec.get("score"),
                 reference_folder_id=spec.get("reference_folder_id"),
+                deleted=spec.get("deleted", False),
                 stack_id=int(stack.id),
                 stack_position=position,
             )
@@ -555,6 +558,54 @@ def test_a_partial_selection_inside_a_stack_collapses_the_whole_stack():
         assert rows[stack_id]["eligible"] is True
         assert rows[stack_id]["copy_picture_ids"] == pics[1:]
         assert body["pictures_moving"] == 2
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_a_selection_reads_its_stacks_by_stack_id_and_leaves_the_scrapheap_out(
+    key_list_plan,
+):
+    """Resolving the stacks and loading their members search ``ix_picture_stack_id``.
+
+    Two or more stack ids beside ``deleted IS 0`` lose to ``ix_picture_deleted``
+    without ``sqlite_stat1`` and walk every kept picture. Whatever the shape,
+    a stack whose members are all in the Scrapheap still resolves to unknown,
+    and a scrapheaped member at position 0 is neither the cover nor a copy.
+    """
+    temp_dir, client, server = _env()
+    try:
+        gone, _gone_pics = _make_stack(server, [{"deleted": True}, {"deleted": True}])
+        headless, headless_pics = _make_stack(server, [{"deleted": True}, {}, {}])
+        plain, plain_pics = _make_stack(server, [{}, {}])
+
+        with key_list_plan(
+            server.vault.db._engine,
+            "FROM picture \nWHERE picture.stack_id IN (?",
+            "ix_picture_stack_id",
+        ) as plans:
+            body = client.post(
+                PREVIEW_URL,
+                json={"stack_ids": [gone, headless], "picture_ids": [plain_pics[1]]},
+            ).json()
+        # The selection's three stacks resolve, then the two live ones load.
+        assert len(plans) == 2, plans
+
+        assert body["unknown_stack_ids"] == [gone]
+        assert body["stacks_selected"] == 2
+        rows = _rows_by_stack(body)
+        assert rows[headless]["cover_picture_id"] == headless_pics[1]
+        assert rows[headless]["copy_picture_ids"] == [headless_pics[2]]
+        assert rows[plain]["copy_picture_ids"] == [plain_pics[1]]
+        assert body["picture_ids_moving"] == sorted([headless_pics[2], plain_pics[1]])
+
+        # The plan re-reports a resolved stack with no members as unknown, so
+        # the resolver is asked directly whether it called the Scrapheap live.
+        resolve = keep_cover_only_service.resolve_selection_in_session
+        assert _run(server, resolve, [gone, headless], [plain_pics[1]]) == (
+            sorted([headless, plain]),
+            [gone],
+        )
+        assert _run(server, resolve, [], []) == ([], [])
     finally:
         _teardown(temp_dir, server)
 
@@ -1148,6 +1199,53 @@ def test_keep_recipes_only_moves_only_what_could_be_made_again():
         )
         rows = _picture_rows(server, list(pics.values()))
         assert not any(row[0] for row in rows.values())
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_coverage_is_read_by_instance_hash_and_the_scrapheap_covers_nothing(
+    key_list_plan, monkeypatch
+):
+    """Whether a copy is covered is read through its instance hash's index.
+
+    The two moving copies' instance hashes beside ``deleted IS 0`` lose to
+    ``ix_picture_deleted`` without ``sqlite_stat1``. Whatever the shape, a
+    scrapheaped picture carrying the uncovered copy's instance does not cover
+    it, in one chunk or several.
+    """
+    temp_dir, client, server, stack_id, pics = _recipes_env()
+    try:
+        _other, (scrapheaped,) = _make_stack(server, [{"deleted": True}])
+
+        def share_instance(session):
+            source = session.get(Picture, pics["uncovered"])
+            picture = session.get(Picture, scrapheaped)
+            picture.workflow_structural_hash = source.workflow_structural_hash
+            picture.workflow_instance_hash = source.workflow_instance_hash
+            session.add(picture)
+            session.commit()
+
+        _run(server, share_instance)
+        selection = {"stack_ids": [stack_id], "keep_recipes": True}
+
+        with key_list_plan(
+            server.vault.db._engine,
+            "FROM picture \nWHERE picture.workflow_instance_hash IN (?",
+            "ix_picture_workflow_instance_hash",
+        ) as plans:
+            preview = client.post(PREVIEW_URL, json=selection).json()
+        assert len(plans) == 1, plans
+        assert preview["picture_ids_moving"] == [pics["covered"]]
+        assert preview["pictures_staying_ghost_not_kept"] == 1
+
+        monkeypatch.setattr(
+            keep_cover_only_service,
+            "chunked",
+            lambda seq: sql_chunking.chunked(seq, size=1),
+        )
+        preview = client.post(PREVIEW_URL, json=selection).json()
+        assert preview["picture_ids_moving"] == [pics["covered"]]
+        assert preview["pictures_staying_ghost_not_kept"] == 1
     finally:
         _teardown(temp_dir, server)
 

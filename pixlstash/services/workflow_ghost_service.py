@@ -308,7 +308,8 @@ def surviving_instance_hashes_in_session(
             Picture.workflow_instance_hash.in_(batch)
         )
         if not include_deleted:
-            query = query.where(Picture.deleted.is_(False))
+            # Not ``IS 0``, which beats the hash index from one hash ("Probe cost").
+            query = query.where(Picture.deleted.is_not(True))
         rows = session.exec(query.distinct()).all()
         surviving.update(value for value in rows if value)
     return surviving

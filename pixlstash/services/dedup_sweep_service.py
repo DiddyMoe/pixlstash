@@ -704,6 +704,12 @@ def _load_stack_siblings(
     siblings: dict[int, SweepMember] = {}
     for start in range(0, len(stack_ids), ID_CHUNK):
         chunk = stack_ids[start : start + ID_CHUNK]
+        # Soft-deleted siblings are dropped here rather than in SQL: beside
+        # ``deleted IS 0``, and without ``sqlite_stat1`` (PixlStash never runs
+        # ``ANALYZE``), the planner rates two or more stack ids below
+        # ``ix_picture_deleted`` and walks every kept picture to find the stacks'
+        # few. Alone, the ids search ``ix_picture_stack_id``
+        # (backend_architecture.md, "Probe cost").
         rows = session.exec(
             select(
                 Picture.id,
@@ -712,11 +718,12 @@ def _load_stack_siblings(
                 Picture.smart_score,
                 Picture.created_at,
                 Picture.size_bytes,
-            ).where(Picture.stack_id.in_(chunk), Picture.deleted.is_(False))
+                Picture.deleted,
+            ).where(Picture.stack_id.in_(chunk))
         ).all()
         for row in rows:
             picture_id = int(row[0])
-            if picture_id in meta_by_id:
+            if row[6] or picture_id in meta_by_id:
                 continue
             siblings[picture_id] = SweepMember(
                 id=picture_id,

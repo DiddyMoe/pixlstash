@@ -1326,6 +1326,56 @@ def test_the_dry_run_summary_counts_a_score_lift(server):
     assert summary["covers_gaining_metadata"] == 1
 
 
+def test_the_dry_run_counts_folded_stacks_by_stack_id_without_the_scrapheap(
+    server, key_list_plan
+):
+    """Two groups each fold a stack with one kept and one scrapheaped sibling.
+    The summary reads the stacks' members by stack id and counts the kept ones."""
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},
+            {"pixel_sha": "aaa", "size_bytes": 100},
+            {"pixel_sha": "bbb", "size_bytes": 200},
+            {"pixel_sha": "bbb", "size_bytes": 200},
+            {"pixel_sha": "ccc", "size_bytes": 300},
+            {"pixel_sha": "ddd", "size_bytes": 400},
+            {"pixel_sha": "eee", "size_bytes": 500},
+            {"pixel_sha": "fff", "size_bytes": 600},
+        ],
+    )
+
+    def pre_stack(session):
+        stacks = (("A", [ids[1], ids[4], ids[5]]), ("B", [ids[3], ids[6], ids[7]]))
+        for name, members in stacks:
+            stack = PictureStack(name=name)
+            session.add(stack)
+            session.commit()
+            session.refresh(stack)
+            for position, picture_id in enumerate(members):
+                pic = session.get(Picture, picture_id)
+                pic.stack_id = int(stack.id)
+                pic.stack_position = position
+                pic.deleted = position == 2
+                session.add(pic)
+        session.commit()
+
+    _run(server, pre_stack)
+    _scan(server)
+    with key_list_plan(
+        server.vault.db._engine,
+        "picture.stack_id IN (SELECT _pixlstash_dry_run_stack_ids.id",
+        "ix_picture_stack_id",
+    ):
+        report = _run(
+            server, verdicts.bulk_auto_stack_in_session, None, None, True, None
+        )
+    assert report["groups"] == 2
+    # Both pairs and each stack's kept sibling; never ids[5] or ids[7].
+    assert report["dry_run_summary"]["pictures"] == 6
+    assert all(_picture(server, pid).stack_id is None for pid in (ids[0], ids[2]))
+
+
 def test_an_applied_run_carries_no_dry_run_summary(server):
     _seed_two_exact_groups(server)
     _scan(server)

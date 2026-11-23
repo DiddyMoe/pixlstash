@@ -810,14 +810,24 @@ def register_routes(router, server):
             def fetch_stack_members(session, stack_ids, deleted_only: bool):
                 if not stack_ids:
                     return []
-                query = select(Picture.id, Picture.stack_id).where(
-                    Picture.stack_id.in_(stack_ids),
-                )
-                if deleted_only:
-                    query = query.where(Picture.deleted.is_(True))
-                else:
-                    query = query.where(Picture.deleted.is_(False))
-                return list(session.exec(query).all())
+                # Members of the other lifecycle are dropped here rather than
+                # in SQL: beside a ``deleted`` term, and without
+                # ``sqlite_stat1`` (PixlStash never runs ``ANALYZE``), the
+                # planner rates two or more stack ids below
+                # ``ix_picture_deleted`` and walks every picture of that
+                # lifecycle to find the stacks' few. Alone, the ids search
+                # ``ix_picture_stack_id`` (backend_architecture.md, "Probe
+                # cost").
+                rows = session.exec(
+                    select(Picture.id, Picture.stack_id, Picture.deleted).where(
+                        Picture.stack_id.in_(stack_ids),
+                    )
+                ).all()
+                return [
+                    (pic_id, stack_id)
+                    for pic_id, stack_id, deleted in rows
+                    if bool(deleted) == deleted_only
+                ]
 
             stack_member_rows = server.vault.db.run_immediate_read_task(
                 fetch_stack_members,

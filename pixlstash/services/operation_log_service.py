@@ -1963,14 +1963,17 @@ def _stack_siblings_in_session(session: Session, moved: set[int]) -> list[int]:
     }
     if not stack_ids:
         return []
+    # Soft-deleted members are dropped here rather than in SQL: beside ``deleted
+    # IS 0``, and without ``sqlite_stat1`` (PixlStash never runs ``ANALYZE``), the
+    # planner rates two or more stack ids below ``ix_picture_deleted`` and walks
+    # every kept picture to find the stacks' few. Alone, the ids search
+    # ``ix_picture_stack_id`` (backend_architecture.md, "Probe cost").
     live = {
         int(picture_id)
-        for picture_id in session.exec(
-            select(Picture.id).where(
-                Picture.stack_id.in_(stack_ids),
-                Picture.deleted.is_(False),
-            )
+        for picture_id, deleted in session.exec(
+            select(Picture.id, Picture.deleted).where(Picture.stack_id.in_(stack_ids))
         ).all()
+        if not deleted
     }
     return sorted(live - moved)
 

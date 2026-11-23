@@ -1260,6 +1260,12 @@ def load_stack_facts(
     ] = {}
     for start in range(0, len(ordered), ID_CHUNK):
         chunk = ordered[start : start + ID_CHUNK]
+        # Soft-deleted members are dropped here rather than in SQL: beside
+        # ``deleted IS 0``, and without ``sqlite_stat1`` (PixlStash never runs
+        # ``ANALYZE``), the planner rates two or more stack ids below
+        # ``ix_picture_deleted`` and walks every kept picture to find the stacks'
+        # few. Alone, the ids search ``ix_picture_stack_id``
+        # (backend_architecture.md, "Probe cost").
         rows = session.exec(
             select(
                 Picture.id,
@@ -1271,7 +1277,8 @@ def load_stack_facts(
                 Picture.thumbnail_height,
                 Picture.orientation,
                 Picture.file_path,
-            ).where(Picture.stack_id.in_(chunk), Picture.deleted.is_(False))
+                Picture.deleted,
+            ).where(Picture.stack_id.in_(chunk))
         ).all()
         for (
             picture_id,
@@ -1283,7 +1290,10 @@ def load_stack_facts(
             thumbnail_height,
             orientation,
             file_path,
+            deleted,
         ) in rows:
+            if deleted:
+                continue
             rows_by_stack[int(stack_id)].append(
                 _stack_member_order_key(picture_id, stack_position, score, created_at)
             )

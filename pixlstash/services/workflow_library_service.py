@@ -47,6 +47,21 @@ class WorkflowActivity:
 _USED_AT = func.coalesce(Picture.created_at, Picture.imported_at)
 
 
+# The kept pictures, for a read narrowed by a list of keys on an indexed column,
+# such as a card's variants. Written ``deleted IS NOT 1`` rather than ``IS 0``
+# (the same rows: ``deleted`` is NOT NULL) because SQLite cannot search an index
+# for ``IS NOT``. Beside ``IS 0``, and without ``sqlite_stat1`` (PixlStash never
+# runs ``ANALYZE``), the planner rates the list below the ``deleted`` indexes
+# (from two keys for a plain read, from one for a read grouped by the key) and
+# walks every kept picture, in score order for the best pictures, to find a
+# card's few. With ``deleted`` out of the running, the keys search their own
+# index. Not for a key computed by an expression, such as ``_filed_as``'s
+# ``CASE`` with run-filed workflows live: no index serves that key, so
+# ``ix_picture_deleted`` is the read's one narrowing and it keeps ``IS 0``
+# (backend_architecture.md, "Probe cost").
+_KEPT_FOR_KEYS = Picture.deleted.is_not(True)
+
+
 def _activity(session: Session, column) -> dict[str, WorkflowActivity]:
     """Group kept pictures by one workflow hash column.
 
@@ -85,7 +100,8 @@ def recipe_activity(
         rows = session.exec(
             select(column, func.count(Picture.id), func.max(_USED_AT))
             .where(column.in_(batch))
-            .where(Picture.deleted.is_(False))
+            # Not ``IS 0``, which beats the hash index from one hash ("Probe cost").
+            .where(_KEPT_FOR_KEYS)
             .group_by(column)
         ).all()
         activity.update(
@@ -427,11 +443,13 @@ def variant_picture_ids(
     """
     if not structural_hashes:
         return []
+    # With ``live`` the CASE key has no index; only ``ix_picture_deleted`` narrows.
+    kept = Picture.deleted.is_(False) if live else _KEPT_FOR_KEYS
     return list(
         session.exec(
             select(Picture.id)
             .where(_filed_as(list(live)).in_(structural_hashes))
-            .where(Picture.deleted.is_(False))
+            .where(kept)
             .order_by(nullslast(_USED_AT.desc()), Picture.id.desc())
             .limit(limit)
         ).all()
@@ -466,7 +484,7 @@ def instance_hashes_for_variants(
         select(Picture.workflow_instance_hash, func.max(_USED_AT).label("used_at"))
         .where(Picture.workflow_structural_hash.in_(structural_hashes))
         .where(Picture.workflow_instance_hash.is_not(None))
-        .where(Picture.deleted.is_(False))
+        .where(_KEPT_FOR_KEYS)
         .group_by(Picture.workflow_instance_hash)
         .order_by(nullslast(func.max(_USED_AT).desc()))
         .limit(limit)
@@ -585,7 +603,7 @@ def best_picture_ids(
         session.exec(
             select(Picture.id)
             .where(Picture.workflow_structural_hash.in_(structural_hashes))
-            .where(Picture.deleted.is_(False))
+            .where(_KEPT_FOR_KEYS)
             .order_by(
                 nullslast(Picture.score.desc()),
                 nullslast(Picture.smart_score.desc()),
@@ -636,7 +654,8 @@ def oldest_kept_by_pixel_sha(session: Session, pixel_shas: list[str]) -> dict[st
         for pixel_sha, picture_id in session.exec(
             select(Picture.pixel_sha, func.min(Picture.id))
             .where(Picture.pixel_sha.in_(pixel_shas))
-            .where(Picture.deleted.is_(False))
+            # Not ``IS 0``, which beats the sha index from one sha ("Probe cost").
+            .where(_KEPT_FOR_KEYS)
             .group_by(Picture.pixel_sha)
         ).all()
     }

@@ -3144,14 +3144,25 @@ def create_router(server) -> APIRouter:
         # stands for the stack: the other members are never trained on.
         stacked = {pic["stack"] for pic in pictures.values()} - {None}
         if stacked:
-            members = session.exec(
-                select(
-                    Picture.id,
-                    Picture.stack_id,
-                    Picture.stack_position,
-                    Picture.created_at,
-                ).where(Picture.stack_id.in_(stacked), Picture.deleted.is_(False))
-            ).all()
+            # Soft-deleted members are dropped here rather than in SQL: beside
+            # ``deleted IS 0``, and without ``sqlite_stat1`` (PixlStash never
+            # runs ``ANALYZE``), the planner rates two or more stack ids below
+            # ``ix_picture_deleted`` and walks every kept picture to find the
+            # stacks' few. Alone, the ids search ``ix_picture_stack_id``
+            # (backend_architecture.md, "Probe cost").
+            members = [
+                row
+                for row in session.exec(
+                    select(
+                        Picture.id,
+                        Picture.stack_id,
+                        Picture.stack_position,
+                        Picture.created_at,
+                        Picture.deleted,
+                    ).where(Picture.stack_id.in_(stacked))
+                ).all()
+                if not row.deleted
+            ]
             covers = {row.id for row in ExportUtils._deduplicate_stacks(members)}
             pictures = {
                 pid: pic

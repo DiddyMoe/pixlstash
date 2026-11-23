@@ -9,6 +9,7 @@ import json
 import psutil
 import tracemalloc
 
+from pixlstash.db_models import Picture, PictureSet, PictureSetMember, PictureStack
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.server import Server
@@ -30,14 +31,16 @@ def log_resources(label):
         )
 
 
-def setup_server_with_temp_db():
+def setup_server_with_temp_db(**config):
+    """Start a server on a temporary vault and log in; *config* adds keys to its
+    server config."""
     log_resources("Before setup_server_with_temp_db")
     temp_dir = tempfile.TemporaryDirectory()
     image_root = os.path.join(temp_dir.name, "images")
     os.makedirs(image_root, exist_ok=True)
     server_config_path = os.path.join(temp_dir.name, "server-config.json")
     with open(server_config_path, "w") as f:
-        f.write(json.dumps({"port": 8000}))
+        f.write(json.dumps({"port": 8000, **config}))
     server = Server(server_config_path)
     client = TestClient(server.api)
 
@@ -655,6 +658,120 @@ def test_members_endpoint_expands_stack_siblings():
         assert members_expanded_resp.status_code == 200
         expanded_ids = set(members_expanded_resp.json()["picture_ids"])
         assert pic_a in expanded_ids and pic_b in expanded_ids
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_set_reads_widen_to_stacks_by_stack_id_and_leave_the_scrapheap_out(
+    key_list_plan,
+):
+    """The set reads that widen a selection to whole stacks, or count a stack's
+    members, search ``ix_picture_stack_id``, never every kept picture, and a
+    scrapheaped sibling stays out unless the caller asks for deleted pictures.
+
+    Background workers stay off: the stack-cohesion task reads stacks by id
+    too, and would land inside the counted blocks."""
+    temp_dir, client, server = setup_server_with_temp_db(
+        disable_background_workers=True
+    )
+    try:
+
+        def seed(session):
+            ids = {}
+            for members in (("one_a", "one_b", "one_gone"), ("two_a", "two_gone")):
+                stack = PictureStack(name=None)
+                session.add(stack)
+                session.flush()
+                for position, name in enumerate(members):
+                    picture = Picture(
+                        file_path=f"{name}.jpg",
+                        stack_id=stack.id,
+                        stack_position=position,
+                        deleted=name.endswith("_gone"),
+                    )
+                    session.add(picture)
+                    session.flush()
+                    ids[name] = picture.id
+            loose = Picture(file_path="loose.jpg")
+            session.add(loose)
+            session.flush()
+            ids["loose"] = loose.id
+            sets = {}
+            for set_name, members in (
+                ("Stacked", ("one_a", "two_a", "loose")),
+                ("Sibling", ("one_b",)),
+                ("Gone", ("one_gone",)),
+            ):
+                picture_set = PictureSet(name=set_name)
+                session.add(picture_set)
+                session.flush()
+                for name in members:
+                    session.add(
+                        PictureSetMember(set_id=picture_set.id, picture_id=ids[name])
+                    )
+                sets[set_name] = picture_set.id
+            session.commit()
+            return ids, sets
+
+        ids, sets = server.vault.db.run_task(seed)
+        kept = sorted(ids[name] for name in ("one_a", "one_b", "two_a", "loose"))
+        stacked_url = f"/picture_sets/{sets['Stacked']}"
+        engine = server.vault.db._engine
+        marker = "FROM picture \nWHERE picture.stack_id IN (?"
+
+        with key_list_plan(engine, marker, "ix_picture_stack_id") as plans:
+            resp = client.get(f"{stacked_url}?info=true")
+        assert len(plans) == 1, plans
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["picture_count"] == len(kept)
+
+        with key_list_plan(engine, marker, "ix_picture_stack_id") as plans:
+            live = client.get(f"{stacked_url}/members?expand_stacks=true")
+            every = client.get(
+                f"{stacked_url}/members?expand_stacks=true&include_deleted=true"
+            )
+        assert len(plans) == 2, plans
+        assert sorted(live.json()["picture_ids"]) == kept
+        assert sorted(every.json()["picture_ids"]) == sorted(ids.values())
+
+        def membership(include_deleted):
+            resp = client.post(
+                "/picture_sets/membership",
+                json={
+                    "picture_ids": [ids["one_a"], ids["two_a"]],
+                    "include_deleted": include_deleted,
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            return {int(k): sorted(v) for k, v in resp.json().items()}
+
+        with key_list_plan(engine, marker, "ix_picture_stack_id") as plans:
+            live = membership(False)
+            every = membership(True)
+        assert len(plans) == 2, plans
+        stacked = sorted([ids["one_a"], ids["two_a"]])
+        assert live == {sets["Stacked"]: stacked, sets["Sibling"]: [ids["one_b"]]}
+        assert every == {
+            sets["Stacked"]: stacked,
+            sets["Sibling"]: [ids["one_b"]],
+            sets["Gone"]: [ids["one_gone"]],
+        }
+
+        # Sibling's pictures are one stack. Grouped by stack, one key is enough
+        # for ``deleted IS 0`` to outrank the stack index.
+        count_marker = (
+            "count(picture.id) AS count_1 \nFROM picture \nWHERE picture.stack_id IN"
+        )
+        with key_list_plan(engine, count_marker, "ix_picture_stack_id") as plans:
+            resp = client.get(f"/picture_sets/{sets['Sibling']}?expand_stacks=true")
+        assert len(plans) == 1, plans
+        assert resp.status_code == 200, resp.text
+        assert {p["id"]: p["stack_count"] for p in resp.json()["pictures"]} == {
+            ids["one_a"]: 2,
+            ids["one_b"]: 2,
+        }
     finally:
         server.close()
         temp_dir.cleanup()
