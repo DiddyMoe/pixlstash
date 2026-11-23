@@ -43,7 +43,7 @@ from pixlstash.db_models.tag import description_caption_content
 from pixlstash.hub import dataset_snapshots, training_runs
 from pixlstash.hub.db import now_iso
 from pixlstash.pixl_logging import get_logger
-from pixlstash.resources.arbiter import arbiter
+from pixlstash.resources.arbiter import Lease, LeaseState, arbiter
 from pixlstash.resources.comfyui_tenant import probe as comfyui_probe
 from pixlstash.resources.ledger import ledger
 from pixlstash.resources.ledger import ram as read_ram
@@ -243,7 +243,7 @@ def _paging(job_id: int, memory: dict) -> bool:
     return tight and last is not None and moved - last > _PAGING_BYTES
 
 
-def _telemetry(job: dict, lease: dict | None, resolution: dict) -> dict:
+def _telemetry(job: dict, lease: Lease | None, resolution: dict) -> dict:
     """The GPU and RAM figures of a run that is waiting or training.
 
     The card and the machine's RAM are measured as a whole; the run's own share
@@ -260,7 +260,7 @@ def _telemetry(job: dict, lease: dict | None, resolution: dict) -> dict:
             else []
         )
         pids = {process.pid for process in tree}
-        device_uuid = (lease or {}).get("device") or ledger().pixlstash_device()
+        device_uuid = (lease.device if lease else None) or ledger().pixlstash_device()
         reading = ledger().device(device_uuid)
         if reading is not None and reading.measurable:
             gpu.update(total_mb=reading.total_mb, used_mb=reading.used_mb)
@@ -1446,17 +1446,21 @@ def create_router(server) -> APIRouter:
         return models
 
     def _checking_uuids() -> set[str]:
-        """The runs whose granted lease the worker shows as checking (#2120)."""
+        """The runs whose granted lease the worker shows as checking (#2120).
+
+        The leases themselves, not the snapshot: that reads every tenant
+        first, and a hung ComfyUI held the job list for its timeout.
+        """
         try:
-            leases = arbiter().snapshot()["leases"]
+            leases = arbiter().leases()
         except Exception as exc:
             logger.warning("Could not read the leases for the job list: %s", exc)
             return set()
         return {
-            row.get("job_id")
-            for row in leases
-            if row.get("state") == "granted"
-            and (row.get("progress") or {}).get("shown_as") == "checking"
+            lease.job_id
+            for lease in leases
+            if lease.state is LeaseState.GRANTED
+            and (lease.progress or {}).get("shown_as") == "checking"
         }
 
     def _summary_phase(job: dict, checking: set[str]) -> str | None:
@@ -1654,11 +1658,13 @@ def create_router(server) -> APIRouter:
         phase = live_view.phase_of(job["status"], info, step, job["completed_at"])
         lease = None
         try:
+            # The lease itself, not the snapshot: that reads every tenant
+            # first, and a hung ComfyUI held the live view for its timeout.
             lease = next(
                 (
-                    row
-                    for row in arbiter().snapshot()["leases"]
-                    if row.get("job_id") == job["uuid"]
+                    candidate
+                    for candidate in arbiter().leases()
+                    if candidate.job_id == job["uuid"]
                 ),
                 None,
             )
@@ -1667,10 +1673,10 @@ def create_router(server) -> APIRouter:
         # The worker's phase telemetry names what the trainer's own info line
         # cannot: a probe ("checking", while the row is still queued) and the
         # previews drawn after training (while it is completed, not imported).
-        shown = ((lease or {}).get("progress") or {}).get("shown_as")
+        shown = ((lease.progress if lease is not None else None) or {}).get("shown_as")
         if (
             lease is not None
-            and lease.get("state") == "granted"
+            and lease.state is LeaseState.GRANTED
             and shown in ("checking", "previews")
             and job["status"] in ("queued", "completed")
             and not job["completed_at"]
@@ -1750,8 +1756,8 @@ def create_router(server) -> APIRouter:
             folder_id = folder["id"] if folder is not None else None
 
         waiting = None
-        if lease is not None and lease.get("state") == "waiting":
-            reason = lease.get("waiting_reason") or {}
+        if lease is not None and lease.state is LeaseState.WAITING:
+            reason = lease.waiting_reason or {}
             waiting = {
                 "code": reason.get("code"),
                 "text": reason.get("text"),
