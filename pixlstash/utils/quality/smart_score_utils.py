@@ -7,6 +7,10 @@ from typing import List, Optional
 
 import numpy as np
 
+from pixlstash.db_models.tag import (
+    DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
+    DEFAULT_SMART_SCORE_PENALIZED_TAGS,
+)
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.quality.anomaly_penalty import (
     DEFAULT_PENALTY_CAP,
@@ -131,7 +135,9 @@ def smart_score_penalised_tags(
                 continue
             try:
                 weight_value = int(float(weight))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # An unusable weight (non-numeric, NaN or infinite) takes the
+                # default weight; only a finite number is clamped below.
                 weight_value = default_weight
             weight_value = max(1, min(5, weight_value))
             existing = d.get(clean)
@@ -143,6 +149,32 @@ def smart_score_penalised_tags(
     if d:
         return d
     return {} if allow_empty else fallback
+
+
+def resolve_owner_penalised_tags(value) -> dict:
+    """Resolve the owner's stored penalised-tags value to the table scoring uses.
+
+    This is the one reading of ``User.smart_score_penalised_tags`` shared by the
+    settings response, the config-change diff, request and background scoring and
+    the library fingerprint, so they cannot disagree about what is penalised.
+
+    A missing value (``None``), unparseable JSON or a value that is neither a list
+    nor an object resolves to a copy of the shipped defaults. A saved empty list or
+    object resolves to ``{}``: the owner removed every row, and that choice must
+    not turn back into the defaults on the next read.
+
+    Args:
+        value: The stored value (JSON string, list, dict or ``None``).
+
+    Returns:
+        A new ``{tag: weight}`` dict with lowercase tags and weights 1-5.
+    """
+    return smart_score_penalised_tags(
+        value,
+        dict(DEFAULT_SMART_SCORE_PENALIZED_TAGS),
+        allow_empty=True,
+        default_weight=DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
+    )
 
 
 class SmartScoreUtils:

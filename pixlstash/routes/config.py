@@ -20,10 +20,6 @@ from pixlstash.hub.workflows import (
     model_ghost_names,
     picture_ghost_count,
 )
-from pixlstash.db_models.tag import (
-    DEFAULT_SMART_SCORE_PENALIZED_TAGS,
-    DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
-)
 from pixlstash.pixl_logging import get_logger
 from pixlstash.routes._helpers import require_hub
 from pixlstash.routes.model_folders import register_comfyui_model_folders
@@ -43,7 +39,7 @@ from pixlstash.services.model_downloads import live_downloads
 from pixlstash.resources.arbiter import arbiter
 from pixlstash.telemetry import mark_install_established
 from pixlstash.server_config_io import persist_server_config
-from pixlstash.utils.quality.smart_score_utils import smart_score_penalised_tags
+from pixlstash.utils.quality.smart_score_utils import resolve_owner_penalised_tags
 from pixlstash.utils.service.smart_score_invalidation import (
     changed_penalised_tags,
     invalidate_all_anomaly_scores,
@@ -58,19 +54,6 @@ from pixlstash.utils.service.user_settings_utils import (
 from pixlstash.utils.watermark import get_default_watermark_bytes
 
 logger = get_logger(__name__)
-
-
-def _resolved_penalised_tags(raw) -> dict:
-    """Resolve a stored ``smart_score_penalised_tags`` value to ``{tag: weight}``.
-
-    Uses the same parser the scorer does, so the config-change diff is taken over the
-    weights that actually reach the penalty rather than over the raw JSON text.
-    """
-    return smart_score_penalised_tags(
-        raw,
-        DEFAULT_SMART_SCORE_PENALIZED_TAGS,
-        default_weight=DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
-    )
 
 
 def create_router(server) -> APIRouter:
@@ -705,7 +688,7 @@ def create_router(server) -> APIRouter:
 
             if isinstance(patch_data, dict) and "comfyui_url" in patch_data:
                 _refuse_orphaning_a_link(user, patch_data["comfyui_url"])
-            old_penalised_tags = _resolved_penalised_tags(
+            old_penalised_tags = resolve_owner_penalised_tags(
                 user.smart_score_penalised_tags
             )
             probe = User(**user.model_dump())
@@ -717,10 +700,11 @@ def create_router(server) -> APIRouter:
                 return set()
             # Diff the *resolved* weight tables, not the raw JSON strings: a
             # reordered or reformatted payload with identical weights must not
-            # trigger a re-score.
+            # trigger a re-score. The resolver is the one the scorer uses, so the
+            # diff is over the weights that actually reach the penalty.
             return changed_penalised_tags(
                 old_penalised_tags,
-                _resolved_penalised_tags(probe.smart_score_penalised_tags),
+                resolve_owner_penalised_tags(probe.smart_score_penalised_tags),
             )
 
         def update_user(session: Session, user_id: int):
