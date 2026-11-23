@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -1489,7 +1490,8 @@ def test_staging_keeps_no_caption_over_one_mib(shared, as_zip):
     session = srv.staging_sessions[staging_id]
     with session["lock"]:
         kept = {
-            stem: len(text) for stem, text in session["sidecar_text_by_stem"].items()
+            stem: len(text)
+            for (_folder, stem), text in session["sidecar_text_by_key"].items()
         }
     assert kept == {"n-fits": _MIB}
 
@@ -1630,6 +1632,7 @@ def _call_stage_files(srv, staging_id, upload):
         staging_id,
         file=[upload],
         key=[],
+        relpath=[],
         idempotency_key=f'"{_CANCELLED_BATCH}"',
     )
 
@@ -1794,3 +1797,268 @@ def test_a_cancelled_upload_stops_copying_within_one_chunk(shared, monkeypatch, 
         # The held read was the second 1 MiB chunk of three.
         assert source.reads_off_loop == source.reads_when_held == 2
     assert os.listdir(staging_dir) == []
+
+
+# ---------------------------------------------------------------------------
+# A caption sidecar tags only the pictures in its own folder. A dropped folder
+# tree names each file's folder in a ``relpath`` field; a zip names it in the
+# member path. Two folders that both hold ``x.png`` and ``x.txt`` keep their own
+# captions.
+# ---------------------------------------------------------------------------
+
+
+def _sized_png(side, color) -> bytes:
+    img = Image.new("RGB", (side, side), color=color)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _two_folder_tree(stem, colors) -> dict:
+    """``a/`` and ``b/`` each hold ``<stem>.png`` and its caption. The pictures
+    are sized apart (31 and 33 px) so a test can tell which one is which."""
+    return {
+        f"a/{stem}.png": _sized_png(31, colors[0]),
+        f"a/{stem}.txt": b"test-tag-a, test-folder-a",
+        f"b/{stem}.png": _sized_png(33, colors[1]),
+        f"b/{stem}.txt": b"test-tag-b, test-folder-b",
+    }
+
+
+def _pictures_by_width(srv, name) -> dict:
+    """The pictures imported as *name*, keyed by width. The names are unique to
+    each test, so nothing else in the module answers this."""
+    return dict(
+        srv.vault.db.run_task(
+            lambda s: [
+                (p.width, p.id)
+                for p in s.exec(
+                    select(Picture).where(Picture.original_file_name == name)
+                ).all()
+            ]
+        )
+    )
+
+
+def _assert_each_folder_kept_its_caption(srv, name):
+    by_width = _pictures_by_width(srv, name)
+    assert set(by_width) == {31, 33}, by_width
+    tags_a = _tags_for(srv, by_width[31])
+    tags_b = _tags_for(srv, by_width[33])
+    assert {"test-tag-a", "test-folder-a"} <= tags_a, tags_a
+    assert {"test-tag-b", "test-folder-b"} <= tags_b, tags_b
+    assert not {"test-tag-b", "test-folder-b"} & tags_a, tags_a
+    assert not {"test-tag-a", "test-folder-a"} & tags_b, tags_b
+
+
+def _tree_request(tree):
+    """A dropped folder tree as the browser sends it: one ``file`` part per
+    file, named by its basename, and one ``relpath`` field per file, in order,
+    holding the path the drop gave it."""
+    parts = []
+    for path, data in tree.items():
+        name = path.rsplit("/", 1)[-1]
+        kind = "text/plain" if name.endswith(".txt") else "application/octet-stream"
+        parts.append(("file", (name, data, kind)))
+    return parts, {"relpath": [f"/{path}" for path in tree]}
+
+
+def _stage_tree(client, staging_id, tree, headers=None):
+    parts, data = _tree_request(tree)
+    return client.post(
+        f"{_STAGING}/{staging_id}/files",
+        files=parts,
+        data=data,
+        headers=headers or {},
+    )
+
+
+def _stage_relpaths(client, staging_id, relpaths, headers=None):
+    """One small picture per relpath, all with the same file name."""
+    parts = [
+        _png_part("fd-label.png", (211, 7, index)) for index in range(len(relpaths))
+    ]
+    return client.post(
+        f"{_STAGING}/{staging_id}/files",
+        files=parts,
+        data={"relpath": relpaths},
+        headers=headers or {},
+    )
+
+
+def _staged_folders(srv, staging_id) -> list:
+    session = srv.staging_sessions[staging_id]
+    with session["lock"]:
+        return [entry["sidecar_folder"] for entry in session["staged_files"]]
+
+
+def _commit_and_wait(client, staging_id):
+    r = client.post(f"{_STAGING}/{staging_id}/commit")
+    assert r.status_code == 200, r.text
+    return _wait_for_stage(client, staging_id, target=("completed",))
+
+
+def test_a_zip_keeps_each_folders_caption_with_that_folders_picture(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+    archive = _zip_bytes(_two_folder_tree("fd-staged-zip", [(201, 1, 1), (201, 1, 2)]))
+
+    r = _stage(client, staging_id, [("file", ("tree.zip", archive, "application/zip"))])
+    assert r.status_code == 200, r.text
+    assert _commit_and_wait(client, staging_id)["imported_count"] == 2
+
+    _assert_each_folder_kept_its_caption(srv, "fd-staged-zip.png")
+
+
+def test_a_dropped_folder_tree_keeps_each_folders_caption(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+
+    tree = _two_folder_tree("fd-staged-tree", [(202, 1, 1), (202, 1, 2)])
+    r = _stage_tree(client, staging_id, tree)
+    assert r.status_code == 200, r.text
+    assert _commit_and_wait(client, staging_id)["imported_count"] == 2
+
+    _assert_each_folder_kept_its_caption(srv, "fd-staged-tree.png")
+
+
+def test_the_one_shot_import_keeps_each_zip_folders_caption(shared):
+    srv, client = shared
+    archive = _zip_bytes(
+        _two_folder_tree("fd-one-shot-zip", [(203, 1, 1), (203, 1, 2)])
+    )
+
+    r = client.post(
+        f"{API}/pictures/import",
+        files=[("file", ("tree.zip", archive, "application/zip"))],
+    )
+    assert r.status_code == 200, r.text
+    assert wait_for_import_task(client, r.json()["task_id"])["status"] == "completed"
+
+    _assert_each_folder_kept_its_caption(srv, "fd-one-shot-zip.png")
+
+
+def test_a_caption_beside_a_dropped_folder_does_not_tag_the_pictures_in_it(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+    tree = {
+        "fd-loose.txt": b"test-tag-loose, test-outside",
+        "a/fd-loose.png": _sized_png(35, (204, 1, 1)),
+        "fd-loose-kept.png": _sized_png(35, (204, 1, 2)),
+        "fd-loose-kept.txt": b"test-tag-kept, test-flat",
+    }
+
+    r = _stage_tree(client, staging_id, tree)
+    assert r.status_code == 200, r.text
+    assert _commit_and_wait(client, staging_id)["imported_count"] == 2
+
+    [inside] = _pictures_by_width(srv, "fd-loose.png").values()
+    [flat] = _pictures_by_width(srv, "fd-loose-kept.png").values()
+    assert not {"test-tag-loose", "test-outside"} & _tags_for(srv, inside)
+    # A caption and a picture side by side at the top of the drop still pair.
+    assert {"test-tag-kept", "test-flat"} <= _tags_for(srv, flat)
+
+
+def test_a_zip_dropped_in_a_folder_takes_captions_from_that_folder(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+    archive = _zip_bytes({"fd-zipped.png": _sized_png(37, (205, 1, 1))})
+    tree = {
+        "shoot/fd-zipped.txt": b"test-tag-zipped, test-shoot",
+        "shoot/bundle.zip": archive,
+    }
+
+    r = _stage_tree(client, staging_id, tree)
+    assert r.status_code == 200, r.text
+    assert _commit_and_wait(client, staging_id)["imported_count"] == 1
+
+    [picture_id] = _pictures_by_width(srv, "fd-zipped.png").values()
+    assert {"test-tag-zipped", "test-shoot"} <= _tags_for(srv, picture_id)
+
+
+def test_a_zip_in_a_dropped_folder_keeps_its_folders_apart_from_the_drops(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+    tree = _two_folder_tree("fd-nested", [(206, 1, 1), (206, 1, 2)])
+    # The b/ half moves into a zip under shoot/ and is renamed a/ there, so
+    # the drop holds an a/ at the top and another inside shoot/tree.zip.
+    zipped = {
+        "a/fd-nested.png": tree.pop("b/fd-nested.png"),
+        "a/fd-nested.txt": tree.pop("b/fd-nested.txt"),
+    }
+    tree["shoot/tree.zip"] = _zip_bytes(zipped)
+
+    r = _stage_tree(client, staging_id, tree)
+    assert r.status_code == 200, r.text
+    assert _commit_and_wait(client, staging_id)["imported_count"] == 2
+
+    _assert_each_folder_kept_its_caption(srv, "fd-nested.png")
+
+
+def test_a_resent_tree_replays_and_a_regrouped_one_is_refused(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+    headers = _key("test-tree-batch")
+
+    first = _stage_relpaths(client, staging_id, ["/a/fd-label.png"], headers)
+    again = _stage_relpaths(client, staging_id, ["/a/fd-label.png"], headers)
+    moved = _stage_relpaths(client, staging_id, ["/b/fd-label.png"], headers)
+
+    assert first.status_code == again.status_code == 200, (first.text, again.text)
+    assert again.json()["replayed"] is True
+    assert moved.status_code == 422, moved.text
+    assert _detail_code(moved) == "idempotency_key_mismatch"
+    assert _staged_folders(srv, staging_id) == ["a"]
+
+
+@pytest.mark.parametrize(
+    "relpath",
+    [
+        "../../etc/fd-label.png",
+        "/a/../../fd-label.png",
+        "/a/\x00/fd-label.png",
+        "/" + "a/" * 2100 + "fd-label.png",
+        "/" + "a" * 4083 + "/fd-label.png",  # 1 + 4083 + 13 == 4097
+    ],
+    ids=["climbs", "climbs-from-a-folder", "nul", "overlong", "one-over-the-limit"],
+)
+def test_a_relpath_that_climbs_or_is_malformed_is_refused(shared, relpath):
+    srv, client = shared
+    staging_id = _open_session(client)
+
+    r = _stage_relpaths(client, staging_id, ["/ok/fd-label.png", relpath])
+
+    assert r.status_code == 400, r.text
+    assert _detail_code(r) == "invalid_relpath"
+    # Refused before a byte was written, the good file of the batch included.
+    assert _staged_paths(srv, staging_id) == []
+    assert os.listdir(_staging_dir(srv, staging_id)) == []
+
+
+@pytest.mark.parametrize(
+    ("relpath", "folder"),
+    [
+        ("/etc/fd-label.png", "etc"),
+        ("..\\..\\etc\\fd-label.png", ""),
+        ("//a//./b/fd-label.png", "a/b"),
+        ("fd-label.png", ""),
+        ("/" + "a" * 4082 + "/fd-label.png", "a" * 4082),  # 1 + 4082 + 13 == 4096
+    ],
+    ids=["absolute", "backslashes", "untidy", "bare-name", "at-the-limit"],
+)
+def test_a_relpath_is_only_a_label_for_the_staged_file(shared, relpath, folder):
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+
+    r = _stage_relpaths(client, staging_id, [relpath])
+
+    assert r.status_code == 200, r.text
+    [path] = _staged_paths(srv, staging_id)
+    # The file lands in the session's own folder under a fresh uuid name,
+    # whatever the relpath said.
+    assert os.path.dirname(path) == staging_dir
+    stem, ext = os.path.splitext(os.path.basename(path))
+    assert str(uuid.UUID(stem)) == stem and ext == ".png"
+    assert _files_on_disk(staging_dir) == {path}
+    assert _staged_folders(srv, staging_id) == [folder]
