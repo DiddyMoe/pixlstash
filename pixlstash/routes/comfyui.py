@@ -3617,7 +3617,7 @@ def create_router(server) -> APIRouter:
         description="Interrupts the currently running ComfyUI prompt and clears the pending queue.",
         response_model=ComfyUIAbortResponse,
     )
-    async def abort_comfyui(request: Request):
+    def abort_comfyui(request: Request):
         user = server.auth.get_user_for_request(request)
         comfyui_url = _comfyui_url(user)
         result = _comfyui_abort(comfyui_url)

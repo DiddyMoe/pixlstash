@@ -1,5 +1,4 @@
 import ast
-import asyncio
 import json
 import os
 import random as _random
@@ -23,6 +22,7 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field as PydanticField
 from sqlalchemy import exists, func
 from sqlmodel import Session, delete, select, update
+from starlette.concurrency import run_in_threadpool
 
 from pixlstash.authz.membership import (
     enforce_character_scope,
@@ -1159,7 +1159,8 @@ def create_router(server) -> APIRouter:
                 payload["project_ids"] = character_project_ids(session, id)
                 return (payload, local_project_membership_updated)
 
-            char, project_membership_updated = server.vault.db.run_task(
+            char, project_membership_updated = await run_in_threadpool(
+                server.vault.db.run_task,
                 alter_char,
                 id,
                 name,
@@ -2005,7 +2006,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=list[CharacterLikenessResultResponse],
     )
-    async def search_by_character_likeness(
+    def search_by_character_likeness(
         request: Request,
         files: List[UploadFile] = File(
             ...,
@@ -2073,7 +2074,7 @@ def create_router(server) -> APIRouter:
                     detail=f"File {idx + 1}: uploaded file must be an image.",
                 )
 
-            raw_bytes = await file.read()
+            raw_bytes = file.file.read()
             if not raw_bytes:
                 raise HTTPException(
                     status_code=400,
@@ -2109,11 +2110,8 @@ def create_router(server) -> APIRouter:
             raise HTTPException(status_code=503, detail="Task runner not available.")
 
         detection_task = FaceDetectionTask(engine, bgr_images)
-        loop = asyncio.get_event_loop()
         try:
-            all_face_results = await loop.run_in_executor(
-                None, task_runner.submit_and_wait, detection_task, 60.0
-            )
+            all_face_results = task_runner.submit_and_wait(detection_task, 60.0)
         except TimeoutError as exc:
             logger.error(
                 "characters/likeness-search: face detection timed out: %s", exc

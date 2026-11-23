@@ -27,6 +27,7 @@ refused credential is live.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import ipaddress
@@ -60,6 +61,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
+from sqlalchemy import event
 from sqlmodel import delete, select, update
 
 from pixlstash import auth, mcp_server
@@ -3060,6 +3062,91 @@ def test_a_token_revoked_while_it_binds_is_refused_and_not_recorded(workflow_env
     )
     assert refusal == "This key is not linked yet."
     assert "example-gone" not in workflow_env.server.auth.bound_token_refusals
+
+
+def test_two_link_checks_at_once_bind_the_token_to_one_address(workflow_env):
+    """Two link checks of one pending token from two addresses at once admit
+    exactly one, and it is the address the token is then bound to: a bind
+    takes the token only while it is still pending."""
+    server = workflow_env.server
+    r = workflow_env.owner.post(
+        f"{API}/users/me/token", json={"description": "pending", "scope": "COMFYUI"}
+    )
+    assert r.status_code == 200, r.text
+    token_id = r.json()["token_id"]
+    public_id = None
+    try:
+
+        def make_pending(session):
+            session.exec(
+                update(UserToken)
+                .where(UserToken.id == token_id)
+                .values(bound_address=auth.TOKEN_BIND_PENDING)
+            )
+            session.commit()
+
+        server.auth._db.run_task(make_pending, priority=DBPriority.IMMEDIATE)
+        server.auth._flush_token_cache()
+        token = server.auth._db.run_immediate_read_task(
+            lambda session: session.get(UserToken, token_id)
+        )
+        public_id = token.public_id
+        assert token.bound_address == auth.TOKEN_BIND_PENDING
+
+        def hold_after_reading_the_token(
+            conn, cursor, statement, parameters, context, executemany
+        ):
+            # Widens the gap between a bind's read of the row and its write,
+            # so both binds read it while it is still pending.
+            if (
+                statement.lstrip().upper().startswith("SELECT")
+                and "FROM usertoken" in statement
+                and token_id in tuple(parameters or ())
+            ):
+                time.sleep(0.05)
+
+        addresses = ("127.0.0.1", "127.0.0.2")
+        refusals = {}
+        both_ready = threading.Barrier(len(addresses))
+
+        def link_check_from(address):
+            both_ready.wait(5)
+            refusals[address] = server.auth.source_refusal(
+                token, address, *auth.TOKEN_BIND_CHECK
+            )
+
+        checks = [
+            threading.Thread(
+                target=link_check_from, args=(address,), name=f"test-bind-{address}"
+            )
+            for address in addresses
+        ]
+        hub = server.auth._db.engine
+        event.listen(hub, "after_cursor_execute", hold_after_reading_the_token)
+        try:
+            for check in checks:
+                check.start()
+            for check in checks:
+                check.join(10)
+        finally:
+            event.remove(hub, "after_cursor_execute", hold_after_reading_the_token)
+
+        assert not any(check.is_alive() for check in checks), "a link check hung"
+        assert set(refusals) == set(addresses), refusals
+        admitted = [address for address in addresses if refusals[address] is None]
+        stored = server.auth._db.run_immediate_read_task(
+            lambda session: session.get(UserToken, token_id).bound_address
+        )
+        assert len(admitted) == 1, (
+            f"admitted {admitted}, the token is bound to {stored}: {refusals}"
+        )
+        assert admitted == [stored], (
+            f"admitted {admitted}, the token is bound to {stored}: {refusals}"
+        )
+    finally:
+        if public_id is not None:
+            server.auth.bound_token_refusals.pop(public_id, None)
+        workflow_env.owner.delete(f"{API}/users/me/token/{token_id}")
 
 
 def test_a_check_that_never_used_the_key_undoes_the_link(workflow_env, comfy_at):
@@ -16280,6 +16367,46 @@ def test_abort_cancels_the_runs_waiting_for_the_gpu(held):
     blocker.release()
     time.sleep(0.6)
     assert held.runnable.submitted == [], "an aborted held run was sent anyway"
+
+
+def _on_event_loop() -> bool:
+    """Whether the calling thread is running an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def test_abort_reaches_comfyui_off_the_event_loop(workflow_env, monkeypatch):
+    """Each of the abort's two calls to ComfyUI can wait out its 10 s timeout
+    when ComfyUI does not answer, so they run on a worker thread rather than on
+    the loop every other request shares."""
+    server = workflow_env.server
+    posted = []
+
+    def fake_post(url, *args, **kwargs):
+        posted.append((urlsplit(url).path, _on_event_loop()))
+        return SimpleNamespace(status_code=200, text="")
+
+    # Never the ComfyUI on the default address: a development box runs one.
+    monkeypatch.setattr(comfyui_service.requests, "post", fake_post)
+    reads = []
+    real_read = server.hub_engine.run_immediate_read_task
+
+    def spy_read(func, *args, **kwargs):
+        reads.append(_on_event_loop())
+        return real_read(func, *args, **kwargs)
+
+    monkeypatch.setattr(server.hub_engine, "run_immediate_read_task", spy_read)
+
+    r = workflow_env.owner.post(f"{API}/comfyui/abort")
+
+    assert r.status_code == 200, r.text
+    assert posted == [("/interrupt", False), ("/queue", False)], posted
+    # The owner's ComfyUI address is read from the hub first.
+    assert reads, "the abort never looked its user up"
+    assert not any(reads), "the user lookup ran on the event loop"
 
 
 def test_cancelling_a_waiting_lease_cancels_its_run_and_only_a_waiting_one(held):

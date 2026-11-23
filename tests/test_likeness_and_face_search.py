@@ -1,6 +1,8 @@
 import asyncio
+import itertools
 import tempfile
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,10 +13,14 @@ from pixlstash.server import Server
 from pixlstash.db_models.face import Face
 from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.tag import Tag
+from pixlstash.routes import characters as _characters_module
+from pixlstash.routes.pictures import _character_likeness as _character_likeness_module
+from pixlstash.routes.pictures import _face_search as _face_search_module
 from pixlstash.routes.pictures import _likeness_search as _likeness_search_module
 from pixlstash.scoring.character_likeness import count_pictures_by_character_likeness
 from pixlstash.services import search_query_service
 from pixlstash.tasks import TaskType
+from pixlstash.tasks.face_detection_task import FaceDetectionTask
 from tests.utils import (
     upload_pictures_and_wait,
     wait_for_faces,
@@ -1342,3 +1348,188 @@ def test_likeness_search_runs_off_the_event_loop(set_env, monkeypatch):
     rows = resp.json()
     assert rows[0]["picture_id"] == ids["m1"], rows[:3]
     assert rows[0]["likeness"] == pytest.approx(1.0, abs=1e-3), rows[0]
+
+
+# ── Uploaded-face searches and the event loop ─────────────────────────────
+
+_probe_names = itertools.count(1)
+
+
+class _VaultWithFaceEngine:
+    """The vault as an uploaded-face handler sees it, with an engine present.
+
+    The test server never loads the face model, and these handlers refuse with
+    503 before the work under test when there is none. Detection itself is
+    faked on the task runner, so the engine is only ever a stand-in, and only
+    the request sees it: the vault's own finders keep reading the real
+    ``vault._engine`` (``None``), so no background task starts against it.
+    """
+
+    def __init__(self, vault):
+        self._vault = vault
+        self._engine = SimpleNamespace(insightface_model_pack=None)
+
+    def __getattr__(self, name):
+        return getattr(self._vault, name)
+
+
+@pytest.fixture
+def uploaded_face_query(set_env, monkeypatch):
+    """A person with one +x reference face on ``m1``, and a face detector that
+    finds one +x face in every uploaded image.
+
+    Yields ``(character_id, face_id, calls)``. ``calls`` records ``(what,
+    on_loop)`` for the detection hand-off (``"detect"``) and for every vault
+    wait (the work function's ``__qualname__``); a test adds its own scoring
+    spy with :func:`_record_call`.
+    """
+    client, server, ids, _sets = set_env
+    resp = client.post(
+        f"{API_PREFIX}/characters", json={"name": f"Loop Probe {next(_probe_names)}"}
+    )
+    assert resp.status_code == 200, resp.text
+    character_id = resp.json()["character"]["id"]
+    face_id = _add_face_with_features(
+        server, ids["m1"], character_id, _unit([1, 0, 0, 0, 0, 0, 0, 0])
+    )
+    calls = []
+
+    def fake_detect(task, timeout_s=60.0):
+        calls.append(("detect", _on_event_loop()))
+        assert isinstance(task, FaceDetectionTask), task
+        face = SimpleNamespace(
+            bbox=(0, 0, 10, 10),
+            embedding=np.array([1, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+        )
+        return [[face] for _ in range(task.params["n_images"])]
+
+    def _spy(real):
+        def spy(func, *args, **kwargs):
+            calls.append((getattr(func, "__qualname__", repr(func)), _on_event_loop()))
+            return real(func, *args, **kwargs)
+
+        return spy
+
+    database = server.vault.db
+    for method in ("run_task", "run_immediate_read_task"):
+        monkeypatch.setattr(database, method, _spy(getattr(database, method)))
+    monkeypatch.setattr(server.vault._task_runner, "submit_and_wait", fake_detect)
+    monkeypatch.setattr(server, "vault", _VaultWithFaceEngine(server.vault))
+    try:
+        yield character_id, face_id, calls
+    finally:
+
+        def _drop(session):
+            session.delete(session.get(Face, face_id))
+            session.commit()
+
+        server.vault.db.run_task(_drop)
+        resp = client.delete(f"{API_PREFIX}/characters/{character_id}")
+        assert resp.status_code == 200, resp.text
+
+
+def _record_call(monkeypatch, calls, module, name):
+    """Spy on ``module.name``, recording ``(name, on_loop)`` into *calls*."""
+    real = getattr(module, name)
+
+    def spy(*args, **kwargs):
+        calls.append((name, _on_event_loop()))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, spy)
+
+
+def _assert_ran_off_the_loop(calls, *expected):
+    """Each *expected* step ran (by the tail of its name), none on the loop.
+
+    *expected* is the positive control: a request that stopped short of the
+    step would otherwise pass.
+    """
+    names = [name for name, _ in calls]
+    for want in expected:
+        assert any(name == want or name.endswith("." + want) for name in names), (
+            f"{want} never ran; recorded: {names}"
+        )
+    on_loop = [call for call in calls if call[1]]
+    assert on_loop == [], f"ran on the event loop: {on_loop}"
+
+
+def test_a_face_search_by_upload_runs_off_the_event_loop(
+    set_env, uploaded_face_query, monkeypatch
+):
+    """The upload's decode, the candidate read and the scoring all run on a
+    worker thread, not on the loop every request shares."""
+    client, _server, ids, _sets = set_env
+    _character_id, face_id, calls = uploaded_face_query
+    _record_call(monkeypatch, calls, _face_search_module, "_score_best_faces")
+
+    resp = client.post(
+        f"{API_PREFIX}/pictures/face-search",
+        params={"top_n": 5},
+        files=[("files", ("query.png", random_images[0], "image/png"))],
+    )
+
+    assert resp.status_code == 200, resp.text
+    _assert_ran_off_the_loop(
+        calls, "detect", "fetch_face_candidates.<locals>._fetch", "_score_best_faces"
+    )
+    # The faked +x detection is what the ranking used: m1's face is exactly +x.
+    rows = resp.json()
+    assert rows[0]["picture_id"] == ids["m1"], rows
+    assert rows[0]["face_id"] == face_id, rows
+
+
+def test_a_character_likeness_search_by_upload_runs_off_the_event_loop(
+    set_env, uploaded_face_query, monkeypatch
+):
+    client, _server, _ids, _sets = set_env
+    character_id, _face_id, calls = uploaded_face_query
+    _record_call(monkeypatch, calls, _characters_module, "combine_likeness_scores")
+
+    resp = client.post(
+        f"{API_PREFIX}/characters/likeness-search",
+        files=[("files", ("query.png", random_images[0], "image/png"))],
+    )
+
+    assert resp.status_code == 200, resp.text
+    _assert_ran_off_the_loop(
+        calls,
+        "detect",
+        "_fetch_character_candidate_embeddings.<locals>._fetch",
+        "combine_likeness_scores",
+    )
+    rows = resp.json()
+    assert rows[0]["character_id"] == character_id, rows
+    assert rows[0]["likeness"] == pytest.approx(1.0, abs=1e-3), rows[0]
+
+
+def test_scoring_an_upload_against_a_character_runs_off_the_event_loop(
+    set_env, uploaded_face_query, monkeypatch
+):
+    """The reference faces are read through the writer queue (an immediate
+    task), which waits behind any write already running."""
+    client, _server, _ids, _sets = set_env
+    character_id, _face_id, calls = uploaded_face_query
+    _record_call(
+        monkeypatch,
+        calls,
+        _character_likeness_module,
+        "compute_character_likeness_for_faces",
+    )
+
+    resp = client.post(
+        f"{API_PREFIX}/pictures/score_character_likeness",
+        files=[("files", ("query.png", random_images[0], "image/png"))],
+        data={"reference_character_id": character_id},
+    )
+
+    assert resp.status_code == 200, resp.text
+    _assert_ran_off_the_loop(
+        calls,
+        "select_reference_faces_for_character",
+        "detect",
+        "compute_character_likeness_for_faces",
+    )
+    [result] = resp.json()["results"]
+    assert result["eligible"] is True, result
+    assert result["character_likeness"] == pytest.approx(1.0, abs=1e-3), result

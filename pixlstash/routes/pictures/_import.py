@@ -326,7 +326,7 @@ def register_routes(router, server):
         description="Starts an asynchronous import of uploaded image/video files (or zip contents) and returns a task id.",
         response_model=ImportStartResponse,
     )
-    async def import_pictures(
+    def import_pictures(
         request: Request,
         file: list[UploadFile] = File(None),
         project_id: int | None = Form(None),
@@ -444,7 +444,7 @@ def register_routes(router, server):
                         ) from exc
                 else:
                     # Non-zip files are typically small; buffer normally.
-                    contents = await upload.read()
+                    contents = upload.file.read()
                     if not contents:
                         continue
                     if len(contents) > _MAX_UPLOAD_BYTES:

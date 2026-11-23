@@ -22,22 +22,31 @@ Covers the three things the design rests on:
    ``anomaly_tag_uncertainty`` recomputed and the cached smart score dropped.
    A half-undo - the tag back but the rejection still on file - is the failure
    these tests exist to prevent.
+6. **The event loop** - the edits, uploads and token checks that wait on a
+   database do so on a worker thread, so a request parked behind the writer or
+   a held engine never stops the server answering the next one.
 """
 
+import asyncio
 import gc
 import io
 import json
 import os
 import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlmodel import delete, select, update
 
+from pixlstash.auth import TOKEN_BIND_PENDING
+from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Operation,
     Picture,
@@ -46,8 +55,11 @@ from pixlstash.db_models import (
     PictureStack,
     Tag,
     TagPrediction,
+    User,
+    UserToken,
     is_tag_sentinel,
 )
+from pixlstash.routes.pictures import _misc
 from pixlstash.server import Server
 from pixlstash.services import operation_log_service, tag_prediction_service
 from pixlstash.tasks import TaskType
@@ -2405,3 +2417,560 @@ def test_a_server_minted_batch_id_is_namespaced():
         operation_log_service.SERVER_BATCH_ID_PREFIX
     )
     assert operation_log_service.new_batch_id() != operation_log_service.new_batch_id()
+
+
+# ---------------------------------------------------------------------------
+# The event loop
+# ---------------------------------------------------------------------------
+#
+# Every request the server answers shares one asyncio event loop. An
+# ``async def`` handler runs ON it, so a call it makes that waits (a writer
+# task queued behind a background batch, an immediate read held off while the
+# library file is swapped, an upload's disk write) stops every other request
+# for as long as it waits. These routes do that kind of work, so it has to run
+# on a worker thread.
+
+
+def _on_event_loop() -> bool:
+    """Whether the calling thread is running an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _record_database_waits(monkeypatch, server):
+    """Record every blocking database call and whether it ran on the event loop.
+
+    Wraps ``run_task`` and ``run_immediate_read_task`` on both databases, the
+    vault's and the hub's (which owns the user and its tokens), as instance
+    attributes so ``monkeypatch`` undoes them. Each entry is ``(database,
+    method, the work function's __qualname__, on_loop, thread name)``.
+    """
+    calls = []
+
+    def _spy(label, method, real):
+        def spy(func, *args, **kwargs):
+            calls.append(
+                (
+                    label,
+                    method,
+                    getattr(func, "__qualname__", repr(func)),
+                    _on_event_loop(),
+                    threading.current_thread().name,
+                )
+            )
+            return real(func, *args, **kwargs)
+
+        return spy
+
+    for label, database in (("vault", server.vault.db), ("hub", server.hub_engine)):
+        for method in ("run_task", "run_immediate_read_task"):
+            monkeypatch.setattr(
+                database, method, _spy(label, method, getattr(database, method))
+            )
+    return calls
+
+
+def _assert_waits_ran_off_the_loop(calls, *expected):
+    """Each *expected* work function ran, and no database call ran on the loop.
+
+    *expected* names a work function by the tail of its ``__qualname__``
+    (``alter_char``, ``get_user.<locals>.<lambda>``), so it still matches once
+    the function moves into a helper. It is the positive control: a request
+    that never reached the database would otherwise pass.
+    """
+    names = [call[2] for call in calls]
+    for want in expected:
+        assert any(name == want or name.endswith("." + want) for name in names), (
+            f"{want} never reached the database; recorded: {names}"
+        )
+    on_loop = [call for call in calls if call[3]]
+    assert on_loop == [], f"database calls ran on the event loop: {on_loop}"
+
+
+def _answered_while_held(server, client, send, entered, release):
+    """Run *send* and a ``GET /version`` on ONE event loop; report whether the
+    second was answered while the first was still parked.
+
+    A ``TestClient`` opens a fresh event loop for every request, so it cannot
+    show one request blocking another. This drives the app over an in-process
+    ASGI transport inside a single ``asyncio.run`` instead. *send* is started,
+    the loop waits until it has reached the held resource (*entered*), then
+    ``/version`` is requested. If *send* parked the loop itself, ``/version``
+    is only answered once *release* has fired. Returns ``(answered while still
+    held, the /version response, send's response)``.
+    """
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.api),
+            base_url="http://testserver",
+            cookies={"session_id": client.cookies.get("session_id")},
+        ) as loop_client:
+            pending = asyncio.ensure_future(send(loop_client))
+            while not entered.is_set() and not pending.done():
+                await asyncio.sleep(0.01)
+            version = await loop_client.get("/version")
+            answered_while_held = not release.is_set()
+            release.set()
+            return answered_while_held, version, await pending
+
+    return asyncio.run(scenario())
+
+
+def test_a_picture_edit_waiting_on_the_writer_does_not_stall_other_requests(
+    monkeypatch, client, server
+):
+    """While a picture edit waits its turn at the writer, the server still
+    answers other requests: the edit waits on a worker thread, not the loop."""
+    picture_id = _upload(client)
+    started, release, entered = threading.Event(), threading.Event(), threading.Event()
+
+    real_run_task = server.vault.db.run_task
+
+    def spy_run_task(func, *args, **kwargs):
+        if getattr(func, "__module__", "") == "pixlstash.routes.pictures._crud":
+            entered.set()
+        return real_run_task(func, *args, **kwargs)
+
+    monkeypatch.setattr(server.vault.db, "run_task", spy_run_task)
+
+    def _hold_the_writer(session):
+        started.set()
+        release.wait(10)
+
+    holder = server.vault.db.submit_task(_hold_the_writer)
+    # Bounds a regression: with the edit parked on the loop nothing else runs
+    # until this fires.
+    safety = threading.Timer(3.0, release.set)
+    safety.daemon = True
+    try:
+        assert started.wait(5), "the writer never picked up the holding task"
+        safety.start()
+        answered_while_held, version, patched = _answered_while_held(
+            server,
+            client,
+            lambda loop_client: loop_client.patch(
+                f"{API}/pictures/{picture_id}", json={"description": "loop check"}
+            ),
+            entered,
+            release,
+        )
+    finally:
+        release.set()
+        safety.cancel()
+        holder.result(10)
+
+    assert entered.is_set(), "the edit never reached the writer"
+    assert patched.status_code == 200, patched.text
+    assert version.status_code == 200, version.text
+    assert answered_while_held, (
+        "GET /version was only answered once the writer was released: the "
+        "picture edit waited for it on the event loop"
+    )
+
+
+def test_score_edits_a_moment_apart_end_at_the_later_one(client, server):
+    """Two score edits of one picture a moment apart, both waiting on a busy
+    writer, leave the later score stored: an edit compares and writes in the
+    order it was sent, even while it waits on a worker thread."""
+    picture_id = _upload(client)
+    start = client.patch(f"{API}/pictures/{picture_id}", json={"score": 3})
+    assert start.status_code == 200, start.text
+
+    started = threading.Event()
+
+    def _keep_the_writer_busy(session):
+        started.set()
+        time.sleep(0.1)
+
+    async def edit_twice():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.api),
+            base_url="http://testserver",
+            cookies={"session_id": client.cookies.get("session_id")},
+        ) as loop_client:
+            first = asyncio.ensure_future(
+                loop_client.patch(f"{API}/pictures/{picture_id}", json={"score": 5})
+            )
+            await asyncio.sleep(0.01)
+            second = await loop_client.patch(
+                f"{API}/pictures/{picture_id}", json={"score": 3}
+            )
+            return await first, second
+
+    busy = server.vault.db.submit_task(_keep_the_writer_busy, priority=DBPriority.LOW)
+    try:
+        assert started.wait(5), "the writer never picked up the busy task"
+        first, second = asyncio.run(edit_twice())
+    finally:
+        busy.result(10)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    stored = server.vault.db.run_immediate_read_task(
+        lambda session: session.get(Picture, picture_id).score
+    )
+    assert stored == 3, f"the later edit set 3, but {stored} is stored"
+
+
+def test_a_thumbnail_waiting_on_a_held_engine_does_not_stall_other_requests(
+    monkeypatch, client, server
+):
+    """While the database file is held (a library restore swaps it under this
+    lock), a thumbnail's lookup waits on a worker thread, not the loop."""
+    picture_id = _upload(client)
+    held, release, entered = threading.Event(), threading.Event(), threading.Event()
+
+    real_read = server.vault.db.run_immediate_read_task
+
+    def spy_read(func, *args, **kwargs):
+        if getattr(func, "__qualname__", "").endswith(
+            "get_thumbnail.<locals>.fetch_picture"
+        ):
+            entered.set()
+        return real_read(func, *args, **kwargs)
+
+    monkeypatch.setattr(server.vault.db, "run_immediate_read_task", spy_read)
+
+    def _hold_the_engine():
+        with server.vault.db.exclusive_engine_access():
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=_hold_the_engine, name="test-engine-holder")
+    safety = threading.Timer(3.0, release.set)
+    safety.daemon = True
+    holder.start()
+    try:
+        assert held.wait(5), "the engine lock was never taken"
+        safety.start()
+        answered_while_held, version, thumbnail = _answered_while_held(
+            server,
+            client,
+            lambda loop_client: loop_client.get(
+                f"{API}/pictures/thumbnails/{picture_id}.webp"
+            ),
+            entered,
+            release,
+        )
+    finally:
+        release.set()
+        safety.cancel()
+        holder.join(10)
+
+    assert entered.is_set(), "the thumbnail never looked its picture up"
+    assert thumbnail.status_code == 200, thumbnail.text
+    assert version.status_code == 200, version.text
+    assert answered_while_held, (
+        "GET /version was only answered once the engine was released: the "
+        "thumbnail's lookup waited for it on the event loop"
+    )
+
+
+def test_a_picture_edit_waits_on_the_database_off_the_loop(monkeypatch, client, server):
+    picture_id = _upload(client)
+    calls = _record_database_waits(monkeypatch, server)
+
+    resp = client.patch(
+        f"{API}/pictures/{picture_id}",
+        json={"description": "off the loop", "tags": ["loop-check"]},
+    )
+
+    assert resp.status_code == 200, resp.text
+    _assert_waits_ran_off_the_loop(calls, "run_recorded_metadata_task.<locals>._task")
+    # The edit itself landed, through the recorded path.
+    assert "loop-check" in _tags(server, picture_id)
+    assert sorted(op["op_type"] for op in _operations(server)) == [
+        "pictures.fields",
+        "pictures.tags.replace",
+    ]
+
+
+def test_a_character_edit_waits_on_the_database_off_the_loop(
+    monkeypatch, client, server
+):
+    _counter[0] += 1
+    created = client.post(f"{API}/characters", json={"name": f"loop-{_counter[0]}"})
+    assert created.status_code == 200, created.text
+    character_id = created.json()["character"]["id"]
+    calls = _record_database_waits(monkeypatch, server)
+
+    resp = client.patch(
+        f"{API}/characters/{character_id}", json={"description": "off the loop"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    _assert_waits_ran_off_the_loop(calls, "alter_char")
+
+
+def test_a_settings_change_waits_on_both_databases_off_the_loop(
+    monkeypatch, client, server
+):
+    calls = _record_database_waits(monkeypatch, server)
+
+    resp = client.patch(f"{API}/users/me/config", json={"theme_mode": "dark"})
+
+    assert resp.status_code == 200, resp.text
+    _assert_waits_ran_off_the_loop(calls, "preview_patch", "update_user")
+
+
+def test_settings_changes_a_moment_apart_all_end_at_the_later_one(client, server):
+    """Two PATCHes of one setting a moment apart leave the saved row, both
+    owner caches and the running value at the later one: a PATCH applies its
+    value in the order it saved it, even while it waits on a worker thread."""
+
+    def saved_cap(session):
+        return session.exec(
+            select(User.max_vram_gb).where(User.username == "testuser")
+        ).one()
+
+    original = server.hub_engine.run_immediate_read_task(saved_cap)
+    start = client.patch(f"{API}/users/me/config", json={"max_vram_gb": 4})
+    assert start.status_code == 200, start.text
+
+    real_run_task = server.hub_engine.run_task
+    real_set_cap = server.vault.set_max_vram_usage_gb
+    first_save = threading.Lock()
+    first_saved, later_applied = threading.Event(), threading.Event()
+
+    def held_run_task(func, *args, **kwargs):
+        result = real_run_task(func, *args, **kwargs)
+        if getattr(func, "__name__", "") == "update_user" and (
+            first_save.acquire(blocking=False)
+        ):
+            first_saved.set()
+            # Parks the first PATCH between saving its value and applying it
+            # until the later one has applied its own, so a PATCH that applies
+            # out of order applies the earlier value last every time. Bounded,
+            # because one that applies in order keeps the later PATCH waiting.
+            later_applied.wait(0.5)
+        return result
+
+    def spy_set_cap(max_vram_gb):
+        real_set_cap(max_vram_gb)
+        if max_vram_gb == 8:
+            later_applied.set()
+
+    async def patch_twice():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.api),
+            base_url="http://testserver",
+            cookies={"session_id": client.cookies.get("session_id")},
+        ) as loop_client:
+            first = asyncio.ensure_future(
+                loop_client.patch(f"{API}/users/me/config", json={"max_vram_gb": 2})
+            )
+            # The later PATCH is sent once the first has saved, so it never
+            # overtakes it. Bounded, in case the first never gets that far.
+            for _ in range(500):
+                if first_saved.is_set() or first.done():
+                    break
+                await asyncio.sleep(0.01)
+            second = await loop_client.patch(
+                f"{API}/users/me/config", json={"max_vram_gb": 8}
+            )
+            return await first, second
+
+    try:
+        server.hub_engine.run_task = held_run_task
+        server.vault.set_max_vram_usage_gb = spy_set_cap
+        try:
+            first, second = asyncio.run(patch_twice())
+        finally:
+            del server.hub_engine.run_task
+            del server.vault.set_max_vram_usage_gb
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first_saved.is_set(), "neither PATCH reached update_user"
+        assert later_applied.is_set(), "the later PATCH never applied its value"
+        state = {
+            "saved": server.hub_engine.run_immediate_read_task(saved_cap),
+            "runtime": server.vault._max_vram_gb,
+            "auth.user": server.auth.user.max_vram_gb,
+            "server._user": server._user.max_vram_gb,
+        }
+        assert state == dict.fromkeys(state, 8.0), state
+    finally:
+        restore = client.patch(f"{API}/users/me/config", json={"max_vram_gb": original})
+        assert restore.status_code == 200, restore.text
+
+
+def test_a_watermark_upload_is_decoded_and_saved_off_the_loop(
+    monkeypatch, client, server
+):
+    buf = io.BytesIO()
+    Image.new("RGBA", (8, 8), color=(200, 30, 30, 128)).save(buf, format="PNG")
+    calls = _record_database_waits(monkeypatch, server)
+    try:
+        resp = client.post(
+            f"{API}/users/me/watermark",
+            files={"file": ("mark.png", buf.getvalue(), "image/png")},
+        )
+        assert resp.status_code == 200, resp.text
+        _assert_waits_ran_off_the_loop(calls, "_save")
+    finally:
+        client.delete(f"{API}/users/me/watermark")
+
+
+def test_a_project_attachment_upload_waits_on_the_database_off_the_loop(
+    monkeypatch, client, server
+):
+    _counter[0] += 1
+    project = client.post(f"{API}/projects", json={"name": f"loop-{_counter[0]}"})
+    assert project.status_code == 200, project.text
+    project_id = project.json()["id"]
+    calls = _record_database_waits(monkeypatch, server)
+
+    resp = client.post(
+        f"{API}/projects/{project_id}/attachments",
+        files={"file": ("notes.txt", b"test-attachment", "text/plain")},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["original_filename"] == "notes.txt"
+    _assert_waits_ran_off_the_loop(calls, "check_project", "insert_record")
+
+
+def test_an_import_checks_its_project_off_the_loop(monkeypatch, client, server):
+    _counter[0] += 1
+    n = _counter[0]
+    project = client.post(f"{API}/projects", json={"name": f"loop-import-{n}"})
+    assert project.status_code == 200, project.text
+    buf = io.BytesIO()
+    Image.new("RGB", (16 + n, 16 + n), color=(n * 7 % 256, 90, 40)).save(
+        buf, format="PNG"
+    )
+    calls = _record_database_waits(monkeypatch, server)
+
+    status = upload_pictures_and_wait(
+        client,
+        [("file", (f"loop{n}.png", buf.getvalue(), "image/png"))],
+        form_data={"project_id": str(project.json()["id"])},
+    )
+
+    assert status["status"] == "completed", status
+    _assert_waits_ran_off_the_loop(
+        calls, "_validate_association_targets.<locals>._check"
+    )
+
+
+def test_a_plugin_run_resolves_its_token_scope_off_the_loop(
+    monkeypatch, client, server
+):
+    """The scope lookup reads the vault for a set, character or project token."""
+    picture_id = _upload(client)
+    scope_calls = []
+    real_scope = _misc.fetch_scope_allowed_picture_ids
+
+    def spy_scope(*args, **kwargs):
+        scope_calls.append(_on_event_loop())
+        return real_scope(*args, **kwargs)
+
+    monkeypatch.setattr(_misc, "fetch_scope_allowed_picture_ids", spy_scope)
+
+    resp = client.post(
+        f"{API}/pictures/plugins/test-no-such-plugin",
+        json={"picture_ids": [picture_id]},
+    )
+
+    assert resp.status_code == 404, resp.text
+    assert scope_calls == [False], "the scope lookup ran on the event loop"
+
+
+def test_a_bearer_token_is_looked_up_off_the_loop(monkeypatch, client, server):
+    token = mint_read_token(client, "test-loop bearer")
+    calls = _record_database_waits(monkeypatch, server)
+
+    resp = bearer_client(server, token).get(f"{API}/sort_mechanisms")
+
+    assert resp.status_code == 200, resp.text
+    # A first use misses the token cache, so it reads the candidates.
+    _assert_waits_ran_off_the_loop(
+        calls, "fetch_candidates", "get_user.<locals>.<lambda>"
+    )
+
+
+def test_a_query_string_token_is_looked_up_off_the_loop(monkeypatch, client, server):
+    token = mint_read_token(client, "test-loop query")
+    calls = _record_database_waits(monkeypatch, server)
+
+    resp = TestClient(server.api).get(f"{API}/sort_mechanisms", params={"token": token})
+
+    assert resp.status_code == 200, resp.text
+    _assert_waits_ran_off_the_loop(
+        calls, "fetch_candidates", "get_user.<locals>.<lambda>"
+    )
+
+
+def test_binding_a_pending_link_token_writes_off_the_loop(monkeypatch, client, server):
+    """The link check's request binds the pending token: a hub write."""
+    r = client.post(
+        f"{API}/users/me/token",
+        json={"description": "test-loop pending", "scope": "ALL"},
+    )
+    assert r.status_code == 200, r.text
+    token, token_id = r.json()["token"], r.json()["token_id"]
+
+    def make_pending(session):
+        session.exec(
+            update(UserToken)
+            .where(UserToken.id == token_id)
+            .values(bound_address=TOKEN_BIND_PENDING)
+        )
+        session.commit()
+
+    server.auth._db.run_task(make_pending, priority=DBPriority.IMMEDIATE)
+    server.auth._flush_token_cache()
+    try:
+        calls = _record_database_waits(monkeypatch, server)
+
+        resp = bearer_client(server, token).get(f"{API}/sort_mechanisms")
+
+        assert resp.status_code == 200, resp.text
+        _assert_waits_ran_off_the_loop(calls, "bind")
+    finally:
+        client.delete(f"{API}/users/me/token/{token_id}")
+
+
+def test_a_guest_score_and_its_cookie_are_resolved_off_the_loop(
+    monkeypatch, client, server
+):
+    picture_id = _upload(client)
+    _counter[0] += 1
+    n = _counter[0]
+    created = client.post(f"{API}/picture_sets", json={"name": f"loop-guest-{n}"})
+    assert created.status_code == 200, created.text
+    set_id = created.json()["picture_set"]["id"]
+    assert (
+        client.post(f"{API}/picture_sets/{set_id}/members/{picture_id}").status_code
+        == 200
+    )
+    token = mint_read_token(
+        client, "test-loop guest", resource_type="picture_set", resource_id=set_id
+    )
+    guest = bearer_client(server, token)
+    calls = _record_database_waits(monkeypatch, server)
+
+    resp = guest.post(
+        f"{API}/pictures/guest-scores",
+        json={
+            "session_id": f"test-session-{n}",
+            "set_cookie": True,
+            "scores": {str(picture_id): 3},
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    _assert_waits_ran_off_the_loop(calls, "fetch_candidates", "_fetch_set", "_run")
+
+    # The cookie it set is resolved by the middleware on the next request.
+    calls.clear()
+    scores = guest.get(f"{API}/pictures/guest-scores")
+
+    assert scores.status_code == 200, scores.text
+    assert scores.json() == {"scores": {str(picture_id): 3}}
+    _assert_waits_ran_off_the_loop(calls, "_lookup_by_token")

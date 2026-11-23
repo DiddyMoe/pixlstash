@@ -17,8 +17,9 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from passlib.hash import bcrypt
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import or_
+from sqlalchemy import or_, update
 from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
 from starlette.routing import compile_path
 
 from pixlstash.database import DBPriority, VaultDatabase
@@ -1792,14 +1793,18 @@ class AuthService:
         to now, which is another one when a concurrent request won."""
 
         def bind(session: Session):
+            # One conditional UPDATE: only a token still pending is bound.
+            session.execute(
+                update(UserToken)
+                .where(
+                    UserToken.id == token_id,
+                    UserToken.bound_address == TOKEN_BIND_PENDING,
+                )
+                .values(bound_address=client_ip)
+            )
+            session.commit()
             token = session.get(UserToken, token_id)
-            if token is None:
-                return None
-            if token.bound_address == TOKEN_BIND_PENDING:
-                token.bound_address = client_ip
-                session.add(token)
-                session.commit()
-            return token.bound_address
+            return None if token is None else token.bound_address
 
         bound = self._db.run_task(bind, priority=DBPriority.IMMEDIATE)
         # The cached row still says pending.
@@ -3013,14 +3018,21 @@ class AuthService:
                             content={"detail": "Token belongs to a different library"},
                         )
             else:
-                # Try Bearer token, then fall back to ?token= query param
+                # Try Bearer token, then fall back to ?token= query param.
+                # Every lookup below can wait on the hub or the vault (a cache
+                # miss, a restore holding the engine), so each runs on a worker
+                # and the event loop keeps serving other requests meanwhile.
                 matched_token: Optional[UserToken] = None
                 auth_header = request.headers.get("Authorization", "")
                 if auth_header.startswith("Bearer "):
                     token_value = auth_header[len("Bearer ") :]
-                    matched_token = self._token_from_value(token_value)
+                    matched_token = await run_in_threadpool(
+                        self._token_from_value, token_value
+                    )
                 if matched_token is None:
-                    matched_token = self._token_from_query_param(request)
+                    matched_token = await run_in_threadpool(
+                        self._token_from_query_param, request
+                    )
 
                 if matched_token is not None:
                     lease = getattr(request.state, "library_lease", None)
@@ -3044,7 +3056,8 @@ class AuthService:
                                 "the settings, signed in on the local network."
                             )
                         return JSONResponse(status_code=403, content={"detail": detail})
-                    refusal = self.source_refusal(
+                    refusal = await run_in_threadpool(
+                        self.source_refusal,
                         matched_token,
                         self._get_real_client_ip(request),
                         request.method,
@@ -3054,7 +3067,7 @@ class AuthService:
                         return JSONResponse(
                             status_code=403, content={"detail": refusal}
                         )
-                    user = self.get_user()
+                    user = await run_in_threadpool(self.get_user)
                     user_id = user.id if user else None
                     if user_id:
                         # Block tokens that can write (ALL, and the ComfyUI
@@ -3151,7 +3164,9 @@ class AuthService:
                                 # in-memory and untouched by this change.
                                 # Reads the vault, not the hub: a guest session
                                 # belongs to one library.
-                                gs = lease.db.run_immediate_read_task(_lookup_by_token)
+                                gs = await run_in_threadpool(
+                                    lease.db.run_immediate_read_task, _lookup_by_token
+                                )
                                 if gs is not None:
                                     request.state.guest_session_id = gs.session_id
                                     self.record_guest_activity(gs.session_id)

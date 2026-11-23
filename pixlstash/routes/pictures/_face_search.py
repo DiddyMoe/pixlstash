@@ -23,7 +23,6 @@ reference faces agree?" without a second round trip.
 
 from __future__ import annotations
 
-import asyncio
 import random as _random
 from io import BytesIO
 from typing import List
@@ -240,7 +239,7 @@ def register_routes(router, server):
         ),
         response_model=list[FaceLikenessMatchResponse],
     )
-    async def search_by_face_likeness(
+    def search_by_face_likeness(
         request: Request,
         files: List[UploadFile] = File(
             default=[],
@@ -515,7 +514,7 @@ def register_routes(router, server):
                         detail=f"File {idx + 1}: uploaded file must be an image.",
                     )
 
-                raw_bytes = await file.read()
+                raw_bytes = file.file.read()
                 if not raw_bytes:
                     raise HTTPException(
                         status_code=400,
@@ -554,11 +553,8 @@ def register_routes(router, server):
                 )
 
             detection_task = FaceDetectionTask(engine, bgr_images)
-            loop = asyncio.get_event_loop()
             try:
-                all_face_results = await loop.run_in_executor(
-                    None, task_runner.submit_and_wait, detection_task, 60.0
-                )
+                all_face_results = task_runner.submit_and_wait(detection_task, 60.0)
             except TimeoutError as exc:
                 logger.error("face-search: face detection timed out: %s", exc)
                 raise HTTPException(
