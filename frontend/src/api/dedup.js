@@ -473,13 +473,17 @@ export async function reopenGroup(signature, { batchId } = {}) {
  *   direction, so a caller that forgets the flag counts rather than writes.
  * @param {string} [options.scopeType=GLOBAL_SCOPE]
  * @param {number|string} [options.scopeId]
- * @param {string} [options.batchId] - omit to have the server mint one.
- * @param {number} [options.limit] - cap the groups acted on, for a paged run.
+ * @param {string} [options.batchId] - omit to have the server mint one. A
+ *   client-minted id is the run's undo handle if the run reached the server,
+ *   even when no answer arrives. An id that already has applied operations is
+ *   refused with 409 `batch_id_not_at_top` unless that batch is still the
+ *   newest in History.
+ * @param {number} [options.limit] - cap the number of groups acted on.
  * @param {AbortSignal} [options.signal] - cancels the request, so a preview the
  *   dialog has moved past (closed, or reopened on another scope) stops waiting.
  * @returns {Promise<Object>} the response body:
  *   `{ batch_id, dry_run, groups, pictures, scope, dry_run_summary, results,
- *   failures }`. `dry_run_summary` is present on a dry run only and carries
+ *   failures, blocked, failed, superseded }`. `dry_run_summary` is present on a dry run only and carries
  *   `{ groups, groups_by_tier, pictures, covers_gaining_tags,
  *   covers_gaining_score, covers_gaining_metadata }`, every figure derived from
  *   the same read of the same groups so the consent dialog's rows cannot
@@ -488,7 +492,9 @@ export async function reopenGroup(signature, { batchId } = {}) {
  *   queue's remainder; that comes from {@link getCounts}. `results` is empty for
  *   a dry run. `failures` names groups the run skipped and why: one unstackable
  *   group never aborts the run, so a partial result is reported rather than
- *   hidden.
+ *   hidden; `blocked` and `failed` count them by outcome. `superseded` counts
+ *   planned groups an earlier group in the same run already took out of the
+ *   queue; they are in neither `results` nor `failures`.
  */
 export async function autoStackExact({
   dryRun = true,

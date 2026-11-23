@@ -34,6 +34,7 @@ from sqlmodel import select
 from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture, PictureSet, PictureSetMember, PictureStack
 from pixlstash.db_models.dedup import DedupGroup, DedupScan, DedupVerdict
+from pixlstash.db_models.operation import Operation
 from pixlstash.db_models.tag import Tag
 from pixlstash.server import Server
 from pixlstash.services import dedup_tier_service as tiers
@@ -2302,5 +2303,126 @@ def test_a_locked_sibling_outside_the_group_makes_the_whole_deck_unstackable():
         assert expanded["stackable"] is False
         assert expanded["blocked_by_sets"] == [{"id": set_id, "name": "Frozen"}]
         assert all(member["stackable"] is False for member in expanded["members"])
+    finally:
+        _teardown(temp_dir, server)
+
+
+# ── auto-stack: the supplied batch id and the run's own cascade ───────────────
+
+
+def _apply_auto_stack(client, batch_id=None, headers=None, limit=1):
+    body = {"dry_run": False, "limit": limit}
+    if batch_id is not None:
+        body["batch_id"] = batch_id
+    return client.post(AUTO_STACK_URL, json=body, headers=headers)
+
+
+def _row_counts(server) -> tuple[int, int]:
+    """Operation and verdict rows, to show a refusal wrote neither."""
+    return _run(
+        server,
+        lambda session: (
+            len(session.exec(select(Operation.id)).all()),
+            len(session.exec(select(DedupVerdict.id)).all()),
+        ),
+    )
+
+
+def test_a_supplied_batch_id_buried_under_another_operation_is_refused():
+    """A run cannot append to a batch that is no longer on top of History.
+
+    Appending would split the batch around the newer operation, and History
+    could then undo neither part: the batch is stale behind the newer
+    operation, and the newer operation sits inside the batch. The refusal comes
+    before any write, whether the id arrives in the body or in the header.
+    """
+    temp_dir, client, server, _ids, _token, _set_id = _env()
+    try:
+        _add_exact_groups(server, count=2)
+        _rescan(server)
+        run = "cli-example-buried-run"
+        first = _apply_auto_stack(client, batch_id=run)
+        assert first.status_code == 200, first.text
+        assert first.json()["batch_id"] == run
+        assert first.json()["groups"] == 1
+
+        # An unrelated operation lands on top of the run's batch.
+        unrelated = sorted(_signatures(client))[0]
+        stacked = client.post(STACK_URL, json={"signature": unrelated})
+        assert stacked.status_code == 200, stacked.text
+        queued = _signatures(client)
+        assert len(queued) == 1
+        before = _row_counts(server)
+
+        for supplied in (
+            {"batch_id": run},
+            {"headers": {"X-Operation-Batch-Id": run}},
+        ):
+            refused = _apply_auto_stack(client, **supplied)
+            assert refused.status_code == 409, refused.text
+            detail = refused.json()["detail"]
+            assert detail["code"] == "batch_id_not_at_top"
+            assert detail["batch_id"] == run
+            assert _row_counts(server) == before
+            assert _signatures(client) == queued
+
+        # History is still two clean undos: the newer operation, then the run.
+        assert client.post(f"{API}/operations/undo", json={}).status_code == 200
+        undone = client.post(f"{API}/operations/batches/{run}/undo", json={})
+        assert undone.status_code == 200, undone.text
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_a_supplied_batch_id_still_on_top_takes_another_run():
+    """Only a buried batch is refused: a repeat that is still on top extends
+    the batch, and the whole batch is still one undo."""
+    temp_dir, client, server, _ids, _token, _set_id = _env()
+    try:
+        _add_exact_groups(server, count=1)
+        _rescan(server)
+        queued = _signatures(client)
+        assert len(queued) == 2
+        run = "cli-example-repeat-run"
+        for _ in range(2):
+            response = _apply_auto_stack(client, batch_id=run)
+            assert response.status_code == 200, response.text
+            assert response.json()["batch_id"] == run
+            assert response.json()["groups"] == 1
+        rows = client.get(f"{API}/operations", params={"batch_id": run}).json()
+        assert len(rows) == 2
+
+        undone = client.post(f"{API}/operations/batches/{run}/undo", json={})
+        assert undone.status_code == 200, undone.text
+        assert _signatures(client) == queued
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_an_auto_stack_response_counts_a_group_an_earlier_group_collapsed():
+    """The response says how many planned groups the run itself took out of the
+    queue, so a run that stacks fewer groups than it planned explains why.
+
+    Two exact pairs are spread across two mixed stacks. Stacking either pair
+    folds both stacks together, which leaves the other pair in one stack.
+    """
+    temp_dir, client, server, ids, _token, _set_id = _env()
+    try:
+        b1, b2 = _insert_pictures(
+            server,
+            [
+                {"pixel_sha": "bbb", "size_bytes": 200},
+                {"pixel_sha": "bbb", "size_bytes": 200},
+            ],
+        )
+        _stack_over_http(server, [ids[0], b1])
+        _stack_over_http(server, [ids[1], b2])
+        _rescan(server)
+
+        response = _apply_auto_stack(client, limit=None)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["groups"] == 1
+        assert body["superseded"] == 1
     finally:
         _teardown(temp_dir, server)

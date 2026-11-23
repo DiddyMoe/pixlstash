@@ -1360,13 +1360,18 @@ class AutoStackRequestModel(BaseModel):
         description=(
             "Operation-log batch id. Omit to have the server mint one (`srv-…`); "
             "every stack in the run shares it, so N stacks reverse with one "
-            "undo. A supplied id must be client-namespaced `cli-…`."
+            "undo. A supplied id must be client-namespaced `cli-…`. A client "
+            "that mints its own id holds the run's undo handle even when it "
+            "never sees the response. An applied run under an id that already "
+            "has applied operations is refused with 409 `batch_id_not_at_top` "
+            "unless that batch is still the newest in History, because "
+            "appending to it would split its undo."
         ),
     )
     limit: Optional[int] = Field(
         default=None,
         ge=1,
-        description="Cap the number of groups acted on, for a paged run.",
+        description="Cap the number of groups acted on.",
     )
 
 
@@ -1414,7 +1419,10 @@ class AutoStackResponse(BaseModel):
             "undo` handle for the whole run. Always present on an applied run - "
             "including a partially applied one - so work that did happen is "
             "never left without a way to reverse it. Null only for a dry run "
-            "with none supplied."
+            "with none supplied. An unexpected error ends the run with a 500 "
+            "after the groups before it have committed under the batch; those "
+            "are in History under this id, which is why a client supplying its "
+            "own `cli-…` id can still undo them."
         ),
     )
     dry_run: bool = Field(description="Whether anything was written.")
@@ -1449,6 +1457,15 @@ class AutoStackResponse(BaseModel):
         default=0, description="Groups refused by a guard, typically a locked set."
     )
     failed: int = Field(default=0, description="Groups that could not be resolved.")
+    superseded: int = Field(
+        default=0,
+        description=(
+            "Planned groups an earlier group in the same run took out of the "
+            "queue: stacking that group folded every stack the later one "
+            "spanned. Nothing is written for them, and they are neither in "
+            "`results` nor in `failures`."
+        ),
+    )
 
 
 # ── Mixed stacks (design D5 / B5) ────────────────────────────────────────────
@@ -2389,7 +2406,10 @@ def create_router(server) -> APIRouter:
             "why they get one consent dialog instead of per-group adjudication; "
             "near and embedding groups always go through the queue no matter how "
             "confident they look. Defaults to `dry_run=true`, which returns the "
-            "counts the dialog shows and writes nothing."
+            "counts the dialog shows and writes nothing. An applied run under a "
+            "supplied batch id that already has applied operations but is no "
+            "longer the newest batch in History is refused with 409 "
+            "`batch_id_not_at_top` before anything is written."
         ),
         response_model=AutoStackResponse,
     )

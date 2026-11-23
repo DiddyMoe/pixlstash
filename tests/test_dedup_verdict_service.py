@@ -18,14 +18,16 @@ Covers:
 
 import gc
 import json
+import logging
 import os
 import sqlite3
 import tempfile
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import event
-from sqlmodel import select
+from sqlalchemy import event, insert
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
@@ -36,6 +38,9 @@ from pixlstash.db_models import (
 )
 from pixlstash.db_models.dedup import (
     DedupGroup,
+    DedupGroupMember,
+    TIER_EXACT,
+    TIER_NEAR,
     VERDICT_KEEP_SEPARATE,
     VERDICT_STACKED,
     DedupVerdict,
@@ -3016,3 +3021,418 @@ def test_the_dry_run_moves_a_frozen_cover_where_the_run_moves_it(server):
     # The run did put ids[2] in front, so the preview described this run.
     assert _picture(server, ids[2]).stack_position == 0
     assert _picture(server, ids[1]).stack_position != 0
+
+
+# ── one commit per verdict, and a bulk run that scales ───────────────────────
+
+
+def _commits_during(server, fn, *args):
+    """Run ``fn(session, *args)`` on the writer and count the session's commits.
+
+    The listener is attached to the task's own session and removed in a
+    ``finally``, so nothing outlives the call.
+    """
+    commits: list[int] = []
+
+    def on_commit(_session) -> None:
+        commits.append(1)
+
+    def counted(session):
+        event.listen(session, "after_commit", on_commit)
+        try:
+            return fn(session, *args)
+        finally:
+            event.remove(session, "after_commit", on_commit)
+
+    result = _run(server, counted)
+    return result, len(commits)
+
+
+def test_a_stack_verdict_commits_once(server):
+    """The stack, the verdict and its operation row land in one commit.
+
+    Recording the operation used to commit as well, so every verdict paid for
+    two commits, and each commit expires the whole identity map.
+    """
+    _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},
+            {"pixel_sha": "aaa", "size_bytes": 100},
+        ],
+    )
+    _scan(server)
+    batch_id = verdicts.new_batch_id()
+    _result, commits = _commits_during(
+        server,
+        verdicts.apply_stack_verdict_in_session,
+        _one_signature(server),
+        None,
+        [],
+        batch_id,
+    )
+    assert commits == 1
+    # The single commit still carried the operation row.
+    assert [row.batch_id for row in _operations(server)] == [batch_id]
+
+
+def test_a_keep_separate_verdict_commits_once(server):
+    """Keep separate records its operation inside the verdict's one commit."""
+    _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},
+            {"pixel_sha": "aaa", "size_bytes": 100},
+        ],
+    )
+    _scan(server)
+    signature = _one_signature(server)
+    batch_id = verdicts.new_batch_id()
+    _result, commits = _commits_during(
+        server, verdicts.apply_keep_separate_in_session, signature, batch_id
+    )
+    assert commits == 1
+    rows = _operations(server)
+    assert [(row.op_type, row.batch_id) for row in rows] == [
+        (verdicts.OP_TYPE_KEEP_SEPARATE, batch_id)
+    ]
+    verdict = _run(
+        server,
+        lambda session: session.exec(
+            select(DedupVerdict).where(DedupVerdict.signature == signature)
+        ).one(),
+    )
+    assert verdict.verdict == VERDICT_KEEP_SEPARATE
+
+
+def test_an_auto_stack_run_commits_once_per_group_and_holds_no_group_rows(server):
+    """Each commit expires the whole identity map, so what the run holds matters.
+
+    The run used to iterate loaded ``DedupGroup`` rows: every per-group commit
+    expired all of them, and each later group paid to reload them. It now
+    iterates ``(id, signature)`` scalars, so at any commit the only group row
+    in the session is the one being applied.
+    """
+    _seed_three_exact_groups(server)
+    _scan(server)
+    held: list[int] = []
+
+    def count_group_rows(session) -> None:
+        held.append(
+            sum(
+                1
+                for obj in session.identity_map.values()
+                if isinstance(obj, DedupGroup)
+            )
+        )
+
+    def run(session):
+        event.listen(session, "before_commit", count_group_rows)
+        try:
+            return verdicts.bulk_auto_stack_in_session(session, None, None, False, None)
+        finally:
+            event.remove(session, "before_commit", count_group_rows)
+
+    report = _run(server, run)
+    assert report["groups"] == 3
+    # One commit per group. The trailing prune commits only when it removes a
+    # stale group, and this fixture has none.
+    assert len(held) == 3
+    assert max(held) == 1
+
+
+def _seed_cascading_exact_groups(server) -> dict[str, int]:
+    """Exact groups A={a1,a2} and B={b1,b2} across two mixed stacks.
+
+    S1 holds a1 and b1, S2 holds a2 and b2 (each led by its A member), so both
+    groups span two stack units and both are live. Stacking either group folds
+    S1 and S2 together, which leaves the other group's members in one stack:
+    no longer a decision, and gone from the queue.
+    """
+    a1, a2, b1, b2 = _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 4.0},
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 1.0},
+            {"pixel_sha": "bbb", "size_bytes": 200, "smart_score": 1.0},
+            {"pixel_sha": "bbb", "size_bytes": 200, "smart_score": 4.0},
+        ],
+    )
+    _stack_pictures(server, [a1, b1], name="first mixed")
+    _stack_pictures(server, [a2, b2], name="second mixed")
+    _scan(server)
+    return {"a1": a1, "a2": a2, "b1": b1, "b2": b2}
+
+
+def _planned_signatures(server) -> list[str]:
+    """The exact groups in the order the run applies them."""
+    return _run(
+        server,
+        lambda session: [
+            str(signature)
+            for signature in session.exec(
+                select(DedupGroup.signature)
+                .where(DedupGroup.tier == TIER_EXACT)
+                .order_by(DedupGroup.confidence.desc(), DedupGroup.id.asc())
+            ).all()
+        ],
+    )
+
+
+def test_an_auto_stack_run_leaves_a_group_an_earlier_group_collapsed(server):
+    """A group the run itself took out of the queue is superseded, not stacked.
+
+    The run is planned once. Stacking the first group folds both mixed stacks,
+    so the second group's members already share one stack: the queue would no
+    longer show it. Applying it anyway forced its own cover to the front,
+    replacing the representative the first group had just chosen, and recorded
+    a second operation for a group that posed no decision.
+    """
+    ids = _seed_cascading_exact_groups(server)
+    first, _second = _planned_signatures(server)
+    first_cover = _preselected_cover(server, first)
+
+    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+
+    stacks = {_picture(server, pid).stack_id for pid in ids.values()}
+    assert len(stacks) == 1
+    leaders = [pid for pid in ids.values() if _picture(server, pid).stack_position == 0]
+    assert leaders == [first_cover]
+    assert report["groups"] == 1
+    assert [item["signature"] for item in report["results"]] == [first]
+    assert report["superseded"] == 1
+    assert report["failures"] == []
+    assert [row.batch_id for row in _operations(server)] == [report["batch_id"]]
+
+
+def test_an_auto_stack_run_still_stacks_a_group_an_earlier_group_only_touched(server):
+    """A touched group that still spans two stack units is applied, not skipped.
+
+    stacked_a and stacked_b already share a stack, and copy_a and copy_b are
+    their unstacked copies. Applying the first group moves the whole stack, so
+    the second group has a touched member and takes the full re-check. Its copy
+    is still outside the stack, so it still poses a decision and the run must
+    stack it too.
+    """
+    stacked_a, stacked_b, copy_a, copy_b = _seed(
+        server,
+        [
+            {"pixel_sha": "aaa"},
+            {"pixel_sha": "bbb"},
+            {"pixel_sha": "aaa"},
+            {"pixel_sha": "bbb"},
+        ],
+    )
+    stack_id = _stack_pictures(server, [stacked_a, stacked_b])
+    _scan(server)
+
+    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+
+    assert report["groups"] == 2
+    assert report["superseded"] == 0
+    assert report["failures"] == []
+    members = (stacked_a, stacked_b, copy_a, copy_b)
+    assert {_picture(server, pid).stack_id for pid in members} == {stack_id}
+    assert [row.batch_id for row in _operations(server)] == [report["batch_id"]] * 2
+
+
+def _two_stack_library(background: int):
+    """An in-memory library: four exact pairs split across two stacks, plus noise.
+
+    Pictures 1-8 alternate between stacks 1 and 2, and exact group *g* holds
+    pictures ``2g - 1`` and ``2g``, one in each stack. *background* near groups
+    of two unstacked pictures each enlarge the member table without sharing a
+    picture with any exact group.
+    """
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    pictures: list[dict] = []
+    groups: list[dict] = []
+    members: list[dict] = []
+
+    def add_picture(pid, stack_id=None, position=None):
+        pictures.append(
+            {
+                "id": pid,
+                "file_path": f"/vault/pic_{pid}.png",
+                "format": "png",
+                "width": 100,
+                "height": 100,
+                "size_bytes": 100,
+                "deleted": False,
+                "stack_id": stack_id,
+                "stack_position": position,
+            }
+        )
+
+    def add_group(gid, tier, picture_ids):
+        groups.append(
+            {
+                "id": gid,
+                "signature": f"test-group-{gid}",
+                "tier": tier,
+                "confidence": 1.0,
+                "member_count": len(picture_ids),
+                "cover_picture_id": picture_ids[0],
+                "resolved": False,
+                "created_at": created_at,
+            }
+        )
+        members.extend(
+            {"group_id": gid, "picture_id": pid, "position": position}
+            for position, pid in enumerate(picture_ids)
+        )
+
+    for pid in range(1, 9):
+        add_picture(pid, stack_id=(pid - 1) % 2 + 1, position=(pid - 1) // 2)
+    for gid in range(1, 5):
+        add_group(gid, TIER_EXACT, [2 * gid - 1, 2 * gid])
+    for index in range(background):
+        first = 9 + 2 * index
+        add_picture(first)
+        add_picture(first + 1)
+        add_group(5 + index, TIER_NEAR, [first, first + 1])
+    with Session(engine) as session:
+        session.add_all([PictureStack(id=1), PictureStack(id=2)])
+        session.flush()
+        session.execute(insert(Picture), pictures)
+        session.execute(insert(DedupGroup), groups)
+        session.execute(insert(DedupGroupMember), members)
+        session.commit()
+    return engine
+
+
+def test_a_recheck_reads_its_own_group_not_the_library():
+    """Re-checking one touched group costs the same however big the library is.
+
+    The run re-checks every group an earlier group touched, so a check whose
+    cost grows with the library makes the whole run quadratic. SQLite VM
+    instructions keep the measure deterministic: ten times as many unrelated
+    groups must not cost anything like ten times the work.
+    """
+
+    def one_recheck(background: int) -> tuple[bool, int]:
+        engine = _two_stack_library(background)
+        steps = [0]
+
+        def tick() -> int:
+            steps[0] += 1
+            return 0
+
+        try:
+            with Session(engine) as session:
+                raw = session.connection().connection.dbapi_connection
+                raw.set_progress_handler(tick, 1)
+                try:
+                    # Group 2 is pictures 3 and 4, one in each stack; 3 was touched.
+                    answer = verdicts._still_poses_a_decision(session, 2, {3})
+                finally:
+                    raw.set_progress_handler(None, 0)
+        finally:
+            engine.dispose()
+        return answer, steps[0]
+
+    small_answer, small = one_recheck(200)
+    large_answer, large = one_recheck(2000)
+
+    assert small_answer is True
+    assert large_answer is True
+    assert large < 2 * small, f"{small} VM steps at 200 groups, {large} at 2000"
+
+
+def test_an_unexpected_error_mid_run_is_logged_with_its_batch_and_raised(
+    server, monkeypatch, caplog
+):
+    """An error the run does not expect stops it, and says what it leaves behind.
+
+    Only the refusals the run understands are recorded per group and skipped.
+    Anything else is a bug, so the run stops instead of guessing. Every earlier
+    group has already committed under the batch by then, so the log line has to
+    name the batch, and that batch has to undo what was applied.
+    """
+    ids = _seed_three_exact_groups(server)
+    _scan(server)
+    batch_id = verdicts.new_batch_id()
+    real = verdicts.apply_stack_verdict_in_session
+    seen: list[str] = []
+
+    def break_on_the_second(session, signature, *args, **kwargs):
+        seen.append(signature)
+        if len(seen) == 2:
+            raise RuntimeError("stand-in failure")
+        return real(session, signature, *args, **kwargs)
+
+    monkeypatch.setattr(verdicts, "apply_stack_verdict_in_session", break_on_the_second)
+    with caplog.at_level(logging.ERROR, logger=verdicts.logger.name):
+        with pytest.raises(RuntimeError, match="stand-in failure"):
+            _run(
+                server,
+                verdicts.bulk_auto_stack_in_session,
+                None,
+                batch_id,
+                False,
+                None,
+            )
+
+    assert len(seen) == 2, "the run stops at the error"
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and batch_id in record.getMessage()
+    ]
+    assert len(errors) == 1, caplog.text
+    assert seen[1] in errors[0].getMessage()
+    assert errors[0].exc_info is not None
+    # The first group committed under the supplied batch, and nothing else did.
+    assert [row.batch_id for row in _operations(server)] == [batch_id]
+    assert sum(1 for pid in ids if _picture(server, pid).stack_id is not None) == 2
+
+    _run(server, operation_log_service.undo_batch_in_session, batch_id)
+    assert [pid for pid in ids if _picture(server, pid).stack_id is not None] == []
+
+
+def test_an_error_in_the_recheck_is_logged_with_its_batch_and_raised(
+    server, monkeypatch, caplog
+):
+    """The re-check before each group sits inside the same logged boundary.
+
+    It is a query of its own and can fail like one. By then the groups before
+    it have committed under the batch, so the error line has to name the batch
+    and the group the run stopped at, exactly as for an error while applying.
+    """
+    _seed_three_exact_groups(server)
+    _scan(server)
+    batch_id = verdicts.new_batch_id()
+    second = _planned_signatures(server)[1]
+    real = verdicts._still_poses_a_decision
+    calls: list[int] = []
+
+    def break_on_the_second(session, group_id, touched_picture_ids):
+        calls.append(group_id)
+        if len(calls) == 2:
+            raise RuntimeError("stand-in failure")
+        return real(session, group_id, touched_picture_ids)
+
+    monkeypatch.setattr(verdicts, "_still_poses_a_decision", break_on_the_second)
+    with caplog.at_level(logging.ERROR, logger=verdicts.logger.name):
+        with pytest.raises(RuntimeError, match="stand-in failure"):
+            _run(
+                server,
+                verdicts.bulk_auto_stack_in_session,
+                None,
+                batch_id,
+                False,
+                None,
+            )
+
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and batch_id in record.getMessage()
+    ]
+    assert len(errors) == 1, caplog.text
+    assert second in errors[0].getMessage()
+    assert errors[0].exc_info is not None
+    # The first group committed under the supplied batch, and nothing else did.
+    assert [row.batch_id for row in _operations(server)] == [batch_id]

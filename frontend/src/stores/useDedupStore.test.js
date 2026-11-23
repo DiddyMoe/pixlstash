@@ -3012,12 +3012,58 @@ describe("useDedupStore - scans and bulk auto-stack", () => {
     expect(getCounts).toHaveBeenCalled();
   });
 
-  it("reports nothing when the bulk run fails", async () => {
-    autoStackExact.mockRejectedValue(new Error("boom"));
+  it("reports nothing when the server answers the bulk run with a fault", async () => {
+    autoStackExact.mockRejectedValue(
+      Object.assign(new Error("fake-failure"), { response: { status: 500 } }),
+    );
     const store = useDedupStore();
     expect(await store.runAutoStack()).toBe(null);
+    expect(store.error?.response?.status).toBe(500);
     expect(store.busy).toBe(false);
   });
+
+  // The run's undo handle is its batch id. Minted here rather than by the
+  // server, it is known before the request leaves, so a run the client stops
+  // waiting for can still be found in History and reversed.
+  it("mints the run's batch id before the request leaves", async () => {
+    servePage([]);
+    autoStackExact.mockResolvedValue({ batch_id: "b-2", groups: 1 });
+    const store = useDedupStore();
+    await store.runAutoStack();
+    expect(autoStackExact).toHaveBeenCalledTimes(1);
+    expect(autoStackExact.mock.calls[0][0].batchId).toMatch(
+      /^cli-[A-Za-z0-9_-]{4,76}$/,
+    );
+  });
+
+  // The server keeps committing groups after the client's 60 s timeout, so a
+  // request that never got an answer is an outcome nobody knows yet, not a
+  // failure: "nothing was lost" would be false.
+  it.each([
+    ["the client's timeout", { code: "ECONNABORTED" }],
+    ["a lost connection", { code: "ERR_NETWORK" }],
+  ])(
+    "reports a run with no answer as unknown, under its own batch id: %s",
+    async (_label, rejection) => {
+      servePage([]);
+      autoStackExact.mockRejectedValue(
+        Object.assign(new Error("fake-no-answer"), rejection),
+      );
+      const store = useDedupStore();
+      listGroups.mockClear();
+      getCounts.mockClear();
+      const result = await store.runAutoStack();
+      const sent = autoStackExact.mock.calls[0][0].batchId;
+      expect(sent).toMatch(/^cli-/);
+      expect(result).toEqual({ outcome: "unknown", batch_id: sent });
+      expect(store.error).toBe(null);
+      // The groups already committed have left the queue, so it is reloaded
+      // exactly as after a run that answered.
+      expect(listGroups).toHaveBeenCalledTimes(1);
+      expect(getCounts).toHaveBeenCalled();
+      expect(store.busy).toBe(false);
+    },
+  );
 
   // The run stacks the scope the user consented to in the dialog, not whatever
   // the queue was navigated to while the dialog was open.
@@ -3033,6 +3079,7 @@ describe("useDedupStore - scans and bulk auto-stack", () => {
       dryRun: false,
       scopeType: "set",
       scopeId: 12,
+      batchId: expect.stringMatching(/^cli-/),
     });
   });
 });

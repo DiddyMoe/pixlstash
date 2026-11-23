@@ -2917,21 +2917,32 @@ export const useDedupStore = defineStore("dedup", () => {
    * The whole run coalesces into one operation batch, so the receipt it raises
    * reverses every stack it created with a single undo.
    *
+   * The batch id is minted here, before the request leaves. A large run can
+   * outlast the client's timeout while the server keeps committing groups, and
+   * a request with no answer is then an outcome nobody knows yet rather than a
+   * failure: the queue is reloaded as after a finished run, and the result
+   * names the batch id the run was sent with, under which History shows and
+   * undoes whatever of the run reached the server.
+   *
    * @param {Object} [options]
    * @param {{scopeType: string, scopeId: (string|number|null)}} [options.scope]
    *   the scope to stack: the one the user previewed, so a scope change while
    *   the dialog was open cannot redirect the run. The queue's current scope
    *   when omitted.
    * @returns {Promise<Object|null>} the run report, carrying `batch_id` and any
-   *   `failures`.
+   *   `failures`; `{outcome: "unknown", batch_id}` when no answer arrived (a
+   *   timeout or a lost connection); `null` when the server answered with an
+   *   error, which is left in `error`.
    */
   async function runAutoStack({ scope = currentScope() } = {}) {
     busy.value = true;
+    const batchId = newOperationBatchId();
     try {
       const result = await autoStackExact({
         dryRun: false,
         scopeType: scope.scopeType,
         scopeId: scope.scopeId,
+        batchId,
       });
       invalidateScopeCounts();
       // The whole run is one operation batch; the same response-driven
@@ -2941,6 +2952,19 @@ export const useDedupStore = defineStore("dedup", () => {
       await refreshCounts();
       return result;
     } catch (err) {
+      if (!err?.response) {
+        // No answer is not a refusal: the server may still be stacking under
+        // this batch, so nothing here retries or claims the run failed.
+        console.warn(
+          `[dedup] no answer from the auto-stack run under batch ${batchId}; ` +
+            "its outcome is unknown",
+          err,
+        );
+        invalidateScopeCounts();
+        await loadFirstPage();
+        await refreshCounts();
+        return { outcome: "unknown", batch_id: batchId };
+      }
       error.value = err;
       console.warn("[dedup] failed to run the auto-stack", err);
       return null;

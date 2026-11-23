@@ -2437,7 +2437,7 @@ def _unfrozen(value):
     return case((Picture.id.notin_(locked_picture_id_subquery()), value), else_=None)
 
 
-def live_groups_filter():
+def live_groups_filter(group_id: Optional[int] = None):
     """Only groups that still POSE a decision.
 
     Three conditions, one HAVING clause over the live (non-scrapheaped) members:
@@ -2470,13 +2470,22 @@ def live_groups_filter():
     filter. :func:`~pixlstash.services.set_lock_service.locked_picture_id_subquery`
     is the shared definition of "frozen", so the read filter and the write guards
     cannot drift.
+
+    *group_id* restricts the aggregate to that one group's member rows, for a
+    caller asking about a single group; ``group_id`` leads the primary key of
+    ``dedupgroupmember``, so that is an index range read instead of a pass over
+    every member in the library.
     """
     stack_unit = func.coalesce(Picture.stack_id, 0 - Picture.id)
-    return DedupGroup.id.in_(
+    members = (
         select(DedupGroupMember.group_id)
         .join(Picture, Picture.id == DedupGroupMember.picture_id)
         .where(Picture.deleted.is_(False))
-        .group_by(DedupGroupMember.group_id)
+    )
+    if group_id is not None:
+        members = members.where(DedupGroupMember.group_id == group_id)
+    return DedupGroup.id.in_(
+        members.group_by(DedupGroupMember.group_id)
         .having(func.count(DedupGroupMember.picture_id) >= 2)
         .having(func.count(func.distinct(stack_unit)) >= 2)
         .having(func.count(func.distinct(_unfrozen(stack_unit))) >= 2)
