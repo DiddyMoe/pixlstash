@@ -1,7 +1,6 @@
 """Task that scans a reference folder and indexes new image files in place."""
 
 import concurrent.futures
-import io
 import os
 import time
 from datetime import datetime, timezone
@@ -1368,12 +1367,9 @@ class ReferenceFolderScanTask(BaseTask):
         Returns:
             An unsaved Picture instance ready for insertion.
         """
-        with open(file_path, "rb") as fh:
-            image_bytes = fh.read()
-
-        created_at = ImageUtils.extract_created_at_from_metadata(
-            image_bytes, fallback_file_path=file_path
-        )
+        # Read from the path, never into memory whole: up to
+        # ``_MAX_BUILD_WORKERS`` of these run at once.
+        created_at = ImageUtils.extract_created_at_from_path(file_path)
 
         width = height = None
         img_format = None
@@ -1384,7 +1380,7 @@ class ReferenceFolderScanTask(BaseTask):
         # A video is not PIL's to open; the thumbnail finder renders its frame.
         if not VideoUtils.is_video_file(file_path):
             try:
-                with Image.open(io.BytesIO(image_bytes)) as img:
+                with Image.open(file_path) as img:
                     img_format = img.format or "PNG"
                     width, height = img.size
                     rendered = ImageUtils.render_thumbnail(img)

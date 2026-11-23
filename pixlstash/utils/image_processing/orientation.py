@@ -386,7 +386,7 @@ def _jpeg_with_orientation(data: bytes, orientation: int) -> bytes:
     Every other EXIF field the photo already carries is preserved - camera,
     lens, timestamps, GPS - because the existing block is loaded and edited
     rather than replaced. That matters beyond politeness:
-    ``ImageUtils.extract_created_at_from_metadata`` reads ``DateTimeOriginal``
+    ``ImageUtils.extract_created_at_from_path`` reads ``DateTimeOriginal``
     out of it to date the picture.
     """
     try:

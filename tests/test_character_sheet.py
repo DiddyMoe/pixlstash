@@ -1798,11 +1798,13 @@ def test_a_used_sheet_stays_in_the_scrapheap_and_purges_cleanly(client, monkeypa
         "_wait_for_comfyui_outputs",
         lambda *a, **k: ([{"filename": "sheet.png"}], None),
     )
-    monkeypatch.setattr(
-        comfyui_service,
-        "_download_comfyui_image",
-        lambda *a, **k: (drawn.getvalue(), ".png"),
-    )
+
+    def fetched(_base_url, _entry, dest_dir):
+        path = pathlib.Path(dest_dir) / "test-sheet.png"
+        path.write_bytes(drawn.getvalue())
+        return str(path), ".png"
+
+    monkeypatch.setattr(comfyui_service, "_download_comfyui_image", fetched)
     comfyui_service._process_comfyui_outputs(
         server,
         "http://comfy",

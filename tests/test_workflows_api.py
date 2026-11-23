@@ -27,6 +27,7 @@ refused credential is live.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import ipaddress
@@ -25402,7 +25403,9 @@ def test_a_picture_in_comfyuis_input_folder_opens_as_the_library_picture(
     env.monkeypatch.setattr(
         workflows_routes, "_read_object_info", lambda url, **_: (info, None)
     )
-    held = b"\x89PNG test-picture-in-the-input-folder"
+    # Past the 128 KiB a sampled hash reads whole, so a match on any other
+    # digest of the file than the library's sampled one misses.
+    held = b"\x89PNG test-picture-in-the-input-folder" + bytes(range(256)) * 1024
     picture = _add_picture(
         env.server,
         env.tmp_path,
@@ -25415,13 +25418,18 @@ def test_a_picture_in_comfyuis_input_folder_opens_as_the_library_picture(
         ("output", "", "made.png"): held,
     }
     fetched = []
+    fetched_into = []
 
-    def download(base_url, entry):
+    def download(base_url, entry, dest_dir):
         fetched.append(entry)
+        fetched_into.append(dest_dir)
         key = (entry["type"], entry["subfolder"], entry["filename"])
         if key not in files:
             raise HTTPException(status_code=404, detail="test-not-there")
-        return files[key], ".png"
+        path = os.path.join(dest_dir, "test-fetched.png")
+        with open(path, "wb") as handle:
+            handle.write(files[key])
+        return path, ".png"
 
     env.monkeypatch.setattr(workflows_routes, "_download_comfyui_image", download)
 
@@ -25448,6 +25456,43 @@ def test_a_picture_in_comfyuis_input_folder_opens_as_the_library_picture(
     assert opened("sub/other.png") == empty
     assert {"filename": "other.png", "subfolder": "sub", "type": "input"} in fetched
     assert opened("gone.png") == empty
+    # Each file is fetched into a folder of its own, gone once it is hashed.
+    assert fetched_into
+    assert [d for d in fetched_into if os.path.exists(d)] == []
+
+
+def test_a_disk_error_fetching_a_load_images_file_still_opens_the_graph(
+    id_loaders,
+):
+    """The file a Load Image names is fetched to a temporary copy to hash
+    it, which a full or read-only disk can refuse. The graph opens all the
+    same, the input an empty Picture Loader to browse in, as for a file
+    ComfyUI does not have. Wrong if opening the graph fails.
+    """
+    env = id_loaders
+    info = json.loads(
+        json.dumps({**CHAIN_OBJECT_INFO, **PACK_OBJECT_INFO, **ID_LOADER_OBJECT_INFO})
+    )
+    info["LoadImage"]["input"]["required"]["image"] = [["in-input.png"], {}]
+    env.monkeypatch.setattr(
+        workflows_routes, "_read_object_info", lambda url, **_: (info, None)
+    )
+
+    def download(base_url, entry, dest_dir):
+        raise OSError(errno.ENOSPC, "test-no-space-left")
+
+    env.monkeypatch.setattr(workflows_routes, "_download_comfyui_image", download)
+    manual = workflows_routes.store_manual_workflow(
+        env.server.hub,
+        "Input in-input.png on a full disk",
+        _picture_document("in-input.png"),
+        "import",
+    )
+
+    assert _opened(env, manual, pixlstash_nodes="true")["workflow"]["7"] == {
+        "class_type": "PixlStashPictureLoader",
+        "inputs": {"picture_ids": "", "library": env.server.vault.library_uuid},
+    }
 
 
 def test_a_diffusion_model_a_vae_and_a_clip_open_as_the_shelfs_loaders(id_loaders):

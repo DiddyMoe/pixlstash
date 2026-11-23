@@ -436,14 +436,8 @@ class LikenessParameterUtils:
     ) -> Optional[datetime]:
         """Extract (or infer) the creation datetime for an image or video file (static version)."""
         try:
-            if VideoUtils.is_video_file(rel_path or full_path):
-                return ImageUtils.extract_created_at_from_metadata(
-                    b"", fallback_file_path=full_path
-                )
-            with open(full_path, "rb") as handle:
-                image_bytes = handle.read()
-            return ImageUtils.extract_created_at_from_metadata(
-                image_bytes, fallback_file_path=full_path
+            return ImageUtils.extract_created_at_from_path(
+                full_path, is_video=VideoUtils.is_video_file(rel_path or full_path)
             )
         except Exception as exc:
             logger.warning(

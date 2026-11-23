@@ -58,6 +58,36 @@ def _boxes(data):
         pos += size
 
 
+def _box_spans(handle, start: int, end: int):
+    """Yield ``(type, payload start, box end)`` for each box between *start* and *end*.
+
+    Reads only the box headers, seeking from one to the next by its declared
+    size (a 64-bit ``largesize`` when the size field is 1, the rest of the
+    range when it is 0), so a payload is never read to be stepped over.
+
+    Raises:
+        ValueError: A box header is cut short by the end of the file.
+    """
+    pos = start
+    while pos + 8 <= end:
+        handle.seek(pos)
+        header = handle.read(16)
+        if len(header) < 8:
+            raise ValueError(f"the box header at byte {pos} is cut short")
+        size, kind = struct.unpack_from(">I4s", header)
+        skip = 8
+        if size == 1:
+            if len(header) < 16:
+                raise ValueError(f"the 64-bit box size at byte {pos} is cut short")
+            size, skip = struct.unpack_from(">Q", header, 8)[0], 16
+        elif size == 0:
+            size = end - pos
+        if size < skip:
+            return
+        yield kind, pos + skip, pos + size
+        pos += size
+
+
 def _mp4_tags(handle, file_size: int) -> dict:
     """The text tags of an MP4 or MOV file, read off its ``moov`` box.
 
@@ -65,25 +95,14 @@ def _mp4_tags(handle, file_size: int) -> dict:
     read whichever side of it ``moov`` is on.
     """
     moov = b""
-    pos = 0
-    while pos + 8 <= file_size:
-        handle.seek(pos)
-        header = handle.read(16)
-        size, kind = struct.unpack_from(">I4s", header)
-        skip = 8
-        if size == 1:
-            size, skip = struct.unpack_from(">Q", header, 8)[0], 16
-        elif size == 0:
-            size = file_size - pos
-        if size < skip:
-            break
-        if kind == b"moov":
-            if size > _MAX_TAG_BYTES:
-                raise ValueError(f"its moov box is {size} bytes")
-            handle.seek(pos + skip)
-            moov = memoryview(handle.read(size - skip))
-            break
-        pos += size
+    for kind, body, box_end in _box_spans(handle, 0, file_size):
+        if kind != b"moov":
+            continue
+        if box_end - body > _MAX_TAG_BYTES:
+            raise ValueError(f"its moov box is {box_end - body} bytes")
+        handle.seek(body)
+        moov = memoryview(handle.read(box_end - body))
+        break
 
     tags: dict = {}
     top = dict(_boxes(moov))
@@ -115,6 +134,46 @@ def _mp4_tags(handle, file_size: int) -> dict:
                 continue
             tags.setdefault(_text(name).lower(), _text(data[8:]))
     return tags
+
+
+def _mvhd_creation_seconds(handle, file_size: int) -> Optional[int]:
+    """The ``mvhd`` creation time of an MP4/MOV, in seconds since 1904.
+
+    Walks the top-level boxes to ``moov`` and its children to ``mvhd``, then
+    reads only that header's version, flags and creation time. ``None`` when
+    the file has no movie header or it records no time (0 means unset).
+
+    Raises:
+        ValueError: A box header is cut short, or the movie header runs past
+            its ``moov`` box or the file, or is shorter than its fields.
+    """
+    for kind, body, box_end in _box_spans(handle, 0, file_size):
+        if kind != b"moov":
+            continue
+        for child, child_body, child_end in _box_spans(handle, body, box_end):
+            if child != b"mvhd":
+                continue
+            if child_end > min(box_end, file_size):
+                raise ValueError(
+                    f"the movie header at byte {child_body} runs to byte "
+                    f"{child_end}, past the end of its moov box or of the file"
+                )
+            handle.seek(child_body)
+            # [version:1][flags:3][creation_time: 4 bytes in v0, 8 in v1]
+            header = handle.read(min(12, child_end - child_body))
+            if header and header[0] not in (0, 1):
+                return None
+            if len(header) < (12 if header[:1] == b"\x01" else 8):
+                raise ValueError(
+                    f"the movie header at byte {child_body} is shorter than its fields"
+                )
+            if header[0] == 0:
+                seconds = struct.unpack_from(">I", header, 4)[0]
+            else:
+                seconds = struct.unpack_from(">Q", header, 4)[0]
+            return seconds or None
+        return None
+    return None
 
 
 def _ebml_header(data, pos: int) -> tuple:
@@ -266,52 +325,48 @@ class VideoUtils:
         return tags
 
     @staticmethod
-    def extract_created_at_from_bytes(data: bytes) -> Optional[datetime]:
-        """Extract the recording creation time from MP4/MOV container bytes.
+    def extract_created_at_from_path(file_path: str) -> Optional[datetime]:
+        """The recording time an MP4/MOV's movie header (``mvhd``) carries.
 
-        Scans for the ``mvhd`` (movie header) ISOM box and reads its
-        ``creation_time`` field, converting from the MP4 epoch (1904-01-01
-        UTC) to a timezone-aware UTC datetime.
+        The box structure is walked by seeking, so the media data is stepped
+        over whichever side of the ``moov`` box it is on and at most a few
+        header bytes are read. WebM/Matroska and AVI carry no ``mvhd`` and
+        answer ``None`` without being walked.
 
         Args:
-            data: Raw video file bytes.
+            file_path: Path of the video file.
 
         Returns:
-            UTC datetime if found, or None if no valid timestamp is present.
+            The time as a timezone-aware UTC datetime, or ``None`` when the
+            container records none or cannot be read.
         """
-        pos = 0
-        while pos < len(data) - 8:
-            idx = data.find(b"mvhd", pos)
-            if idx < 4:
-                # Need at least 4 bytes before 'mvhd' for the box size field.
-                break
-            version_pos = idx + 4  # byte immediately after the 4-byte box type
-            if version_pos >= len(data):
-                break
-            version = data[version_pos]
-            # Layout after box type: [version:1][flags:3][creation_time:4 or 8]
-            ct_pos = version_pos + 4  # skip version (1) + flags (3)
-            try:
-                if version == 0:
-                    if ct_pos + 4 > len(data):
-                        break
-                    ct_val = struct.unpack(">I", data[ct_pos : ct_pos + 4])[0]
-                elif version == 1:
-                    if ct_pos + 8 > len(data):
-                        break
-                    ct_val = struct.unpack(">Q", data[ct_pos : ct_pos + 8])[0]
-                else:
-                    pos = idx + 4
-                    continue
-            except struct.error:
-                pos = idx + 4
-                continue
-            if ct_val == 0:
-                # Unset / epoch-0 means not recorded.
-                pos = idx + 4
-                continue
-            return _MP4_EPOCH + timedelta(seconds=ct_val)
-        return None
+        try:
+            with open(file_path, "rb") as handle:
+                file_size = os.fstat(handle.fileno()).st_size
+                magic = handle.read(4)
+                if magic in (_EBML_MAGIC, b"RIFF"):
+                    return None
+                seconds = _mvhd_creation_seconds(handle, file_size)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Could not read the movie header of %s, so its date falls back "
+                "to the file's own: %s",
+                file_path,
+                exc,
+            )
+            return None
+        if seconds is None:
+            return None
+        try:
+            return _MP4_EPOCH + timedelta(seconds=seconds)
+        except OverflowError:
+            logger.warning(
+                "The movie header of %s records an impossible time (%d s), so "
+                "its date falls back to the file's own.",
+                file_path,
+                seconds,
+            )
+            return None
 
     @staticmethod
     def read_first_video_frame_bgr(file_path: str) -> Optional[np.ndarray]:

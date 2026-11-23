@@ -693,7 +693,7 @@ def no_test_opens_a_comfyui_socket(monkeypatch):
 
     # Nor does opening a graph with PixlStash nodes ask it for a Load Image's
     # file (`_input_file_sha`): it answers as a ComfyUI without the file.
-    def no_input_file(base_url, entry):
+    def no_input_file(base_url, entry, dest_dir):
         raise HTTPException(status_code=404, detail="test-no-comfyui")
 
     monkeypatch.setattr(workflows_routes, "_download_comfyui_image", no_input_file)

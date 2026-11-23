@@ -756,7 +756,7 @@ def test_full_hash_mismatch_does_not_restore_from_the_scrapheap(
 
 
 def test_staging_and_comfy_batches_keep_sampled_collisions_distinct(
-    owner_server, monkeypatch
+    owner_server, monkeypatch, tmp_path
 ):
     srv, client = owner_server
     first = _bmp_bytes((40, 50, 60))
@@ -774,20 +774,34 @@ def test_staging_and_comfy_batches_keep_sampled_collisions_distinct(
 
     monkeypatch.setattr(
         ImageUtils,
-        "calculate_hash_from_bytes",
-        staticmethod(lambda _data: "forced-comfy-collision"),
+        "calculate_hash_from_file_path",
+        staticmethod(lambda _path: "forced-comfy-collision"),
     )
-    third = _bmp_bytes((70, 80, 90))
-    fourth = _bmp_bytes((90, 80, 70))
-    new_ids, duplicate_ids = _import_comfyui_outputs(
-        srv, [(third, ".bmp"), (fourth, ".bmp")]
-    )
+    third = tmp_path / "test-third.bmp"
+    third.write_bytes(_bmp_bytes((70, 80, 90)))
+    fourth = tmp_path / "test-fourth.bmp"
+    fourth.write_bytes(_bmp_bytes((90, 80, 70)))
+    outputs = [(str(third), ".bmp"), (str(fourth), ".bmp")]
+    new_ids, duplicate_ids = _import_comfyui_outputs(srv, outputs)
     assert len(new_ids) == 2
     assert duplicate_ids == []
 
-    repeated_new, repeated_duplicates = _import_comfyui_outputs(
-        srv, [(third, ".bmp"), (fourth, ".bmp")]
+    # A generated picture has no file name of its own: the name it was
+    # fetched under is not recorded as one.
+    made = srv.vault.db.run_immediate_read_task(
+        lambda session: session.exec(
+            select(Picture).where(Picture.id.in_(new_ids))
+        ).all()
     )
+    assert [pic.original_file_name for pic in made] == [None, None]
+    published = set()
+    for pic in made:
+        stored = os.path.join(srv.vault.image_root, *pic.file_path.split("/"))
+        with open(stored, "rb") as handle:
+            published.add(handle.read())
+    assert published == {third.read_bytes(), fourth.read_bytes()}
+
+    repeated_new, repeated_duplicates = _import_comfyui_outputs(srv, outputs)
     assert repeated_new == []
     assert sorted(repeated_duplicates) == sorted(new_ids)
 
