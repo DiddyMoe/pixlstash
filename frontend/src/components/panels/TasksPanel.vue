@@ -2,6 +2,25 @@
   <div ref="root" class="tm" @focusout="onFocusOut">
     <!-- One root, but no box of its own (`display: contents`): the rows are
          the popover body's own flex children, so its gap spaces them. -->
+    <!-- A task worker that stopped while the backend means to run: first,
+         since the work queued for it is held up until a new one starts. -->
+    <div
+      v-if="laneNotice"
+      class="tm-lane-notice"
+      role="status"
+      data-testid="tm-lane-notice"
+    >
+      <v-icon size="16" class="tm-lane-notice-icon" aria-hidden="true">
+        mdi-alert-outline
+      </v-icon>
+      <div class="tm-lane-notice-body">
+        <p class="tm-lane-notice-title">Background work is held up</p>
+        <p class="tm-lane-notice-text">{{ laneNotice.text }}</p>
+        <p v-if="laneNotice.error" class="tm-lane-notice-error">
+          {{ laneNotice.error }}
+        </p>
+      </div>
+    </div>
     <!-- A finished run is not an active task, and the panel is not empty with
          one in it either: the idle line gives way. -->
     <div
@@ -841,6 +860,48 @@ function onFocusOut(event) {
 }
 
 const tasksStore = useTasksStore();
+
+// ── A task worker that stopped ────────────────────────────────────────────────
+//
+// The poll's `lanes` (the owner's alone): `degraded` while the backend means to
+// run and a worker of its has exited. What was queued for that worker waits
+// until the next task queued brings a new one up. Null when every worker is
+// there, or the server does not say.
+function plural(count, one, many) {
+  return count === 1 ? `1 ${one}` : `${count} ${many}`;
+}
+
+const laneNotice = computed(() => {
+  const lanes = tasksStore.lanes;
+  if (!lanes?.degraded) return null;
+  const sentences = [];
+  const gpu = lanes.gpu;
+  if (gpu && gpu.alive < gpu.total) {
+    sentences.push(
+      gpu.queued
+        ? `The GPU worker stopped unexpectedly, and ${plural(gpu.queued, "GPU task waits", "GPU tasks wait")} for it.`
+        : "The GPU worker stopped unexpectedly.",
+    );
+  }
+  const cpu = lanes.cpu;
+  if (cpu && cpu.alive === 0) {
+    sentences.push(
+      cpu.queued
+        ? `The CPU workers stopped unexpectedly, and ${plural(cpu.queued, "task waits", "tasks wait")} for them.`
+        : "The CPU workers stopped unexpectedly.",
+    );
+  } else if (cpu && cpu.alive < cpu.total) {
+    sentences.push(
+      `${cpu.total - cpu.alive} of ${cpu.total} CPU workers stopped unexpectedly; the rest carry on.`,
+    );
+  }
+  sentences.push("A new worker starts when the next task is queued.");
+  const failure = lanes.last_failure;
+  return {
+    text: sentences.join(" "),
+    error: failure?.error ? `Last error: ${failure.error}` : "",
+  };
+});
 
 // ── The GPU queue (VRAM orchestration) ────────────────────────────────────────
 //
@@ -1837,6 +1898,50 @@ const tmSystemItems = computed(() => {
   color: rgba(var(--v-theme-on-surface), 0.4);
   font-style: italic;
   padding: var(--space-4) 0 var(--space-2);
+}
+
+/* A stopped task worker, in the app's notice shape (ComfyuiExposureNotice.vue):
+   the glyph and the rail carry the warning hue, the sentences stay text. Sized
+   to the panel's own rows. */
+.tm-lane-notice {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid rgb(var(--v-theme-border));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-surface-warning));
+  border-radius: var(--radius-md);
+  background: rgba(var(--v-theme-on-surface), 0.04);
+}
+
+.tm-lane-notice-icon {
+  color: rgb(var(--v-theme-surface-warning));
+}
+
+.tm-lane-notice-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.tm-lane-notice-body p {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+.tm-lane-notice-title {
+  font-weight: var(--weight-semibold);
+}
+
+.tm-lane-notice-text,
+.tm-lane-notice-error {
+  color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
+}
+
+.tm-lane-notice-error {
+  overflow-wrap: anywhere;
 }
 
 .tm-worker-list {

@@ -138,6 +138,10 @@ export const useTasksStore = defineStore("tasks", () => {
   // The GPU's state as the poll reports it (`resources`), or null when the
   // backend does not send it (an older server, or a read-only session).
   const resources = ref(null);
+  // Whether the backend's task workers are there to run queued work (`lanes`):
+  // how many are alive per lane, how much waits, the last worker failure. Sent
+  // to the owner only; null for anyone else and on an older server.
+  const lanes = ref(null);
 
   /**
    * Stop one run in flight and no other, whichever tab or tool started it:
@@ -840,6 +844,7 @@ export const useTasksStore = defineStore("tasks", () => {
         Array.isArray(progress?.downloads) ? progress.downloads : [],
       );
       resources.value = progress?.resources ?? null;
+      lanes.value = progress?.lanes ?? null;
       noteClearPhases(resources.value?.leases ?? []);
       const now = Date.now() / 1000;
       nowSeconds.value = now;
@@ -946,6 +951,7 @@ export const useTasksStore = defineStore("tasks", () => {
     offersSeen.clear();
     finishedPolled = false;
     resources.value = null;
+    lanes.value = null;
     seenClearPhase.clear();
     modelDownloads.value = [];
     seenDownloadStatus.clear();
@@ -998,6 +1004,8 @@ export const useTasksStore = defineStore("tasks", () => {
     freeComfyuiCache,
     quitComfyuiFor,
     comfyuiHost,
+    // task worker health (owner only)
+    lanes,
     // transient progress (the grid's sort/search wait)
     transientProgress,
     clearTransientProgress,

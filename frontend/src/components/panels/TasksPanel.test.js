@@ -1919,3 +1919,96 @@ describe("clearing ComfyUI's memory from Tasks", () => {
     expect(wrapper.find('[data-testid="tm-comfy-host"]').exists()).toBe(false);
   });
 });
+
+// `lanes` on the poll: whether the backend's task workers are there to run what
+// is queued (the owner's alone).
+function lanesAnswer(over = {}) {
+  return {
+    running: true,
+    degraded: false,
+    last_failure: null,
+    waiting_for_gpu_memory: 0,
+    cpu: { alive: 2, total: 2, restarts: 0, queued: 0 },
+    gpu: { alive: 1, total: 1, restarts: 0, queued: 0 },
+    ...over,
+  };
+}
+
+describe("a task worker that stopped", () => {
+  function noticeOf(lanes) {
+    useTasksStore().lanes = lanes;
+    return mount(TasksPanel, globalOpts).find('[data-testid="tm-lane-notice"]');
+  }
+
+  it("says the GPU work is held up, how much waits, and what went wrong", () => {
+    const notice = noticeOf(
+      lanesAnswer({
+        degraded: true,
+        last_failure: {
+          worker: "test-runner-gpu",
+          error: "ValueError: test-broken-item",
+          at: "2026-01-01T00:00:00+00:00",
+        },
+        gpu: { alive: 0, total: 1, restarts: 0, queued: 3 },
+      }),
+    );
+    expect(notice.exists()).toBe(true);
+    expect(notice.attributes("role")).toBe("status");
+    expect(notice.find(".tm-lane-notice-title").text()).toBe(
+      "Background work is held up",
+    );
+    expect(notice.find(".tm-lane-notice-text").text()).toBe(
+      "The GPU worker stopped unexpectedly, and 3 GPU tasks wait for it. " +
+        "A new worker starts when the next task is queued.",
+    );
+    expect(notice.find(".tm-lane-notice-error").text()).toBe(
+      "Last error: ValueError: test-broken-item",
+    );
+  });
+
+  it("says the CPU work waits only once every CPU worker has stopped", () => {
+    expect(
+      noticeOf(
+        lanesAnswer({
+          degraded: true,
+          cpu: { alive: 0, total: 2, restarts: 1, queued: 1 },
+        }),
+      )
+        .find(".tm-lane-notice-text")
+        .text(),
+    ).toBe(
+      "The CPU workers stopped unexpectedly, and 1 task waits for them. " +
+        "A new worker starts when the next task is queued.",
+    );
+    expect(
+      noticeOf(
+        lanesAnswer({
+          degraded: true,
+          cpu: { alive: 1, total: 2, restarts: 0, queued: 4 },
+        }),
+      )
+        .find(".tm-lane-notice-text")
+        .text(),
+    ).toBe(
+      "1 of 2 CPU workers stopped unexpectedly; the rest carry on. " +
+        "A new worker starts when the next task is queued.",
+    );
+  });
+
+  it("says nothing while every worker is there, after a stop, or on a server that does not say", () => {
+    // Replaced workers are counted, not reported: nothing is held up.
+    const replaced = lanesAnswer({
+      last_failure: { worker: "test-runner-gpu", error: "ValueError: x", at: "" },
+      gpu: { alive: 1, total: 1, restarts: 2, queued: 0 },
+    });
+    expect(noticeOf(replaced).exists()).toBe(false);
+    // Stopped on purpose (shutting down): no worker is meant to be there.
+    const stopped = lanesAnswer({
+      running: false,
+      cpu: { alive: 0, total: 2, restarts: 0, queued: 0 },
+      gpu: { alive: 0, total: 1, restarts: 0, queued: 0 },
+    });
+    expect(noticeOf(stopped).exists()).toBe(false);
+    expect(noticeOf(null).exists()).toBe(false);
+  });
+});
