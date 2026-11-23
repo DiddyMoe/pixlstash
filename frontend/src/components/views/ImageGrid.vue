@@ -7624,8 +7624,14 @@ function resetThumbnailState() {
   }
 }
 
+// The length as well as the list: while a view streams in, each batch's rows
+// go into the same fetched list in place, and only its length says so.
 watch(
-  [() => expandedStackIds.value, () => lastFetchedGridImages.value],
+  [
+    () => expandedStackIds.value,
+    () => lastFetchedGridImages.value,
+    () => lastFetchedGridImages.value.length,
+  ],
   () => {
     emitStackStats();
   },

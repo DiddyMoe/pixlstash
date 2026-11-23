@@ -1321,34 +1321,39 @@ export function useGridFetch(
           };
         }
 
-        // Splice raw picture metadata into the placeholder grid at `offset`,
-        // preserving thumbnail/face data for cells already loaded.
+        // Write raw picture metadata into the placeholder grid at `offset`,
+        // preserving thumbnail/face data for cells already loaded. Each row
+        // replaces the cell at its own index, in place, so a batch costs its
+        // own rows rather than a copy of the whole grid; nothing shifts. The
+        // write reaches what reads the grid's rows, not a watcher of the grid
+        // array itself, which fires only when the array is replaced. Returns
+        // the rows written.
         const splicePictures = (pictures, offset) => {
-          if (!pictures.length) return;
-          const grid = allGridImages.value.slice();
+          const grid = allGridImages.value;
+          const written = [];
           for (let i = 0; i < pictures.length; i++) {
             const idx = offset + i;
-            if (idx < grid.length) {
-              const pic = pictures[i];
-              const existing = grid[idx];
-              grid[idx] = {
-                ...pic,
-                idx,
-                thumbnail: existing?.thumbnail ?? null,
-                faces: existing?.faces ?? [],
-                penalised_tags: existing?.penalised_tags ?? [],
-                thumbnail_width:
-                  pic.thumbnail_width ?? existing?.thumbnail_width,
-                thumbnail_height:
-                  pic.thumbnail_height ?? existing?.thumbnail_height,
-                square_crop_x: pic.square_crop_x ?? existing?.square_crop_x,
-                square_crop_y: pic.square_crop_y ?? existing?.square_crop_y,
-                square_crop_side:
-                  pic.square_crop_side ?? existing?.square_crop_side,
-              };
-            }
+            if (idx >= grid.length) break;
+            const pic = pictures[i];
+            const existing = grid[idx];
+            const row = {
+              ...pic,
+              idx,
+              thumbnail: existing?.thumbnail ?? null,
+              faces: existing?.faces ?? [],
+              penalised_tags: existing?.penalised_tags ?? [],
+              thumbnail_width: pic.thumbnail_width ?? existing?.thumbnail_width,
+              thumbnail_height:
+                pic.thumbnail_height ?? existing?.thumbnail_height,
+              square_crop_x: pic.square_crop_x ?? existing?.square_crop_x,
+              square_crop_y: pic.square_crop_y ?? existing?.square_crop_y,
+              square_crop_side:
+                pic.square_crop_side ?? existing?.square_crop_side,
+            };
+            grid[idx] = row;
+            written.push(row);
           }
-          allGridImages.value = grid;
+          return written;
         };
 
         // 1. Fast total count - single indexed SQL query.
@@ -1394,6 +1399,7 @@ export function useGridFetch(
           id: null,
           idx: i,
         }));
+        const streamGrid = allGridImages.value;
         if (!fetchStartedWithPreserveScroll) {
           visibleStart.value = 0;
           visibleEnd.value = Math.min(total, windowCount);
@@ -1528,6 +1534,7 @@ export function useGridFetch(
         lastFetchedGridImages.value = allGridImages.value.filter(
           (img) => img && img.id != null,
         );
+        const streamFetched = lastFetchedGridImages.value;
 
         // 4. Background stream: fill remaining items sequentially after first
         // batch is rendered.  Sequential (not parallel) to avoid DB contention
@@ -1549,12 +1556,29 @@ export function useGridFetch(
           const bgNetworkElapsedMs = bgResTimed.elapsedMs;
           const bgUiStartedAt = getNowMs();
           const bgPics = bgResTimed?.body?.pictures ?? [];
-          splicePictures(bgPics, bgOffset);
+          const bgRows = splicePictures(bgPics, bgOffset);
           updateVisibleThumbnails();
           // Keep lastFetchedGridImages current so deletes during streaming work.
-          lastFetchedGridImages.value = allGridImages.value.filter(
-            (img) => img && img.id != null,
-          );
+          // While both lists are still the ones this load wrote, the batch's
+          // rows go in ahead of the early tail's, the only rows already past
+          // them. Once anything else has replaced either list (a delete, a
+          // re-score, a stack toggle), the whole grid is read again instead.
+          if (
+            allGridImages.value === streamGrid &&
+            lastFetchedGridImages.value === streamFetched
+          ) {
+            let at = streamFetched.length;
+            while (at > 0 && streamFetched[at - 1].idx >= bgOffset) at -= 1;
+            streamFetched.splice(
+              at,
+              0,
+              ...bgRows.filter((img) => img.id != null),
+            );
+          } else {
+            lastFetchedGridImages.value = allGridImages.value.filter(
+              (img) => img && img.id != null,
+            );
+          }
           await nextTick();
           const bgUiElapsedMs = Math.max(0, getNowMs() - bgUiStartedAt);
           const bgElapsedMs = bgNetworkElapsedMs + bgUiElapsedMs;

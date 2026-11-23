@@ -2877,17 +2877,41 @@ async function applyAllImagesUpdate() {
   }
 }
 
+async function refreshFromAllImages() {
+  // Don't disturb the DOM while the user is actively typing - the reactive
+  // update to image.value causes a DOM patch that can blur the focused input.
+  // Set a flag so we apply the update as soon as editing finishes.
+  if (isAddingTag.value || isDescriptionEditing.value) {
+    pendingAllImagesUpdate.value = true;
+    return;
+  }
+  await applyAllImagesUpdate();
+}
+
+watch(() => allImages.value, refreshFromAllImages);
+
+// A grid streaming in writes each batch's rows into the array it already
+// handed down, so the row of the picture on screen can land without
+// `allImages` being replaced. Re-read the picture when its row turns up, as
+// the replacement would have; a move to another picture is not an arrival.
+// Opened mid-stream, the snapshot frozen on open holds only the rows loaded
+// by then, so while it lacks the picture the live list is searched too; the
+// re-read then re-freezes the snapshot with the row in it.
 watch(
-  () => allImages.value,
-  async () => {
-    // Don't disturb the DOM while the user is actively typing - the reactive
-    // update to image.value causes a DOM patch that can blur the focused input.
-    // Set a flag so we apply the update as soon as editing finishes.
-    if (isAddingTag.value || isDescriptionEditing.value) {
-      pendingAllImagesUpdate.value = true;
-      return;
-    }
-    await applyAllImagesUpdate();
+  [
+    () => (open.value ? (image.value?.id ?? null) : null),
+    () => {
+      if (!open.value || image.value?.id == null) return false;
+      const key = String(image.value.id);
+      if (allImageById.value.has(key)) return true;
+      return (Array.isArray(allImages.value) ? allImages.value : []).some(
+        (item) => item?.id != null && String(item.id) === key,
+      );
+    },
+  ],
+  ([shownId, hasRow], [shownBefore, hadRow]) => {
+    if (shownId == null || String(shownId) !== String(shownBefore)) return;
+    if (hasRow && !hadRow) void refreshFromAllImages();
   },
 );
 

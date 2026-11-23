@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { ref, reactive, effectScope } from "vue";
+import { ref, reactive, effectScope, customRef, toRaw } from "vue";
 import { setActivePinia, createPinia } from "pinia";
 import { useSortStore } from "../stores/useSortStore.js";
 import { useFilterStore } from "../stores/useFilterStore.js";
@@ -1214,4 +1214,176 @@ describe("useGridFetch: a failed batch fails the load", () => {
     expect(outcome.error).toBe(firstError);
     expect(grid.imagesError.value).toBe("test-first-failed");
   });
+});
+
+// The rows a stream request answers with: ids count up from 1 in server order,
+// so a row's id says which slot it belongs in.
+function streamedRows(offset, batchLimit) {
+  return Array.from({ length: batchLimit }, (_, i) => ({ id: offset + i + 1 }));
+}
+
+// A grid list that counts the rows it costs: each row read or written in an
+// array it holds, and each row of an array handed to it whole.
+function countingListRef(ops) {
+  const isRow = (key) => typeof key === "string" && /^\d+$/.test(key);
+  const counted = (rows) =>
+    reactive(
+      new Proxy(rows, {
+        get(target, key, receiver) {
+          if (isRow(key)) ops.rows += 1;
+          return Reflect.get(target, key, receiver);
+        },
+        set(target, key, value, receiver) {
+          if (isRow(key)) ops.rows += 1;
+          return Reflect.set(target, key, value, receiver);
+        },
+      }),
+    );
+  let held = counted([]);
+  return customRef((track, trigger) => ({
+    get() {
+      track();
+      return held;
+    },
+    set(next) {
+      const rows = toRaw(next);
+      ops.rows += rows.length;
+      held = counted(rows);
+      trigger();
+    },
+  }));
+}
+
+describe("useGridFetch: a streamed batch costs what it brings", () => {
+  // 50,000 pictures stream as a 200-row first batch, a 200-row early tail and
+  // ten background batches between them, the first nine of 5,000 rows.
+  const TOTAL = 50_000;
+
+  beforeEach(() => {
+    getPictureCount.mockReset();
+    streamPictures.mockReset();
+    getPictureCount.mockResolvedValue({ count: TOTAL });
+  });
+
+  it("works on each background batch's own rows, not on everything already loaded", async () => {
+    const ops = { rows: 0 };
+    const background = [];
+    streamPictures.mockImplementation((_query, { offset, batchLimit }) => {
+      if (offset > 0 && offset + batchLimit < TOTAL) {
+        background.push({ batchLimit, rowsBefore: ops.rows });
+      }
+      return Promise.resolve({ pictures: streamedRows(offset, batchLimit) });
+    });
+    const { grid, refs } = makeHarness({
+      extraRefs: {
+        allGridImages: countingListRef(ops),
+        lastFetchedGridImages: countingListRef(ops),
+      },
+    });
+
+    await grid.fetchAllGridImages({ force: true });
+
+    // A batch's cost runs from its own request to the next one's.
+    const costs = background
+      .slice(1)
+      .map((next, i) => next.rowsBefore - background[i].rowsBefore);
+    expect(costs).toHaveLength(9);
+    costs.forEach((cost, i) => {
+      expect(cost, `rows per batch: ${costs.join(", ")}`).toBeLessThanOrEqual(
+        8 * background[i].batchLimit,
+      );
+    });
+    const ids = refs.allGridImages.value.map((row) => row.id);
+    expect(ids).toEqual(Array.from({ length: TOTAL }, (_, i) => i + 1));
+    expect(refs.lastFetchedGridImages.value).toHaveLength(TOTAL);
+  });
+});
+
+describe("useGridFetch: the fetched rows stay in step with a streaming grid", () => {
+  // 12,000 pictures stream as a 200-row first batch, a 200-row early tail and
+  // background batches of 5,000, 5,000 and 1,600 rows between them.
+  const TOTAL = 12_000;
+  const TAIL_START = TOTAL - 200;
+
+  beforeEach(() => {
+    getPictureCount.mockReset();
+    streamPictures.mockReset();
+    getPictureCount.mockResolvedValue({ count: TOTAL });
+  });
+
+  // Both lists as plain rows, so a comparison sees each row's fields.
+  function readLists(refs) {
+    const gridRows = toRaw(refs.allGridImages.value).map((row) => toRaw(row));
+    const fetchedRows = toRaw(refs.lastFetchedGridImages.value).map((row) =>
+      toRaw(row),
+    );
+    return { gridRows, fetchedRows };
+  }
+
+  // Streams the view, reading both lists as each later background batch is
+  // asked for (the batch before it fully landed) and once at the end.
+  async function streamReading(refsWrite = () => {}) {
+    const reads = [];
+    let refs = null;
+    streamPictures.mockImplementation((_query, { offset, batchLimit }) => {
+      if (offset > 200 && offset < TAIL_START) {
+        reads.push({ offset, ...readLists(refs) });
+        if (offset === 5200) refsWrite(refs);
+      }
+      return Promise.resolve({ pictures: streamedRows(offset, batchLimit) });
+    });
+    const harness = makeHarness();
+    refs = harness.refs;
+    await harness.grid.fetchAllGridImages({ force: true });
+    reads.push({ offset: null, ...readLists(refs) });
+    return reads;
+  }
+
+  const loaded = (rows) => rows.filter((row) => row && row.id != null);
+
+  it("fills the grid in place in server order, a placeholder in every slot still to come", async () => {
+    const reads = await streamReading();
+
+    const expectedIds = (loadedEnd) =>
+      Array.from({ length: TOTAL }, (_, i) =>
+        i < loadedEnd || i >= TAIL_START ? i + 1 : null,
+      );
+    expect(reads.map((read) => read.offset)).toEqual([5200, 10200, null]);
+    for (const { offset, gridRows, fetchedRows } of reads) {
+      const ids = gridRows.map((row) => row.id);
+      expect(ids).toEqual(expectedIds(offset ?? TOTAL));
+      expect(gridRows.every((row, i) => row.idx === i)).toBe(true);
+      expect(fetchedRows).toEqual(loaded(gridRows));
+    }
+  });
+
+  it.each([
+    [
+      "a delete takes a picture out of both lists",
+      (refs) => {
+        const kept = (row) => row.id !== 3;
+        refs.allGridImages.value = refs.allGridImages.value.filter(kept);
+        refs.lastFetchedGridImages.value =
+          refs.lastFetchedGridImages.value.filter(kept);
+      },
+    ],
+    [
+      "a re-score rewrites a card in the grid alone",
+      (refs) => {
+        const next = refs.allGridImages.value.slice();
+        next[1] = { ...next[1], score: 5 };
+        refs.allGridImages.value = next;
+      },
+    ],
+  ])(
+    "keeps the fetched rows the grid's loaded rows after %s mid-stream",
+    async (_case, write) => {
+      const reads = await streamReading(write);
+
+      expect(reads.map((read) => read.offset)).toEqual([5200, 10200, null]);
+      for (const { gridRows, fetchedRows } of reads) {
+        expect(fetchedRows).toEqual(loaded(gridRows));
+      }
+    },
+  );
 });
