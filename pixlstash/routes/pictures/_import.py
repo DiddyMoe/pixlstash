@@ -849,11 +849,14 @@ def register_routes(router, server):
 
                 if all_imported_ids:
                     _mark_stage("finalizing_import_context")
-                    # Queue face extraction asynchronously - do not block on it.
-                    for pic in new_pictures:
-                        vault.get_worker_future(
-                            TaskType.FACE_EXTRACTION, Picture, pic.id, "faces"
-                        )
+                    # The workers find the new pictures themselves; nothing
+                    # here waits for them. A vault can be without an engine: a
+                    # server not readied at start-up, or a library switch whose
+                    # engine build failed and kept the library open. Its model
+                    # workers stay idle until one is built, so only an import
+                    # that brought new pictures in builds it.
+                    if new_pictures:
+                        vault.ensure_ready()
 
                     def apply_import_context(
                         session,

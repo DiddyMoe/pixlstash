@@ -38,6 +38,7 @@ from pixlstash.db_models import (
 from pixlstash.server import Server
 from pixlstash.services import scrapheap_service
 from pixlstash.services.comfyui_service import _import_comfyui_outputs
+from pixlstash.tasks.missing_face_extraction_finder import MissingFaceExtractionFinder
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from tests.authz_guard import no_spa_fallback  # noqa: F401
 
@@ -822,3 +823,56 @@ def test_restore_announces_exactly_the_pictures_it_restored(owner_server):
         assert emitted == []
     finally:
         srv.vault.notify = real_notify
+
+
+# ---------------------------------------------------------------------------
+# What an import leaves behind for the background workers
+# ---------------------------------------------------------------------------
+
+
+def test_one_shot_import_leaves_no_face_watcher_behind(owner_server, monkeypatch):
+    """Nothing waits on a new picture's faces, so the import registers no
+    watcher for them: one left behind is only collected by an extraction, and
+    an extraction that never comes leaves it in the vault for good. The import
+    still brings the inference engine up on a server that has not built it."""
+    srv, client = owner_server
+    # Registered, or the import is refused; idle, so no extraction collects
+    # what the import left behind.
+    monkeypatch.setattr(MissingFaceExtractionFinder, "find_task", lambda self: None)
+    assert srv.vault._engine is None
+
+    status = _one_shot_import(client, [("test-watch.png", _png_bytes((9, 99, 199)))])
+
+    assert status["imported_count"] == 1, status
+    assert srv.vault._planner_watchers == {}
+    assert srv.vault._engine is not None
+
+
+def test_a_duplicate_only_import_does_not_build_the_engine(owner_server, monkeypatch):
+    """An import that brings nothing new in gives the workers nothing to do, so
+    it does not try to build the inference engine. A library whose engine
+    build failed stays open without one; rebuilding it for every re-import of
+    files already in the library failed those imports."""
+    srv, client = owner_server
+    monkeypatch.setattr(MissingFaceExtractionFinder, "find_task", lambda self: None)
+    builds = []
+
+    def _failing_build():
+        builds.append("build")
+        raise RuntimeError("test-engine-build-failed")
+
+    monkeypatch.setattr(srv.vault, "_create_engine", _failing_build)
+    assert srv.vault._engine is None
+    data = _png_bytes((7, 77, 177))
+
+    _one_shot_import(client, [("test-engineless.png", data)])
+    ids = _picture_ids(srv)
+    assert ids, "the first import's picture row did not commit"
+    builds.clear()
+
+    status = _one_shot_import(client, [("test-engineless.png", data)])
+
+    assert status["status"] == "completed", status
+    assert status["duplicate_count"] == 1, status
+    assert builds == []
+    assert _picture_ids(srv) == ids
