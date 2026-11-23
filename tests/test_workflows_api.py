@@ -18160,9 +18160,10 @@ def test_a_refused_clone_is_logged_by_field_name_never_by_the_text_it_sent(
     The clone body is where a caller's own text reaches a validation error: the
     swaps validator formats the replacement filename into its message, and a
     swap whose value is not a string puts the graph filename, a mapping key the
-    caller chose, into the error's location. The response still tells the caller
-    which entry was refused; the server log keeps only the names the route
-    declares and writes ``*`` for anything else.
+    caller chose, into the error's location. The response tells the caller which
+    entry was refused by its location and writes the formatted value as ``*``;
+    the server log keeps only the names the route declares and writes ``*`` for
+    anything else.
     """
     with caplog.at_level(logging.WARNING, logger="pixlstash.server"):
         not_a_model = _clone(workflow_env, {"fake-a.safetensors": "fake-name.txt"})
@@ -18170,9 +18171,16 @@ def test_a_refused_clone_is_logged_by_field_name_never_by_the_text_it_sent(
 
     assert not_a_model.status_code == 422, not_a_model.text
     assert not_a_string.status_code == 422, not_a_string.text
-    # The response is unchanged: both values were in the errors to be logged.
-    assert "fake-name.txt" in not_a_model.text
-    assert "fake-key.safetensors" in not_a_string.text
+    # Both errors held caller text to be logged: the value in the message, the
+    # key in the location (which the response keeps, as the entry's address).
+    assert not_a_model.json()["detail"][0]["msg"] == (
+        "Value error, '*' is not a model file"
+    )
+    assert not_a_string.json()["detail"][0]["loc"] == [
+        "body",
+        "swaps",
+        "fake-key.safetensors",
+    ]
 
     lines = [
         record.getMessage()
@@ -18188,6 +18196,104 @@ def test_a_refused_clone_is_logged_by_field_name_never_by_the_text_it_sent(
     assert str((("body", "swaps", "*"), "string_type")) in lines[1], lines[1]
     for value in ("fake-a.safetensors", "fake-name.txt", "fake-key.safetensors"):
         assert value not in caplog.text
+
+
+_SENT_VALUE = "fake-secret-value-123"
+
+
+def test_a_refused_request_is_answered_by_field_and_error_never_by_the_value_sent(
+    cloneable,
+):
+    """A 422 names the field and what is wrong with it, not the values submitted.
+
+    Pydantic's error carries the submitted value as ``input`` and a validator's
+    exception as ``ctx``, and a validator can format the value into ``msg`` as
+    the swaps one does, or format a text it built from two values, as the
+    defaults one does with a parameter's address. Every source of a request
+    (body, query, path, an entry of a mapping) is refused by one handler, so
+    each is asked once, beside the same request with a value the route accepts.
+    """
+    refused = {
+        "query": cloneable.owner.get(
+            f"{API}/workflows", params={"include_hidden": _SENT_VALUE}
+        ),
+        "path": cloneable.owner.get(f"{API}/operations/{_SENT_VALUE}"),
+        "body": _clone(cloneable, {_SHELF_FILENAME: _SENT_VALUE}),
+        "entry": _clone(cloneable, {_SHELF_FILENAME: [_SENT_VALUE]}),
+        # Both quote kinds in the address, so its repr escapes the label's "'".
+        "address": cloneable.owner.put(
+            f"{API}/workflows/{RUN_WF}/defaults",
+            json={
+                "defaults": [
+                    {
+                        "slot_label": f"lora:{_SENT_VALUE}'s",
+                        "input_name": 'fake-"strength"',
+                        "value": 1,
+                    }
+                ]
+            },
+        ),
+    }
+    expected = {
+        "query": (
+            ["query", "include_hidden"],
+            "bool_parsing",
+            "Input should be a valid boolean, unable to interpret input",
+        ),
+        "path": (
+            ["path", "operation_id"],
+            "int_parsing",
+            "Input should be a valid integer, unable to parse string as an integer",
+        ),
+        # The validator formats the replacement into its message; the message
+        # still says what is wrong, with the value written as ``*``.
+        "body": (
+            ["body", "swaps"],
+            "value_error",
+            "Value error, '*' is not a model file",
+        ),
+        # The entry is addressed by its key, which is the field's location.
+        "entry": (
+            ["body", "swaps", _SHELF_FILENAME],
+            "string_type",
+            "Input should be a valid string",
+        ),
+        "address": (
+            ["body", "defaults"],
+            "value_error",
+            "Value error, '*/*' names a model or a LoRA, not a parameter.",
+        ),
+    }
+    for source, response in refused.items():
+        assert response.status_code == 422, (source, response.text)
+        assert _SENT_VALUE not in response.text, (source, response.text)
+        detail = response.json()["detail"]
+        assert [set(error) for error in detail] == [{"type", "loc", "msg"}], (
+            source,
+            detail,
+        )
+        error = detail[0]
+        assert (error["loc"], error["type"], error["msg"]) == expected[source], (
+            source,
+            detail,
+        )
+
+    # A value is starred in the spelling ``!r`` gives it (a tab written as
+    # ``\t``), and only as a whole word: ``mod`` leaves ``model`` intact.
+    for value in ("fake-secret\tvalue-123", "mod"):
+        response = _clone(cloneable, {_SHELF_FILENAME: value})
+        assert response.status_code == 422, (value, response.text)
+        assert response.json()["detail"][0]["msg"] == (
+            "Value error, '*' is not a model file"
+        ), (value, response.text)
+
+    # The same requests with values the routes accept get past validation.
+    listed = cloneable.owner.get(f"{API}/workflows", params={"include_hidden": "true"})
+    assert listed.status_code == 200, listed.text
+    missing = cloneable.owner.get(f"{API}/operations/999999999")
+    assert missing.status_code == 404, missing.text
+    cloned = _clone(cloneable, {_SHELF_FILENAME: CLONE_CHECKPOINT})
+    assert cloned.status_code == 201, cloned.text
 
 
 def _plans(env, **sets):
