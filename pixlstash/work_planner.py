@@ -2,11 +2,17 @@ import math
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.task_runner import TaskCancelledError
+from pixlstash.tasks.task_outcome import (
+    LOG_ID_LIMIT,
+    OutcomeSummary,
+    id_sample,
+    read_outcomes,
+)
 
 if TYPE_CHECKING:
     from pixlstash.tasks.task_type import TaskType
@@ -17,13 +23,43 @@ logger = get_logger(__name__)
 
 @dataclass
 class _PassStats:
-    """One finder's burst, from its first submit until the drain fires."""
+    """One finder's burst, from its first submit until the drain fires.
+
+    ``pictures`` counts only what a task reported as succeeded, so a burst
+    that failed every picture reads ``pictures=0`` however many it handled.
+    ``attempted`` counts every picture handed to a finished task. A picture
+    whose task reported no outcome for it (a task that does not report
+    outcomes, or one that raised) is ``unknown``: neither done nor failed.
+    """
 
     started_at: float
     pictures: int = 0
     tasks: int = 0
     gpu_util_sum: float = 0.0
     gpu_samples: int = 0
+    attempted: int = 0
+    failed: int = 0
+    deferred: int = 0
+    unknown: int = 0
+    #: The first few pictures that failed or were deferred, for the log.
+    no_progress_ids: list = field(default_factory=list)
+
+    def record(self, picture_ids, summary: "OutcomeSummary | None") -> None:
+        """Count one finished task's pictures by what it reported for them."""
+        ids = set(picture_ids)
+        self.attempted += len(ids)
+        if summary is None:
+            self.unknown += len(ids)
+            return
+        reported = summary.succeeded | summary.failed | summary.deferred
+        self.pictures += len(summary.succeeded & ids)
+        self.failed += len(summary.failed & ids)
+        self.deferred += len(summary.deferred & ids)
+        self.unknown += len(ids - reported)
+        room = LOG_ID_LIMIT - len(self.no_progress_ids)
+        if room > 0:
+            stuck = (summary.failed | summary.deferred) & ids
+            self.no_progress_ids.extend(id_sample(stuck)[:room])
 
 
 class _PlannerStopping(Exception):
@@ -397,6 +433,7 @@ class WorkPlanner:
         self._wake.set()
 
     def on_task_complete(self, task, error):
+        summary = self._task_outcomes(task, error)
         finder_name = None
         with self._lock:
             finder_name = self._finder_by_task_id.pop(getattr(task, "id", None), None)
@@ -408,11 +445,10 @@ class WorkPlanner:
                 stats = self._pass_stats.get(finder_name)
                 if stats is not None:
                     stats.tasks += 1
-                    if error is None:
-                        picture_ids = (getattr(task, "params", None) or {}).get(
-                            "picture_ids"
-                        ) or []
-                        stats.pictures += len(picture_ids)
+                    picture_ids = (getattr(task, "params", None) or {}).get(
+                        "picture_ids"
+                    ) or []
+                    stats.record(picture_ids, summary)
         if finder_name:
             _GPU_FINDERS = {"MissingTagFinder", "MissingFaceExtractionFinder"}
             if new_inflight == 0 and not is_exhausted and finder_name in _GPU_FINDERS:
@@ -737,6 +773,26 @@ class WorkPlanner:
                 stats.gpu_util_sum += utilization
                 stats.gpu_samples += 1
 
+    @staticmethod
+    def _task_outcomes(task, error) -> "OutcomeSummary | None":
+        """What a finished *task* reported for its pictures, if it reported it.
+
+        ``None`` when it raised, when it does not report outcomes, or when what
+        it reported is malformed (logged): its pictures then count as unknown.
+        """
+        if error is not None:
+            return None
+        try:
+            return read_outcomes(getattr(task, "result", None))
+        except ValueError as exc:
+            logger.error(
+                "WorkPlanner: task %s reported an outcome that is not one, "
+                "counting its pictures as unknown: %s",
+                getattr(task, "id", None),
+                exc,
+            )
+            return None
+
     def _log_pipeline_pass(self, finder_name: str) -> None:
         with self._lock:
             stats = self._pass_stats.pop(finder_name, None)
@@ -748,9 +804,12 @@ class WorkPlanner:
             if stats.gpu_samples
             else "n/a"
         )
+        # Fields are only ever appended to this line: log readers match
+        # ``finder=`` and ``pictures=`` by name.
         logger.info(
             "[PIPELINE_PASS] finder=%s pictures=%d tasks=%d wall_s=%.1f "
-            "img_per_s=%.1f gpu_busy=%s gpu_samples=%d",
+            "img_per_s=%.1f gpu_busy=%s gpu_samples=%d attempted=%d failed=%d "
+            "deferred=%d unknown=%d",
             finder_name,
             stats.pictures,
             stats.tasks,
@@ -758,7 +817,21 @@ class WorkPlanner:
             stats.pictures / wall_s if wall_s > 0 else 0.0,
             gpu_busy,
             stats.gpu_samples,
+            stats.attempted,
+            stats.failed,
+            stats.deferred,
+            stats.unknown,
         )
+        if stats.no_progress_ids:
+            # A pass that keeps reporting the same ids here is retrying the same
+            # pictures without getting anywhere.
+            logger.info(
+                "[PIPELINE_NO_PROGRESS] finder=%s failed=%d deferred=%d ids=%r",
+                finder_name,
+                stats.failed,
+                stats.deferred,
+                stats.no_progress_ids,
+            )
 
     def _notify_all_tasks_complete(self, finder, finder_name: str):
         self._log_pipeline_pass(finder_name)

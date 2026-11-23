@@ -13,6 +13,7 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture, Quality
 from pixlstash.utils.quality.quality_utils import QualityUtils
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.image_processing.media_load import file_read_error
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask
 from pixlstash.utils.sql_chunking import not_in_json
@@ -328,21 +329,34 @@ class QualityTask(BaseTask):
                 # and left every column unset, so the finder re-selected the
                 # same corrupt picture on every sweep (#585). Mark it and move
                 # on: _compute writes sentinel quality values for unloadable
-                # images, and _filter_and_claim skips it once marked.
+                # images, and _filter_and_claim skips it once marked. Only a
+                # file whose bytes can be read is corrupt: one that cannot be
+                # read right now (no file descriptor left, an I/O error) is not
+                # marked, so the other stages still try it; it is held out only
+                # while its location is unmounted.
+                read_error = file_read_error(file_path) if file_path else None
                 registry = getattr(self._db, "unprocessable_images", None)
-                if registry is not None:
+                if registry is not None and read_error is None:
                     registry.mark_unprocessable(
                         getattr(pic, "id", None),
                         str(file_path),
                         reason="quality source could not be decoded",
                     )
-                else:
-                    logger.warning(
-                        "QualityTask: cannot infer metadata for picture id=%s "
-                        "path=%s: file could not be loaded",
-                        pic.id,
-                        pic.file_path,
+                    continue
+                if registry is not None:
+                    registry.mark_unreachable(
+                        getattr(pic, "id", None),
+                        str(file_path),
+                        reason="quality source location is not mounted",
                     )
+                logger.warning(
+                    "QualityTask: cannot infer metadata for picture id=%s path=%s: %s",
+                    pic.id,
+                    pic.file_path,
+                    "file could not be loaded"
+                    if read_error is None
+                    else f"file could not be read ({read_error.strerror}); not marked undecodable",
+                )
                 continue
 
             height, width = img.shape[:2]

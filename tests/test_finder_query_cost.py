@@ -658,7 +658,9 @@ def test_image_embedding_needs_nothing_upstream(tmp_path):
         assert task.params["picture_ids"] == [picture_id]
 
 
-_IMAGE_EMBEDDING_PROBE = "where picture.image_embedding is null"
+# The selection's own column list: the WHERE clause starts with a parenthesis
+# when the OR is followed by the scrapheap and file-path clauses.
+_IMAGE_EMBEDDING_PROBE = "picture.width, picture.height from picture where"
 
 
 def _image_embedding_plan(vault, aesthetic_disabled: bool) -> list[str]:

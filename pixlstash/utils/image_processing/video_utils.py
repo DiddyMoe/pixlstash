@@ -317,51 +317,71 @@ class VideoUtils:
     def read_first_video_frame_bgr(file_path: str) -> Optional[np.ndarray]:
         """Read the first frame of a video file and return it as a BGR numpy array."""
         cap = cv2.VideoCapture(file_path)
-        ret, frame = cap.read()
-        cap.release()
+        try:
+            if not cap.isOpened():
+                return None
+            ret, frame = cap.read()
+        finally:
+            cap.release()
         if ret and frame is not None:
             return frame
         return None
 
     @staticmethod
-    def extract_video_frames(file_path: str, frame_indices=None) -> List[Image.Image]:
+    def _read_indices(cap, indices) -> List[Image.Image]:
+        """Read *indices* from an open capture whose frame count is known.
+
+        Indices outside ``[0, frame count)`` are skipped. A frame the backend
+        cannot seek to or decode is left out rather than failing the rest.
+        """
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frames = []
+        for idx in sorted(set(indices)):
+            if not 0 <= idx < frame_count:
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        return frames
+
+    @staticmethod
+    def _read_first_frame(cap) -> List[Image.Image]:
+        """One sequential read from an open capture, with no seek.
+
+        For a container whose backend reports a frame count of 0 (it does not
+        support the property, as some backends do for WebM and MKV): seeking is
+        meaningless there, but the first frame can still be read.
+        """
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return []
+        return [Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))]
+
+    @staticmethod
+    def extract_video_frames(file_path: str, frame_indices) -> List[Image.Image]:
         """
         Extract frames from a video file and return them as PIL Images.
 
+        When the backend reports no frame count, only the first frame is read,
+        whatever *frame_indices* asks for.
+
         Args:
             file_path: Path to video file.
-            frame_indices: List of specific frame indices to extract (0-based).
-                           If None, all frames are extracted.
+            frame_indices: Frame indices to extract (0-based).
 
         Returns:
-            List of PIL.Image objects.
+            List of PIL.Image objects; empty when the file cannot be opened.
         """
-        frames = []
         cap = cv2.VideoCapture(file_path)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if frame_indices is not None:
-            sorted_indices = sorted(list(set(frame_indices)))
-            for idx in sorted_indices:
-                if 0 <= idx < frame_count:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        pil_img = Image.fromarray(frame_rgb)
-                        frames.append(pil_img)
+        try:
+            if not cap.isOpened():
+                return []
+            if int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) <= 0:
+                return VideoUtils._read_first_frame(cap)
+            return VideoUtils._read_indices(cap, frame_indices)
+        finally:
             cap.release()
-            return frames
-
-        for idx in range(frame_count):
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                continue
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(frame_rgb)
-            frames.append(pil_img)
-        cap.release()
-        return frames
 
     @staticmethod
     def extract_representative_video_frames(
@@ -370,27 +390,28 @@ class VideoUtils:
         """
         Extract ``count`` evenly spaced frames from a video (e.g. start, middle, end).
 
+        The file is opened once. When the backend reports no frame count, the
+        first frame is read sequentially instead.
+
         Args:
             file_path: Path to video file.
             count: Number of frames to extract (evenly spaced).
 
         Returns:
-            List of PIL.Image objects.
+            List of PIL.Image objects; empty when the file cannot be opened.
         """
         cap = cv2.VideoCapture(file_path)
-        if not cap.isOpened():
-            return []
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-
-        if total_frames <= 0:
-            total_frames = 1
-
-        if count == 1:
-            indices = [0]
-        else:
-            step = (total_frames - 1) / (count - 1)
-            indices = sorted(list(set([int(i * step) for i in range(count)])))
-
-        return VideoUtils.extract_video_frames(file_path, frame_indices=indices)
+        try:
+            if not cap.isOpened():
+                return []
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                return VideoUtils._read_first_frame(cap)
+            if count == 1:
+                indices = [0]
+            else:
+                step = (total_frames - 1) / (count - 1)
+                indices = sorted(set(int(i * step) for i in range(count)))
+            return VideoUtils._read_indices(cap, indices)
+        finally:
+            cap.release()

@@ -108,6 +108,7 @@ pixlstash/
 │   ├── base_task.py                  # BaseTask, TaskStatus, QueueType
 │   ├── base_task_finder.py           # BaseTaskFinder + picture claim
 │   ├── task_type.py                  # TaskType enum
+│   ├── task_outcome.py               # Per-picture Outcome/Reason + RetryHold backoff
 │   ├── quality_task.py
 │   ├── description_task.py
 │   ├── text_embedding_task.py
@@ -175,7 +176,7 @@ pixlstash/
 │   ├── rate_limiter.py
 │   ├── comfyui_utilities.py
 │   ├── insightface_batched.py
-│   ├── image_processing/             # image_utils, face_utils, video_utils
+│   ├── image_processing/             # image_utils, face_utils, video_utils, media_load
 │   ├── likeness/                     # likeness_utils, likeness_parameter_utils
 │   ├── quality/                      # quality_utils, smart_score_utils
 │   ├── stack/                        # stack_utils
@@ -1276,6 +1277,7 @@ Snapshot: id, kind, created_at, relative_path,
 - **`BaseTask`** (`tasks/base_task.py`) — abstract task. Declares `task_type`, `queue_type` (CPU/GPU), `priority`, `run()`.
 - **`BaseTaskFinder`** (`tasks/base_task_finder.py`) — queries DB for missing work (leaving suppressed pictures out in the query, ahead of its `LIMIT`: see *Suppressed pictures* below), claims picture IDs, builds task instances, releases claims in `on_task_complete()`.
 - **`TaskType`** (`tasks/task_type.py`) — enum of all task types.
+- **Task outcomes** (`tasks/task_outcome.py`, stdlib only) — what a task reports for *each* picture it was handed: `SUCCEEDED`, `FAILED_RETRYABLE` (the environment failed; the file is presumed healthy), `FAILED_PERMANENT` (the bytes read and cannot be decoded) or `DEFERRED` (not attempted), each with a `Reason`. A task returns them as `result["outcomes"]` (`outcomes_payload`); `read_outcomes` groups them and returns `None` for a task that has not adopted the contract. `RetryHold` is the in-memory capped, jittered exponential backoff a finder puts retryable failures on: the n-th consecutive hold waits a random time in `[d/2, d]`, `d = min(cap, base * 2**n)`. Only `IMAGE_EMBEDDING` reports outcomes so far (see *Image-embedding outcomes* below).
 - **`TaskRunner`** — executes tasks from CPU and GPU queues. CPU queue is multi-threaded (`NUM_WORKERS` per `worker_config.py`); GPU queue is serialised to avoid CUDA contention. Every task that may touch the GPU first asks the VRAM arbiter for a LIGHT lease, and never blocks on one (see *VRAM arbitration* below).
 - **`WorkPlanner`** — polls each finder, respects `*_MAX_INFLIGHT` limits, applies adaptive backoff when no work is found.
 
@@ -1355,6 +1357,22 @@ The write path has to tell the two apart. Blanking a description is how a pictur
 **Re-processing**: setting a work column to `NULL` (e.g. via an Alembic migration) makes the corresponding finder pick the row up on the next pass — this is how data regenerations are triggered.
 
 **An image-embedding preload holds no decoded original (#2748).** `ImageEmbeddingTask._preload_images_task` decodes each picture, takes the perceptual hash from the full frame, and keeps only the image put through CLIP's own first resize (`ClipService.reduce_for_preprocess`: shortest side to 224 px, bicubic; an image that would be enlarged, such as a thin strip, is kept as it is), plus the preprocessed tensor when CLIP is already loaded. The resize that opens the preprocessing then leaves the image as it is, so the tensor is bit-identical to the original's. Before CLIP is loaded the resize is built from open_clip's config without the model (`_unloaded_first_resize`), which `tests/test_image_embedding_worker.py` holds to the transform a real load returns. Preloading 64 × 24 MP photos held 6.6 GB of RSS before, 0.5 GB after.
+
+**Image-embedding outcomes: a failing picture is held back, not reselected.** A failed picture keeps a `NULL` embedding, which is exactly what `fetch_work` selects, so a task that reported only the pictures it changed had its failures picked up again on the next sweep, seconds later. `ImageEmbeddingTask` now reports an outcome for every picture in its batch (*Task outcomes* above), and `MissingImageEmbeddingFinder.on_task_complete` settles each one:
+
+- `SUCCEEDED` and `FAILED_PERMANENT` clear the picture's hold; a success also clears the backend hold.
+- `FAILED_RETRYABLE` puts the picture on the finder's `RetryHold` (2 s doubling to a 300 s cap, jittered), whose active ids join the suppressed ids `fetch_work` excludes. A picture that keeps failing is retried more and more rarely and never marked broken.
+- `FAILED_RETRYABLE` with `BACKEND_UNAVAILABLE` (CLIP will not load) holds the whole finder instead, capped at `BACKEND_HOLD_CAP_S` (60 s): `find_task` builds no batch and decodes nothing until it expires, and the next batch is the probe.
+- `DEFERRED` (cancelled, or never started) changes nothing: the picture stays eligible.
+- A task that raised holds all of its pictures; a cancelled one holds none. A result with no outcomes, or an outcome that is not one, is a bug in the task: it is logged as an error and its pictures are held.
+
+The holds are in memory and per finder, so a restart retries everything. Only `FAILED_PERMANENT` reaches the `UnprocessableImageRegistry`. The stage selects only rows with a `file_path` that are not in the scrapheap (`_eligible_picture_clauses`, the rule tagging applies), written `deleted IS NOT 1` so the planner keeps serving the probe from the two partial missing-column indexes.
+
+**Only a file whose bytes read is called undecodable.** `utils/image_processing/media_load.py` loads a picture's frames and says why it could not: `load_pil_classified` returns a `LoadResult` whose `LoadFailure` is `UNDECODABLE` or `NO_FRAMES` (permanent), `IO_ERROR`, `RESOURCE` or `UNCLASSIFIED`. An `OSError` with an `errno` (`EMFILE`, `EIO`, `ESTALE`) is the machine failing; Pillow's decode errors carry none. A decoder that does not say why it failed (OpenCV returns no frames when it cannot open a file, which includes running out of descriptors) gets one more check, `file_read_error`: the file is undecodable only if its first byte reads. The embedding task maps `IO_ERROR` to `UNREACHABLE` when `file_location_is_unreachable` says the whole location is gone (and marks it unreachable in the registry until it is back) and to `IO_TRANSIENT` otherwise; `RESOURCE` and `UNCLASSIFIED` are retryable, and an unclassified one is logged as an error rather than guessed permanent. `QualityTask` applies the same `file_read_error` check before it marks a file undecodable, but its `_compute` still records an unloadable picture's quality as not measurable (`sharpness = -1`), so it does not retry it. `ThumbnailGenerationTask` marks every existing file it cannot load, because `MissingThumbnailFinder` has no retry hold and an unreadable file would be re-selected on every sweep.
+
+**The preload wait is bounded.** The GPU worker waits for a task's preload at most `ImageEmbeddingTask.PRELOAD_WAIT_S` (300 s), because a decode stuck on a file (a stalled network share, a pathological image) cannot be interrupted, and an unbounded wait held the GPU worker, and with it every GPU task, for as long as it was stuck. The preload runs each picture on a pool of up to `_PRELOAD_WORKERS` (4) daemon decode threads and publishes it as it finishes, so one stuck file holds up only itself. Past the deadline the task embeds what was decoded and reports the rest: a decode still running is `FAILED_RETRYABLE` (`DECODE_TIMEOUT`), so the finder backs off from that file, and a picture whose decode never started is `DEFERRED`. The timeout bounds the wait, not the decode: the thread keeps running. So that a hanging file costs at most one task's decode threads rather than a new set per sweep, the finder asks the completed task which decodes are still running (`finish_preload`) and builds no new batch until they return. A decode that never returns (a hung network mount) therefore stops similarity indexing until it returns or PixlStash restarts; the other GPU tasks carry on. A cancel stops new decodes and is checked once more before inference, so a cancelled task embeds nothing and reports its pictures `DEFERRED` (`CANCELLED`); `on_cancel` waits for the preload at most `_CANCEL_JOIN_S` (10 s) and warns if a decode is still running.
+
+**Progress counts what succeeded.** The planner's `[PIPELINE_PASS]` line counts in `pictures=` only what a task reported `SUCCEEDED`, so a pass that failed every picture reads `pictures=0`. It appends `attempted=`, `failed=`, `deferred=` and `unknown=` (a picture whose task raised or does not report outcomes, neither done nor failed; every finder but this one, for now). Fields are only ever appended to that line, because log readers and `tests/test_pipeline_throughput_verification.py` match `finder=` and `pictures=` by name. A pass with failed or deferred pictures also logs `[PIPELINE_NO_PROGRESS]` with the first few ids, so the same ids reappearing pass after pass is a loop seen in the log.
 
 **A CPU spillover engine runs the configured plugins.** `TagTask` and `DescriptionTask` build their spillover engine with `InferenceEngine.create(device="cpu")` and no settings, then hand it the spilling workflow's `tagger_settings` on every acquire, so a spilled batch runs the owner's tagger, captioner and crop settings rather than the defaults.
 
@@ -2175,7 +2193,7 @@ This rule is enforced by **`tests/test_architecture_guardrails.py::test_services
 | [utils/request_origin.py](../pixlstash/utils/request_origin.py) | `OriginClientMiddleware` — captures the per-tab `X-Client-Id` for the real-time event envelope (see §15) |
 | [utils/comfyui_utilities.py](../pixlstash/utils/comfyui_utilities.py) | ComfyUI workflow parsing |
 | [utils/insightface_batched.py](../pixlstash/utils/insightface_batched.py) | Batched InsightFace wrapper |
-| utils/image_processing/ | `image_utils`, `face_utils`, `video_utils` |
+| utils/image_processing/ | `image_utils`, `face_utils`, `video_utils`, `media_load` (classified frame loading, see §7) |
 | utils/likeness/ | `likeness_utils`, `likeness_parameter_utils` |
 | utils/quality/ | `quality_utils`, `smart_score_utils` |
 | utils/stack/ | `stack_utils` |

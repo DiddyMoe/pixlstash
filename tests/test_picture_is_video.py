@@ -28,6 +28,7 @@ import sqlite3
 import tempfile
 from io import BytesIO
 
+import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -38,6 +39,7 @@ from pixlstash.db_models import Face, Picture
 from pixlstash.server import Server
 from pixlstash.tasks.reference_folder_scan_task import ReferenceFolderScanTask
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.vault import Vault
 from tests.test_migrations import (
     _MIGRATIONS_DIR,
@@ -188,6 +190,111 @@ class TestReferenceFolderScanIsVideo:
         Image.new("RGB", (64, 64), color="blue").save(buf, format="PNG")
         pic = self._build(tmp_path, "still.png", buf.getvalue())
         assert pic.is_video is False
+
+
+def _install_recording_capture(
+    monkeypatch, *, frame_count: int, opened: bool = True, read_raises: bool = False
+) -> dict:
+    """Replace ``cv2.VideoCapture`` with a double that records what is done to it.
+
+    Each frame's pixels hold its index, so a test can tell which frames were
+    read. A real backend reports a frame count of 0 when it does not support
+    the property, which is the case this double makes reachable without a
+    binary fixture.
+    """
+    log = {"opens": 0, "releases": 0, "reads": 0, "seeks": []}
+
+    class _RecordingCapture:
+        def __init__(self, _path):
+            log["opens"] += 1
+            self._pos = 0
+
+        def isOpened(self):
+            return opened
+
+        def get(self, prop):
+            return float(frame_count) if prop == cv2.CAP_PROP_FRAME_COUNT else 0.0
+
+        def set(self, prop, value):
+            if prop == cv2.CAP_PROP_POS_FRAMES:
+                log["seeks"].append(int(value))
+                self._pos = int(value)
+            return True
+
+        def read(self):
+            log["reads"] += 1
+            if read_raises:
+                raise cv2.error("fake-decoder-failure")
+            if frame_count > 0 and self._pos >= frame_count:
+                return False, None
+            frame = np.full((4, 4, 3), self._pos, dtype=np.uint8)
+            self._pos += 1
+            return True, frame
+
+        def release(self):
+            log["releases"] += 1
+
+    monkeypatch.setattr(
+        "pixlstash.utils.image_processing.video_utils.cv2.VideoCapture",
+        _RecordingCapture,
+    )
+    return log
+
+
+_FRAME_READERS = {
+    "representative": lambda path: VideoUtils.extract_representative_video_frames(
+        path, count=3
+    ),
+    "indices": lambda path: VideoUtils.extract_video_frames(path, [0, 1]),
+    "first_bgr": VideoUtils.read_first_video_frame_bgr,
+}
+
+
+class TestVideoFrameSampler:
+    """The video frame helpers every stage samples a clip through."""
+
+    def test_an_unknown_frame_count_still_reads_frame_zero(self, monkeypatch):
+        """A backend reporting 0 frames gets one sequential read, not none."""
+        log = _install_recording_capture(monkeypatch, frame_count=0)
+
+        frames = VideoUtils.extract_representative_video_frames(
+            "/home/me/clips/test-clip.webm", count=3
+        )
+
+        assert [f.getpixel((0, 0)) for f in frames] == [(0, 0, 0)]
+        assert log == {"opens": 1, "releases": 1, "reads": 1, "seeks": []}
+
+    def test_a_known_frame_count_reads_evenly_spaced_frames(self, monkeypatch):
+        log = _install_recording_capture(monkeypatch, frame_count=10)
+
+        frames = VideoUtils.extract_representative_video_frames(
+            "/home/me/clips/test-clip.mp4", count=3
+        )
+
+        assert [f.getpixel((0, 0))[0] for f in frames] == [0, 4, 9]
+        assert log["seeks"] == [0, 4, 9]
+        assert (log["opens"], log["releases"]) == (1, 1)
+
+    @pytest.mark.parametrize("reader", sorted(_FRAME_READERS))
+    def test_a_failing_read_still_releases_the_capture(self, monkeypatch, reader):
+        log = _install_recording_capture(monkeypatch, frame_count=10, read_raises=True)
+
+        with pytest.raises(cv2.error):
+            _FRAME_READERS[reader]("/home/me/clips/test-clip.mp4")
+
+        assert (log["opens"], log["releases"]) == (1, 1)
+
+    @pytest.mark.parametrize("reader", sorted(_FRAME_READERS))
+    def test_a_capture_that_did_not_open_is_released_unread(self, monkeypatch, reader):
+        log = _install_recording_capture(monkeypatch, frame_count=10, opened=False)
+
+        result = _FRAME_READERS[reader]("/home/me/clips/test-clip.mp4")
+
+        if reader == "first_bgr":
+            assert result is None
+        else:
+            assert result == []
+        assert log == {"opens": 1, "releases": 1, "reads": 0, "seeks": []}
 
 
 # ---------------------------------------------------------------------------
