@@ -1,7 +1,6 @@
 <script setup>
 import { nextTick, onBeforeUnmount, ref } from "vue";
 import { API_BASE_URL, isReadOnly } from "../../utils/apiClient";
-import { sleep } from "../../utils/utils";
 import { useTasksStore } from "../../stores/useTasksStore";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useImportArrivalsStore } from "../../stores/useImportArrivalsStore";
@@ -12,24 +11,39 @@ import {
   openStagingSession,
   stageFiles,
 } from "../../api/pictureImport";
-import { errorDetail, errorMessage } from "../../utils/apiError";
+import { errorDetail } from "../../utils/apiError";
+import {
+  abortableSleep,
+  isTransientError,
+  pollUntilSettled,
+} from "../../utils/pollUntilSettled";
 
 // ── Async streaming-staging import (#459) ────────────────────────────────────
-// This component owns the two-phase import over the finalised streaming-staging
-// session contract. It renders nothing itself: what the user sees is the
-// grid's arriving tiles (useImportArrivalsStore → ArrivingTiles, #2512) and,
-// for anyone who navigates away, the Tasks-tab row, both live from the drop.
+// This component owns the upload and the commit of the two-phase import over
+// the streaming-staging session contract. It renders nothing itself: what the
+// user sees is the grid's arriving tiles (useImportArrivalsStore →
+// ArrivingTiles, #2512) and, for anyone who navigates away, the Tasks-tab row,
+// both live from the drop.
 //   Phase A "staging / unsafe":  open a staging session, then STREAM the files
 //     into it batch by batch, each with its arriving tile's key. A beforeunload
 //     guard is armed (leaving now aborts the upload) and the band says so; its
 //     Cancel (and the Tasks row's) discards the not-yet-committed session.
+//     Each batch carries an Idempotency-Key, the same on every resend, so a
+//     batch whose reply was lost is answered from the first copy instead of
+//     being staged twice. Only what a resend can outlast is sent again (no
+//     reply, a timeout, a 5xx, the server still taking the same batch); a
+//     refusal is final, and the staged files are discarded at once.
 //   Safe transition:  once every byte is staged, commit hands off to a
 //     background PictureImportTask; the guard drops and the tiles turn from
-//     "uploading" to "checking".
-//   Phase B "importing / safe":  polled BY staging id. Each file's outcome
-//     (new / duplicate / scrapheaped / failed) marks its tile as it is
-//     decided. Refresh is harmless. The grid refreshes off the backend's
-//     CHANGED_PICTURES / PICTURE_IMPORTED WS broadcast (no results payload).
+//     "uploading" to "checking". A commit whose reply is lost is not cancelled:
+//     the session's status says whether it started.
+//   Phase B "importing / safe":  followed BY staging id by the tasks store
+//     (useTasksStore.followImportRun), not by this component: the grid that
+//     mounts it unmounts on every view switch, and the store also picks the
+//     import back up after a reload. Each file's outcome (new / duplicate /
+//     scrapheaped / failed) marks its tile as it is decided. The grid
+//     refreshes off the backend's CHANGED_PICTURES / PICTURE_IMPORTED WS
+//     broadcast (no results payload).
 //   Scrapheap matches:  a staged file whose content matches a SOFT-DELETED
 //     picture is reported in its own bucket. It is not imported again (that
 //     would put a second copy of every scrapheaped picture back on disk); the
@@ -57,29 +71,6 @@ const tasksStore = useTasksStore();
 const noticeStore = useNoticeStore();
 const arrivals = useImportArrivalsStore();
 
-function plural(count, word) {
-  return `${count} ${word}${count === 1 ? "" : "s"}`;
-}
-
-/**
- * The completion headline, built from the buckets it actually names.
- *
- * The old line asked "did anything import?" and answered "All files were
- * duplicates", which became a lie the moment a third outcome existed: files
- * matching a picture in the Scrapheap are not duplicates: the import restored
- * them, and saying "duplicates" would hide that they are back.
- */
-function summariseImport({ imported, duplicate, scrapheaped }) {
-  const restored = `${plural(scrapheaped, "picture")} from the Scrapheap`;
-  if (imported > 0)
-    return scrapheaped > 0
-      ? `Imported ${plural(imported, "image")}, restored ${restored}`
-      : `Imported ${plural(imported, "image")}`;
-  if (scrapheaped > 0) return `Restored ${restored}`;
-  if (duplicate > 0) return "All files were duplicates";
-  return "Nothing to import";
-}
-
 // Whole-flow gate (Phase A + Phase B) used for re-entrancy.
 const importActive = ref(false);
 
@@ -87,9 +78,11 @@ const importProgress = ref(0);
 const importTotal = ref(0);
 const uploadBytesUploaded = ref(0);
 const uploadBytesTotal = ref(0);
-const importPhase = ref(""); // uploading | processing | done | duplicates | cancelled | error
+const importPhase = ref(""); // uploading | processing | done | duplicates | unknown | cancelled | error
 const cancelImport = ref(false);
 const currentImportController = ref(null);
+// Aborted by a cancel, so a wait between two attempts ends at once.
+let cancelController = null;
 
 // Unique id for the current import: its Tasks-tab row and its arriving group.
 let importRunId = null;
@@ -97,7 +90,6 @@ let importRunId = null;
 let currentStagingId = null;
 // True from the commit request on: the bytes are handed over, cancel is over.
 let committing = false;
-let hideTimerId = null;
 
 // ── beforeunload guard (the hard backstop for the unsafe upload window) ───────
 let guardArmed = false;
@@ -122,19 +114,59 @@ function disarmGuard() {
 const TERMINAL_IMPORT_PHASES = new Set([
   "done",
   "duplicates",
+  "unknown",
   "cancelled",
   "error",
 ]);
 
-function clearHideTimer() {
-  if (hideTimerId !== null) {
-    clearTimeout(hideTimerId);
-    hideTimerId = null;
-  }
+// The longest wait between two sends of one batch, or two commits.
+const MAX_RESEND_WAIT_MS = 8000;
+
+/** The code of a refusal the server explained (`detail: {code, message}`). */
+function refusalCode(err) {
+  return err?.response?.data?.detail?.code ?? null;
+}
+
+/**
+ * The sentence for a failed import request: the server's reason first, then
+ * the transport's message, then `fallback`. The import routes refuse with
+ * `detail: {code, message}`, whose sentence errorDetail does not read.
+ */
+function refusalMessage(err, fallback) {
+  const message = err?.response?.data?.detail?.message;
+  return (
+    errorDetail(err) ||
+    (typeof message === "string" ? message.trim() : "") ||
+    err?.message ||
+    fallback
+  );
+}
+
+/**
+ * Whether a batch the server did not take may be taken if sent again: no
+ * reply, a timeout, a server error, or the server still receiving the same
+ * batch. A refusal (4xx) is the answer to these files, and 507 is the disk,
+ * which a resend does not free.
+ */
+function canResendBatch(err) {
+  if (refusalCode(err) === "batch_in_progress") return true;
+  return isTransientError(err) && err?.response?.status !== 507;
+}
+
+/** A fresh key for one batch; every resend of that batch carries it. */
+function newBatchKey() {
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+  );
+}
+
+/** Full jitter: clients that lost the server together do not return together. */
+function resendWait(attempt) {
+  return Math.random() * Math.min(MAX_RESEND_WAIT_MS, 1000 * 2 ** attempt);
 }
 
 function finalizeCancelled() {
-  clearHideTimer();
   disarmGuard();
   importPhase.value = "cancelled";
   importActive.value = false;
@@ -158,45 +190,233 @@ function finalizeCancelled() {
 }
 
 function finalizeError(message) {
-  clearHideTimer();
   disarmGuard();
   importPhase.value = "error";
   importActive.value = false;
   if (importRunId) {
     // The arriving band holds the reason until it is dismissed; the task row
-    // is the record for anyone who has navigated away from the grid.
+    // is the record for anyone who has navigated away from the grid. The store
+    // takes the row out later, whether or not this importer is still mounted.
     arrivals.fail(importRunId, message);
-    tasksStore.setImportRun(importRunId, {
-      status: "failed",
-      percent: 0,
-      current: importProgress.value,
-      total: importTotal.value,
-      message: `Import failed: ${message}`,
-      label: "Import failed",
-    });
-    const runId = importRunId;
-    hideTimerId = setTimeout(() => {
-      tasksStore.clearImportRun(runId);
-      hideTimerId = null;
-    }, 8000);
+    tasksStore.finishImportRun(
+      importRunId,
+      {
+        status: "failed",
+        percent: 0,
+        current: importProgress.value,
+        total: importTotal.value,
+        message: `Import failed: ${message}`,
+        label: "Import failed",
+      },
+      8000,
+    );
   }
   cancelImport.value = false;
   currentImportController.value = null;
-  if (importRunId) tasksStore.unregisterImportAbort(importRunId);
   emit("import-error", { message });
+}
+
+/**
+ * Discard the staging session of an import that cannot reach its commit, so
+ * its files go now instead of when the server reaps the session.
+ *
+ * @returns {Promise<boolean>} true when the server answers that the import
+ *   has started after all: the session is then followed, not failed.
+ */
+async function abandonStaging() {
+  const stagingId = currentStagingId;
+  if (!stagingId) return false;
+  try {
+    await cancelStaging({ backendUrl: props.backendUrl, stagingId });
+  } catch (err) {
+    if (refusalCode(err) === "import_committed") return true;
+    console.warn(
+      "Could not discard the staging session; the server removes it when it expires",
+      stagingId,
+      err,
+    );
+  }
+  currentStagingId = null;
+  return false;
+}
+
+/** End an import before its commit: discard what was staged, say why. */
+async function failBeforeCommit(message) {
+  if (await abandonStaging()) {
+    await followCommitted(currentStagingId);
+    return;
+  }
+  finalizeError(message);
+}
+
+/**
+ * Hand the staged files to the server's import.
+ *
+ * A refusal (4xx, 507) means nothing started. Any other failure (no reply, a
+ * timeout, a 5xx, a commit already in progress) leaves open whether the
+ * import began, so the session's status decides: still `staging` means it
+ * never started, and it is committed again; any later stage means it did,
+ * and it is followed. A commit whose reply was lost is never cancelled.
+ * Asking the status and waiting to commit again both end on `signal`.
+ *
+ * @param {string} stagingId
+ * @param {number} maxAttempts
+ * @param {AbortSignal} signal - the tasks store's, aborted by stopPolling().
+ * @returns {Promise<{committed: true, stagedCount?: number}
+ *   | {committed: false, error: *} | {committed: false, aborted: true}>}
+ */
+async function commitImport(stagingId, maxAttempts, signal) {
+  for (let attempt = 1; ; attempt++) {
+    let failure;
+    try {
+      const commit = await commitStaging({
+        backendUrl: props.backendUrl,
+        stagingId,
+      });
+      return { committed: true, stagedCount: commit.stagedCount };
+    } catch (err) {
+      if (!err?.isAxiosError) throw err;
+      const status = err.response?.status;
+      if (status === 507 || (status !== 409 && !isTransientError(err))) {
+        return { committed: false, error: err };
+      }
+      failure = err;
+      console.warn(
+        `[IMPORT] Commit of ${stagingId} unanswered (attempt ${attempt}); asking the session`,
+        err,
+      );
+    }
+    const answer = await pollUntilSettled({
+      fetchStatus: (fetchSignal) =>
+        fetchStagingStatus({
+          backendUrl: props.backendUrl,
+          stagingId,
+          signal: fetchSignal,
+        }),
+      isTerminal: (status) => status.stage !== "committing",
+      signal,
+    });
+    if (answer.state === "aborted") return { committed: false, aborted: true };
+    // Gone (404) or past staging: the follower says how it ends.
+    if (answer.state !== "settled" || answer.status.stage !== "staging") {
+      return { committed: true };
+    }
+    if (attempt >= maxAttempts) return { committed: false, error: failure };
+    if (!(await abortableSleep(resendWait(attempt), signal))) {
+      return { committed: false, aborted: true };
+    }
+  }
+}
+
+/**
+ * The tasks store stopped polling (sign-out, teardown) before the commit was
+ * known to have started: nothing follows this import, so its row and tiles go.
+ */
+function endUnfollowedImport(stagingId) {
+  disarmGuard();
+  importActive.value = false;
+  currentStagingId = null;
+  currentImportController.value = null;
+  if (importRunId) {
+    tasksStore.unregisterImportAbort(importRunId);
+    tasksStore.clearImportRun(importRunId);
+    arrivals.dismiss(importRunId);
+  }
+  logImportTrace("Polling stopped before the commit was answered", {
+    stagingId,
+  });
+}
+
+/**
+ * Leave a committed import to the tasks store, which follows it to its end
+ * even after this importer unmounts, and report how it ended.
+ */
+async function followCommitted(stagingId, stagedCount) {
+  // The session is committed; it can no longer be cancelled from the client.
+  committing = true;
+  disarmGuard();
+  currentStagingId = null;
+  const runId = importRunId;
+  tasksStore.unregisterImportAbort(runId);
+  arrivals.markChecking(runId);
+  importTotal.value = stagedCount || importTotal.value;
+  importProgress.value = 0;
+  // The safe transition: the bytes are on the server and leaving is harmless.
+  importPhase.value = "processing";
+
+  const result = await tasksStore.followImportRun({
+    runId,
+    stagingId,
+    backendUrl: props.backendUrl,
+    total: importTotal.value,
+  });
+  currentImportController.value = null;
+  cancelImport.value = false;
+  importActive.value = false;
+
+  if (result.state === "completed") {
+    // There is no per-file results[] - the grid reconciles the new pictures
+    // off the backend's CHANGED_PICTURES / PICTURE_IMPORTED WebSocket
+    // broadcast, which the grid already consumes.
+    const { status } = result;
+    const importedCount = status.importedCount ?? 0;
+    importPhase.value = importedCount === 0 ? "duplicates" : "done";
+    importTotal.value = Math.max(importTotal.value, status.total || 0);
+    importProgress.value = importTotal.value;
+    emit("import-finished", {
+      importedCount,
+      total: importTotal.value,
+      phase: importPhase.value,
+      results: [],
+    });
+    logImportTrace("Import finished", {
+      importedCount,
+      duplicateCount: status.duplicateCount ?? 0,
+      // The third bucket: content that matched a picture in the Scrapheap,
+      // restored instead of imported again.
+      scrapheapedCount: status.scrapheapedCount ?? 0,
+      scrapheapedPictureIds: status.scrapheapedPictureIds ?? [],
+      phase: importPhase.value,
+    });
+  } else if (result.state === "unknown") {
+    // The server no longer knows the import (restarted, expired): what it
+    // imported is kept, so the grid still refreshes, and nothing is a failure.
+    importPhase.value = "unknown";
+    emit("import-finished", {
+      importedCount: null,
+      total: importTotal.value,
+      phase: importPhase.value,
+      results: [],
+    });
+    logImportTrace("Import status unknown", { stagingId });
+  } else if (result.state === "failed") {
+    importPhase.value = "error";
+    const message = result.status.error || "Import failed";
+    emit("import-error", { message });
+    logImportTrace("Import failed", { message });
+  } else if (result.state === "cancelled") {
+    // Committed imports don't cancel client-side; an external cancel is a
+    // terminal, non-error exit.
+    importPhase.value = "cancelled";
+    emit("import-cancelled");
+  }
+  // "aborted": the store stopped following (sign-out, teardown). It has kept
+  // the run for a reload, and there is nothing to report.
 }
 
 // The single client-side abort path, shared by the arriving band's Cancel and
 // the Tasks-tab cancel affordance (via tasksStore.abortImportRun → this handler,
 // registered in startImport). It stops the in-flight upload by aborting the
-// active request controller; the batch loop's cancel checks then unwind cleanly
-// through finalizeCancelled (no error toast). This can only stop the PRE-COMMIT
-// upload - once committed, the import is a background server task the client
-// cannot stop (see the abortable notes in startImport / useTasksStore).
+// active request controller, and any wait before a resend; the batch loop's
+// cancel checks then unwind cleanly through finalizeCancelled (no error
+// toast). This can only stop the PRE-COMMIT upload - once committed, the
+// import is a background server task the client cannot stop (see the
+// abortable notes in startImport / useTasksStore).
 function handleCancelImport() {
   // Once the commit is sent there is nothing a client abort can stop.
   if (!importActive.value || committing) return;
   cancelImport.value = true;
+  cancelController?.abort();
   if (currentImportController.value) {
     try {
       currentImportController.value.abort();
@@ -219,7 +439,6 @@ async function startImport(files, options = {}) {
   if (importActive.value) {
     // Recover from a stale terminal state left by the previous run.
     if (TERMINAL_IMPORT_PHASES.has(importPhase.value)) {
-      clearHideTimer();
       importActive.value = false;
     } else {
       // Said, not swallowed: this importer runs one import at a time, and a
@@ -235,8 +454,8 @@ async function startImport(files, options = {}) {
     }
   }
 
-  clearHideTimer();
   cancelImport.value = false;
+  cancelController = new AbortController();
   currentStagingId = null;
   committing = false;
   // Drop any lingering handler from a previous run before minting a new id.
@@ -259,8 +478,8 @@ async function startImport(files, options = {}) {
   // Make the (otherwise dead) import-abort subsystem live: register the real
   // client-side abort so tasksStore.abortImportRun(runId) actually stops the
   // in-flight upload. Unregistered
-  // on every terminal path (finalizeCancelled / finalizeError / completion) and
-  // on unmount.
+  // on every terminal path (finalizeCancelled / finalizeError / the commit)
+  // and on unmount.
   tasksStore.registerImportAbort(importRunId, () => handleCancelImport());
   importActive.value = true;
   importProgress.value = 0;
@@ -350,9 +569,12 @@ async function startImport(files, options = {}) {
           Math.ceil(batchBytes / (1024 * 1024)) * TIMEOUT_PER_MB_MS,
         );
       const batchIndex = Math.floor(i / BATCH_SIZE) + 1;
+      // One key per batch, sent on every attempt: a resend after a lost reply
+      // is answered from the first copy instead of staging the files twice.
+      const batchKey = newBatchKey();
 
       let ok = false;
-      let lastError = null;
+      let lastMessage = null;
 
       for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         if (cancelImport.value) {
@@ -391,6 +613,7 @@ async function startImport(files, options = {}) {
             stagingId: currentStagingId,
             files: batch,
             keys: batchKeys,
+            idempotencyKey: batchKey,
             signal: controller.signal,
             timeoutMs: batchTimeoutMs,
             onUploadProgress: (progressEvent) => {
@@ -403,6 +626,11 @@ async function startImport(files, options = {}) {
               );
               arrivals.setBytesSent(importRunId, uploadBytesUploaded.value);
               reportUpload();
+              // Every byte is out: the wait now is the server storing the
+              // batch, which the batch timeout bounds. Not a stall.
+              if (progressEvent.total > 0 && loaded >= progressEvent.total) {
+                clearInterval(noProgressTimer);
+              }
             },
           });
           arrivals.markSkipped(
@@ -431,12 +659,12 @@ async function startImport(files, options = {}) {
             finalizeCancelled();
             return;
           }
+          let resend;
           if (isAbort || isTimeout) {
-            lastError = new Error(
-              noProgressAbortFired
-                ? "Upload stalled (no progress)"
-                : "Upload timed out",
-            );
+            resend = true;
+            lastMessage = noProgressAbortFired
+              ? "Upload stalled (no progress)"
+              : "Upload timed out";
             console.warn(
               `[IMPORT] Batch ${batchIndex} aborted (attempt ${attempt}). reason=${
                 noProgressAbortFired
@@ -447,20 +675,31 @@ async function startImport(files, options = {}) {
               }`,
             );
           } else {
-            lastError = err;
+            resend = canResendBatch(err);
+            lastMessage = refusalMessage(err, "Upload failed.");
             console.warn(
-              `[IMPORT] Batch ${batchIndex} failed (attempt ${attempt}):`,
+              `[IMPORT] Batch ${batchIndex} failed (attempt ${attempt}${
+                resend ? "" : ", not resent"
+              }):`,
               err,
             );
           }
-          if (attempt < MAX_RETRIES) {
-            await sleep(1000);
+          if (!resend) break;
+          if (
+            attempt < MAX_RETRIES &&
+            !(await abortableSleep(
+              resendWait(attempt),
+              cancelController.signal,
+            ))
+          ) {
+            finalizeCancelled();
+            return;
           }
         }
       }
 
       if (!ok) {
-        finalizeError(lastError ? lastError.message : "Upload failed.");
+        await failBeforeCommit(lastMessage ?? "Upload failed.");
         return;
       }
 
@@ -478,8 +717,8 @@ async function startImport(files, options = {}) {
 
     // All bytes are staged - commit the SAFE HANDOFF to the background import.
     // From here Cancel has nothing to stop, so neither the band nor the Tasks
-    // row offers it. The leave guard stays armed until the commit returns:
-    // closing the tab mid-commit would strand the staged session.
+    // row offers it. The leave guard stays armed until the commit is known to
+    // have started: closing the tab mid-commit would strand the staged session.
     uploadBytesUploaded.value = uploadBytesTotal.value;
     committing = true;
     arrivals.markChecking(importRunId);
@@ -492,173 +731,37 @@ async function startImport(files, options = {}) {
       label: "Importing pictures",
     });
 
-    let commit;
-    try {
-      commit = await commitStaging({
-        backendUrl: props.backendUrl,
-        stagingId: currentStagingId,
-      });
-    } catch (err) {
-      // Commit is still inside the unsafe window. Surface the
-      // reason (400 empty / face-worker-down, 409 committed, 507 disk) and
-      // discard the session. A 409 means it is already handed off, so leave it.
-      const detail =
-        errorDetail(err) || err?.message || "Import commit failed.";
-      const status = err?.response?.status;
-      if (status !== 409 && currentStagingId) {
-        const stagingId = currentStagingId;
-        cancelStaging({ backendUrl: props.backendUrl, stagingId }).catch((e) =>
-          console.warn("Failed to cancel staging after commit error", e),
-        );
-      }
-      currentStagingId = null;
-      finalizeError(detail);
+    const stagingId = currentStagingId;
+    // The store's signal, not this importer's: a view switch unmounts the
+    // importer and the commit is still settled and handed to the store, but
+    // signing out stops it.
+    const stopSignal = tasksStore.importWorkSignal();
+    const commit = await commitImport(stagingId, MAX_RETRIES, stopSignal);
+    if (commit.aborted || stopSignal.aborted) {
+      endUnfollowedImport(stagingId);
       return;
     }
-
-    // The session is committed; it can no longer be cancelled from the client.
-    disarmGuard();
-    const stagingId = currentStagingId;
-    currentStagingId = null;
-    importTotal.value = commit.stagedCount || files.length;
-    importProgress.value = 0;
-
-    // The safe transition: the bytes are on the server and leaving is harmless.
-    importPhase.value = "processing";
-    tasksStore.setImportRun(importRunId, {
-      status: "running",
-      percent: 0,
-      current: 0,
-      total: importTotal.value,
-      message: "Queued on the server…",
-      label: "Importing pictures",
-    });
-
-    // ── Phase B: poll the staging session by id until the import is done. ──
-    const maxAttempts = 600;
-    const intervalMs = 1000;
-    let attempts = 0;
-    let finalStatus = null;
-    let outcomesSeen = 0;
-
-    while (attempts < maxAttempts) {
-      const st = await fetchStagingStatus({
-        backendUrl: props.backendUrl,
-        stagingId,
-        outcomesFrom: outcomesSeen,
-      });
-      outcomesSeen += st.outcomes.length;
-      arrivals.applyOutcomes(importRunId, st.outcomes);
-
-      const total = st.total || importTotal.value || files.length;
-      const processed = Math.min(st.processed, total);
-      importProgress.value = processed;
-      importTotal.value = Math.max(importTotal.value, total);
-      arrivals.setProgress(importRunId, processed, total);
-
-      const pct = importTotal.value
-        ? Math.min(100, (processed / importTotal.value) * 100)
-        : 0;
-      tasksStore.setImportRun(importRunId, {
-        status: "running",
-        percent: pct,
-        current: processed,
-        total: importTotal.value,
-        message:
-          st.stage === "importing"
-            ? "Checking for duplicates…"
-            : "Queued on the server…",
-        label: "Importing pictures",
-      });
-
-      if (st.stage === "completed") {
-        finalStatus = st;
-        break;
-      }
-      if (st.stage === "failed") {
-        throw new Error(st.error || "Import failed");
-      }
-      if (st.stage === "cancelled") {
-        // Committed imports don't cancel client-side; treat an external cancel
-        // as a terminal, non-error exit.
-        finalizeCancelled();
-        return;
-      }
-
-      await sleep(intervalMs);
-      attempts++;
+    if (!commit.committed) {
+      // Refused before anything started (400 empty / face worker down, 404,
+      // 507 disk): the server put the session back to staging. Discard it.
+      await failBeforeCommit(
+        refusalMessage(commit.error, "Import commit failed."),
+      );
+      return;
     }
-
-    if (!finalStatus) {
-      throw new Error("Import timed out");
-    }
-
-    // Summarise from the terminal status. There is no per-file results[] - the
-    // grid reconciles the new pictures off the backend's CHANGED_PICTURES /
-    // PICTURE_IMPORTED WebSocket broadcast, which the grid already consumes.
-    const importedCount = finalStatus.importedCount ?? 0;
-    const duplicateCount = finalStatus.duplicateCount ?? 0;
-    // The third bucket: content that matched a picture in the Scrapheap. Not
-    // imported again (that would put a second copy back on disk); the backend
-    // restored the picture instead.
-    const scrapheapedCount = finalStatus.scrapheapedCount ?? 0;
-    const scrapheapedPictureIds = finalStatus.scrapheapedPictureIds ?? [];
-
-    importPhase.value = importedCount === 0 ? "duplicates" : "done";
-    arrivals.land(importRunId);
-    importTotal.value = Math.max(importTotal.value, files.length);
-    importProgress.value = importTotal.value;
-    currentImportController.value = null;
-    cancelImport.value = false;
-    importActive.value = false;
-
-    // Punctuate completion on the task row, then let it leave the list.
-    tasksStore.setImportRun(importRunId, {
-      status: "completed",
-      percent: 100,
-      current: importTotal.value,
-      total: importTotal.value,
-      message: summariseImport({
-        imported: importedCount,
-        duplicate: duplicateCount,
-        // Per picture, and only what the server actually restored.
-        scrapheaped: scrapheapedPictureIds.length,
-      }),
-      label: "Importing pictures",
-    });
-    const finishedRunId = importRunId;
-    tasksStore.unregisterImportAbort(finishedRunId);
-    setTimeout(() => tasksStore.clearImportRun(finishedRunId), 2600);
-
-    // The public emit contract is unchanged, but the streaming-staging contract
-    // returns no per-file results - the grid refreshes off the WS broadcast, so
-    // `results` is empty. (Consumers that relied on results[].picture_id, e.g.
-    // SideBar drop-to-set/character association, no longer receive ids here.)
-    emit("import-finished", {
-      importedCount,
-      total: importTotal.value,
-      phase: importPhase.value,
-      results: [],
-    });
-    logImportTrace("Import finished", {
-      importedCount,
-      duplicateCount,
-      scrapheapedCount,
-      scrapheapedPictureIds,
-      phase: importPhase.value,
-    });
+    await followCommitted(stagingId, commit.stagedCount);
   } catch (error) {
     // The server's reason first: opening the session onto a locked set answers
     // 409 with why, and axios's own message says only the status code.
-    const message = errorMessage(error, String(error));
-    finalizeError(message);
+    const message = refusalMessage(error, String(error));
+    if (committing) finalizeError(message);
+    else await failBeforeCommit(message);
     logImportTrace("Import failed", { message });
   }
 }
 
 onBeforeUnmount(() => {
   disarmGuard();
-  clearHideTimer();
   if (importRunId) tasksStore.unregisterImportAbort(importRunId);
 });
 

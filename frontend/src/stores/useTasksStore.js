@@ -7,8 +7,11 @@ import { cancelModelDownload } from "../api/modelDownloads";
 import { formatModelSize } from "../utils/modelShelf";
 import { cancelLease, freeComfyui, runLeaseAnyway } from "../api/resources";
 import { listTrainingJobs, quitComfyuiForTrainingJob } from "../api/training";
+import { fetchStagingStatus } from "../api/pictureImport";
 import { deviceVramBar, runKey, runMatches } from "../utils/gpuMemory";
+import { pollUntilSettled } from "../utils/pollUntilSettled";
 import { gbTenths } from "../utils/trainingPlan";
+import { useImportArrivalsStore } from "./useImportArrivalsStore";
 import { useNoticeStore } from "./useNoticeStore";
 import { useSidebarStore } from "./useSidebarStore";
 
@@ -40,6 +43,128 @@ export function downloadMessage(download) {
 /** Nothing waiting: `transientProgress` when no grid is sorting or searching. */
 function idleTransientProgress() {
   return { visible: false, status: "idle", message: "", percent: 0 };
+}
+
+// The committed imports this tab follows, kept for a reload of the tab
+// (sessionStorage does not outlive a closed tab).
+const IMPORT_RUNS_STORAGE_KEY = "pixlstash:importRuns";
+// How long a finished import's row stays in the list.
+const IMPORT_COMPLETED_ROW_MS = 2600;
+const IMPORT_ENDED_ROW_MS = 8000;
+// The server inserts every new picture in one step after checking the last
+// file, so "all files checked" is not "done": 100% waits for the end.
+const IMPORT_PERCENT_BEFORE_END = 95;
+const IMPORT_STILL_WORKING_MS = 10 * 60 * 1000;
+
+function plural(count, word) {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * The completion headline, built from the buckets it actually names.
+ *
+ * The old line asked "did anything import?" and answered "All files were
+ * duplicates", which became a lie the moment a third outcome existed: files
+ * matching a picture in the Scrapheap are not duplicates: the import restored
+ * them, and saying "duplicates" would hide that they are back.
+ */
+export function summariseImport({ imported, duplicate, scrapheaped }) {
+  const restored = `${plural(scrapheaped, "picture")} from the Scrapheap`;
+  if (imported > 0)
+    return scrapheaped > 0
+      ? `Imported ${plural(imported, "image")}, restored ${restored}`
+      : `Imported ${plural(imported, "image")}`;
+  if (scrapheaped > 0) return `Restored ${restored}`;
+  if (duplicate > 0) return "All files were duplicates";
+  return "Nothing to import";
+}
+
+function isImportOver(status) {
+  return ["completed", "failed", "cancelled"].includes(status.stage);
+}
+
+/** Changes whenever the server import moves on. */
+function importProgressKey(status) {
+  return `${status.stage}|${status.phase}|${status.processed}`;
+}
+
+/**
+ * The row's message and percent for what the server says it is doing. A
+ * server without `phase` reads as it always did.
+ */
+function importPhaseRow(status, processed, total) {
+  const share = total
+    ? Math.min(IMPORT_PERCENT_BEFORE_END, (processed / total) * 100)
+    : 0;
+  switch (status.phase) {
+    case "queued":
+      return { message: "Waiting for the importer…", percent: 0 };
+    case "processing":
+      return {
+        message: `Checking pictures (${processed} of ${total})…`,
+        percent: share,
+      };
+    case "persisting":
+      return {
+        message: "Adding pictures to the library…",
+        percent: IMPORT_PERCENT_BEFORE_END,
+      };
+    case "finalizing":
+      return { message: "Finishing up…", percent: IMPORT_PERCENT_BEFORE_END };
+    default:
+      return {
+        message:
+          status.stage === "importing"
+            ? "Checking for duplicates…"
+            : "Queued on the server…",
+        percent: share,
+      };
+  }
+}
+
+function readPersistedImportRuns() {
+  try {
+    const raw = window.sessionStorage.getItem(IMPORT_RUNS_STORAGE_KEY);
+    const runs = raw ? JSON.parse(raw) : [];
+    return Array.isArray(runs) ? runs : [];
+  } catch (e) {
+    console.warn(
+      "tasks: could not read the imports to reconnect to; a reload will not pick them up",
+      e,
+    );
+    return [];
+  }
+}
+
+function writePersistedImportRuns(runs) {
+  try {
+    if (runs.length) {
+      window.sessionStorage.setItem(
+        IMPORT_RUNS_STORAGE_KEY,
+        JSON.stringify(runs),
+      );
+    } else {
+      window.sessionStorage.removeItem(IMPORT_RUNS_STORAGE_KEY);
+    }
+  } catch (e) {
+    console.warn(
+      "tasks: could not save the running imports; a reload will not reconnect to them",
+      e,
+    );
+  }
+}
+
+function rememberImportRun(run) {
+  const others = readPersistedImportRuns().filter(
+    (entry) => entry?.stagingId !== run.stagingId,
+  );
+  writePersistedImportRuns([...others, run]);
+}
+
+function forgetImportRun(stagingId) {
+  const runs = readPersistedImportRuns();
+  const kept = runs.filter((entry) => entry?.stagingId !== stagingId);
+  if (kept.length !== runs.length) writePersistedImportRuns(kept);
 }
 
 /**
@@ -404,11 +529,12 @@ export const useTasksStore = defineStore("tasks", () => {
   }
 
   // ── Import run state (frontend-driven, #459) ──────────────────────────────
-  // The async import (ImageImporter) surfaces its server-side Phase B here as a
-  // determinate task row: the two-phase dialog auto-hides at the safe
-  // transition and the import continues as just another entry in the Tasks
-  // tab. runId → { status, percent, message, label,
-  // current, total, abortable }.
+  // The async import is one task row from the drop on. ImageImporter writes it
+  // while it uploads and commits; once committed, followImportRun (below)
+  // follows the server import and writes it until the end. runId → { status,
+  // percent, message, label, current, total, abortable }. `status` is
+  // running, completed, failed, or unknown (the server no longer knows the
+  // import, which is not a failure).
   //
   // `abortable` is the honest gate for the Tasks-tab cancel affordance: it is
   // true ONLY while a client-side abort can genuinely act (the pre-commit upload
@@ -435,6 +561,8 @@ export const useTasksStore = defineStore("tasks", () => {
   }
 
   function clearImportRun(runId) {
+    clearTimeout(importRowTimers.get(runId));
+    importRowTimers.delete(runId);
     if (runId && runId in importRuns) delete importRuns[runId];
   }
 
@@ -453,13 +581,259 @@ export const useTasksStore = defineStore("tasks", () => {
     if (handler) handler();
   }
 
+  // runId → the timer that takes an ended run's row out of the list.
+  const importRowTimers = new Map();
+
+  /**
+   * Show a run's last row, then take it out of the list after `rowMs`. The
+   * store owns the timer, so the row leaves even when the importer that
+   * started the run is gone.
+   */
+  function finishImportRun(runId, run, rowMs) {
+    if (!runId) return;
+    unregisterImportAbort(runId);
+    setImportRun(runId, run);
+    clearTimeout(importRowTimers.get(runId));
+    importRowTimers.set(
+      runId,
+      setTimeout(() => clearImportRun(runId), rowMs),
+    );
+  }
+
+  // ── Following a committed import ──────────────────────────────────────────
+  // Once the bytes are committed the import is a server task, and the store
+  // follows it, not the importer that uploaded it: the store outlives the grid
+  // (which unmounts on every view switch), and two importers asking for one
+  // session get one follower. The run is also kept in sessionStorage, and
+  // startPolling() reconnects to it after a reload of the tab.
+  //
+  // stagingId → { promise, controller, settled }. An ended follower stays, so
+  // asking again returns how it ended instead of reopening a finished run.
+  const importFollowers = new Map();
+
+  async function runImportFollower({
+    runId,
+    stagingId,
+    backendUrl,
+    total,
+    signal,
+  }) {
+    const arrivals = useImportArrivalsStore();
+    let expected = Number(total) || 0;
+    let outcomesSeen = 0;
+    rememberImportRun({ runId, stagingId, backendUrl, total: expected });
+    setImportRun(runId, {
+      status: "running",
+      current: 0,
+      total: expected,
+      message: "Queued on the server…",
+      label: "Importing pictures",
+    });
+
+    const fetchStatus = async (fetchSignal) => {
+      const status = await fetchStagingStatus({
+        backendUrl,
+        stagingId,
+        outcomesFrom: outcomesSeen,
+        signal: fetchSignal,
+      });
+      outcomesSeen += status.outcomes.length;
+      arrivals.applyOutcomes(runId, status.outcomes);
+      return status;
+    };
+    const showProgress = (status, { idleMs }) => {
+      const runTotal = status.total || expected;
+      const processed = Math.min(status.processed, runTotal);
+      expected = Math.max(expected, runTotal);
+      arrivals.setProgress(runId, processed, runTotal);
+      const row = importPhaseRow(status, processed, expected);
+      const queued = status.phase === "queued";
+      setImportRun(runId, {
+        status: "running",
+        percent: row.percent,
+        current: processed,
+        // A queued import has checked nothing yet, so no "0 / N" count.
+        total: queued ? 0 : expected,
+        message:
+          !queued && idleMs >= IMPORT_STILL_WORKING_MS
+            ? "Still working on the server; no progress for 10 min"
+            : row.message,
+        label: "Importing pictures",
+      });
+    };
+    const showReconnecting = () => {
+      setImportRun(runId, {
+        ...importRuns[runId],
+        status: "running",
+        message: "Reconnecting to the server…",
+      });
+    };
+
+    const result = await pollUntilSettled({
+      fetchStatus,
+      isTerminal: isImportOver,
+      progressOf: importProgressKey,
+      onStatus: showProgress,
+      onTransientError: showReconnecting,
+      signal,
+    });
+    if (result.state === "aborted") return result;
+    forgetImportRun(stagingId);
+
+    if (result.state === "unknown") {
+      // Restarted, expired, or the library changed: what was imported is
+      // kept, and nothing says the rest failed.
+      console.warn(
+        "tasks: the server no longer knows import",
+        stagingId,
+        result.error,
+      );
+      arrivals.dismiss(runId);
+      finishImportRun(
+        runId,
+        {
+          ...importRuns[runId],
+          status: "unknown",
+          message:
+            "Lost track of this import (the server restarted or the session expired). Pictures already imported are kept.",
+          label: "Import status unknown",
+        },
+        IMPORT_ENDED_ROW_MS,
+      );
+      return { state: "unknown", error: result.error };
+    }
+
+    const { status } = result;
+    if (status.stage === "completed") {
+      arrivals.land(runId);
+      finishImportRun(
+        runId,
+        {
+          status: "completed",
+          percent: 100,
+          current: expected,
+          total: expected,
+          message: summariseImport({
+            imported: status.importedCount ?? 0,
+            duplicate: status.duplicateCount ?? 0,
+            // Per picture, and only what the server actually restored.
+            scrapheaped: status.scrapheapedPictureIds.length,
+          }),
+          label: "Importing pictures",
+        },
+        IMPORT_COMPLETED_ROW_MS,
+      );
+      return { state: "completed", status };
+    }
+    if (status.stage === "failed") {
+      const message = status.error || "Import failed";
+      arrivals.fail(runId, message);
+      finishImportRun(
+        runId,
+        {
+          status: "failed",
+          percent: 0,
+          current: importRuns[runId]?.current ?? 0,
+          total: expected,
+          message: `Import failed: ${message}`,
+          label: "Import failed",
+        },
+        IMPORT_ENDED_ROW_MS,
+      );
+      return { state: "failed", status };
+    }
+    // Cancelled on the server: nothing to report, the row and tiles leave.
+    unregisterImportAbort(runId);
+    clearImportRun(runId);
+    arrivals.dismiss(runId);
+    return { state: "cancelled", status };
+  }
+
+  /**
+   * Follow a committed import until the server says it is over, writing its
+   * Tasks row and its arriving tiles on the way.
+   *
+   * @param {Object} run
+   * @param {string} run.runId - the run's Tasks row and arriving group.
+   * @param {string} run.stagingId
+   * @param {string} run.backendUrl
+   * @param {number} [run.total] - files staged, until the server says.
+   * @returns {Promise<{state: "completed"|"failed"|"cancelled", status: Object}
+   *   | {state: "unknown", error: *} | {state: "aborted"}>} Every call for
+   *   one staging id is answered by the same follower and the same result.
+   */
+  function followImportRun({ runId, stagingId, backendUrl, total = 0 }) {
+    const existing = importFollowers.get(stagingId);
+    if (existing) return existing.promise;
+    const follower = { controller: new AbortController(), settled: false };
+    importFollowers.set(stagingId, follower);
+    follower.promise = runImportFollower({
+      runId,
+      stagingId,
+      backendUrl,
+      total,
+      signal: follower.controller.signal,
+    }).then(
+      (result) => {
+        if (result.state !== "aborted") follower.settled = true;
+        return result;
+      },
+      (error) => {
+        // Not a request failure (those end the poll as unknown): a fault in
+        // the follower itself. Let a later follow try again.
+        if (importFollowers.get(stagingId) === follower) {
+          importFollowers.delete(stagingId);
+        }
+        throw error;
+      },
+    );
+    return follower.promise;
+  }
+
+  /** Reconnect to the imports this tab was following before a reload. */
+  function resumeImportRuns() {
+    for (const run of readPersistedImportRuns()) {
+      if (!run?.runId || !run?.stagingId || !run?.backendUrl) continue;
+      followImportRun(run).catch((error) =>
+        console.error(
+          "tasks: could not follow resumed import",
+          run.stagingId,
+          error,
+        ),
+      );
+    }
+  }
+
+  // Import work that answers to the store's lifetime rather than to the
+  // importer that started it: an importer reconciling an unanswered commit
+  // waits on this signal, so stopPolling() (sign-out, teardown) ends that wait
+  // as it ends the followers. A view switch does not.
+  let importWork = new AbortController();
+
+  /** The signal stopPolling() aborts; read it when the work starts. */
+  function importWorkSignal() {
+    return importWork.signal;
+  }
+
+  /** Stop every follower still running; the runs stay saved for a reload. */
+  function stopImportFollowers() {
+    importWork.abort();
+    importWork = new AbortController();
+    for (const [stagingId, follower] of importFollowers) {
+      if (follower.settled) continue;
+      follower.controller.abort();
+      importFollowers.delete(stagingId);
+    }
+  }
+
   // The backend surfaces the async import (#459) through the SAME generic
   // worker-progress snapshot as detection/watch-folder rows, under this key
   // (TaskType.PICTURE_IMPORT.value). When our own frontend-driven import run is
   // active it IS the single import row (driven by /status polling across both
   // stages), so we suppress the generic snapshot entry to avoid a double row.
-  // With no active import run (e.g. after a mid-import tab refresh) it is NOT
-  // suppressed, so the import still shows as a fallback worker row.
+  // With no active import run (a tab refreshed mid-import with nothing saved
+  // to reconnect to) it is NOT suppressed, so the import still shows as a
+  // fallback worker row.
   const IMPORT_WORKER_KEY = "PictureImportTask";
 
   // ── Derived: active work ──────────────────────────────────────────────────
@@ -921,6 +1295,7 @@ export const useTasksStore = defineStore("tasks", () => {
       document.addEventListener("visibilitychange", onVisibilityChange);
     }
     tick();
+    resumeImportRuns();
   }
 
   // Kick an immediate progress fetch and switch to the fast cadence right away,
@@ -969,6 +1344,7 @@ export const useTasksStore = defineStore("tasks", () => {
     if (typeof document !== "undefined") {
       document.removeEventListener("visibilitychange", onVisibilityChange);
     }
+    stopImportFollowers();
   }
 
   return {
@@ -1016,6 +1392,9 @@ export const useTasksStore = defineStore("tasks", () => {
     registerImportAbort,
     unregisterImportAbort,
     abortImportRun,
+    finishImportRun,
+    followImportRun,
+    importWorkSignal,
     // derived
     activeEntries,
     importEntries,
