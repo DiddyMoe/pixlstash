@@ -45,6 +45,12 @@ def select_reference_faces_for_character(
     are the person's faces on it, most central first. Without one: 5-star
     pictures, then 4-star, then the rest, oldest first.
 
+    The rest can be every face of a person on tens of thousands of pictures,
+    so it is ranked on face ids and picture dates alone, its tags are read
+    through a subquery rather than a list of picture ids (SQLite caps the
+    parameters one statement binds), and only the faces picked are loaded.
+    No stage loads ``Picture`` rows, whose embeddings are not deferred.
+
     Args:
         session: Database session to query faces and pictures.
         character_id: Character id to select reference faces for.
@@ -60,30 +66,30 @@ def select_reference_faces_for_character(
 
     min_refs = min(5, max_refs)
 
+    eligible = (
+        Face.character_id == character_id,
+        Face.features.is_not(None),
+        Picture.deleted.is_(False),
+    )
     base_query = (
-        select(Face, Picture)
-        .join(Picture, Face.picture_id == Picture.id)
-        .where(
-            Face.character_id == character_id,
-            Face.features.is_not(None),
-            Picture.deleted.is_(False),
-        )
+        select(Face).join(Picture, Face.picture_id == Picture.id).where(*eligible)
     )
 
-    rows = session.exec(
-        base_query.where(Picture.score >= 5)
-        .order_by(Picture.created_at.asc(), Picture.id.asc())
-        .limit(max_refs)
-    ).all()
+    representatives = list(
+        session.exec(
+            base_query.where(Picture.score >= 5)
+            .order_by(Picture.created_at.asc(), Picture.id.asc())
+            .limit(max_refs)
+        ).all()
+    )
 
     logger.debug(
         "[reference_faces] character_id=%s target_count=%s five_star_rows=%s",
         character_id,
         max_refs,
-        len(rows),
+        len(representatives),
     )
 
-    representatives = [face for face, _ in rows]
     if len(representatives) >= max_refs:
         return representatives
 
@@ -92,7 +98,7 @@ def select_reference_faces_for_character(
         face.picture_id for face in representatives if face is not None
     }
 
-    remaining_rows = session.exec(
+    remaining_faces = session.exec(
         base_query.where(Picture.score >= 4)
         .where(~Picture.id.in_(selected_picture_ids))
         .order_by(Picture.created_at.asc(), Picture.id.asc())
@@ -101,23 +107,25 @@ def select_reference_faces_for_character(
     logger.debug(
         "[reference_faces] character_id=%s four_five_rows=%s selected_pictures=%s",
         character_id,
-        len(remaining_rows),
+        len(remaining_faces),
         len(selected_picture_ids),
     )
-    if remaining_rows:
-        for face, _ in remaining_rows:
-            if len(representatives) >= max_refs:
-                break
-            if face.id in selected_face_ids:
-                continue
-            selected_face_ids.add(face.id)
-            representatives.append(face)
+    for face in remaining_faces:
+        if len(representatives) >= max_refs:
+            break
+        if face.id in selected_face_ids:
+            continue
+        selected_face_ids.add(face.id)
+        representatives.append(face)
 
     if len(representatives) >= min_refs:
         return representatives
 
+    rest = (*eligible, ~Picture.id.in_(selected_picture_ids))
     remaining_rows = session.exec(
-        base_query.where(~Picture.id.in_(selected_picture_ids))
+        select(Face.id, Face.picture_id, Picture.created_at)
+        .join(Picture, Face.picture_id == Picture.id)
+        .where(*rest)
     ).all()
     logger.debug(
         "[reference_faces] character_id=%s remaining_rows=%s selected_pictures=%s",
@@ -134,53 +142,65 @@ def select_reference_faces_for_character(
         penalised_tag_set = {
             str(tag).strip().lower() for tag in penalised_tags.keys() if tag
         }
-        remaining_picture_ids = [picture.id for _, picture in remaining_rows]
         tag_weights = defaultdict(float)
-        if penalised_tag_set and remaining_picture_ids:
+        if penalised_tag_set:
+            rest_pictures = (
+                select(Face.picture_id)
+                .join(Picture, Face.picture_id == Picture.id)
+                .where(*rest)
+            )
             tag_rows = session.exec(
                 select(Tag.picture_id, Tag.tag)
-                .where(Tag.picture_id.in_(remaining_picture_ids))
+                .where(Tag.picture_id.in_(rest_pictures))
                 .where(Tag.tag.is_not(None))
                 .where(func.lower(Tag.tag).in_(penalised_tag_set))
             ).all()
-            for pic_id, tag in tag_rows or []:
+            for pic_id, tag in tag_rows:
                 if not tag:
                     continue
                 tag_weights[pic_id] += penalised_tags.get(tag.strip().lower(), 0.0)
 
-        remaining_rows.sort(
+        remaining_rows = sorted(
+            remaining_rows,
             key=lambda row: (
-                tag_weights.get(row[1].id, 0.0),
-                row[1].created_at or datetime.max.replace(tzinfo=timezone.utc),
-                row[1].id,
-                row[0].id or 0,
-            )
+                tag_weights.get(row.picture_id, 0.0),
+                row.created_at or datetime.max.replace(tzinfo=timezone.utc),
+                row.picture_id,
+                row.id or 0,
+            ),
         )
         logger.debug(
             "[reference_faces] character_id=%s penalised_tags=%s",
             character_id,
             len(tag_weights),
         )
-        for face, _ in remaining_rows:
-            if len(representatives) >= min_refs:
+        ranked = iter(remaining_rows)
+        while len(representatives) < min_refs:
+            picked = []
+            for row in ranked:
+                if row.id in selected_face_ids:
+                    continue
+                selected_face_ids.add(row.id)
+                picked.append(row.id)
+                if len(representatives) + len(picked) >= min_refs:
+                    break
+            if not picked:
                 break
-            if face.id in selected_face_ids:
-                continue
-            selected_face_ids.add(face.id)
-            representatives.append(face)
+            loaded = session.exec(select(Face).where(Face.id.in_(picked))).all()
+            by_id = {face.id: face for face in loaded}
+            # A face deleted since it was ranked gives its place to the next.
+            representatives.extend(by_id[i] for i in picked if i in by_id)
 
     if len(representatives) >= min_refs:
         return representatives
 
-    fallback_row = session.exec(
+    fallback_face = session.exec(
         base_query.order_by(
             desc(Picture.score), Picture.created_at.asc(), Picture.id
         ).limit(1)
     ).first()
-    if fallback_row:
-        fallback_face = fallback_row[0]
-        if fallback_face and fallback_face.id not in selected_face_ids:
-            representatives.append(fallback_face)
+    if fallback_face and fallback_face.id not in selected_face_ids:
+        representatives.append(fallback_face)
 
     logger.debug(
         "[reference_faces] character_id=%s final_faces=%s",
