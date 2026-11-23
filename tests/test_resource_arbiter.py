@@ -15,9 +15,11 @@ from types import SimpleNamespace
 
 import psutil
 import pytest
+import requests
 
 from pixlstash import gpu_select
 from pixlstash.resources import arbiter as arbiter_module
+from pixlstash.resources import comfyui_tenant
 from pixlstash.resources.arbiter import (
     LeaseKind,
     LeaseState,
@@ -25,6 +27,7 @@ from pixlstash.resources.arbiter import (
     Tenant,
     safety_margin_mb,
 )
+from pixlstash.resources.comfyui_tenant import ComfyUIProbe
 from pixlstash.resources.ledger import DeviceReading, Ledger
 
 CARD = "GPU-00000000-0000-0000-0000-000000000001"
@@ -1397,6 +1400,556 @@ def test_an_identical_card_elsewhere_is_told_apart_by_a_fresh_second_read(
     probe.watch("http://comfy.invalid")
     probe._get = lambda path: next(reads, _comfy_stats(TOTAL, TOTAL - 3000))
     assert probe.device() is None
+
+
+def _start_callers(count, call):
+    """Start *count* threads that call *call* at once. Returns them and the
+    list their outcomes land in: ``("value", result)`` or ``("error", exc)``."""
+    barrier = threading.Barrier(count)
+    outcomes = [None] * count
+
+    def run(index):
+        barrier.wait(timeout=10)
+        try:
+            outcomes[index] = ("value", call())
+        except Exception as exc:
+            outcomes[index] = ("error", exc)
+
+    threads = [
+        threading.Thread(
+            target=run, args=(index,), name=f"test-probe-caller-{index}", daemon=True
+        )
+        for index in range(count)
+    ]
+    for thread in threads:
+        thread.start()
+    return threads, outcomes
+
+
+def _join(threads):
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads), "a caller never returned"
+
+
+def _on_wait(monkeypatch, probe, key, signal):
+    """Call *signal* whenever a caller starts waiting for *probe*'s *key* read
+    in flight, so a test can tell a caller that waits from one that asks."""
+
+    class Done(threading.Event):
+        def __init__(self, flight):
+            super().__init__()
+            self.flight = flight
+
+        def wait(self, timeout=None):
+            if probe._inflight.get(key) is self.flight:
+                signal()
+            return super().wait(timeout)
+
+    class Flight(comfyui_tenant._Flight):
+        def __init__(self, generation):
+            super().__init__(generation)
+            self.done = Done(self)
+
+    monkeypatch.setattr(comfyui_tenant, "_Flight", Flight)
+
+
+@pytest.mark.parametrize(
+    "path, read, answer",
+    [
+        ("/system_stats", "stats", _comfy_stats(TOTAL, TOTAL)),
+        ("/queue", "_queue_now", {"queue_running": [], "queue_pending": []}),
+    ],
+)
+def test_concurrent_comfyui_reads_share_one_request(monkeypatch, path, read, answer):
+    """Every progress poll, admission and peak sample that found the read
+    expired sent its own, so a slow ComfyUI was asked once per caller."""
+    callers = 6
+    arrived = threading.Semaphore(0)
+    release = threading.Event()
+    calls = []
+
+    def slow(asked):
+        calls.append(asked)
+        arrived.release()
+        assert release.wait(timeout=10)
+        return answer
+
+    probe = ComfyUIProbe("test-client")
+    probe.watch("http://comfy.invalid")
+    probe._get = slow
+    _on_wait(monkeypatch, probe, path, arrived.release)
+    threads, outcomes = _start_callers(callers, getattr(probe, read))
+    try:
+        # Each caller is either reading or waiting for a read.
+        for _ in range(callers):
+            assert arrived.acquire(timeout=10)
+    finally:
+        release.set()
+    _join(threads)
+    assert calls == [path]
+    assert all(kind == "value" and got is answer for kind, got in outcomes), outcomes
+
+
+def test_a_read_of_the_old_address_is_not_kept_after_watch(monkeypatch):
+    """A switched connection re-points the probe while reads of the old
+    ComfyUI are in flight. Kept, or joined after the switch, the old answers
+    stood as the new ComfyUI's: its memory and queue for a second, a failed
+    read for ten, and the least the old one held as the new one's floor."""
+    old, new = "http://comfy-a.invalid", "http://comfy-b.invalid"
+    answers = {
+        old: {
+            "/system_stats": _comfy_stats(TOTAL, TOTAL, torch_mb=5000),
+            "/queue": {
+                "queue_running": [[0, "p", {}, {"client_id": "someone-else"}]],
+                "queue_pending": [],
+            },
+        },
+        new: {
+            "/system_stats": _comfy_stats(TOTAL, TOTAL, torch_mb=700),
+            "/queue": {"queue_running": [], "queue_pending": []},
+        },
+    }
+    in_flight = threading.Barrier(3)  # a stats read, a queue read and the test
+    release = threading.Event()
+
+    def read(path):
+        # As the real read: its address is taken as it starts.
+        url = probe.base_url
+        if url == old:
+            in_flight.wait(timeout=10)
+            assert release.wait(timeout=10)
+        return answers[url][path]
+
+    probe = ComfyUIProbe("test-client")
+    probe.watch(old)
+    probe._get = read
+    settled = threading.Event()
+    _on_wait(monkeypatch, probe, "/system_stats", settled.set)
+    readers = [
+        threading.Thread(target=probe.usage_mb, daemon=True),
+        threading.Thread(target=probe.busy, daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    asked = []
+    try:
+        in_flight.wait(timeout=10)
+        probe.watch(new)
+        after = threading.Thread(
+            target=lambda: (asked.append(probe.stats()), settled.set()), daemon=True
+        )
+        after.start()
+        assert settled.wait(timeout=10)
+        assert asked == [answers[new]["/system_stats"]], (
+            "a read after the switch waited for the old ComfyUI's"
+        )
+    finally:
+        release.set()
+    _join([*readers, after])
+    assert probe.kept_mb() is None, "the old ComfyUI's least held, as the new one's"
+    # Whatever read is kept, however old it is.
+    assert probe.stats(max_age_s=60.0) == answers[new]["/system_stats"], (
+        "the old ComfyUI's memory, as the new one's"
+    )
+    assert probe.idle(max_age_s=60.0), "the old ComfyUI's queue, as the new one's"
+
+
+def test_a_process_search_begun_before_watch_names_no_process(monkeypatch):
+    """A search for ComfyUI's process outlasting a switch named the old
+    card's listener as the new ComfyUI's, the process ``quit`` would end."""
+    searching = threading.Event()
+    release = threading.Event()
+
+    class SlowLedger(_ProcessLedger):
+        def processes(self, uuid=None):
+            if not searching.is_set():
+                searching.set()
+                assert release.wait(timeout=10)
+            return super().processes(uuid)
+
+    class Listening:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def net_connections(self, kind="inet"):
+            return [
+                SimpleNamespace(
+                    status=psutil.CONN_LISTEN, laddr=SimpleNamespace(port=7801)
+                )
+            ]
+
+    fake = SlowLedger({CARD: {4242: 9000}})
+    monkeypatch.setattr(comfyui_tenant, "ledger", lambda: fake)
+    monkeypatch.setattr(comfyui_tenant.time, "sleep", lambda s: None)
+    monkeypatch.setattr(comfyui_tenant.psutil, "Process", Listening)
+    probe = ComfyUIProbe("test-client")
+    probe.watch("http://comfy-a.invalid:7801")
+    probe._get = lambda path: _comfy_stats(TOTAL, TOTAL, torch_mb=160)
+    assert probe.device() == CARD
+    reader = threading.Thread(target=probe.usage_mb, daemon=True)
+    reader.start()
+    try:
+        assert searching.wait(timeout=10)
+        # Another machine's ComfyUI on the same port.
+        probe.watch("http://comfy-b.invalid:7801")
+    finally:
+        release.set()
+    _join([reader])
+    assert not probe.can_quit(), "the old card's process, as the new ComfyUI's"
+
+
+def test_a_fresh_read_never_joins_one_in_flight(monkeypatch):
+    """``free`` and the card match need a read sent after their call: one
+    already in flight may predate the unload or the model load they measure."""
+    began = threading.Event()
+    release = threading.Event()
+    settled = threading.Event()
+    calls = []
+
+    def read(path):
+        calls.append(path)
+        if len(calls) == 1:
+            began.set()
+            assert release.wait(timeout=10)
+            return {"read": "before"}
+        return {"read": "after"}
+
+    probe = ComfyUIProbe("test-client")
+    probe.watch("http://comfy.invalid")
+    probe._get = read
+    _on_wait(monkeypatch, probe, "/system_stats", settled.set)
+    expiring = threading.Thread(target=probe.stats, daemon=True)
+    expiring.start()
+    fresh = []
+    try:
+        assert began.wait(timeout=10)
+        asking = threading.Thread(
+            target=lambda: (fresh.append(probe.stats(max_age_s=0.0)), settled.set()),
+            daemon=True,
+        )
+        asking.start()
+        assert settled.wait(timeout=10)
+        assert fresh == [{"read": "after"}], "the fresh read took one sent before it"
+    finally:
+        release.set()
+    _join([expiring, asking])
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("test-broken-double"), requests.ConnectionError("test-refused")],
+    ids=["raises", "unreachable"],
+)
+def test_followers_are_released_when_the_read_raises(monkeypatch, failure):
+    """A read that raises hands its exception to every caller that waited for
+    it; an unreachable ComfyUI is None to them all, and stands as before."""
+    callers = 4
+    arrived = threading.Semaphore(0)
+    release = threading.Event()
+    calls = []
+
+    def failing(path):
+        calls.append(path)
+        arrived.release()
+        assert release.wait(timeout=10)
+        raise failure
+
+    probe = ComfyUIProbe("test-client")
+    probe.watch("http://comfy.invalid")
+    probe._get = failing
+    _on_wait(monkeypatch, probe, "/system_stats", arrived.release)
+    threads, outcomes = _start_callers(callers, probe.stats)
+    try:
+        for _ in range(callers):
+            assert arrived.acquire(timeout=10)
+    finally:
+        release.set()
+    _join(threads)
+    assert calls == ["/system_stats"]
+    if isinstance(failure, RuntimeError):
+        assert all(kind == "error" and got is failure for kind, got in outcomes), (
+            outcomes
+        )
+    else:
+        assert outcomes == [("value", None)] * callers
+    assert probe._inflight == {}
+
+    # A raised read is not kept, an unreachable one stands as before.
+    probe._get = lambda path: calls.append(path) or {"read": "again"}
+    expected = {"read": "again"} if isinstance(failure, RuntimeError) else None
+    assert probe.stats() == expected
+    assert len(calls) == (2 if expected else 1)
+
+
+def test_device_mapping_is_shared(monkeypatch):
+    """The card match is two fresh reads 0.3 s apart; callers arriving while
+    it runs wait for its answer instead of each running their own."""
+    callers = 4
+    arrived = threading.Semaphore(0)
+    release = threading.Event()
+    sleeps = []
+    real_sleep = time.sleep
+
+    def pause(seconds):
+        if not threading.current_thread().name.startswith("test-probe-caller"):
+            return real_sleep(seconds)
+        sleeps.append(seconds)
+        arrived.release()
+        assert release.wait(timeout=10)
+
+    monkeypatch.setattr(comfyui_tenant, "ledger", FakeLedger)
+    monkeypatch.setattr(comfyui_tenant.time, "sleep", pause)
+    probe = ComfyUIProbe("test-client")
+    probe.watch("http://comfy.invalid")
+    probe._get = lambda path: _comfy_stats(TOTAL, TOTAL)
+    _on_wait(monkeypatch, probe, "mapping", arrived.release)
+    threads, outcomes = _start_callers(callers, probe.device)
+    try:
+        # One caller is between the match's two reads, the rest wait for it.
+        for _ in range(callers):
+            assert arrived.acquire(timeout=10)
+    finally:
+        release.set()
+    _join(threads)
+    assert outcomes == [("value", CARD)] * callers
+    assert sleeps == [0.3], "one card match, its two reads 0.3 s apart"
+
+
+def test_quit_asks_the_queue_afresh_and_keeps_no_read_from_before_it(monkeypatch):
+    """A queue read already in flight may predate a job just submitted, and a
+    read of the quit process that outlasts it must not stand as the next
+    ComfyUI's."""
+    ended = []
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def net_connections(self, kind="inet"):
+            return [
+                SimpleNamespace(
+                    status=psutil.CONN_LISTEN, laddr=SimpleNamespace(port=7801)
+                )
+            ]
+
+        def terminate(self):
+            ended.append(self.pid)
+
+        def wait(self, timeout=None):
+            return 0
+
+    reading = threading.Semaphore(0)
+    release = threading.Event()
+    queue = {"queue_running": [], "queue_pending": []}
+
+    def read(path):
+        if threading.current_thread().name == "test-read-before-quit":
+            reading.release()
+            assert release.wait(timeout=10)
+            if path == "/queue":
+                return {"queue_running": [], "queue_pending": []}
+            return _comfy_stats(TOTAL, TOTAL, torch_mb=5000)
+        return queue if path == "/queue" else _comfy_stats(TOTAL, TOTAL, torch_mb=700)
+
+    fake = _ProcessLedger({CARD: {4242: 600}})
+    monkeypatch.setattr(comfyui_tenant, "ledger", lambda: fake)
+    monkeypatch.setattr(comfyui_tenant.time, "sleep", lambda s: None)
+    monkeypatch.setattr(comfyui_tenant.psutil, "Process", FakeProcess)
+    probe = ComfyUIProbe("test-client")
+    probe.watch("http://comfy-a.invalid:7801")
+    probe._get = read
+    assert probe.device() == CARD
+    assert probe.usage_mb() == 700 and probe.can_quit()
+
+    settled = threading.Event()
+    _on_wait(monkeypatch, probe, "/queue", settled.set)
+    before = [
+        threading.Thread(target=probe.jobs, name="test-read-before-quit", daemon=True),
+        threading.Thread(
+            target=lambda: probe.stats(max_age_s=0.0),
+            name="test-read-before-quit",
+            daemon=True,
+        ),
+    ]
+    for thread in before:
+        thread.start()
+    quitting = []
+    try:
+        for _ in before:
+            assert reading.acquire(timeout=10)
+        # A job is submitted after the queue read in flight was sent.
+        queue["queue_running"] = [[0, "p", {}, {"client_id": "someone-else"}]]
+        asking = threading.Thread(
+            target=lambda: (quitting.append(probe.quit()), settled.set()), daemon=True
+        )
+        asking.start()
+        assert settled.wait(timeout=10)
+        assert quitting == [False] and ended == [], "quit on a read from before the job"
+        queue["queue_running"] = []
+        assert probe.quit() and ended == [4242]
+    finally:
+        release.set()
+    _join([*before, asking])
+    # Whatever read is kept, however old it is.
+    assert probe.stats(max_age_s=60.0) == _comfy_stats(TOTAL, TOTAL, torch_mb=700), (
+        "a read of the quit process stood after the quit"
+    )
+
+
+_BUSY_QUEUE = {
+    "queue_running": [[0, "p", {}, {"client_id": "someone-else"}]],
+    "queue_pending": [],
+}
+_EMPTY_QUEUE = {"queue_running": [], "queue_pending": []}
+
+
+def test_quit_never_ends_a_process_after_the_address_changed_under_it(monkeypatch):
+    """A connection switched while ``quit`` checked ComfyUI's process sent its
+    queue read to the new address: the old ComfyUI, mid-job, was ended on the
+    new one's empty queue. The port check cannot tell them apart when both
+    use ComfyUI's default port."""
+    old, new = "http://comfy-a.invalid:7801", "http://comfy-b.invalid:7802"
+    ended = []
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def terminate(self):
+            ended.append(self.pid)
+
+        def wait(self, timeout=None):
+            return 0
+
+    checking = threading.Event()
+    release = threading.Event()
+
+    def listening(pids):
+        # The first process check is held open while the connection switches.
+        if not checking.is_set():
+            checking.set()
+            assert release.wait(timeout=10)
+        return 4242
+
+    monkeypatch.setattr(comfyui_tenant.psutil, "Process", FakeProcess)
+    probe = ComfyUIProbe("test-client")
+    probe.watch(old)
+    probe._pid = 4242
+    # As the real read: its address is taken as it starts.
+    probe._get = lambda path: _BUSY_QUEUE if probe.base_url == old else _EMPTY_QUEUE
+    probe._listening_pid = listening
+    quitting = []
+    asking = threading.Thread(target=lambda: quitting.append(probe.quit()), daemon=True)
+    asking.start()
+    try:
+        assert checking.wait(timeout=10)
+        probe.watch(new)
+    finally:
+        release.set()
+    _join([asking])
+    assert quitting == [False] and ended == [], (
+        "the old ComfyUI ended mid-job on the new one's queue"
+    )
+
+    # The new ComfyUI's own idle process, its address unchanged: ended.
+    probe._pid = 4242
+    assert probe.quit() and ended == [4242]
+
+
+def test_quit_never_ends_the_old_process_on_a_switch_asked_during_a_process_search(
+    monkeypatch,
+):
+    """A switch asked while a search for ComfyUI's process held the probe
+    waited for it. A ``quit`` started meanwhile took the old pid and checked
+    its port before the switch landed, then read the new ComfyUI's empty
+    queue and ended the old, busy process."""
+    old, new = "http://comfy-a.invalid:7801", "http://comfy-b.invalid:7802"
+    ended = []
+    searching = threading.Event()
+    release_search = threading.Event()
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def net_connections(self, kind="inet"):
+            if self.pid != 4242:
+                # Another app's process on the card, scanned under the lock.
+                searching.set()
+                assert release_search.wait(timeout=10)
+                return []
+            return [
+                SimpleNamespace(
+                    status=psutil.CONN_LISTEN, laddr=SimpleNamespace(port=7801)
+                )
+            ]
+
+        def terminate(self):
+            ended.append(self.pid)
+
+        def wait(self, timeout=None):
+            return 0
+
+    switch_asked = threading.Event()
+    quit_asked = threading.Event()
+    quit_may_enter = threading.Event()
+
+    class HeldLock:
+        """The probe's lock. Says when the switch asks for it, and holds the
+        quit's first ask back until the test lets it through."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            name = threading.current_thread().name
+            if name == "test-switch":
+                switch_asked.set()
+            elif name == "test-quit" and not quit_asked.is_set():
+                quit_asked.set()
+                assert quit_may_enter.wait(timeout=10)
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc_info):
+            self._lock.release()
+
+    # ComfyUI's known pid is not on the card's list, so a search runs.
+    fake = _ProcessLedger({CARD: {5151: 900}})
+    monkeypatch.setattr(comfyui_tenant, "ledger", lambda: fake)
+    monkeypatch.setattr(comfyui_tenant.psutil, "Process", FakeProcess)
+    probe = ComfyUIProbe("test-client")
+    probe.watch(old)
+    probe._pid = 4242
+    probe._mapping = (time.monotonic(), CARD)
+    probe._get = lambda path: _BUSY_QUEUE if probe.base_url == old else _EMPTY_QUEUE
+    probe._lock = HeldLock()
+    quitting = []
+    search = threading.Thread(target=probe._process_mb, name="test-search", daemon=True)
+    switch = threading.Thread(
+        target=probe.watch, args=(new,), name="test-switch", daemon=True
+    )
+    asking = threading.Thread(
+        target=lambda: quitting.append(probe.quit()), name="test-quit", daemon=True
+    )
+    search.start()
+    try:
+        assert searching.wait(timeout=10)
+        switch.start()
+        assert switch_asked.wait(timeout=10)
+        asking.start()
+        assert quit_asked.wait(timeout=10)
+        release_search.set()
+        # The switch lands before the quit next takes the lock.
+        _join([search, switch])
+    finally:
+        release_search.set()
+        quit_may_enter.set()
+    _join([asking])
+    assert quitting == [False] and ended == [], (
+        "the old ComfyUI ended mid-job on the new one's queue"
+    )
 
 
 def test_a_granted_lease_carries_its_live_progress_in_the_snapshot():

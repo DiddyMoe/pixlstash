@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
+from typing import TypeVar
 from urllib.parse import urlparse
 
 import psutil
@@ -69,6 +71,22 @@ _MB = 1024 * 1024
 _UNREAD = object()
 _NO_PROXY = {"http": None, "https": None, "all": None}
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+_T = TypeVar("_T")
+
+
+class _Flight:
+    """One read in progress, which later callers wait for instead of repeating.
+
+    Args:
+        generation: The probe's generation when the read began; its answer is
+            kept only while that is still the probe's.
+    """
+
+    def __init__(self, generation: int) -> None:
+        self.generation = generation
+        self.done = threading.Event()
+        self.value: object = None
+        self.error: BaseException | None = None
 
 
 class ComfyUIProbe:
@@ -92,6 +110,11 @@ class ComfyUIProbe:
         self._searched: frozenset[int] = frozenset()
         # The least this ComfyUI has been seen to hold: what /free leaves.
         self._floor_mb: int | None = None
+        # Bumped whenever what was read stops being this ComfyUI's (another
+        # address, or its process quit): a read begun before is not kept.
+        self._generation = 0
+        # The reads in progress, by kind: one at a time, the rest wait for it.
+        self._inflight: dict[str, _Flight] = {}
 
     @property
     def base_url(self) -> str | None:
@@ -102,12 +125,8 @@ class ComfyUIProbe:
         with self._lock:
             if base_url != self._base_url:
                 self._base_url = base_url
-                self._stats = (0.0, None)
-                self._queue = (0.0, None)
                 self._mapping = (0.0, None)
-                self._pid = None
-                self._searched = frozenset()
-                self._floor_mb = None
+                self._forget_process_locked()
 
     # ── reads ────────────────────────────────────────────────────────────
 
@@ -116,43 +135,86 @@ class ComfyUIProbe:
         response.raise_for_status()
         return response.json()
 
+    def _read(self, path: str, what: str) -> dict | None:
+        """*path*'s answer, or None when ComfyUI cannot be read."""
+        try:
+            return self._get(path)
+        except (requests.RequestException, ValueError) as exc:
+            logger.debug(
+                "ComfyUI's %s at %s cannot be read: %s", what, self._base_url, exc
+            )
+            return None
+
+    def _shared(
+        self, key: str, slot: str, max_age_s: float, fetch: Callable[[], _T]
+    ) -> _T | None:
+        """*slot*'s cached answer while it stands, else one *fetch* shared by
+        every caller that arrives while it is in flight.
+
+        The fetch runs outside the lock. Its answer is kept in *slot* only if
+        the generation it began in is still the probe's (``watch`` to another
+        address and ``quit`` start a new one) and it is not ``_UNREAD``.
+        Whoever waited gets that answer, or the exception the fetch raised. A
+        fresh read (``max_age_s=0``) must be sent after the call, so it never
+        joins one begun before; it leads its own, which later callers may join.
+        """
+        with self._lock:
+            if self._base_url is None:
+                return None
+            read_at, value = getattr(self, slot)
+            # A failed read is cached too: a hung ComfyUI must cost one
+            # timeout per TTL, not one per caller.
+            if read_at and time.monotonic() - read_at < _ttl(value, max_age_s):
+                return value
+            flight = self._inflight.get(key) if max_age_s else None
+            leading = flight is None
+            if leading:
+                flight = _Flight(self._generation)
+                # A fresh read beside one in flight leads its own, unlisted.
+                self._inflight.setdefault(key, flight)
+        if not leading:
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            return flight.value
+        try:
+            flight.value = fetch()
+        except BaseException as exc:
+            flight.error = exc
+            raise
+        finally:
+            with self._lock:
+                if self._inflight.get(key) is flight:
+                    del self._inflight[key]
+                if flight.error is None and flight.value is not _UNREAD:
+                    if flight.generation == self._generation:
+                        setattr(self, slot, (time.monotonic(), flight.value))
+                    else:
+                        logger.debug(
+                            "Not keeping ComfyUI's %s read: it began before "
+                            "the address or the process changed (now %s)",
+                            key,
+                            self._base_url,
+                        )
+            flight.done.set()
+        return flight.value
+
     def stats(self, max_age_s: float = STATS_TTL_S) -> dict | None:
         """ComfyUI's ``/system_stats``, or None when it cannot be read."""
-        if self._base_url is None:
-            return None
-        read_at, value = self._stats
-        # A failed read is cached too: a hung ComfyUI must cost one timeout
-        # per TTL, not one per caller.
-        if read_at and time.monotonic() - read_at < _ttl(value, max_age_s):
-            return value
-        try:
-            value = self._get("/system_stats")
-        except (requests.RequestException, ValueError) as exc:
-            logger.debug(
-                "ComfyUI's stats at %s cannot be read: %s", self._base_url, exc
-            )
-            value = None
-        self._stats = (time.monotonic(), value)
-        return value
+        return self._shared(
+            "/system_stats",
+            "_stats",
+            max_age_s,
+            lambda: self._read("/system_stats", "stats"),
+        )
 
-    def _queue_now(self) -> dict | None:
-        if self._base_url is None:
-            return None
-        read_at, value = self._queue
-        if read_at and time.monotonic() - read_at < _ttl(value, STATS_TTL_S):
-            return value
-        try:
-            value = self._get("/queue")
-        except (requests.RequestException, ValueError) as exc:
-            logger.debug(
-                "ComfyUI's queue at %s cannot be read: %s", self._base_url, exc
-            )
-            value = None
-        self._queue = (time.monotonic(), value)
-        return value
+    def _queue_now(self, max_age_s: float = STATS_TTL_S) -> dict | None:
+        return self._shared(
+            "/queue", "_queue", max_age_s, lambda: self._read("/queue", "queue")
+        )
 
-    def _entries(self) -> list | None:
-        queue = self._queue_now()
+    def _entries(self, max_age_s: float = STATS_TTL_S) -> list | None:
+        queue = self._queue_now(max_age_s)
         if not isinstance(queue, dict):
             return None
         return [
@@ -171,20 +233,19 @@ class ComfyUIProbe:
 
     def device(self) -> str | None:
         """The UUID of the card this ComfyUI runs on, or None for a remote one."""
-        if self._base_url is None:
-            return None
-        checked_at, mapped = self._mapping
-        if checked_at and time.monotonic() - checked_at < MAPPING_TTL_S:
-            return mapped
-        if self.stats() is None:
+        # One match at a time: its two fresh reads 0.3 s apart are shared.
+        found = self._shared("mapping", "_mapping", MAPPING_TTL_S, self._find_device)
+        if found is _UNREAD:
             # Unreachable is not remote: keep the last answer and ask again,
             # rather than admit this ComfyUI's runs unchecked for a minute.
+            checked_at, mapped = self._mapping
             return self._unread_answer(checked_at, mapped)
-        found = self._map_device()
-        if found is _UNREAD:
-            return self._unread_answer(checked_at, mapped)
-        self._mapping = (time.monotonic(), found)
         return found
+
+    def _find_device(self) -> str | None | object:
+        if self.stats() is None:
+            return _UNREAD
+        return self._map_device()
 
     @staticmethod
     def _unread_answer(checked_at: float, mapped: str | None) -> str | None:
@@ -261,6 +322,7 @@ class ComfyUIProbe:
 
     def usage_mb(self) -> int | None:
         """What ComfyUI holds, MB; None when it cannot be read."""
+        generation = self._generation
         row = self._device_row()
         if row is None:
             return None
@@ -270,9 +332,12 @@ class ComfyUIProbe:
         else:
             usage = max(int(row.get("torch_vram_total") or 0) // _MB, held or 0)
         if usage is not None:
-            self._floor_mb = (
-                usage if self._floor_mb is None else min(usage, self._floor_mb)
-            )
+            with self._lock:
+                # Read before ComfyUI changed: another one's floor.
+                if generation == self._generation:
+                    self._floor_mb = (
+                        usage if self._floor_mb is None else min(usage, self._floor_mb)
+                    )
         return usage
 
     def kept_mb(self) -> int | None:
@@ -300,19 +365,34 @@ class ComfyUIProbe:
         PixlStash did not start ComfyUI and cannot start it again; the caller
         has the owner's yes. Returns True once the process has exited.
         """
-        pid = self._pid
+        with self._lock:
+            # Read as one pair: a ``watch`` between two unlocked reads could
+            # pair the old address's pid with the new address's generation.
+            pid = self._pid
+            generation = self._generation
         # Asked again now: a pid read a while ago may name another process,
         # and a queue read a second ago may have missed a job just submitted.
         if pid is not None and self._listening_pid([pid]) is None:
             pid = None
-        self._queue = (0.0, None)
-        if pid is None or not self.idle():
+        if pid is None or not self.idle(max_age_s=0.0):
             logger.info(
                 "Not quitting ComfyUI at %s: %s",
                 self._base_url,
                 "no process of its is known" if pid is None else "it is not idle",
             )
             return False
+        with self._lock:
+            if generation != self._generation:
+                # Another address (or a quit) since the pid was read: the
+                # port check and the queue read may have been the new
+                # ComfyUI's, not this process's.
+                logger.info(
+                    "Not quitting ComfyUI process %s: ComfyUI changed while its "
+                    "queue was read (another address or a quit; now %s)",
+                    pid,
+                    self._base_url,
+                )
+                return False
         try:
             process = psutil.Process(pid)
             process.terminate()
@@ -336,13 +416,24 @@ class ComfyUIProbe:
             pid,
         )
         with self._lock:
-            self._pid = None
-            self._searched = frozenset()
-            self._stats = (0.0, None)
-            self._queue = (0.0, None)
-            # The next ComfyUI started here is a new process with its own floor.
-            self._floor_mb = None
+            # The next ComfyUI started here is a new process with its own
+            # floor, and a read begun before the quit was the old one's.
+            self._forget_process_locked()
         return True
+
+    def _forget_process_locked(self) -> None:
+        """Drop what was read of ComfyUI's process; the caller holds the lock.
+
+        A new generation, so a read still in flight from before is neither
+        joined nor kept.
+        """
+        self._generation += 1
+        self._inflight.clear()
+        self._stats = (0.0, None)
+        self._queue = (0.0, None)
+        self._pid = None
+        self._searched = frozenset()
+        self._floor_mb = None
 
     def _process_mb(self) -> int | None:
         """ComfyUI's process memory on its card per NVML, or None unknown.
@@ -351,25 +442,34 @@ class ComfyUIProbe:
         cannot attribute memory (Windows WDDM, Docker) or the process is not
         found, and the allocator's figure stands alone.
         """
-        card = self._mapping[1]
+        with self._lock:
+            generation = self._generation
+            card = self._mapping[1]
         if not card or card == UNMEASURED_DEVICE:
             return None
         processes = ledger().processes(card)
-        if self._pid not in processes and frozenset(processes) != self._searched:
-            self._searched = frozenset(processes)
-            found = self._listening_pid(processes)
-            if found is not None and self._pid is not None and found != self._pid:
-                # ComfyUI was restarted: its floor was another process's.
-                self._floor_mb = None
-            self._pid = found
-            if self._pid is None and processes:
-                logger.warning(
-                    "No process on ComfyUI's card listens on %s, so its memory "
-                    "is read from its allocator alone and may show as other "
-                    "apps'",
-                    self._base_url,
-                )
-        return processes.get(self._pid)
+        # The search under the lock, so concurrent callers do not each scan
+        # every process's sockets; it is local, no HTTP.
+        with self._lock:
+            if generation != self._generation:
+                # ComfyUI changed since its card was read: not this one's.
+                return None
+            if self._pid not in processes and frozenset(processes) != self._searched:
+                self._searched = frozenset(processes)
+                found = self._listening_pid(processes)
+                if found is not None and self._pid is not None and found != self._pid:
+                    # ComfyUI was restarted: its floor was another process's.
+                    self._floor_mb = None
+                self._pid = found
+                if self._pid is None and processes:
+                    logger.warning(
+                        "No process on ComfyUI's card listens on %s, so its "
+                        "memory is read from its allocator alone and may show "
+                        "as other apps'",
+                        self._base_url,
+                    )
+            pid = self._pid
+        return processes.get(pid)
 
     def _listening_pid(self, pids) -> int | None:
         """Which of *pids* listens on ComfyUI's port, or None."""
@@ -416,9 +516,10 @@ class ComfyUIProbe:
             for item in entries
         )
 
-    def idle(self) -> bool:
-        """Nothing at all is queued or running on ComfyUI."""
-        entries = self._entries()
+    def idle(self, max_age_s: float = STATS_TTL_S) -> bool:
+        """Nothing at all is queued or running on ComfyUI, per a queue read at
+        most *max_age_s* old (0: one sent after the call)."""
+        entries = self._entries(max_age_s)
         return entries is not None and not entries
 
     def jobs(self) -> int:
