@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import signal
 import sqlite3
@@ -24,6 +25,7 @@ import pytest
 from pixlstash.training import local_ai_toolkit as local_ai_toolkit_module
 from pixlstash.training.backend import TrainingHandle, TrainingSpec
 from pixlstash.training.local_ai_toolkit import LocalAiToolkit, safe_job_stem
+from tests.training.fake_run import _init_loss_db, _log_step
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 # A trimmed, fast template (12 steps, save_every 4) used to drive the stub.
@@ -931,3 +933,254 @@ def test_scan_checkpoints_survives_a_checkpoint_pruned_mid_scan(tmp_path, monkey
 
     assert intermediate == [str(save_root / "run_000000200.safetensors")]
     assert final is None
+
+
+# ----------------------------------------------------------------------
+# Reading the loss log: each read must equal a whole read of the log.
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def loss_log(tmp_path):
+    """Make a run's loss log holding the given ``(step, loss)`` points.
+
+    Yields a factory returning ``(handle, writer)``; the writer stays open, as
+    the trainer's does, and is closed after the test.
+    """
+    writers = []
+
+    def make(points):
+        handle = LocalAiToolkit.handle_for(
+            str(tmp_path / "work"), "fake-loss-run", "loss"
+        )
+        writer = _init_loss_db(handle.loss_db_path)
+        writers.append(writer)
+        for step, loss in points:
+            _log_step(writer, step, loss)
+        return handle, writer
+
+    yield make
+    for writer in writers:
+        writer.close()
+
+
+def _full_read(path):
+    """The loss curve and max step of the log at *path*, read whole here."""
+    con = sqlite3.connect(path)
+    try:
+        (max_step,) = con.execute("SELECT MAX(step) FROM steps").fetchone()
+        curve = [
+            {"step": step, "loss": loss}
+            for step, loss in con.execute(
+                "SELECT step, value_real FROM metrics "
+                "WHERE key = 'loss/loss' AND value_real IS NOT NULL ORDER BY step"
+            )
+        ]
+    finally:
+        con.close()
+    return curve, max_step
+
+
+def _remove_loss_log(path):
+    """Delete a loss log and its WAL files, as a restarted run's cleanup does."""
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            os.remove(path + suffix)
+
+
+def test_a_loss_log_that_grew_is_read_as_it_now_is(loss_log):
+    """A later read of a log that grew equals a whole read of it."""
+    handle, writer = loss_log([(step, 1.0 / step) for step in range(1, 101)])
+    backend = _make_backend()
+
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+    for step in range(101, 104):
+        _log_step(writer, step, 1.0 / step)
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+
+def test_a_loss_read_leaves_the_curve_it_returned_before_alone(loss_log):
+    """A read that finds more points returns a new list, not the old one grown."""
+    handle, writer = loss_log([(1, 0.9), (2, 0.8)])
+    backend = _make_backend()
+
+    first, _ = backend._read_loss_db(handle)
+    _log_step(writer, 3, 0.7)
+    second, _ = backend._read_loss_db(handle)
+
+    assert [point["step"] for point in first] == [1, 2]
+    assert [point["step"] for point in second] == [1, 2, 3]
+
+
+def test_a_loss_step_rewritten_after_it_was_read_is_read_again(loss_log):
+    """The trainer logs with INSERT OR REPLACE, so a read step can change value."""
+    handle, writer = loss_log([(step, 0.5) for step in range(1, 11)])
+    backend = _make_backend()
+    backend._read_loss_db(handle)
+
+    _log_step(writer, 4, 0.25)
+    _log_step(writer, 11, 0.5)
+    curve, max_step = backend._read_loss_db(handle)
+
+    assert (curve, max_step) == _full_read(handle.loss_db_path)
+    assert curve[3] == {"step": 4, "loss": 0.25}
+
+
+def test_a_loss_log_logged_over_is_read_as_it_now_is(loss_log):
+    """A resumed run logs over steps it logged before; a read shows the new losses."""
+    handle, writer = loss_log([(1, 0.5), (2, 0.5), (3, 0.5)])
+    backend = _make_backend()
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+    # Same count, same sum, same step-weighted sum as before.
+    for step, loss in ((1, 0.625), (2, 0.25), (3, 0.625)):
+        _log_step(writer, step, loss)
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+    _log_step(writer, 4, 0.4)
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+
+def test_a_resume_after_an_infinite_loss_is_read_as_it_now_is(loss_log):
+    """A loss of +inf earlier in the log does not hide a later step logged again."""
+    handle, writer = loss_log([(1, 0.9), (2, math.inf), (3, 0.7), (4, 0.6)])
+    backend = _make_backend()
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+    # Resumed from step 3: the trainer drops what it logged past it and logs 4 again.
+    writer.execute("DELETE FROM metrics WHERE step > 3")
+    writer.execute("DELETE FROM steps WHERE step > 3")
+    _log_step(writer, 4, 0.55)
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+
+def test_a_loss_log_cut_back_by_a_carry_on_is_read_again(loss_log, tmp_path):
+    """A carry-on drops the steps past the one it keeps; the run logs them anew."""
+    handle, writer = loss_log([(step, 0.5) for step in range(1, 11)])
+    backend = _make_backend()
+    backend._read_loss_db(handle)
+    take = tmp_path / "take-1"
+    take.mkdir()
+
+    LocalAiToolkit._set_loss_log_aside(handle.loss_db_path, str(take), 6)
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+    assert backend._read_loss_db(handle)[1] == 6
+
+    for step in range(7, 13):
+        _log_step(writer, step, 0.3)
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+
+def test_an_empty_loss_value_is_skipped_until_its_step_is_logged_again(loss_log):
+    """A step logged without a loss value has no point, until it gets one."""
+    handle, writer = loss_log([(1, 0.9), (2, 0.8)])
+    writer.execute("INSERT OR REPLACE INTO steps(step, wall_time) VALUES(3, 0)")
+    writer.execute(
+        "INSERT OR REPLACE INTO metrics(step, key, value_real, value_text) "
+        "VALUES(3, 'loss/loss', NULL, NULL)"
+    )
+    backend = _make_backend()
+
+    curve, max_step = backend._read_loss_db(handle)
+    assert (curve, max_step) == _full_read(handle.loss_db_path)
+    assert [point["step"] for point in curve] == [1, 2]
+
+    _log_step(writer, 3, 0.7)
+    assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+
+def test_a_replaced_loss_log_is_read_whole(loss_log):
+    """A restarted run replaces the log; what it holds now is what is read."""
+    handle, writer = loss_log([(step, 0.5) for step in range(1, 21)])
+    backend = _make_backend()
+    backend._read_loss_db(handle)
+    writer.close()
+    _remove_loss_log(handle.loss_db_path)
+
+    replacement = _init_loss_db(handle.loss_db_path)
+    try:
+        for step in range(1, 6):
+            _log_step(replacement, step, 0.9)
+        assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+        for step in range(6, 31):
+            _log_step(replacement, step, 0.9)
+        assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+    finally:
+        replacement.close()
+
+
+def test_a_missing_loss_log_is_not_read_as_an_empty_one(loss_log, tmp_path, caplog):
+    """A log that is gone is not read, unlike one with no points.
+
+    Before its first step a run has no log, which is no news; a log that was
+    read and is gone is.
+    """
+    not_yet = LocalAiToolkit.handle_for(str(tmp_path / "work"), "fake-new", "new")
+    handle, writer = loss_log([(1, 0.9)])
+    backend = _make_backend()
+    with caplog.at_level("WARNING"):
+        assert backend._read_loss_db(not_yet) == (None, None)
+    assert caplog.text == ""
+
+    backend._read_loss_db(handle)
+    writer.close()
+    _remove_loss_log(handle.loss_db_path)
+    with caplog.at_level("WARNING"):
+        assert backend._read_loss_db(handle) == (None, None)
+    assert "missing after it was read" in caplog.text
+
+    _init_loss_db(handle.loss_db_path).close()
+    assert backend._read_loss_db(handle) == ([], None)
+
+
+def test_a_locked_loss_log_is_logged_and_read_on_the_next_poll(
+    loss_log, monkeypatch, caplog
+):
+    """A read the trainer's lock refused is logged, and the next one reads it."""
+    monkeypatch.setattr(local_ai_toolkit_module, "_SQLITE_BUSY_TIMEOUT_MS", 1)
+    handle, writer = loss_log([(step, 0.5) for step in range(1, 11)])
+    backend = _make_backend()
+    backend._read_loss_db(handle)
+
+    writer.execute("PRAGMA locking_mode=EXCLUSIVE")
+    _log_step(writer, 11, 0.4)
+    with caplog.at_level("WARNING"):
+        assert backend._read_loss_db(handle) == (None, None)
+    assert "Could not read loss DB" in caplog.text
+    writer.close()
+
+    writer = _init_loss_db(handle.loss_db_path)
+    try:
+        _log_step(writer, 12, 0.3)
+        assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+    finally:
+        writer.close()
+
+
+def test_the_loss_curve_and_its_step_come_from_one_snapshot(loss_log, monkeypatch):
+    """A step logged while the curve is read shows in both or in neither."""
+    handle, writer = loss_log([(1, 0.9), (2, 0.8)])
+    real_connect = sqlite3.connect
+    logged = []
+
+    def log_a_step_mid_read(statement):
+        if not logged and statement.startswith("SELECT step, value_real FROM"):
+            logged.append(statement)
+            _log_step(writer, 3, 0.7)
+
+    def connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        if kwargs.get("uri"):
+            conn.set_trace_callback(log_a_step_mid_read)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    curve, max_step = _make_backend()._read_loss_db(handle)
+
+    assert logged
+    assert [point["step"] for point in curve] == [1, 2]
+    assert max_step == 2
+    assert _full_read(handle.loss_db_path)[1] == 3

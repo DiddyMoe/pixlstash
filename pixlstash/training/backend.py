@@ -76,8 +76,9 @@ class TrainingProgress:
 
     A poll returns this regardless of which backend produced it. Every field is
     populated best-effort: a backend that cannot read a particular source (e.g.
-    a locked or missing loss DB) returns empty/last-known values rather than
-    raising, so a polling loop never crashes.
+    a locked or missing loss DB) returns empty/last-known values (``None`` for
+    a loss curve it could not read) rather than raising, so a polling loop
+    never crashes.
 
     Attributes:
         status: Lifecycle state, normalised to the trainer's vocabulary:
@@ -89,7 +90,9 @@ class TrainingProgress:
             if it could not be determined.
         speed: Speed string from the trainer (e.g. ``"2.31 iter/sec"``), used
             to derive an ETA. Empty string when unknown.
-        loss_curve: Ordered list of ``{"step": int, "loss": float}`` points.
+        loss_curve: Ordered list of ``{"step": int, "loss": float}`` points,
+            or ``None`` when the source could not be read this poll (the caller
+            keeps what it had). A backend never mutates a list it has returned.
         samples: Absolute paths to generated preview sample files.
         checkpoints: Absolute paths to intermediate ``.safetensors`` checkpoints
             (excluding the final one), oldest first.
@@ -102,7 +105,7 @@ class TrainingProgress:
     step: int
     total_steps: int | None
     speed: str
-    loss_curve: list[dict] = field(default_factory=list)
+    loss_curve: list[dict] | None = field(default_factory=list)
     samples: list[str] = field(default_factory=list)
     checkpoints: list[str] = field(default_factory=list)
     final_checkpoint: str | None = None
@@ -195,7 +198,8 @@ class TrainerBackend(ABC):
         """Read a fresh progress snapshot for a running or finished job.
 
         Must be robust: never raise on a locked/missing/partial DB; return
-        empty or last-known values and log a warning instead.
+        empty or last-known values (``None`` for a loss curve it could not
+        read) and log a warning instead.
 
         Args:
             handle: The job handle.

@@ -11922,6 +11922,21 @@ run's existing stack, after its members, so the cover and the set's LoRA stay
 where they were. The old final's `model.training_step` is set when the run is
 queued, so the cover maps to its own step meanwhile.
 
+**How a poll writes the row.** The worker polls a running trainer every
+`poll_interval_s` (5 s; `TrainingService._poll_until_done`).
+`LocalAiToolkit.progress` reads the step and the loss curve from the trainer's
+`loss_log.db` in one read transaction, so the two agree. Each poll reads the
+whole loss log, so a step the trainer wrote again (a resume, a log cut back to
+carry on, a new file) shows on the next poll. A poll writes only the columns
+that changed since its last write, and nothing when none did. A loss log that
+is locked or missing reads as no curve rather than an empty one, so the stored
+curve stays and the next poll reads it again; a log that goes missing after it
+was read is logged as a warning. `GET /training/jobs` reads summary columns
+only (no curve, log tail, config or sample paths), and
+`GET /training/jobs/{id}/status` takes the latest loss from the stored curve in
+SQL rather than loading it; a stored curve that is not valid JSON answers no
+latest loss and is logged.
+
 `/training/jobs*` lists and addresses only the open library's runs; another
 library's run answers as one that does not exist. The worker claims and
 reconciles only its own library's runs, so a queued or unfinished run of another

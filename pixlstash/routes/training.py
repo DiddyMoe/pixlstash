@@ -198,19 +198,6 @@ def _redact_job(payload: dict) -> dict:
     }
 
 
-def _latest_loss(loss_curve) -> float | None:
-    """Return the loss value of the last point in a loss curve, if any."""
-    if not isinstance(loss_curve, list) or not loss_curve:
-        return None
-    last = loss_curve[-1]
-    if isinstance(last, dict) and "loss" in last:
-        try:
-            return float(last["loss"])
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
 # Swap traffic between two polls of the live view above this reads as the
 # machine paging to disk.
 _PAGING_BYTES = 32 * 1024 * 1024
@@ -2178,10 +2165,15 @@ def create_router(server) -> APIRouter:
     def get_training_job_status(job_id: int, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
-        job = training_runs.get_run(hub, library_uuid, job_id)
+        # The latest loss is read in SQL; the curve itself is never loaded here.
+        job = training_runs.get_run_status_summary(hub, library_uuid, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Training job not found")
-        loss_curve = _parse_json_field(job["loss_curve"], "loss_curve", job["uuid"])
+        if job["loss_curve_malformed"]:
+            logger.warning("Could not parse loss_curve for job %s", job["uuid"])
+        latest_loss = job["latest_loss"]
+        if not isinstance(latest_loss, (int, float)):
+            latest_loss = None
         total = job["total_steps"] or 0
         # A trainer can report a step past its planned total; the fraction stops at 1.
         progress = min(job["step"] / total, 1.0) if total > 0 else 0.0
@@ -2192,7 +2184,7 @@ def create_router(server) -> APIRouter:
                 "status": job["status"],
                 "step": job["step"],
                 "total_steps": job["total_steps"],
-                "latest_loss": _latest_loss(loss_curve),
+                "latest_loss": None if latest_loss is None else float(latest_loss),
                 "progress": progress,
                 "info": job["report"] or job["error"],
             }

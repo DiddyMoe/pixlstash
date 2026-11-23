@@ -171,6 +171,15 @@ def safe_job_stem(name: str, job_id: str) -> str:
     return stem
 
 
+def _loss_points(rows: list[tuple]) -> list[dict]:
+    """Turn ``(step, value)`` loss rows into curve points, skipping empty values."""
+    return [
+        {"step": int(step), "loss": float(value)}
+        for step, value in rows
+        if value is not None
+    ]
+
+
 class LocalAiToolkit(TrainerBackend):
     """Drive a local ai-toolkit checkout to train a LoRA.
 
@@ -211,6 +220,9 @@ class LocalAiToolkit(TrainerBackend):
         # and always on Windows (the trainer is not our child there), which is
         # why liveness also has a zombie-aware PID probe fallback.
         self._processes: dict[int, subprocess.Popen] = {}
+        # The loss logs (by path) whose last read found loss rows, so a log
+        # that goes missing after it was read is logged as a warning.
+        self._loss_logs_read: set[str] = set()
 
     # ------------------------------------------------------------------
     # Path layout (single source of truth)
@@ -692,9 +704,9 @@ class LocalAiToolkit(TrainerBackend):
     def progress(self, handle: TrainingHandle) -> TrainingProgress:
         """Read a fresh progress snapshot from the Job table, loss DB, and disk.
 
-        Robust by design: a locked or missing loss DB yields an empty loss curve
-        (logged at warning level) rather than an exception, so a polling loop
-        never crashes.
+        Robust by design: a locked or missing loss DB yields a loss curve of
+        ``None`` rather than an exception, so a polling loop never crashes and
+        a caller can tell a log it could not read from one with no points.
 
         Args:
             handle: The job handle.
@@ -1347,25 +1359,41 @@ class LocalAiToolkit(TrainerBackend):
     # Private helpers: loss DB (step + loss curve), WAL-aware/read-only
     # ------------------------------------------------------------------
 
-    def _read_loss_db(self, handle: TrainingHandle) -> tuple[list[dict], int | None]:
+    def _read_loss_db(
+        self, handle: TrainingHandle
+    ) -> tuple[list[dict] | None, int | None]:
         """Read the loss curve and max step from the trainer's loss DB.
 
         Opens ``loss_log.db`` read-only and WAL-aware (``mode=ro`` +
         ``PRAGMA query_only=1``) with a short busy timeout and a few retries.
-        Tolerates a missing or locked DB by returning an empty curve.
+        Both come from one read transaction, so they agree with each other.
+        Every read reads the whole log (see :meth:`_read_loss_rows`).
+        A missing DB, or one still locked after the retries, is not read: the
+        curve is ``None``. A missing one is logged at warning level only once it
+        had been read, since a run has none before its first step.
 
         Args:
             handle: The job handle.
 
         Returns:
-            A ``(loss_curve, max_step)`` tuple. ``loss_curve`` is a list of
-            ``{"step": int, "loss": float}`` dicts ordered by step; ``max_step``
-            is the highest logged step or ``None`` if unavailable.
+            A ``(loss_curve, max_step)`` tuple. ``loss_curve`` is a new list of
+            ``{"step": int, "loss": float}`` dicts ordered by step on every
+            read. It is empty for a DB with no loss rows and ``None`` for one
+            not read. ``max_step`` is the highest logged step or ``None`` if
+            unavailable.
         """
-        if not os.path.exists(handle.loss_db_path):
-            return [], None
+        path = handle.loss_db_path
+        if not os.path.exists(path):
+            if path in self._loss_logs_read:
+                self._loss_logs_read.discard(path)
+                logger.warning(
+                    "Loss DB %s is missing after it was read; no curve read", path
+                )
+            else:
+                logger.debug("No loss DB at %s yet", path)
+            return None, None
 
-        uri = sqlite_file_uri(handle.loss_db_path, read_only=True)
+        uri = sqlite_file_uri(path, read_only=True)
         last_exc: sqlite3.Error | None = None
         for attempt in range(_SQLITE_READ_RETRIES):
             try:
@@ -1373,17 +1401,9 @@ class LocalAiToolkit(TrainerBackend):
                 try:
                     conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
                     conn.execute("PRAGMA query_only=1")
-                    max_row = conn.execute("SELECT MAX(step) FROM steps").fetchone()
-                    max_step = (
-                        int(max_row[0])
-                        if max_row is not None and max_row[0] is not None
-                        else None
-                    )
-                    rows = conn.execute(
-                        "SELECT step, value_real FROM metrics "
-                        "WHERE key = ? ORDER BY step",
-                        (_LOSS_METRIC_KEY,),
-                    ).fetchall()
+                    conn.execute("BEGIN")
+                    curve, max_step = self._read_loss_rows(conn)
+                    conn.commit()
                 finally:
                     conn.close()
             except sqlite3.Error as exc:
@@ -1391,12 +1411,11 @@ class LocalAiToolkit(TrainerBackend):
                 time.sleep(0.05 * (attempt + 1))
                 continue
 
-            loss_curve = [
-                {"step": int(step), "loss": float(value)}
-                for step, value in rows
-                if value is not None
-            ]
-            return loss_curve, max_step
+            if curve:
+                self._loss_logs_read.add(path)
+            else:
+                self._loss_logs_read.discard(path)
+            return curve, max_step
 
         logger.warning(
             "Could not read loss DB %s after %d attempts: %s",
@@ -1404,7 +1423,35 @@ class LocalAiToolkit(TrainerBackend):
             _SQLITE_READ_RETRIES,
             last_exc,
         )
-        return [], None
+        return None, None
+
+    @staticmethod
+    def _read_loss_rows(conn: sqlite3.Connection) -> tuple[list[dict], int | None]:
+        """Read the whole loss curve and the max step of a loss log.
+
+        The whole log is read because the trainer rewrites earlier steps: it
+        logs a step with ``INSERT OR REPLACE``, a resumed run logs again the
+        steps past the checkpoint it resumed from, and a carry-on cuts the log
+        back. An exact check of which rows changed costs about as much as
+        reading them all.
+
+        Args:
+            conn: A read-only connection inside a read transaction.
+
+        Returns:
+            ``(loss_curve, max_step)``: the loss points ordered by step (empty
+            if the log has no loss rows), and the highest logged step or
+            ``None``.
+        """
+        max_row = conn.execute("SELECT MAX(step) FROM steps").fetchone()
+        max_step = (
+            int(max_row[0]) if max_row is not None and max_row[0] is not None else None
+        )
+        rows = conn.execute(
+            "SELECT step, value_real FROM metrics WHERE key = ? ORDER BY step",
+            (_LOSS_METRIC_KEY,),
+        ).fetchall()
+        return _loss_points(rows), max_step
 
     # ------------------------------------------------------------------
     # Private helpers: config
