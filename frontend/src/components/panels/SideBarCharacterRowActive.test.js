@@ -29,6 +29,7 @@
 // selected. That is the state this file pins.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { shallowRef } from "vue";
 import { setActivePinia, createPinia } from "pinia";
 import { mount, flushPromises } from "@vue/test-utils";
 
@@ -90,9 +91,12 @@ vi.mock("vue-router", async () => {
 });
 
 import { isReadOnly, sessionContext } from "../../utils/apiClient";
+import { useSidebarRefresh } from "../../composables/useSidebarRefresh";
 import { useFilterStore } from "../../stores/useFilterStore";
 import { useSelectionStore } from "../../stores/useSelectionStore";
 import { useSidebarStore } from "../../stores/useSidebarStore";
+import { useEntityListsStore } from "../../stores/useEntityListsStore";
+import unknownPerson from "../../assets/unknown-person.png";
 import SideBar from "./SideBar.vue";
 
 /**
@@ -548,6 +552,374 @@ describe("Create with LoRA… in a person's or a set's context menu", () => {
 
     attached = [LORA];
     expect((await loraItem(row)).disabled).toBe(false);
+    wrapper.unmount();
+  });
+});
+
+describe("a coordinated refresh with the sidebar mounted", () => {
+  // The paths that read the shared people, set and project lists. Thumbnail,
+  // summary and count reads are other routes and are not counted here.
+  const LIST_URLS = ["/characters", "/picture_sets", "/projects"];
+
+  function listReads() {
+    return apiGet.mock.calls
+      .map(([url]) => String(url ?? ""))
+      .filter((url) => LIST_URLS.includes(url))
+      .sort();
+  }
+
+  /** The app's refresh coordinator, pointed at a mounted sidebar. */
+  function coordinatorFor(sidebar) {
+    let api;
+    const host = mount({
+      setup() {
+        api = useSidebarRefresh({ sidebarRef: shallowRef(sidebar.vm) });
+        return () => null;
+      },
+    });
+    return { api, host };
+  }
+
+  it("reads each shared list once, through the sidebar", async () => {
+    const sidebar = await mountSidebar();
+    const { api, host } = coordinatorFor(sidebar);
+    apiGet.mockClear();
+
+    api.refreshSidebar();
+    for (let i = 0; i < 5; i += 1) await flushPromises();
+
+    // The sidebar's own readers refetch all three lists. A second invalidation
+    // of the same lists from the coordinator would queue a trailing read of
+    // each behind the first.
+    expect(listReads()).toEqual(LIST_URLS);
+
+    host.unmount();
+    sidebar.unmount();
+  });
+
+  it("shows the project counts of a trailing read, not of the read a refresh joined", async () => {
+    const sidebar = await mountSidebar();
+    const { api, host } = coordinatorFor(sidebar);
+    const projectReads = [];
+    apiGet.mockImplementation((url) => {
+      if (url === "/projects") {
+        return new Promise((resolve) => projectReads.push(resolve));
+      }
+      return Promise.resolve(respond(url));
+    });
+
+    // A second refresh while the first one's project read is out queues a
+    // trailing read; both refreshes' count passes join the first read.
+    api.refreshSidebar();
+    api.refreshSidebar();
+    projectReads.shift()({
+      data: [{ id: 31, name: "test-project", image_count: 11 }],
+    });
+    for (let i = 0; i < 5; i += 1) await flushPromises();
+    expect(projectReads).toHaveLength(1);
+
+    projectReads.shift()({
+      data: [{ id: 31, name: "test-project", image_count: 99 }],
+    });
+    for (let i = 0; i < 5; i += 1) await flushPromises();
+
+    expect(useEntityListsStore().projects[0].image_count).toBe(99);
+    expect(sidebar.vm.scopeCounts.byId[31]).toBe(99);
+
+    host.unmount();
+    sidebar.unmount();
+  });
+});
+
+describe("character thumbnail object URLs", () => {
+  // Each person's thumbnail is an object URL over a fetched blob, and the blob
+  // stays in memory until the URL is revoked. jsdom has no blob URLs, so both
+  // halves are stand-ins that record what the sidebar asked for.
+  const THUMBNAIL_PATH = /^\/characters\/(\d+)\/thumbnail$/;
+  let created;
+  let revoked;
+  let people;
+  /** Thumbnail reads still waiting for an answer, oldest first. */
+  let thumbnailReads;
+  let originalCreate;
+  let originalRevoke;
+  /** The sidebar whose rows a revoke must no longer be showing. */
+  let watched;
+  let revokedWhileShown;
+
+  beforeEach(() => {
+    created = [];
+    revoked = [];
+    watched = null;
+    revokedWhileShown = [];
+    people = CHARACTERS;
+    thumbnailReads = [];
+    originalCreate = URL.createObjectURL;
+    originalRevoke = URL.revokeObjectURL;
+    URL.createObjectURL = vi.fn((blob) => {
+      const url = `blob:test-${blob.person}-${created.length + 1}`;
+      created.push(url);
+      return url;
+    });
+    URL.revokeObjectURL = vi.fn((url) => {
+      revoked.push(url);
+      // Revoked while a row still points at it: that image can no longer load.
+      if (watched?.html().includes(url)) revokedWhileShown.push(url);
+    });
+    apiGet.mockImplementation((url) => {
+      const u = String(url ?? "");
+      const thumbnail = THUMBNAIL_PATH.exec(u);
+      if (thumbnail) {
+        const id = Number(thumbnail[1]);
+        return new Promise((resolve, reject) => {
+          thumbnailReads.push({
+            id,
+            answer: () => resolve({ data: { person: id } }),
+            fail: reject,
+          });
+        });
+      }
+      if (u === "/characters") return Promise.resolve({ data: people });
+      return Promise.resolve(respond(url));
+    });
+  });
+
+  afterEach(() => {
+    URL.createObjectURL = originalCreate;
+    URL.revokeObjectURL = originalRevoke;
+  });
+
+  /** Answer every thumbnail read, including the ones a freed slot starts. */
+  async function answerThumbnails() {
+    while (thumbnailReads.length) {
+      thumbnailReads.splice(0).forEach((read) => read.answer());
+      await flushPromises();
+    }
+    // The revokes wait for the render that stops showing the old URL.
+    await flushPromises();
+  }
+
+  async function refresh(wrapper) {
+    wrapper.vm.refreshSidebar();
+    for (let i = 0; i < 5; i += 1) await flushPromises();
+  }
+
+  function urlsFor(person) {
+    return created.filter((url) => url.startsWith(`blob:test-${person.id}-`));
+  }
+
+  function shownThumbnail(wrapper, name) {
+    return characterRow(wrapper, name)
+      .find("img.sidebar-character-thumb")
+      .attributes("src");
+  }
+
+  it("revokes every URL a later refresh replaces, and shows the new ones", async () => {
+    const wrapper = await mountSidebar();
+    watched = wrapper;
+    await answerThumbnails();
+    const [adaFirst] = urlsFor(ADA);
+    const [graceFirst] = urlsFor(GRACE);
+    expect(shownThumbnail(wrapper, ADA.name)).toBe(adaFirst);
+
+    await refresh(wrapper);
+    await answerThumbnails();
+
+    expect([...revoked].sort()).toEqual([adaFirst, graceFirst].sort());
+    expect(revokedWhileShown).toEqual([]);
+    expect(shownThumbnail(wrapper, ADA.name)).toBe(urlsFor(ADA)[1]);
+    expect(shownThumbnail(wrapper, GRACE.name)).toBe(urlsFor(GRACE)[1]);
+    watched = null;
+    wrapper.unmount();
+  });
+
+  it("revokes the thumbnail of a person who is no longer listed", async () => {
+    const wrapper = await mountSidebar();
+    watched = wrapper;
+    await answerThumbnails();
+    const [adaFirst] = urlsFor(ADA);
+    const [graceUrl] = urlsFor(GRACE);
+
+    people = [ADA];
+    await refresh(wrapper);
+    await answerThumbnails();
+
+    expect(characterRow(wrapper, GRACE.name)).toBeUndefined();
+    expect([...revoked].sort()).toEqual([adaFirst, graceUrl].sort());
+    expect(revokedWhileShown).toEqual([]);
+    watched = null;
+    wrapper.unmount();
+  });
+
+  it("installs nothing for a person removed while their read was out", async () => {
+    const wrapper = await mountSidebar();
+    expect(thumbnailReads.map((read) => read.id)).toEqual([ADA.id, GRACE.id]);
+
+    people = [ADA];
+    await refresh(wrapper);
+    await answerThumbnails();
+
+    expect(urlsFor(GRACE)).toEqual([]);
+    wrapper.unmount();
+  });
+
+  it("drops the face it had when a read fails, and shows the placeholder", async () => {
+    // The route answers 404 for a person with no usable face, so the face from
+    // before is stale, not a better answer than the placeholder.
+    const wrapper = await mountSidebar();
+    watched = wrapper;
+    await answerThumbnails();
+    const [adaUrl] = urlsFor(ADA);
+
+    await refresh(wrapper);
+    thumbnailReads.splice(0).forEach((read) =>
+      read.id === ADA.id ? read.fail(new Error("test-no-face")) : read.answer(),
+    );
+    await flushPromises();
+    await flushPromises();
+
+    expect(shownThumbnail(wrapper, ADA.name)).toBe(unknownPerson);
+    expect(revoked).toContain(adaUrl);
+    expect(revokedWhileShown).toEqual([]);
+    expect(urlsFor(ADA)).toEqual([adaUrl]);
+    watched = null;
+    wrapper.unmount();
+  });
+
+  it("installs nothing from a read that a newer one superseded", async () => {
+    const wrapper = await mountSidebar();
+    await refresh(wrapper);
+    const [olderAda, olderGrace, newerAda, newerGrace] = thumbnailReads.splice(0);
+    expect([olderAda.id, olderGrace.id, newerAda.id, newerGrace.id]).toEqual([
+      ADA.id,
+      GRACE.id,
+      ADA.id,
+      GRACE.id,
+    ]);
+
+    newerAda.answer();
+    newerGrace.answer();
+    await flushPromises();
+    olderAda.answer();
+    olderGrace.answer();
+    await flushPromises();
+    await flushPromises();
+
+    expect(created).toEqual([`blob:test-${ADA.id}-1`, `blob:test-${GRACE.id}-2`]);
+    expect(shownThumbnail(wrapper, ADA.name)).toBe(`blob:test-${ADA.id}-1`);
+    expect(shownThumbnail(wrapper, GRACE.name)).toBe(`blob:test-${GRACE.id}-2`);
+    wrapper.unmount();
+  });
+
+  it("creates nothing after unmount, and revokes what it was showing", async () => {
+    const wrapper = await mountSidebar();
+    await answerThumbnails();
+    const shown = [...created];
+
+    // One refresh has its thumbnail reads out; a second is still waiting for
+    // the people list, so its reads would only be asked for after unmount.
+    await refresh(wrapper);
+    expect(thumbnailReads.map((read) => read.id)).toEqual([ADA.id, GRACE.id]);
+    wrapper.vm.refreshSidebar();
+    wrapper.unmount();
+    for (let i = 0; i < 5; i += 1) await flushPromises();
+    await answerThumbnails();
+
+    expect(created).toEqual(shown);
+    expect([...revoked].sort()).toEqual([...shown].sort());
+  });
+
+  it("keeps the thumbnails shown after a session reset when an older people read lands", async () => {
+    const wrapper = await mountSidebar();
+    await answerThumbnails();
+    const peopleReads = [];
+    const answer = apiGet.getMockImplementation();
+    apiGet.mockImplementation((url, config) =>
+      url === "/characters"
+        ? new Promise((resolve) => peopleReads.push(resolve))
+        : answer(url, config),
+    );
+
+    // One refresh is still waiting for the people list when the session
+    // resets; a refresh after the reset gets its list first and installs
+    // fresh thumbnails.
+    await refresh(wrapper);
+    const beforeReset = peopleReads.shift();
+    useEntityListsStore().reset();
+    await refresh(wrapper);
+    peopleReads.shift()({ data: CHARACTERS });
+    for (let i = 0; i < 5; i += 1) await flushPromises();
+    await answerThumbnails();
+    const adaCurrent = urlsFor(ADA).at(-1);
+    expect(shownThumbnail(wrapper, ADA.name)).toBe(adaCurrent);
+
+    // The read from before the reset belongs to the previous session.
+    beforeReset({ data: CHARACTERS });
+    for (let i = 0; i < 5; i += 1) await flushPromises();
+
+    expect(shownThumbnail(wrapper, ADA.name)).toBe(adaCurrent);
+    wrapper.unmount();
+  });
+
+  it("revokes every URL on a session reset, and installs nothing from a read still out", async () => {
+    const wrapper = await mountSidebar();
+    await answerThumbnails();
+    const shown = [...created];
+
+    // A refresh has its thumbnail reads out when the session resets.
+    await refresh(wrapper);
+    useEntityListsStore().reset();
+    await flushPromises();
+    await answerThumbnails();
+
+    expect(created).toEqual(shown);
+    expect([...revoked].sort()).toEqual([...shown].sort());
+    wrapper.unmount();
+  });
+
+  it("keeps at most six thumbnail reads out at once", async () => {
+    people = Array.from({ length: 20 }, (_, i) => ({
+      id: 100 + i,
+      name: `test-person-${i}`,
+      image_count: 1,
+      project_image_count: 1,
+    }));
+    const ids = people.map((person) => person.id);
+    const wrapper = await mountSidebar();
+
+    expect(thumbnailReads.map((read) => read.id)).toEqual(ids.slice(0, 6));
+    // A slot that frees starts the next person in line, not a burst.
+    thumbnailReads.shift().answer();
+    await flushPromises();
+    expect(thumbnailReads.map((read) => read.id)).toEqual(ids.slice(1, 7));
+
+    await answerThumbnails();
+    expect(created).toEqual(ids.map((id, i) => `blob:test-${id}-${i + 1}`));
+    wrapper.unmount();
+  });
+
+  it("skips the queued reads that a newer refresh superseded", async () => {
+    people = Array.from({ length: 20 }, (_, i) => ({
+      id: 100 + i,
+      name: `test-person-${i}`,
+      image_count: 1,
+      project_image_count: 1,
+    }));
+    const ids = people.map((person) => person.id);
+    const asked = [];
+    const ask = apiGet.getMockImplementation();
+    apiGet.mockImplementation((url, config) => {
+      const thumbnail = THUMBNAIL_PATH.exec(String(url ?? ""));
+      if (thumbnail) asked.push(Number(thumbnail[1]));
+      return ask(url, config);
+    });
+    const wrapper = await mountSidebar();
+    await refresh(wrapper);
+    await answerThumbnails();
+
+    // The first refresh's six reads were already out; its other fourteen were
+    // still queued and give way to the second refresh's.
+    expect(asked).toEqual([...ids.slice(0, 6), ...ids]);
     wrapper.unmount();
   });
 });

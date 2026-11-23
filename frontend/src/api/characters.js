@@ -172,18 +172,11 @@ export async function getCharacterName(id) {
  * a Blob it can turn into an object URL, not a mangled string.
  *
  * @param {number|string} id
- * @param {Object} [options]
- * @param {string|number} [options.cacheBuster] - forces a fresh image past the
- *   HTTP cache after the thumbnail has been regenerated.
  * @returns {Promise<Blob>} the image data.
  */
-export async function getCharacterThumbnail(id, { cacheBuster } = {}) {
-  const path =
-    cacheBuster != null
-      ? `/${id}/thumbnail?cb=${cacheBuster}`
-      : `/${id}/thumbnail`;
+export async function getCharacterThumbnail(id) {
   return unwrap(
-    apiClient.get(charactersUrl(path), {
+    apiClient.get(charactersUrl(`/${id}/thumbnail`), {
       responseType: "blob",
     }),
   );
