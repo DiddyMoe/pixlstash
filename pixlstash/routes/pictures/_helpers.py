@@ -395,7 +395,8 @@ def _enrich_stack_counts(server, pics: list[dict]) -> list[dict]:
             select(Picture.stack_id, func.count(Picture.id))
             .where(
                 Picture.stack_id.in_(stack_ids),
-                Picture.deleted.is_(False),
+                # Not ``IS 0``, which beats the stack index from one id ("Probe cost").
+                Picture.deleted.is_not(True),
             )
             .group_by(Picture.stack_id)
         ).all()

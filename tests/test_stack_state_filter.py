@@ -259,6 +259,49 @@ def test_a_stack_with_two_live_members_is_still_stacked():
         gc.collect()
 
 
+def test_the_grids_stack_counts_search_the_stack_index(key_list_plan):
+    """Three stacks on the page, each with a scrapheaped member: the count reads
+    through ``ix_picture_stack_id`` and counts only the kept members."""
+    tmp, client, server = _setup_server()
+    try:
+        kept_by_stack = {11: 2, 12: 3, 13: 4}
+
+        def _insert(session):
+            for stack_id, kept in kept_by_stack.items():
+                session.add(PictureStack(id=stack_id))
+                session.flush()
+                for position in range(kept + 1):
+                    session.add(
+                        Picture(
+                            file_path=f"stack-{stack_id}-{position}.jpg",
+                            score=0,
+                            imported_at=datetime.now(timezone.utc),
+                            stack_id=stack_id,
+                            stack_position=position,
+                            deleted=position == kept,
+                        )
+                    )
+            session.commit()
+
+        server.vault.db.run_task(_insert, priority=DBPriority.IMMEDIATE)
+
+        with key_list_plan(
+            server.vault.db._engine,
+            "count(picture.id) AS count_1 \nFROM picture \nWHERE picture.stack_id IN",
+            "ix_picture_stack_id",
+        ) as plans:
+            resp = client.get("/pictures/stream?offset=0&batch_limit=500&fields=grid")
+        assert resp.status_code == 200, resp.text
+        assert len(plans) == 1, plans
+        assert {
+            p["stack_id"]: p["stack_count"] for p in resp.json()["pictures"]
+        } == kept_by_stack
+    finally:
+        server.close()
+        tmp.cleanup()
+        gc.collect()
+
+
 def test_stack_state_unresolved_returns_only_undecided_group_members():
     tmp, client, server = _setup_server()
     try:
