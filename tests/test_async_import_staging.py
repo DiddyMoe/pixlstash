@@ -11,6 +11,7 @@ scoped token is denied (403) and the owner is allowed (200 / works) - over-block
 the owner would be its own regression.
 """
 
+import asyncio
 import errno
 import functools
 import io
@@ -22,8 +23,10 @@ import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
+from fastapi import APIRouter, UploadFile
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlmodel import select
@@ -33,6 +36,7 @@ from pixlstash.routes.pictures import _import as import_mod
 from pixlstash.server import Server
 from pixlstash.tasks.picture_import_task import PictureImportTask
 from tests.authz_guard import no_spa_fallback  # noqa: F401
+from tests.utils import wait_for_import_task
 
 API = "/api/v1"
 
@@ -1325,3 +1329,468 @@ def test_a_failed_import_removes_its_staged_files_and_frees_the_library(
     assert "test-import-failure" in status["error"]
     assert not os.path.lexists(staging_dir)
     _wait_for_readers(srv, baseline)
+
+
+# ---------------------------------------------------------------------------
+# An upload's disk work runs on a worker thread, never on the event loop; a
+# zip entry is copied a bounded chunk at a time; a caption file has a size cap.
+# ---------------------------------------------------------------------------
+
+_MIB = 1024 * 1024
+
+
+def _on_event_loop() -> bool:
+    """True when the caller runs on a thread that is running an event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _record_writes_into(patch, directory) -> list:
+    """For each file opened for writing in *directory*, note whether it was
+    opened on the event loop."""
+    on_loop = []
+
+    def recording_open(path, mode="r", *args, **kwargs):
+        if "w" in mode and os.path.dirname(os.fspath(path)) == directory:
+            on_loop.append(_on_event_loop())
+        return open(path, mode, *args, **kwargs)
+
+    patch.setattr(import_mod, "open", recording_open, raising=False)
+    return on_loop
+
+
+class _ReadRecorder:
+    """A zip entry open for reading that notes each read's size and whether
+    the read ran on the event loop."""
+
+    def __init__(self, handle, reads):
+        self._handle = handle
+        self._reads = reads
+
+    def read(self, n=-1):
+        self._reads.append((n, _on_event_loop()))
+        return self._handle.read(n)
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._handle.__exit__(*exc_info)
+
+
+def _record_zip_entry_reads(patch) -> list:
+    reads = []
+    real_open = zipfile.ZipFile.open
+
+    def recording_open(self, name, mode="r", *args, **kwargs):
+        handle = real_open(self, name, mode, *args, **kwargs)
+        return _ReadRecorder(handle, reads) if mode == "r" else handle
+
+    patch.setattr(zipfile.ZipFile, "open", recording_open)
+    return reads
+
+
+def _caption(size: int) -> bytes:
+    """A comma-separated tag list padded to exactly *size* bytes."""
+    head = b"test-tag-a, test-tag-b, "
+    return head + b"x" * (size - len(head))
+
+
+def _parts(files: dict, zip_name=None) -> list:
+    """Multipart ``file`` parts for *files*, or one zip holding them all."""
+    if zip_name:
+        return [("file", (zip_name, _zip_bytes(files), "application/zip"))]
+    return [
+        ("file", (name, data, "text/plain" if name.endswith(".txt") else "image/png"))
+        for name, data in files.items()
+    ]
+
+
+@pytest.mark.parametrize("as_zip", [False, True], ids=["files", "zip"])
+def test_staging_writes_files_on_a_worker_thread(shared, monkeypatch, as_zip):
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    images = {"m1.png": _png_bytes((67, 68, 69)), "m2.png": _png_bytes((70, 71, 72))}
+
+    with monkeypatch.context() as patch:
+        on_loop = _record_writes_into(patch, staging_dir)
+        r = _stage(client, staging_id, _parts(images, "m.zip" if as_zip else None))
+    assert r.status_code == 200, r.text
+    assert sorted(_staged_names(srv, staging_id)) == sorted(images)
+    assert on_loop == [False, False]
+
+
+def test_a_zip_entry_is_copied_in_bounded_chunks_on_a_worker_thread(
+    shared, monkeypatch
+):
+    srv, client = shared
+    staging_id = _open_session(client)
+    # Deflated and several chunks long, so a whole-entry read would show.
+    payload = bytes(range(256)) * (3 * _MIB // 256)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("big.png", payload)
+    parts = [("file", ("big.zip", buf.getvalue(), "application/zip"))]
+
+    with monkeypatch.context() as patch:
+        reads = _record_zip_entry_reads(patch)
+        r = _stage(client, staging_id, parts)
+    assert r.status_code == 200, r.text
+    assert reads, "the entry was never read"
+    assert all(0 < size <= _MIB for size, _ in reads), reads
+    assert not any(on_loop for _, on_loop in reads), reads
+    [staged] = _staged_paths(srv, staging_id)
+    with open(staged, "rb") as fh:
+        assert fh.read() == payload
+
+
+def test_a_corrupt_zip_entry_leaves_no_partial_file(shared):
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    marker = b"test-corrupt-entry"
+    archive = bytearray(
+        _zip_bytes({"q1.png": _png_bytes((73, 74, 75)), "q2.png": marker * 1000})
+    )
+    # _zip_bytes stores entries uncompressed: flip a byte of the second
+    # entry's data so it no longer matches its CRC.
+    archive[archive.index(marker)] ^= 0xFF
+
+    r = _stage(
+        client, staging_id, [("file", ("q.zip", bytes(archive), "application/zip"))]
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["skipped"] == ["q.zip"]
+    assert _files_on_disk(staging_dir) == set(_staged_paths(srv, staging_id))
+
+
+@pytest.mark.parametrize("as_zip", [False, True], ids=["files", "zip"])
+def test_staging_keeps_no_caption_over_one_mib(shared, as_zip):
+    srv, client = shared
+    staging_id = _open_session(client)
+    files = {
+        "n.png": _png_bytes((76, 77, 78)),
+        "n-fits.txt": _caption(_MIB),
+        "n-over.txt": _caption(_MIB + 1),
+    }
+
+    r = _stage(client, staging_id, _parts(files, "n.zip" if as_zip else None))
+    assert r.status_code == 200, r.text
+    # A caption the client sent is reported back; one inside a zip is left
+    # out like any other entry the import cannot use.
+    assert r.json()["skipped"] == ([] if as_zip else ["n-over.txt"])
+    session = srv.staging_sessions[staging_id]
+    with session["lock"]:
+        kept = {
+            stem: len(text) for stem, text in session["sidecar_text_by_stem"].items()
+        }
+    assert kept == {"n-fits": _MIB}
+
+
+def _record_parsed_caption_sizes(patch) -> list:
+    sizes = []
+    real_parse = import_mod._parse_sidecar_tags
+
+    def recording_parse(raw_text):
+        sizes.append(len(raw_text))
+        return real_parse(raw_text)
+
+    patch.setattr(import_mod, "_parse_sidecar_tags", recording_parse)
+    return sizes
+
+
+@pytest.mark.parametrize("as_zip", [False, True], ids=["files", "zip"])
+def test_the_one_shot_import_leaves_out_a_caption_over_one_mib(
+    shared, monkeypatch, as_zip
+):
+    _srv, client = shared
+    files = {
+        "p-fits.png": _png_bytes((79, 80, 81 + as_zip)),
+        "p-fits.txt": _caption(_MIB),
+        "p-over.png": _png_bytes((83, 84, 85 + as_zip)),
+        "p-over.txt": _caption(_MIB + 1),
+    }
+
+    with monkeypatch.context() as patch:
+        parsed = _record_parsed_caption_sizes(patch)
+        r = client.post(
+            f"{API}/pictures/import",
+            files=_parts(files, "p.zip" if as_zip else None),
+        )
+    assert r.status_code == 200, r.text
+    assert wait_for_import_task(client, r.json()["task_id"])["status"] == "completed"
+    assert parsed == [_MIB]
+
+
+def test_the_one_shot_import_unpacks_a_zip_on_a_worker_thread(shared, monkeypatch):
+    _srv, client = shared
+    archive = _zip_bytes(
+        {"r.png": _png_bytes((87, 88, 89)), "r.txt": b"test-tag-a, test-tag-b"}
+    )
+
+    with monkeypatch.context() as patch:
+        reads = _record_zip_entry_reads(patch)
+        r = client.post(
+            f"{API}/pictures/import",
+            files=[("file", ("r.zip", archive, "application/zip"))],
+        )
+    assert r.status_code == 200, r.text
+    assert wait_for_import_task(client, r.json()["task_id"])["status"] == "completed"
+    assert reads, "the zip's entries were never read"
+    assert not any(on_loop for _, on_loop in reads), reads
+
+
+# ---------------------------------------------------------------------------
+# A cancelled upload keeps its session and its files until the worker thread
+# copying it has stopped, and that copy stops within one chunk. These call the
+# upload route's coroutine directly so the test can cancel it the way a server
+# shutdown does.
+# ---------------------------------------------------------------------------
+
+_CANCELLED_BATCH = "test-cancelled-upload"
+
+
+class _GatedUploadFile(io.BytesIO):
+    """An upload's spooled file that counts the reads made off the event loop
+    and holds the first one *holds_at* picks until the test releases it."""
+
+    def __init__(self, data: bytes, holds_at):
+        super().__init__(data)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.reads_off_loop = 0
+        self.reads_when_held = None
+        self._holds_at = holds_at
+        self._held = False
+
+    def read(self, size=-1):
+        if not _on_event_loop():
+            self.reads_off_loop += 1
+            if not self._held and self._holds_at(self):
+                self._held = True
+                self.reads_when_held = self.reads_off_loop
+                self.entered.set()
+                if not self.release.wait(60):
+                    raise RuntimeError("test gate was never released")
+        return super().read(size)
+
+
+def _gated_upload(as_zip, staging_dir):
+    """A 3 MiB file held at its second chunk, or a stored zip of three entries
+    held at the first chunk of the second, a 3 MiB entry, once it is being
+    written into *staging_dir*."""
+    if as_zip:
+        data = _zip_bytes(
+            {
+                "s1.png": b"\x01" * 300_000,
+                "s2.png": b"\x02" * (3 * _MIB),
+                "s3.png": b"\x03" * 300_000,
+            }
+        )
+        source = _GatedUploadFile(
+            data, lambda _source: len(os.listdir(staging_dir)) >= 2
+        )
+        name = "s.zip"
+    else:
+        data = bytes(range(256)) * (3 * _MIB // 256)
+        source = _GatedUploadFile(data, lambda source: source.reads_off_loop == 2)
+        name = "s.png"
+    return source, UploadFile(file=source, filename=name, size=len(data))
+
+
+def _stage_files_route(srv):
+    """The upload route's coroutine, bound to *srv* the way the server binds it."""
+    router = APIRouter()
+    import_mod.register_routes(router, srv)
+    [endpoint] = [
+        route.endpoint
+        for route in router.routes
+        if route.path == "/pictures/import/staging/{staging_id}/files"
+        and "POST" in route.methods
+    ]
+    return endpoint
+
+
+def _call_stage_files(srv, staging_id, upload):
+    """The upload route's coroutine for one file, under the session's library."""
+    session = srv.staging_sessions[staging_id]
+    lease = SimpleNamespace(
+        library_uuid=session["library_uuid"], generation=session["generation"]
+    )
+    request = SimpleNamespace(state=SimpleNamespace(library_lease=lease))
+    return _stage_files_route(srv)(
+        request,
+        staging_id,
+        file=[upload],
+        key=[],
+        idempotency_key=f'"{_CANCELLED_BATCH}"',
+    )
+
+
+def _upload_state(session) -> dict:
+    with session["lock"]:
+        return {
+            "inflight": session["inflight"],
+            "batches": {key: rec["state"] for key, rec in session["batches"].items()},
+            "staged": [entry["file_path"] for entry in session["staged_files"]],
+        }
+
+
+async def _wait_for_the_gate(source, task):
+    deadline = time.monotonic() + 30
+    while not source.entered.is_set():
+        if task.done():
+            task.result()
+            raise AssertionError("the upload finished without reaching the gate")
+        assert time.monotonic() < deadline, "the upload never reached the gate"
+        await asyncio.sleep(0.01)
+
+
+async def _cancel_at_the_gate(srv, staging_id, source, upload) -> dict:
+    """Start the upload, cancel it while its copy is held, give the cancel
+    half a second, then release the copy. Returns what the session and the
+    request looked like just before the release."""
+    session = srv.staging_sessions[staging_id]
+    task = asyncio.create_task(_call_stage_files(srv, staging_id, upload))
+    try:
+        await _wait_for_the_gate(source, task)
+        task.cancel()
+        await asyncio.wait({task}, timeout=0.5)
+        held = {"request_done": task.done(), **_upload_state(session)}
+    finally:
+        source.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    return held
+
+
+@pytest.mark.parametrize("as_zip", [False, True], ids=["plain", "zip"])
+def test_a_cancelled_upload_keeps_its_session_until_the_copy_stops(shared, as_zip):
+    srv, client = shared
+    staging_id = _open_session(client)
+    session = srv.staging_sessions[staging_id]
+    staging_dir = _staging_dir(srv, staging_id)
+    before = _upload_state(session)
+    source, upload = _gated_upload(as_zip, staging_dir)
+
+    held = asyncio.run(_cancel_at_the_gate(srv, staging_id, source, upload))
+
+    assert held == {
+        "request_done": False,
+        "inflight": 1,
+        "batches": {_CANCELLED_BATCH: "in_progress"},
+        "staged": before["staged"],
+    }
+    assert _upload_state(session) == {
+        "inflight": 0,
+        "batches": {},
+        "staged": before["staged"],
+    }
+    assert os.listdir(staging_dir) == []
+
+
+@pytest.mark.parametrize("as_zip", [False, True], ids=["plain", "zip"])
+def test_a_torn_down_loop_waits_for_the_upload_copy(shared, as_zip):
+    srv, client = shared
+    staging_id = _open_session(client)
+    session = srv.staging_sessions[staging_id]
+    staging_dir = _staging_dir(srv, staging_id)
+    source, upload = _gated_upload(as_zip, staging_dir)
+    at_release = {}
+
+    def release_later():
+        if source.entered.wait(30):
+            time.sleep(0.5)
+            at_release.update(_upload_state(session))
+        source.release.set()
+
+    async def leave_while_copying():
+        task = asyncio.create_task(_call_stage_files(srv, staging_id, upload))
+        await _wait_for_the_gate(source, task)
+        # Returning with the upload still running makes asyncio.run cancel it.
+
+    timer = threading.Thread(target=release_later)
+    timer.start()
+    try:
+        asyncio.run(leave_while_copying())
+    finally:
+        source.release.set()
+        timer.join()
+
+    assert at_release["inflight"] == 1, at_release
+    state = _upload_state(session)
+    assert (state["inflight"], state["batches"]) == (0, {}), state
+    assert os.listdir(staging_dir) == []
+
+
+def _record_zip_members_opened(patch, source) -> list:
+    """The names of the entries opened in the zip read from *source*."""
+    opened = []
+    real_open = zipfile.ZipFile.open
+
+    def recording_open(self, name, *args, **kwargs):
+        if self.fp is source:
+            opened.append(getattr(name, "filename", name))
+        return real_open(self, name, *args, **kwargs)
+
+    patch.setattr(zipfile.ZipFile, "open", recording_open)
+    return opened
+
+
+def _signal_when_the_copy_ends(patch, as_zip, source) -> threading.Event:
+    """An event set once the worker thread is done with *source*, however its
+    copy ended: the plain copy returns, or the zip around *source* closes."""
+    ended = threading.Event()
+    if as_zip:
+        real_exit = zipfile.ZipFile.__exit__
+
+        def exit_and_signal(self, *exc_info):
+            ours = self.fp is source
+            try:
+                return real_exit(self, *exc_info)
+            finally:
+                if ours:
+                    ended.set()
+
+        patch.setattr(zipfile.ZipFile, "__exit__", exit_and_signal)
+    else:
+        real_copy = import_mod._copy_upload_part
+
+        def copy_and_signal(*args, **kwargs):
+            try:
+                return real_copy(*args, **kwargs)
+            finally:
+                ended.set()
+
+        patch.setattr(import_mod, "_copy_upload_part", copy_and_signal)
+    return ended
+
+
+@pytest.mark.parametrize("as_zip", [False, True], ids=["plain", "zip"])
+def test_a_cancelled_upload_stops_copying_within_one_chunk(shared, monkeypatch, as_zip):
+    srv, client = shared
+    staging_id = _open_session(client)
+    staging_dir = _staging_dir(srv, staging_id)
+    source, upload = _gated_upload(as_zip, staging_dir)
+
+    with monkeypatch.context() as patch:
+        opened = _record_zip_members_opened(patch, source)
+        copy_ended = _signal_when_the_copy_ends(patch, as_zip, source)
+        asyncio.run(_cancel_at_the_gate(srv, staging_id, source, upload))
+        assert copy_ended.wait(30), "the copy never ended"
+
+    # The copy read nothing more from the upload after the held chunk.
+    if as_zip:
+        assert source.reads_off_loop == source.reads_when_held
+        assert opened == ["s1.png", "s2.png"]
+    else:
+        # The held read was the second 1 MiB chunk of three.
+        assert source.reads_off_loop == source.reads_when_held == 2
+    assert os.listdir(staging_dir) == []

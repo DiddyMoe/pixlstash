@@ -1,3 +1,5 @@
+import asyncio
+import contextvars
 import errno
 import functools
 import hashlib
@@ -27,6 +29,7 @@ from sqlalchemy import (
 )
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import select, Session
+from starlette.concurrency import run_in_threadpool
 from typing import Literal, Optional
 
 from pixlstash.database import DBPriority
@@ -75,6 +78,14 @@ _STAGING_MAX_FILES = 50_000
 _STAGING_MAX_FILE_BYTES = 20 * 1024**3  # 20 GB per streamed file / zip
 _STAGING_MAX_ZIP_ENTRIES = 50_000  # max files inside a single zip
 _STAGING_MAX_ZIP_DECOMPRESSED_BYTES = 50 * 1024**3  # 50 GB total decompressed
+
+# A caption file larger than this is left out of an import, by both import
+# paths. Captions are a short tag list and their text is held in memory until
+# the import runs.
+_MAX_SIDECAR_BYTES = 1024 * 1024
+
+# How much of an upload or zip entry is copied to disk at a time.
+_COPY_CHUNK_BYTES = 1024 * 1024
 
 # Reaper bounds. An opened-but-never-committed session leaks its .staging/ dir
 # and memory; a finished session is never popped otherwise. The reaper (run
@@ -324,6 +335,103 @@ def _remove_batch_files(staging_id: str, paths: list[str]) -> None:
                 path,
                 exc,
             )
+
+
+class _UploadCopyStopped(Exception):
+    """Raised on the worker thread by an upload's copy once the request that
+    started it is cancelled, so the copy ends within one chunk. Neither an
+    ``OSError`` nor a ``BadZipFile``: a stopped upload is not reported as
+    unreadable, skipped or out of disk."""
+
+
+async def _copy_upload_off_the_loop(
+    staging_id: str, filename: Optional[str], copy, *args
+):
+    """Run *copy* on a worker thread and return what it returns.
+
+    *copy* is a blocking copy of one upload into the staging dir. It gets a
+    ``threading.Event`` as its last argument and raises ``_UploadCopyStopped``
+    before its next chunk once that is set.
+
+    A cancelled request keeps its upload lease and its files until the copy
+    has stopped writing: the cancel sets the event, the request waits for the
+    worker thread to return, and only then does the cancellation reach the
+    caller, whose ``finally`` removes the files. The copy runs as a plain
+    executor future, not a task, so tearing down the event loop cancels the
+    request but not the copy, and the request still waits for it.
+    """
+    loop = asyncio.get_running_loop()
+    stop = threading.Event()
+    future = loop.run_in_executor(
+        None, contextvars.copy_context().run, copy, *args, stop
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        stop.set()
+        logger.info(
+            "Staging %s: upload %s was cancelled; waiting for its copy to stop "
+            "before its files are removed",
+            staging_id,
+            filename,
+        )
+        cancelled_again = False
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                if not cancelled_again:
+                    cancelled_again = True
+                    logger.warning(
+                        "Staging %s: upload %s was cancelled again while its "
+                        "copy is stopping; still waiting for the copy, since "
+                        "removing its files before it ends would leave the "
+                        "rest of the copy on disk with no owner",
+                        staging_id,
+                        filename,
+                    )
+        error = None if future.cancelled() else future.exception()
+        if error is not None and not isinstance(error, _UploadCopyStopped):
+            logger.error(
+                "Staging %s: the copy of cancelled upload %s failed: %s",
+                staging_id,
+                filename,
+                error,
+                exc_info=error,
+            )
+        raise
+
+
+def _copy_upload_part(upload: UploadFile, dest_path: str, stop: threading.Event) -> int:
+    """Copy an uploaded part into *dest_path* a chunk at a time; return the
+    bytes written.
+
+    Blocking file I/O: the part is a spooled temporary file. Call it through
+    ``_copy_upload_off_the_loop`` so neither the reads nor the writes hold the
+    event loop. Raises ``_UploadCopyStopped`` before the next chunk once
+    *stop* is set.
+    """
+    source = upload.file
+    source.seek(0)
+    written = 0
+    with open(dest_path, "wb") as out:
+        while True:
+            if stop.is_set():
+                raise _UploadCopyStopped(f"copy of {upload.filename!r} stopped")
+            chunk = source.read(_COPY_CHUNK_BYTES)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > _STAGING_MAX_FILE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"File '{upload.filename}' exceeds the "
+                        f"{_STAGING_MAX_FILE_BYTES // 1024**3} GB limit"
+                    ),
+                )
+            out.write(chunk)
+    return written
 
 
 def _staging_file_limit(staged: int) -> HTTPException:
@@ -643,74 +751,94 @@ def register_routes(router, server):
         uploaded_file_stems: list[str] = []
         sidecar_text_by_stem: dict[str, str] = {}
         allowed_caption_exts = {".txt"}
+
+        def _read_zip(upload: UploadFile) -> None:
+            """Read an uploaded zip's media and caption entries.
+
+            Blocking file I/O on the spooled temporary file: call it through
+            ``run_in_threadpool``. Each media entry is read whole, because the
+            import takes the media as bytes.
+            """
+            upload_file = upload.file
+            upload_file.seek(0, 2)
+            upload_size = upload_file.tell()
+            upload_file.seek(0)
+            if upload_size == 0:
+                return
+            if upload_size > _MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Uploaded file '{upload.filename}' exceeds the "
+                        f"{_MAX_UPLOAD_BYTES // 1024**3} GB limit."
+                    ),
+                )
+            with zipfile.ZipFile(upload_file) as zip_file:
+                entries = [i for i in zip_file.infolist() if not i.is_dir()]
+                if len(entries) > _MAX_ZIP_ENTRIES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Zip '{upload.filename}' contains too many files (max {_MAX_ZIP_ENTRIES:,}).",
+                    )
+                total_decompressed = sum(i.file_size for i in entries)
+                if total_decompressed > _MAX_ZIP_DECOMPRESSED_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Zip '{upload.filename}' decompressed size exceeds the "
+                            f"{_MAX_ZIP_DECOMPRESSED_BYTES // 1024**3} GB limit."
+                        ),
+                    )
+                added = 0
+                for info in entries:
+                    inner_ext = os.path.splitext(info.filename)[1].lower()
+                    is_caption = inner_ext in allowed_caption_exts
+                    if not is_caption and inner_ext not in STAGING_ALLOWED_MEDIA_EXTS:
+                        continue
+                    with zip_file.open(info) as handle:
+                        data = (
+                            handle.read(_MAX_SIDECAR_BYTES + 1)
+                            if is_caption
+                            else handle.read()
+                        )
+                    if not data:
+                        continue
+                    base_name = os.path.basename(info.filename)
+                    stem = _normalise_sidecar_stem(base_name)
+                    if is_caption:
+                        if len(data) > _MAX_SIDECAR_BYTES:
+                            logger.warning(
+                                "Leaving out caption %s in zip %s: "
+                                "larger than %d bytes",
+                                info.filename,
+                                upload.filename,
+                                _MAX_SIDECAR_BYTES,
+                            )
+                            continue
+                        sidecar_text_by_stem.setdefault(
+                            stem,
+                            data.decode("utf-8", errors="ignore"),
+                        )
+                        continue
+                    uploaded_files.append((data, inner_ext, base_name))
+                    uploaded_file_stems.append(stem)
+                    added += 1
+                if added == 0:
+                    logger.warning(
+                        "No valid media files found in zip: %s",
+                        upload.filename,
+                    )
+
         if file is not None:
             for upload in file:
                 if not upload.filename:
                     continue
                 ext = os.path.splitext(upload.filename)[1].lower()
                 if ext == ".zip":
-                    # Work directly from the spooled temp file to avoid loading
-                    # the entire archive as a bytes object in memory (which would
-                    # require as much RAM as the zip is large, e.g. 16+ GB).
-                    upload_file = upload.file
-                    upload_file.seek(0, 2)
-                    upload_size = upload_file.tell()
-                    upload_file.seek(0)
-                    if upload_size == 0:
-                        continue
-                    if upload_size > _MAX_UPLOAD_BYTES:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(
-                                f"Uploaded file '{upload.filename}' exceeds the "
-                                f"{_MAX_UPLOAD_BYTES // 1024**3} GB limit."
-                            ),
-                        )
+                    # Read from the spooled temp file, never the whole archive
+                    # as one bytes object, and on a worker thread.
                     try:
-                        with zipfile.ZipFile(upload_file) as zip_file:
-                            entries = [i for i in zip_file.infolist() if not i.is_dir()]
-                            if len(entries) > _MAX_ZIP_ENTRIES:
-                                raise HTTPException(
-                                    status_code=413,
-                                    detail=f"Zip '{upload.filename}' contains too many files (max {_MAX_ZIP_ENTRIES:,}).",
-                                )
-                            total_decompressed = sum(i.file_size for i in entries)
-                            if total_decompressed > _MAX_ZIP_DECOMPRESSED_BYTES:
-                                raise HTTPException(
-                                    status_code=413,
-                                    detail=(
-                                        f"Zip '{upload.filename}' decompressed size exceeds the "
-                                        f"{_MAX_ZIP_DECOMPRESSED_BYTES // 1024**3} GB limit."
-                                    ),
-                                )
-                            added = 0
-                            for info in entries:
-                                inner_ext = os.path.splitext(info.filename)[1].lower()
-                                if (
-                                    inner_ext not in STAGING_ALLOWED_MEDIA_EXTS
-                                    and inner_ext not in allowed_caption_exts
-                                ):
-                                    continue
-                                with zip_file.open(info) as handle:
-                                    data = handle.read()
-                                if not data:
-                                    continue
-                                base_name = os.path.basename(info.filename)
-                                stem = _normalise_sidecar_stem(base_name)
-                                if inner_ext in allowed_caption_exts:
-                                    sidecar_text_by_stem.setdefault(
-                                        stem,
-                                        data.decode("utf-8", errors="ignore"),
-                                    )
-                                    continue
-                                uploaded_files.append((data, inner_ext, base_name))
-                                uploaded_file_stems.append(stem)
-                                added += 1
-                            if added == 0:
-                                logger.warning(
-                                    "No valid media files found in zip: %s",
-                                    upload.filename,
-                                )
+                        await run_in_threadpool(_read_zip, upload)
                     except zipfile.BadZipFile as exc:
                         logger.error("Invalid zip file: %s", upload.filename)
                         raise HTTPException(
@@ -718,8 +846,19 @@ def register_routes(router, server):
                             detail="Invalid zip file",
                         ) from exc
                 else:
-                    # Non-zip files are typically small; buffer normally.
-                    contents = await upload.read()
+                    if ext in allowed_caption_exts:
+                        contents = await upload.read(_MAX_SIDECAR_BYTES + 1)
+                        if len(contents) > _MAX_SIDECAR_BYTES:
+                            logger.warning(
+                                "Leaving out caption %s: larger than %d bytes",
+                                upload.filename,
+                                _MAX_SIDECAR_BYTES,
+                            )
+                            continue
+                    else:
+                        # Media is held whole until the import thread writes
+                        # it, because the import takes it as bytes.
+                        contents = await upload.read()
                     if not contents:
                         continue
                     if len(contents) > _MAX_UPLOAD_BYTES:
@@ -1598,16 +1737,31 @@ def register_routes(router, server):
             if staged + len(batch_entries) >= _STAGING_MAX_FILES:
                 raise _staging_file_limit(staged)
 
-        def _stage_media_bytes(data: bytes, ext: str, original_name: str) -> bool:
-            """Write already-read media bytes into the staging dir (zip entries)."""
-            if not data:
+        def _stage_zip_entry(
+            zip_file: zipfile.ZipFile,
+            info: zipfile.ZipInfo,
+            ext: str,
+            stop: threading.Event,
+        ) -> bool:
+            """Copy one media entry of a zip into the staging dir, a chunk at a
+            time, raising ``_UploadCopyStopped`` before the next chunk once
+            *stop* is set."""
+            if info.file_size == 0:
                 return False
             _check_file_cap()
             dest_path = os.path.join(staging_dir, f"{uuid.uuid4()}{ext}")
             written_paths.append(dest_path)
             try:
-                with open(dest_path, "wb") as out:
-                    out.write(data)
+                with zip_file.open(info) as src, open(dest_path, "wb") as out:
+                    while True:
+                        if stop.is_set():
+                            raise _UploadCopyStopped(
+                                f"copy of {info.filename!r} stopped"
+                            )
+                        chunk = src.read(_COPY_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        out.write(chunk)
             except OSError as exc:
                 _remove_batch_files(staging_id, [dest_path])
                 if exc.errno in _DISK_FULL_ERRNOS:
@@ -1615,18 +1769,105 @@ def register_routes(router, server):
                 logger.error(
                     "Staging %s: failed to write extracted file %s: %s",
                     staging_id,
-                    original_name,
+                    info.filename,
                     exc,
                 )
                 return False
+            except Exception:
+                # A corrupt entry fails part-way through the copy, and a
+                # cancelled upload stops part-way: leave no partial file
+                # behind, whatever happens to the rest of the zip.
+                _remove_batch_files(staging_id, [dest_path])
+                raise
             batch_entries.append(
                 {
                     "file_path": dest_path,
-                    "original_file_name": os.path.basename(original_name),
+                    "original_file_name": os.path.basename(info.filename),
                     "client_key": current_key,
                 }
             )
             return True
+
+        def _stage_zip(upload: UploadFile, stop: threading.Event) -> int:
+            """Unpack an uploaded zip into the staging area; return how many
+            media entries were staged.
+
+            Media entries are staged and .txt entries kept as sidecars, with
+            the one-shot import's entry and size guards. Blocking file I/O
+            (the archive is a spooled temporary file and every entry is copied
+            to disk a chunk at a time): call it through
+            ``_copy_upload_off_the_loop``. Raises ``_UploadCopyStopped`` before
+            the next entry, or the next chunk of one, once *stop* is set.
+            """
+            upload_file = upload.file
+            upload_file.seek(0, 2)
+            upload_size = upload_file.tell()
+            upload_file.seek(0)
+            if upload_size == 0:
+                return 0
+            if upload_size > _STAGING_MAX_FILE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Zip '{upload.filename}' exceeds the "
+                        f"{_STAGING_MAX_FILE_BYTES // 1024**3} GB limit"
+                    ),
+                )
+            with zipfile.ZipFile(upload_file) as zip_file:
+                entries = [i for i in zip_file.infolist() if not i.is_dir()]
+                if len(entries) > _STAGING_MAX_ZIP_ENTRIES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Zip '{upload.filename}' contains too "
+                            f"many files (max "
+                            f"{_STAGING_MAX_ZIP_ENTRIES:,})."
+                        ),
+                    )
+                if (
+                    sum(i.file_size for i in entries)
+                    > _STAGING_MAX_ZIP_DECOMPRESSED_BYTES
+                ):
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Zip '{upload.filename}' decompressed "
+                            f"size exceeds the "
+                            f"{_STAGING_MAX_ZIP_DECOMPRESSED_BYTES // 1024**3}"
+                            " GB limit."
+                        ),
+                    )
+                added = 0
+                for info in entries:
+                    if stop.is_set():
+                        raise _UploadCopyStopped(
+                            f"unpacking of {upload.filename!r} stopped"
+                        )
+                    inner_ext = os.path.splitext(info.filename)[1].lower()
+                    base_name = os.path.basename(info.filename)
+                    if inner_ext in STAGING_ALLOWED_CAPTION_EXTS:
+                        with zip_file.open(info) as handle:
+                            data = handle.read(_MAX_SIDECAR_BYTES + 1)
+                        if len(data) > _MAX_SIDECAR_BYTES:
+                            logger.warning(
+                                "Staging %s: leaving out caption %s in zip %s: "
+                                "larger than %d bytes",
+                                staging_id,
+                                info.filename,
+                                upload.filename,
+                                _MAX_SIDECAR_BYTES,
+                            )
+                        elif data:
+                            batch_sidecars.setdefault(
+                                _normalise_sidecar_stem(base_name),
+                                data.decode("utf-8", errors="ignore"),
+                            )
+                        continue
+                    if inner_ext not in STAGING_ALLOWED_MEDIA_EXTS:
+                        continue
+                    if _stage_zip_entry(zip_file, info, inner_ext, stop):
+                        added += 1
+                return added
 
         try:
             for upload_index, upload in enumerate(file):
@@ -1641,7 +1882,16 @@ def register_routes(router, server):
                 if ext in STAGING_ALLOWED_CAPTION_EXTS:
                     try:
                         await upload.seek(0)
-                        raw = await upload.read()
+                        raw = await upload.read(_MAX_SIDECAR_BYTES + 1)
+                        if len(raw) > _MAX_SIDECAR_BYTES:
+                            logger.warning(
+                                "Staging %s: skipping caption %s: larger than %d bytes",
+                                staging_id,
+                                upload.filename,
+                                _MAX_SIDECAR_BYTES,
+                            )
+                            skipped.append(upload.filename)
+                            continue
                         batch_sidecars.setdefault(
                             _normalise_sidecar_stem(upload.filename),
                             raw.decode("utf-8", errors="ignore"),
@@ -1657,80 +1907,22 @@ def register_routes(router, server):
                         skipped.append(upload.filename)
                     continue
 
-                # --- Zip archive: extract server-side into the staging area,
-                # mirroring the one-shot import's zip handling (media entries
-                # staged, .txt entries stored as sidecars, same entry/size
-                # guards). ---
+                # --- Zip archive: extracted server-side into the staging
+                # area, on a worker thread. A cancelled request waits for the
+                # unpacking to stop before its ``finally`` releases anything. ---
                 if ext == ".zip":
                     try:
-                        await upload.seek(0)
-                        upload_file = upload.file
-                        upload_file.seek(0, 2)
-                        upload_size = upload_file.tell()
-                        upload_file.seek(0)
-                        if upload_size == 0:
-                            skipped.append(upload.filename)
-                            continue
-                        if upload_size > _STAGING_MAX_FILE_BYTES:
-                            raise HTTPException(
-                                status_code=413,
-                                detail=(
-                                    f"Zip '{upload.filename}' exceeds the "
-                                    f"{_STAGING_MAX_FILE_BYTES // 1024**3} GB limit"
-                                ),
+                        if await _copy_upload_off_the_loop(
+                            staging_id, upload.filename, _stage_zip, upload
+                        ):
+                            received.append(upload.filename)
+                        else:
+                            logger.warning(
+                                "Staging %s: no valid media in zip %s",
+                                staging_id,
+                                upload.filename,
                             )
-                        with zipfile.ZipFile(upload_file) as zip_file:
-                            entries = [i for i in zip_file.infolist() if not i.is_dir()]
-                            if len(entries) > _STAGING_MAX_ZIP_ENTRIES:
-                                raise HTTPException(
-                                    status_code=413,
-                                    detail=(
-                                        f"Zip '{upload.filename}' contains too "
-                                        f"many files (max "
-                                        f"{_STAGING_MAX_ZIP_ENTRIES:,})."
-                                    ),
-                                )
-                            if (
-                                sum(i.file_size for i in entries)
-                                > _STAGING_MAX_ZIP_DECOMPRESSED_BYTES
-                            ):
-                                raise HTTPException(
-                                    status_code=413,
-                                    detail=(
-                                        f"Zip '{upload.filename}' decompressed "
-                                        f"size exceeds the "
-                                        f"{_STAGING_MAX_ZIP_DECOMPRESSED_BYTES // 1024**3}"
-                                        " GB limit."
-                                    ),
-                                )
-                            added = 0
-                            for info in entries:
-                                inner_ext = os.path.splitext(info.filename)[1].lower()
-                                base_name = os.path.basename(info.filename)
-                                if inner_ext in STAGING_ALLOWED_CAPTION_EXTS:
-                                    with zip_file.open(info) as handle:
-                                        data = handle.read()
-                                    if data:
-                                        batch_sidecars.setdefault(
-                                            _normalise_sidecar_stem(base_name),
-                                            data.decode("utf-8", errors="ignore"),
-                                        )
-                                    continue
-                                if inner_ext not in STAGING_ALLOWED_MEDIA_EXTS:
-                                    continue
-                                with zip_file.open(info) as handle:
-                                    data = handle.read()
-                                if _stage_media_bytes(data, inner_ext, base_name):
-                                    added += 1
-                            if added:
-                                received.append(upload.filename)
-                            else:
-                                logger.warning(
-                                    "Staging %s: no valid media in zip %s",
-                                    staging_id,
-                                    upload.filename,
-                                )
-                                skipped.append(upload.filename)
+                            skipped.append(upload.filename)
                     except HTTPException:
                         raise
                     except zipfile.BadZipFile:
@@ -1742,8 +1934,9 @@ def register_routes(router, server):
                         skipped.append(upload.filename)
                     continue
 
-                # --- Plain media: stream to disk to avoid buffering a large
-                # file. ---
+                # --- Plain media: copied to disk a chunk at a time, on a
+                # worker thread. A cancelled request waits for the copy to
+                # stop before its ``finally`` releases anything. ---
                 if ext not in STAGING_ALLOWED_MEDIA_EXTS:
                     logger.warning(
                         "Staging %s: skipping unsupported file %s",
@@ -1756,25 +1949,14 @@ def register_routes(router, server):
                 dest_name = f"{uuid.uuid4()}{ext}"
                 dest_path = os.path.join(staging_dir, dest_name)
                 written_paths.append(dest_path)
-                written = 0
                 try:
-                    await upload.seek(0)
-                    with open(dest_path, "wb") as out:
-                        while True:
-                            chunk = await upload.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            written += len(chunk)
-                            if written > _STAGING_MAX_FILE_BYTES:
-                                raise HTTPException(
-                                    status_code=413,
-                                    detail=(
-                                        f"File '{upload.filename}' exceeds the "
-                                        f"{_STAGING_MAX_FILE_BYTES // 1024**3} GB "
-                                        "limit"
-                                    ),
-                                )
-                            out.write(chunk)
+                    written = await _copy_upload_off_the_loop(
+                        staging_id,
+                        upload.filename,
+                        _copy_upload_part,
+                        upload,
+                        dest_path,
+                    )
                 except HTTPException:
                     raise
                 except Exception as exc:

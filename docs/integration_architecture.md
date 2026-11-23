@@ -2565,8 +2565,10 @@ zip over its size limit, or a dropped connection) none of its files stays on
 disk, a zip's extracted entries included, and its key is not remembered, so
 the same request may simply be sent again. A retry of an accepted batch is
 answered even after the session was committed. `skipped[]` lists files the
-server could not use (unsupported, empty, unreadable); a full disk is never
-reported as skipped.
+server could not use (unsupported, empty, unreadable, or a caption `.txt` over
+1 MiB); a full disk is never reported as skipped. A caption over 1 MiB inside a
+zip is left out the same way, but `skipped[]` names only files the client sent,
+so it lists the zip only when the zip held no usable media.
 
 **Committing: `POST /pictures/import/staging/{id}/commit`** is idempotent per
 session.
@@ -2616,7 +2618,10 @@ not remove so the next run retries. A failed import removes its staged files. A
 `.staging/` entry no session owns (a restart between upload and commit) is
 removed by the next reaper run once it is older than the idle TTL.
 
-The one-shot `POST /pictures/import` (the ComfyUI node's route) is unchanged.
+The one-shot `POST /pictures/import` (the ComfyUI node's route) has none of the
+above. It shares only the caption limit: a caption over 1 MiB, sent or inside a
+zip, is left out of the import (that route answers with a task id and no
+`skipped[]`).
 
 
 ---
