@@ -1,8 +1,10 @@
-// Model shelf resource - /adapters and /checkpoints.
+// Model shelf resource - /adapters, /checkpoints and /models.
 //
 // Two route blocks, one table (see `pixlstash/routes/model_shelf.py`). They
 // converge on the same query filtered by `file_kind`; the blocks stay apart
-// because their addressing differs. Three consequences the caller must honour:
+// because their addressing differs. `GET /models` is the same list for several
+// kinds in one read, which is what a caller wanting more than one kind uses.
+// Three consequences the caller must honour:
 //
 //   * `attachments` come back ON THE LIST as well as on the detail, so the
 //     shelf never fetches them a row at a time.
@@ -76,6 +78,33 @@ export async function listCheckpoints({ baseModel, q } = {}) {
   if (q) params.q = q;
   const body = await unwrap(apiClient.get("/checkpoints", { params }));
   return Array.isArray(body?.checkpoints) ? body.checkpoints : [];
+}
+
+/**
+ * List the shelf's rows of several kinds in one read.
+ *
+ * Each row is the one `/adapters` or `/checkpoints` returns for its kind, but
+ * the server's whole-library lookups behind the rows (locations, attachments,
+ * picture counts) are paid once for the lot rather than once per kind. The
+ * order across kinds is not a contract.
+ *
+ * Sent as `file_kind=a&file_kind=b`, which is what FastAPI's `list[str]`
+ * reads. Axios' default array form is `file_kind[]=`, a key the route does
+ * not declare: it would answer 422 for a missing `file_kind`.
+ *
+ * @param {Array<string>} fileKinds - any of `adapter`, `unknown`, `vae`,
+ *   `text_encoder`, `controlnet`, `upscaler`, `engine` and `checkpoint`.
+ *   Anything else is a 400.
+ * @returns {Promise<Array<Object>>} the `models` array of the response body.
+ */
+export async function listModels(fileKinds) {
+  const body = await unwrap(
+    apiClient.get("/models", {
+      params: { file_kind: fileKinds },
+      paramsSerializer: { indexes: null },
+    }),
+  );
+  return Array.isArray(body?.models) ? body.models : [];
 }
 
 /**

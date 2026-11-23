@@ -13,6 +13,7 @@
 // So these assert the query string, not the arguments.
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import axios from "axios";
 
 vi.mock("../utils/apiClient", () => ({
   API_BASE_URL: "/api/v1",
@@ -26,6 +27,7 @@ import {
   forgetModels,
   listAdapters,
   listCheckpoints,
+  listModels,
   lookupBaseModelsOnline,
   putMemberVerdict,
   putSetVerdict,
@@ -95,6 +97,22 @@ describe("api/modelShelf listAdapters", () => {
     // sent must not reach them as `undefined`.
     apiClient.get.mockResolvedValue({ data: {} });
     expect(await listAdapters()).toEqual([]);
+  });
+});
+
+describe("api/modelShelf listModels", () => {
+  it("repeats file_kind once per kind, the form a FastAPI list reads", async () => {
+    apiClient.get.mockResolvedValue({ data: { models: [{ id: 1 }] } });
+    expect(await listModels(["adapter", "checkpoint"])).toEqual([{ id: 1 }]);
+    const [url, config] = apiClient.get.mock.calls[0];
+    // Through axios' own serialiser rather than a comparison with its config:
+    // the default would send `file_kind[]=`, which the route does not declare.
+    expect(axios.getUri({ url, ...config })).toBe(
+      "/models?file_kind=adapter&file_kind=checkpoint",
+    );
+
+    apiClient.get.mockResolvedValue({ data: {} });
+    expect(await listModels(["vae"])).toEqual([]);
   });
 });
 

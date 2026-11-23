@@ -17,6 +17,18 @@ vi.mock("../../api/modelShelf", () => ({
   BASE_MODEL_UNASSIGNED: "UNASSIGNED",
   listAdapters: (...args) => listAdapters(...args),
   listCheckpoints: (...args) => listCheckpoints(...args),
+  // The store reads every ticked kind in one call; each kind is answered by
+  // the double that answers it on its own route.
+  listModels: async (fileKinds) =>
+    (
+      await Promise.all(
+        fileKinds.map((fileKind) => {
+          if (fileKind === "adapter") return listAdapters();
+          if (fileKind === "checkpoint") return listCheckpoints();
+          return listAdapters({ fileKind });
+        }),
+      )
+    ).flat(),
 }));
 
 import ShelfShowPanel from "./ShelfShowPanel.vue";
