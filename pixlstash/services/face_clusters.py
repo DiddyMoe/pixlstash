@@ -137,9 +137,7 @@ def cluster_faces(
             unclustered.append(faces[indices[0]][0])
             continue
         vecs = units[indices]
-        sims = vecs @ vecs.T
-        n = len(indices)
-        cohesion = float((sims.sum() - n) / (n * (n - 1)))
+        cohesion = _cohesion(vecs)
         members = sorted(
             zip((faces[i][0] for i in indices), centrality(vecs), strict=True),
             key=lambda m: (-m[1], m[0]),
@@ -147,6 +145,17 @@ def cluster_faces(
         clusters.append(Cluster(members, cohesion, centroid(vecs)))
     clusters.sort(key=lambda c: (-len(c.members), c.members[0][0]))
     return clusters, sorted(unclustered)
+
+
+def _cohesion(units: np.ndarray) -> float:
+    """The mean likeness between every two of the unit *units*; 1.0 for one."""
+    n = len(units)
+    if n < 2:
+        return 1.0
+    # Every pairwise likeness summed is the squared length of the summed
+    # vectors, so no n-by-n likeness matrix is built.
+    summed = units.sum(axis=0)
+    return float((summed @ summed - n) / (n * (n - 1)))
 
 
 @dataclass

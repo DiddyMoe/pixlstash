@@ -167,43 +167,43 @@ def _mismatch_counts(
     Same-stack pairs first, then stored high-likeness pairs; a likeness pair
     whose two pictures share a stack is skipped (already counted). When
     ``picture_ids`` is provided, only pairs whose BOTH pictures are in scope
-    count (membership in ``alive``/``stack_of`` enforces this downstream).
+    count (membership in ``alive``/``stack_of`` enforces this downstream), and
+    every read is restricted to the scope in SQL. An empty scope returns ``{}``
+    without querying.
     """
-    alive = {
-        int(r)
-        for r in session.exec(select(Picture.id).where(Picture.deleted.is_(False)))
-    }
+    alive_query = select(Picture.id).where(Picture.deleted.is_(False))
+    stack_query = select(Picture.id, Picture.stack_id).where(
+        Picture.stack_id.is_not(None), Picture.deleted.is_(False)
+    )
+    # Scoped board: materialise the scope into a per-connection temp table once
+    # and filter the picture, tag and likeness reads below via ``IN (SELECT
+    # ...)``, so each returns in-scope rows rather than the whole library.
+    # Binding one SQL parameter per id instead would exceed SQLite's
+    # bound-parameter ceiling for a large scope (tens of thousands of pictures)
+    # and raise OperationalError. The table holds the requested ids, deleted
+    # ones included: ``alive`` drops those, and the ``in alive`` guards below
+    # drop their tag rows and pairs. A distinct table name keeps this from
+    # clobbering the caller's own scope table (see ``compute_tag_health_rows``).
+    scope_subq = None
     if picture_ids is not None:
-        alive &= picture_ids
+        if not picture_ids:
+            return {}
+        scope_subq = scope_id_subquery(
+            session, picture_ids, name="_pixlstash_scope_ids_mismatch"
+        )
+        alive_query = alive_query.where(Picture.id.in_(scope_subq))
+        stack_query = stack_query.where(Picture.id.in_(scope_subq))
+    alive = {int(r) for r in session.exec(alive_query)}
     stack_of: dict[int, int] = {
         int(pid): int(sid)
-        for pid, sid in session.exec(
-            select(Picture.id, Picture.stack_id).where(
-                Picture.stack_id.is_not(None), Picture.deleted.is_(False)
-            )
-        )
+        for pid, sid in session.exec(stack_query)
         if int(pid) in alive
     }
     tags_of: dict[int, set[str]] = defaultdict(set)
-    # Scoped board: read only in-scope tag rows rather than the whole Tag table
-    # (``alive`` is already narrowed to the scope above). An empty scope means no
-    # rows - skip the query so an empty ``.in_(())`` never runs. Unscoped, ``alive``
+    # Scoped board: read only in-scope tag rows rather than the whole Tag table.
+    # No live picture in scope means no rows - skip the query. Unscoped, ``alive``
     # is ~every non-deleted picture, so the whole-table scan is kept (and the
     # ``pid in alive`` guard still drops tags on deleted pictures).
-    # When scoped, materialise ``alive`` into a per-connection temp table once
-    # and filter via ``IN (SELECT ...)`` rather than binding one SQL parameter
-    # per id - a large scope (tens of thousands of pictures) would otherwise
-    # exceed SQLite's bound-parameter ceiling and raise OperationalError. The
-    # subquery is result-identical to ``.in_(alive)`` and is reused for the
-    # likeness-pairs query below (which binds ``alive`` at both endpoints). A
-    # distinct table name keeps this from clobbering the caller's own scope
-    # table (see ``compute_tag_health_rows``).
-    scope_subq = None
-    if picture_ids is not None and alive:
-        scope_subq = scope_id_subquery(
-            session, alive, name="_pixlstash_scope_ids_mismatch"
-        )
-
     tag_query = select(Tag.picture_id, Tag.tag)
     if picture_ids is not None:
         if not alive:
@@ -240,9 +240,9 @@ def _mismatch_counts(
 
     # Stored high-likeness pairs (canonical a < b, so each pair appears once).
     # Scoped board: both endpoints must be in scope (the Python guard below drops
-    # any pair with an endpoint outside ``alive``), so push that into SQL to avoid
-    # scanning every stored pair. Empty scope → no pairs. Unscoped keeps the full
-    # scan (``alive`` is ~the whole table there).
+    # any pair with an endpoint outside ``alive``), so push the scope into SQL to
+    # avoid scanning every stored pair. No live picture in scope → no pairs.
+    # Unscoped keeps the full scan (``alive`` is ~the whole table there).
     pair_query = select(
         PictureLikeness.picture_id_a, PictureLikeness.picture_id_b
     ).where(PictureLikeness.likeness >= MISMATCH_LIKENESS_THRESHOLD)
@@ -251,7 +251,7 @@ def _mismatch_counts(
             pairs: list = []
         else:
             # Both endpoints filtered via the shared temp-table subquery - this
-            # pair binds ``alive`` twice, so a plain ``.in_(alive)`` would hit
+            # pair binds the scope twice, so a plain ``.in_(ids)`` would hit
             # the parameter ceiling at half the scope size.
             pair_query = pair_query.where(
                 PictureLikeness.picture_id_a.in_(scope_subq),

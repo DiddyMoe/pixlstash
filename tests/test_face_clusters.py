@@ -1,5 +1,7 @@
 """Face clusters, on synthetic embeddings (no server)."""
 
+import tracemalloc
+
 import numpy as np
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -49,6 +51,59 @@ def test_the_planted_centre_is_the_most_central_member():
     scores = [c for _, c in cluster.members]
     assert scores == sorted(scores, reverse=True)
     assert np.allclose(centrality([person, person * 2]), [1.0, 1.0])
+
+
+def _pairwise_cohesion(units):
+    """The mean likeness of every two rows, read off the full likeness matrix."""
+    n = len(units)
+    return float(((units @ units.T).sum() - n) / (n * (n - 1)))
+
+
+def test_cohesion_is_the_mean_likeness_of_every_two_faces():
+    rng = np.random.default_rng(17)
+    person = rng.standard_normal(DIM)
+    for units in (
+        face_clusters._unit(rng.standard_normal((2, DIM))),
+        face_clusters._unit(rng.standard_normal((300, DIM))),
+        face_clusters._unit(person + rng.standard_normal((500, DIM)) * 0.2),
+    ):
+        assert face_clusters._cohesion(units) == pytest.approx(
+            _pairwise_cohesion(units), abs=1e-12
+        )
+    twins = face_clusters._unit(np.tile(person, (5, 1)))
+    assert face_clusters._cohesion(twins) == pytest.approx(1.0, abs=1e-12)
+    opposed = face_clusters._unit([person, -person])
+    assert face_clusters._cohesion(opposed) == pytest.approx(-1.0, abs=1e-12)
+    assert face_clusters._cohesion(face_clusters._unit([person])) == 1.0
+
+
+def test_each_clusters_cohesion_is_over_its_own_members():
+    rng = np.random.default_rng(29)
+    a, b = rng.standard_normal(DIM), rng.standard_normal(DIM)
+    faces = [(pid, a + rng.standard_normal(DIM) * 0.3) for pid in range(1, 21)]
+    faces += [(pid, b + rng.standard_normal(DIM) * 0.6) for pid in range(31, 46)]
+    clusters, unclustered = cluster_faces(faces, 0.3)
+    by_id = dict(faces)
+    assert unclustered == []
+    assert [sorted(pid for pid, _ in c.members) for c in clusters] == [
+        list(range(1, 21)),
+        list(range(31, 46)),
+    ]
+    for cluster in clusters:
+        units = face_clusters._unit([by_id[pid] for pid, _ in cluster.members])
+        assert cluster.cohesion == pytest.approx(_pairwise_cohesion(units), abs=1e-12)
+
+
+def test_cohesion_builds_no_pair_matrix():
+    """A likeness matrix of 3,000 faces is 72 MB of float64; the sum needs one row."""
+    units = face_clusters._unit(np.random.default_rng(23).standard_normal((3000, DIM)))
+    tracemalloc.start()
+    try:
+        face_clusters._cohesion(units)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 3000 * 3000 * 8 // 100
 
 
 def test_a_single_face_is_unclustered():
