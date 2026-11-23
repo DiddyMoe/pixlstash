@@ -1186,7 +1186,6 @@ import {
 import {
   listCharacters,
   getCharacterName,
-  getCharacterThumbnail,
   addCharacterFacesByFaceId,
 } from "../../api/characters";
 import { listStackPictures, setStackOrder } from "../../api/stacks";
@@ -5030,7 +5029,6 @@ onUnmounted(() => {
     clearTimeout(swipeHintTimer);
     swipeHintTimer = null;
   }
-  clearCharacterThumbnails();
   closeFallbackSaveDialog();
 });
 
@@ -5123,8 +5121,6 @@ const faceBboxes = ref([]);
 const detectionBboxes = ref([]);
 const characters = ref([]);
 const charactersLoading = ref(false);
-const characterThumbnails = ref({});
-let characterThumbnailEpoch = 0;
 let metadataRequestId = 0;
 let faceBboxesRequestId = 0;
 let detectionBboxesRequestId = 0;
@@ -5346,60 +5342,20 @@ function detectionBoxColor(det) {
   return faceBoxColor(detectionColorIndex.value.get(det?.label ?? "") ?? 0);
 }
 
+// The people list is read for the names only (the create-person flow picks the
+// next free default name from it); the lightbox shows no person's thumbnail.
 async function fetchCharacters() {
   if (!backendUrl.value || charactersLoading.value) return;
   charactersLoading.value = true;
-  const requestEpoch = (characterThumbnailEpoch += 1);
   try {
     const data = await listCharacters();
-    const list = Array.isArray(data) ? data : [];
-    characters.value = list;
-    await Promise.all(
-      list.map(async (char) => fetchCharacterThumbnail(char?.id, requestEpoch)),
-    );
+    characters.value = Array.isArray(data) ? data : [];
   } catch (e) {
     console.error("Failed to fetch characters:", e);
     characters.value = [];
   } finally {
-    if (requestEpoch === characterThumbnailEpoch) {
-      charactersLoading.value = false;
-    }
+    charactersLoading.value = false;
   }
-}
-
-async function fetchCharacterThumbnail(characterId, requestEpoch) {
-  if (!characterId || !backendUrl.value) return;
-  try {
-    const blob = await getCharacterThumbnail(characterId, {
-      cacheBuster: Date.now(),
-    });
-    if (requestEpoch !== characterThumbnailEpoch) return;
-    const blobUrl = URL.createObjectURL(blob);
-    const existing = characterThumbnails.value[characterId];
-    if (existing) {
-      URL.revokeObjectURL(existing);
-    }
-    characterThumbnails.value = {
-      ...characterThumbnails.value,
-      [characterId]: blobUrl,
-    };
-  } catch (e) {
-    console.error(`Failed to fetch thumbnail for character ${characterId}:`, e);
-    if (requestEpoch !== characterThumbnailEpoch) return;
-    characterThumbnails.value = {
-      ...characterThumbnails.value,
-      [characterId]: null,
-    };
-  }
-}
-
-function clearCharacterThumbnails() {
-  Object.values(characterThumbnails.value).forEach((url) => {
-    if (url) {
-      URL.revokeObjectURL(url);
-    }
-  });
-  characterThumbnails.value = {};
 }
 
 // ── Create a person from a face row (#645) ───────────────────────────────────
