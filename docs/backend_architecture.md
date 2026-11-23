@@ -6661,8 +6661,32 @@ non-destructive foundation the whole feature is built on.
 
 ### 22.1 Tier 1 — exact, and the hash decision
 
-Tier 1 is `GROUP BY pixel_sha, size_bytes HAVING count(*) > 1` on the **existing
-indexed `picture.pixel_sha` column**. No new hash column was added.
+Tier 1 groups live pictures on `(pixel_sha, size_bytes)` using the **existing
+`picture.pixel_sha` column**. No new hash column was added.
+
+It runs in two steps, and only the second is an index lookup:
+
+- **Discovery** (`find_exact_keys_in_session`) is one
+  `GROUP BY pixel_sha, size_bytes HAVING count(*) > 1` aggregate. No index covers
+  the live `(pixel_sha, size_bytes)` key, so it reads every live picture row in
+  the scope once (SQLite walks `ix_picture_deleted` and groups through a
+  temporary B-tree) and returns only the duplicated keys with their member
+  counts, ordered by each key's lowest picture id. That order is the order new
+  exact groups are created, and so their queue order at equal confidence; it
+  does not depend on the plan SQLite picks.
+- **Members** (`build_exact_groups_for_keys_in_session`) are read per page of
+  keys with `pixel_sha IN (...)`; a scoped scan adds its scope predicate, and
+  nothing else is in the `WHERE`. PixlStash never runs `ANALYZE`, and without
+  statistics SQLite prefers a `deleted = 0` equality on `ix_picture_deleted` to
+  the `IN` list, which made each page a full read of the live table. `deleted`
+  is therefore selected and dropped in Python. The price is that the read
+  returns every scrapheaped copy, and every other file size, of the page's
+  hashes; no index yet bounds it to the page's live rows. Pinned
+  by `test_the_exact_member_lookup_is_planned_on_the_pixel_sha_index`, which
+  reads the plan of the statement the build actually issues.
+
+§22.8 covers how the background scan splits the two steps between a reader and
+the writer.
 
 Be honest about what `pixel_sha` is. `ImageUtils._calculate_sha256_digest` hashes
 the whole file only up to 128 KiB; above that it samples 8 chunks of 8 KiB spread
@@ -6673,8 +6697,8 @@ Two consequences, both deliberate:
 
 - **`size_bytes` is a co-key, not decoration.** The sample offsets are derived from
   the file size, so equal size plus equal sampled digest is a far stronger claim
-  than the digest alone. It costs nothing — the `pixel_sha` index already narrows
-  the group.
+  than the digest alone. The member lookup still goes through the `pixel_sha`
+  index; the size only splits what that lookup returns.
 - **Exact matches still go through a consent dialog.** `POST /dedup/auto-stack`
   defaults to `dry_run=true`; the design deliberately does not stack exact matches
   at import without the user seeing the count first. The worst case of a false
@@ -6883,6 +6907,19 @@ would make the deck an N+1 on the one query the queue page is measured by
   a re-import can give the same content new picture ids. Pinned by
   `test_a_near_scan_does_not_downgrade_an_exact_group` and
   `test_the_upsert_takes_the_stronger_tier_in_either_arrival_order`.
+
+  **The upsert is set-based** (`persist_groups_in_session`): one chunked lookup
+  of the stored `(id, signature, tier)` rows, one multi-row insert of the new
+  groups, one update by primary key of the refreshed ones, one delete and one
+  insert of their members, one commit. The groups are folded in order first, so
+  the rules are the ones the row-at-a-time version applied: the first occurrence
+  of a new signature creates the row, a later or stored one refreshes it under
+  tier precedence, `member_count`, `resolved` and `scan_id` are always written,
+  and the last occurrence's members are the ones kept. The row-at-a-time version
+  cost about a millisecond of writer time per group. These statements bypass the
+  session's identity map, so a caller must not trust a `DedupGroup` it loaded
+  before the call; the commit expires it. Pinned by
+  `test_the_set_based_upsert_keeps_every_per_group_rule`.
 - **`dedupverdict`** — verdict memory keyed on the group **signature**: `sha256`
   of the sorted member content keys, where a content key is
   **`<pixel_sha>:<size_bytes>`** (or `id:<n>` for a picture not yet hashed).
@@ -6904,7 +6941,13 @@ would make the deck an N+1 on the one query the queue page is measured by
 
 `prune_stale_groups_in_session()` removes groups whose live membership has
 dropped below two, so the sidebar badge cannot be inflated by scrapheaped
-pictures. Prune only runs on a verdict or a scan, so the counts and the open
+pictures. It is one `DELETE ... WHERE id NOT IN (groups with two or more live
+members)`, with the member rows following through their `ON DELETE CASCADE` key,
+rather than a load of every group (evidence JSON included) tested in Python,
+which the auto-stack loop paid once per batch. Pinned by
+`test_prune_keeps_exactly_the_groups_with_two_live_members`.
+
+Prune only runs on a verdict or a scan, so the counts and the open
 queue additionally filter on the spot (`_live_groups_filter`): a group counts
 only while it still POSES a decision — two or more live members spanning two
 or more stack units (`COALESCE(stack_id, -id)`). The stack-unit half exists
@@ -7002,8 +7045,9 @@ verdict between two pages.
 ### 22.8 Streaming and the background path
 
 `DedupScanFinder` / `DedupScanTask` (`TaskType.DEDUP_SCAN`) turn a `pending`
-`dedupscan` row into work. Tier 1 runs first and in one shot so the queue is never
-empty; tier 2 then commits **after each bucket**, so a bucket's groups appear in
+`dedupscan` row into work. Tier 1 runs first and commits **after each page of
+keys**, so the queue starts filling within one page; tier 2 then commits **after
+each bucket**, so a bucket's groups appear in
 the queue the moment that bucket finishes and `scanned_buckets` advances with it;
 tier 3 appends last. Restarting a scan is safe because persistence is an upsert.
 The finder `depends_on` `PIXEL_SHA` and `IMAGE_EMBEDDING` so a scan reports honest
@@ -7014,17 +7058,58 @@ one writer thread (§13), so the original task's per-bucket commits still held t
 thread for the entire scan: the callback did not return between buckets. A
 12,098-picture scan held it for 104 seconds, starving grid reads queued behind it.
 `DedupScanTask` now submits bounded work as separate `DBPriority.LOW` callbacks:
-indexed tier-1 setup, bucket construction, one capped near bucket at a time,
+scan start (prune, a `SELECT count(*)` of the scope, mark running), one tier-1
+page at a time, bucket construction, one capped near bucket at a time,
 keyset-paged embedding edges, bounded embedding-component persistence, and final
-status. Only plain Python ids, cursors, buckets, pairs and policy values survive
-between callbacks; no ORM row or `Session` crosses the boundary. An interactive
-callback already in the queue therefore runs before the next LOW scan slice.
-Shutdown uses the same boundary: `DedupScanTask.on_cancel()` records a stop
-request, lets the callback that currently owns its request-local session return,
-and submits no later scan slice. A short lifecycle callback moves a non-complete
-row back to `pending` (without discarding its counters), so the finder resumes it
-on the next start; cancellation racing with the final committed slice never
-regresses `complete`.
+status. Only plain Python ids, keys, cursors, buckets, pairs and policy values
+survive between callbacks; no ORM row or `Session` crosses the boundary. An
+interactive callback already in the queue therefore runs before the next LOW
+scan slice. Shutdown uses the same boundary: `DedupScanTask.on_cancel()` records
+a stop request, lets the callback that currently owns its request-local session
+return, and submits no later scan slice. A short lifecycle callback moves a
+non-complete row back to `pending` (without discarding its counters), so the
+finder resumes it on the next start; cancellation racing with the final
+committed slice never regresses `complete`.
+
+**Tier 1 is split between a reader and the writer.** Its discovery aggregate
+reads every live row in the scope (§22.1), so the task runs it exactly once, on
+a concurrent WAL reader through `run_immediate_read_task` (`_exact_keys_read`),
+and the writer stays free while it runs. Only the duplicated keys and their
+counts come back. `page_exact_keys` cuts them into pages of at most
+`EXACT_PAGE_MAX_KEYS` keys and `EXACT_PAGE_MAX_MEMBERS` members without ever
+splitting a key, and each page is one LOW writer slice
+(`_persist_exact_page_slice`) that re-reads that page's members through the
+`pixel_sha` index, persists them and publishes `groups_found`. That read
+returns every `picture` row whose `pixel_sha` is one of the page's hashes: the
+page's live members, every scrapheaped copy of that content, and every copy at
+another file size. The extra rows are dropped in Python. A tier-1 writer slice
+therefore costs O(page), or O(largest group) when one key alone exceeds the
+member bound, unless the Scrapheap holds many copies of content that still has
+two live copies, or one hash appears at many file sizes. No index yet bounds
+the read to the page's live rows. Because each page re-reads its members, a
+picture imported, scrapheaped or rehashed after discovery is seen, and a key
+that has lost its second live member produces no group. Cancellation is checked
+before and after the read, as for a writer slice; the read itself cannot be
+interrupted. While it runs it holds a WAL snapshot and the read side of the
+engine lock, so a restore's `exclusive_engine_access` waits for it and a
+checkpoint cannot pass its snapshot. Pinned by
+`test_the_exact_tier_holds_the_writer_one_page_at_a_time`,
+`test_each_exact_page_is_built_from_the_pictures_as_they_are_now` and
+`test_a_reader_step_honours_a_cancel_on_either_side`.
+
+**Retirement is chosen on a reader and applied under a guard.** When a scan
+completes, `_obsolete_groups_read` picks, on a reader, the ids of groups this
+scan last produced that its completed tiers did not find again (it reads
+`(id, tier, signature)`, never the evidence). The final writer slice deletes
+them with `delete_scan_groups_in_session`, `WHERE id IN (...) AND scan_id = <this
+scan>`, in the same commit as the terminal status. The `scan_id` guard covers the
+gap between the two: a global or sibling scan that refreshed one of those rows
+in between owns it now, and it is kept. A cancel that arrives after the ids are
+chosen retires nothing, because the final slice is never submitted. Pinned by
+`test_a_group_another_scan_refreshes_before_the_final_slice_is_kept` and
+`test_a_cancel_after_retirements_are_chosen_retires_nothing`. The synchronous
+`DedupScanTask.run_scan_in_session` (used by the end-to-end seed) runs the same
+steps in one session.
 
 The picture grid's ordinary count/list path is read-only and uses WAL's parallel
 read side. Character membership (including its optional project intersection)
