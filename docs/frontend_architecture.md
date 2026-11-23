@@ -91,7 +91,7 @@ frontend/src/
 ├── api/                         # Backend resource modules: the only place URL strings live (see §8)
 │   ├── config.js                # Per-user config blob: GET/PATCH /users/me/config
 │   ├── serverConfig.js          # Server-wide config topics under /server-config/
-│   ├── users.js                 # /users/me/* — account, tokens/share links, watermark
+│   ├── users.js                 # /users/me/* — account, tokens/share links, watermark, penalised tags
 │   ├── session.js               # /session/context — the current credential's scope
 │   ├── workers.js               # /workers/progress — background-worker poll
 │   ├── snapshots.js             # /snapshots + restore/preview sub-resources
@@ -1176,8 +1176,19 @@ The Snapshots section of the Recovery pane. Props: `open: Boolean`. Lists and ma
 #### `ComputeSection.vue` (795 lines)
 Compute-runtime manager, behind both the GPU & compute pane (`view="compute"`) and the Server pane (`view="backend"`). Talks to the Electron preload bridge (`window.pixlstashDesktop`) to switch between the built-in CPU/Metal runtime and an on-demand GPU overlay; the same choice appears on the first-run welcome screen. Switching the runtime restarts the local server (which reloads the page). Props: `open: Boolean`. The runtime list no-ops outside the desktop shell; two blocks above it work on every install, which is why the Compute tab now shows on headless too: **Which GPU PixlStash uses** (`GET /compute/gpus`: Auto first with `auto_reason`, a row per GPU, integrated ones not pickable; choosing stages, *Apply & restart* commits with `PATCH /compute/gpu` and, on the desktop, restarts through `useAccelerator(<the active runtime>)`, on headless says to restart) and **Sharing the GPU** (the VRAM limit, now "PixlStash's VRAM limit", which caps PixlStash's own work only, and *Run a workflow alone after it runs out of memory*, `auto_exclusive_after_oom`).
 
-#### `SmartScoreSection.vue` (366 lines)
-Penalised-tags configuration. Props: `open: Boolean`. Fetches `GET /users/me/config` on open and on `onMounted`. Saves directly via `PATCH /users/me/config`. Owns all penalised-tag CRUD state internally.
+#### `SmartScoreSection.vue` (659 lines)
+Penalised-tags configuration, plus the hidden-tag filter. Props: `open: Boolean`. Emits `update:hidden-tags` and `update:apply-tag-filter`. Fetches `GET /users/me/config` and `GET /users/me/penalised-tags/cleanup` on open and on `onMounted`. Owns all penalised-tag state internally. The contract is in integration §2.11.
+- **Adding a tag and changing a weight** save the whole list through `PATCH /users/me/config`.
+- **X removes the tag everywhere.** A danger confirm says the tag is removed from every picture in this library and that the tagger stops adding it in all the owner's libraries. Then `DELETE /users/me/penalised-tags/{tag}`; the chip goes only on the server's answer. One removal or re-add runs at a time, from the question to the answer. While one is in flight, the chip's meta reads "Removing…" and the weight selects are disabled. X is ignored while a list save is still on its way, because that save carries the list with the tag in it.
+- **Adding a removed name back** (it is in the status's `excluded`) asks first, then goes through `PUT /users/me/penalised-tags/{tag}` at weight 3. Nothing removed earlier comes back.
+- **The cleanup job is followed by polling.** Both answers can carry a `cleanup` job. The section polls the status route every second and shows a sticky info notice keyed per job (`penalised-cleanup:<id>`). It ends in one of:
+  - a success notice;
+  - a warning that counts the locked pictures skipped;
+  - "stopped before it finished" with *Retry* (`POST .../cleanup`);
+  - following the newer job that took over the names.
+
+  A failed status read leaves "Could not check" with *Check again*. Polling is not tied to the component: the notices are global, so a job is followed to its end after the dialog closes. A job running before a reload is not picked up again.
+- **On open, an `interrupted` status** (removed tags still on unlocked pictures, no job running) raises "Removed tags are still on N pictures in this library." with *Remove from this library*. A 409 from that retry means a job is already running, and the section follows it instead.
 
 #### `AccountSection.vue` (1255 lines)
 The Account & tokens pane. Props: `open: Boolean`.
@@ -4420,7 +4431,7 @@ For `<img :src="...">` bindings and similar direct browser requests that bypass 
 |---|---|
 | `api/config.js` | `GET`/`PATCH /users/me/config`, the per-user config blob |
 | `api/serverConfig.js` | `/server-config/*`, the server-wide topics (scrapheap retention, snapshots) |
-| `api/users.js` | `/users/me/*`: the owner account, its tokens and share links, the watermark |
+| `api/users.js` | `/users/me/*`: the owner account, its tokens and share links, the watermark, the penalised tags (remove, add back, the cleanup status and retry) |
 | `api/session.js` | `/session/context` and `/sort_mechanisms` |
 | `api/workers.js` | `/workers/progress`, the background-worker poll |
 | `api/snapshots.js` | `/snapshots` and its restore/preview sub-resources |
