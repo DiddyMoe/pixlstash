@@ -268,7 +268,10 @@ def test_cancel_runs_takes_only_its_prompts_off_comfyui(monkeypatch):
         status_code = 200
         text = ""
 
-    def post(url, json=None, timeout=None):
+    def post(url, json=None, timeout=None, allow_redirects=True, proxies=None):
+        # Straight to ComfyUI: no environment proxy, no redirect followed.
+        assert allow_redirects is False
+        assert proxies == comfyui_service.NO_PROXY
         calls.append((url, json))
         return Answer()
 
@@ -311,7 +314,9 @@ def test_cancel_runs_does_not_count_a_run_comfyui_refused(monkeypatch):
 
     codes = {"p-ok": 200, "p-refused": 500}
 
-    def post(url, json=None, timeout=None):
+    def post(url, json=None, timeout=None, allow_redirects=True, proxies=None):
+        assert allow_redirects is False
+        assert proxies == comfyui_service.NO_PROXY
         return Answer(codes[json["delete"][0]])
 
     monkeypatch.setattr(comfyui_service.requests, "post", post)

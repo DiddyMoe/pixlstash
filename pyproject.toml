@@ -39,8 +39,11 @@ dependencies = [
     "uvicorn>=0.41.0",
     "uvicorn[standard]>=0.41.0",
     # Already installed by uvicorn[standard], which accepts older ones: the
-    # ComfyUI progress listener needs the sync client, added in 11.0.
-    "websockets>=11.0",
+    # ComfyUI progress listener opens the sync client with `proxy=None` and
+    # `ping_interval=None`, which it takes from 15.0. The floor is 17.4, the
+    # first release outside GHSA-6m5v-9gmr-5665 (a server can exhaust a
+    # client's memory with empty fragments).
+    "websockets>=17.4",
     "numpy>=2.4.3",
     "pillow>=13.0.0",
     "opencv-python>=4.13.0.92",

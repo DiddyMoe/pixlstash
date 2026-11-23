@@ -1465,18 +1465,38 @@ def _extensions_answer(monkeypatch, answer, loader=None):
     ``GET /object_info/PixlStashCheckpointLoader`` (*loader*; ``{}``, no such
     class, by default)."""
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, allow_redirects=True, proxies=None):
+        # Straight to ComfyUI: no environment proxy, no redirect followed.
+        assert allow_redirects is False
+        assert proxies == comfyui_service.NO_PROXY
         got = answer
         if "/object_info/" in url:
             got = {} if loader is None else loader
         if isinstance(got, Exception):
             raise got
-        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: got)
+        if isinstance(got, SimpleNamespace):
+            # An answer other than a 200, given whole.
+            return got
+        return SimpleNamespace(
+            status_code=200, raise_for_status=lambda: None, json=lambda: got
+        )
 
     monkeypatch.setattr(
         comfyui_service,
         "requests",
-        SimpleNamespace(get=fake_get, RequestException=requests.RequestException),
+        SimpleNamespace(
+            get=fake_get,
+            RequestException=requests.RequestException,
+            HTTPError=requests.HTTPError,
+        ),
+    )
+
+
+def _redirected(body):
+    """ComfyUI's address answering with a redirect that carries *body*, which
+    ``raise_for_status`` lets through."""
+    return SimpleNamespace(
+        status_code=302, raise_for_status=lambda: None, json=lambda: body
     )
 
 
@@ -1510,6 +1530,13 @@ def test_the_node_check_is_owner_only(workflow_env, monkeypatch):
         (["/extensions/other-pack/open_workflow.js"], False, False, False),
         (requests.ConnectionError("refused"), None, None, None),
         ({"not": "a list"}, None, None, None),
+        # A redirect is not ComfyUI answering, whatever its body lists.
+        (
+            _redirected(["/extensions/ComfyUI-PixlStash/open_workflow.js"]),
+            None,
+            None,
+            None,
+        ),
         # A pack that opens a run from the Run popup, and another pack's
         # script of the same name.
         (
@@ -1591,6 +1618,8 @@ def _loader(*optional):
         # No pack loader at all, and ComfyUI gone mid-restart.
         ({}, False),
         (requests.ConnectionError("restarting"), None),
+        # A redirect is not ComfyUI answering, whatever its body declares.
+        (_redirected(_loader("shelf", "weight_dtype")), None),
     ],
 )
 def test_the_node_check_says_whether_the_shelf_loader_is_current(
@@ -1614,7 +1643,9 @@ def _system_stats_answer(monkeypatch, answer) -> list[str]:
         asked.append(url)
         if url.endswith("/extensions"):
             # The node check, asked once ComfyUI has answered: no nodes.
-            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: [])
+            return SimpleNamespace(
+                status_code=200, raise_for_status=lambda: None, json=lambda: []
+            )
         assert allow_redirects is False, "a redirect names a host nobody probed"
         assert proxies == comfyui_service.NO_PROXY
         if isinstance(answer, Exception):

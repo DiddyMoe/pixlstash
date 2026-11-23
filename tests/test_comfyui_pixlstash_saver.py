@@ -13,6 +13,7 @@ import event. Both are covered here.
 """
 
 import json
+import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -33,6 +34,50 @@ SAVER_GRAPH = {
 
 def _history(outputs: dict) -> dict:
     return {"prompt-1": {"outputs": outputs, "status": {"status_str": "success"}}}
+
+
+# ComfyUI's queue as ``_read_comfyui_queue`` answers it: (running, pending).
+RUNNING = (frozenset({"prompt-1"}), frozenset())
+WAITING = (frozenset(), frozenset({"prompt-1"}))
+GONE = (frozenset(), frozenset())
+
+
+def _raising(exc: BaseException):
+    """A stand-in for a call that raises *exc*, whatever it is passed."""
+
+    def raises(*_args, **_kwargs):
+        raise exc
+
+    return raises
+
+
+def _comfyui_answers(monkeypatch, histories: list, queues: list) -> list[str]:
+    """ComfyUI answers a run's wait with *queues* and *histories*, in order,
+    and its sleeps return at once. The log of what the wait did, in order:
+    ``sleep``, ``queue`` (a read of the queue) or ``history``."""
+    log = []
+    sleeps = len(queues)
+
+    def sleep(_seconds):
+        # Each sleep comes before a read of the queue, so one past the answers
+        # given is a wait that stopped asking: it fails rather than spins.
+        assert log.count("sleep") < sleeps, "the wait slept on without asking"
+        log.append("sleep")
+
+    def read_queue(_base_url):
+        log.append("queue")
+        return queues.pop(0)
+
+    def fetch_history(_base_url, _prompt_id):
+        log.append("history")
+        return histories.pop(0)
+
+    monkeypatch.setattr(comfyui_service, "time", SimpleNamespace(sleep=sleep))
+    monkeypatch.setattr(comfyui_service, "_queue_reads", {})
+    monkeypatch.setattr(comfyui_service, "_queue_waits", {})
+    monkeypatch.setattr(comfyui_service, "_read_comfyui_queue", read_queue)
+    monkeypatch.setattr(comfyui_service, "_fetch_comfyui_history", fetch_history)
+    return log
 
 
 class TestGraphInspection:
@@ -935,17 +980,11 @@ class TestOutputProcessing:
         )
 
     def test_a_finished_run_with_no_outputs_stops_waiting(self, monkeypatch):
-        monkeypatch.setattr(
-            comfyui_service, "_fetch_comfyui_history", lambda *a: _history({})
-        )
-        monkeypatch.setattr(
-            comfyui_service.time,
-            "sleep",
-            lambda _s: (_ for _ in ()).throw(AssertionError("kept polling")),
-        )
+        log = _comfyui_answers(monkeypatch, [_history({})], [GONE])
         assert comfyui_service._wait_for_comfyui_outputs(
             "http://comfy", "prompt-1", ["9"]
         ) == ([], None)
+        assert log == ["sleep", "queue", "history"]
 
 
 class TestVideoSavers:
@@ -1030,82 +1069,61 @@ class TestVideoSavers:
 
 
 class TestWaitingOutARun:
-    """The budget is for a prompt ComfyUI has let go of, not for the run."""
+    """The wait lasts while ComfyUI's queue holds the prompt, however long."""
 
-    @staticmethod
-    def _clock(monkeypatch, histories, queued):
-        """Each poll advances a fake clock past the budget; *histories* are
-        the history answers in order, *queued* the queue's answers in order."""
-        now = [0.0]
-        monkeypatch.setattr(comfyui_service.time, "time", lambda: now[0])
-        monkeypatch.setattr(
-            comfyui_service.time,
-            "sleep",
-            lambda _s: now.__setitem__(0, now[0] + 400),
+    DONE = _history({"7": {"images": [{"filename": "out_00001_.mp4"}]}})
+
+    def test_a_prompt_still_in_the_queue_is_waited_for_however_long(self, monkeypatch):
+        log = _comfyui_answers(
+            monkeypatch, [self.DONE], [RUNNING, WAITING, RUNNING, GONE]
         )
-        asked = []
-
-        def fake_queued(base_url, prompt_id):
-            asked.append(prompt_id)
-            return queued.pop(0)
-
-        monkeypatch.setattr(comfyui_service, "_comfyui_prompt_queued", fake_queued)
-        monkeypatch.setattr(
-            comfyui_service, "_fetch_comfyui_history", lambda *a: histories.pop(0)
-        )
-        return asked
-
-    def test_a_prompt_still_in_the_queue_is_waited_for_past_the_budget(
-        self, monkeypatch
-    ):
-        done = _history({"7": {"images": [{"filename": "out_00001_.mp4"}]}})
-        asked = self._clock(monkeypatch, [{}, {}, {}, done], [True, True, True])
         images, _ids = comfyui_service._wait_for_comfyui_outputs(
             "http://comfy", "prompt-1", ["7"]
         )
         assert [image["filename"] for image in images] == ["out_00001_.mp4"]
-        assert asked == ["prompt-1"] * 3
+        # Its history is read once, when the queue no longer holds it.
+        assert log == ["sleep", "queue"] * 4 + ["history"]
+        # And nothing is kept for the address once no run waits on it.
+        assert comfyui_service._queue_reads == {}
+        assert comfyui_service._queue_waits == {}
 
     def test_a_prompt_comfyui_no_longer_has_is_a_stopped_run(self, monkeypatch):
         """In neither the queue nor the history: taken off the queue before
         its turn, or lost to a restart. Said so, not "finished"."""
-        asked = self._clock(monkeypatch, [{}, {}], [False])
+        log = _comfyui_answers(monkeypatch, [{}], [GONE])
         with pytest.raises(comfyui_service.ComfyUIRunStopped, match="no longer has"):
             comfyui_service._wait_for_comfyui_outputs("http://comfy", "prompt-1", ["7"])
-        assert asked == ["prompt-1"]
+        assert log == ["sleep", "queue", "history"]
 
     def test_the_apps_own_abort_is_noticed_at_once(self, monkeypatch):
         """Abort clears ComfyUI's queue, and a prompt that was waiting in it
-        never reaches the history: its poller asks the queue on its next pass
-        rather than at its next check, so the run is said to have stopped
-        before the owner has started the next one."""
-        asked = []
-        monkeypatch.setattr(
-            comfyui_service,
-            "_comfyui_prompt_queued",
-            lambda *a: asked.append(1) or False,
-        )
-        monkeypatch.setattr(comfyui_service, "_fetch_comfyui_history", lambda *a: {})
+        never reaches the history: its waiter goes by a read of the queue sent
+        after the clear, never one sent before it, so the run is said to have
+        stopped before the owner has started the next one."""
+        for registry in ("_run_outcomes", "_run_ids", "_live_runs", "_held_cancels"):
+            monkeypatch.setattr(comfyui_service, registry, {})
+        log = _comfyui_answers(monkeypatch, [{}], [RUNNING, GONE])
         monkeypatch.setattr(
             comfyui_service.requests,
             "post",
-            lambda *a, **k: type("R", (), {"status_code": 200, "text": ""})(),
+            lambda *a, **k: SimpleNamespace(status_code=200, text=""),
         )
-        # The first pass finds nothing and sleeps; the abort lands meanwhile.
-        # A second sleep means the abort went unnoticed.
-        slept = []
 
+        # While the wait sleeps, the listener reads the queue (it still holds
+        # the prompt) and the owner aborts. A second sleep means the wait went
+        # by the read from before the abort.
         def abort_while_asleep(_s):
-            assert not slept, "kept waiting after the queue was cleared"
-            slept.append(1)
+            assert "sleep" not in log, "kept waiting after the queue was cleared"
+            log.append("sleep")
+            comfyui_service._note_running_prompts("http://comfy")
             comfyui_service._comfyui_abort("http://comfy")
 
-        monkeypatch.setattr(comfyui_service.time, "sleep", abort_while_asleep)
+        monkeypatch.setattr(
+            comfyui_service, "time", SimpleNamespace(sleep=abort_while_asleep)
+        )
         with pytest.raises(comfyui_service.ComfyUIRunStopped):
-            comfyui_service._wait_for_comfyui_outputs(
-                "http://comfy", "prompt-1", None, timeout_s=3600
-            )
-        assert asked == [1]
+            comfyui_service._wait_for_comfyui_outputs("http://comfy", "prompt-1", None)
+        assert log == ["sleep", "queue", "queue", "history"]
 
     @pytest.mark.parametrize("status, cleared", [(200, True), (500, False)])
     def test_only_a_queue_that_was_cleared_sends_the_pollers_to_ask(
@@ -1137,10 +1155,11 @@ class TestWaitingOutARun:
         # ComfyUI still has it on record, so it ran: nothing to import, and
         # the caller says "finished without outputs".
         unfinished = {"prompt-1": {"outputs": {}}}
-        self._clock(monkeypatch, [unfinished, unfinished], [False])
+        log = _comfyui_answers(monkeypatch, [unfinished], [GONE])
         assert comfyui_service._wait_for_comfyui_outputs(
             "http://comfy", "prompt-1", ["7"]
         ) == ([], None)
+        assert log == ["sleep", "queue", "history"]
 
     def test_a_prompt_that_finishes_as_it_leaves_the_queue_is_collected(
         self, monkeypatch
@@ -1148,13 +1167,12 @@ class TestWaitingOutARun:
         """The queue is asked BEFORE the history is read. The other way round,
         a prompt that finishes between the two reads is in neither answer and
         its video is never collected."""
-        done = _history({"7": {"images": [{"filename": "out_00001_.mp4"}]}})
-        asked = self._clock(monkeypatch, [], [False])
+        log = _comfyui_answers(monkeypatch, [], [GONE])
         # The prompt finishes at the moment the queue is asked about it.
         monkeypatch.setattr(
             comfyui_service,
             "_fetch_comfyui_history",
-            lambda *a: done if asked else {},
+            lambda *a: self.DONE if "queue" in log else {},
         )
         images, _ids = comfyui_service._wait_for_comfyui_outputs(
             "http://comfy", "prompt-1", ["7"]
@@ -1162,38 +1180,471 @@ class TestWaitingOutARun:
         assert [image["filename"] for image in images] == ["out_00001_.mp4"]
 
     @pytest.mark.parametrize(
-        "queue, held",
+        "queue, answer",
         [
-            ({"queue_running": [[3, "prompt-1", {}]], "queue_pending": []}, True),
-            ({"queue_running": [], "queue_pending": [[4, "prompt-1", {}]]}, True),
-            ({"queue_running": [[3, "other", {}]], "queue_pending": []}, False),
-            # Not an answer about the prompt at all: not known to be gone.
-            ([], True),
+            (
+                {"queue_running": [[3, "prompt-1", {}]], "queue_pending": []},
+                (frozenset({"prompt-1"}), frozenset()),
+            ),
+            (
+                {
+                    "queue_running": [],
+                    "queue_pending": [[4, "prompt-1", {}], [5, "prompt-2", {}]],
+                },
+                (frozenset(), frozenset({"prompt-1", "prompt-2"})),
+            ),
+            (
+                {"queue_running": [[3, "other", {}]]},
+                (frozenset({"other"}), frozenset()),
+            ),
+            # Not an answer about the queue at all: unread, not empty.
+            ([], None),
         ],
     )
-    def test_the_queue_is_read_for_the_prompt(self, monkeypatch, queue, held):
-        class _Response:
-            def raise_for_status(self):
-                return None
+    def test_the_queue_is_read_for_its_prompts(self, monkeypatch, queue, answer):
+        asked = []
 
-            def json(self):
-                return queue
+        def get(url, timeout=None, allow_redirects=True, proxies=None):
+            asked.append((url, allow_redirects, proxies))
+            return SimpleNamespace(
+                status_code=200, raise_for_status=lambda: None, json=lambda: queue
+            )
 
-        monkeypatch.setattr(
-            comfyui_service.requests, "get", lambda *a, **k: _Response()
-        )
-        assert (
-            comfyui_service._comfyui_prompt_queued("http://comfy", "prompt-1") is held
-        )
+        monkeypatch.setattr(comfyui_service.requests, "get", get)
+        assert comfyui_service._read_comfyui_queue("http://comfy") == answer
+        # Straight to the address asked, never through an environment proxy,
+        # and never on to wherever a redirect points.
+        assert asked == [("http://comfy/queue", False, comfyui_service.NO_PROXY)]
+
+    @pytest.mark.parametrize(
+        "get",
+        [
+            _raising(comfyui_service.requests.ConnectionError("refused")),
+            lambda *a, **k: SimpleNamespace(
+                status_code=503,
+                raise_for_status=_raising(
+                    comfyui_service.requests.HTTPError("503 Server Error")
+                ),
+                json=dict,
+            ),
+            # Another host's address, whatever the body says.
+            lambda *a, **k: SimpleNamespace(
+                status_code=302,
+                raise_for_status=lambda: None,
+                json=lambda: {"queue_running": [], "queue_pending": []},
+            ),
+            lambda *a, **k: SimpleNamespace(
+                status_code=200,
+                raise_for_status=lambda: None,
+                json=_raising(ValueError("Expecting value")),
+            ),
+        ],
+        ids=["refused", "error-status", "redirect", "not-json"],
+    )
+    def test_a_queue_that_cannot_be_read_is_no_answer(self, monkeypatch, get):
+        monkeypatch.setattr(comfyui_service.requests, "get", get)
+        assert comfyui_service._read_comfyui_queue("http://comfy") is None
 
     def test_a_queue_that_cannot_be_read_does_not_abandon_the_run(self, monkeypatch):
-        def refuse(*a, **k):
-            raise comfyui_service.requests.ConnectionError("refused")
-
-        monkeypatch.setattr(comfyui_service.requests, "get", refuse)
-        assert (
-            comfyui_service._comfyui_prompt_queued("http://comfy", "prompt-1") is True
+        """Each pass then reads the prompt's history instead, as a lone run
+        would, and the wait goes on while the history has no entry for it."""
+        log = _comfyui_answers(monkeypatch, [{}, {}, self.DONE], [None, None, GONE])
+        images, _ids = comfyui_service._wait_for_comfyui_outputs(
+            "http://comfy", "prompt-1", ["7"]
         )
+        assert [image["filename"] for image in images] == ["out_00001_.mp4"]
+        assert log == ["sleep", "queue", "history"] * 3
+
+
+COMFY = "http://comfy"
+GUARD_S = 10.0
+"""How long a test waits on one of its threads before calling it stuck."""
+
+
+class _TestOver(BaseException):
+    """Ends a waiter its test left waiting."""
+
+
+class _Unexpected(Exception):
+    """Not a queue that could not be read, which ``_read_comfyui_queue``
+    answers as no answer, but anything else raised while reading it."""
+
+
+class _Rounds:
+    """Runs waited on at one ComfyUI, each in its own thread as the app waits
+    on them. A waiter's sleep lasts until the test lets it go, so a round is
+    each waiter going by the queue once, and no real time passes. Keeps how
+    each wait ended, and who waits on a read of the queue another sent."""
+
+    def __init__(self):
+        self._turn = threading.Condition()
+        self._asleep: set[str] = set()
+        self._joining: set[str] = set()
+        self._over = False
+        self._threads: list[threading.Thread] = []
+        self.outcomes: dict[str, object] = {}
+
+    def sleep(self, _seconds):
+        name = threading.current_thread().name
+        with self._turn:
+            self._asleep.add(name)
+            self._turn.notify_all()
+            woken = self._turn.wait_for(
+                lambda: name not in self._asleep or self._over, GUARD_S
+            )
+        if self._over:
+            raise _TestOver
+        assert woken, f"{name} was never woken"
+
+    def start(self, *prompt_ids):
+        """A waiter on each of *prompt_ids*; back once all of them sleep."""
+        for prompt_id in prompt_ids:
+            thread = threading.Thread(
+                target=self._wait,
+                args=(prompt_id,),
+                name=f"waiter-{prompt_id}",
+                daemon=True,
+            )
+            self._threads.append(thread)
+            thread.start()
+        self.settle()
+
+    def _wait(self, prompt_id):
+        try:
+            outcome = comfyui_service._wait_for_comfyui_outputs(COMFY, prompt_id, None)
+        except BaseException as exc:  # How the wait ended is what is tested.
+            outcome = exc
+        with self._turn:
+            self.outcomes[prompt_id] = outcome
+            self._turn.notify_all()
+
+    def settle(self):
+        """Back once every waiter sleeps or has ended."""
+        with self._turn:
+            settled = self._turn.wait_for(
+                lambda: all(
+                    thread.name in self._asleep
+                    or thread.name.removeprefix("waiter-") in self.outcomes
+                    for thread in self._threads
+                ),
+                GUARD_S,
+            )
+        assert settled, "a waiter neither slept nor ended"
+
+    def round(self, *prompt_ids):
+        """Wake the waiters on *prompt_ids*, or every one, and come back once
+        each sleeps again or has ended."""
+        with self._turn:
+            if prompt_ids:
+                self._asleep -= {f"waiter-{prompt_id}" for prompt_id in prompt_ids}
+            else:
+                self._asleep.clear()
+            self._turn.notify_all()
+        self.settle()
+
+    def asleep(self) -> set[str]:
+        """The prompt ids of the waiters asleep."""
+        with self._turn:
+            return {name.removeprefix("waiter-") for name in self._asleep}
+
+    def joined(self, count: int) -> None:
+        """Back once *count* waiters wait on a read of the queue another sent."""
+        with self._turn:
+            joined = self._turn.wait_for(lambda: len(self._joining) == count, GUARD_S)
+        assert joined, f"{count} waiters never shared the read in flight"
+
+    def read_type(self):
+        """``_QueueRead``, whose ``done`` notes who waits on it and lets them
+        go when the test ends. A waiter left on a read that never ended fails
+        rather than hanging the run of tests."""
+        rounds = self
+
+        class _Done(threading.Event):
+            def set(self):
+                super().set()
+                with rounds._turn:
+                    rounds._turn.notify_all()
+
+            def wait(self, timeout=None):
+                name = threading.current_thread().name
+                with rounds._turn:
+                    rounds._joining.add(name)
+                    rounds._turn.notify_all()
+                    ended = rounds._turn.wait_for(
+                        lambda: self.is_set() or rounds._over, GUARD_S
+                    )
+                    rounds._joining.discard(name)
+                if rounds._over:
+                    raise _TestOver
+                assert ended, f"{name} was left waiting on a read that never ended"
+                return True
+
+        class _WatchedRead(comfyui_service._QueueRead):
+            def __init__(self, number, cleared):
+                super().__init__(number, cleared)
+                self.done = _Done()
+
+        return _WatchedRead
+
+    def stop(self):
+        """End every waiter still waiting, and join them all."""
+        with self._turn:
+            self._over = True
+            self._turn.notify_all()
+        for thread in self._threads:
+            thread.join(GUARD_S)
+        assert not [t.name for t in self._threads if t.is_alive()], (
+            "a waiter outlived its test"
+        )
+
+
+class _FakeComfyUI:
+    """A ComfyUI's queue and history, answered in process as ``requests.get``.
+    Notes each request made of it with whether a redirect would be followed
+    and the proxies it was sent with."""
+
+    def __init__(self, rounds: _Rounds):
+        self._rounds = rounds
+        self._lock = threading.Lock()
+        self._asked: list[tuple[str, object, object]] = []
+        self.running: list[str] = []
+        self.pending: list[str] = []
+        self.histories: dict[str, dict] = {}
+        # (exception, how many other waiters share the read before it raises)
+        self.queue_failure: tuple[BaseException, int] | None = None
+
+    def get(self, url, timeout=None, allow_redirects=True, proxies=None):
+        failure = None
+        with self._lock:
+            self._asked.append((url, allow_redirects, proxies))
+            if url == f"{COMFY}/queue":
+                failure, self.queue_failure = self.queue_failure, None
+                body = {
+                    "queue_running": [[1, pid, {}] for pid in self.running],
+                    "queue_pending": [
+                        [2 + n, pid, {}] for n, pid in enumerate(self.pending)
+                    ],
+                }
+            else:
+                prompt_id = url.removeprefix(f"{COMFY}/history/")
+                entry = self.histories.get(prompt_id)
+                body = {} if entry is None else {prompt_id: entry}
+        if failure is not None:
+            exc, sharers = failure
+            self._rounds.joined(sharers)
+            raise exc
+        return SimpleNamespace(
+            status_code=200, text="", raise_for_status=lambda: None, json=lambda: body
+        )
+
+    def taken(self) -> list[tuple[str, object, object]]:
+        """The requests made since this was last asked, in order."""
+        with self._lock:
+            asked, self._asked = self._asked, []
+        return asked
+
+
+@pytest.fixture
+def comfyui(monkeypatch):
+    """A fake ComfyUI and the runs waited on at it; each waiter is ended,
+    and joined, with the test."""
+    rounds = _Rounds()
+    fake = _FakeComfyUI(rounds)
+    monkeypatch.setattr(comfyui_service, "_queue_reads", {})
+    monkeypatch.setattr(comfyui_service, "_queue_waits", {})
+    monkeypatch.setattr(comfyui_service, "_QueueRead", rounds.read_type())
+    monkeypatch.setattr(comfyui_service, "time", SimpleNamespace(sleep=rounds.sleep))
+    monkeypatch.setattr(comfyui_service.requests, "get", fake.get)
+    yield fake, rounds
+    rounds.stop()
+
+
+QUEUE_READ = (f"{COMFY}/queue", False, comfyui_service.NO_PROXY)
+
+
+def _history_read(prompt_id: str) -> tuple[str, object, object]:
+    return (f"{COMFY}/history/{prompt_id}", False, comfyui_service.NO_PROXY)
+
+
+def _saved(prompt_id: str) -> dict:
+    """ComfyUI's history entry for a prompt that saved one picture."""
+    return {
+        "outputs": {"9": {"images": [{"filename": f"{prompt_id}.png"}]}},
+        "status": {"status_str": "success"},
+    }
+
+
+def _collected(prompt_id: str) -> tuple[list[dict], None]:
+    """What the wait for that prompt returns: its picture, to download."""
+    return [{"filename": f"{prompt_id}.png", "subfolder": "", "type": "output"}], None
+
+
+class TestOneQueueReadForEveryRun:
+    """However many runs wait at one ComfyUI, each round asks it about its
+    queue once; each run still ends its own way, and nothing is left behind
+    once none waits."""
+
+    @pytest.mark.parametrize("count", [1, 4])
+    def test_a_round_reads_the_queue_once_however_many_runs_wait(self, comfyui, count):
+        fake, rounds = comfyui
+        before = set(threading.enumerate())
+        prompt_ids = [f"test-{n}" for n in range(count)]
+        fake.running, fake.pending = prompt_ids[:1], prompt_ids[1:]
+        rounds.start(*prompt_ids)
+        assert fake.taken() == []
+        for _ in range(3):
+            rounds.round()
+            # Straight to ComfyUI, never through an environment proxy.
+            assert fake.taken() == [QUEUE_READ]
+        # ComfyUI finishes them all: the queue no longer holds them, and each
+        # run reads its own history.
+        fake.running, fake.pending = [], []
+        fake.histories = {prompt_id: _saved(prompt_id) for prompt_id in prompt_ids}
+        rounds.round()
+        asked = fake.taken()
+        assert asked[0] == QUEUE_READ
+        assert sorted(asked[1:]) == sorted(map(_history_read, prompt_ids))
+        assert rounds.outcomes == {
+            prompt_id: _collected(prompt_id) for prompt_id in prompt_ids
+        }
+        # Nothing is kept for the address, and no thread is left behind.
+        assert comfyui_service._queue_reads == {}
+        assert comfyui_service._queue_waits == {}
+        rounds.stop()
+        assert set(threading.enumerate()) - before == set()
+
+    def test_each_run_ends_its_own_way(self, comfyui):
+        fake, rounds = comfyui
+        fake.running = ["test-done"]
+        fake.pending = ["test-failed", "test-gone", "test-later"]
+        rounds.start("test-done", "test-failed", "test-gone", "test-later")
+        rounds.round()
+        assert fake.taken() == [QUEUE_READ]
+        # One finishes, one fails, one is taken off the queue, one waits on.
+        fake.running, fake.pending = ["test-later"], []
+        fake.histories = {
+            "test-done": _saved("test-done"),
+            "test-failed": _ended("execution_error", ERROR_EVENT)["prompt-1"],
+        }
+        rounds.round()
+        asked = fake.taken()
+        assert asked[0] == QUEUE_READ
+        assert sorted(asked[1:]) == sorted(
+            map(_history_read, ["test-done", "test-failed", "test-gone"])
+        )
+        assert rounds.asleep() == {"test-later"}
+        outcomes = rounds.outcomes
+        assert outcomes["test-done"] == _collected("test-done")
+        assert type(outcomes["test-failed"]) is RuntimeError
+        assert "(UNETLoader) failed: KeyError" in str(outcomes["test-failed"])
+        assert type(outcomes["test-gone"]) is comfyui_service.ComfyUIRunStopped
+        assert "no longer has this run" in str(outcomes["test-gone"])
+
+        fake.running = []
+        fake.histories["test-later"] = _saved("test-later")
+        rounds.round()
+        assert fake.taken() == [QUEUE_READ, _history_read("test-later")]
+        assert outcomes["test-later"] == _collected("test-later")
+        assert comfyui_service._queue_reads == {}
+        assert comfyui_service._queue_waits == {}
+
+    def test_a_read_that_raises_ends_only_the_run_that_sent_it(self, comfyui):
+        """The runs sharing it are not left waiting on it: the next sends a
+        read of its own, and they wait on as before."""
+        fake, rounds = comfyui
+        prompt_ids = ["test-a", "test-b", "test-c"]
+        fake.pending = list(prompt_ids)
+        rounds.start(*prompt_ids)
+        failure = _Unexpected("test-unexpected")
+        fake.queue_failure = (failure, 2)
+        rounds.round()
+        assert fake.taken() == [QUEUE_READ, QUEUE_READ]
+        (sender,) = rounds.outcomes
+        assert rounds.outcomes[sender] is failure
+        others = set(prompt_ids) - {sender}
+        assert rounds.asleep() == others
+
+        fake.pending = []
+        fake.histories = {prompt_id: _saved(prompt_id) for prompt_id in others}
+        rounds.round()
+        assert {p: rounds.outcomes[p] for p in others} == {
+            prompt_id: _collected(prompt_id) for prompt_id in others
+        }
+        assert comfyui_service._queue_reads == {}
+        assert comfyui_service._queue_waits == {}
+
+    def test_a_run_goes_by_no_read_sent_before_it_was_queued(self, comfyui):
+        """Such a read predates the prompt, so it does not list it: gone by,
+        it would read as ComfyUI no longer having the run."""
+        fake, rounds = comfyui
+        fake.running = ["test-first"]
+        rounds.start("test-first")
+        rounds.round()
+        assert fake.taken() == [QUEUE_READ]
+        # That read is kept for the run still waiting on it. A run queued
+        # since wakes first.
+        fake.pending = ["test-second"]
+        rounds.start("test-second")
+        rounds.round("test-second")
+        assert fake.taken() == [QUEUE_READ]
+        assert rounds.outcomes == {}
+        assert rounds.asleep() == {"test-first", "test-second"}
+
+    def test_a_run_that_ends_as_the_read_kept_for_it_ends_leaves_nothing_kept(
+        self, monkeypatch
+    ):
+        """A read another sent is kept for the run still waiting, and that run
+        ends just as the read does: once neither is left, nothing is kept for
+        the address, whichever of the two went first."""
+        go = threading.Event()
+        asleep = threading.Event()
+        outcomes = []
+
+        def sleep(_seconds):
+            # The run sleeps until the read is all but over, then ends, as a
+            # run does once it has read its own history.
+            asleep.set()
+            assert go.wait(GUARD_S), "the read never came to an end"
+            raise _TestOver
+
+        class _EndsTheRunFirst(threading.Event):
+            def set(self):
+                go.set()
+                # Long enough for the run to end, unless it must first take
+                # the lock the read is set under.
+                waiter.join(1.0)
+                super().set()
+
+        class _Read(comfyui_service._QueueRead):
+            def __init__(self, number, cleared):
+                super().__init__(number, cleared)
+                self.done = _EndsTheRunFirst()
+
+        def wait():
+            try:
+                comfyui_service._wait_for_comfyui_outputs(COMFY, "test-ending", None)
+            except BaseException as exc:  # How the wait ended is what is tested.
+                outcomes.append(exc)
+
+        monkeypatch.setattr(comfyui_service, "_queue_reads", {})
+        monkeypatch.setattr(comfyui_service, "_queue_waits", {})
+        monkeypatch.setattr(comfyui_service, "_QueueRead", _Read)
+        monkeypatch.setattr(comfyui_service, "time", SimpleNamespace(sleep=sleep))
+        monkeypatch.setattr(comfyui_service, "_read_comfyui_queue", lambda _url: GONE)
+        waiter = threading.Thread(target=wait, name="waiter-test-ending", daemon=True)
+        waiter.start()
+        assert asleep.wait(GUARD_S), "the run never waited"
+        # Meanwhile the listener reads the queue, as it does on opening its
+        # socket.
+        read = comfyui_service._shared_queue_read(
+            COMFY, comfyui_service._queue_reads_sent
+        )
+        waiter.join(GUARD_S)
+        assert not waiter.is_alive(), "the run outlived its test"
+        assert read.done.is_set()
+        assert [type(exc) for exc in outcomes] == [_TestOver]
+        assert comfyui_service._queue_reads == {}
+        assert comfyui_service._queue_waits == {}
 
 
 ERROR_EVENT = {
@@ -1311,20 +1762,18 @@ class TestHowARunEnded:
         )
 
     def test_the_wait_tells_a_stopped_run_from_a_failed_one(self, monkeypatch):
-        monkeypatch.setattr(
-            comfyui_service,
-            "_fetch_comfyui_history",
-            lambda *a: _ended("execution_error", ERROR_EVENT),
+        _comfyui_answers(
+            monkeypatch,
+            [
+                _ended("execution_error", ERROR_EVENT),
+                _ended("execution_interrupted", {"node_type": "KSampler"}),
+            ],
+            [GONE, GONE],
         )
         with pytest.raises(RuntimeError, match="UNETLoader\\) failed") as failed:
             comfyui_service._wait_for_comfyui_outputs("http://comfy", "prompt-1", None)
         assert not isinstance(failed.value, comfyui_service.ComfyUIRunStopped)
 
-        monkeypatch.setattr(
-            comfyui_service,
-            "_fetch_comfyui_history",
-            lambda *a: _ended("execution_interrupted", {"node_type": "KSampler"}),
-        )
         with pytest.raises(comfyui_service.ComfyUIRunStopped, match="at KSampler"):
             comfyui_service._wait_for_comfyui_outputs("http://comfy", "prompt-1", None)
 
