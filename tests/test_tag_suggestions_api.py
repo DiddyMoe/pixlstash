@@ -12,15 +12,18 @@ from fastapi.testclient import TestClient
 from datetime import datetime, timezone
 
 import numpy as np
+import pytest
 from sqlalchemy import event as sa_event
 from sqlalchemy import insert as sa_insert
 from sqlalchemy import update as sa_update
-from sqlmodel import select
+from sqlalchemy.pool import NullPool
+from sqlmodel import Session, SQLModel, create_engine, select
 
-from pixlstash.db_models import Picture, Tag
+from pixlstash.db_models import Picture, Review, Tag
 from pixlstash.db_models.tag_prediction import TagPrediction
 from pixlstash.db_models.tag_suggestion import TagSuggestion
 from pixlstash.server import Server
+from pixlstash.services.tag_scan_service import _write_suspects
 from tests.utils import upload_pictures_and_wait
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
@@ -582,9 +585,18 @@ def _set_phash(server, pic_id, phash_int):
     server.vault.db.run_task(upd)
 
 
-def test_scan_tag_builds_and_rebuilds_queue():
+def test_scan_tag_builds_and_rebuilds_queue(monkeypatch):
     from pixlstash.services import tag_scan_service
 
+    # Every scan hands the kernel the tag scan's scratch budget.
+    budgets = []
+    kernel = tag_scan_service.knn_disagreement_with_neighbors
+
+    def _spy(*args, **kwargs):
+        budgets.append(kwargs.get("max_block_bytes"))
+        return kernel(*args, **kwargs)
+
+    monkeypatch.setattr(tag_scan_service, "knn_disagreement_with_neighbors", _spy)
     temp_dir, client, server = _setup()
     try:
         a = _upload_picture(client)  # Bad1.png
@@ -615,7 +627,9 @@ def test_scan_tag_builds_and_rebuilds_queue():
         assert res2["count"] == res["count"]
         rows2 = client.get("/tag_suggestions").json()
         assert len(rows2) == len(rows)
+        assert budgets == [256 * 2**20, 256 * 2**20]
     finally:
+        monkeypatch.undo()
         server.close()
         temp_dir.cleanup()
         gc.collect()
@@ -1820,8 +1834,6 @@ def test_accept_refuses_when_a_manual_fix_contradicts_the_suggestion():
     """F2(ii): a human recorded the opposite label after the suggestion was
     raised (a manual fix). Accepting the stale suggestion would reverse it, so
     accept must refuse (loudly) and leave both the label and the row untouched."""
-    import pytest
-
     from pixlstash.services.tag_suggestion_service import (
         SuggestionConflictError,
         accept_suggestion,
@@ -1862,3 +1874,240 @@ def test_accept_refuses_when_a_manual_fix_contradicts_the_suggestion():
         server.close()
         temp_dir.cleanup()
         gc.collect()
+
+
+@pytest.fixture(scope="module")
+def suspects_engine(tmp_path_factory):
+    """A bare vault schema (no server): pictures 1-3000 and reviews 1 and 2.
+
+    Each test writes under its own tag, so the module's rows never meet.
+    """
+    path = tmp_path_factory.mktemp("suspects") / "vault.db"
+    engine = create_engine(f"sqlite:///{path}", poolclass=NullPool)
+
+    def _foreign_keys_on(dbapi_conn, _record):
+        dbapi_conn.execute("PRAGMA foreign_keys = ON")
+
+    sa_event.listen(engine, "connect", _foreign_keys_on)
+    try:
+        SQLModel.metadata.create_all(engine)
+        with Session(engine) as session:
+            session.execute(
+                sa_insert(Picture),
+                [
+                    {
+                        "id": pid,
+                        "deleted": False,
+                        "file_path": f"/home/me/pictures/test-{pid}.png",
+                    }
+                    for pid in range(1, 3001)
+                ],
+            )
+            session.add_all(
+                [Review(id=1, tag="test-old"), Review(id=2, tag="test-new")]
+            )
+            session.commit()
+        yield engine
+    finally:
+        sa_event.remove(engine, "connect", _foreign_keys_on)
+        engine.dispose()
+
+
+def _queue_rows(engine, rows):
+    """Insert TagSuggestion rows; *rows* fill in over a stale pending default."""
+    stale = {
+        "direction": "remove",
+        "score": 0.1,
+        "reason": "test-stale",
+        "status": "PENDING",
+        "review_id": None,
+        "reviewed_at": None,
+    }
+    with Session(engine) as session:
+        session.execute(sa_insert(TagSuggestion), [stale | row for row in rows])
+        session.commit()
+
+
+def _suspect(pid):
+    return {
+        "picture_id": pid,
+        "direction": "add",
+        "score": 0.9,
+        "reason": "test-fresh",
+        "twin_picture_id": None,
+        "twin_sim": None,
+        "neighbors": [],
+    }
+
+
+def _rows_of(engine, tag):
+    with Session(engine) as session:
+        return {
+            (row.picture_id, row.source): row
+            for row in session.exec(
+                select(TagSuggestion).where(TagSuggestion.tag == tag)
+            ).all()
+        }
+
+
+def test_writing_suspects_loads_only_their_existing_suggestions(suspects_engine):
+    """2,000 queued rows, three incoming suspects: only the two queued ones load."""
+    tag, nn = "test-queue", "near_neighbor"
+    _queue_rows(
+        suspects_engine,
+        [{"picture_id": pid, "tag": tag, "source": nn} for pid in range(1, 2001)]
+        + [{"picture_id": pid, "tag": tag, "source": "model"} for pid in (5, 6)]
+        + [{"picture_id": pid, "tag": "test-other", "source": nn} for pid in (5, 6)],
+    )
+    loaded = []
+
+    def _record(_session, instance):
+        if isinstance(instance, TagSuggestion):
+            loaded.append((instance.picture_id, instance.tag, instance.source))
+
+    with Session(suspects_engine) as session:
+        sa_event.listen(session, "loaded_as_persistent", _record)
+        try:
+            stats = _write_suspects(
+                session,
+                tag,
+                nn,
+                [_suspect(5), _suspect(6), _suspect(2500)],
+                None,
+                False,
+            )
+        finally:
+            sa_event.remove(session, "loaded_as_persistent", _record)
+    assert sorted(loaded) == [(5, tag, nn), (6, tag, nn)]
+    assert stats == {"new": 1, "prev_reviewed": 0}
+    rows = _rows_of(suspects_engine, tag)
+    assert {
+        key: row.reason for key, row in rows.items() if key[0] in (5, 6, 7, 2500)
+    } == {
+        (5, nn): "test-fresh",
+        (6, nn): "test-fresh",
+        (7, nn): "test-stale",
+        (2500, nn): "test-fresh",
+        (5, "model"): "test-stale",
+        (6, "model"): "test-stale",
+    }
+    assert rows[(2500, nn)].status == "PENDING"
+
+
+def test_writing_suspects_adopts_skips_and_reopens_by_review(suspects_engine):
+    """Each existing-row rule still applies to the rows the incoming read returns."""
+    tag, nn = "test-branches", "near_neighbor"
+    decided_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    _queue_rows(
+        suspects_engine,
+        [
+            {"picture_id": 11, "tag": tag, "source": nn},
+            {
+                "picture_id": 12,
+                "tag": tag,
+                "source": nn,
+                "status": "SKIPPED",
+                "review_id": 1,
+            },
+            {
+                "picture_id": 13,
+                "tag": tag,
+                "source": nn,
+                "status": "ACCEPTED",
+                "review_id": 2,
+            },
+            {
+                "picture_id": 14,
+                "tag": tag,
+                "source": nn,
+                "status": "DISMISSED",
+                "review_id": 1,
+                "reviewed_at": decided_at,
+            },
+            {"picture_id": 16, "tag": tag, "source": nn, "review_id": 1},
+        ],
+    )
+    with Session(suspects_engine) as session:
+        stats = _write_suspects(
+            session, tag, nn, [_suspect(pid) for pid in (11, 12, 13, 14, 15)], 2, True
+        )
+    assert stats == {"new": 4, "prev_reviewed": 1}
+    rows = {pid: row for (pid, _), row in _rows_of(suspects_engine, tag).items()}
+    state = {
+        pid: (
+            row.review_id,
+            row.status,
+            row.reason,
+            row.prior_review_id,
+            row.prior_status,
+        )
+        for pid, row in rows.items()
+    }
+    assert state == {
+        11: (2, "PENDING", "test-fresh", None, None),
+        12: (2, "PENDING", "test-fresh", None, None),
+        13: (2, "ACCEPTED", "test-stale", None, None),
+        14: (2, "PENDING", "test-fresh", 1, "DISMISSED"),
+        15: (2, "PENDING", "test-fresh", None, None),
+        16: (1, "PENDING", "test-stale", None, None),
+    }
+    assert rows[14].reviewed_at is None
+    assert rows[14].prior_reviewed_at.replace(tzinfo=timezone.utc) == decided_at
+
+
+def test_writing_no_suspects_commits_without_a_statement(suspects_engine):
+    issued, commits = [], []
+
+    def _record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        issued.append(statement)
+
+    def _committed(_session):
+        commits.append(True)
+
+    sa_event.listen(suspects_engine, "before_cursor_execute", _record)
+    try:
+        with Session(suspects_engine) as session:
+            sa_event.listen(session, "after_commit", _committed)
+            try:
+                stats = _write_suspects(
+                    session, "test-none", "near_neighbor", [], 2, True
+                )
+            finally:
+                sa_event.remove(session, "after_commit", _committed)
+    finally:
+        sa_event.remove(suspects_engine, "before_cursor_execute", _record)
+    assert stats == {"new": 0, "prev_reviewed": 0}
+    assert issued == []
+    assert commits == [True]
+
+
+def test_writing_suspects_binds_no_parameter_per_picture(suspects_engine):
+    """1,500 incoming suspects under SQLite's historical 999-variable ceiling."""
+    tag, nn = "test-many", "near_neighbor"
+    incoming = range(1, 1501)
+    _queue_rows(
+        suspects_engine,
+        [{"picture_id": pid, "tag": tag, "source": nn} for pid in incoming],
+    )
+
+    def _variable_ceiling(dbapi_conn, _record):
+        dbapi_conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+
+    sa_event.listen(suspects_engine, "connect", _variable_ceiling)
+    try:
+        with Session(suspects_engine) as session:
+            # The connection the write runs on (held until its commit).
+            raw = session.connection().connection.driver_connection
+            ceiling = raw.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+            stats = _write_suspects(
+                session, tag, nn, [_suspect(pid) for pid in incoming], None, False
+            )
+    finally:
+        sa_event.remove(suspects_engine, "connect", _variable_ceiling)
+        suspects_engine.dispose()
+    assert ceiling == 999
+    assert stats == {"new": 0, "prev_reviewed": 0}
+    rows = _rows_of(suspects_engine, tag)
+    assert {pid for (pid, _), row in rows.items() if row.reason == "test-fresh"} == set(
+        incoming
+    )

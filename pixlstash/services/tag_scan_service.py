@@ -90,6 +90,11 @@ SOURCES = (SOURCE, MODEL_SOURCE)
 DEFAULT_BOUNDARY_LIMIT = 50
 MAX_BOUNDARY_LIMIT = 500
 
+# Scratch budget for one block of the kNN kernel (12 bytes a similarity cell).
+# At the kernel's default 1024-row block it binds only above ~21,800 embeddings,
+# where it shrinks the block instead of letting scratch grow with the library.
+_KNN_SCRATCH_BYTES = 256 * 2**20
+
 # Default dhash Hamming threshold for both the displayed-twin override at scan
 # time and the read-time "pair" kind derivation (same shot, altered copy).
 DEFAULT_MAX_TWIN_HAMMING = 8
@@ -432,12 +437,16 @@ def scan_tag(
     phash_ints = np.array(phash_values, dtype=np.uint64)
     valid_mask = np.array(phash_valid, dtype=bool)
 
-    emb = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(
+    raw = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(
         len(ids), EMBEDDING_DIM
     )
-    norms = np.linalg.norm(emb, axis=1, keepdims=True)
+    # The loaded rows hold every blob too; release both before the unit-norm copy
+    # so the build peaks near two embedding matrices rather than four.
+    del emb_rows, blobs
+    norms = np.linalg.norm(raw, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
-    emb = (emb / norms).astype(np.float32)
+    emb = raw / norms  # float32 / float32 stays float32: no extra cast copy
+    del raw
 
     has_literal = np.array([pid in literal for pid in ids], dtype=bool)
     has_concept = np.array([pid in concept for pid in ids], dtype=bool)
@@ -516,7 +525,7 @@ def scan_tag(
         )
 
         pos_frac, twin_idx, twin_sim, neighbor_idx = knn_disagreement_with_neighbors(
-            emb, has_concept, k
+            emb, has_concept, k, max_block_bytes=_KNN_SCRATCH_BYTES
         )
 
         for i in range(len(ids)):
@@ -620,17 +629,28 @@ def _write_suspects(
     skip and re-parent existing rows by the same rules. Returns
     ``{"new", "prev_reviewed"}``.
     """
-    # Diff-insert against ALL existing rows for (tag, source): the unique
-    # constraint is on (picture_id, tag, source), so a suspect with any prior
-    # row is updated-or-skipped, never re-inserted. Nothing is ever deleted.
-    existing = {
-        row.picture_id: row
-        for row in session.exec(
-            select(TagSuggestion).where(
-                TagSuggestion.tag == tag, TagSuggestion.source == source
-            )
-        ).all()
-    }
+    # Diff-insert against every existing (tag, source) row of an incoming
+    # picture: the unique constraint is on (picture_id, tag, source), so a
+    # suspect with any prior row is updated-or-skipped, never re-inserted.
+    # Nothing is ever deleted. Only the incoming pictures' rows are loaded, by
+    # a temp-table subquery (no bound parameter per id), which lets SQLite use
+    # that unique index instead of reading the whole (tag, source) queue.
+    incoming = {int(r["picture_id"]) for r in suspects}
+    existing: dict[int, TagSuggestion] = {}
+    if incoming:
+        incoming_scope = scope_id_subquery(
+            session, incoming, name="_pixlstash_incoming_suspect_ids"
+        )
+        existing = {
+            row.picture_id: row
+            for row in session.exec(
+                select(TagSuggestion).where(
+                    TagSuggestion.picture_id.in_(incoming_scope),
+                    TagSuggestion.tag == tag,
+                    TagSuggestion.source == source,
+                )
+            ).all()
+        }
     now = datetime.now(timezone.utc)
     new_count = 0
     prev_reviewed = 0
