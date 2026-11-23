@@ -68,7 +68,7 @@ from pixlstash.services.set_lock_service import (
     enforce_pictures_not_locked,
     locked_picture_id_subquery,
 )
-from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sql_chunking import chunked, not_in_json
 from pixlstash.services.scrapheap_service import DEFAULT_RETENTION_DAYS
 from pixlstash.services.workflow_ghost_service import DEFAULT_GHOST_RETENTION
 from pixlstash.services.snapshot_service import SnapshotService
@@ -2661,20 +2661,21 @@ class Vault:
             .where(Picture.thumbnail_width.is_(None))
             .where(Picture.deleted.is_(False))
             .where(Picture.file_path.is_not(None))
+            .where(not_in_json(Picture.id, suppressed_ids))
         )
-        if suppressed_ids:
-            stmt = stmt.where(Picture.id.notin_(tuple(suppressed_ids)))
         result = session.exec(stmt).one()
         if isinstance(result, (tuple, list)):
             return result[0]
         return result or 0
 
-    @staticmethod
-    def _count_missing_descriptions(session: Session) -> int:
+    def _count_missing_descriptions(self, session: Session) -> int:
         # The same predicate MissingDescriptionFinder selects on: NULL or a
-        # ``__description::`` sentinel, and never a picture frozen by a locked
-        # set. A reset writes the sentinel, not NULL, so counting NULL alone
-        # read "N / N" through an entire regeneration (#1162).
+        # ``__description::`` sentinel, never a picture frozen by a locked
+        # set, and never a suppressed one (undecodable or unreachable), which
+        # the finder will not hand out. A reset writes the sentinel, not NULL,
+        # so counting NULL alone read "N / N" through an entire regeneration
+        # (#1162).
+        suppressed_ids = self.db.unprocessable_images.active_suppressed_ids()
         result = session.exec(
             select(func.count())
             .select_from(Picture)
@@ -2687,6 +2688,7 @@ class Vault:
                     ),
                 ),
                 ~Picture.id.in_(locked_picture_id_subquery()),
+                not_in_json(Picture.id, suppressed_ids),
             )
         ).one()
         if isinstance(result, (tuple, list)):
@@ -2737,9 +2739,11 @@ class Vault:
             return result[0]
         return result or 0
 
-    @staticmethod
-    def _count_missing_quality(session: Session) -> int:
-        return QualityTask.count_missing_quality(session)
+    def _count_missing_quality(self, session: Session) -> int:
+        # Suppressed pictures (undecodable or unreachable) are left out, as
+        # MissingQualityFinder leaves them out, so "remaining" can reach 0.
+        suppressed_ids = self.db.unprocessable_images.active_suppressed_ids()
+        return QualityTask.count_missing_quality(session, suppressed_ids)
 
     @staticmethod
     def _count_total_described(session: Session) -> int:

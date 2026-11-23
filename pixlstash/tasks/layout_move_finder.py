@@ -1,6 +1,7 @@
 """Finder for pictures owing a layout check (v1.11 Phase 4b)."""
 
 import time
+from typing import Collection
 
 from pixlstash.tasks.base_task_finder import SimpleMissingFinder
 from pixlstash.tasks.layout_move_task import LayoutMoveTask
@@ -32,8 +33,12 @@ class LayoutMoveFinder(SimpleMissingFinder):
     def _batch_size(self) -> int:
         return LayoutMoveTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session, limit: int) -> list:
-        return LayoutMoveTask.find_due_pictures(session, limit, time.time())
+    def _fetch_candidates(
+        self, session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ) -> list:
+        return LayoutMoveTask.find_due_pictures(
+            session, limit, time.time(), suppressed_ids
+        )
 
     def _create_task(self, pictures: list):
         return LayoutMoveTask(

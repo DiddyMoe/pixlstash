@@ -19,6 +19,7 @@ from pixlstash.tagger_plugins.clip_service import CLIP_MODEL_NAME
 
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
+from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
 
@@ -274,7 +275,7 @@ class ImageEmbeddingTask(BaseTask):
             )
         stmt = select(func.count()).select_from(Picture).where(condition)
         if suppressed_ids:
-            stmt = stmt.where(Picture.id.notin_(tuple(suppressed_ids)))
+            stmt = stmt.where(not_in_json(Picture.id, suppressed_ids))
         result = session.exec(stmt).one()
         if isinstance(result, tuple):
             return result[0]
@@ -314,7 +315,7 @@ class ImageEmbeddingTask(BaseTask):
             Picture.id, Picture.file_path, Picture.width, Picture.height
         ).where(condition)
         if suppressed_ids:
-            stmt = stmt.where(Picture.id.notin_(tuple(suppressed_ids)))
+            stmt = stmt.where(not_in_json(Picture.id, suppressed_ids))
         stmt = stmt.limit(int(limit or cls.BATCH_SIZE))
         return session.exec(stmt).all()
 

@@ -1,4 +1,5 @@
-from sqlalchemy import not_
+from typing import Collection
+
 from sqlmodel import Session, select
 
 from pixlstash.db_models import Snapshot
@@ -6,6 +7,7 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.task_runner import TaskCancelledError
 from pixlstash.tasks.base_task_finder import BaseTaskFinder
 from pixlstash.tasks.snapshot_identity_scrub_task import SnapshotIdentityScrubTask
+from pixlstash.utils.sql_chunking import not_in_json
 
 logger = get_logger(__name__)
 
@@ -104,11 +106,10 @@ class MissingSnapshotIdentityScrubFinder(BaseTaskFinder):
         )
 
     @staticmethod
-    def _fetch_next(session: Session, skip: set[int]):
+    def _fetch_next(session: Session, skip: Collection[int]):
         statement = select(Snapshot.id, Snapshot.relative_path).where(
-            Snapshot.identity_scrubbed_at.is_(None)
+            Snapshot.identity_scrubbed_at.is_(None),
+            not_in_json(Snapshot.id, skip),
         )
-        if skip:
-            statement = statement.where(not_(Snapshot.id.in_(skip)))
         row = session.exec(statement.order_by(Snapshot.id).limit(1)).first()
         return (row[0], row[1]) if row else None

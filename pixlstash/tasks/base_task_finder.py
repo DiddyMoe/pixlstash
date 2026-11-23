@@ -1,7 +1,7 @@
 import threading
 import time
 from abc import ABC, ABCMeta, abstractmethod
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Collection, Optional
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.worker_config import UNKNOWN_PICTURE_PIXELS
@@ -74,18 +74,21 @@ class BaseTaskFinder(ABC, metaclass=TaskFinderRegistry):
                 dimensions counts as ``UNKNOWN_PICTURE_PIXELS`` (#2750).
 
         Pictures whose image file cannot be decoded (issue #585) are excluded
-        here, at the one point every batch finder claims through, so a corrupt
-        image is skipped uniformly instead of being re-selected on every sweep.
-        Suppression is looked up by picture id against the registry's own stored
-        path (never ``picture.file_path``, which is often deferred and the
-        candidate pictures are detached here); a rewritten file lifts it
-        automatically (see :class:`UnprocessableImageRegistry`).
+        here too, at the one point every batch finder claims through, so a
+        corrupt image is skipped uniformly instead of being re-selected on every
+        sweep. This is the last guard, not the filter: the fetch must already
+        have left them out ahead of its ``LIMIT`` (see
+        :meth:`_suppressed_picture_ids`), or a run of them fills the window and
+        hides the work behind it. Suppression is looked up by picture id against
+        the registry's own stored path (never ``picture.file_path``, which is
+        often deferred and the candidate pictures are detached here); a
+        rewritten file lifts it automatically (see
+        :class:`UnprocessableImageRegistry`).
 
         Returns:
             A list of pictures selected from *pictures* that were unclaimed.
         """
-        database = getattr(self, "_db", None)
-        registry = getattr(database, "unprocessable_images", None)
+        registry = self._unprocessable_registry()
         selected = []
         pixels = 0
         with self._claim_lock:
@@ -149,6 +152,30 @@ class BaseTaskFinder(ABC, metaclass=TaskFinderRegistry):
             for picture_id in picture_ids:
                 self._claimed_picture_ids.discard(picture_id)
 
+    def _unprocessable_registry(self):
+        """The database's :class:`UnprocessableImageRegistry`, or ``None`` without one."""
+        database = getattr(self, "_db", None)
+        return getattr(database, "unprocessable_images", None)
+
+    def _suppressed_picture_ids(self) -> set[int]:
+        """Picture ids the fetch must leave out ahead of its ``LIMIT``.
+
+        A suppressed picture stays selectable by every stage's query (its
+        target column is still unset), so a fetch that only drops it in
+        :meth:`_filter_and_claim` reads a window that a run of them can fill
+        entirely: the finder then reports no work while eligible rows wait
+        behind them, for as long as the run lasts. The set goes into the query
+        through ``not_in_json``, one bound parameter whatever its size.
+
+        Call this before opening the read, never inside it: a stale entry is
+        re-validated with a ``stat``, which on an unmounted volume waits for the
+        mount's timeout, and that wait must not hold a read transaction.
+        """
+        registry = self._unprocessable_registry()
+        if registry is None:
+            return set()
+        return registry.active_suppressed_ids()
+
 
 class SimpleMissingFinder(BaseTaskFinder, ABC):
     """Base for finders that follow the fetch-claim-create pattern.
@@ -156,14 +183,16 @@ class SimpleMissingFinder(BaseTaskFinder, ABC):
     Subclasses implement three small methods and get a correct ``find_task``
     for free.  The fetch multiplier is ``max_inflight_tasks() + 1`` so that
     ``_filter_and_claim`` can always fill one full task even when all in-flight
-    slots are already claimed.
+    slots are already claimed. Suppressed pictures are not part of that
+    arithmetic: they are excluded in the query, ahead of the ``LIMIT``.
 
     Subclasses must implement (in addition to ``finder_name``):
 
     - ``_batch_size() -> int`` - number of pictures per task.
-    - ``_fetch_candidates(session, limit: int) -> list`` - DB query; called as
-      a bound method so it receives ``session`` as the first argument when
-      invoked through ``run_immediate_read_task``.
+    - ``_fetch_candidates(session, limit: int, suppressed_ids) -> list`` - DB
+      query; called as a bound method so it receives ``session`` as the first
+      argument when invoked through ``run_immediate_read_task``. It must leave
+      *suppressed_ids* out in the query itself, ahead of its ``LIMIT``.
     - ``_create_task(pictures: list)`` - construct and return the task.
     """
 
@@ -176,7 +205,9 @@ class SimpleMissingFinder(BaseTaskFinder, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _fetch_candidates(self, session, limit: int) -> list:
+    def _fetch_candidates(
+        self, session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ) -> list:
         raise NotImplementedError
 
     @abstractmethod
@@ -192,7 +223,10 @@ class SimpleMissingFinder(BaseTaskFinder, ABC):
             return None
         batch = self._batch_size()
         limit = batch * (max(1, self.max_inflight_tasks()) + 1)
-        pictures = self._db.run_immediate_read_task(self._fetch_candidates, limit)
+        suppressed_ids = self._suppressed_picture_ids()
+        pictures = self._db.run_immediate_read_task(
+            self._fetch_candidates, limit, suppressed_ids
+        )
         if not pictures:
             return None
         selected = self._filter_and_claim(pictures, batch)
@@ -222,7 +256,10 @@ class BaseDeferringFinder(BaseTaskFinder):
 
     A picture finder mixes this in behind :class:`SimpleMissingFinder`, whose
     claims stand in for ``_handed_out``; its ``_fetch_candidates`` must skip
-    ``_deferred`` itself, and the claims are released after the deferral too.
+    ``_deferred`` itself, in the query alongside the suppressed ids and ahead
+    of the ``LIMIT`` (a deferred set only grows, so dropping it from the rows
+    afterwards needs a window that grows with it), and the claims are released
+    after the deferral too.
     """
 
     _IDS_PARAM: str

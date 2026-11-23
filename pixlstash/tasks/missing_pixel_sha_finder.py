@@ -1,5 +1,7 @@
 """Finder for pictures missing the tier-1 exact-duplicate hash."""
 
+from typing import Collection
+
 from pixlstash.tasks.base_task_finder import SimpleMissingFinder
 from pixlstash.tasks.pixel_sha_task import PixelShaTask
 
@@ -22,8 +24,12 @@ class MissingPixelShaFinder(SimpleMissingFinder):
     def _batch_size(self) -> int:
         return PixelShaTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session, limit: int) -> list:
-        return PixelShaTask.find_pictures_missing_pixel_sha(session, limit)
+    def _fetch_candidates(
+        self, session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ) -> list:
+        return PixelShaTask.find_pictures_missing_pixel_sha(
+            session, limit, suppressed_ids
+        )
 
     def _create_task(self, pictures: list):
         return PixelShaTask(database=self._db, pictures=pictures)

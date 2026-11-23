@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Collection
 
 from sqlmodel import Session, select
 from sqlalchemy.orm import load_only, selectinload
@@ -13,6 +13,7 @@ from pixlstash.db_models import (
     Tag,
 )
 from pixlstash.task_runner import TaskCancelledError
+from pixlstash.utils.sql_chunking import not_in_json
 
 from .base_task_finder import BaseDeferringFinder, SimpleMissingFinder
 from .text_embedding_task import TextEmbeddingTask
@@ -49,7 +50,12 @@ class MissingTextEmbeddingFinder(SimpleMissingFinder, BaseDeferringFinder):
     def _batch_size(self) -> int:
         return self.EMBEDDING_BATCH_SIZE
 
-    def _fetch_candidates(self, session: Session, limit: int):
+    def _fetch_candidates(
+        self,
+        session: Session,
+        limit: int,
+        suppressed_ids: Collection[int] = frozenset(),
+    ):
         query = select(Picture)
         query = query.options(
             load_only(Picture.id, Picture.description, Picture.text_embedding),
@@ -82,11 +88,11 @@ class MissingTextEmbeddingFinder(SimpleMissingFinder, BaseDeferringFinder):
                     escape=DESCRIPTION_SENTINEL_ESCAPE_CHAR,
                 ),
             )
-        query = query.order_by(Picture.id)
-        query = query.limit(limit + len(self._deferred))
-        return [
-            pic for pic in session.exec(query).all() if pic.id not in self._deferred
-        ]
+        query = query.where(
+            not_in_json(Picture.id, set(suppressed_ids) | self._deferred)
+        )
+        query = query.order_by(Picture.id).limit(limit)
+        return session.exec(query).all()
 
     def _create_task(self, pictures: list):
         return TextEmbeddingTask(

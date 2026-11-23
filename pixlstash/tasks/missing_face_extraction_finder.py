@@ -1,10 +1,11 @@
 import threading
-from typing import Callable
+from typing import Callable, Collection
 
 from sqlmodel import Session, select
 from sqlalchemy.orm import selectinload
 
 from pixlstash.db_models import Picture
+from pixlstash.utils.sql_chunking import not_in_json
 
 from .base_task_finder import BaseTaskFinder
 from .device_release_task import DeviceReleaseTask
@@ -52,7 +53,7 @@ class MissingFaceExtractionFinder(BaseTaskFinder):
         # a backoff that grows by 1.8x each time. Two slots that could never
         # fill, and a growing sleep between the batches that did: the stall was
         # the finder starving itself, not the GPU.
-        suppressed_ids = self._db.unprocessable_images.active_suppressed_ids()
+        suppressed_ids = self._suppressed_picture_ids()
         limit = FACE_EXTRACTION_BATCH_LIMIT * (max(1, self.max_inflight_tasks()) + 1)
         pictures = self._db.run_immediate_read_task(
             lambda session: self._fetch_missing_features(
@@ -135,14 +136,16 @@ class MissingFaceExtractionFinder(BaseTaskFinder):
         return engine is not None and getattr(engine, "keep_models_in_memory", False)
 
     @staticmethod
-    def _fetch_missing_features(session: Session, limit: int, suppressed_ids=None):
-        stmt = select(Picture).where(~Picture.faces.any())
-        if suppressed_ids:
-            # At the query, not in `_filter_and_claim`: a run of undecodable
-            # pictures long enough to fill the window would otherwise hand back
-            # a candidate list that claims nothing, forever, and the work behind
-            # them would never be reached at all.
-            stmt = stmt.where(Picture.id.notin_(tuple(suppressed_ids)))
+    def _fetch_missing_features(
+        session: Session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ):
+        # At the query, not in `_filter_and_claim`: a run of undecodable
+        # pictures long enough to fill the window would otherwise hand back a
+        # candidate list that claims nothing, forever, and the work behind them
+        # would never be reached at all.
+        stmt = select(Picture).where(
+            ~Picture.faces.any(), not_in_json(Picture.id, suppressed_ids)
+        )
         return session.exec(
             stmt.options(selectinload(Picture.faces)).order_by(Picture.id).limit(limit)
         ).all()

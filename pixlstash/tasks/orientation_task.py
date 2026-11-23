@@ -19,6 +19,7 @@ column has to describe what the renderers do, not what the container says.
 """
 
 import time
+from typing import Collection
 
 from sqlmodel import Session, select
 
@@ -28,6 +29,7 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.orientation import read_orientation
+from pixlstash.utils.sql_chunking import not_in_json
 
 logger = get_logger(__name__)
 
@@ -99,13 +101,19 @@ class OrientationTask(BaseTask):
         return changed
 
     @staticmethod
-    def find_pictures_missing_orientation(session: Session, limit: int) -> list:
-        """Return non-deleted pictures with a file but no stored orientation."""
+    def find_pictures_missing_orientation(
+        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+    ) -> list:
+        """Return non-deleted pictures with a file but no stored orientation.
+
+        *exclude_ids* are left out ahead of the ``LIMIT``.
+        """
         return session.exec(
             select(Picture)
             .where(Picture.orientation.is_(None))
             .where(Picture.deleted.is_(False))
             .where(Picture.file_path.is_not(None))
+            .where(not_in_json(Picture.id, exclude_ids))
             .order_by(Picture.id)
             .limit(limit)
         ).all()

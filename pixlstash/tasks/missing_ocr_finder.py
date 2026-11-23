@@ -1,6 +1,6 @@
 """Finder for pictures whose text has not been read."""
 
-from typing import Callable
+from typing import Callable, Collection
 
 from pixlstash.task_runner import TaskCancelledError
 
@@ -56,9 +56,12 @@ class MissingOcrFinder(SimpleMissingFinder, BaseDeferringFinder):
     def _batch_size(self) -> int:
         return OcrTask.BATCH_SIZE
 
-    def _fetch_candidates(self, session, limit: int) -> list:
-        pictures = OcrTask.find_unread_pictures(session, limit + len(self._deferred))
-        return [pic for pic in pictures if pic.id not in self._deferred]
+    def _fetch_candidates(
+        self, session, limit: int, suppressed_ids: Collection[int] = frozenset()
+    ) -> list:
+        return OcrTask.find_unread_pictures(
+            session, limit, set(suppressed_ids) | self._deferred
+        )
 
     def _create_task(self, pictures: list):
         return OcrTask(
