@@ -276,11 +276,6 @@ class PictureLikenessFrontier(SQLModel, table=True):
         session.commit()
 
     @classmethod
-    def max_picture_id(cls, session: Session) -> int:
-        res = session.exec(select(Picture.id).order_by(Picture.id.desc())).first()
-        return int(res) if res is not None else 0
-
-    @classmethod
     def update(cls, session: Session, a: int, new_jmax: int) -> None:
         pf = session.get(PictureLikenessFrontier, a)
         if pf is None:

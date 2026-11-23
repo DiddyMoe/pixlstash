@@ -2497,6 +2497,310 @@ def test_engine_guardrail_does_not_flag_the_configured_helpers(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Guardrail: an ordered select reduced to one row carries a LIMIT
+# ---------------------------------------------------------------------------
+# ``Result.first()`` and ``Result.scalar()`` add no LIMIT to the SQL; they keep
+# the first row and discard the rest. An ORM result without ``yield_per`` is
+# buffered, so ``session.exec(select(Model).order_by(...)).first()`` fetches
+# and hydrates every matching row to return one. ``.limit(1)`` makes SQLite
+# stop after the first row. (The legacy ``Query.first()`` adds the LIMIT by
+# itself and is not a ``select``, so it is out of scope here.)
+#
+# Shapes followed: an inline chain, a statement bound to a local name and
+# refined later (``stmt = stmt.order_by(...)``), a chain that starts from such
+# a name, a name bound in an enclosing function, and a conditional expression
+# in the executed call (``session.exec(a if c else b)``).
+# Bindings are flow-insensitive per function: a name counts as limited when any
+# assignment to it in that function adds ``.limit``. The scan is a syntactic,
+# per-function tripwire for the shapes above, not a proof that every ordered
+# one-row read is limited. Shapes it does not follow, and so lets through:
+#
+# - a ``.limit`` added on only some paths (``if c: stmt = stmt.limit(1)``), or
+#   added after the execution: it counts as present;
+# - a conditional expression bound to a name (``stmt = a if c else b``);
+# - a ``Result`` stored in a name and reduced in a later statement;
+# - ``.limit(None)`` after ``.limit(1)``;
+# - a statement built in another function, passed in as a parameter, or stored
+#   on an attribute.
+
+_ROW_REDUCERS = ("first", "scalar")
+# Result adapters that sit between the execute call and the reducer.
+_RESULT_ADAPTERS = ("scalars", "mappings", "unique", "tuples")
+_STATEMENT_EXECUTORS = ("exec", "execute", "scalars")
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _own_scope_nodes(scope) -> list:
+    """Return the nodes of *scope*, stopping at (but including) nested scopes."""
+    nodes = []
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        nodes.append(node)
+        if not isinstance(node, _SCOPE_NODES):
+            stack.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
+def _statement_methods(node, env: dict) -> set:
+    """Return the call names along a statement chain, plus its bound base's."""
+    names = set()
+    while isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            names.add(func.attr)
+            node = func.value
+            continue
+        if isinstance(func, ast.Name):
+            names.add(func.id)
+        return names
+    if isinstance(node, ast.Name):
+        names |= env.get(node.id, set())
+    return names
+
+
+def _statements_reduced_to_one_row(call: ast.Call) -> list:
+    """Return the statement expressions *call* executes and reduces to one row."""
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return []
+    if func.attr == "scalar" and call.args:
+        # Session.scalar(stmt)
+        return [call.args[0]]
+    if func.attr not in _ROW_REDUCERS:
+        return []
+    result = func.value
+    while (
+        isinstance(result, ast.Call)
+        and isinstance(result.func, ast.Attribute)
+        and result.func.attr in _RESULT_ADAPTERS
+        and not result.args
+    ):
+        result = result.func.value
+    if (
+        isinstance(result, ast.Call)
+        and isinstance(result.func, ast.Attribute)
+        and result.func.attr in _STATEMENT_EXECUTORS
+        and result.args
+    ):
+        return [result.args[0]]
+    return []
+
+
+def _ordered_single_row_offenders(source: str) -> list[tuple[int, str]]:
+    """Return ``(lineno, snippet)`` for each ordered select reduced without LIMIT.
+
+    Args:
+        source: Python source text of a single module.
+
+    Returns:
+        Sorted ``(lineno, stripped source line)`` pairs, one per offending
+        reducer call.
+    """
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    hits: dict[int, str] = {}
+
+    def _visit(scope, outer_env: dict) -> None:
+        nodes = _own_scope_nodes(scope)
+        assigns = sorted(
+            (
+                node
+                for node in nodes
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+                and node.value is not None
+            ),
+            key=lambda node: (node.lineno, node.col_offset),
+        )
+        bindings = []
+        for node in assigns:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                bindings.append((targets[0].id, node.value))
+        own_names = {name for name, _ in bindings}
+        env = {k: v for k, v in outer_env.items() if k not in own_names}
+        for name, value in bindings:
+            methods = _statement_methods(value, env)
+            if "select" in methods:
+                env[name] = env.get(name, set()) | methods
+
+        for node in nodes:
+            if isinstance(node, _SCOPE_NODES):
+                _visit(node, env)
+                continue
+            if not isinstance(node, ast.Call):
+                continue
+            pending = _statements_reduced_to_one_row(node)
+            while pending:
+                statement = pending.pop()
+                if isinstance(statement, ast.IfExp):
+                    pending.extend((statement.body, statement.orelse))
+                    continue
+                methods = _statement_methods(statement, env)
+                if {"select", "order_by"} <= methods and "limit" not in methods:
+                    lineno = node.lineno
+                    hits.setdefault(lineno, lines[lineno - 1].strip())
+
+    _visit(tree, {})
+    return sorted(hits.items())
+
+
+def _scan_for_unlimited_ordered_reads(root: Path, base: Path) -> dict[str, list]:
+    """Walk *root* recursively and map each offending module to its hits.
+
+    Args:
+        root: Directory tree to scan.
+        base: Directory the reported keys are made relative to.
+
+    Returns:
+        ``{posix relative path: [(lineno, snippet), ...]}``.
+    """
+    found: dict[str, list] = {}
+    for path in sorted(root.rglob("*.py")):
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            pytest.fail(f"could not read {path}: {exc}")
+        try:
+            hits = _ordered_single_row_offenders(source)
+        except SyntaxError as exc:
+            pytest.fail(f"could not parse {path}: {exc}")
+        if hits:
+            found[path.relative_to(base).as_posix()] = hits
+    return found
+
+
+def test_no_ordered_select_is_reduced_to_one_row_without_a_limit():
+    """No ordered select in a followed shape is reduced to one row without a limit.
+
+    Every module under ``pixlstash/`` is scanned. The scan is a syntactic,
+    per-function tripwire, not a proof: the comment above this section lists
+    the shapes it follows and the ones it lets through.
+    """
+    found = _scan_for_unlimited_ordered_reads(PIXLSTASH_DIR, REPO_ROOT)
+    offenders = [
+        f"  {rel}:{lineno}: {snippet}"
+        for rel, hits in sorted(found.items())
+        for lineno, snippet in hits
+    ]
+    assert not offenders, (
+        "An ordered select reduced with .first()/.scalar() must carry .limit(1). "
+        "Result.first() adds no LIMIT, so SQLite returns every matching row and "
+        "the ORM hydrates all of them to keep one.\n\nOffending call sites:\n"
+        + "\n".join(offenders)
+        + "\n\nFix: add .limit(1) to the statement before executing it."
+    )
+
+
+_UNLIMITED_ORDERED_READ_SHAPES = {
+    "inline chain": (
+        "def f(session):\n"
+        "    return session.exec(\n"
+        "        select(Op).where(Op.status == 'a').order_by(Op.id.desc())\n"
+        "    ).first()\n"
+    ),
+    "bound statement": (
+        "def f(session):\n"
+        "    stmt = select(Op).order_by(Op.id.desc())\n"
+        "    return session.exec(stmt).first()\n"
+    ),
+    "refined statement": (
+        "def f(session, flag):\n"
+        "    stmt = select(Op)\n"
+        "    if flag:\n"
+        "        stmt = stmt.where(Op.flag.is_(True))\n"
+        "    stmt = stmt.order_by(Op.id)\n"
+        "    return session.exec(stmt).first()\n"
+    ),
+    "chain from a bound base": (
+        "def f(session):\n"
+        "    base = select(Face, Pic).join(Pic, Face.pic_id == Pic.id)\n"
+        "    return session.exec(base.order_by(Pic.score.desc())).first()\n"
+    ),
+    "closure over an enclosing statement": (
+        "def f(db):\n"
+        "    stmt = select(Op).order_by(Op.id)\n"
+        "    return db.run_task(lambda session: session.exec(stmt).first())\n"
+    ),
+    "result scalar": (
+        "def f(session):\n"
+        "    return session.exec(select(Op.id).order_by(Op.id.desc())).scalar()\n"
+    ),
+    "session scalar": (
+        "def f(session):\n"
+        "    return session.scalar(select(Op.id).order_by(Op.id.desc()))\n"
+    ),
+    "scalars first": (
+        "def f(session):\n"
+        "    return session.scalars(select(Op).order_by(Op.id)).first()\n"
+    ),
+    "execute then scalars": (
+        "def f(session):\n"
+        "    return session.execute(select(Op).order_by(Op.id)).scalars().first()\n"
+    ),
+    "conditional statement": (
+        "def f(session, wanted):\n"
+        "    return session.exec(\n"
+        "        select(Op).where(Op.id.in_(wanted)) if wanted\n"
+        "        else select(Op).order_by(Op.id)\n"
+        "    ).first()\n"
+    ),
+    "module-level qualified select": (
+        "import sqlmodel\n\n"
+        "ROW = SESSION.exec(sqlmodel.select(Op).order_by(Op.id)).first()\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_UNLIMITED_ORDERED_READ_SHAPES))
+def test_unlimited_ordered_read_guardrail_detects_every_shape(shape, tmp_path):
+    """The guardrail's own regression test, planted in a nested subpackage."""
+    nested = tmp_path / "pkg" / "sub" / "deeper"
+    nested.mkdir(parents=True)
+    (nested / "reads.py").write_text(_UNLIMITED_ORDERED_READ_SHAPES[shape])
+
+    found = _scan_for_unlimited_ordered_reads(tmp_path, tmp_path)
+    assert "pkg/sub/deeper/reads.py" in found, (
+        f"the {shape!r} shape was not detected: {found}"
+    )
+
+
+def test_unlimited_ordered_read_guardrail_does_not_flag_bounded_or_multi_row_reads(
+    tmp_path,
+):
+    """Over-blocking is its own regression: limited, unordered and list reads pass."""
+    (tmp_path / "ok.py").write_text(
+        "def limited(session):\n"
+        "    return session.exec(select(Op).order_by(Op.id).limit(1)).first()\n"
+        "\n\n"
+        "def limited_later(session):\n"
+        "    stmt = select(Op).order_by(Op.id)\n"
+        "    stmt = stmt.limit(1)\n"
+        "    return session.exec(stmt).first()\n"
+        "\n\n"
+        "def unordered(session, op_id):\n"
+        "    return session.exec(select(Op).where(Op.id == op_id)).first()\n"
+        "\n\n"
+        "def every_row(session):\n"
+        "    return session.exec(select(Op).order_by(Op.id)).all()\n"
+        "\n\n"
+        "def legacy_query(session):\n"
+        "    return session.query(Op).order_by(Op.id).first()\n"
+        "\n\n"
+        "def outer(session):\n"
+        "    query = select(Op).order_by(Op.id)\n"
+        "    rows = session.exec(query).all()\n"
+        "\n"
+        "    def inner(name):\n"
+        "        query = select(Op).where(Op.name == name)\n"
+        "        return session.exec(query).first()\n"
+        "\n"
+        "    return rows, inner\n"
+    )
+    assert _scan_for_unlimited_ordered_reads(tmp_path, tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
 # Guardrail: the ML stack must not be imported on the server's import path
 # ---------------------------------------------------------------------------
 #

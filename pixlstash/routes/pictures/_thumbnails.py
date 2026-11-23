@@ -347,9 +347,7 @@ def register_routes(router, server):
                     )
                 ).all()
 
-            rows = server.vault.db.run_task(
-                fetch_penalised_tags, priority=DBPriority.IMMEDIATE
-            )
+            rows = server.vault.db.run_immediate_read_task(fetch_penalised_tags)
             for pic_id, tag in rows or []:
                 if tag:
                     penalised_tag_map[pic_id].append(tag)
@@ -455,9 +453,7 @@ def register_routes(router, server):
                     )
                 ).all()
 
-            rows = server.vault.db.run_task(
-                fetch_character_names, priority=DBPriority.IMMEDIATE
-            )
+            rows = server.vault.db.run_immediate_read_task(fetch_character_names)
             character_name_map = {char_id: name for char_id, name in rows or []}
         results = {}
         for pic in pics:

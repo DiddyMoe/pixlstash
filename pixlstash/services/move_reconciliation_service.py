@@ -337,6 +337,7 @@ def _remove_project(session: Session, picture: Picture, project_id: int) -> bool
                 PictureProjectMember.project_id != project_id,
             )
             .order_by(PictureProjectMember.project_id.asc())
+            .limit(1)
         ).first()
         picture.project_id = int(fallback) if fallback is not None else None
         session.add(picture)

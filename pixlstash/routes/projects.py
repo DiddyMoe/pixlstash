@@ -637,6 +637,7 @@ def create_router(server) -> APIRouter:
                     select(PictureProjectMember.project_id)
                     .where(PictureProjectMember.picture_id == picture.id)
                     .order_by(PictureProjectMember.project_id.asc())
+                    .limit(1)
                 ).first()
                 session.add(picture)
 

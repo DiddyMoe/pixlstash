@@ -242,7 +242,7 @@ def create_router(server) -> APIRouter:
                 ).one()
                 if total_count >= max_stored:
                     oldest = session.exec(
-                        select(GuestSession).order_by(GuestSession.created_at)
+                        select(GuestSession).order_by(GuestSession.created_at).limit(1)
                     ).first()
                     if oldest is not None:
                         session.delete(oldest)

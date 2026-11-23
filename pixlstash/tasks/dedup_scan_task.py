@@ -786,4 +786,5 @@ class DedupScanTask(BaseTask):
             select(DedupScan)
             .where(DedupScan.status.in_([SCAN_PENDING, SCAN_RUNNING]))
             .order_by(DedupScan.started_at)
+            .limit(1)
         ).first()

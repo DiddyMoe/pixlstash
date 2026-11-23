@@ -38,7 +38,7 @@ def register_seed_folder_in_session(
     session.add(rf)
     session.commit()
     session.refresh(rf)
-    project = session.exec(select(Project).order_by(Project.id)).first()
+    project = session.exec(select(Project).order_by(Project.id).limit(1)).first()
     return rf.id, project.name if project is not None else None
 
 

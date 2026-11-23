@@ -391,6 +391,7 @@ def pending_commit(server) -> Optional[dict]:
             select(FolderMappingCommit)
             .where(FolderMappingCommit.state == STATE_PENDING)
             .order_by(FolderMappingCommit.id.desc())
+            .limit(1)
         ).first()
         if row is None:
             return None
