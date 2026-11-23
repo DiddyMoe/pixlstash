@@ -10040,21 +10040,40 @@ def create_router(server) -> APIRouter:
                 break
         subfolder, _, filename = name.rpartition("/")
         try:
-            data, _ext = _download_comfyui_image(
-                comfyui_url,
-                {"filename": filename, "subfolder": subfolder, "type": folder},
-            )
-        except HTTPException as exc:
+            with tempfile.TemporaryDirectory(
+                prefix="pixlstash-comfyui-"
+            ) as download_dir:
+                try:
+                    path, _ext = _download_comfyui_image(
+                        comfyui_url,
+                        {"filename": filename, "subfolder": subfolder, "type": folder},
+                        download_dir,
+                    )
+                except HTTPException as exc:
+                    logger.info(
+                        "[workflows] Load Image's %s (%s) is not matched to a "
+                        "library picture by its content: ComfyUI did not hand "
+                        "over the file (%s).",
+                        name,
+                        folder,
+                        exc.detail,
+                    )
+                    return None
+                if not os.path.getsize(path):
+                    return None
+                return ImageUtils.calculate_hash_from_file_path(path)
+        except OSError as exc:
+            # The copy is written to the system temporary folder, which a full
+            # or read-only disk, or a name too long for it, can refuse.
             logger.info(
                 "[workflows] Load Image's %s (%s) is not matched to a library "
-                "picture by its content: ComfyUI did not hand over the file "
-                "(%s).",
+                "picture by its content: its file could not be copied to a "
+                "temporary folder to hash (%s).",
                 name,
                 folder,
-                exc.detail,
+                exc,
             )
             return None
-        return ImageUtils.calculate_hash_from_bytes(data) if data else None
 
     def _loads_off_the_shelf(
         request: Request | None,

@@ -1602,7 +1602,8 @@ def _picture_source_origin(server, pic_id: int) -> tuple[bool, str | None]:
     is. There is no dedicated provenance column, so this reads the three fields
     that are only ever written on an *inbound* path and are left NULL by
     PixlStash's own ComfyUI import (``_import_comfyui_outputs`` calls
-    ``create_picture_from_bytes`` without any of them):
+    ``create_picture_from_file`` with ``record_source_name=False`` and sets
+    none of them):
 
     - ``reference_folder_id`` - the reference folder the file is tracked in.
     - ``import_source_folder`` - the watch-folder root that produced the file.

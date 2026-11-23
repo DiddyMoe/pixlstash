@@ -602,11 +602,13 @@ class TestFailingToSwitch:
             "_wait_for_comfyui_outputs",
             lambda *_args, **_kwargs: [{"filename": "result.png"}],
         )
-        monkeypatch.setattr(
-            comfyui_service,
-            "_download_comfyui_image",
-            lambda *_args, **_kwargs: (b"generated", ".png"),
-        )
+
+        def fetched(_base_url, _entry, dest_dir):
+            path = Path(dest_dir) / "test-result.png"
+            path.write_bytes(b"generated")
+            return str(path), ".png"
+
+        monkeypatch.setattr(comfyui_service, "_download_comfyui_image", fetched)
         monkeypatch.setattr(
             comfyui_service,
             "_import_comfyui_outputs",

@@ -1,11 +1,13 @@
 """Image loading, thumbnail generation, metadata extraction, and picture creation utilities."""
 
 import cv2
+import errno
 import functools
 import hashlib
 import os
 import piexif
 import piexif.helper
+import shutil
 import tempfile
 import uuid
 
@@ -14,7 +16,7 @@ from fractions import Fraction
 import json
 
 from io import BytesIO
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 from PIL import ExifTags, Image, ImageOps
@@ -458,103 +460,123 @@ class ImageUtils:
         return [x_min, y_min, x_max, y_max]
 
     @staticmethod
-    def extract_created_at_from_metadata(
-        image_bytes: bytes, fallback_file_path: str = None
-    ) -> Optional[datetime]:
-        """
-        Try to extract the creation datetime from EXIF (for images), or from file
-        metadata (for videos / filesystem).
-
-        Returns a timezone-aware datetime in UTC, or None if not found.
-        """
+    def _exif_created_at(img: Image.Image) -> Optional[datetime]:
+        """The capture time an open image's EXIF records, in UTC, or ``None``."""
         try:
-            with Image.open(BytesIO(image_bytes)) as img:
-                exif_data = img.info.get("exif")
-                if exif_data and piexif:
-                    exif_dict = piexif.load(exif_data)
-                    date_str = None
-                    for tag in ("DateTimeOriginal", "DateTime", "DateTimeDigitised"):
-                        val = exif_dict["0th"].get(
-                            piexif.ImageIFD.__dict__.get(tag)
-                        ) or exif_dict["Exif"].get(piexif.ExifIFD.__dict__.get(tag))
-                        if val:
-                            date_str = val.decode() if isinstance(val, bytes) else val
-                            break
-                    if date_str:
+            exif_data = img.info.get("exif")
+            if exif_data and piexif:
+                exif_dict = piexif.load(exif_data)
+                date_str = None
+                for tag in ("DateTimeOriginal", "DateTime", "DateTimeDigitised"):
+                    val = exif_dict["0th"].get(
+                        piexif.ImageIFD.__dict__.get(tag)
+                    ) or exif_dict["Exif"].get(piexif.ExifIFD.__dict__.get(tag))
+                    if val:
+                        date_str = val.decode() if isinstance(val, bytes) else val
+                        break
+                if date_str:
 
-                        def _read_exif_offset() -> Optional[str]:
-                            try:
-                                exif_ifd = exif_dict.get("Exif") or {}
-                                offset_tag_ids = [
-                                    getattr(piexif.ExifIFD, "OffsetTimeOriginal", None),
-                                    getattr(piexif.ExifIFD, "OffsetTime", None),
-                                    getattr(
-                                        piexif.ExifIFD, "OffsetTimeDigitized", None
-                                    ),
-                                    36880,
-                                    36881,
-                                    36882,
-                                ]
-                                for tag_id in offset_tag_ids:
-                                    if tag_id is None:
-                                        continue
-                                    raw_val = exif_ifd.get(tag_id)
-                                    if not raw_val:
-                                        continue
-                                    text = (
-                                        raw_val.decode(errors="replace")
-                                        if isinstance(raw_val, bytes)
-                                        else str(raw_val)
-                                    ).strip()
-                                    if text:
-                                        return text
-                            except Exception as exc:
-                                logger.debug(
-                                    "Could not read EXIF timezone offset (%s).", exc
-                                )
-                                return None
-                            return None
-
+                    def _read_exif_offset() -> Optional[str]:
                         try:
-                            offset_text = _read_exif_offset()
-                            if offset_text:
-                                normalized_offset = offset_text.replace(" ", "")
-                                dt = datetime.strptime(
-                                    f"{date_str} {normalized_offset}",
-                                    "%Y:%m:%d %H:%M:%S %z",
-                                )
-                                return dt.astimezone(timezone.utc)
-
-                            dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
-                            local_tz = (
-                                datetime.now(timezone.utc).astimezone().tzinfo
-                                or timezone.utc
-                            )
-                            return dt.replace(tzinfo=local_tz).astimezone(timezone.utc)
+                            exif_ifd = exif_dict.get("Exif") or {}
+                            offset_tag_ids = [
+                                getattr(piexif.ExifIFD, "OffsetTimeOriginal", None),
+                                getattr(piexif.ExifIFD, "OffsetTime", None),
+                                getattr(piexif.ExifIFD, "OffsetTimeDigitized", None),
+                                36880,
+                                36881,
+                                36882,
+                            ]
+                            for tag_id in offset_tag_ids:
+                                if tag_id is None:
+                                    continue
+                                raw_val = exif_ifd.get(tag_id)
+                                if not raw_val:
+                                    continue
+                                text = (
+                                    raw_val.decode(errors="replace")
+                                    if isinstance(raw_val, bytes)
+                                    else str(raw_val)
+                                ).strip()
+                                if text:
+                                    return text
                         except Exception as exc:
-                            logger.debug("Failed to parse EXIF datetime: %s", exc)
+                            logger.debug(
+                                "Could not read EXIF timezone offset (%s).", exc
+                            )
+                            return None
+                        return None
+
+                    try:
+                        offset_text = _read_exif_offset()
+                        if offset_text:
+                            normalized_offset = offset_text.replace(" ", "")
+                            dt = datetime.strptime(
+                                f"{date_str} {normalized_offset}",
+                                "%Y:%m:%d %H:%M:%S %z",
+                            )
+                            return dt.astimezone(timezone.utc)
+
+                        dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+                        local_tz = (
+                            datetime.now(timezone.utc).astimezone().tzinfo
+                            or timezone.utc
+                        )
+                        return dt.replace(tzinfo=local_tz).astimezone(timezone.utc)
+                    except Exception as exc:
+                        logger.debug("Failed to parse EXIF datetime: %s", exc)
         except Exception as exc:
             logger.debug("Failed to extract EXIF metadata from image: %s", exc)
-
-        # Try to read creation time from the video container (MP4/MOV mvhd box)
-        # before falling back to the filesystem mtime, which reflects the import
-        # time rather than the original recording time for uploaded files.
-        try:
-            video_dt = VideoUtils.extract_created_at_from_bytes(image_bytes)
-            if video_dt is not None:
-                return video_dt
-        except Exception as exc:
-            logger.debug("Failed to extract video container creation time: %s", exc)
-
-        if fallback_file_path and os.path.exists(fallback_file_path):
-            try:
-                ts = os.path.getmtime(fallback_file_path)
-                return datetime.fromtimestamp(ts, tz=timezone.utc)
-            except Exception as exc:
-                logger.debug(
-                    "Failed to read file mtime for %s: %s", fallback_file_path, exc
-                )
         return None
+
+    @staticmethod
+    def extract_created_at_from_path(
+        file_path: str,
+        *,
+        mtime_source: Optional[str] = None,
+        is_video: Optional[bool] = None,
+    ) -> Optional[datetime]:
+        """When a media file on disk was made, read from the file itself.
+
+        In order: an image's EXIF capture time; for a video file only, the
+        recording time its container's movie header carries; then the
+        filesystem mtime. The mtime is the import time for an uploaded file,
+        which is why both are tried first. Nothing is read whole: the image
+        is opened lazily for its EXIF and the video's boxes are walked by
+        seeking.
+
+        Args:
+            file_path: The file to read the metadata from.
+            mtime_source: The file whose mtime is the fallback, when that is
+                not *file_path* - the original a working copy was made from,
+                whose mtime is the one that still means something.
+            is_video: Whether the file is a video, when the caller has already
+                found that out from its content (an import's working copy may
+                have no extension). ``None`` decides by the extension.
+
+        Returns:
+            A timezone-aware datetime in UTC, or ``None`` if none is found.
+        """
+        if is_video is None:
+            is_video = VideoUtils.is_video_file(file_path)
+        created_at = None
+        if is_video:
+            created_at = VideoUtils.extract_created_at_from_path(file_path)
+        else:
+            try:
+                with Image.open(file_path) as img:
+                    created_at = ImageUtils._exif_created_at(img)
+            except Exception as exc:
+                logger.debug("Could not open %s to read its EXIF: %s", file_path, exc)
+        if created_at is not None:
+            return created_at
+
+        mtime_path = mtime_source or file_path
+        try:
+            return datetime.fromtimestamp(os.path.getmtime(mtime_path), tz=timezone.utc)
+        except OSError as exc:
+            logger.debug("Failed to read file mtime for %s: %s", mtime_path, exc)
+            return None
 
     @staticmethod
     def load_metadata(file_path):
@@ -922,29 +944,48 @@ class ImageUtils:
         picture_uuid: Optional[str] = None,
         pixel_sha: Optional[str] = None,
         subfolder: Optional[str] = None,
+        *,
+        output_dir: Optional[str] = None,
+        reference_folder_id: Optional[int] = None,
+        record_source_name: bool = True,
     ) -> Picture:
-        """
-        Create a Picture from a file path, using metadata for created_at if available.
+        """Create a Picture from a file on disk, copying it into the library.
+
+        The source is copied in chunks, never read whole into memory, and
+        never moved: it belongs to whoever handed it over (a staging folder, a
+        watch folder, a ComfyUI run's fetch folder), who removes it when they
+        are done. Everything recorded is derived from the copy, so it
+        describes exactly the bytes that are published - except the mtime
+        fallback for ``created_at``, which is read from the source, because
+        the copy's own mtime is now.
 
         Args:
             subfolder: Relative folder under ``image_root_path`` to write into,
                 for a library whose root has a v1.11 layout. See
                 :meth:`create_picture_from_bytes`.
+            output_dir: As for :meth:`create_picture_from_bytes`.
+            reference_folder_id: As for :meth:`create_picture_from_bytes`.
+            record_source_name: Whether the source's file name is recorded as
+                the picture's ``original_file_name``. False for a file named
+                only for the fetch that brought it, such as a ComfyUI output:
+                that name is not the picture's own.
         """
         if not os.path.exists(source_file_path):
             raise ValueError(f"Source file path does not exist: {source_file_path}")
-        with open(source_file_path, "rb") as f:
-            image_bytes = f.read()
-        created_at = ImageUtils.extract_created_at_from_metadata(
-            image_bytes, fallback_file_path=source_file_path
-        )
-        return ImageUtils.create_picture_from_bytes(
-            image_root_path=image_root_path,
-            image_bytes=image_bytes,
+        return ImageUtils._publish_picture(
+            image_root_path,
+            lambda part_path: shutil.copyfile(source_file_path, part_path),
+            source_label=source_file_path,
+            part_suffix=os.path.splitext(source_file_path)[1].lower(),
+            mtime_source=source_file_path,
             picture_uuid=picture_uuid,
             pixel_sha=pixel_sha,
-            created_at=created_at,
-            original_file_name=os.path.basename(source_file_path),
+            created_at=None,
+            original_file_name=(
+                os.path.basename(source_file_path) if record_source_name else None
+            ),
+            output_dir=output_dir,
+            reference_folder_id=reference_folder_id,
             subfolder=subfolder,
         )
 
@@ -961,6 +1002,9 @@ class ImageUtils:
         subfolder: Optional[str] = None,
     ) -> Picture:
         """Create a Picture from raw bytes, deriving metadata and saving the file.
+
+        The bytes are written to an in-progress file and described from there,
+        through the same steps :meth:`create_picture_from_file` takes.
 
         Args:
             image_root_path: The vault's image root directory. Always used for
@@ -984,41 +1028,157 @@ class ImageUtils:
                 only ``output_dir`` makes a path absolute, and that means a
                 reference folder. Ignored when *output_dir* is given.
         """
-        if not pixel_sha:
-            pixel_sha = ImageUtils.calculate_hash_from_bytes(image_bytes)
 
-        inferred_ext = ""
-        if picture_uuid:
-            inferred_ext = os.path.splitext(str(picture_uuid))[1].lower().lstrip(".")
+        def _write_part(part_path: str) -> None:
+            with open(part_path, "xb") as handle:
+                handle.write(image_bytes)
 
-        img_format = None
-        width = height = None
-        orientation = None
-        thumbnail_bytes = None
-        # Thumbnail column values (AR-bitmap dims + faceless square crop). Faces
-        # are not known at import; ``FaceExtractionTask`` refines the square crop
-        # once faces are detected.
-        thumb_cols: dict = {}
-        is_video = False
+        inferred_ext = ImageUtils._extension_of(picture_uuid)
+        return ImageUtils._publish_picture(
+            image_root_path,
+            _write_part,
+            source_label=original_file_name or picture_uuid or "uploaded bytes",
+            part_suffix=f".{inferred_ext}" if inferred_ext else "",
+            mtime_source=None,
+            picture_uuid=picture_uuid,
+            pixel_sha=pixel_sha,
+            created_at=created_at,
+            original_file_name=original_file_name,
+            output_dir=output_dir,
+            reference_folder_id=reference_folder_id,
+            subfolder=subfolder,
+        )
+
+    @staticmethod
+    def _extension_of(picture_uuid: Optional[str]) -> str:
+        """The lower-case extension, without its dot, of a picture's file name."""
+        if not picture_uuid:
+            return ""
+        return os.path.splitext(str(picture_uuid))[1].lower().lstrip(".")
+
+    @staticmethod
+    def _publish_picture(
+        image_root_path: str,
+        write_part: Callable[[str], None],
+        *,
+        source_label: str,
+        part_suffix: str,
+        mtime_source: Optional[str],
+        picture_uuid: Optional[str],
+        pixel_sha: Optional[str],
+        created_at: Optional[datetime],
+        original_file_name: Optional[str],
+        output_dir: Optional[str],
+        reference_folder_id: Optional[int],
+        subfolder: Optional[str],
+    ) -> Picture:
+        """Write a new picture's file, describe it, and publish it at its name.
+
+        *write_part* writes the content to the path it is handed: a hidden
+        in-progress file in the destination folder, hidden so no folder walk
+        indexes it. Hash, format, dimensions, orientation, thumbnail and date
+        are all derived from that file; only then is it renamed onto its final
+        name with ``os.replace``, which is atomic on one filesystem. A reader
+        never sees a partial file at that name, and a full disk or a process
+        that dies mid-write leaves none there; on any failure the process sees,
+        the in-progress file is removed. Nothing is fsynced, so a power loss
+        straight after the rename can still leave the name holding fewer bytes.
+
+        The parameters are those of :meth:`create_picture_from_bytes`, plus:
+
+        Args:
+            source_label: Where the content came from, for log lines.
+            part_suffix: Extension (with its dot) for the in-progress file, so
+                OpenCV picks the demuxer for the video's own container. Empty
+                for content with no name, which OpenCV is handed as ``.mp4``.
+            mtime_source: The file whose mtime is the ``created_at`` fallback,
+                when that is not the in-progress file.
+        """
+        inferred_ext = ImageUtils._extension_of(picture_uuid)
+        if output_dir:
+            dest_dir = output_dir
+        elif subfolder:
+            dest_dir = os.path.join(image_root_path, *subfolder.split("/"))
+        else:
+            dest_dir = image_root_path
+        os.makedirs(dest_dir, exist_ok=True)
+        part_path = os.path.join(
+            dest_dir, f".{uuid.uuid4().hex}.part{part_suffix or '.mp4'}"
+        )
+
+        full_path = None
+        published = False
         try:
-            with Image.open(BytesIO(image_bytes)) as img:
-                img_format = img.format or "PNG"
-                width, height = img.size
-                # Read here, from the image that is already open, rather than
-                # left to `MissingOrientationFinder`. That finder exists to fill
-                # rows that predate the column; a NEW picture whose orientation
-                # is NULL for an indeterminate window is a value anything reading
-                # it right after import races - and the operation log records it
-                # as a facet, so a rotate landing in that window would snapshot
-                # `None` as the prior state and its undo would have nothing to
-                # write back.
+            write_part(part_path)
+            if not pixel_sha:
+                pixel_sha = ImageUtils.calculate_hash_from_file_path(part_path)
+
+            img_format = None
+            width = height = None
+            orientation = None
+            thumbnail_bytes = None
+            # Thumbnail column values (AR-bitmap dims + faceless square crop).
+            # Faces are not known at import; ``FaceExtractionTask`` refines the
+            # square crop once faces are detected.
+            thumb_cols: dict = {}
+            is_video = False
+            try:
+                with Image.open(part_path) as img:
+                    img_format = img.format or "PNG"
+                    width, height = img.size
+                    # Read here, from the image that is already open, rather
+                    # than left to `MissingOrientationFinder`. That finder
+                    # exists to fill rows that predate the column; a NEW
+                    # picture whose orientation is NULL for an indeterminate
+                    # window is a value anything reading it right after import
+                    # races - and the operation log records it as a facet, so a
+                    # rotate landing in that window would snapshot `None` as
+                    # the prior state and its undo would have nothing to write
+                    # back.
+                    try:
+                        raw_orientation = int(
+                            (img.getexif() or {}).get(ORIENTATION_TAG, 1)
+                        )
+                    except (TypeError, ValueError):
+                        raw_orientation = 1
+                    orientation = raw_orientation if 1 <= raw_orientation <= 8 else 1
+                    rendered = ImageUtils.render_thumbnail(img)
+                    if rendered is not None:
+                        thumbnail_bytes, bmp_w, bmp_h, crop = rendered
+                        thumb_cols = {
+                            "thumbnail_width": bmp_w,
+                            "thumbnail_height": bmp_h,
+                            "square_crop_x": crop["x"],
+                            "square_crop_y": crop["y"],
+                            "square_crop_side": crop["side"],
+                        }
+            except Exception as exc:
+                logger.debug(
+                    "%s is not an image Pillow reads, so it is read as a video: %s",
+                    source_label,
+                    exc,
+                )
+                is_video = True
+
+            if not is_video and (
+                thumbnail_bytes is None or width is None or height is None
+            ):
+                raise ValueError(f"Failed to generate thumbnail for {source_label}")
+
+            if is_video:
+                cap = cv2.VideoCapture(part_path)
                 try:
-                    raw_orientation = int((img.getexif() or {}).get(ORIENTATION_TAG, 1))
-                except (TypeError, ValueError):
-                    raw_orientation = 1
-                orientation = raw_orientation if 1 <= raw_orientation <= 8 else 1
-                rendered = ImageUtils.render_thumbnail(img)
-                if rendered is not None:
+                    ret, frame = cap.read()
+                    if not ret:
+                        logger.error(
+                            "Could not read first frame from video %s for thumbnail.",
+                            source_label,
+                        )
+                        raise ValueError("Failed to read first frame from video")
+                    height, width = frame.shape[:2]
+                    rendered = ImageUtils.render_thumbnail(frame)
+                    if rendered is None:
+                        raise ValueError("Failed to generate thumbnail for video")
                     thumbnail_bytes, bmp_w, bmp_h, crop = rendered
                     thumb_cols = {
                         "thumbnail_width": bmp_w,
@@ -1027,85 +1187,38 @@ class ImageUtils:
                         "square_crop_y": crop["y"],
                         "square_crop_side": crop["side"],
                     }
-        except Exception:
-            is_video = True
-
-        if not is_video and (
-            thumbnail_bytes is None or width is None or height is None
-        ):
-            raise ValueError("Failed to generate thumbnail for image bytes")
-
-        if is_video:
-            # Use the real extension as the temp-file suffix so that cv2 picks
-            # the correct demuxer/codec (e.g. QuickTime for .mov).
-            video_suffix = f".{inferred_ext}" if inferred_ext else ".mp4"
-            tmp_path = None
-            cap = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=video_suffix
-                ) as tmp:
-                    tmp.write(image_bytes)
-                    tmp_path = tmp.name
-                cap = cv2.VideoCapture(tmp_path)
-                ret, frame = cap.read()
-                if not ret:
-                    logger.error("Could not read first frame from video for thumbnail.")
-                    raise ValueError("Failed to read first frame from video")
-                height, width = frame.shape[:2]
-                rendered = ImageUtils.render_thumbnail(frame)
-                if rendered is None:
-                    raise ValueError("Failed to generate thumbnail for video")
-                thumbnail_bytes, bmp_w, bmp_h, crop = rendered
-                thumb_cols = {
-                    "thumbnail_width": bmp_w,
-                    "thumbnail_height": bmp_h,
-                    "square_crop_x": crop["x"],
-                    "square_crop_y": crop["y"],
-                    "square_crop_side": crop["side"],
-                }
-            finally:
-                if cap is not None:
+                finally:
                     cap.release()
-                if tmp_path is not None and os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError as rm_err:
-                        logger.warning(
-                            "Failed to remove video temp file %s: %s", tmp_path, rm_err
-                        )
-            if inferred_ext:
-                img_format = inferred_ext.upper()
+                img_format = inferred_ext.upper() if inferred_ext else "MP4"
+
+            if not created_at:
+                created_at = ImageUtils.extract_created_at_from_path(
+                    part_path, mtime_source=mtime_source, is_video=is_video
+                )
+
+            if not picture_uuid:
+                picture_uuid = str(uuid.uuid4()) + f".{img_format.lower()}"
+            file_name = os.path.basename(picture_uuid)
+            full_path = os.path.join(dest_dir, file_name)
+            if output_dir:
+                # Saved into the caller-specified directory (e.g. a reference
+                # folder). Store the absolute path: that is what marks a
+                # reference-folder picture for every reader.
+                picture_file_path: str = full_path
+            elif subfolder:
+                # Placement on write, v1.11 Phase 4b. Relative, so the picture
+                # stays a library picture; the layout decided the folder and the
+                # caller has already checked that the root has one.
+                picture_file_path = "/".join([*subfolder.split("/"), file_name])
             else:
-                img_format = "MP4"
+                picture_file_path = file_name
+            size_bytes = os.path.getsize(part_path)
 
-        if not picture_uuid:
-            picture_uuid = str(uuid.uuid4()) + f".{img_format.lower()}"
-
-        file_name = os.path.basename(picture_uuid)
-        if output_dir:
-            # Save into the caller-specified directory (e.g. a reference folder).
-            # Store the absolute path: that is what marks a reference-folder
-            # picture for every reader.
-            full_path = os.path.join(output_dir, file_name)
-            picture_file_path: str = full_path
-        elif subfolder:
-            # Placement on write, v1.11 Phase 4b. Relative, so the picture stays
-            # a library picture; the layout decided the folder and the caller
-            # has already checked that the root has one.
-            relative = os.path.join(*subfolder.split("/"), file_name)
-            full_path = os.path.join(image_root_path, relative)
-            picture_file_path = relative.replace(os.sep, "/")
-        else:
-            full_path = os.path.join(image_root_path, file_name)
-            picture_file_path = file_name
-        if os.path.exists(full_path):
-            size_bytes = os.path.getsize(full_path)
-        else:
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "wb") as f:
-                f.write(image_bytes)
-            size_bytes = len(image_bytes)
+            ImageUtils._move_into_place(part_path, full_path)
+            published = True
+        finally:
+            if not published:
+                ImageUtils._discard_part(part_path, source_label, full_path or dest_dir)
 
         if thumbnail_bytes:
             saved_thumb = ImageUtils.write_thumbnail_bytes(
@@ -1114,10 +1227,6 @@ class ImageUtils:
             if not saved_thumb:
                 logger.warning("Failed to persist thumbnail for %s", file_name)
 
-        if not created_at:
-            created_at = ImageUtils.extract_created_at_from_metadata(
-                image_bytes, fallback_file_path=full_path
-            )
         if not created_at:
             created_at = datetime.now(timezone.utc)
 
@@ -1163,6 +1272,59 @@ class ImageUtils:
             is_video=is_video,
             **thumb_cols,
         )
+
+    @staticmethod
+    def _move_into_place(part_path: str, full_path: str) -> None:
+        """Rename a finished in-progress file onto its final name.
+
+        A file already at that name when it is checked is never overwritten,
+        and never taken as the new picture unless it is a regular file holding
+        exactly the same bytes (same size and SHA-256); then it is kept and the
+        in-progress copy dropped. A link there is never followed. Two imports
+        racing to the same name are not guarded against: one that takes the
+        name between the check and the rename is replaced by the other.
+
+        Raises:
+            FileExistsError: Something else already has that name.
+        """
+        if os.path.lexists(full_path):
+            same = (
+                not os.path.islink(full_path)
+                and os.path.isfile(full_path)
+                and os.path.getsize(full_path) == os.path.getsize(part_path)
+            )
+            if same:
+                same = ImageUtils.calculate_full_hash_from_file_path(
+                    full_path
+                ) == ImageUtils.calculate_full_hash_from_file_path(part_path)
+            if not same:
+                raise FileExistsError(
+                    errno.EEXIST, "A different file already has this name", full_path
+                )
+            logger.debug("%s already holds these bytes; keeping it.", full_path)
+            os.remove(part_path)
+            return
+        os.replace(part_path, full_path)
+
+    @staticmethod
+    def _discard_part(part_path: str, source_label: str, destination: str) -> None:
+        """Remove the in-progress file of an import that did not complete."""
+        logger.warning(
+            "Import of %s into %s did not complete; removing its in-progress copy.",
+            source_label,
+            destination,
+        )
+        try:
+            os.remove(part_path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            logger.error(
+                "Could not remove the in-progress copy %s of %s: %s",
+                part_path,
+                source_label,
+                exc,
+            )
 
     @staticmethod
     def cosine_similarity(a: bytes, b: bytes) -> float:

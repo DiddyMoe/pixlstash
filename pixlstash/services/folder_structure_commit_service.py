@@ -46,7 +46,6 @@ collapse to one path component as the same folder.
 from __future__ import annotations
 
 import concurrent.futures
-import io
 import json
 import os
 import time
@@ -739,12 +738,7 @@ def _build_managed_picture(
     for the whole import, resolved once by the caller.
     """
     pixel_sha = ImageUtils.calculate_hash_from_file_path(abs_path)
-    with open(abs_path, "rb") as fh:
-        image_bytes = fh.read()
-
-    created_at = ImageUtils.extract_created_at_from_metadata(
-        image_bytes, fallback_file_path=abs_path
-    )
+    created_at = ImageUtils.extract_created_at_from_path(abs_path)
 
     width = height = None
     img_format = None
@@ -755,7 +749,7 @@ def _build_managed_picture(
     # later. Trying anyway logged a WARNING per clip that read as a failure.
     if not is_video:
         try:
-            with Image.open(io.BytesIO(image_bytes)) as img:
+            with Image.open(abs_path) as img:
                 img_format = img.format or "PNG"
                 width, height = img.size
                 rendered = ImageUtils.render_thumbnail(img)

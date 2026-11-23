@@ -13,11 +13,16 @@ import event. Both are covered here.
 """
 
 import json
+import os
+import tempfile
 import threading
+import tracemalloc
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
+from sqlalchemy.orm import configure_mappers
 
 import pixlstash.services.comfyui_service as comfyui_service
 from pixlstash.services import comfyui_recipe_service
@@ -811,10 +816,206 @@ class _FakeServer:
         self.vault = _FakeVault()
 
 
+_MIB = 1024 * 1024
+
+
+class _StreamedView:
+    """ComfyUI's ``GET /view`` as ``requests`` returns it with ``stream=True``.
+
+    The body arrives in three pieces, and ``content`` refuses: taking the
+    whole body at once is what holds every output of a run in memory until
+    its import ends. With *cut_after*, the stream ends after that many pieces
+    with the error a dropped connection raises.
+    """
+
+    def __init__(self, body: bytes, cut_after: int | None = None):
+        self.status_code = 200
+        self.text = ""
+        self.chunk_sizes = []
+        self.closed = False
+        self._body = body
+        self._cut_after = cut_after
+
+    @property
+    def content(self):
+        raise AssertionError("the whole body was taken at once")
+
+    def iter_content(self, chunk_size=1):
+        self.chunk_sizes.append(chunk_size)
+        piece = max(1, -(-len(self._body) // 3))
+        for n, start in enumerate(range(0, len(self._body), piece)):
+            if n == self._cut_after:
+                raise comfyui_service.requests.exceptions.ChunkedEncodingError(
+                    "test-cut-off"
+                )
+            yield self._body[start : start + piece]
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+
+def _serve_views(monkeypatch, bodies: dict, cut_after: int | None = None) -> list:
+    """Stand in for ComfyUI's ``/view`` over *bodies*, by file name; return
+    ``(url, keyword arguments, response)`` for each request."""
+    asked = []
+
+    def get(url, **kwargs):
+        view = _StreamedView(bodies[kwargs["params"]["filename"]], cut_after)
+        asked.append((url, kwargs, view))
+        return view
+
+    monkeypatch.setattr(comfyui_service.requests, "get", get)
+    return asked
+
+
+def _traced_peak(call):
+    """Run *call* under ``tracemalloc``; return its result and the heap peak.
+
+    The ORM's mappers are configured first: the first ``Picture`` a process
+    builds does that, a one-time ~3 MiB that is not the file being measured.
+    """
+    configure_mappers()
+    tracemalloc.start()
+    try:
+        result = call()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return result, peak
+
+
+class TestFetchingOutputs:
+    """An output is fetched to a file and imported from it, never held whole."""
+
+    def test_an_output_is_written_to_disk_as_it_arrives(self, monkeypatch, tmp_path):
+        body = b"test-output-" * 30000
+        asked = _serve_views(monkeypatch, {"out_00001.png": body})
+
+        path, ext = comfyui_service._download_comfyui_image(
+            "http://comfy",
+            {"filename": "out_00001.png", "subfolder": "test-sub", "type": "output"},
+            str(tmp_path),
+        )
+
+        assert (os.path.dirname(path), os.path.splitext(path)[1], ext) == (
+            str(tmp_path),
+            ".png",
+            ".png",
+        )
+        with open(path, "rb") as handle:
+            assert handle.read() == body
+        ((url, kwargs, view),) = asked
+        assert url == "http://comfy/view"
+        assert kwargs == {
+            "params": {
+                "filename": "out_00001.png",
+                "subfolder": "test-sub",
+                "type": "output",
+            },
+            "stream": True,
+            "timeout": 30,
+            "allow_redirects": False,
+            "proxies": comfyui_service.NO_PROXY,
+        }
+        (chunk_size,) = view.chunk_sizes
+        assert chunk_size is not None and 0 < chunk_size <= _MIB
+        assert view.closed
+
+    @pytest.mark.parametrize("kind", ["relative", "absolute"])
+    def test_a_fetched_file_stays_in_the_runs_folder(self, monkeypatch, tmp_path, kind):
+        """ComfyUI names the file, but only its extension is taken: a name
+        that climbs out of the run's folder, or an absolute path, still lands
+        inside it. Both escapes point inside this test's own folder."""
+        run = tmp_path / "run" / "fetch"
+        run.mkdir(parents=True)
+        escape = tmp_path / "test-escape.png"
+        name = "../../test-escape.png" if kind == "relative" else str(escape)
+        _serve_views(monkeypatch, {name: b"test-output-" * 1000})
+
+        path, ext = comfyui_service._download_comfyui_image(
+            "http://comfy", {"filename": name, "type": "output"}, str(run)
+        )
+
+        assert (os.path.dirname(path), ext) == (str(run), ".png")
+        assert os.listdir(run) == [os.path.basename(path)]
+        assert not escape.exists()
+
+    def test_a_fetch_cut_off_midway_is_a_failed_fetch(self, monkeypatch, tmp_path):
+        asked = _serve_views(
+            monkeypatch, {"out_00001.png": b"test-output-" * 30000}, cut_after=1
+        )
+
+        with pytest.raises(comfyui_service.HTTPException) as failed:
+            comfyui_service._download_comfyui_image(
+                "http://comfy", {"filename": "out_00001.png"}, str(tmp_path)
+            )
+
+        assert (failed.value.status_code, failed.value.detail) == (
+            502,
+            "ComfyUI image fetch failed",
+        )
+        assert asked[0][2].closed
+
+    def test_an_output_is_imported_without_being_read_whole(self, tmp_path):
+        """A ~14 MiB output is fingerprinted and copied into the library with
+        a heap peak under a quarter of its size, and arrives byte for byte.
+
+        Decoded pixels live in Pillow's own allocations, outside the traced
+        heap, so what this measures is the file held in memory.
+        """
+        downloads = tmp_path / "test-downloads"
+        library = tmp_path / "library"
+        downloads.mkdir()
+        library.mkdir()
+        source = downloads / "test-output.bmp"
+        Image.new("RGB", (2200, 2200), (40, 50, 60)).save(source, format="BMP")
+        size = os.path.getsize(source)
+        server = SimpleNamespace(
+            vault=SimpleNamespace(
+                image_root=str(library),
+                db=SimpleNamespace(
+                    # The library holds nothing with this content, and the
+                    # rows are not what this test is about.
+                    run_immediate_read_task=lambda fn, *args: {},
+                    run_task=lambda fn, *args: [],
+                ),
+            )
+        )
+
+        _, peak = _traced_peak(
+            lambda: comfyui_service._import_comfyui_outputs(
+                server, [(str(source), ".bmp")]
+            )
+        )
+
+        assert peak < size / 4, f"heap peak {peak / _MIB:.1f} MiB of {size / _MIB:.1f}"
+        (published,) = [p for p in library.iterdir() if p.suffix == ".bmp"]
+        assert published.read_bytes() == source.read_bytes()
+
+
 class TestOutputProcessing:
     def _run(
-        self, monkeypatch, images, pixlstash_ids, imported=(), duplicates=(), **kwargs
+        self,
+        monkeypatch,
+        images,
+        pixlstash_ids,
+        imported=(),
+        duplicates=(),
+        fetch=False,
+        import_outputs=None,
+        **kwargs,
     ):
+        """Process a run's outputs with everything past ComfyUI stood in for.
+
+        With *fetch*, the real download runs (the test stands in for
+        ``requests.get``); *import_outputs* replaces the stand-in import.
+        """
         server = _FakeServer()
         calls = {
             "downloads": 0,
@@ -830,15 +1031,21 @@ class TestOutputProcessing:
             lambda *a, **kw: (images, pixlstash_ids),
         )
 
-        def fake_download(base_url, entry):
+        def fake_download(base_url, entry, dest_dir):
             calls["downloads"] += 1
-            return b"png-bytes", ".png"
+            path = os.path.join(dest_dir, f"test-{calls['downloads']}.png")
+            with open(path, "wb") as handle:
+                handle.write(b"png-bytes")
+            return path, ".png"
 
-        monkeypatch.setattr(comfyui_service, "_download_comfyui_image", fake_download)
+        if not fetch:
+            monkeypatch.setattr(
+                comfyui_service, "_download_comfyui_image", fake_download
+            )
         monkeypatch.setattr(
             comfyui_service,
             "_import_comfyui_outputs",
-            lambda *a, **kw: (list(imported), list(duplicates)),
+            import_outputs or (lambda *a, **kw: (list(imported), list(duplicates))),
         )
         monkeypatch.setattr(
             comfyui_service, "_held_before", lambda srv, ids, started: list(ids)
@@ -985,6 +1192,79 @@ class TestOutputProcessing:
             "http://comfy", "prompt-1", ["9"]
         ) == ([], None)
         assert log == ["sleep", "queue", "history"]
+
+    def test_outputs_are_imported_from_files_that_go_with_the_run(
+        self, monkeypatch, tmp_path
+    ):
+        """Each output is fetched to a file in a folder of the run's own, the
+        import is handed those files, and the folder is gone once the run
+        ends. An output with no bytes is not imported."""
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        bodies = {
+            "out_00001.png": b"test-first-" * 20000,
+            "out_00002.png": b"test-second-" * 20000,
+            "out_00003.png": b"",
+        }
+        _serve_views(monkeypatch, bodies)
+        handed = []
+
+        def import_outputs(srv, entries, **kwargs):
+            for path, ext in entries:
+                with open(path, "rb") as handle:
+                    handed.append((os.path.dirname(path), handle.read(), ext))
+            return [40, 41], []
+
+        server, _calls = self._run(
+            monkeypatch,
+            images=[{"filename": name} for name in bodies],
+            pixlstash_ids=None,
+            fetch=True,
+            import_outputs=import_outputs,
+        )
+
+        assert [(body, ext) for _folder, body, ext in handed] == [
+            (bodies["out_00001.png"], ".png"),
+            (bodies["out_00002.png"], ".png"),
+        ]
+        (folder,) = {folder for folder, _body, _ext in handed}
+        assert os.path.dirname(folder) == str(tmp_path)
+        assert os.path.basename(folder).startswith("pixlstash-comfyui-")
+        assert list(tmp_path.iterdir()) == []
+        assert self._ending(server.vault.events[-1]) == (
+            "comfyui-prompt-1",
+            "completed",
+        )
+
+    @pytest.mark.parametrize("fails", ["the import", "the fetch"])
+    def test_the_fetched_files_go_with_a_run_that_fails(
+        self, monkeypatch, tmp_path, fails
+    ):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        _serve_views(
+            monkeypatch,
+            {"out_00001.png": b"test-output-" * 20000},
+            cut_after=1 if fails == "the fetch" else None,
+        )
+
+        def import_outputs(srv, entries, **kwargs):
+            raise OSError(28, "test-no-space-left")
+
+        server, _calls = self._run(
+            monkeypatch,
+            images=[{"filename": "out_00001.png"}],
+            pixlstash_ids=None,
+            fetch=True,
+            import_outputs=import_outputs,
+        )
+
+        assert list(tmp_path.iterdir()) == []
+        payload = server.vault.events[-1][1]
+        assert (payload["status"], payload["message"]) == (
+            "failed",
+            "[Errno 28] test-no-space-left"
+            if fails == "the import"
+            else "ComfyUI image fetch failed",
+        )
 
 
 class TestVideoSavers:
@@ -1898,9 +2178,14 @@ class TestTheEndingIsToldAndKept:
             "_wait_for_comfyui_outputs",
             lambda *a, **k: ([{"filename": "out.png"}], None),
         )
-        monkeypatch.setattr(
-            comfyui_service, "_download_comfyui_image", lambda *a: (b"png", ".png")
-        )
+
+        def fetched(_base_url, _entry, dest_dir):
+            path = os.path.join(dest_dir, "test-out.png")
+            with open(path, "wb") as handle:
+                handle.write(b"png")
+            return path, ".png"
+
+        monkeypatch.setattr(comfyui_service, "_download_comfyui_image", fetched)
         monkeypatch.setattr(
             comfyui_service, "_import_comfyui_outputs", lambda *a, **k: ([], [7, 8])
         )

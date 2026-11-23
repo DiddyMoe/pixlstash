@@ -18,14 +18,19 @@ casually undone.
 
 from __future__ import annotations
 
+import errno
 import io
+import json
 import os
+import shutil
 import struct
+from datetime import datetime, timezone
 
 import piexif
 import pytest
 from PIL import Image, ImageOps, PngImagePlugin
 
+from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.orientation import (
     ORIENTATION_NORMAL,
     ROTATE_180,
@@ -606,3 +611,194 @@ def test_import_records_a_corrupt_orientation_as_normal(tmp_path):
     )
 
     assert picture.orientation == ORIENTATION_NORMAL
+
+
+# ---------------------------------------------------------------------------
+# Import from a file on disk: one copy is described, and that copy published
+# ---------------------------------------------------------------------------
+
+_SOURCE_MTIME = datetime(2021, 6, 1, 8, 30, 0, tzinfo=timezone.utc)
+_EXECUTED_PROMPT = json.dumps(
+    {
+        "4": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": "test-model.safetensors"},
+        },
+        "6": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": "a cat on a sofa", "clip": ["4", 1]},
+        },
+        "3": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["6", 0], "model": ["4", 0], "seed": 7},
+        },
+    }
+)
+
+
+def _rotated_photo(path) -> datetime:
+    """A JPEG with a capture time and a quarter-turn tag; returns that time.
+
+    ``DateTimeOriginal`` carries no offset, so it is read as local time.
+    """
+    exif = {
+        "0th": {piexif.ImageIFD.Orientation: 6},
+        "Exif": {piexif.ExifIFD.DateTimeOriginal: b"2026:03:15 14:32:04"},
+        "GPS": {},
+        "1st": {},
+        "thumbnail": None,
+    }
+    _tile().save(path, "JPEG", quality=95, exif=piexif.dump(exif))
+    local = datetime.now(timezone.utc).astimezone().tzinfo or timezone.utc
+    return datetime(2026, 3, 15, 14, 32, 4, tzinfo=local).astimezone(timezone.utc)
+
+
+def _generated_png(path) -> datetime:
+    """A PNG carrying the graph ComfyUI executed and no EXIF; returns its mtime."""
+    info = PngImagePlugin.PngInfo()
+    info.add_text("prompt", _EXECUTED_PROMPT)
+    _tile().save(path, "PNG", pnginfo=info)
+    os.utime(path, (_SOURCE_MTIME.timestamp(), _SOURCE_MTIME.timestamp()))
+    return _SOURCE_MTIME
+
+
+# What the import recorded when it read the whole file into memory: format,
+# width, height, orientation, positive prompt, models.
+_AS_RECORDED_BEFORE = {
+    "photo.jpg": ("JPEG", 3, 2, 6, None, "[]"),
+    "generated.png": ("PNG", 3, 2, 1, "a cat on a sofa", '["test-model.safetensors"]'),
+}
+
+
+@pytest.mark.parametrize(
+    "name,make", [("photo.jpg", _rotated_photo), ("generated.png", _generated_png)]
+)
+def test_an_import_from_a_file_records_what_the_whole_read_did(tmp_path, name, make):
+    """Reading from the file on disk must not change what a picture records.
+
+    The date is the EXIF capture time when there is one, else the SOURCE's
+    mtime: the library's copy is new, so its own mtime would date every such
+    picture to the moment it was imported.
+    """
+    source = tmp_path / name
+    created_at = make(source)
+    data = source.read_bytes()
+    library = tmp_path / "library"
+
+    picture = ImageUtils.create_picture_from_file(str(library), str(source))
+
+    assert (
+        picture.format,
+        picture.width,
+        picture.height,
+        picture.orientation,
+        picture.comfyui_positive_prompt,
+        picture.comfyui_models,
+    ) == _AS_RECORDED_BEFORE[name]
+    assert picture.created_at == created_at
+    assert picture.original_file_name == name
+    assert (library / picture.file_path).read_bytes() == data
+    assert source.is_file(), "the source is the caller's to remove, not the import's"
+
+
+def test_a_disk_that_fills_mid_copy_leaves_nothing_in_the_library(
+    tmp_path, monkeypatch
+):
+    """Neither a truncated picture nor its in-progress copy may stay behind."""
+    source = tmp_path / "photo.jpg"
+    _rotated_photo(source)
+    data = source.read_bytes()
+    library = tmp_path / "library"
+    library.mkdir()
+
+    def _copy_half_then_fill_the_disk(src, dst):
+        with open(dst, "wb") as handle:
+            handle.write(data[: len(data) // 2])
+        raise OSError(errno.ENOSPC, "No space left on device", dst)
+
+    monkeypatch.setattr(shutil, "copyfile", _copy_half_then_fill_the_disk)
+
+    with pytest.raises(OSError) as raised:
+        ImageUtils.create_picture_from_file(str(library), str(source))
+
+    assert raised.value.errno == errno.ENOSPC
+    assert sorted(os.listdir(library)) == []
+
+
+def test_content_that_cannot_be_described_leaves_nothing_in_the_library(tmp_path):
+    """The file is written before it is described; a failure must remove it."""
+    library = tmp_path / "library"
+    library.mkdir()
+
+    with pytest.raises(ValueError):
+        ImageUtils.create_picture_from_bytes(
+            str(library), b"neither a picture nor a video", picture_uuid="junk.png"
+        )
+
+    assert sorted(os.listdir(library)) == []
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [b"somebody else's picture", None],
+    ids=["different-size", "same-size-different-bytes"],
+)
+def test_an_import_never_takes_over_a_different_file_at_its_name(tmp_path, existing):
+    """A name already taken is refused, and what holds it is left alone.
+
+    Taking the existing file as the import's own would record its size beside
+    a hash and dimensions read from other bytes.
+    """
+    source = tmp_path / "photo.jpg"
+    _rotated_photo(source)
+    data = source.read_bytes()
+    if existing is None:
+        existing = bytes(reversed(data))
+    library = tmp_path / "library"
+    library.mkdir()
+    taken = library / "taken.jpg"
+    taken.write_bytes(existing)
+
+    with pytest.raises(FileExistsError):
+        ImageUtils.create_picture_from_bytes(
+            str(library), data, picture_uuid="taken.jpg"
+        )
+
+    assert taken.read_bytes() == existing
+    assert sorted(os.listdir(library)) == ["taken.jpg"]
+
+
+def test_an_import_never_takes_a_link_at_its_name_as_its_file(tmp_path):
+    """A link is refused even when what it points at holds the same bytes."""
+    source = tmp_path / "photo.jpg"
+    _rotated_photo(source)
+    data = source.read_bytes()
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "taken.jpg").symlink_to(source)
+
+    with pytest.raises(FileExistsError):
+        ImageUtils.create_picture_from_bytes(
+            str(library), data, picture_uuid="taken.jpg"
+        )
+
+    assert (library / "taken.jpg").is_symlink()
+    assert sorted(os.listdir(library)) == ["taken.jpg"]
+
+
+def test_an_import_of_the_bytes_already_at_its_name_keeps_that_file(tmp_path):
+    """The same import run twice is not an error, and leaves one file."""
+    source = tmp_path / "photo.jpg"
+    _rotated_photo(source)
+    data = source.read_bytes()
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "same.jpg").write_bytes(data)
+
+    picture = ImageUtils.create_picture_from_bytes(
+        str(library), data, picture_uuid="same.jpg"
+    )
+
+    assert (picture.file_path, picture.size_bytes) == ("same.jpg", len(data))
+    assert (library / "same.jpg").read_bytes() == data
+    assert [name for name in os.listdir(library) if ".part" in name] == []

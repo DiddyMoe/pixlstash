@@ -19,6 +19,7 @@ import ntpath
 import os
 import posixpath
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -141,6 +142,8 @@ LISTEN_POLL_S = 2.0
 LISTEN_RETRY_S = 5.0
 # The largest frame the listener takes off ComfyUI's socket.
 LISTEN_MAX_FRAME = 16 * 1024 * 1024
+# How much of an output file is held in memory at once while it is fetched.
+FETCH_CHUNK_BYTES = 1024 * 1024
 
 # The runs in flight, by prompt id, in the order they were queued: what
 # GET /workers/progress reports. From ``follow_run`` until
@@ -1708,7 +1711,21 @@ def _emit_comfyui_completed_progress(
     )
 
 
-def _download_comfyui_image(base_url: str, entry: dict) -> tuple[bytes, str]:
+def _download_comfyui_image(
+    base_url: str, entry: dict, dest_dir: str
+) -> tuple[str, str]:
+    """Fetch one of ComfyUI's files into *dest_dir*; return its path and
+    extension.
+
+    The body is streamed to the file a chunk at a time, so a run's outputs
+    are never held in memory. The file gets a fresh name in *dest_dir*, which
+    belongs to the caller: a fetch that fails part-way leaves its partial file
+    there for the caller's cleanup of the folder.
+
+    Raises:
+        HTTPException: 502 when ComfyUI cannot be reached, refuses the file,
+            or the connection drops mid-body.
+    """
     filename = entry.get("filename")
     subfolder = entry.get("subfolder") or ""
     file_type = entry.get("type") or "output"
@@ -1717,33 +1734,44 @@ def _download_comfyui_image(base_url: str, entry: dict) -> tuple[bytes, str]:
         "subfolder": subfolder,
         "type": file_type,
     }
+    ext = os.path.splitext(filename or "")[1].lower() or ".png"
+    path = os.path.join(dest_dir, f"{uuid.uuid4().hex}{ext}")
     try:
-        response = requests.get(
+        with requests.get(
             f"{base_url}/view",
             params=params,
+            stream=True,
             timeout=30,
             allow_redirects=False,
             proxies=NO_PROXY,
-        )
+        ) as response:
+            if response.status_code >= 300:
+                detail = (response.text or "").strip()
+                logger.warning(
+                    "ComfyUI image fetch failed: status=%s detail=%s",
+                    response.status_code,
+                    detail,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"ComfyUI image fetch failed: {response.status_code} {detail}",
+                )
+            with open(path, "xb") as handle:
+                for chunk in response.iter_content(chunk_size=FETCH_CHUNK_BYTES):
+                    handle.write(chunk)
     except requests.RequestException as exc:
-        logger.warning("ComfyUI image fetch failed: %s", exc)
+        logger.warning(
+            "ComfyUI image fetch failed for %s (%s, %r): %s",
+            filename,
+            file_type,
+            subfolder,
+            exc,
+        )
         raise HTTPException(
             status_code=502,
             detail="ComfyUI image fetch failed",
         ) from exc
-    if response.status_code >= 300:
-        detail = (response.text or "").strip()
-        logger.warning(
-            "ComfyUI image fetch failed: status=%s detail=%s",
-            response.status_code,
-            detail,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"ComfyUI image fetch failed: {response.status_code} {detail}",
-        )
-    ext = os.path.splitext(filename or "")[1].lower() or ".png"
-    return response.content, ext
+    return path, ext
 
 
 def _unique_edit_filename(output_dir: str, stem: str, ext: str) -> str:
@@ -1759,21 +1787,29 @@ def _unique_edit_filename(output_dir: str, stem: str, ext: str) -> str:
 @import_dedup_service.serialised_import()
 def _import_comfyui_outputs(
     server,
-    image_entries: list[tuple[bytes, str]],
+    image_entries: list[tuple[str, str]],
     output_dir: str | None = None,
     reference_folder_id: int | None = None,
     source_file_stem: str | None = None,
 ) -> tuple[list[int], list[int]]:
+    """Import a run's fetched outputs; return ``(new ids, duplicate ids)``.
+
+    *image_entries* are ``(path, extension)`` of files fetched for this run
+    (``_download_comfyui_image``). Each is fingerprinted and copied into the
+    library from its file, never read whole into memory; the files stay
+    where they are, for the caller to remove. The name a file was fetched
+    under is not recorded as the picture's own.
+    """
     if not image_entries:
         return [], []
 
     fingerprints = [
         (
-            ImageUtils.calculate_hash_from_bytes(img_bytes),
-            len(img_bytes),
-            ImageUtils.calculate_full_hash_from_bytes(img_bytes),
+            ImageUtils.calculate_hash_from_file_path(path),
+            os.path.getsize(path),
+            ImageUtils.calculate_full_hash_from_file_path(path),
         )
-        for img_bytes, _ext in image_entries
+        for path, _ext in image_entries
     ]
 
     candidates = server.vault.db.run_immediate_read_task(
@@ -1793,7 +1829,7 @@ def _import_comfyui_outputs(
     subfolder = resolve_placement(server.vault.db, output_dir)
 
     new_picture_map = {}
-    for (img_bytes, ext), fingerprint in zip(image_entries, fingerprints):
+    for (path, ext), fingerprint in zip(image_entries, fingerprints):
         if fingerprint in existing_map or fingerprint in new_picture_map:
             continue
         sampled_sha, _size_bytes, _full_sha = fingerprint
@@ -1801,14 +1837,15 @@ def _import_comfyui_outputs(
             pic_uuid = _unique_edit_filename(output_dir, source_file_stem, ext)
         else:
             pic_uuid = f"{uuid.uuid4()}{ext}"
-        new_picture_map[fingerprint] = ImageUtils.create_picture_from_bytes(
-            image_root_path=server.vault.image_root,
-            image_bytes=img_bytes,
+        new_picture_map[fingerprint] = ImageUtils.create_picture_from_file(
+            server.vault.image_root,
+            path,
             picture_uuid=pic_uuid,
             pixel_sha=sampled_sha,
+            subfolder=subfolder,
             output_dir=output_dir,
             reference_folder_id=reference_folder_id,
-            subfolder=subfolder,
+            record_source_name=False,
         )
     new_pictures = list(new_picture_map.values())
 
@@ -2509,52 +2546,57 @@ def _process_comfyui_outputs(
             logger.warning("ComfyUI produced no outputs for prompt %s", prompt_id)
             emit_failure(rejected or "ComfyUI finished without outputs.")
             return
-        entries = []
-        for entry in images:
-            img_bytes, ext = _download_comfyui_image(base_url, entry)
-            if img_bytes:
-                entries.append((img_bytes, ext))
+        # The outputs are fetched to files in a folder of this run's own, which
+        # goes when the import is done or the run fails, partial files and all.
+        with tempfile.TemporaryDirectory(prefix="pixlstash-comfyui-") as download_dir:
+            entries = []
+            for entry in images:
+                path, ext = _download_comfyui_image(base_url, entry, download_dir)
+                if os.path.getsize(path):
+                    entries.append((path, ext))
 
-        lease, pinned_server = acquire_origin()
-        if pinned_server is None:
-            logger.info(
-                "Discarding stale ComfyUI outputs for prompt %s after library change",
-                prompt_id,
-            )
-            record_run_outcome(
-                prompt_id,
-                "failed",
-                message="The library changed before this run's outputs were imported",
-            )
-            return
+            lease, pinned_server = acquire_origin()
+            if pinned_server is None:
+                logger.info(
+                    "Discarding stale ComfyUI outputs for prompt %s after library change",
+                    prompt_id,
+                )
+                record_run_outcome(
+                    prompt_id,
+                    "failed",
+                    message="The library changed before this run's outputs were imported",
+                )
+                return
 
-        output_dir: str | None = None
-        ref_folder_id: int | None = None
-        source_file_stem: str | None = None
-        if source_picture_id is not None:
-            src_pic = pinned_server.vault.db.run_immediate_read_task(
-                lambda session: session.get(Picture, source_picture_id)
-            )
-            if (
-                src_pic is not None
-                and src_pic.reference_folder_id is not None
-                and src_pic.file_path
-                and os.path.isabs(src_pic.file_path)
-            ):
-                output_dir = os.path.dirname(src_pic.file_path)
-                ref_folder_id = src_pic.reference_folder_id
-                raw = src_pic.original_file_name or os.path.basename(src_pic.file_path)
-                source_file_stem = os.path.splitext(raw)[0] if raw else None
+            output_dir: str | None = None
+            ref_folder_id: int | None = None
+            source_file_stem: str | None = None
+            if source_picture_id is not None:
+                src_pic = pinned_server.vault.db.run_immediate_read_task(
+                    lambda session: session.get(Picture, source_picture_id)
+                )
+                if (
+                    src_pic is not None
+                    and src_pic.reference_folder_id is not None
+                    and src_pic.file_path
+                    and os.path.isabs(src_pic.file_path)
+                ):
+                    output_dir = os.path.dirname(src_pic.file_path)
+                    ref_folder_id = src_pic.reference_folder_id
+                    raw = src_pic.original_file_name or os.path.basename(
+                        src_pic.file_path
+                    )
+                    source_file_stem = os.path.splitext(raw)[0] if raw else None
 
-        # Already-existing re-imports (`duplicate_ids`) get no import event:
-        # they are already in the grid. The ending says so instead.
-        new_ids, duplicate_ids = _import_comfyui_outputs(
-            pinned_server,
-            entries,
-            output_dir=output_dir,
-            reference_folder_id=ref_folder_id,
-            source_file_stem=source_file_stem,
-        )
+            # Already-existing re-imports (`duplicate_ids`) get no import event:
+            # they are already in the grid. The ending says so instead.
+            new_ids, duplicate_ids = _import_comfyui_outputs(
+                pinned_server,
+                entries,
+                output_dir=output_dir,
+                reference_folder_id=ref_folder_id,
+                source_file_stem=source_file_stem,
+            )
         # Only what this run itself imported new may be held: a saver-reported
         # id, or a duplicate, can be a picture the library already had.
         imported_ids = list(new_ids)

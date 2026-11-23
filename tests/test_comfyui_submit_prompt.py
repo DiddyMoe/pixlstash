@@ -465,12 +465,23 @@ def test_every_request_of_a_run_goes_straight_to_comfyui(monkeypatch, tmp_path):
     }
     sent = []
 
+    class _Answer(SimpleNamespace):
+        # An output is fetched as a stream, inside a ``with``.
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def iter_content(self, chunk_size=None):
+            yield self.content
+
     def answer(method):
         # ``requests`` follows a redirect unless told not to.
         def request(url, allow_redirects=True, proxies=None, **_kwargs):
             path = url.removeprefix(COMFY)
             sent.append((method, path, allow_redirects, proxies))
-            return SimpleNamespace(
+            return _Answer(
                 status_code=200,
                 text="",
                 content=b"fake-bytes",
@@ -490,7 +501,11 @@ def test_every_request_of_a_run_goes_straight_to_comfyui(monkeypatch, tmp_path):
     comfyui_service.follow_run("p-1", COMFY, run_id="run-1")
     comfyui_service._read_comfyui_queue(COMFY)
     comfyui_service._fetch_comfyui_history(COMFY, "p-1")
-    comfyui_service._download_comfyui_image(COMFY, {"filename": "test-out.png"})
+    fetched = tmp_path / "fetched"
+    fetched.mkdir()
+    comfyui_service._download_comfyui_image(
+        COMFY, {"filename": "test-out.png"}, str(fetched)
+    )
     comfyui_service._live_runs["p-1"]["status"] = "running"
     comfyui_service.cancel_runs(["run-1"])
     comfyui_service._comfyui_abort(COMFY)

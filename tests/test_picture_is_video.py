@@ -17,6 +17,10 @@ ever wrong in production code:
    closure inside the route handler and cannot be imported, so the route is the
    only way to run it; it decides the value written into the thumbnail cache's
    metadata sidecar, which is what the test reads back.
+5. Every path that ingests a file already on disk dates it the same way (EXIF,
+   then a video's movie header, then the file's mtime) and reads it from its
+   path rather than whole into memory - asserted over all four such paths, so
+   a sibling left on the old bytes path is red.
 """
 
 import contextlib
@@ -25,21 +29,28 @@ import glob
 import json
 import os
 import sqlite3
+import struct
 import tempfile
+import tracemalloc
+from datetime import datetime, timezone
 from io import BytesIO
 
 import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image, PngImagePlugin
 from sqlalchemy import text
+from sqlalchemy.orm import configure_mappers
 from sqlmodel import Session, select
 
 from pixlstash.db_models import Face, Picture
 from pixlstash.server import Server
+from pixlstash.services.folder_structure_commit_service import _build_managed_picture
 from pixlstash.tasks.reference_folder_scan_task import ReferenceFolderScanTask
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
+from pixlstash.utils.likeness.likeness_parameter_utils import LikenessParameterUtils
 from pixlstash.vault import Vault
 from tests.test_migrations import (
     _MIGRATIONS_DIR,
@@ -295,6 +306,280 @@ class TestVideoFrameSampler:
         else:
             assert result == []
         assert log == {"opens": 1, "releases": 1, "reads": 0, "seeks": []}
+
+
+# ---------------------------------------------------------------------------
+# Ingesting a file already on disk: its date, and how much of it is read
+# ---------------------------------------------------------------------------
+
+_MP4_EPOCH = datetime(1904, 1, 1, tzinfo=timezone.utc)
+_SOURCE_MTIME = datetime(2020, 5, 17, 12, 0, 0, tzinfo=timezone.utc)
+_RECORDED_AT = datetime(2023, 8, 9, 10, 11, 12, tzinfo=timezone.utc)
+_DECOY_AT = datetime(2001, 1, 1, tzinfo=timezone.utc)
+_MIB = 1024 * 1024
+
+
+def _seconds_since_1904(moment: datetime) -> int:
+    return int((moment - _MP4_EPOCH).total_seconds())
+
+
+def _box(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I4s", 8 + len(payload), kind) + payload
+
+
+def _mvhd(version: int, created: datetime) -> bytes:
+    """A movie header box: creation and modification time, then the rest zeroed."""
+    seconds = _seconds_since_1904(created)
+    times = struct.pack(">II" if version == 0 else ">QQ", seconds, seconds)
+    return _box(b"mvhd", bytes([version, 0, 0, 0]) + times + bytes(80))
+
+
+def _write_mp4(path, *, version: int, mdat_payload: int, large_mdat: bool) -> None:
+    """``ftyp | mdat | moov{mvhd}``, the movie header after the media, as a camera writes it.
+
+    The media data opens with a box-shaped decoy - a ``moov`` holding an
+    ``mvhd`` dated ``_DECOY_AT`` - so a reader that scans for the header text,
+    or that descends into the media data instead of stepping over it by its
+    size, answers the decoy. The rest of the media data is a sparse hole, so a
+    large file costs no time to write.
+    """
+    decoy = _box(b"moov", _mvhd(0, _DECOY_AT))
+    assert mdat_payload > len(decoy)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2mp41"))
+        if large_mdat:
+            handle.write(struct.pack(">I4sQ", 1, b"mdat", 16 + mdat_payload))
+        else:
+            handle.write(struct.pack(">I4s", 8 + mdat_payload, b"mdat"))
+        handle.write(decoy)
+        handle.seek(mdat_payload - len(decoy), os.SEEK_CUR)
+        handle.write(_box(b"moov", _mvhd(version, _RECORDED_AT)))
+    os.utime(path, (_SOURCE_MTIME.timestamp(), _SOURCE_MTIME.timestamp()))
+
+
+def _write_png_with_mvhd_text(path) -> None:
+    """A PNG without EXIF whose bytes happen to contain a movie-header shape.
+
+    A private ancillary chunk carries ``mvhd``, version 0, flags, then a
+    nonzero 32-bit time: exactly what an unstructured scan takes for a
+    recording date.
+    """
+    info = PngImagePlugin.PngInfo()
+    info.add(
+        b"prVt",
+        b"\x00\x00\x00\x6cmvhd"
+        + bytes(4)
+        + struct.pack(">I", _seconds_since_1904(_DECOY_AT)),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 48), color="green").save(path, "PNG", pnginfo=info)
+    os.utime(path, (_SOURCE_MTIME.timestamp(), _SOURCE_MTIME.timestamp()))
+
+
+def _write_noise_png(path, side: int) -> None:
+    """A PNG of random pixels, which does not compress: file size ~ 3 * side^2."""
+    pixels = np.random.default_rng(7).integers(0, 256, (side, side, 3), dtype=np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(pixels).save(path, "PNG", compress_level=0)
+    os.utime(path, (_SOURCE_MTIME.timestamp(), _SOURCE_MTIME.timestamp()))
+
+
+_INGEST_PATHS = ("staged import", "reference scan", "local import", "likeness backfill")
+
+
+@pytest.fixture(params=_INGEST_PATHS)
+def created_at_via(request, tmp_path, monkeypatch):
+    """The ``created_at`` one on-disk ingest path gives a file.
+
+    Yields ``read(path) -> datetime``. Anything a path needs set up (a vault
+    for the reference scan) is built here, outside the call, so a memory
+    measurement around ``read`` sees only the ingest itself.
+    """
+    # A staged video is opened by OpenCV for its thumbnail frame; the fake
+    # keeps a binary video fixture out of the repository.
+    monkeypatch.setattr(
+        "pixlstash.utils.image_processing.image_utils.cv2.VideoCapture",
+        _FakeVideoCapture,
+    )
+    if request.param == "staged import":
+        library = tmp_path / "library"
+
+        def _staged(path):
+            return ImageUtils.create_picture_from_file(
+                image_root_path=str(library), source_file_path=str(path)
+            ).created_at
+
+        yield _staged
+    elif request.param == "reference scan":
+        with Vault(image_root=str(tmp_path / "images")) as vault:
+
+            def _scanned(path):
+                task = ReferenceFolderScanTask(
+                    vault.db, 1, str(path.parent), str(path.parent)
+                )
+                return task._build_picture(str(path), "sha-for-test", 1).created_at
+
+            yield _scanned
+    elif request.param == "local import":
+
+        def _local(path):
+            return _build_managed_picture(
+                str(path), path.name, str(path.parent)
+            ).created_at
+
+        yield _local
+    else:
+
+        def _backfilled(path):
+            return LikenessParameterUtils.compute_created_at_from_file_static(
+                str(path), path.name
+            )
+
+        yield _backfilled
+
+
+def _traced_peak(call):
+    """Run *call* under ``tracemalloc``; return its result and the heap peak.
+
+    The ORM's mappers are configured first: the first ``Picture`` a process
+    builds does that, a one-time ~3 MiB that is not the file being measured,
+    and which test of a shard builds it first is down to the shard.
+    """
+    configure_mappers()
+    tracemalloc.start()
+    try:
+        result = call()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return result, peak
+
+
+_FTYP = _box(b"ftyp", b"isom\x00\x00\x02\x00isom")
+_DECOY_SECONDS = struct.pack(">I", _seconds_since_1904(_DECOY_AT))
+
+
+class TestIngestFromAPath:
+    """A file already on disk is dated and described from its path."""
+
+    def test_mvhd_text_in_a_png_is_not_a_timestamp(self, tmp_path, created_at_via):
+        """A still image is never searched for a movie header: no EXIF date
+        means the file's own mtime, not a date found in its pixels or chunks."""
+        source = tmp_path / "src" / "test-still.png"
+        _write_png_with_mvhd_text(source)
+
+        assert created_at_via(source) == _SOURCE_MTIME
+
+    @pytest.mark.parametrize(
+        "version,large_mdat", [(0, False), (1, True)], ids=["v0", "v1-largesize"]
+    )
+    def test_mp4_creation_time_is_read_with_moov_after_mdat(
+        self, tmp_path, created_at_via, version, large_mdat
+    ):
+        """The recording time comes from the real movie header, found by
+        stepping over the media data by its declared size."""
+        source = tmp_path / "src" / "test-clip.mp4"
+        _write_mp4(source, version=version, mdat_payload=_MIB, large_mdat=large_mdat)
+
+        assert created_at_via(source) == _RECORDED_AT
+
+    def test_a_cut_short_mp4_is_dated_by_its_mtime_and_says_why(
+        self, tmp_path, created_at_via, caplog
+    ):
+        """A box header the file ends inside is a broken container, not one
+        that records no time: the mtime is used and the reason is logged."""
+        source = tmp_path / "src" / "test-cut-short.mp4"
+        source.parent.mkdir(parents=True)
+        ftyp = _box(b"ftyp", b"isom\x00\x00\x02\x00isom")
+        source.write_bytes(ftyp + struct.pack(">I4s", 1, b"mdat") + bytes(3))
+        os.utime(source, (_SOURCE_MTIME.timestamp(), _SOURCE_MTIME.timestamp()))
+
+        with caplog.at_level("WARNING"):
+            assert created_at_via(source) == _SOURCE_MTIME
+        assert f"the 64-bit box size at byte {len(ftyp)} is cut short" in caplog.text
+
+    @pytest.mark.parametrize("version", [0, 1], ids=["v0", "v1"])
+    def test_a_movie_header_with_no_creation_time_is_dated_by_its_mtime(
+        self, tmp_path, created_at_via, version
+    ):
+        """A creation time of 0 is how an encoder such as OpenCV's says it
+        recorded none: the file's own mtime is used, not 1904-01-01."""
+        source = tmp_path / "src" / "test-undated.mp4"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(_FTYP + _box(b"moov", _mvhd(version, _MP4_EPOCH)))
+        os.utime(source, (_SOURCE_MTIME.timestamp(), _SOURCE_MTIME.timestamp()))
+
+        assert created_at_via(source) == _SOURCE_MTIME
+
+    # Each file holds a 2001 date in the four bytes after the movie header's
+    # version and flags, but outside the header. Its fields start at byte 36:
+    # after the ftyp and the moov's and the mvhd's own 8-byte box headers.
+    @pytest.mark.parametrize(
+        "movie,reason",
+        [
+            (
+                _box(b"moov", _box(b"mvhd", b"")) + bytes(4) + _DECOY_SECONDS,
+                "the movie header at byte 36 is shorter than its fields",
+            ),
+            (
+                _box(
+                    b"moov",
+                    _box(b"mvhd", b"\x01\x00\x00\x00" + bytes(4)) + _DECOY_SECONDS,
+                ),
+                "the movie header at byte 36 is shorter than its fields",
+            ),
+            (
+                struct.pack(">I4s", 16, b"moov")
+                + struct.pack(">I4s", 108, b"mvhd")
+                + bytes(4)
+                + _DECOY_SECONDS
+                + bytes(96),
+                "the movie header at byte 36 runs to byte 136, past the end of "
+                "its moov box or of the file",
+            ),
+        ],
+        ids=["empty", "v1-shorter-than-its-time", "past-its-moov"],
+    )
+    def test_a_movie_header_is_dated_only_from_inside_itself(
+        self, tmp_path, created_at_via, caplog, movie, reason
+    ):
+        """A movie header too short for its creation time, or one running past
+        its moov box, is a broken container: the bytes beyond it are not its
+        date. The mtime is used and the reason is logged."""
+        source = tmp_path / "src" / "test-malformed.mp4"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(_FTYP + movie)
+        os.utime(source, (_SOURCE_MTIME.timestamp(), _SOURCE_MTIME.timestamp()))
+
+        with caplog.at_level("WARNING"):
+            assert created_at_via(source) == _SOURCE_MTIME
+        assert reason in caplog.text
+
+    def test_a_video_is_not_read_whole(self, tmp_path, created_at_via):
+        """A 24 MiB clip is ingested with a heap peak of a few MiB at most."""
+        source = tmp_path / "src" / "test-large-clip.mp4"
+        _write_mp4(source, version=0, mdat_payload=24 * _MIB, large_mdat=False)
+
+        created_at, peak = _traced_peak(lambda: created_at_via(source))
+
+        assert peak < 4 * _MIB, f"heap peak {peak / _MIB:.1f} MiB"
+        assert created_at == _RECORDED_AT
+
+    def test_an_image_is_not_read_whole(self, tmp_path, created_at_via):
+        """A ~14 MiB PNG is ingested with a heap peak under a quarter of its size.
+
+        Decoded pixels live in Pillow's own allocations, outside the traced
+        heap, so what this measures is the encoded file held in memory.
+        """
+        source = tmp_path / "src" / "test-large-still.png"
+        _write_noise_png(source, side=2200)
+        size = os.path.getsize(source)
+
+        created_at, peak = _traced_peak(lambda: created_at_via(source))
+
+        assert peak < size / 4, f"heap peak {peak / _MIB:.1f} MiB of {size / _MIB:.1f}"
+        assert created_at == _SOURCE_MTIME
 
 
 # ---------------------------------------------------------------------------
