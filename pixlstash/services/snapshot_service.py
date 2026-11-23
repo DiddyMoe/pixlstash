@@ -24,7 +24,7 @@ from sqlmodel import Session, select
 from pixlstash.database import (
     SQLITE_BUSY_TIMEOUT_S,
     DBPriority,
-    _compute_picture_metadata_hash,
+    _compute_picture_metadata_hashes,
 )
 from pixlstash.db_models import Character, Picture, PictureSet, Project
 from pixlstash.db_models.snapshot import Snapshot
@@ -70,6 +70,11 @@ _CANCEL_WAIT_S = 10.0
 # How often a snapshot waiting to register behind a restore checks whether it
 # has been cancelled.
 _REGISTRATION_POLL_S = 0.1
+
+# Pictures per call when the manifest hashes rows whose ``metadata_hash`` is
+# NULL. The batched helper holds every picture it was asked for (embedding
+# blobs included) until it returns, so the batch bounds that memory.
+_NULL_HASH_BATCH = 500
 
 
 class SnapshotCancelledError(RuntimeError):
@@ -879,14 +884,22 @@ class SnapshotService:
         # Pull id + metadata_hash together. The hash map lets the interactive
         # restore preview and hash-compare read hashes from the sidecar and
         # never decompress the snapshot archive. NULL hashes (legacy rows the
-        # after_flush hook hasn't stamped yet) are computed on the spot so the
-        # map is complete.
+        # after_flush hook hasn't stamped yet) are computed on the spot, in
+        # batches, so the map is complete.
         hash_rows = session.exec(select(Picture.id, Picture.metadata_hash)).all()
         picture_ids: list[int] = [row[0] for row in hash_rows]
+        null_ids = [pid for pid, h in hash_rows if h is None]
+        computed: dict[int, str] = {}
+        for start in range(0, len(null_ids), _NULL_HASH_BATCH):
+            computed.update(
+                _compute_picture_metadata_hashes(
+                    session, null_ids[start : start + _NULL_HASH_BATCH]
+                )
+            )
         picture_hashes: dict[str, str] = {}
         for pid, h in hash_rows:
             if h is None:
-                h = _compute_picture_metadata_hash(session, pid)
+                h = computed.get(pid)
             if h is not None:
                 picture_hashes[str(pid)] = h
         picture_set_count = session.exec(select(func.count(PictureSet.id))).one()
