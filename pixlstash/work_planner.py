@@ -555,7 +555,13 @@ class WorkPlanner:
         # leave the GPU idle while the planner sleeps MIN_INTERVAL_S between
         # cycles.  Previously, a single submit + return True meant inflight
         # was always 1 regardless of max_inflight.
-        while True:
+        #
+        # At most one find per slot, plus one to learn that the finder ran dry
+        # after a task ended inside this turn (the drain edge below needs it).
+        # Bounded only by inflight, a finder whose tasks end before its next
+        # find_task returns - a model that cannot load fails at once - never
+        # ends its turn, and every other finder waits behind it.
+        for _ in range(max_inflight + 1):
             with self._lock:
                 inflight_count = int(self._inflight_by_finder.get(finder_name, 0))
             if inflight_count >= max_inflight:

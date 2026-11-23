@@ -18,6 +18,7 @@ from pixlstash.inference.vram_budget import (
     WD14_PER_ITEM_MB,
 )
 from pixlstash.pixl_logging import get_logger
+from pixlstash.tagger_plugins import registry as tagger_registry
 from pixlstash.tagger_plugins.pixlstash_tagger import (
     PIXLSTASH_TAGGER_IMAGE_SIZE_FIXED_QUALITY_CROP,
     PIXLSTASH_TAGGER_IMAGE_SIZE_FULL,
@@ -413,18 +414,47 @@ class TaggingWorkflow:
             image_size=self.pixlstash_tagger_image_size_quality_crop(),
         )
 
-    def ensure_active_plugin_ready(self, engine_override: str | None = None) -> None:
-        """Pre-load the active tag plugin without running inference.
-
-        Mirrors the loading logic in :meth:`tag_images` but stops before
-        calling ``plugin.tag_images()``.  Call this from a background thread
-        before submitting a :class:`~pixlstash.tasks.tag_task.TagTask` to the
-        GPU queue so the model is warm by the time the GPU worker picks the
-        task up.
+    def is_active_plugin_loaded(self, engine_override: str | None = None) -> bool:
+        """Whether the plugin :meth:`tag_images` would run is already in memory.
 
         Args:
-            engine_override: If given, pre-load this specific plugin instead
-                of the configured ``active_tag_plugin``.
+            engine_override: If given, ask about this plugin instead of the
+                configured ``active_tag_plugin``.
+
+        Returns:
+            ``True`` when the plugin's model is loaded, or when there is
+            nothing to load (``""`` means no tagging). ``False`` when the next
+            task to run it has to load it, including a plugin that is not
+            installed.
+        """
+        active = self.active_plugin_name(engine_override)
+        if not active:
+            return True
+        if active == "wd14":
+            return self._engine.wd14_service.is_loaded()
+        if active == "pixlstash_tagger":
+            return self._engine.pixlstash_tagger_service.is_loaded()
+        plugin = tagger_registry.get_tagger_plugin_manager().get_plugin(active)
+        return plugin is not None and plugin.is_loaded()
+
+    def ensure_active_plugin_ready(self, engine_override: str | None = None) -> None:
+        """Load the active tag plugin without running inference.
+
+        Mirrors the loading logic in :meth:`tag_images` but stops before
+        calling ``plugin.tag_images()``. Call it on the thread that runs the
+        inference: for a :class:`~pixlstash.tasks.tag_task.TagTask` that is
+        the GPU worker, after the arbiter has admitted the task, so the load
+        is counted in the task's lease and never overlaps other device work.
+
+        Args:
+            engine_override: If given, load this specific plugin instead of
+                the configured ``active_tag_plugin``.
+
+        Raises:
+            RuntimeError: The PixlStash tagger reported that it could not be
+                loaded. The tagger logs the cause itself.
+            Exception: Whatever WD14 or a third-party plugin raised while
+                loading, except a missing Python module (see below).
         """
         active = self.active_plugin_name(engine_override)
         if not active:
@@ -438,17 +468,19 @@ class TaggingWorkflow:
                 False,
             )
         elif active == "pixlstash_tagger":
-            self._engine.lifecycle.ensure_tagging_ready(
+            loaded = self._engine.lifecycle.ensure_tagging_ready(
                 self._engine.wd14_service,
                 self._engine.pixlstash_tagger_service,
                 False,
                 True,
             )
+            if not loaded:
+                raise RuntimeError(
+                    "The PixlStash tagger could not be loaded; its warning in "
+                    "the log gives the cause."
+                )
         else:
-            from pixlstash.tagger_plugins.registry import get_tagger_plugin_manager
-
-            mgr = get_tagger_plugin_manager()
-            plugin = mgr.get_plugin(active)
+            plugin = tagger_registry.get_tagger_plugin_manager().get_plugin(active)
             if plugin is None:
                 logger.warning(
                     "[TaggingWorkflow] ensure_active_plugin_ready: plugin %r not found",
@@ -458,9 +490,21 @@ class TaggingWorkflow:
             plugins_cfg = self._tagger_settings.get("plugins", {})
             cfg = plugins_cfg.get(active, {})
             params = {**plugin.default_params(), **cfg.get("params", {})}
-            if hasattr(plugin, "setup"):
-                plugin.setup(self._engine.device)
-            plugin.init(params)
+            try:
+                if hasattr(plugin, "setup"):
+                    plugin.setup(self._engine.device)
+                plugin.init(params)
+            except ModuleNotFoundError as exc:
+                # Not raised: a missing dependency will not appear on a retry.
+                # `_tag_images_single_plugin` answers it with an empty result
+                # per picture, which takes the pictures out of the queue;
+                # failing the task here would queue them again forever.
+                logger.warning(
+                    "[TaggingWorkflow] Plugin %r needs '%s', which is not "
+                    "installed; its pictures will be cleared without tags.",
+                    active,
+                    exc.name,
+                )
 
     # ------------------------------------------------------------------
     # Private helpers

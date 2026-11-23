@@ -358,7 +358,8 @@ was not established.
 
 ### The tagger preload (2026-09-27)
 
-`TagTask`'s preload thread (see "Not covered") loaded the PixlStash tagger on
+`TagTask`'s model preload thread (since removed: see "The tag task's model
+load: on the GPU worker") loaded the PixlStash tagger on
 Metal while another thread ran CLIP, using the real services in a harness.
 Both threads reached Metal in 65 runs: 48 with the preload overlapping CLIP
 inference, 5 overlapping only CLIP's load, and 12 against cache flushes alone.
@@ -418,9 +419,10 @@ Terms used below:
   CPU for search queries (see "Searching").
 
 Two sources of a second Metal thread are closed at their source rather than
-synchronised: transformers' loader pool and search queries. Two more, the
-anomaly-region route and the device-cache flushes that unload models, are
-routed onto the GPU worker. The rest are listed under "Not covered".
+synchronised: transformers' loader pool and search queries. Three more, the
+anomaly-region route, the tag task's model load and the device-cache flushes
+that unload models, are routed onto the GPU worker. The rest are listed under
+"Not covered".
 
 ### Loading: one loader thread wherever Metal exists
 
@@ -542,6 +544,33 @@ host a tag batch on the worker beside it would have met fp32 weights (the CPU
 model is fp32 throughout, so only accelerators were affected). One worker
 thread closes both.
 
+### The tag task's model load: on the GPU worker
+
+`TagTask.on_queued` runs on whichever thread submits the task (the planner, or
+a request thread for an interactive retag). It used to load the active tag
+plugin on a `TagModelPreload` thread of its own and wait for it, so the load
+ran beside whatever the GPU worker was doing and held the submitting thread
+until it finished. For the built-in tagger that load is `load_file` onto Metal,
+`load_state_dict` back into a model built on the CPU, then `.to(mps)` and
+`.half()` over its 344 weights; a third-party tag plugin's `setup()` and
+`init()` ran there too.
+
+`on_queued` now only starts the image preload. The load runs in
+`TagTask._run_task`, on the GPU worker once the task's lease is granted, so it
+never overlaps other device work and its memory is part of that lease:
+`TagTask.estimated_vram_mb` asks for the model's weights while it is not loaded
+and for activations alone once it is. A task moved to the CPU tags on its own
+CPU engine and loads nothing onto the device. A load that fails fails the
+task, with two exceptions: a third-party plugin missing a Python module is
+logged and its pictures are cleared without tags, and an active plugin that
+is not registered is logged and the task completes having tagged nothing.
+
+None of this was measured on Metal. The 2026-09-27 runs (see "The tagger
+preload" under "What reproduces where") had the old thread overlap CLIP in 8 of
+8 restarts and saw no crash, so the move removes a measured overlap, not a
+measured crash. The cost is that a cold load now holds the GPU worker, and
+other GPU tasks wait for it instead of running beside it.
+
 ### Device-cache flushes: on the GPU worker
 
 Unloading models ends in `empty_device_cache()`, which on Metal is
@@ -588,15 +617,6 @@ crash it removes is the one the anomaly route showed (5 of 5 runs, see
 
 These do, or may do, Metal work on a thread other than the GPU worker:
 
-- **The tagger preload.** `TagTask.on_queued` runs on whichever thread submits
-  the task (the planner, or a request thread for an interactive retag) and
-  loads the active tag plugin on its own `TagModelPreload` thread. For the
-  built-in tagger that is `load_file` onto Metal, `load_state_dict` back into a
-  model built on the CPU, then `.to(mps)` and `.half()` over its 344 weights; a
-  third-party tag plugin's `setup()` and `init()` run there too. Measured on
-  2026-09-27 (see "What reproduces where"): it overlapped CLIP on the worker in
-  8 of 8 restarts with the CPU copies on, and nothing crashed. The unloads
-  queued on the worker (see "Device-cache flushes") do not wait for it.
 - **CPU-queue tasks granted GPU memory.** The runner lets a CPU-queue task ask
   for a GPU lease and flushes after it on its CPU worker; making room no longer
   waits for one. No CPU-queue task asks for GPU memory today, and one that did

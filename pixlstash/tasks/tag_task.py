@@ -208,12 +208,12 @@ class TagTask(BaseTask):
         self._preload_started_at: float | None = None
         self._preload_finished_at: float | None = None
         self._cpu_spillover_enabled = False
-        self._model_preload_thread: threading.Thread | None = None
-        self._model_preload_done: threading.Event = threading.Event()
-        self._model_preload_error: Exception | None = None
 
     def on_queued(self) -> None:
-        # Start image preloading immediately so it overlaps with model loading.
+        # Runs on the submitting thread (the planner, or a request thread for
+        # an interactive retag), so it only starts work and never waits. The
+        # image preload overlaps the queue wait, admission and the model load,
+        # which `_run_task` does on the GPU worker.
         if self._preload_thread is None or not self._preload_thread.is_alive():
             self._preload_cancel.clear()
             self._preload_started_at = time.perf_counter()
@@ -225,40 +225,6 @@ class TagTask(BaseTask):
             )
             self._preload_thread.start()
 
-        # Start model loading in a background thread and wait for it to finish
-        # before returning.  submit() puts the task in the GPU queue only after
-        # on_queued() returns, so the GPU worker will never block on model load.
-        if self._model_preload_thread is None:
-            self._model_preload_thread = threading.Thread(
-                target=self._preload_model,
-                name=f"TagModelPreload-{self.id[:8]}",
-                daemon=True,
-            )
-            self._model_preload_thread.start()
-        self._model_preload_done.wait()
-
-    def _preload_model(self) -> None:
-        t_start = time.perf_counter()
-        try:
-            self._tagging_workflow.ensure_active_plugin_ready(
-                engine_override=self._engine_override,
-            )
-            logger.debug(
-                "[TAG_MODEL_PRELOAD] task_id=%s done in %.1fs",
-                self.id,
-                time.perf_counter() - t_start,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[TAG_MODEL_PRELOAD] task_id=%s failed after %.1fs: %s",
-                self.id,
-                time.perf_counter() - t_start,
-                exc,
-            )
-            self._model_preload_error = exc
-        finally:
-            self._model_preload_done.set()
-
     def on_cancel(self) -> None:
         self._preload_cancel.set()
         if self._preload_thread is not None:
@@ -268,10 +234,6 @@ class TagTask(BaseTask):
                     "TagTask preload thread did not stop in time for task %s",
                     self.id,
                 )
-        # Model loading cannot be interrupted; just wait briefly so the event
-        # is set and any subsequent wait() calls return promptly.
-        if self._model_preload_thread is not None:
-            self._model_preload_thread.join(timeout=5)
 
     _PRELOAD_WORKERS = 4
 
@@ -642,6 +604,20 @@ class TagTask(BaseTask):
         if not self._pictures:
             return {"changed_count": 0, "changed": []}
 
+        if not self._cpu_spillover_enabled:
+            # Here, on the GPU worker after admission: the load is counted in
+            # this task's lease and never overlaps other device work. A load
+            # that fails fails the task. A spilled task tags on its own CPU
+            # engine and does not need the GPU model.
+            load_start = time.perf_counter()
+            self._tagging_workflow.ensure_active_plugin_ready(
+                engine_override=self._engine_override
+            )
+            logger.debug(
+                "[TAG_MODEL_LOAD] task_id=%s ready in %.3fs",
+                self.id,
+                time.perf_counter() - load_start,
+            )
         changed = self._tag_pictures_batch()
         # Release preloaded PIL Images immediately after inference.  Without
         # this the images stay alive until the task object is garbage collected
@@ -654,13 +630,21 @@ class TagTask(BaseTask):
         }
 
     def estimated_vram_mb(self) -> int:
+        """Device memory this task asks the arbiter for before it runs.
+
+        The task loads the tagger itself once admitted, so a cold tagger is
+        priced with its weights. A warm one is priced with activations only:
+        the arbiter reads free device memory, which already excludes loaded
+        weights.
+        """
+        workflow = self._tagging_workflow
+        image_count = len(self._pictures)
         try:
-            return max(
-                0,
-                self._tagging_workflow.estimated_incremental_vram_mb(
-                    len(self._pictures)
-                ),
-            )
+            if workflow.is_active_plugin_loaded(self._engine_override):
+                estimate = workflow.estimated_incremental_vram_mb(image_count)
+            else:
+                estimate = workflow.estimated_vram_mb(image_count)
+            return max(0, estimate)
         except Exception as exc:
             logger.debug(
                 "TagTask: VRAM estimate failed for %d picture(s); assuming 0: %s",
