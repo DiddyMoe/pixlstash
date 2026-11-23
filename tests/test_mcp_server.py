@@ -18,6 +18,7 @@ import socket
 import ssl
 import tempfile
 import threading
+import urllib.error
 import urllib.parse
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -612,6 +613,9 @@ class _Response:
     status = 200
     headers = {"Content-Type": "application/json"}
 
+    def __init__(self, body: bytes = b"[]"):
+        self._body = io.BytesIO(body)
+
     def __enter__(self):
         return self
 
@@ -619,7 +623,10 @@ class _Response:
         return False
 
     def read(self):
-        return b"[]"
+        return self._body.read()
+
+    def read1(self, size=-1):
+        return self._body.read1(size)
 
 
 def test_every_read_tool_request_is_a_get_through_http_fetch(monkeypatch):
@@ -883,7 +890,7 @@ def _run_fetch(endings: dict[str, list[dict]], prompts=None):
     *endings*, one answer per read and the last one from then on."""
     seen = []
 
-    def fetch(path, params, method="GET", body=None):
+    def fetch(path, params, method="GET", body=None, *, deadline=None):
         seen.append((method, path, body))
         if path == "/workflows/run":
             answer = {
@@ -1017,7 +1024,7 @@ def test_a_wait_is_held_to_the_most_the_server_allows(monkeypatch):
     monkeypatch.setattr(mcp_server, "MAX_RUN_WAIT_SECONDS", 0)
     fetch, seen = _run_fetch({"p1": [dict(RUNNING)]})
 
-    def counted(path, params, method="GET", body=None):
+    def counted(path, params, method="GET", body=None, *, deadline=None):
         # An uncapped hour of zero-length polls would never come back.
         assert len(seen) < 5, "waited past the cap"
         return fetch(path, params, method, body)
@@ -1064,7 +1071,7 @@ def test_one_bad_answer_does_not_stop_a_run_being_followed(monkeypatch):
     fetch, seen = _run_fetch({"p1": [dict(FAILED)]})
     blips = [(500, "application/json", b'{"detail": "busy"}')]
 
-    def flaky(path, params, method="GET", body=None):
+    def flaky(path, params, method="GET", body=None, *, deadline=None):
         if path.startswith("/workflows/runs/") and blips:
             seen.append((method, path, body))
             return blips.pop()
@@ -1080,7 +1087,7 @@ def test_a_bad_answer_that_lasts_the_whole_wait_is_reported_unknown(monkeypatch)
     monkeypatch.setattr(mcp_server, "RUN_POLL_SECONDS", 0)
     seen = []
 
-    def broken(path, params, method="GET", body=None):
+    def broken(path, params, method="GET", body=None, *, deadline=None):
         seen.append(path)
         if path == "/workflows/run":
             answer = {"status": "success", "prompts": [{"prompt_id": "p1"}]}
@@ -1116,6 +1123,251 @@ def test_a_wait_that_is_not_a_time_is_refused_before_anything_runs(wait):
     )
     assert result["isError"] is True
     assert "wait_seconds" in result["content"][0]["text"]
+
+
+class _Clock:
+    """Stands in for the `time` module in mcp_server: sleeps and slow answers
+    move it on, and nothing really waits."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        assert seconds >= 0, seconds
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(mcp_server, "time", clock)
+    return clock
+
+
+def _slow_run_fetch(clock, endings, prompts=None, stalls=()):
+    """`_run_fetch` on *clock*: each status read takes a quarter of a second
+    and is recorded as (path, when it started, the deadline it was given).
+
+    A read named in *stalls* as (path, how many times asked) gets no answer,
+    and ends the way http_fetch ends one: at its deadline with WaitOver, or
+    after TIMEOUT_SECONDS with a ToolError when that comes first.
+    """
+    fetch, seen = _run_fetch(endings, prompts)
+    reads = []
+
+    def slow(path, params, method="GET", body=None, *, deadline=None):
+        if method == "POST":
+            return fetch(path, params, method, body)
+        reads.append((path, clock.now, deadline))
+        if (path, sum(read[0] == path for read in reads)) not in stalls:
+            clock.now += 0.25
+            return fetch(path, params, method, body)
+        seen.append((method, path, body))
+        timeout = clock.now + mcp_server.TIMEOUT_SECONDS
+        if deadline is not None and deadline < timeout:
+            clock.now = deadline
+            raise mcp_server.WaitOver(f"The wait was over before {path} answered.")
+        clock.now = timeout
+        raise mcp_server.ToolError(f"PixlStash did not answer {path}.")
+
+    return slow, seen, reads
+
+
+def _queued(*prompt_ids):
+    return [
+        {"workflow_id": WORKFLOW_ID, "prompt_id": key, "status": "queued"}
+        for key in prompt_ids
+    ]
+
+
+def _statuses(result) -> list:
+    assert result["isError"] is False, result
+    prompts = json.loads(result["content"][0]["text"])["prompts"]
+    return [prompt["status"] for prompt in prompts]
+
+
+def test_every_status_read_carries_what_is_left_of_the_wait(clock):
+    """Each read is given the wait's deadline, none starts once it has
+    passed, and the answer comes by then."""
+    slow, _seen, reads = _slow_run_fetch(
+        clock, {"p1": [dict(RUNNING)], "p2": [dict(RUNNING)]}
+    )
+    deadline = clock.now + 10
+    result = _write(slow, "run_workflow", workflow_id=WORKFLOW_ID, wait_seconds=10)
+    assert _statuses(result) == ["running", "running"]
+    # Positive control: the runs were followed, not looked at once.
+    assert len(reads) > 4, reads
+    assert {given for _path, _at, given in reads} == {deadline}
+    assert [at for _path, at, _given in reads if at >= deadline] == []
+    assert clock.now <= deadline
+
+
+def test_a_stalled_status_read_ends_the_wait_with_what_was_collected(clock):
+    """A read still unanswered when the wait is over ends the follow-up. Each
+    run keeps what it last showed rather than turning "unknown", no run is
+    asked about after that, and nothing is cancelled or queued again."""
+    slow, seen, _reads = _slow_run_fetch(
+        clock,
+        {key: [dict(RUNNING)] for key in ("p1", "p2", "p3")},
+        prompts=_queued("p1", "p2", "p3"),
+        stalls={("/workflows/runs/p2", 2)},
+    )
+    deadline = clock.now + 10
+    result = _write(slow, "run_workflow", workflow_id=WORKFLOW_ID, wait_seconds=10)
+    assert _statuses(result) == ["running", "running", "running"]
+    assert [(method, path) for method, path, _body in seen] == [
+        ("POST", "/workflows/run"),
+        *[("GET", f"/workflows/runs/{key}") for key in ("p1", "p2", "p3", "p1", "p2")],
+    ]
+    assert clock.now <= deadline
+
+
+def test_a_zero_wait_looks_once_for_no_longer_than_the_first_look(clock):
+    """No wait is still one read of each run, held to RUN_FIRST_LOOK_SECONDS:
+    a run whose read is cut off then is answered as it was queued."""
+    slow, seen, reads = _slow_run_fetch(
+        clock,
+        {"p1": [dict(RUNNING)], "p2": [dict(RUNNING)]},
+        prompts=_queued("p1", "p2"),
+        stalls={("/workflows/runs/p2", 1)},
+    )
+    first_look_end = clock.now + mcp_server.RUN_FIRST_LOOK_SECONDS
+    result = _write(slow, "run_workflow", workflow_id=WORKFLOW_ID, wait_seconds=0)
+    assert _statuses(result) == ["running", "queued"]
+    assert [path for _method, path, _body in seen[1:]] == [
+        "/workflows/runs/p1",
+        "/workflows/runs/p2",
+    ]
+    assert {given for _path, _at, given in reads} == {first_look_end}
+    assert clock.now == first_look_end
+
+
+def test_only_the_first_look_outlasts_a_short_wait(clock):
+    """A wait shorter than RUN_FIRST_LOOK_SECONDS lends that time to the first
+    look alone: once it is in, no run is read after the wait is over."""
+    slow, _seen, reads = _slow_run_fetch(
+        clock, {"p1": [dict(RUNNING)], "p2": [dict(RUNNING)]}
+    )
+    start = clock.now
+    result = _write(slow, "run_workflow", workflow_id=WORKFLOW_ID, wait_seconds=1.25)
+    assert _statuses(result) == ["running", "running"]
+    first_look = mcp_server.RUN_FIRST_LOOK_SECONDS
+    assert [(path, at - start, given - start) for path, at, given in reads] == [
+        ("/workflows/runs/p1", 0, first_look),
+        ("/workflows/runs/p2", 0.25, first_look),
+    ]
+    assert clock.now == start + 1.25
+
+
+class _Trickle(_Response):
+    """An answer that arrives a byte a second on the virtual clock: urllib's
+    timeout is per recv, so it never trips on this."""
+
+    closed = False
+
+    def __init__(self, clock):
+        # 200 bytes of `[ ... ]`: valid JSON, if anyone waits for all of it.
+        super().__init__(b"[" + b" " * 198 + b"]")
+        self.clock = clock
+
+    def read(self):
+        rest = super().read()
+        self.clock.now += len(rest)
+        return rest
+
+    def read1(self, size=-1):
+        chunk = super().read1(1)
+        self.clock.now += len(chunk)
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+
+def _opened(monkeypatch, answer):
+    """http_fetch over an opener that records each timeout it is given and
+    answers with *answer*(request)."""
+    timeouts = []
+
+    def open_(request, timeout):
+        timeouts.append(timeout)
+        return answer(request)
+
+    monkeypatch.setattr(
+        mcp_server, "_build_opener", lambda context=None: SimpleNamespace(open=open_)
+    )
+    return mcp_server.http_fetch("http://127.0.0.1:9537", "example-token"), timeouts
+
+
+def test_a_trickled_answer_is_cut_at_the_deadline(monkeypatch, clock):
+    fetch, timeouts = _opened(monkeypatch, lambda request: _Trickle(clock))
+    deadline = clock.now + 3.5
+    with pytest.raises(mcp_server.WaitOver):
+        fetch("/workflows/runs/p1", {}, deadline=deadline)
+    # The socket is given only what is left of the wait...
+    assert timeouts == [3.5]
+    # ...and the body no more than the one recv under way when it ran out.
+    assert clock.now <= deadline + 1
+
+
+def test_a_trickled_refusal_is_cut_at_the_deadline_too(monkeypatch, clock):
+    def refuse(request):
+        headers = {"Content-Type": "application/json"}
+        raise urllib.error.HTTPError(
+            request.full_url, 500, "busy", headers, _Trickle(clock)
+        )
+
+    fetch, _timeouts = _opened(monkeypatch, refuse)
+    deadline = clock.now + 3.5
+    with pytest.raises(mcp_server.WaitOver):
+        fetch("/workflows/runs/p1", {}, deadline=deadline)
+    assert clock.now <= deadline + 1
+
+
+def test_a_call_without_a_wait_is_held_to_timeout_seconds_in_all(monkeypatch, clock):
+    """The "did not answer within" message is a promise about the clock."""
+    fetch, timeouts = _opened(monkeypatch, lambda request: _Trickle(clock))
+    start = clock.now
+    result = _call(fetch, "list_tags")
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert f"did not answer /tags within {mcp_server.TIMEOUT_SECONDS}s" in text
+    assert timeouts == [mcp_server.TIMEOUT_SECONDS]
+    assert clock.now <= start + mcp_server.TIMEOUT_SECONDS + 1
+
+
+def test_a_request_whose_wait_is_already_over_is_not_sent(monkeypatch, clock):
+    fetch, timeouts = _opened(monkeypatch, lambda request: pytest.fail("sent"))
+    with pytest.raises(mcp_server.WaitOver):
+        fetch("/workflows/runs/p1", {}, deadline=clock.now)
+    assert timeouts == []
+
+
+@pytest.mark.parametrize(
+    "timed_out, without_a_wait",
+    [
+        # urllib wraps a timeout while connecting or sending...
+        (urllib.error.URLError(TimeoutError("timed out")), "Could not reach"),
+        # ...but not one while waiting for the status line.
+        (TimeoutError("timed out"), "did not answer"),
+    ],
+)
+def test_a_timeout_at_the_deadline_is_the_wait_ending(
+    monkeypatch, clock, timed_out, without_a_wait
+):
+    def unanswered(request):
+        raise timed_out
+
+    fetch, _timeouts = _opened(monkeypatch, unanswered)
+    with pytest.raises(mcp_server.WaitOver):
+        fetch("/workflows/runs/p1", {}, deadline=clock.now + 3.5)
+    # Without a wait the same timeout is PixlStash not answering.
+    with pytest.raises(mcp_server.ToolError, match=without_a_wait) as raised:
+        fetch("/tags", {})
+    assert not isinstance(raised.value, mcp_server.WaitOver)
 
 
 def test_import_posts_json_through_http_fetch(monkeypatch):

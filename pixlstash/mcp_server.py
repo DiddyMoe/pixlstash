@@ -77,6 +77,9 @@ TIMEOUT_SECONDS = 60
 RUN_WAIT_SECONDS = 30
 MAX_RUN_WAIT_SECONDS = 120
 RUN_POLL_SECONDS = 1.0
+# A wait shorter than this, zero included, still reads each run once and gives
+# that first look this long; every later read ends with the wait.
+RUN_FIRST_LOOK_SECONDS = 5.0
 # ponytail: a real graph is 50-500 KB; this only stops a stray path at a huge file.
 MAX_GRAPH_BYTES = 16 * 1024 * 1024
 
@@ -178,7 +181,9 @@ read-only or scoped."""
 
 # (path, params, method="GET", body=None) -> (status, content type, body). The
 # one seam between the protocol and the network, so tests can route requests
-# through a TestClient. A body is sent as JSON.
+# through a TestClient. A body is sent as JSON. Following a run also passes
+# `deadline=` (a time.monotonic() value), past which the request ends in
+# WaitOver.
 Fetch = Callable[..., tuple[int, str, bytes]]
 
 _PICTURE_ID = {"type": "integer", "description": "The picture's id."}
@@ -627,6 +632,10 @@ class NotFoundError(ToolError):
     """PixlStash answered 404: an answer, where any other failure may pass."""
 
 
+class WaitOver(ToolError):
+    """The caller's own deadline, not PixlStash, ended the request."""
+
+
 def unreachable_message(base: str, reason) -> str:
     """Why nothing answered, in terms the owner can act on.
 
@@ -657,15 +666,52 @@ def unreachable_message(base: str, reason) -> str:
     )
 
 
+def _read_by(response, end: float) -> bytes:
+    """The rest of *response*'s body, or ``TimeoutError`` once *end* passes.
+
+    urllib's timeout bounds each socket operation, not the body: a server that
+    sends a byte at a time keeps a plain ``read()`` going for as long as it
+    likes. *end* is a ``time.monotonic()`` value. The bound covers the body's
+    content, not the framing of a chunked answer.
+    """
+    chunks = []
+    while True:
+        if time.monotonic() >= end:
+            raise TimeoutError("the body was still arriving")
+        # read1 makes at most one recv for the payload, so trickled content
+        # holds past *end* by that one recv at most, which can last the
+        # request's whole budget. For a chunked answer http.client reads each
+        # chunk-size line and the trailers in its own readline loops, bounded
+        # per recv only: a server that dribbles that framing, like one that
+        # dribbles the status line or headers, can still hold a request past
+        # *end*.
+        chunk = response.read1(64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def http_fetch(
     base_url: str, token: str, context: ssl.SSLContext | None = None
 ) -> Fetch:
-    """Return a :data:`Fetch` that calls *base_url* with *token* as Bearer."""
+    """Return a :data:`Fetch` that calls *base_url* with *token* as Bearer.
+
+    Each request's body content is held to ``TIMEOUT_SECONDS`` in all, and to
+    *deadline* when that comes sooner, give or take the one socket read under
+    way then, which can last as long as the request's whole budget. The status
+    line, the headers and the framing of a chunked answer are bounded per
+    socket read only.
+    """
     base = base_url.rstrip("/")
     opener = _build_opener(context)
 
     def fetch(
-        path: str, params: dict, method: str = "GET", body: object = None
+        path: str,
+        params: dict,
+        method: str = "GET",
+        body: object = None,
+        *,
+        deadline: float | None = None,
     ) -> tuple[int, str, bytes]:
         query = urllib.parse.urlencode(params, doseq=True)
         url = f"{base}{API_PREFIX}{path}" + (f"?{query}" if query else "")
@@ -675,17 +721,34 @@ def http_fetch(
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        now = time.monotonic()
+        end = now + TIMEOUT_SECONDS
+        # Whether running out of time means the caller's wait is over rather
+        # than that PixlStash is not answering.
+        cut_by_wait = deadline is not None and deadline < end
+        if cut_by_wait:
+            if deadline <= now:
+                raise WaitOver(f"The wait was over before {path} was asked.")
+            end = deadline
         try:
-            with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+            try:
+                response = opener.open(request, timeout=end - now)
+            except urllib.error.HTTPError as exc:
+                logger.warning("[mcp] %s answered %s", path, exc.code)
+                # The refusal's body says why; it is read like any other.
+                response = exc
+            with response:
                 return (
                     response.status,
                     response.headers.get("Content-Type", ""),
-                    response.read(),
+                    _read_by(response, end),
                 )
-        except urllib.error.HTTPError as exc:
-            logger.warning("[mcp] %s answered %s", path, exc.code)
-            return exc.code, exc.headers.get("Content-Type", ""), exc.read()
         except urllib.error.URLError as exc:
+            if cut_by_wait and isinstance(exc.reason, TimeoutError):
+                logger.info("[mcp] The wait was over while connecting for %s", path)
+                raise WaitOver(
+                    f"The wait was over before PixlStash answered {path}."
+                ) from exc
             logger.warning("[mcp] Could not reach %s%s: %s", base, path, exc)
             raise ToolError(unreachable_message(base, exc.reason)) from exc
         except http.client.RemoteDisconnected as exc:
@@ -702,8 +765,13 @@ def http_fetch(
             ) from exc
         except TimeoutError as exc:
             # Only the *send* is wrapped in URLError; a read timeout arrives
-            # bare. The first search loads the text encoder, which is the call
-            # most likely to sit here.
+            # bare, and so does _read_by's. The first search loads the text
+            # encoder, which is the call most likely to sit here.
+            if cut_by_wait:
+                logger.info("[mcp] The wait was over while reading %s", path)
+                raise WaitOver(
+                    f"The wait was over before PixlStash answered {path}."
+                ) from exc
             logger.warning("[mcp] %s timed out after %ss", path, TIMEOUT_SECONDS)
             raise ToolError(
                 f"PixlStash did not answer {path} within {TIMEOUT_SECONDS}s."
@@ -1027,6 +1095,12 @@ def _follow_runs(fetch: Fetch, answer, wait_seconds: float) -> None:
     fails in its first seconds (a model ComfyUI cannot load, a node that
     raises) is answered with its reason rather than with "queued". Raises
     ``ToolError`` with the reasons when every run failed.
+
+    Every read is held to what is left of the wait, so a slow or silent
+    PixlStash keeps the answer past it by no more than ``http_fetch`` lets
+    one request run over; a run not read by then keeps what it last showed.
+    Only the first look is allowed
+    ``RUN_FIRST_LOOK_SECONDS`` when the wait is shorter.
     """
     prompts = answer.get("prompts") if isinstance(answer, dict) else None
     # A run held for the GPU has no prompt id yet; its run id names it.
@@ -1036,37 +1110,56 @@ def _follow_runs(fetch: Fetch, answer, wait_seconds: float) -> None:
         if isinstance(entry, dict) and (entry.get("prompt_id") or entry.get("run_id"))
     ]
     pending = list(entries)
-    deadline = time.monotonic() + wait_seconds
-    while pending:
-        for entry in list(pending):
-            try:
-                outcome = json.loads(
-                    _get(fetch, _run_path(entry.get("run_id") or entry["prompt_id"]))[1]
-                )
-            except ToolError as exc:
-                # The run is queued all the same; only its ending is unread.
-                entry.update(status="unknown", message=str(exc))
-                if isinstance(exc, NotFoundError):
-                    # Not on record (an older PixlStash, or one restarted
-                    # since): asking again will not change the answer.
-                    pending.remove(entry)
-                # Anything else may be a blip, so the run is asked about
-                # again until the wait is over.
-                continue
-            for key in ("status", "message", "stopped", "picture_ids"):
-                entry[key] = outcome.get(key)
-            if outcome.get("prompt_id"):
-                entry["prompt_id"] = outcome["prompt_id"]
-            # Waiting for the GPU is not an ending either.
-            if outcome.get("status") not in ("running", "waiting"):
-                pending.remove(entry)
+    started = time.monotonic()
+    deadline = started + wait_seconds
+    reads_end = max(deadline, started + RUN_FIRST_LOOK_SECONDS)
+    while pending and _read_runs(fetch, pending, reads_end):
         if not pending or time.monotonic() >= deadline:
             break
+        reads_end = deadline
         # Never past the deadline: the wait asked for is the wait given.
         time.sleep(min(RUN_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     if entries and all(entry.get("status") == "failed" for entry in entries):
         reasons = dict.fromkeys(str(entry.get("message")) for entry in entries)
         raise ToolError("The run failed: " + "; ".join(reasons))
+
+
+def _read_runs(fetch: Fetch, pending: list, reads_end: float) -> bool:
+    """Read how each *pending* run stands, dropping those that have ended.
+
+    False when *reads_end* (a ``time.monotonic()`` value) passed first. The
+    runs not read then keep what they last showed: "queued" or "waiting" from
+    the run's own answer, or "running" from an earlier read.
+    """
+    for entry in list(pending):
+        if time.monotonic() >= reads_end:
+            return False
+        try:
+            path = _run_path(entry.get("run_id") or entry["prompt_id"])
+            outcome = json.loads(_checked(*fetch(path, {}, deadline=reads_end))[1])
+        except WaitOver as exc:
+            # The wait ended this read, not PixlStash: not hearing back in
+            # time says nothing about the run, so it is not marked "unknown".
+            logger.info("[mcp] Stopped following %d run(s): %s", len(pending), exc)
+            return False
+        except ToolError as exc:
+            # The run is queued all the same; only its ending is unread.
+            entry.update(status="unknown", message=str(exc))
+            if isinstance(exc, NotFoundError):
+                # Not on record (an older PixlStash, or one restarted
+                # since): asking again will not change the answer.
+                pending.remove(entry)
+            # Anything else may be a blip, so the run is asked about
+            # again until the wait is over.
+            continue
+        for key in ("status", "message", "stopped", "picture_ids"):
+            entry[key] = outcome.get(key)
+        if outcome.get("prompt_id"):
+            entry["prompt_id"] = outcome["prompt_id"]
+        # Waiting for the GPU is not an ending either.
+        if outcome.get("status") not in ("running", "waiting"):
+            pending.remove(entry)
+    return True
 
 
 def handle_message(
