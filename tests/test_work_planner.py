@@ -959,9 +959,11 @@ def test_a_finder_burst_emits_exactly_one_pipeline_pass_line(caplog):
     runner.on_submit = lambda task: planner.on_task_complete(task, None)
 
     with caplog.at_level(logging.INFO):
-        # Both tasks submit, complete and run the finder dry in one cycle; the
-        # second cycle finds nothing and must not report the burst again.
+        # Both tasks submit and complete inside the first cycle's turn, which
+        # ends at its find limit; the second cycle runs the finder dry and
+        # reports the burst; the third finds nothing and must not report it again.
         assert planner._run_finders_once() is True
+        assert planner._run_finders_once() is False
         assert planner._run_finders_once() is False
 
     line = _one_line(caplog, "[PIPELINE_PASS]")
@@ -1191,3 +1193,55 @@ def test_release_ends_the_hold_without_waiting_for_the_lease():
         assert [task.id for task in submitted] == ["task-1"]
     finally:
         planner.stop()
+
+
+class _EndlessFinder(_OneShotFinder):
+    """Three slots and more work than one turn should take."""
+
+    def __init__(self):
+        super().__init__()
+        self.finds = 0
+
+    def finder_name(self) -> str:
+        return "TestEndlessFinder"
+
+    def max_inflight_tasks(self) -> int:
+        return 3
+
+    def find_task(self):
+        self.finds += 1
+        # Runs dry at 50 only so a regression fails instead of hanging.
+        if self.finds > 50:
+            return None
+        return _FakeTask(f"endless-{self.finds}")
+
+
+class _CountingIdleFinder(_OneShotFinder):
+    def __init__(self):
+        super().__init__()
+        self.finds = 0
+
+    def find_task(self):
+        self.finds += 1
+        return None
+
+
+def test_a_finder_whose_tasks_end_at_once_gives_up_its_turn():
+    """A finder whose slots keep freeing up during its turn still ends it.
+
+    A tagger that cannot load fails its task before the planner's next
+    find_task returns, so in-flight never reaches the limit. Bounded only by
+    in-flight, that finder kept the turn for as long as it had work, and every
+    other finder - faces, thumbnails, embeddings - waited behind it.
+    """
+    runner = _FastCompleteRunner()
+    endless, other = _EndlessFinder(), _CountingIdleFinder()
+    planner = WorkPlanner(task_runner=runner, task_finders=[endless, other])
+    runner.on_submit = lambda task: planner.on_task_complete(
+        task, RuntimeError("test-model-cannot-load")
+    )
+
+    assert planner._run_finders_once() is True
+
+    assert endless.finds == endless.max_inflight_tasks() + 1
+    assert other.finds == 1

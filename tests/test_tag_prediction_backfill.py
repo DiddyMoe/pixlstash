@@ -261,3 +261,43 @@ def test_finder_captures_the_reset_generation_before_reading():
     task = finder.find_task()
 
     assert registry.reset_since([picture.id, 99], task._reset_generation) == {1}
+
+
+def test_a_backfill_whose_tagger_cannot_load_is_not_handed_out_again(tmp_path):
+    """A tagger that cannot load fails the task, and its pictures wait.
+
+    The failure writes no rows, so the pictures still have no predictions and
+    the finder's query selects them again. Without the deferral the planner
+    handed the same batch out on every cycle, one load attempt each, for ever.
+    """
+    engine = _make_engine(tmp_path)
+    with Session(engine) as session:
+        pic_id = _add_picture(session, "a.jpg", tags=["dog"])
+
+    class _Db(_FakeDB):
+        tag_resets = TagResetRegistry()
+
+        def run_immediate_read_task(self, fn, *args):
+            with Session(engine) as session:
+                return fn(session, *args)
+
+    class _CannotLoad(_RecordingWorkflow):
+        def ensure_active_plugin_ready(self, engine_override=None):
+            raise RuntimeError("test-tagger-cannot-load")
+
+        def suggested_task_size(self):
+            return 8
+
+    tagger = SimpleNamespace(
+        tagger_settings={"active_tag_plugin": "pixlstash_tagger"},
+        tagging_workflow=_CannotLoad(configured_plugin="pixlstash_tagger"),
+    )
+    finder = MissingTagPredictionFinder(_Db(), engine_getter=lambda: tagger)
+
+    task = finder.find_task()
+    assert task.params["picture_ids"] == [pic_id]
+    with pytest.raises(RuntimeError, match="test-tagger-cannot-load") as failed:
+        task.run()
+    finder.on_task_complete(task, failed.value)
+
+    assert finder.find_task() is None

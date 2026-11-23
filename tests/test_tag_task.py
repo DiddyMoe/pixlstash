@@ -1,4 +1,5 @@
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,12 +11,15 @@ from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.tag import Tag
 from pixlstash.db_models.tag_prediction import TagPrediction
 from pixlstash.inference.workflows.tagging import TaggingWorkflow
+from pixlstash.resources.arbiter import ResourceArbiter
 from pixlstash.tagger_plugins.pixlstash_tagger import (
     CENTRE_CROP_TAG_WHITELIST,
     FACE_QUALITY_CROP_TAGS,
     PixlStashTaggerPlugin,
     QUALITY_CROP_TAG_WHITELIST,
 )
+from pixlstash.task_runner import TaskRunner
+from pixlstash.tasks.base_task import TaskStatus
 from pixlstash.tasks.tag_task import TagTask
 
 
@@ -1047,3 +1051,335 @@ def test_a_picture_that_will_not_reduce_costs_only_its_own_preload(tmp_path, cap
     assert list(task._preloaded_images) == [pictures[1].file_path]
     assert set(task._preloaded_crops) == {1, 2}
     assert "could not reduce" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# The tagger model loads on the GPU worker, after admission
+# ---------------------------------------------------------------------------
+
+
+class _LoadingWorkflow(_PluginWorkflow):
+    """`_PluginWorkflow` whose model starts unloaded, recording each step.
+
+    Every entry in *events* is ``(step, thread name)``: ``"load"`` for
+    `ensure_active_plugin_ready`, ``"tag"`` for the full pass.
+    """
+
+    COLD_MB = 1200
+    WARM_MB = 256
+
+    def __init__(self, events, load_error=None):
+        super().__init__()
+        self.events = events
+        self.load_error = load_error
+        self.load_overrides = []
+        self.load_started = threading.Event()
+        self.load_allowed = threading.Event()
+        self.load_allowed.set()
+        self.loaded = False
+        self.tagger_settings = {}
+
+    def is_active_plugin_loaded(self, engine_override=None):
+        return self.loaded
+
+    def estimated_vram_mb(self, image_count):
+        return self.COLD_MB
+
+    def estimated_incremental_vram_mb(self, image_count):
+        return self.WARM_MB
+
+    def ensure_active_plugin_ready(self, engine_override=None):
+        self.events.append(("load", threading.current_thread().name))
+        self.load_overrides.append(engine_override)
+        self.load_started.set()
+        self.load_allowed.wait(10)
+        if self.load_error is not None:
+            raise self.load_error
+        self.loaded = True
+
+    def tag_images(self, image_paths, out_raw_scores=None, **kwargs):
+        self.events.append(("tag", threading.current_thread().name))
+        return super().tag_images(image_paths, out_raw_scores=out_raw_scores, **kwargs)
+
+
+class _NoCard:
+    """A ledger with no device to read, so memory never refuses a lease."""
+
+    def devices(self, max_age_s=1.0):
+        return []
+
+    def device(self, uuid):
+        return None
+
+    def pixlstash_device(self):
+        return None
+
+    def other_processes(self, limit=3):
+        return []
+
+
+class _RecordingArbiter(ResourceArbiter):
+    """Grants, or refuses, every light lease; records each request in *events*."""
+
+    def __init__(self, events, grant=True):
+        super().__init__(_NoCard(), usage=lambda: None)
+        self.events = events
+        self.grant = grant
+        self.requested_mb = []
+
+    def try_light(self, label, need_mb=0, **kwargs):
+        self.events.append(("admit", threading.current_thread().name))
+        self.requested_mb.append(need_mb)
+        if not self.grant:
+            return None
+        return SimpleNamespace(on_cpu=False, release=lambda: None)
+
+
+def _loading_task(tmp_path, workflow, engine_override=None):
+    path = _png(tmp_path, "test-load.png")
+    return TagTask(
+        _PredictionDb(str(tmp_path), [1]),
+        workflow,
+        [Picture(id=1, file_path=str(path))],
+        engine_override=engine_override,
+    )
+
+
+def _settle_through_runner(task, arbiter) -> list:
+    """Run *task* on a real TaskRunner; return the errors its callbacks saw."""
+    runner = TaskRunner(name="test-tag-load", resource_arbiter=arbiter)
+    errors = []
+    settled = threading.Event()
+
+    def _on_complete(_task, error):
+        errors.append(error)
+        settled.set()
+
+    runner.add_task_complete_callback(_on_complete)
+    runner.start()
+    try:
+        runner.submit(task)
+        assert settled.wait(10), "the tag task never settled"
+    finally:
+        runner.stop()
+    return errors
+
+
+def test_queuing_a_tag_task_does_not_wait_for_the_model(tmp_path):
+    """`on_queued` runs on the planner's thread, or a request's for a retag.
+
+    A load that took minutes there held every stage the planner feeds.
+    """
+    workflow = _LoadingWorkflow([])
+    workflow.load_allowed.clear()
+    task = _loading_task(tmp_path, workflow)
+
+    queuing = threading.Thread(target=task.on_queued, name="test-submitter")
+    try:
+        queuing.start()
+        queuing.join(0.5)
+        assert not queuing.is_alive(), "on_queued waited for the model load"
+    finally:
+        workflow.load_allowed.set()
+        queuing.join(10)
+        task.on_cancel()
+
+
+def test_the_model_loads_on_the_gpu_worker_after_admission(tmp_path):
+    """Admitted first, so the arbiter counts the load and nothing else on the
+    device runs while it happens."""
+    events = []
+    workflow = _LoadingWorkflow(events)
+    task = _loading_task(tmp_path, workflow)
+    arbiter = _RecordingArbiter(events)
+
+    _settle_through_runner(task, arbiter)
+
+    assert task.status == TaskStatus.COMPLETED, task.error
+    assert [step for step, _thread in events] == ["admit", "load", "tag"]
+    assert events[1][1] == events[0][1], "the model loaded off the GPU worker"
+    assert arbiter.requested_mb == [_LoadingWorkflow.COLD_MB], (
+        "the admission before a cold load must ask for the model's weights too"
+    )
+
+
+def test_a_task_moved_to_the_cpu_never_loads_the_gpu_model(tmp_path, monkeypatch):
+    """Refused by the arbiter, the task tags on its own CPU engine; loading the
+    GPU model anyway would put the weights on a card that had no room."""
+    gpu_events = []
+    cpu_events = []
+    gpu_workflow = _LoadingWorkflow(gpu_events)
+    cpu_workflow = _LoadingWorkflow(cpu_events)
+    monkeypatch.setattr(
+        TagTask,
+        "_acquire_cpu_spillover_engine",
+        classmethod(
+            lambda cls, image_root, settings: SimpleNamespace(
+                tagging_workflow=cpu_workflow
+            )
+        ),
+    )
+    task = _loading_task(tmp_path, gpu_workflow)
+
+    _settle_through_runner(task, _RecordingArbiter(gpu_events, grant=False))
+
+    assert task.status == TaskStatus.COMPLETED, task.error
+    assert gpu_workflow.load_overrides == [], "the GPU model was loaded"
+    assert [step for step, _thread in cpu_events] == ["tag"]
+
+
+def test_a_cold_tagger_is_priced_with_its_weights(tmp_path):
+    workflow = _LoadingWorkflow([])
+    task = _loading_task(tmp_path, workflow)
+
+    assert task.estimated_vram_mb() == _LoadingWorkflow.COLD_MB
+    workflow.loaded = True
+    assert task.estimated_vram_mb() == _LoadingWorkflow.WARM_MB
+
+
+def test_a_model_that_will_not_load_fails_the_task_with_its_error(tmp_path):
+    """The task fails with the load's error and settles, so the finder gives
+    its pictures back; nothing is tagged by a model that is not there."""
+    events = []
+    load_error = RuntimeError("test-tagger-load-failure")
+    workflow = _LoadingWorkflow(events, load_error=load_error)
+    task = _loading_task(tmp_path, workflow)
+
+    errors = _settle_through_runner(task, _RecordingArbiter(events))
+
+    assert task.status == TaskStatus.FAILED
+    assert task.error == "test-tagger-load-failure"
+    assert errors == [load_error]
+    assert [step for step, _thread in events] == ["admit", "load"]
+
+
+def test_the_engine_override_chooses_the_model_that_loads(tmp_path):
+    workflow = _LoadingWorkflow([])
+    task = _loading_task(tmp_path, workflow, engine_override="test-other-tagger")
+
+    task.run()
+
+    assert workflow.load_overrides == ["test-other-tagger"]
+
+
+def test_cancelling_a_tag_task_does_not_wait_for_a_model_load(tmp_path):
+    workflow = _LoadingWorkflow([])
+    workflow.load_allowed.clear()
+    task = _loading_task(tmp_path, workflow)
+    task.on_queued()
+    worker = threading.Thread(target=task.run, name="test-gpu-worker")
+    worker.start()
+    try:
+        assert workflow.load_started.wait(10), "the load never started"
+        cancelling = threading.Thread(target=task.on_cancel, name="test-canceller")
+        cancelling.start()
+        cancelling.join(0.5)
+        assert not cancelling.is_alive(), "on_cancel waited for the model load"
+    finally:
+        workflow.load_allowed.set()
+        worker.join(10)
+
+
+class _FailingPlugin:
+    """A third-party tagger whose `init` raises *error*."""
+
+    name = "test-failing-tagger"
+
+    def __init__(self, error):
+        self.error = error
+
+    def default_params(self):
+        return {}
+
+    def init(self, params):
+        raise self.error
+
+    def is_loaded(self):
+        return False
+
+
+def _plugin_workflow(monkeypatch, plugins, active, pixlstash_loaded=False):
+    """A TaggingWorkflow whose registry knows *plugins* by name."""
+    by_name = {plugin.name: plugin for plugin in plugins}
+    manager = SimpleNamespace(get_plugin=by_name.get)
+    monkeypatch.setattr(
+        "pixlstash.tagger_plugins.registry.get_tagger_plugin_manager",
+        lambda: manager,
+    )
+    engine = SimpleNamespace(
+        device="cpu",
+        lifecycle=SimpleNamespace(ensure_tagging_ready=lambda *args: False),
+        wd14_service=SimpleNamespace(is_loaded=lambda: False),
+        pixlstash_tagger_service=SimpleNamespace(is_loaded=lambda: pixlstash_loaded),
+    )
+    return TaggingWorkflow(
+        engine=engine,
+        use_wd14=False,
+        use_pixlstash_tagger=True,
+        tagger_settings={"active_tag_plugin": active},
+    )
+
+
+def test_a_pixlstash_tagger_that_will_not_load_raises(monkeypatch):
+    """The tagger reports a failed load by returning False; carried on, the
+    task would finish with nothing tagged and its pictures written off."""
+    workflow = _plugin_workflow(monkeypatch, [], "pixlstash_tagger")
+
+    with pytest.raises(RuntimeError, match="PixlStash tagger could not be loaded"):
+        workflow.ensure_active_plugin_ready()
+
+
+def test_a_plugin_missing_a_module_is_left_to_the_tagging_pass(monkeypatch, caplog):
+    """A missing package never appears on a retry: `tag_images` clears those
+    pictures, so failing the task here would only queue them forever."""
+    error = ModuleNotFoundError(
+        "No module named 'test_missing_package'", name="test_missing_package"
+    )
+    workflow = _plugin_workflow(
+        monkeypatch, [_FailingPlugin(error)], _FailingPlugin.name
+    )
+
+    with caplog.at_level("WARNING"):
+        workflow.ensure_active_plugin_ready()
+
+    assert "test_missing_package" in caplog.text
+
+
+def test_any_other_plugin_load_error_reaches_the_task(monkeypatch):
+    error = RuntimeError("test-plugin-init-failure")
+    workflow = _plugin_workflow(
+        monkeypatch, [_FailingPlugin(error)], _FailingPlugin.name
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        workflow.ensure_active_plugin_ready()
+
+    assert raised.value is error
+
+
+class _WarmPlugin:
+    name = "test-warm-tagger"
+
+    def is_loaded(self):
+        return True
+
+
+@pytest.mark.parametrize(
+    "engine_override, expected",
+    [
+        (None, True),
+        ("wd14", False),
+        (_WarmPlugin.name, True),
+        ("test-missing-tagger", False),
+        ("", True),
+    ],
+)
+def test_is_active_plugin_loaded_asks_the_model_that_would_run(
+    monkeypatch, engine_override, expected
+):
+    """The estimate reads this: a wrong answer prices a cold load as warm."""
+    workflow = _plugin_workflow(
+        monkeypatch, [_WarmPlugin()], "pixlstash_tagger", pixlstash_loaded=True
+    )
+
+    assert workflow.is_active_plugin_loaded(engine_override) is expected

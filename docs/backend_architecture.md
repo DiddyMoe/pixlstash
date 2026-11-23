@@ -1957,12 +1957,17 @@ third is unfixed. Details, and every measurement, are in
 `docs/apple-metal-thread-safety.md`.
 
 Two sources of a second thread on the accelerator are closed at their source
-rather than synchronised, and two more are routed onto the GPU worker: the
-anomaly-region route, and every model unload, whose device-cache flush is
-queued as a `DeviceReleaseTask` (the idle sweep, making room, the face finder's
-end-of-work release; `Vault.stop()` skips the flush if a worker outlived the
-stop). The rest — the tagger preload, image plugins, and a few allocator calls
-— are listed under "Not covered" in that document.
+rather than synchronised, and three more are routed onto the GPU worker: the
+anomaly-region route, the tag task's model load, and every model unload, whose
+device-cache flush is queued as a `DeviceReleaseTask` (the idle sweep, making
+room, the face finder's end-of-work release; `Vault.stop()` skips the flush if
+a worker outlived the stop). `TagTask` loads its tagger in `_run_task` once its
+lease is granted, never from `on_queued` (which runs on the submitting thread
+and only starts the image preload); `TagTask.estimated_vram_mb` asks for the
+model's weights while it is not loaded, and a task moved to the CPU loads
+nothing onto the device. The rest — image plugins, CPU-queue tasks granted GPU
+memory, and a few allocator calls — are listed under "Not covered" in that
+document.
 
 **Loading.** transformers reads and casts weights on a pool of
 `min(4, cpu_count)` threads, so *merely loading a model* trips it — measured at

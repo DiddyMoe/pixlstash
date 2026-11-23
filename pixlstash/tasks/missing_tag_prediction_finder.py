@@ -11,7 +11,8 @@ from pixlstash.db_models import (
     TAG_SENTINEL_ESCAPE_CHAR,
 )
 from pixlstash.pixl_logging import get_logger
-from .base_task_finder import SimpleMissingFinder
+from pixlstash.task_runner import TaskCancelledError
+from .base_task_finder import BaseDeferringFinder, SimpleMissingFinder
 from .tag_prediction_backfill_task import TagPredictionBackfillTask
 from .task_type import TaskType
 
@@ -19,7 +20,7 @@ from .task_type import TaskType
 logger = get_logger(__name__)
 
 
-class MissingTagPredictionFinder(SimpleMissingFinder):
+class MissingTagPredictionFinder(SimpleMissingFinder, BaseDeferringFinder):
     """Find pictures that have real tags but no tag predictions and back-fill them.
 
     Predictions are only ever written by the PixlStash tagger, in the same pass
@@ -29,7 +30,15 @@ class MissingTagPredictionFinder(SimpleMissingFinder):
     retag sentinel. This finder closes that gap by running the tagger for raw
     scores only and writing predictions against the existing tags, without
     re-tagging (which would replace the curated tag set).
+
+    A task that fails defers its pictures for the rest of the session
+    (:class:`BaseDeferringFinder`): without this a tagger that cannot load
+    would be handed the same batch every planner cycle.
     """
+
+    _IDS_PARAM = "picture_ids"
+    _TRANSIENT = (TaskCancelledError,)
+    _WHAT = "Back-filling tag predictions"
 
     def __init__(self, database, engine_getter: Callable):
         super().__init__(database)
@@ -94,7 +103,8 @@ class MissingTagPredictionFinder(SimpleMissingFinder):
         return super().find_task()
 
     def _fetch_candidates(self, session: Session, limit: int) -> list:
-        return self._fetch_missing_predictions(session, limit)
+        pictures = self._fetch_missing_predictions(session, limit + len(self._deferred))
+        return [pic for pic in pictures if pic.id not in self._deferred]
 
     @staticmethod
     def _fetch_missing_predictions(session: Session, limit: int) -> list:
