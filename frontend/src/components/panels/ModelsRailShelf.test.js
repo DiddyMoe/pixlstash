@@ -36,6 +36,14 @@ vi.mock("../../api/modelShelf", () => ({
   listAdapters: (...args) =>
     args[0]?.fileKind ? Promise.resolve([]) : listAdapters(...args),
   listCheckpoints: (...args) => listCheckpoints(...args),
+  // The store's one read of every ticked kind: the same two doubles answer.
+  listModels: async (fileKinds) =>
+    (
+      await Promise.all([
+        fileKinds.includes("adapter") ? listAdapters() : [],
+        fileKinds.includes("checkpoint") ? listCheckpoints() : [],
+      ])
+    ).flat(),
   listBaseModelCompletions: vi.fn().mockResolvedValue([]),
   editModels: vi.fn(),
   forgetModels: vi.fn(),

@@ -22,9 +22,8 @@ import {
   putSetVerdict,
   putMemberVerdict,
   forgetModels,
-  listAdapters,
   listBaseModelCompletions,
-  listCheckpoints,
+  listModels,
   lookupBaseModelsOnline,
   markWorkflowSetSeen,
   mergeWorkflowSets,
@@ -309,11 +308,11 @@ export function clampColumnWidth(key, px) {
  * The sort keys: one per column, so every heading sorts. The first five mirror
  * `SortKey` in `routes/model_shelf.py`; `type` and `sets` are the client's own.
  *
- * Applied CLIENT-SIDE, and that is not a shortcut. `fetchRows` issues one
- * request per selected block and concatenates the results, so three
- * server-sorted lists would arrive correctly ordered and be destroyed by the
- * merge. Every field these keys read is already on the list payload, so sorting
- * here costs no request and no refetch when the user flips a direction.
+ * Applied CLIENT-SIDE, and that is not a shortcut. `fetchRows` reads only the
+ * ticked blocks and merges them with the rows of the blocks it left standing,
+ * so a server-sorted answer would be destroyed by the merge. Every field these
+ * keys read is already on the list payload, so sorting here costs no request
+ * and no refetch when the user flips a direction.
  */
 export const SORT_KEYS = [
   "added_at",
@@ -1282,11 +1281,15 @@ export const useModelShelfStore = defineStore("modelShelf", () => {
   /**
    * Load every row the top-level type checkboxes ask for.
    *
-   * One request per selected block, never one per kind or per base model:
-   * those two narrow the fetched set in {@link visibleRows} instead. The list
-   * already carries locations and attachments, so a row costs no follow-up,
-   * and a base-model multi-select would otherwise be one request per option
-   * with the results merged client-side anyway.
+   * One request for every selected block (`GET /models` naming their kinds),
+   * never one per block, per kind or per base model. Each list read pays the
+   * server's whole-library lookups (locations, attachments, picture counts)
+   * once whatever it returns, so a request per block paid them once per kind:
+   * eight times on a default load. The adapter kind and base model narrow the
+   * fetched set in {@link visibleRows} instead. The list already carries
+   * locations and attachments, so a row costs no follow-up, and a base-model
+   * multi-select would otherwise be one request per option with the results
+   * merged client-side anyway.
    *
    * A fetch REPLACES the blocks it asked for and LEAVES THE REST STANDING.
    * `rows` is therefore everything known, not the shown set: the type
@@ -1297,7 +1300,7 @@ export const useModelShelfStore = defineStore("modelShelf", () => {
    * Checkpoints dropped base models that stayed selected and persisted with
    * no box left to untick them.
    *
-   * `epoch` discards a flight the user has already overtaken: three
+   * `epoch` discards a flight the user has already overtaken: the type
    * checkboxes each refetch, so a slower earlier request could otherwise land
    * last and show adapters only while Checkpoints is ticked. Same shape as
    * `useLibrariesStore.refresh`.
@@ -1322,18 +1325,19 @@ export const useModelShelfStore = defineStore("modelShelf", () => {
     const blocks = fetchedBlocks();
     const hidesAtStart = modelHideEvents;
     try {
-      const results = await Promise.all(blockRequests(blocks));
+      const kinds = blockKinds(blocks);
+      const results = kinds.length ? await listModels(kinds) : [];
       if (startedAt !== epoch) return;
       const refreshed = new Set(blocks);
       rows.value = [
         ...rows.value.filter((row) => !refreshed.has(blockOf(row))),
-        ...results.flat(),
+        ...results,
       ];
       // Each row says whether this library hides it. Skipped when a hide was
       // sent or answered while the read was out: the local list is newer.
       if (modelHideEvents === hidesAtStart) {
         const hidden = new Set(hiddenModelIds.value);
-        for (const row of results.flat()) {
+        for (const row of results) {
           if (row.hidden) hidden.add(row.id);
           else hidden.delete(row.id);
         }
@@ -1369,32 +1373,23 @@ export const useModelShelfStore = defineStore("modelShelf", () => {
   }
 
   /**
-   * The requests for some blocks: one per block, one per kind for `support`.
+   * The `file_kind`s some blocks read: one per block, four for `support`.
    *
    * @param {Array<string>} blocks - `BLOCKS` entries.
    */
-  function blockRequests(blocks) {
-    const requests = [];
-    if (blocks.includes("adapters")) requests.push(listAdapters());
-    if (blocks.includes("checkpoints")) requests.push(listCheckpoints());
-    if (blocks.includes("unclassified")) {
-      requests.push(listAdapters({ fileKind: "unknown" }));
-    }
+  function blockKinds(blocks) {
+    const kinds = [];
+    if (blocks.includes("adapters")) kinds.push("adapter");
+    if (blocks.includes("checkpoints")) kinds.push("checkpoint");
+    if (blocks.includes("unclassified")) kinds.push("unknown");
     // The engines block: PixlStash's own taggers and scorers, the
     // InsightFace packs and every HuggingFace repo in the cache. Same
-    // route, same shape, one more `file_kind`.
-    if (blocks.includes("engines")) {
-      requests.push(listAdapters({ fileKind: "engine" }));
-    }
-    // Several requests for one checkbox: the route takes a single
-    // `file_kind`, and these kinds are one thing to a reader deciding what to
-    // keep.
-    if (blocks.includes("support")) {
-      for (const fileKind of SUPPORT_KINDS) {
-        requests.push(listAdapters({ fileKind }));
-      }
-    }
-    return requests;
+    // shape, one more `file_kind`.
+    if (blocks.includes("engines")) kinds.push("engine");
+    // Several kinds for one checkbox: these are one thing to a reader
+    // deciding what to keep.
+    if (blocks.includes("support")) kinds.push(...SUPPORT_KINDS);
+    return kinds;
   }
 
   /**

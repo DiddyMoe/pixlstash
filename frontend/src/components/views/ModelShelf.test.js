@@ -61,6 +61,20 @@ vi.mock("../../api/modelShelf", () => ({
     return listAdapters(...args);
   },
   listCheckpoints: (...args) => listCheckpoints(...args),
+  // The store reads every ticked kind in one call; each kind is answered by
+  // the double that answers it on its own route.
+  listModels: async (fileKinds) =>
+    (
+      await Promise.all(
+        fileKinds.map((fileKind) => {
+          if (fileKind === "adapter") return listAdapters();
+          if (fileKind === "checkpoint") return listCheckpoints();
+          if (fileKind === "engine") return listEngines({ fileKind });
+          if (fileKind === "unknown") return listUnclassified({ fileKind });
+          return listSupport({ fileKind });
+        }),
+      )
+    ).flat(),
   // The shelf's destructive verb. Mocked for the same reason the folder reads
   // are - it is a network call on a user gesture - and because a suite that
   // really called it would be asserting the server's gate rather than the

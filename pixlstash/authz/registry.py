@@ -560,6 +560,10 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
         justification="§16.3 serves the raw bytes of a model file out of a registered model folder - the same read-inside-a-registered-root authority as model-folders/{folder_id}/runs/{run_name}/samples/{filename}, and a new capability rather than a subset of GET /adapters, which serves metadata only. Takes no host path: the sha256 addresses a row the scanner wrote, the join is contained, and only a `present` copy is served; owner + loopback/LAN/Tailscale, or remote owner iff allow_remote_host_ops=true (§16.3.1)",
     ),
     ("GET", "/api/v1/checkpoints"): RoutePolicy(_OWNER),
+    # The union of the two list reads above, several kinds per request: the
+    # same rows, the same default library pin, nothing the per-kind routes do
+    # not already return.
+    ("GET", "/api/v1/models"): RoutePolicy(_OWNER),
     # The assignment path. OWNER_ONLY, same pin: it WRITES the active vault's
     # adapter_attachment rows, so a token stamped for another library must not
     # reach it. Not LOCAL_OWNER_ONLY - it names a hash and two row ids, never a

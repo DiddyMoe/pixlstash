@@ -622,8 +622,11 @@ Rules neither side may drift from:
    the server; the route is owner-only and writes hub rows only.
    **Hidden models are the active library's own too**: `PUT /models/hidden`
    (`{ids: [...], hidden}`) answers `{hidden_models}`, the whole new list of
-   `model.id`s. Every `/adapters` and `/checkpoints` row carries
-   `hidden: bool` and this payload carries `hidden_models`. The server never
+   `model.id`s. Every `/adapters`, `/checkpoints` and `/models` row carries
+   `hidden: bool` and this payload carries `hidden_models` (`GET /models` is
+   the shelf's own read: one request naming every kind it shows as a repeated
+   `file_kind`, `{models: [...]}`, each row field for field the one its kind's
+   route returns; an unknown kind is a 400). The server never
    drops a hidden row from those lists, since the client also names models
    from them; **the client leaves a hidden model out of anything it offers**
    (the shelf's rows, cards and trays, the rail, the set choosers, the Run
@@ -656,8 +659,8 @@ Rules neither side may drift from:
    key is a 404, and so is an id not on the shelf when recording (clearing
    skips that check, so an answer naming a model that left can still go). A verdict belongs to its exact key:
    members change, no verdict, and the server clears nothing. The model's own
-   shelf row (`GET /adapters`, `GET /adapters/{sha256}`, `GET /checkpoints`)
-   carries `set_verdicts: [{combo_key, names, verdict}]`, the owner's member
+   shelf row (`GET /adapters`, `GET /adapters/{sha256}`, `GET /checkpoints`,
+   `GET /models`) carries `set_verdicts: [{combo_key, names, verdict}]`, the owner's member
    answers about that model, `names` being the set's members in shelf names,
    base model first.
    The same rows carry `hash_pending: bool` beside `sha256`. A null `sha256`

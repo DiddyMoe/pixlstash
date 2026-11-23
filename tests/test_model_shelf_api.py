@@ -36,6 +36,7 @@ import itertools
 import json
 import os
 import re
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -102,6 +103,7 @@ _SHELF_ROUTES = (
     ("GET", "/api/v1/adapters"),
     ("GET", "/api/v1/adapters/{sha256}"),
     ("GET", "/api/v1/checkpoints"),
+    ("GET", "/api/v1/models"),
     ("GET", "/api/v1/models/base-models"),
     ("POST", "/api/v1/models/companions"),
     ("PUT", "/api/v1/models/hidden"),
@@ -674,6 +676,335 @@ def test_character_and_set_filters_are_mutually_exclusive(shelf_env):
 
 
 # ===========================================================================
+# GET /models - every block the shelf shows, in one read
+# ===========================================================================
+
+# Every kind a shelf load asks for, and the route that serves each one alone.
+_EVERY_KIND = (
+    "adapter",
+    "unknown",
+    "engine",
+    "vae",
+    "text_encoder",
+    "controlnet",
+    "upscaler",
+    "checkpoint",
+)
+
+
+def _digest(label: str) -> str:
+    """A real hex digest: the seed's padded stand-ins can never match a recipe."""
+    return hashlib.sha256(f"test-{label}".encode()).hexdigest()
+
+
+def _per_kind_rows(shelf_env) -> dict[int, dict]:
+    """Each kind read from the route that serves it alone, keyed by id."""
+    rows: dict[int, dict] = {}
+    for file_kind in _EVERY_KIND:
+        if file_kind == "checkpoint":
+            r = shelf_env.owner.get(f"{API}/checkpoints")
+            payload = r.json()["checkpoints"]
+        else:
+            r = shelf_env.owner.get(f"{API}/adapters", params={"file_kind": file_kind})
+            payload = r.json()["adapters"]
+        assert r.status_code == 200, r.text
+        for row in payload:
+            assert row["id"] not in rows, f"model {row['id']} is in two kind routes"
+            rows[row["id"]] = row
+    return rows
+
+
+def _models(shelf_env, kinds=_EVERY_KIND, **params) -> list[dict]:
+    r = shelf_env.owner.get(
+        f"{API}/models", params={"file_kind": list(kinds), **params}
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["models"]
+
+
+def _seed_every_kind(shelf_env) -> dict[str, int]:
+    """One model of each kind the seed lacks, digests real so a recipe can match.
+
+    Two of them share a filename, so a name recipe reaches both.
+    """
+    return {
+        "engine": _add_model(shelf_env, "engine", "test-engine.safetensors", None),
+        "vae": _add_model(shelf_env, "vae", "test-vae.safetensors", _digest("vae")),
+        "text_encoder": _add_model(
+            shelf_env,
+            "text_encoder",
+            "test-shared.safetensors",
+            _digest("text-encoder"),
+        ),
+        "controlnet": _add_model(
+            shelf_env, "controlnet", "test-shared.safetensors", _digest("controlnet")
+        ),
+        "upscaler": _add_model(
+            shelf_env, "upscaler", "test-upscaler.safetensors", _digest("upscaler")
+        ),
+    }
+
+
+def _seed_counted_recipes(server) -> None:
+    """Recipes reaching every tier: by digest, by A1111 prefix, by a shared name."""
+    _seed_recipe(
+        server,
+        "models-read-a",
+        [("lora_name", "alice.safetensors"), ("vae_sha256", _digest("vae"))],
+    )
+    _seed_recipe(
+        server,
+        "models-read-b",
+        [
+            ("ckpt_name", "base_xl.safetensors"),
+            ("clip_name", "test-shared.safetensors"),
+        ],
+    )
+    _seed_recipe(
+        server, "models-read-c", [("upscale_model_sha256", _digest("upscaler")[:10])]
+    )
+    for recipe, copies in (
+        ("models-read-a", 2),
+        ("models-read-b", 1),
+        ("models-read-c", 1),
+    ):
+        for _ in range(copies):
+            _seed_picture(server, recipe)
+
+
+def test_one_models_read_is_the_union_of_the_kind_routes(shelf_env):
+    """One read of every kind serves, row for row, what the kind routes serve.
+
+    Field equality covers what each row borrows from a whole-library lookup:
+    locations, attachments, picture counts in both tiers, the hide and the
+    set marks. The fixture makes those differ from row to row.
+    """
+    server = shelf_env.server
+    extra = _seed_every_kind(shelf_env)
+    _seed_counted_recipes(server)
+    _attach(server, ADAPTER_WITH_BASE, "character", shelf_env.character_id)
+    _attach(server, _digest("vae"), "set", shelf_env.set_id)
+    hidden = [shelf_env.model_ids["dana.safetensors"], extra["controlnet"]]
+    try:
+        r = shelf_env.owner.put(
+            f"{API}/models/hidden", json={"ids": hidden, "hidden": True}
+        )
+        assert r.status_code == 200, r.text
+
+        expected = _per_kind_rows(shelf_env)
+        models = _models(shelf_env)
+
+        assert len(models) == len(expected), "a row came back twice"
+        assert {row["id"]: row for row in models} == expected
+        # The premise: every kind is present and every lookup has something to
+        # disagree about.
+        assert {row["file_kind"] for row in models} == set(_EVERY_KIND)
+        by_id = {row["id"]: row for row in models}
+        assert by_id[extra["vae"]]["pictures_verified"] == 2
+        assert by_id[extra["upscaler"]]["pictures_verified"] == 1
+        assert by_id[extra["text_encoder"]]["pictures_by_filename"] == 1
+        assert by_id[extra["controlnet"]]["pictures_by_filename"] == 1
+        assert by_id[shelf_env.model_ids["alice.safetensors"]]["attachments"]
+        assert {row["id"] for row in models if row["hidden"]} == set(hidden)
+    finally:
+        _wipe_recipes(server)
+
+
+def test_a_models_read_computes_the_aggregates_once(shelf_env, monkeypatch):
+    """Eight kinds in one read pay for each whole-library lookup once, not eight
+    times: that cost, not the row count, is what a shelf load spends."""
+    _seed_every_kind(shelf_env)
+    _seed_counted_recipes(shelf_env.server)
+    calls: dict[str, int] = {}
+
+    def counted(module, name):
+        real = getattr(module, name)
+
+        def wrapper(*args, **kwargs):
+            calls[name] = calls.get(name, 0) + 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, wrapper)
+        calls[name] = 0
+
+    for name in (
+        "fetch_models",
+        "fetch_locations",
+        "fetch_attachments",
+        "fetch_capabilities",
+        "fetch_picture_counts",
+        "fetch_model_marks",
+        "fetch_character_names",
+        "hidden_model_ids",
+        "kind_suggestions",
+    ):
+        counted(model_shelf_routes, name)
+    # The two whole-library passes inside the picture counts.
+    counted(model_shelf_service, "recipe_picture_counts")
+    counted(model_shelf_service, "recipe_asset_index")
+    try:
+        models = _models(shelf_env)
+        assert {row["file_kind"] for row in models} == set(_EVERY_KIND)
+        assert calls == dict.fromkeys(calls, 1)
+    finally:
+        _wipe_recipes(shelf_env.server)
+
+
+def test_a_models_read_answers_the_edges_of_its_kinds(shelf_env):
+    """A kind outside the shelf is refused rather than quietly dropped."""
+    r = shelf_env.owner.get(
+        f"{API}/models", params={"file_kind": ["adapter", "test-bogus"]}
+    )
+    assert r.status_code == 400, r.text
+    assert "file_kind" in r.json()["detail"]
+
+    # Kinds with nothing on the shelf are an empty read, not an error.
+    assert _models(shelf_env, ("controlnet", "vae")) == []
+
+    # A kind named twice is still each row once.
+    adapters = {
+        row["id"] for row in shelf_env.owner.get(f"{API}/adapters").json()["adapters"]
+    }
+    twice = [row["id"] for row in _models(shelf_env, ("adapter", "adapter"))]
+    assert sorted(twice) == sorted(adapters)
+
+    r = shelf_env.owner.get(
+        f"{API}/models",
+        params={
+            "file_kind": ["adapter"],
+            "character_id": shelf_env.character_id,
+            "set_id": shelf_env.set_id,
+        },
+    )
+    assert r.status_code == 400, r.text
+
+
+def test_a_kind_named_past_the_bound_parameter_floor_is_read_once(shelf_env):
+    """A kind repeated more times than SQLite binds is still one ``IN`` entry.
+
+    Pinned to SQLite's historical 999-variable floor (the one
+    ``utils/sql_chunking`` designs for) before the first request of that size:
+    the limit is checked when a statement is prepared, so a statement already
+    cached at a higher limit would hide the crossing.
+    """
+    raw = shelf_env.server.hub.connection
+    previous = raw.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+    adapters = sorted(
+        row["id"] for row in shelf_env.owner.get(f"{API}/adapters").json()["adapters"]
+    )
+    assert adapters, "premise: the seed has adapters"
+    raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+    try:
+        r = shelf_env.owner.get(
+            f"{API}/models", params=[("file_kind", "adapter")] * 1000
+        )
+        assert r.status_code == 200, r.text
+        assert sorted(row["id"] for row in r.json()["models"]) == adapters
+    finally:
+        raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+
+def test_a_models_read_sees_every_change_made_since_the_last(shelf_env):
+    """Nothing is kept between reads: a hide, an attachment and a picture binned
+    and restored each show on the very next one."""
+    server = shelf_env.server
+    alice = shelf_env.model_ids["alice.safetensors"]
+    _seed_recipe(server, "models-fresh", [("lora_name", "alice.safetensors")])
+    picture_id = _seed_picture(server, "models-fresh")
+
+    def alice_row():
+        return {row["id"]: row for row in _models(shelf_env)}[alice]
+
+    def set_deleted(deleted):
+        def write(session: Session):
+            session.get(Picture, picture_id).deleted = deleted
+            session.commit()
+
+        server.vault.db.run_task(write, priority=DBPriority.IMMEDIATE)
+
+    try:
+        first = alice_row()
+        assert first["hidden"] is False
+        assert first["attachments"] == []
+        assert first["pictures_by_filename"] == 1
+
+        r = shelf_env.owner.put(
+            f"{API}/models/hidden", json={"ids": [alice], "hidden": True}
+        )
+        assert r.status_code == 200, r.text
+        assert alice_row()["hidden"] is True
+
+        r = shelf_env.owner.put(
+            f"{API}/adapters/{ADAPTER_WITH_BASE}/attachments",
+            json=[{"entity_type": "character", "entity_id": shelf_env.character_id}],
+        )
+        assert r.status_code == 200, r.text
+        assert alice_row()["attachments"] == [
+            {"entity_type": "character", "entity_id": shelf_env.character_id}
+        ]
+
+        set_deleted(True)
+        assert alice_row()["pictures_by_filename"] == 0
+        set_deleted(False)
+        assert alice_row()["pictures_by_filename"] == 1
+    finally:
+        _wipe_recipes(server)
+
+
+def test_adapter_detail_counts_without_the_whole_library_map(shelf_env, monkeypatch):
+    """One adapter's page counts that adapter's pictures, and only those.
+
+    The answer is the one its list row gives, in both tiers; what changes is
+    that the vault-wide recipe tally and the shelf-wide name index are not built
+    to get it.
+    """
+    server = shelf_env.server
+    verified = _digest("detail")
+    _add_model(shelf_env, "adapter", "test-detail.safetensors", verified, kind="lora")
+    _seed_recipe(
+        server,
+        "detail-digest",
+        [("lora_sha256", verified), ("lora_name", "test-detail.safetensors")],
+    )
+    _seed_recipe(server, "detail-name", [("lora_name", "alice.safetensors")])
+    _seed_recipe(server, "detail-other", [("lora_name", "bob.safetensors")])
+    for recipe, copies in (
+        ("detail-digest", 1),
+        ("detail-name", 2),
+        ("detail-other", 3),
+    ):
+        for _ in range(copies):
+            _seed_picture(server, recipe)
+    try:
+        listed = {
+            row["sha256"]: row
+            for row in shelf_env.owner.get(f"{API}/adapters").json()["adapters"]
+        }
+        # The premise: both tiers are populated on the list.
+        assert listed[verified]["pictures_verified"] == 1
+        assert listed[verified]["pictures_by_filename"] == 0
+        assert listed[ADAPTER_WITH_BASE]["pictures_by_filename"] == 2
+
+        calls = {"recipe_picture_counts": 0, "recipe_asset_index": 0}
+        for name in calls:
+            real = getattr(model_shelf_service, name)
+
+            def wrapper(*args, _name=name, _real=real, **kwargs):
+                calls[_name] += 1
+                return _real(*args, **kwargs)
+
+            monkeypatch.setattr(model_shelf_service, name, wrapper)
+
+        for sha256 in (verified, ADAPTER_WITH_BASE, ADAPTER_NO_BASE):
+            r = shelf_env.owner.get(f"{API}/adapters/{sha256}")
+            assert r.status_code == 200, r.text
+            assert r.json() == listed[sha256]
+        assert calls == {"recipe_picture_counts": 0, "recipe_asset_index": 0}
+    finally:
+        _wipe_recipes(server)
+
+
+# ===========================================================================
 # Authorization - both directions, on every route
 # ===========================================================================
 
@@ -692,6 +1023,7 @@ def _shelf_paths() -> list[str]:
         f"{API}/checkpoints",
         f"{API}/favourites",
         f"{API}/model-stacks/proposals",
+        f"{API}/models?file_kind=adapter&file_kind=checkpoint",
         f"{API}/models/base-models",
     ]
 

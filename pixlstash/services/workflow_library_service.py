@@ -28,6 +28,7 @@ from pixlstash.db_models import Character, Picture, PictureSet, Project
 from pixlstash.services.saved_recipe_service import counts_by_workflow_id
 from pixlstash.stacking import get_or_create_stack_for_picture
 from pixlstash.utils.query.predicate_filter import filed_as as _filed_as
+from pixlstash.utils.sql_chunking import chunked
 
 
 @dataclass(frozen=True)
@@ -68,25 +69,30 @@ def _activity(session: Session, column) -> dict[str, WorkflowActivity]:
 def recipe_activity(
     session: Session, structural_hashes: list[str]
 ) -> dict[str, WorkflowActivity]:
-    """The same figures per recipe, for the variants under one topology.
+    """The same figures per recipe, for the recipes the caller names.
 
     Narrowed by hash rather than grouped vault-wide: the caller already knows
-    which recipes it is expanding, and a topology holding 159 of them is still
-    one ``IN`` over an indexed column.
+    which recipes it is expanding (one topology's variants, or every recipe
+    that names one model). The ``IN`` over the indexed column is read in
+    :func:`~pixlstash.utils.sql_chunking.chunked` batches, because a model
+    named across a large library hands over more hashes than SQLite binds in
+    one statement. Each batch groups every kept picture of the hashes it
+    names, so no hash's figures are split between batches.
     """
-    if not structural_hashes:
-        return {}
     column = Picture.workflow_structural_hash
-    rows = session.exec(
-        select(column, func.count(Picture.id), func.max(_USED_AT))
-        .where(column.in_(structural_hashes))
-        .where(Picture.deleted.is_(False))
-        .group_by(column)
-    ).all()
-    return {
-        key: WorkflowActivity(pictures=count, last_used=last_used)
-        for key, count, last_used in rows
-    }
+    activity: dict[str, WorkflowActivity] = {}
+    for batch in chunked(list(structural_hashes)):
+        rows = session.exec(
+            select(column, func.count(Picture.id), func.max(_USED_AT))
+            .where(column.in_(batch))
+            .where(Picture.deleted.is_(False))
+            .group_by(column)
+        ).all()
+        activity.update(
+            (key, WorkflowActivity(pictures=count, last_used=last_used))
+            for key, count, last_used in rows
+        )
+    return activity
 
 
 def recipe_picture_counts(session: Session) -> dict[str, int]:

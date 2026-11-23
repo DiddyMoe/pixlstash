@@ -39,8 +39,8 @@ made of text encoders, and *"which of these can I delete"* had no answer at all.
 **Folding happens on the way out, not in the database.** Every row carries
 ``base_model_folded`` beside its raw ``base_model``. That is where the fold
 belongs: ``base_model`` is free text by rule, and the shelf sorts, filters,
-groups and builds its facets **client-side** (one request per selected block,
-concatenated - see ``useModelShelfStore``), so a canonical column or a SQLite
+groups and builds its facets **client-side** (one ``GET /models`` naming every
+ticked block's kinds - see ``useModelShelfStore``), so a canonical column or a SQLite
 collation would fold the one path the shelf does not use and leave the other
 four unfolded. One computed field serves all of them, costs a dict lookup per
 row, and needs no migration.
@@ -218,6 +218,11 @@ ADAPTER_BLOCK_FILE_KINDS = (
     FILE_CONTROLNET,
     FILE_UPSCALER,
 )
+
+# What ``GET /models`` reads in one request: every hash-addressable kind and the
+# checkpoints. A checkpoint is still never folded into another kind's rows - the
+# union only shares the whole-page lookups each per-kind route would repeat.
+MODEL_LIST_FILE_KINDS = (*ADAPTER_BLOCK_FILE_KINDS, FILE_CHECKPOINT)
 
 # Constrained here rather than validated in the handler, so an unknown key is a
 # 422 from FastAPI and never reaches the SQL builder. The values are the five
@@ -1986,6 +1991,14 @@ class AdapterListResponse(BaseModel):
     adapters: list[ModelResponse]
 
 
+class ModelListResponse(BaseModel):
+    """Body of ``GET /models``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    models: list[ModelResponse]
+
+
 class CheckpointListResponse(BaseModel):
     """Body of ``GET /checkpoints``."""
 
@@ -2243,7 +2256,15 @@ def create_router(server) -> APIRouter:
         sort: str = DEFAULT_SORT,
         direction: str = DEFAULT_DIRECTION,
     ) -> list[ModelResponse]:
-        """The shared body of both list routes: three queries, whatever the size."""
+        """The shared body of the list routes, for one kind or several.
+
+        One ``fetch_models`` read, then, for a non-empty page, each whole-page
+        lookup exactly once whatever the rows or kinds: locations,
+        attachments, capabilities, picture counts (a vault-wide tally and a
+        scan of the recipe assets), marks, character names, hidden ids and the
+        kind suggestions. Those lookups are paid per call, not per kind, which
+        is what ``GET /models`` is for.
+        """
         if character_id is not None and set_id is not None:
             raise HTTPException(
                 status_code=400, detail="Give character_id or set_id, not both."
@@ -2427,7 +2448,7 @@ def create_router(server) -> APIRouter:
             fetch_locations(server.hub, int(row["id"])),
             fetch_attachments(server.vault, sha256=sha256),
             fetch_capabilities(server.hub, int(row["id"])),
-            fetch_picture_counts(server.hub, server.vault),
+            fetch_picture_counts(server.hub, server.vault, model_ids=[int(row["id"])]),
             fetch_model_marks(server.hub),
             fetch_character_names(server.vault),
             set(hidden_model_ids(server.hub, server.vault.library_uuid)),
@@ -2528,6 +2549,87 @@ def create_router(server) -> APIRouter:
                 sort=sort,
                 direction=direction,
             ),
+        )
+
+    @router.get(
+        "/models",
+        summary="List the shelf's models of several kinds at once",
+        description=(
+            "The rows `/adapters` and `/checkpoints` return, for every "
+            "`file_kind` named, in one read: repeat the parameter "
+            "(`file_kind=adapter&file_kind=checkpoint`). The whole-page lookups "
+            "behind each row (locations, attachments, picture counts and the "
+            "rest) are made once for the union rather than once per kind, so "
+            "this is the route a caller wanting several kinds uses. A row is "
+            "field for field the one its own kind's route returns; the order "
+            "of the union is not a contract."
+        ),
+        tags=["model_shelf"],
+        response_model=ModelListResponse,
+    )
+    def list_models(
+        request: Request,
+        file_kind: list[str] = Query(
+            ...,
+            description=(
+                "Repeat for each kind: `adapter`, `unknown`, `vae`, "
+                "`text_encoder`, `controlnet`, `upscaler`, `engine` or "
+                "`checkpoint`."
+            ),
+        ),
+        base_model: Optional[str] = Query(
+            None,
+            description=(
+                "Exact match on the recorded base model, or `UNASSIGNED` for the "
+                "rows that record none. Omit for all."
+            ),
+        ),
+        base_model_family: Optional[str] = Query(
+            None, description="Same as on /adapters. Omit for all."
+        ),
+        kind: Optional[str] = Query(
+            None, description="Adapter algorithm, e.g. `lora` or `lokr`."
+        ),
+        character_id: Optional[int] = Query(
+            None, description="Only models attached to this character."
+        ),
+        set_id: Optional[int] = Query(
+            None, description="Only models attached to this picture set."
+        ),
+        q: Optional[str] = Query(
+            None,
+            description="Substring of the display name, filename or trigger words.",
+        ),
+        sort: SortKey = Query(DEFAULT_SORT, description="Same five keys as /adapters."),
+        direction: SortDirection = Query(
+            DEFAULT_DIRECTION, description="`desc` (default) or `asc`."
+        ),
+    ):
+        server.auth.ensure_secure_when_required(request)
+        unknown = [value for value in file_kind if value not in MODEL_LIST_FILE_KINDS]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"file_kind must be one of {list(MODEL_LIST_FILE_KINDS)}; "
+                    f"got {unknown}."
+                ),
+            )
+        return ModelListResponse(
+            models=_build_list(
+                # Each value is a bound SQL parameter: a kind named twice is
+                # read once, so a request can never bind more than the eight
+                # kinds (SQLite's floor is 999, utils/sql_chunking).
+                tuple(dict.fromkeys(file_kind)),
+                base_model=base_model,
+                family=base_model_family,
+                kind=kind,
+                q=q,
+                character_id=character_id,
+                set_id=set_id,
+                sort=sort,
+                direction=direction,
+            )
         )
 
     @router.get(

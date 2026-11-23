@@ -24,6 +24,21 @@ const listUnclassified = vi.fn();
 // one checkbox and one row bucket, so a test that wants support rows wants them
 // without caring which of the requests carried them.
 const listSupport = vi.fn();
+// The store reads every ticked block in one `GET /models`. This double answers
+// it from the per-kind doubles above, one call per kind it names and in that
+// order, so each test keeps seeding the result set it means.
+const listModels = vi.fn(async (fileKinds) => {
+  const parts = await Promise.all(
+    fileKinds.map((fileKind) => {
+      if (fileKind === "adapter") return listAdapters();
+      if (fileKind === "checkpoint") return listCheckpoints();
+      if (fileKind === "engine") return listEngines({ fileKind });
+      if (fileKind === "unknown") return listUnclassified({ fileKind });
+      return listSupport({ fileKind });
+    }),
+  );
+  return parts.flat();
+});
 
 const editModels = vi.fn();
 const listBaseModelCompletions = vi.fn();
@@ -55,6 +70,7 @@ vi.mock("../api/modelShelf", () => ({
     return listAdapters(...args);
   },
   listCheckpoints: (...args) => listCheckpoints(...args),
+  listModels: (...args) => listModels(...args),
   editModels: (...args) => editModels(...args),
   listBaseModelCompletions: (...args) => listBaseModelCompletions(...args),
   forgetModels: (...args) => forgetModels(...args),
@@ -167,6 +183,8 @@ beforeEach(() => {
   listEngines.mockReset().mockResolvedValue([]);
   listUnclassified.mockReset().mockResolvedValue([]);
   listSupport.mockReset().mockResolvedValue([]);
+  // Cleared, not reset: the fan-out above is the double's whole behaviour.
+  listModels.mockClear();
   listBaseModelCompletions.mockReset().mockResolvedValue([]);
   fetchWorkflowSets.mockReset().mockResolvedValue({
     combinations: [],
@@ -244,6 +262,31 @@ describe("defaults", () => {
     expect(listCheckpoints).toHaveBeenCalledTimes(1);
     expect(listUnclassified).toHaveBeenCalledWith({ fileKind: "unknown" });
     expect(store.activeCount).toBe(0);
+  });
+
+  it("reads every ticked block in one request", async () => {
+    // The server pays its whole-library lookups once per list read, whatever
+    // it returns: a request per block paid them once per kind, eight times on
+    // the default shelf.
+    const store = useModelShelfStore();
+    await store.fetchRows();
+    expect(listModels).toHaveBeenCalledTimes(1);
+    expect(listModels).toHaveBeenCalledWith([
+      "adapter",
+      "checkpoint",
+      "unknown",
+      "engine",
+      "vae",
+      "text_encoder",
+      "controlnet",
+      "upscaler",
+    ]);
+
+    // An unticked block's kinds leave the one read rather than adding another.
+    listModels.mockClear();
+    await store.setFilters({ checkpoints: false, support: false }, { refetch: true });
+    expect(listModels).toHaveBeenCalledTimes(1);
+    expect(listModels).toHaveBeenCalledWith(["adapter", "unknown", "engine"]);
   });
 
   it("asks for the engines, because nothing else on the shelf shows them", async () => {
@@ -524,9 +567,9 @@ describe("the badge", () => {
 });
 
 describe("the support block", () => {
-  it("puts every kind in one bucket from one request each", async () => {
-    // One checkbox, four `file_kind`s. The route takes a single kind, so the
-    // block is four requests, and a reader deciding what to keep sees one list.
+  it("puts every kind in one bucket", async () => {
+    // One checkbox, four `file_kind`s, and a reader deciding what to keep sees
+    // one list. The double answers each kind from `listSupport` in turn.
     const store = useModelShelfStore();
     listSupport
       .mockResolvedValueOnce([adapter({ id: 1, file_kind: "vae", kind: null })])
