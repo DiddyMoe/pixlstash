@@ -4,7 +4,7 @@
 // same choice is offered on the first-run welcome screen; this is where it can
 // be changed afterwards. Switching the runtime restarts the local server, which
 // reloads this page - so a successful action ends with the app reloading.
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from "vue";
 import { login } from "../../utils/apiClient";
 import { getAuthState } from "../../api/users";
 import { getComputeGpus, setComputeGpu } from "../../api/compute";
@@ -26,6 +26,8 @@ const props = defineProps({
   // sharing it, and acceleration) and 'backend' (Server: remote access and
   // desktop). Each instance loads and renders only its own half.
   view: { type: String, default: "compute" },
+  // True while this instance's pane is the shown tab.
+  active: { type: Boolean, default: false },
 });
 
 const isBackend = computed(() => props.view === "backend");
@@ -569,6 +571,24 @@ function loadForView() {
   }
 }
 
+// Read when the pane is first shown, and never again in this mount. The
+// settings dialog remounts its content when it opens, but a reopen during the
+// close animation keeps the mount and does not read again, so this is once per
+// mount, not once per open. A return to the tab keeps what the user has not
+// applied yet: `loadForView()` overwrites `serverDraft` and the VRAM slider. A
+// later re-read must not hydrate `serverDraft` while `serverDirty`, nor the
+// slider while a save is pending.
+let loaded = false;
+watch(
+  () => props.open && props.active,
+  (shown) => {
+    if (!shown || loaded) return;
+    loaded = true;
+    loadForView();
+  },
+  { immediate: true },
+);
+
 onMounted(() => {
   // Only the compute view installs accelerators, so only it needs progress.
   if (!isBackend.value && desktop?.onProgress) {
@@ -579,22 +599,23 @@ onMounted(() => {
       };
     });
   }
-  loadForView();
+});
+
+onBeforeUnmount(() => {
+  // Closing Settings unmounts the pane; a slider move still inside the
+  // debounce is saved now rather than dropped.
+  if (maxVramGbSaveTimer) {
+    clearTimeout(maxVramGbSaveTimer);
+    maxVramGbSaveTimer = null;
+    saveMaxVramGb();
+  }
 });
 
 onUnmounted(() => {
   if (stopProgress) stopProgress();
   if (portCheckTimer) clearTimeout(portCheckTimer);
-  if (maxVramGbSaveTimer) clearTimeout(maxVramGbSaveTimer);
   if (maxVramGbSavedTimer) clearTimeout(maxVramGbSavedTimer);
 });
-
-watch(
-  () => props.open,
-  (isOpen) => {
-    if (isOpen) loadForView();
-  },
-);
 </script>
 
 <template>

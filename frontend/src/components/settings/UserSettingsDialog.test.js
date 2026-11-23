@@ -23,19 +23,27 @@ vi.mock("../widgets/AppButton.vue", () => ({
 const sectionStub = vi.hoisted(() => ({
   template: '<div class="section-stub" />',
 }));
+// The panes that are told both whether the dialog is open and whether their own
+// tab is the one showing. The stub writes both props out so a test can read them.
+const paneStub = vi.hoisted(() => (cls) => ({
+  props: { open: Boolean, active: Boolean },
+  template: `<div class="${cls}" :data-open="String(open)" :data-active="String(active)" />`,
+}));
 vi.mock("./AccountSection.vue", () => ({ default: sectionStub }));
 vi.mock("./AppearanceSection.vue", () => ({ default: sectionStub }));
-vi.mock("./BehaviourSection.vue", () => ({ default: sectionStub }));
-vi.mock("./ComputeSection.vue", () => ({
-  default: { template: '<div class="compute-stub" />' },
+vi.mock("./BehaviourSection.vue", () => ({
+  default: paneStub("behaviour-stub"),
 }));
+vi.mock("./ComputeSection.vue", () => ({ default: paneStub("compute-stub") }));
 vi.mock("./LibrariesSection.vue", () => ({ default: sectionStub }));
 vi.mock("./ImportFoldersSection.vue", () => ({ default: sectionStub }));
 vi.mock("./ModelFoldersSection.vue", () => ({ default: sectionStub }));
 vi.mock("./PrivacySection.vue", () => ({ default: sectionStub }));
 vi.mock("./SharingSection.vue", () => ({ default: sectionStub }));
 vi.mock("./ScrapheapSection.vue", () => ({ default: sectionStub }));
-vi.mock("./SnapshotsSection.vue", () => ({ default: sectionStub }));
+vi.mock("./SnapshotsSection.vue", () => ({
+  default: paneStub("snapshots-stub"),
+}));
 vi.mock("./GhostsSection.vue", () => ({ default: sectionStub }));
 vi.mock("./AiToolkitSetup.vue", () => ({ default: sectionStub }));
 vi.mock("./SmartScoreSection.vue", () => ({ default: sectionStub }));
@@ -244,5 +252,98 @@ describe("UserSettingsDialog library navigation", () => {
     // One item left: a heading over it would be noise.
     expect(wrapper.findAll(".settings-nav-item")).toHaveLength(1);
     expect(wrapper.find(".settings-nav-heading").exists()).toBe(false);
+  });
+});
+
+// Every pane is mounted while the dialog is open; v-show only hides the ones
+// whose tab is not showing. A pane told `active` is the one the user can see,
+// so it may poll or make its first read; the others must be told they are not.
+describe("UserSettingsDialog tells each pane whether its tab is showing", () => {
+  const PANES = {
+    behaviour: "#settings-pane-behaviour .behaviour-stub",
+    snapshots: "#settings-pane-recovery .snapshots-stub",
+    compute: "#settings-pane-compute .compute-stub",
+  };
+
+  /** The panes whose given prop is true, by name. */
+  function panesWith(wrapper, prop, panes = PANES) {
+    return Object.entries(panes)
+      .filter(([, selector]) => {
+        const pane = wrapper.find(selector);
+        expect(pane.exists()).toBe(true);
+        return pane.attributes(`data-${prop}`) === "true";
+      })
+      .map(([name]) => name);
+  }
+
+  it("marks only the pane of the tab that is showing", async () => {
+    sessionContext.value = { scope: "ALL" };
+    const wrapper = mountDialog();
+    await nextTick();
+
+    expect(panesWith(wrapper, "open")).toEqual([
+      "behaviour",
+      "snapshots",
+      "compute",
+    ]);
+    expect(panesWith(wrapper, "active")).toEqual([]);
+
+    await wrapper.find("#settings-nav-behaviour").trigger("click");
+    expect(panesWith(wrapper, "active")).toEqual(["behaviour"]);
+
+    await wrapper.find("#settings-nav-recovery").trigger("click");
+    expect(panesWith(wrapper, "active")).toEqual(["snapshots"]);
+
+    await wrapper.find("#settings-nav-compute").trigger("click");
+    expect(panesWith(wrapper, "active")).toEqual(["compute"]);
+  });
+
+  it.each([
+    ["behaviour", "behaviour"],
+    ["recovery", "snapshots"],
+    ["compute", "compute"],
+  ])(
+    "takes the %s tab's pane out of view when the dialog closes on it",
+    async (tab, pane) => {
+      sessionContext.value = { scope: "ALL" };
+      const wrapper = mount(UserSettingsDialog, {
+        props: { open: true, initialTab: tab },
+        global: { stubs: { VIcon: true } },
+      });
+      await nextTick();
+      expect(panesWith(wrapper, "active")).toEqual([pane]);
+
+      await wrapper.setProps({ open: false });
+      expect(panesWith(wrapper, "open")).toEqual([]);
+      expect(panesWith(wrapper, "active")).toEqual([]);
+    },
+  );
+
+  it("tells the desktop Server pane apart from the Compute pane", async () => {
+    // `isDesktop` is read when the module is evaluated, so the bridge has to
+    // be in place before the import.
+    sessionContext.value = { scope: "ALL" };
+    window.pixlstashDesktop = {};
+    try {
+      vi.resetModules();
+      const { default: Desktop } = await import("./UserSettingsDialog.vue");
+      const wrapper = mount(Desktop, {
+        props: { open: true, initialTab: "backend" },
+        global: { stubs: { VIcon: true } },
+      });
+      await nextTick();
+      const panes = {
+        compute: PANES.compute,
+        backend: "#settings-pane-backend .compute-stub",
+      };
+
+      expect(panesWith(wrapper, "active", panes)).toEqual(["backend"]);
+
+      await wrapper.setProps({ open: false });
+      expect(panesWith(wrapper, "active", panes)).toEqual([]);
+    } finally {
+      delete window.pixlstashDesktop;
+      vi.resetModules();
+    }
   });
 });

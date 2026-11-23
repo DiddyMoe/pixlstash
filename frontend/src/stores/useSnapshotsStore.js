@@ -31,6 +31,10 @@ export const useSnapshotsStore = defineStore("snapshots", () => {
   const restoreDialogResources = ref(null); // null → full restore
 
   const dailySnapshotsEnabled = ref(true);
+  // True while the saved daily setting is being read. The switch is disabled
+  // meanwhile, so a toggle cannot be overwritten by the read it raced, nor
+  // rolled back to the unread default if its save fails.
+  const snapshotSettingsLoading = ref(false);
 
   // Bumped by reset(); a read still on the wire when the credential changed is
   // dropped rather than written into the next session's list.
@@ -172,6 +176,7 @@ export const useSnapshotsStore = defineStore("snapshots", () => {
   }
 
   async function fetchSnapshotSettings() {
+    snapshotSettingsLoading.value = true;
     const requestEpoch = epoch;
     try {
       const settings = await getSnapshotSettings();
@@ -180,6 +185,8 @@ export const useSnapshotsStore = defineStore("snapshots", () => {
     } catch (err) {
       // Non-fatal; leave current value as-is.
       console.warn("Failed to fetch snapshot settings:", err);
+    } finally {
+      if (requestEpoch === epoch) snapshotSettingsLoading.value = false;
     }
   }
 
@@ -200,6 +207,7 @@ export const useSnapshotsStore = defineStore("snapshots", () => {
     restoreDialogSnapshotId.value = null;
     restoreDialogResources.value = null;
     dailySnapshotsEnabled.value = true;
+    snapshotSettingsLoading.value = false;
   }
 
   const unsubscribeSessionReset = onSessionReset(reset);
@@ -226,6 +234,7 @@ export const useSnapshotsStore = defineStore("snapshots", () => {
     restoreDialogSnapshotId,
     restoreDialogResources,
     dailySnapshotsEnabled,
+    snapshotSettingsLoading,
     // actions
     fetchSnapshots,
     fetchStatus,

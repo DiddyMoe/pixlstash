@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import { nextTick } from "vue";
 
@@ -43,9 +43,9 @@ vi.mock("../../api/taggers", () => ({
 
 import BehaviourSection from "./BehaviourSection.vue";
 
-function mountPane(stubOverrides = {}) {
+function mountPane(stubOverrides = {}, props = { open: true }) {
   return mount(BehaviourSection, {
-    props: { open: true },
+    props,
     global: {
       stubs: {
         "v-dialog": {
@@ -371,5 +371,104 @@ describe("the PixlStash tagger's settings sit in the pane", () => {
     await nextTick();
 
     expect(form(w).props("modelValue")).toEqual({ threshold_offset: 0.3 });
+  });
+});
+
+// The pane re-reads `is_loaded` every five seconds. Each tick is a request, so
+// it runs only while somebody can see the result: the dialog is open, this is
+// the shown tab and the page is visible.
+describe("the loaded-state poll runs only while the pane can be seen", () => {
+  let pageState;
+  let visibilitySpy;
+  let wrapper;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    pageState = "visible";
+    visibilitySpy = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockImplementation(() => pageState);
+  });
+
+  afterEach(() => {
+    wrapper?.unmount();
+    wrapper = null;
+    visibilitySpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  async function openPane(props) {
+    const { listTaggers } = await import("../../api/taggers");
+    wrapper = mountPane({}, { open: true, ...props });
+    await vi.advanceTimersByTimeAsync(0);
+    return listTaggers;
+  }
+
+  it("does not poll while another tab is shown", async () => {
+    const listTaggers = await openPane({ active: false });
+    // The open-time read of the full list.
+    expect(listTaggers).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(listTaggers).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads on becoming the shown tab, then every five seconds until left", async () => {
+    const listTaggers = await openPane({ active: false });
+
+    await wrapper.setProps({ active: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(listTaggers).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(listTaggers).toHaveBeenCalledTimes(3);
+
+    await wrapper.setProps({ active: false });
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(listTaggers).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not read twice when the dialog opens on this tab", async () => {
+    const listTaggers = await openPane({ active: true });
+    expect(listTaggers).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(listTaggers).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(listTaggers).toHaveBeenCalledTimes(2);
+  });
+
+  it("pauses while the page is hidden and catches up when it is shown", async () => {
+    const listTaggers = await openPane({ active: true });
+
+    pageState = "hidden";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(listTaggers).toHaveBeenCalledTimes(1);
+
+    pageState = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(listTaggers).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(listTaggers).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops when the dialog closes", async () => {
+    const listTaggers = await openPane({ active: true });
+
+    // `active` stays true, so only `open` can stop it.
+    await wrapper.setProps({ open: false });
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(listTaggers).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves no poll and no listener behind once unmounted", async () => {
+    const listTaggers = await openPane({ active: true });
+
+    wrapper.unmount();
+    wrapper = null;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(listTaggers).toHaveBeenCalledTimes(1);
   });
 });

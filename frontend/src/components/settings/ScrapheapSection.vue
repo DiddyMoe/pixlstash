@@ -35,8 +35,10 @@ const props = defineProps({
 const store = useScrapheapRetentionStore();
 const userPrefsStore = useUserPrefsStore();
 
-// Vuetify dialogs stay mounted after the first open, so onMounted would only
-// ever fire once - fetch on the open transition instead (the house pattern).
+// The settings dialog unmounts its content once it has closed and mounts it
+// again on the next open with `open` already true, so this immediate watcher
+// reads once per open. Watching `open` rather than using onMounted also covers
+// a reopen during the close animation, when the content is still mounted.
 watch(
   () => props.open,
   (isOpen) => {
