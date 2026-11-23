@@ -6941,17 +6941,32 @@ lists, so polling it to light a dot costs more than the button it would save.
 
 **A reload must not move the ground.** It happens unprompted, so `loadRuns`
 restores the grid's scroll offset and keeps the picked run with its ticked
-checkpoints. A run that has *vanished* — imported from another window, or
-deleted — drops the selection instead, or the import bar would point at a run
-that is no longer there.
+checkpoints. The ticks are kept by never writing them on a reload: the store
+fills a single run's checkpoints once per run name, so a checkpoint ticked or
+unticked while a read is out stays as the reader left it. A run that has
+*vanished* — imported from another window, or deleted — drops the selection
+instead, or the import bar would point at a run that is no longer there.
 
-**And it must not land out of order.** Mount, the output-root watcher,
-`visibilitychange` and `window.focus` all start a read and none of them cancels
-the last, so two are in flight whenever one is slow. `loadRuns` therefore
-allocates a generation and captures the folder id it asks about — the request is
-made against the captured id, never a re-read of the store — and every
-completion (rows, count, error, spinner) is dropped unless its generation is
-still the newest.
+**And it must not land out of order.** A read is never cancelled, so a newer
+one supersedes one still in flight. `loadRuns` and `loadJobs` therefore
+allocate a generation, `loadRuns` captures the folder id it asks about — the
+request is made against the captured id, never a re-read of the store — and
+every completion (rows, count, error, spinner) is dropped unless its generation
+is still the newest.
+
+**Nor be asked for twice when once will do.** A tab switch fires
+`visibilitychange` and `window.focus` together, the sidebar and the grid both
+read on mount, and the 5 s live poll can tick while a slow listing is still
+out. Those readers only want the list as it is, so they pass `{ join: true }`
+and share the newest read in flight for the same folder. Every other caller
+starts its own: one that follows a change (an import, a stop, a retry, Train
+longer, a delete, a run ending, the way back from a run's page, a new output
+root) needs a read that started *after* the change, and joining one that left
+before it would show what the change replaced. That is why joining is opt-in:
+a new caller is correct unless it asks to share. A shared read that fails fails
+for every reader that joined it (through `error` / `jobsFailed`; the reads do
+not reject), and the in-flight entry is dropped when the read settles, so the
+next call asks again.
 
 **Changing the output root clears the rows, the count and the selection
 immediately**, before the new read starts. That, and not the response ordering,
@@ -6967,8 +6982,9 @@ is what must not be eroded: `GET /model-folders/{id}/runs` reads filenames and
 one `config.yaml` per run, and hashes, copies, moves and writes nothing. So the
 whole grid — names, steps, sizes, previews, what the config says the run trained
 against — is drawn for an entire output root before the user has committed to
-anything. That is also what makes reloading on every focus affordable. Do not
-add a call to `TrainingRuns` that breaks it.
+anything. That is also what makes reloading on every focus affordable, though
+not free — the `config.yaml` parse is per run, which is why the unprompted
+reloads share one read. Do not add a call to `TrainingRuns` that breaks it.
 
 **Several runs at a time**, `role="listbox"` + `aria-multiselectable`. The
 endpoint is per-run and takes `SHELF_IO_LOCK` with `blocking=False`, so a batch
@@ -7166,10 +7182,12 @@ numbered by `runName` in `utils/trainingPlan.js` when the run is started), and
 the folder's only for a run with no job; the folder name, with its uuid suffix,
 stays the key and what every API call takes. Cards sort live first,
 then newest (`modified_at`, else the job's `created_at`). The read guards
-(generation per read, ticks reconciled to what is still listed, the old root's
-rows dropped the moment the root changes) moved from the view into the store
-unchanged; the view keeps the scroll restore, the focus and visibility
-reloads, and a 5 s reload of jobs and folder while any run is live. **Nothing
+(generation per read, the shared read for callers that pass `join`, ticks
+reconciled to what is still listed, the old root's rows dropped the moment the
+root changes) live in the store; the view keeps the scroll restore and the
+reloads, and chooses which join: mount, the focus and visibility reloads and
+the 5 s reload of jobs and folder while any run is live do; the rest do not.
+**Nothing
 is importable until the job list has been read**: until then, or when it
 fails, a run still training reads as finished, and importing it from a folder
 set to delete what it imports would remove the folder under the trainer. The store is reset on a session change

@@ -91,7 +91,7 @@
     <p v-if="jobsFailed" class="tr-note" role="alert">
       Could not read which runs are training, so nothing can be imported until
       it can.
-      <AppButton size="sm" variant="secondary" @click="reload">Retry</AppButton>
+      <AppButton size="sm" variant="secondary" @click="reload()">Retry</AppButton>
     </p>
 
     <div
@@ -397,7 +397,7 @@
         :job-id="longerCard.job.id"
         :title="`Train ${longerCard.name} longer`"
         @close="longerOpen = false"
-        @started="reload"
+        @started="reload()"
       />
     </v-menu>
 
@@ -656,7 +656,8 @@
 // and changes nothing, so the whole grid - names, steps, sizes, previews, what
 // the config says it trained against - is drawn before the user commits to any
 // of it. Nothing here hashes, copies or writes until Import is pressed. That is
-// also what makes reloading free enough to do on every focus.
+// also what makes reloading safe to do on every focus; it is not free (each
+// run's config is parsed), so the unprompted reloads share one read.
 
 import {
   computed,
@@ -1213,18 +1214,22 @@ function onGridKeydown(event) {
  * A reload fires on its own whenever the tab regains focus, so it must not
  * move the page under someone who is mid-decision: the scroll offset is
  * restored here, and the store keeps every still-present tick.
+ *
+ * @param {{join?: boolean}} [options] - passed to the store: `join` shares a
+ *   read already in flight. Only for a caller that wants the list as it is;
+ *   one that follows a change (an import, a run ending, the run page) omits it.
  */
-async function loadRuns() {
+async function loadRuns(options) {
   const scrollTop = gridEl.value?.scrollTop ?? 0;
-  await runsStore.loadRuns();
+  await runsStore.loadRuns(options);
   cursor.value = Math.min(cursor.value, Math.max(cards.value.length - 1, 0));
   await nextTick();
   if (gridEl.value) gridEl.value.scrollTop = scrollTop;
 }
 
 /** The button and the auto-reload read the same; only the button shows it. */
-function reload() {
-  return Promise.all([loadRuns(), runsStore.loadJobs()]);
+function reload(options) {
+  return Promise.all([loadRuns(options), runsStore.loadJobs(options)]);
 }
 
 /** Only the button's own reload shows on the button. */
@@ -1242,13 +1247,14 @@ async function reloadByHand() {
  * Reload when the tab is looked at again.
  *
  * `visibilitychange` covers switching tabs and un-minimising; `focus` covers
- * moving between windows on one desktop, which fires no visibility change. Both
- * are cheap here because the listing walks a directory and reads nothing else,
- * and neither runs while the tab is hidden, which is what a polling timer could
- * not promise.
+ * moving between windows on one desktop, which fires no visibility change.
+ * Neither runs while the tab is hidden, which is what a polling timer could
+ * not promise. A tab switch fires both at once, and the listing parses each
+ * run's config, so both join the read already in flight rather than each
+ * starting one.
  */
 function onVisible() {
-  if (document.visibilityState === "visible") reload();
+  if (document.visibilityState === "visible") reload({ join: true });
 }
 
 /**
@@ -1275,15 +1281,18 @@ watch(
   { immediate: true },
 );
 
-// Back from a run page: what it trained may have landed meanwhile.
+// Back from a run page: what it trained may have landed meanwhile, and it may
+// have stopped a job or queued one, so this read must start after the page
+// closed rather than join one the live poll started under it.
 watch([openUuid, openFolderRun], ([uuid, name]) => {
   if (!uuid && !name) reload();
 });
 
 // While a run trains its card follows it: the job's step for the bar, the
-// folder for its samples and checkpoints (the listing costs nothing). A run
-// leaving the live set has written its last checkpoint, so the folder is read
-// again.
+// folder for its samples and checkpoints. The poll joins a read already out,
+// so a slow listing is not asked for again before it answers. A run leaving
+// the live set has written its last checkpoint, so the folder is read again,
+// in a read of its own: one already out may have started before that write.
 let liveTimer = null;
 watch(
   () => runsStore.liveCount,
@@ -1292,7 +1301,7 @@ watch(
     liveTimer = null;
     if (n > 0) {
       liveTimer = setInterval(() => {
-        if (document.visibilityState === "visible") reload();
+        if (document.visibilityState === "visible") reload({ join: true });
       }, LIVE_POLL_MS);
     }
     if (before != null && n < before) loadRuns();
@@ -1302,8 +1311,8 @@ watch(
 
 onMounted(() => {
   if (!folders.loaded) folders.refresh();
-  loadRuns();
-  runsStore.loadJobs();
+  // Joins the read the sidebar may have started a moment ago.
+  reload({ join: true });
   document.addEventListener("visibilitychange", onVisible);
   window.addEventListener("focus", onVisible);
 });
