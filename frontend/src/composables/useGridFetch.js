@@ -1,5 +1,5 @@
-import { ref, computed, nextTick } from "vue";
-import { isReadOnly } from "../utils/apiClient";
+import { ref, computed, nextTick, onScopeDispose } from "vue";
+import { isReadOnly, onSessionReset } from "../utils/apiClient";
 import {
   getPictureCount,
   streamPictures,
@@ -261,6 +261,12 @@ export function useGridFetch(
         : null,
       // Narrowing to text matches changes which pictures the grid shows.
       textMatchesOnly: searchStore.textMatchesOnly === true,
+      // The queries the reads send. A filter or derived parameter that changes
+      // a request changes the key, including one added to a builder later, so
+      // two loads with the same key ask the server for the same rows.
+      stream: buildStreamSelectionSuffix(),
+      ids: buildPictureIdsQueryParams(),
+      likeness: buildLikenessGroupQueryParams(),
     });
   }
 
@@ -635,10 +641,350 @@ export function useGridFetch(
     return params.toString();
   }
 
+  // The selection, sort, media-type and filter part of the stream and count
+  // queries. Both reads use it, so the count covers exactly the rows the
+  // stream returns.
+  function buildStreamSelectionSuffix() {
+    const _charIds = normalizedSelectedCharacterIds.value;
+    const _selChar = selectionStore.selectedCharacter;
+    // Pass sort/descending to both the stream and the count URLs.  The sort
+    // is not always count-neutral: CHARACTER_LIKENESS joins through Face and
+    // changes the row set, so the count must run over the same query as the
+    // stream or the placeholder grid ends up larger than the stream can fill.
+    const _sort = sortStore.selectedSort?.trim();
+    const _desc =
+      typeof sortStore.selectedDescending === "boolean"
+        ? sortStore.selectedDescending
+        : true;
+    // For CHARACTER_LIKENESS the backend also needs reference_character_id in
+    // both the stream and count URLs - the reference determines the row set.
+    const _refCharSuffix =
+      _sort === "CHARACTER_LIKENESS" &&
+      sortStore.selectedSimilarityCharacter
+        ? `&reference_character_id=${encodeURIComponent(sortStore.selectedSimilarityCharacter)}`
+        : "";
+    const _sortSuffix = _sort
+      ? `&sort=${encodeURIComponent(_sort)}&descending=${_desc}${_refCharSuffix}`
+      : "";
+    // Build character/set + project filter params for count and stream URLs.
+    const _charP = new URLSearchParams();
+    if (hasSetSelection.value) {
+      // Set view - mirrors _appendSelectionParams set branch.
+      if (isSetOverlapView.value) {
+        for (const setId of normalizedSelectedSetIds.value) {
+          _charP.append("set_ids", String(setId));
+        }
+        _charP.set(
+          "set_mode",
+          selectionStore.setMultiMode ?? "intersection",
+        );
+        if (
+          selectionStore.setMultiMode === "difference" &&
+          selectionStore.setDifferenceBaseId != null
+        ) {
+          _charP.set(
+            "base_set_id",
+            String(selectionStore.setDifferenceBaseId),
+          );
+        }
+        if (projectStore.projectViewMode === "project") {
+          const _pidSet = new Set(
+            normalizedSelectedSetIds.value.map(
+              (id) => projectStore.setProjectIds?.[id] ?? null,
+            ),
+          );
+          if (_pidSet.size === 1) {
+            const _pid = [..._pidSet][0];
+            _charP.set(
+              "project_id",
+              _pid != null ? String(_pid) : "UNASSIGNED",
+            );
+          }
+        }
+      } else if (primarySelectedSetId.value != null) {
+        _charP.set("set_id", String(primarySelectedSetId.value));
+        if (projectStore.projectViewMode === "project") {
+          _charP.set(
+            "project_id",
+            projectStore.selectedProjectId != null
+              ? String(projectStore.selectedProjectId)
+              : "UNASSIGNED",
+          );
+        }
+      }
+    } else if (_charIds.length > 1) {
+      for (const id of _charIds) _charP.append("character_ids", String(id));
+      _charP.set(
+        "character_mode",
+        selectionStore.characterMultiMode ?? "union",
+      );
+      // Only apply project filter when all selected characters share the same project.
+      if (projectStore.projectViewMode === "project") {
+        const _pidSet = new Set(
+          _charIds.map(
+            (id) => projectStore.characterProjectIds?.[id] ?? null,
+          ),
+        );
+        if (_pidSet.size === 1) {
+          const _pid = [..._pidSet][0];
+          _charP.set(
+            "project_id",
+            _pid != null ? String(_pid) : "UNASSIGNED",
+          );
+        }
+      }
+    } else if (_selChar === String(SCRAPHEAP_PICTURES_ID)) {
+      _charP.set("only_deleted", "true");
+    } else if (
+      _selChar != null &&
+      _selChar !== "" &&
+      _selChar !== ALL_PICTURES_ID
+    ) {
+      _charP.set("character_id", String(_selChar));
+      _appendFaceClusterParams(_charP);
+      if (projectStore.projectViewMode === "project") {
+        _charP.set(
+          "project_id",
+          projectStore.selectedProjectId != null
+            ? String(projectStore.selectedProjectId)
+            : "UNASSIGNED",
+        );
+      }
+    } else if (
+      _selChar === ALL_PICTURES_ID &&
+      _unassignedFilterOn()
+    ) {
+      _setUnassignedParams(_charP);
+      if (projectStore.projectViewMode === "project") {
+        _charP.set(
+          "project_id",
+          projectStore.selectedProjectId != null
+            ? String(projectStore.selectedProjectId)
+            : "UNASSIGNED",
+        );
+      }
+    } else if (projectStore.projectViewMode === "project") {
+      _charP.set(
+        "project_id",
+        projectStore.selectedProjectId != null
+          ? String(projectStore.selectedProjectId)
+          : "UNASSIGNED",
+      );
+    }
+    if (referenceFolderIdFilter.value != null) {
+      _charP.set(
+        "reference_folder_id",
+        String(referenceFolderIdFilter.value),
+      );
+    }
+    if (importSourceFolderFilter.value != null) {
+      _charP.set(
+        "import_source_folder",
+        String(importSourceFolderFilter.value),
+      );
+    }
+    if (inboxPeriod.value) _charP.set("inbox", inboxPeriod.value);
+    // Filter params
+    if (filePathPrefixFilter.value != null) {
+      _charP.set("file_path_prefix", String(filePathPrefixFilter.value));
+    }
+    const _charSuffix = _charP.size ? `&${_charP.toString()}` : "";
+    // Build media type format filter params for count and stream URLs.
+    const _formatP = new URLSearchParams();
+    _appendMediaTypeParams(_formatP);
+    const _formatSuffix = _formatP.size ? `&${_formatP.toString()}` : "";
+    // Build filter-menu params for count and stream URLs.
+    // Each labelled block corresponds to a separate commit - remove any single
+    // block to bisect a regression.
+    const _filterP = new URLSearchParams();
+    // Filter params: score range
+    if (filterStore.minScoreFilter != null)
+      _filterP.set("min_score", String(filterStore.minScoreFilter));
+    if (filterStore.maxScoreFilter != null)
+      _filterP.set("max_score", String(filterStore.maxScoreFilter));
+    if (filterStore.unscoredOnlyFilter) _filterP.set("unscored", "1");
+    if (filterStore.favouriteOnlyFilter) _filterP.set("favourite", "1");
+    // Filter params: smart score bucket
+    if (filterStore.smartScoreBucketFilter != null)
+      _filterP.set(
+        "smart_score_bucket",
+        String(filterStore.smartScoreBucketFilter),
+      );
+    // Filter params: resolution bucket
+    if (filterStore.resolutionBucketFilter != null)
+      _filterP.set(
+        "resolution_bucket",
+        String(filterStore.resolutionBucketFilter),
+      );
+    // Filter params: ComfyUI model / LoRA
+    (filterStore.comfyuiModelFilter || []).forEach((m) =>
+      _filterP.append("comfyui_model", m),
+    );
+    (filterStore.comfyuiLoraFilter || []).forEach((l) =>
+      _filterP.append("comfyui_lora", l),
+    );
+    // Filter params: the ticked workflows' pictures (F7, #1797)
+    workflowFilterParams(filterStore.workflowFilter).forEach(
+      ([name, value]) => _filterP.append(name, value),
+    );
+    // Filter params: tag filters
+    (filterStore.tagFilter || []).forEach((t) => _filterP.append("tag", t));
+    (filterStore.tagRejectedFilter || []).forEach((t) =>
+      _filterP.append("rejected_tag", t),
+    );
+    (filterStore.tagConfidenceAboveFilter || []).forEach((e) =>
+      _filterP.append("tag_confidence_above", e),
+    );
+    (filterStore.tagConfidenceBelowFilter || []).forEach((e) =>
+      _filterP.append("tag_confidence_below", e),
+    );
+    // Filter params: face bbox filter
+    if (filterStore.faceBboxFilter != null)
+      _filterP.set("face_filter", String(filterStore.faceBboxFilter));
+    // Filter params: impossible-tag sources (repeatable, OR'd)
+    (filterStore.impossibleSources || []).forEach((s) =>
+      _filterP.append("impossible_tag_source", s),
+    );
+    // Filter params: stack state. "all" is the absence of the filter, so it
+    // is expressed by omission rather than by a sentinel the backend would
+    // have to know a second spelling for. This is the default grid path;
+    // the search and likeness-group builders carry the same param, and
+    // leaving it out here was why moving the Stacks segments did nothing.
+    if (
+      filterStore.stackStateFilter &&
+      filterStore.stackStateFilter !== "all"
+    )
+      _filterP.set("stack_state", String(filterStore.stackStateFilter));
+    // Filter params: shared only
+    if (filterStore.sharedOnlyFilter) _filterP.set("shared_only", "true");
+    // Filter params: hidden-tag filter
+    if (userPrefsStore.applyTagFilter)
+      _filterP.set("apply_tag_filter", "true");
+    const _filterSuffix = _filterP.size ? `&${_filterP.toString()}` : "";
+    return `${_charSuffix}${_sortSuffix}${_formatSuffix}${_filterSuffix}`;
+  }
+
   // ============================================================
   // GRID FETCH
   // ============================================================
+  // The load that owns the grid right now: its fetch key, the controller that
+  // cancels its reads, and its promise. Null when no load is running.
+  let inFlight = null;
+
+  // Cancel the running load and move the epoch on, so nothing it still has in
+  // flight can write into the grid or finalize a newer load's state.
+  function cancelGridLoad() {
+    const current = inFlight;
+    inFlight = null;
+    gridLoadEpoch.value += 1;
+    current?.controller.abort();
+  }
+
+  // A credential change: the previous principal's load must never land, and
+  // its completion records must not debounce the first read of the next one.
+  function resetGridLoadForSession() {
+    cancelGridLoad();
+    lastFetchKey.value = "";
+    lastFetchSuccess.value = { key: "", at: 0 };
+    lastFetchError.value = { key: "", at: 0 };
+    imagesLoading.value = false;
+    gridReady.value = true;
+  }
+
+  const unsubscribeSessionReset = onSessionReset(resetGridLoadForSession);
+  onScopeDispose(() => {
+    unsubscribeSessionReset();
+    cancelGridLoad();
+  });
+
+  /**
+   * Load the grid for the current view.
+   *
+   * At most one load runs at a time. A call for the view that is already
+   * loading waits for it and then re-reads once, however many such calls
+   * arrived meanwhile, because the data may have changed under the running
+   * read. A call that passes `join: true` (it only needs the view loaded, not
+   * re-read) shares the running load instead, and is skipped if the same view
+   * finished loading moments ago. A call for a different view cancels the
+   * running load.
+   */
   async function fetchAllGridImages(options = {}) {
+    const force = options?.force === true;
+    const join = options?.join === true;
+    // Capture scroll-preservation intent *synchronously* before any await so
+    // that it is not affected by the gridVersion watcher clearing it later.
+    const fetchStartedWithPreserveScroll = preserveScrollOnNextFetch.value;
+    if (
+      fetchStartedWithPreserveScroll &&
+      pendingScrollTop.value === null &&
+      scrollWrapper.value
+    ) {
+      pendingScrollTop.value = scrollWrapper.value.scrollTop;
+    }
+    const fetchKey = buildGridFetchKey();
+    const current = inFlight;
+    if (current && current.key === fetchKey) {
+      if (!force && join) return current.promise;
+      const runTrailing = () =>
+        runTrailingLoad(current, options, fetchStartedWithPreserveScroll);
+      return current.promise.then(runTrailing, runTrailing);
+    }
+    const now = Date.now();
+    if (
+      !force &&
+      join &&
+      lastFetchSuccess.value.key === fetchKey &&
+      now - lastFetchSuccess.value.at < 1200
+    ) {
+      return undefined;
+    }
+    if (
+      !force &&
+      join &&
+      lastFetchError.value.key === fetchKey &&
+      now - lastFetchError.value.at < 2500
+    ) {
+      return undefined;
+    }
+    return beginGridLoad(fetchKey, options, fetchStartedWithPreserveScroll);
+  }
+
+  // The forced re-read behind `previous`, run once it settles. Every call for
+  // its view that arrived while it ran and did not join lands here: the first
+  // starts the re-read and the rest join it. Nothing runs once the view has
+  // moved on or a session reset cancelled `previous`.
+  function runTrailingLoad(previous, options, fetchStartedWithPreserveScroll) {
+    if (previous.controller.signal.aborted) return undefined;
+    if (buildGridFetchKey() !== previous.key) return undefined;
+    if (inFlight?.key === previous.key) return inFlight.promise;
+    return beginGridLoad(
+      previous.key,
+      { ...options, force: true },
+      fetchStartedWithPreserveScroll,
+    );
+  }
+
+  function beginGridLoad(fetchKey, options, fetchStartedWithPreserveScroll) {
+    inFlight?.controller.abort();
+    const record = {
+      key: fetchKey,
+      controller: new AbortController(),
+      promise: null,
+    };
+    inFlight = record;
+    record.promise = runGridLoad(
+      record,
+      options,
+      fetchStartedWithPreserveScroll,
+    ).finally(() => {
+      if (inFlight === record) inFlight = null;
+    });
+    return record.promise;
+  }
+
+  async function runGridLoad(record, options, fetchStartedWithPreserveScroll) {
+    const { key: fetchKey } = record;
+    const { signal } = record.controller;
     const force = options?.force === true;
     const activeSortKey = getActiveSortKey();
     const isSortedFetch = !!activeSortKey;
@@ -661,44 +1007,11 @@ export function useGridFetch(
       backgroundBatchCount: 0,
       postProcessMs: null,
     };
-    // Capture scroll-preservation intent *synchronously* before any await so
-    // that it is not affected by the gridVersion watcher clearing it later.
-    const fetchStartedWithPreserveScroll = preserveScrollOnNextFetch.value;
-    if (
-      fetchStartedWithPreserveScroll &&
-      pendingScrollTop.value === null &&
-      scrollWrapper.value
-    ) {
-      pendingScrollTop.value = scrollWrapper.value.scrollTop;
-    }
-    const fetchKey = buildGridFetchKey();
-    const now = Date.now();
-    if (!force && imagesLoading.value && lastFetchKey.value === fetchKey) {
-      const lastActivity = Math.max(
-        lastFetchSuccess.value.at || 0,
-        lastFetchError.value.at || 0,
-      );
-      if (now - lastActivity < 2500) {
-        return;
-      }
-      imagesLoading.value = false;
-    }
-    if (
-      !force &&
-      lastFetchSuccess.value.key === fetchKey &&
-      now - lastFetchSuccess.value.at < 1200
-    ) {
-      return;
-    }
-    if (
-      !force &&
-      lastFetchError.value.key === fetchKey &&
-      now - lastFetchError.value.at < 2500
-    ) {
-      return;
-    }
     lastFetchKey.value = fetchKey;
     const loadId = (gridLoadEpoch.value += 1);
+    // False once a newer load, a session reset or teardown has taken the grid:
+    // from then on this load must not write rows or state.
+    const isCurrent = () => loadId === gridLoadEpoch.value;
     if (typeof onGridFetchStart === "function") {
       onGridFetchStart({
         loadId,
@@ -718,8 +1031,6 @@ export function useGridFetch(
       sortedFetchStartedAt = getNowMs();
       startSmartScoreProgress(loadId, activeSortKey);
     }
-    const requestId = Date.now();
-    fetchAllGridImages.lastRequestId = requestId;
     // A suggestion search's ranked list and its picture rows, cached in
     // `cache` against the subject `id` (under `key`) so neither slider costs a
     // round trip; only a new subject or a force refetches. Null when a newer
@@ -730,20 +1041,20 @@ export function useGridFetch(
         return cached.matches;
       let raw;
       try {
-        raw = await search(id);
+        raw = await search(id, { signal });
       } catch (error) {
         error.gridFetchPhase = phase;
         throw error;
       }
-      if (fetchAllGridImages.lastRequestId !== requestId) return null;
+      if (!isCurrent()) return null;
       const ranked = Array.isArray(raw) ? raw : [];
       const rowsById = {};
       if (ranked.length) {
         const rows = await listPicturesByIds(
           ranked.map((r) => r.picture_id),
-          { fields: "grid" },
+          { fields: "grid", signal },
         );
-        if (fetchAllGridImages.lastRequestId !== requestId) return null;
+        if (!isCurrent()) return null;
         for (const pic of Array.isArray(rows) ? rows : []) {
           rowsById[pic.id] = pic;
         }
@@ -779,8 +1090,10 @@ export function useGridFetch(
         fetchMode = "likeness-groups";
         const threshold = getStackThreshold(sortStore.stackThreshold);
         const likenessGroupParams = buildLikenessGroupQueryParams();
-        const data = await getLikenessGroups(threshold, likenessGroupParams);
-        if (fetchAllGridImages.lastRequestId !== requestId) {
+        const data = await getLikenessGroups(threshold, likenessGroupParams, {
+          signal,
+        });
+        if (!isCurrent()) {
           if (isSortedFetch && options?.showProgress === true)
             completeSmartScoreProgress(loadId, 0, false);
           return;
@@ -864,6 +1177,9 @@ export function useGridFetch(
             cohesion != null
               ? Math.floor(cohesion * 100) / 100
               : SET_SUGGEST_FALLBACK_THRESHOLD;
+          // The seat is part of this view's key: re-key the running load so
+          // a call that queued on it still gets its re-read.
+          record.key = buildGridFetchKey();
         }
         const rowsById = setSuggestRanked?.value?.rowsById ?? {};
         images = cutSetSuggestions(
@@ -877,7 +1193,7 @@ export function useGridFetch(
         fetchMode = "face-likeness-search";
         // Face likeness search: POST to face-search with source_face_id.
         const queryFaceId = faceLikenessSearchFaceId.value;
-        const faceResultsRaw = await faceSearch(queryFaceId);
+        const faceResultsRaw = await faceSearch(queryFaceId, { signal });
         const faceResults = Array.isArray(faceResultsRaw) ? faceResultsRaw : [];
         if (!faceResults.length) {
           images = [];
@@ -885,6 +1201,7 @@ export function useGridFetch(
           const idOrder = faceResults.map((r) => r.picture_id);
           const rows = await listPicturesByIds(idOrder, {
             fields: "grid",
+            signal,
           });
           const picturesById = {};
           for (const pic of Array.isArray(rows) ? rows : []) {
@@ -897,7 +1214,7 @@ export function useGridFetch(
         // Reverse image search: POST to likeness-search with stored CLIP embeddings.
         // Multiple IDs are combined with min similarity (must match all sources).
         const queryPicIds = reverseImageSearchPictureIds.value;
-        const likenessRaw = await likenessSearch(queryPicIds);
+        const likenessRaw = await likenessSearch(queryPicIds, { signal });
         const likenessResults = Array.isArray(likenessRaw) ? likenessRaw : [];
         if (!likenessResults.length) {
           images = [];
@@ -905,6 +1222,7 @@ export function useGridFetch(
           const idOrder = likenessResults.map((r) => r.picture_id);
           const rows = await listPicturesByIds(idOrder, {
             fields: "grid",
+            signal,
           });
           const picturesById = {};
           for (const pic of Array.isArray(rows) ? rows : []) {
@@ -927,12 +1245,12 @@ export function useGridFetch(
             ? cached.rows
             : null;
         if (!rows) {
-          const body = await searchPictures(searchText, { query: params });
+          const body = await searchPictures(searchText, {
+            query: params,
+            signal,
+          });
           rows = Array.isArray(body) ? body : [];
-          if (
-            textSearchResults &&
-            fetchAllGridImages.lastRequestId === requestId
-          ) {
+          if (textSearchResults && isCurrent()) {
             textSearchResults.value = { key: cacheKey, query: searchText, rows };
           }
         }
@@ -962,8 +1280,7 @@ export function useGridFetch(
         //   2. Pre-build placeholder grid so END key works before streaming starts
         //   3. First batch (visible area) + last batch (END cells) in parallel
         //   4. Background stream fills the middle at BG_BATCH rows per request
-        const _charIds = normalizedSelectedCharacterIds.value;
-        const _selChar = selectionStore.selectedCharacter;
+        const streamSelection = buildStreamSelectionSuffix();
         if (isSortedFetch && options?.showProgress === true) {
           completeSmartScoreProgress(loadId, 0, true);
         }
@@ -991,221 +1308,7 @@ export function useGridFetch(
             : 0;
         const FIRST_BATCH = Math.max(200, _fbVisibleItems + _fbCols * 2);
         const LAST_BATCH = Math.max(200, _fbVisibleItems + _fbCols * 2);
-        // Pass sort/descending to both the stream and the count URLs.  The sort
-        // is not always count-neutral: CHARACTER_LIKENESS joins through Face and
-        // changes the row set, so the count must run over the same query as the
-        // stream or the placeholder grid ends up larger than the stream can fill.
-        const _sort = sortStore.selectedSort?.trim();
-        const _desc =
-          typeof sortStore.selectedDescending === "boolean"
-            ? sortStore.selectedDescending
-            : true;
-        // For CHARACTER_LIKENESS the backend also needs reference_character_id in
-        // both the stream and count URLs - the reference determines the row set.
-        const _refCharSuffix =
-          _sort === "CHARACTER_LIKENESS" &&
-          sortStore.selectedSimilarityCharacter
-            ? `&reference_character_id=${encodeURIComponent(sortStore.selectedSimilarityCharacter)}`
-            : "";
-        const _sortSuffix = _sort
-          ? `&sort=${encodeURIComponent(_sort)}&descending=${_desc}${_refCharSuffix}`
-          : "";
-        // Build character/set + project filter params for count and stream URLs.
-        const _charP = new URLSearchParams();
-        if (hasSetSelection.value) {
-          // Set view - mirrors _appendSelectionParams set branch.
-          if (isSetOverlapView.value) {
-            for (const setId of normalizedSelectedSetIds.value) {
-              _charP.append("set_ids", String(setId));
-            }
-            _charP.set(
-              "set_mode",
-              selectionStore.setMultiMode ?? "intersection",
-            );
-            if (
-              selectionStore.setMultiMode === "difference" &&
-              selectionStore.setDifferenceBaseId != null
-            ) {
-              _charP.set(
-                "base_set_id",
-                String(selectionStore.setDifferenceBaseId),
-              );
-            }
-            if (projectStore.projectViewMode === "project") {
-              const _pidSet = new Set(
-                normalizedSelectedSetIds.value.map(
-                  (id) => projectStore.setProjectIds?.[id] ?? null,
-                ),
-              );
-              if (_pidSet.size === 1) {
-                const _pid = [..._pidSet][0];
-                _charP.set(
-                  "project_id",
-                  _pid != null ? String(_pid) : "UNASSIGNED",
-                );
-              }
-            }
-          } else if (primarySelectedSetId.value != null) {
-            _charP.set("set_id", String(primarySelectedSetId.value));
-            if (projectStore.projectViewMode === "project") {
-              _charP.set(
-                "project_id",
-                projectStore.selectedProjectId != null
-                  ? String(projectStore.selectedProjectId)
-                  : "UNASSIGNED",
-              );
-            }
-          }
-        } else if (_charIds.length > 1) {
-          for (const id of _charIds) _charP.append("character_ids", String(id));
-          _charP.set(
-            "character_mode",
-            selectionStore.characterMultiMode ?? "union",
-          );
-          // Only apply project filter when all selected characters share the same project.
-          if (projectStore.projectViewMode === "project") {
-            const _pidSet = new Set(
-              _charIds.map(
-                (id) => projectStore.characterProjectIds?.[id] ?? null,
-              ),
-            );
-            if (_pidSet.size === 1) {
-              const _pid = [..._pidSet][0];
-              _charP.set(
-                "project_id",
-                _pid != null ? String(_pid) : "UNASSIGNED",
-              );
-            }
-          }
-        } else if (_selChar === String(SCRAPHEAP_PICTURES_ID)) {
-          _charP.set("only_deleted", "true");
-        } else if (
-          _selChar != null &&
-          _selChar !== "" &&
-          _selChar !== ALL_PICTURES_ID
-        ) {
-          _charP.set("character_id", String(_selChar));
-          _appendFaceClusterParams(_charP);
-          if (projectStore.projectViewMode === "project") {
-            _charP.set(
-              "project_id",
-              projectStore.selectedProjectId != null
-                ? String(projectStore.selectedProjectId)
-                : "UNASSIGNED",
-            );
-          }
-        } else if (
-          _selChar === ALL_PICTURES_ID &&
-          _unassignedFilterOn()
-        ) {
-          _setUnassignedParams(_charP);
-          if (projectStore.projectViewMode === "project") {
-            _charP.set(
-              "project_id",
-              projectStore.selectedProjectId != null
-                ? String(projectStore.selectedProjectId)
-                : "UNASSIGNED",
-            );
-          }
-        } else if (projectStore.projectViewMode === "project") {
-          _charP.set(
-            "project_id",
-            projectStore.selectedProjectId != null
-              ? String(projectStore.selectedProjectId)
-              : "UNASSIGNED",
-          );
-        }
-        if (referenceFolderIdFilter.value != null) {
-          _charP.set(
-            "reference_folder_id",
-            String(referenceFolderIdFilter.value),
-          );
-        }
-        if (importSourceFolderFilter.value != null) {
-          _charP.set(
-            "import_source_folder",
-            String(importSourceFolderFilter.value),
-          );
-        }
-        if (inboxPeriod.value) _charP.set("inbox", inboxPeriod.value);
-        // Filter params
-        if (filePathPrefixFilter.value != null) {
-          _charP.set("file_path_prefix", String(filePathPrefixFilter.value));
-        }
-        const _charSuffix = _charP.size ? `&${_charP.toString()}` : "";
-        // Build media type format filter params for count and stream URLs.
-        const _formatP = new URLSearchParams();
-        _appendMediaTypeParams(_formatP);
-        const _formatSuffix = _formatP.size ? `&${_formatP.toString()}` : "";
-        // Build filter-menu params for count and stream URLs.
-        // Each labelled block corresponds to a separate commit - remove any single
-        // block to bisect a regression.
-        const _filterP = new URLSearchParams();
-        // Filter params: score range
-        if (filterStore.minScoreFilter != null)
-          _filterP.set("min_score", String(filterStore.minScoreFilter));
-        if (filterStore.maxScoreFilter != null)
-          _filterP.set("max_score", String(filterStore.maxScoreFilter));
-        if (filterStore.unscoredOnlyFilter) _filterP.set("unscored", "1");
-        if (filterStore.favouriteOnlyFilter) _filterP.set("favourite", "1");
-        // Filter params: smart score bucket
-        if (filterStore.smartScoreBucketFilter != null)
-          _filterP.set(
-            "smart_score_bucket",
-            String(filterStore.smartScoreBucketFilter),
-          );
-        // Filter params: resolution bucket
-        if (filterStore.resolutionBucketFilter != null)
-          _filterP.set(
-            "resolution_bucket",
-            String(filterStore.resolutionBucketFilter),
-          );
-        // Filter params: ComfyUI model / LoRA
-        (filterStore.comfyuiModelFilter || []).forEach((m) =>
-          _filterP.append("comfyui_model", m),
-        );
-        (filterStore.comfyuiLoraFilter || []).forEach((l) =>
-          _filterP.append("comfyui_lora", l),
-        );
-        // Filter params: the ticked workflows' pictures (F7, #1797)
-        workflowFilterParams(filterStore.workflowFilter).forEach(
-          ([name, value]) => _filterP.append(name, value),
-        );
-        // Filter params: tag filters
-        (filterStore.tagFilter || []).forEach((t) => _filterP.append("tag", t));
-        (filterStore.tagRejectedFilter || []).forEach((t) =>
-          _filterP.append("rejected_tag", t),
-        );
-        (filterStore.tagConfidenceAboveFilter || []).forEach((e) =>
-          _filterP.append("tag_confidence_above", e),
-        );
-        (filterStore.tagConfidenceBelowFilter || []).forEach((e) =>
-          _filterP.append("tag_confidence_below", e),
-        );
-        // Filter params: face bbox filter
-        if (filterStore.faceBboxFilter != null)
-          _filterP.set("face_filter", String(filterStore.faceBboxFilter));
-        // Filter params: impossible-tag sources (repeatable, OR'd)
-        (filterStore.impossibleSources || []).forEach((s) =>
-          _filterP.append("impossible_tag_source", s),
-        );
-        // Filter params: stack state. "all" is the absence of the filter, so it
-        // is expressed by omission rather than by a sentinel the backend would
-        // have to know a second spelling for. This is the default grid path;
-        // the search and likeness-group builders carry the same param, and
-        // leaving it out here was why moving the Stacks segments did nothing.
-        if (
-          filterStore.stackStateFilter &&
-          filterStore.stackStateFilter !== "all"
-        )
-          _filterP.set("stack_state", String(filterStore.stackStateFilter));
-        // Filter params: shared only
-        if (filterStore.sharedOnlyFilter) _filterP.set("shared_only", "true");
-        // Filter params: hidden-tag filter
-        if (userPrefsStore.applyTagFilter)
-          _filterP.set("apply_tag_filter", "true");
-        const _filterSuffix = _filterP.size ? `&${_filterP.toString()}` : "";
-        const streamQuery = `fields=grid&grid_lite=true&stack_leaders_only=true${_charSuffix}${_sortSuffix}${_formatSuffix}${_filterSuffix}`;
+        const streamQuery = `fields=grid&grid_lite=true&stack_leaders_only=true${streamSelection}`;
 
         // Wraps a resource-module call (which resolves to the response BODY,
         // not the Axios envelope) so the grid can report per-batch timings.
@@ -1251,9 +1354,10 @@ export function useGridFetch(
         // 1. Fast total count - single indexed SQL query.
         const countStartedAt = getNowMs();
         const countBody = await getPictureCount(
-          `stack_leaders_only=true${_charSuffix}${_sortSuffix}${_formatSuffix}${_filterSuffix}`,
+          `stack_leaders_only=true${streamSelection}`,
+          { signal },
         );
-        if (fetchAllGridImages.lastRequestId !== requestId) return;
+        if (!isCurrent()) return;
         fetchPhaseTimings.countMs = Math.max(0, getNowMs() - countStartedAt);
         const total =
           typeof countBody?.count === "number" ? countBody.count : 0;
@@ -1344,24 +1448,30 @@ export function useGridFetch(
           streamPictures(streamQuery, {
             offset: 0,
             batchLimit: FIRST_BATCH,
+            signal,
           }),
         );
         // Tail batch: for collections where the gap exceeds TAIL_THRESHOLD.
-        // `.catch` keeps it from becoming an unhandled rejection if we bail out
-        // (stale requestId) before awaiting it below.
+        // Settled into an outcome so it is never an unhandled rejection when
+        // this load stops before awaiting it below (the first batch failed, or
+        // a newer load took the grid). A failure is rethrown there.
         const tailReqPromise = (
           shouldFetchTailEarly
             ? timeRequest(
                 streamPictures(streamQuery, {
                   offset: potentialLastBatchStart,
                   batchLimit: LAST_BATCH,
+                  signal,
                 }),
               )
             : Promise.resolve(null)
-        ).catch(() => null);
+        ).then(
+          (result) => ({ result }),
+          (error) => ({ error }),
+        );
 
         const firstResTimed = await firstReqPromise;
-        if (fetchAllGridImages.lastRequestId !== requestId) return;
+        if (!isCurrent()) return;
         fetchPhaseTimings.firstBatchMs = firstResTimed?.elapsedMs ?? null;
 
         const firstPics = firstResTimed?.body?.pictures ?? [];
@@ -1381,7 +1491,7 @@ export function useGridFetch(
         if (prefetchEnd > visibleEnd.value) {
           const marginStart = visibleEnd.value;
           requestAnimationFrame(() => {
-            if (fetchAllGridImages.lastRequestId !== requestId) return;
+            if (!isCurrent()) return;
             fetchThumbnailsBatch(marginStart, prefetchEnd, {
               reason: "initial-margin-prefetch",
             });
@@ -1397,8 +1507,13 @@ export function useGridFetch(
           });
         }
 
-        const lastResTimed = await tailReqPromise;
-        if (fetchAllGridImages.lastRequestId !== requestId) return;
+        const tailOutcome = await tailReqPromise;
+        if (!isCurrent()) return;
+        // A failed tail leaves the end of the grid as placeholders the
+        // background stream never reaches; it fails the load like any other
+        // batch rather than passing as a shorter grid.
+        if (tailOutcome.error) throw tailOutcome.error;
+        const lastResTimed = tailOutcome.result;
         fetchPhaseTimings.tailBatchMs = lastResTimed?.elapsedMs ?? null;
         if (lastResTimed?.body) {
           const lastPics = lastResTimed?.body?.pictures ?? [];
@@ -1419,15 +1534,16 @@ export function useGridFetch(
         // that would slow the already-visible first-batch response.
         let bgOff = FIRST_BATCH;
         while (bgOff < lastBatchStart) {
-          if (fetchAllGridImages.lastRequestId !== requestId) return;
+          if (!isCurrent()) return;
           const limit = Math.min(BG_BATCH, lastBatchStart - bgOff);
           const bgResTimed = await timeRequest(
             streamPictures(streamQuery, {
               offset: bgOff,
               batchLimit: limit,
+              signal,
             }),
           );
-          if (fetchAllGridImages.lastRequestId !== requestId) return;
+          if (!isCurrent()) return;
           const bgOffset = bgOff;
           bgOff += limit;
           const bgNetworkElapsedMs = bgResTimed.elapsedMs;
@@ -1495,7 +1611,7 @@ export function useGridFetch(
         return;
       }
 
-      if (fetchAllGridImages.lastRequestId !== requestId) {
+      if (!isCurrent()) {
         if (isSortedFetch && options?.showProgress === true)
           completeSmartScoreProgress(loadId, 0, false);
         return;
@@ -1594,6 +1710,13 @@ export function useGridFetch(
         fetchThumbnailsBatch(visibleStart.value, prefetchEnd);
       }
       await refreshExpandedStacksAfterFetch();
+      // Superseded while the stacks refreshed: recording this view's success
+      // now would debounce a quick return to it while the grid shows another.
+      if (!isCurrent()) {
+        if (isSortedFetch && options?.showProgress === true)
+          completeSmartScoreProgress(loadId, 0, false);
+        return;
+      }
       requestAnimationFrame(() => {
         if (initialRender.value) {
           initialRender.value = false;
@@ -1607,7 +1730,9 @@ export function useGridFetch(
       }
       fetchSucceeded = true;
     } catch (e) {
-      if (fetchAllGridImages.lastRequestId !== requestId) {
+      // A superseded load fails silently: a cancelled read rejects here, and
+      // its error belongs to a view that is no longer on screen.
+      if (!isCurrent()) {
         if (isSortedFetch && options?.showProgress === true)
           completeSmartScoreProgress(loadId, 0, false);
         return;
