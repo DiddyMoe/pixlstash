@@ -6,10 +6,13 @@ near-duplicate twin selection that the tag scan uses to prefer an altered copy o
 over the CLIP-nearest opposite-labelled neighbour.
 """
 
+import tracemalloc
+
 import numpy as np
 
 from pixlstash.utils.near_neighbor import (
     hamming_distance,
+    knn_disagreement_with_neighbors,
     nearest_opposite_by_hamming,
 )
 
@@ -192,3 +195,158 @@ def test_with_neighbors_degenerate_sizes():
     )
     assert nbr.shape == (3, 2)
     assert (nbr >= 0).all()
+
+
+# ---------------------------------------------------------------------------
+# knn_disagreement_with_neighbors: outputs and scratch memory per block.
+# ---------------------------------------------------------------------------
+
+_OUTPUTS = ("pos_frac", "twin_idx", "twin_sim", "neighbor_idx")
+
+
+def _reference_kernel(emb, has_tag, k, block):
+    """The kernel's earlier, plainer loop: the oracle for its outputs."""
+    n = emb.shape[0]
+    pos_frac = np.zeros(n, dtype=np.float32)
+    twin_idx = np.full(n, -1, dtype=np.int64)
+    twin_sim = np.zeros(n, dtype=np.float32)
+    if n <= 1:
+        return pos_frac, twin_idx, twin_sim, np.empty((n, 0), dtype=np.int64)
+    k = min(k, n - 1)
+    neighbor_idx = np.full((n, k), -1, dtype=np.int64)
+    y = has_tag.astype(np.float32)
+    for start in range(0, n, block):
+        end = min(start + block, n)
+        sims = emb[start:end] @ emb.T
+        for local, glob in enumerate(range(start, end)):
+            sims[local, glob] = -np.inf
+        top = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
+        for local in range(end - start):
+            glob = start + local
+            nbr = top[local]
+            w = np.clip(sims[local, nbr], 0.0, None)
+            wsum = w.sum()
+            pos_frac[glob] = float((w * y[nbr]).sum() / wsum) if wsum > 0 else 0.0
+            order = np.argsort(-sims[local, nbr], kind="stable")
+            neighbor_idx[glob] = nbr[order]
+            opp = nbr[has_tag[nbr] != has_tag[glob]]
+            if opp.size:
+                best = int(opp[np.argmax(sims[local, opp])])
+                twin_idx[glob] = best
+                twin_sim[glob] = float(sims[local, best])
+    return pos_frac, twin_idx, twin_sim, neighbor_idx
+
+
+def _assert_same_bits(actual, expected, context):
+    for name, got, want in zip(_OUTPUTS, actual, expected, strict=True):
+        np.testing.assert_array_equal(got, want, err_msg=f"{name}, {context}")
+        assert got.dtype == want.dtype, f"{name}, {context}"
+        assert got.tobytes() == want.tobytes(), f"{name}, {context}"
+
+
+def _random_rows(n, dim, seed):
+    rng = np.random.default_rng(seed)
+    return _unit_rows(rng.standard_normal((n, dim))), rng.random(n) < 0.3
+
+
+def test_kernel_outputs_match_the_reference_loop_bit_for_bit():
+    """At a given block height every output is the reference's, bit for bit,
+    including exact ties (duplicates), a similarity of -1 and a zero vector."""
+    emb, has_tag = _random_rows(1100, 32, seed=11)
+    emb[1] = emb[0]
+    emb[2] = emb[0]
+    emb[3] = -emb[0]
+    emb[4] = 0.0
+    for block in (1024, 7):
+        _assert_same_bits(
+            knn_disagreement_with_neighbors(emb, has_tag, 12, block),
+            _reference_kernel(emb, has_tag, 12, block),
+            f"block={block}",
+        )
+
+
+def test_smallest_inputs_under_a_one_row_budget():
+    for n, k in ((0, 5), (1, 5), (2, 5), (3, 1), (3, 10)):
+        emb, has_tag = _random_rows(n, 4, seed=n)
+        has_tag[:1] = True
+        _assert_same_bits(
+            knn_disagreement_with_neighbors(emb, has_tag, k, max_block_bytes=1),
+            _reference_kernel(emb, has_tag, k, block=1),
+            f"n={n}, k={k}",
+        )
+
+
+def test_a_budget_that_shrinks_the_block_moves_no_neighbour():
+    """A smaller block may change a similarity in its last bit (the product is
+    blocked differently), never which pictures are neighbours or twins."""
+    n, k = 300, 12
+    emb, has_tag = _random_rows(n, 32, seed=8)
+    # Precondition: each row's top k + 1 similarities are far apart, so a
+    # last-bit change cannot reorder them.
+    sims = emb @ emb.T
+    np.fill_diagonal(sims, -np.inf)
+    ranked = -np.sort(-sims, axis=1)[:, : k + 1]
+    assert np.diff(ranked, axis=1).max() < -1e-5
+
+    whole = knn_disagreement_with_neighbors(emb, has_tag, k)
+    budgeted = knn_disagreement_with_neighbors(
+        emb, has_tag, k, max_block_bytes=12 * n * 7
+    )
+    np.testing.assert_array_equal(budgeted[1], whole[1], err_msg="twin_idx")
+    np.testing.assert_array_equal(budgeted[3], whole[3], err_msg="neighbor_idx")
+    np.testing.assert_allclose(budgeted[0], whole[0], rtol=0, atol=1e-6)
+    np.testing.assert_allclose(budgeted[2], whole[2], rtol=0, atol=1e-6)
+
+
+def _block_heights(monkeypatch, emb, has_tag, **kwargs):
+    heights = []
+    real_argpartition = np.argpartition
+
+    def recording_argpartition(a, *args, **kw):
+        heights.append(a.shape)
+        return real_argpartition(a, *args, **kw)
+
+    monkeypatch.setattr(np, "argpartition", recording_argpartition)
+    try:
+        knn_disagreement_with_neighbors(emb, has_tag, 4, **kwargs)
+    finally:
+        monkeypatch.undo()
+    return heights
+
+
+def test_budget_sets_the_block_height(monkeypatch):
+    """B = min(block, max(1, budget // (12 * n))): 12 bytes a similarity cell."""
+    n = 60
+    emb, has_tag = _random_rows(n, 8, seed=3)
+    assert _block_heights(monkeypatch, emb, has_tag) == [(n, n)]
+    assert (
+        _block_heights(monkeypatch, emb, has_tag, max_block_bytes=12 * n * 5)
+        == [(5, n)] * 12
+    )
+    assert (
+        _block_heights(
+            monkeypatch, emb, has_tag, max_block_bytes=12 * n * 5 + 12 * n - 1
+        )
+        == [(5, n)] * 12
+    )
+    assert _block_heights(monkeypatch, emb, has_tag, max_block_bytes=1) == [(1, n)] * n
+    assert _block_heights(
+        monkeypatch, emb, has_tag, block=16, max_block_bytes=10**12
+    ) == [(16, n)] * 3 + [(12, n)]
+
+
+def test_scratch_memory_stays_near_one_block():
+    """One block is a float32 similarity matrix plus argpartition's index array,
+    12 bytes a cell; the outputs add about half a byte a cell here. Holding a
+    second similarity matrix or the previous block's index array is >= 16."""
+    n, rows = 4096, 256
+    emb, has_tag = _random_rows(n, 64, seed=9)
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        base, _ = tracemalloc.get_traced_memory()
+        knn_disagreement_with_neighbors(emb, has_tag, 12, max_block_bytes=12 * n * rows)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert (peak - base) / (rows * n) < 14
