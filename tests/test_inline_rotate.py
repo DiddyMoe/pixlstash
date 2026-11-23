@@ -33,6 +33,7 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -42,9 +43,11 @@ from fastapi.testclient import TestClient
 from passlib.hash import bcrypt
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+from sqlalchemy import event
 from sqlmodel import delete, select
 
 from pixlstash.db_models import (
+    Character,
     Detection,
     Face,
     Operation,
@@ -55,11 +58,13 @@ from pixlstash.db_models import (
     UserToken,
 )
 from pixlstash.db_models.reference_folder import ReferenceFolder
+from pixlstash.routes.pictures import _thumbnails
 from pixlstash.server import Server
 from pixlstash.services import operation_log_service
 from pixlstash.tasks import TaskType
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.orientation import read_orientation
+from pixlstash.utils.insightface_model_utils import DEFAULT_MODEL_PACK
 from tests.utils import upload_pictures_and_wait
 
 API = "/api/v1"
@@ -667,6 +672,162 @@ def test_a_rotate_before_the_thumbnail_is_processed_changes_the_url(client, serv
 
     assert len({first, second, third}) == 3, (
         f"each turn must give the thumbnail a new URL, got {first}, {second}, {third}"
+    )
+
+
+def _statements_of_the_request(server, monkeypatch, send):
+    """Send one request; return its response and the SQL its own reads ran.
+
+    The shared server's sweeps read a new picture's faces too, embeddings and
+    all, on task-runner threads and on the writer thread (a tagging preload was
+    caught doing it mid-request), so the engine sees more than this request.
+    The request's thread is learned from the first call the route makes, and
+    the writer counts only while it runs a task that thread submitted.
+    """
+    db = server.vault.db
+    request_threads = set()
+    in_request_task = threading.local()
+    statements = []
+    scope_lookup = _thumbnails.fetch_scope_allowed_picture_ids
+    submit = db.submit_task
+
+    def _learning_scope_lookup(*args, **kwargs):
+        request_threads.add(threading.current_thread())
+        return scope_lookup(*args, **kwargs)
+
+    def _marking_submit(func, *args, **kwargs):
+        if threading.current_thread() not in request_threads:
+            return submit(func, *args, **kwargs)
+
+        def _marked(session, *task_args, **task_kwargs):
+            in_request_task.active = True
+            try:
+                return func(session, *task_args, **task_kwargs)
+            finally:
+                in_request_task.active = False
+
+        return submit(_marked, *args, **kwargs)
+
+    def _record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if threading.current_thread() in request_threads or getattr(
+            in_request_task, "active", False
+        ):
+            statements.append(" ".join(statement.split()))
+
+    monkeypatch.setattr(
+        _thumbnails, "fetch_scope_allowed_picture_ids", _learning_scope_lookup
+    )
+    monkeypatch.setattr(db, "submit_task", _marking_submit)
+    event.listen(db._engine, "before_cursor_execute", _record)
+    try:
+        response = send()
+    finally:
+        event.remove(db._engine, "before_cursor_execute", _record)
+    return response, statements
+
+
+def test_batch_thumbnail_metadata_omits_face_features(client, server, monkeypatch):
+    """The overlay batch reads the face columns it sends, and not the embedding.
+
+    Every face row carries its embedding (``features``, 2 KiB), and an overlay
+    entry sends none of it: the id, the box mapped into bitmap space, the
+    character and the frame. A grid page asks for a few hundred thumbnails at
+    once, so loading whole face rows read every embedding on the page only to
+    drop it.
+
+    The entries are asserted whole because a column projection fails quietly
+    here: a face column the overlay reads but the projection leaves out raises
+    on the detached row, the box read swallows that, and the face is simply
+    missing from the response.
+    """
+    picture_id = _upload(client)
+    stand_in_embedding = bytes(range(256)) * 8  # the size of a real one
+
+    def _seed(session):
+        picture = session.get(Picture, picture_id)
+        # A 2x bitmap, so a mapped box differs from the stored one.
+        picture.thumbnail_width = picture.width * 2
+        picture.thumbnail_height = picture.height * 2
+        character = Character(name="test-character")
+        session.add(character)
+        session.flush()
+        # Ids and (frame_index, face_index) both ascend: two indexes on `face`
+        # lead with picture_id and either may serve the read, so the order the
+        # list comparison below expects is the same under both.
+        faces = [
+            Face(
+                picture_id=picture_id,
+                frame_index=0,
+                face_index=0,
+                bbox=[2, 2, 6, 4],
+                character_id=character.id,
+                features=stand_in_embedding,
+                # The current pack: any other makes the model-refresh sweep
+                # re-detect this picture and delete the face as undetected.
+                model_pack=DEFAULT_MODEL_PACK,
+            ),
+            # A later video frame's face, with no embedding and no character.
+            Face(
+                picture_id=picture_id, frame_index=2, face_index=0, bbox=[8, 4, 12, 10]
+            ),
+            # A row with no box is never an overlay. Its own frame, so it cannot
+            # collide with the no-face row the extraction sweep may add.
+            Face(picture_id=picture_id, frame_index=5, face_index=-1, bbox=None),
+        ]
+        for face in faces:
+            session.add(face)
+            session.flush()
+        detection = Detection(
+            picture_id=picture_id, bbox=[1, 1, 3, 3], label="cat", score=0.9
+        )
+        session.add(detection)
+        session.flush()
+        seeded = ([face.id for face in faces], detection.id, character.id)
+        session.commit()
+        return seeded
+
+    face_ids, detection_id, character_id = server.vault.db.run_task(_seed)
+    embedded_id, video_frame_id, _no_box_id = face_ids
+
+    response, statements = _statements_of_the_request(
+        server,
+        monkeypatch,
+        lambda: client.post(f"{API}/pictures/thumbnails", json={"ids": [picture_id]}),
+    )
+    assert response.status_code == 200, response.text
+    entry = response.json()[str(picture_id)]
+    assert entry["faces"] == [
+        {
+            "id": embedded_id,
+            "bbox": [4, 4, 12, 8],
+            "character_id": character_id,
+            "character_name": "test-character",
+            "frame_index": 0,
+        },
+        {
+            "id": video_frame_id,
+            "bbox": [16, 8, 24, 20],
+            "character_id": None,
+            "character_name": None,
+            "frame_index": 2,
+        },
+    ]
+    assert entry["detections"] == [
+        {
+            "id": detection_id,
+            "bbox": [2, 2, 6, 6],
+            "label": "cat",
+            "score": 0.9,
+            "frame_index": 0,
+        }
+    ]
+
+    assert any(" FROM face " in f"{statement} " for statement in statements), (
+        f"the capture never saw the request read its faces: {statements}"
+    )
+    embedding_reads = [s for s in statements if "face.features" in s]
+    assert embedding_reads == [], (
+        f"the overlay batch loaded the face embeddings it never sends: {embedding_reads}"
     )
 
 

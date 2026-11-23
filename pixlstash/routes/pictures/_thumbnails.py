@@ -17,11 +17,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import (
     func,
 )
+from sqlalchemy.orm import load_only
 from sqlmodel import Session, select
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Character,
+    Face,
     Picture,
     Tag,
 )
@@ -402,14 +404,15 @@ def register_routes(router, server):
                 )
                 return bbox, False
 
-        pics = server.vault.db.run_task(
-            lambda session: Picture.find(
+        def read_pictures_and_faces(session: Session):
+            # One task for both reads: the face boxes are mapped by the picture's
+            # geometry, so they must come from the same committed state.
+            found = Picture.find(
                 session,
                 id=ids,
                 select_fields=[
                     "id",
                     "file_path",
-                    "faces",
                     "detections",
                     "width",
                     "height",
@@ -430,8 +433,32 @@ def register_routes(router, server):
                 ],
                 include_deleted=True,
                 include_unimported=True,
-            ),
-            priority=DBPriority.IMMEDIATE,
+            )
+            faces_by_picture = defaultdict(list)
+            if found:
+                # Only the columns an overlay entry is built from. A face's
+                # `features` is its 2 KiB embedding, which this response never
+                # sends; loading whole rows read it for every face on the page.
+                # The same detached-row rule as above: a column missing here
+                # makes the face's read raise, and the face drops out silently.
+                for face in session.exec(
+                    select(Face)
+                    .where(Face.picture_id.in_([pic.id for pic in found]))
+                    .options(
+                        load_only(
+                            Face.id,
+                            Face.picture_id,
+                            Face.character_id,
+                            Face.frame_index,
+                            Face.bbox_,
+                        )
+                    )
+                ).all():
+                    faces_by_picture[face.picture_id].append(face)
+            return found, faces_by_picture
+
+        pics, faces_by_picture = server.vault.db.run_task(
+            read_pictures_and_faces, priority=DBPriority.IMMEDIATE
         )
         logger.debug(
             "Thumbnail batch resolved: requested=%s found=%s",
@@ -440,8 +467,8 @@ def register_routes(router, server):
         )
         character_name_map = {}
         character_ids = set()
-        for pic in pics:
-            for face in getattr(pic, "faces", []):
+        for faces in faces_by_picture.values():
+            for face in faces:
                 if getattr(face, "character_id", None) is not None:
                     character_ids.add(face.character_id)
         if character_ids:
@@ -460,7 +487,7 @@ def register_routes(router, server):
             try:
                 face_entries = []
                 raw_face_bboxes = []
-                for face in getattr(pic, "faces", []):
+                for face in faces_by_picture.get(pic.id, []):
                     bbox = None
                     try:
                         bbox = face.bbox if hasattr(face, "bbox") else None
