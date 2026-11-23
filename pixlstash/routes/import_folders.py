@@ -14,6 +14,7 @@ from pixlstash.db_models.import_folder import ImportFolder
 from pixlstash.db_models.picture import Picture
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
+from pixlstash.tasks.missing_watch_folder_import_finder import watch_folder_state
 from pixlstash.utils.host_path_utils import is_absolute_host_path, normalize_host_path
 from pixlstash.utils.library_roots import (
     holding_folder_overlap_lock,
@@ -54,6 +55,10 @@ class ImportFolderResponse(BaseModel):
     last_imported_at: Optional[datetime] = None
     # The folder is not on disk (unplugged drive, renamed, deleted).
     missing: bool = False
+    # The folder is on disk but the server cannot list it (permissions on it or
+    # a parent, a stale mount), so nothing in it is imported. Never true
+    # together with ``missing``.
+    unreadable: bool = False
 
 
 class ImportFoldersListResponse(BaseModel):
@@ -98,6 +103,7 @@ def create_router(server) -> APIRouter:
         picture_count: int = 0,
         last_imported_at: Optional[datetime] = None,
     ) -> ImportFolderResponse:
+        missing, access_error = watch_folder_state(folder.folder)
         return ImportFolderResponse(
             id=folder.id,
             folder=folder.folder,
@@ -107,7 +113,8 @@ def create_router(server) -> APIRouter:
             last_checked=folder.last_checked,
             picture_count=picture_count,
             last_imported_at=last_imported_at,
-            missing=not os.path.isdir(folder.folder),
+            missing=missing,
+            unreadable=access_error is not None,
         )
 
     def _notify_changed(request: Request) -> None:

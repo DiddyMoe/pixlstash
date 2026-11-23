@@ -69,6 +69,24 @@ describe("ImportFoldersSection", () => {
     expect(row.text()).toContain("12");
   });
 
+  it("says so when a folder is on disk but the server cannot read it", async () => {
+    api.listImportFolders.mockResolvedValue({
+      folders: [
+        {
+          ...RENDERS,
+          missing: false,
+          unreadable: true,
+          last_imported_at: "2026-01-02T03:04:05Z",
+        },
+      ],
+    });
+    const wrapper = mountSection();
+    await flushPromises();
+    const status = wrapper.find(".ifs-list .ifs-row [role='status']");
+    expect(status.exists()).toBe(true);
+    expect(status.text()).toBe("Folder can't be read");
+  });
+
   it("adds a folder named after its last component when no name is given", async () => {
     const wrapper = mountSection();
     await flushPromises();

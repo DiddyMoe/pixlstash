@@ -1,4 +1,6 @@
+import errno
 import os
+import stat
 import threading
 import time
 
@@ -14,6 +16,33 @@ from .base_task_finder import BaseTaskFinder
 from .watch_folder_import_task import WatchFolderImportTask
 
 logger = get_logger(__name__)
+
+
+def watch_folder_state(folder: str) -> tuple[bool, OSError | None]:
+    """Say whether a watch folder is missing, or there but not readable.
+
+    Returns ``(missing, error)``. ``missing`` is true when nothing is at the
+    path or it is not a directory. ``error`` is set when the folder is there
+    but the server cannot list and enter it: the folder or one of its parents
+    cannot be opened, or it lacks read and execute permission. At most one of
+    the two is set.
+
+    The folder listing and the scan both use this, so the row in Settings and
+    what the scan does agree. It asks the filesystem only: the path rules are
+    not consulted and the path is used as given, so a link is judged by the
+    directory it points at, the same way the scan reads it.
+    """
+    try:
+        folder_stat = os.stat(folder)
+    except (FileNotFoundError, NotADirectoryError):
+        return True, None
+    except OSError as exc:
+        return False, exc
+    if not stat.S_ISDIR(folder_stat.st_mode):
+        return True, None
+    if not os.access(folder, os.R_OK | os.X_OK):
+        return False, PermissionError(errno.EACCES, os.strerror(errno.EACCES), folder)
+    return False, None
 
 
 class MissingWatchFolderImportFinder(BaseTaskFinder):
@@ -75,6 +104,13 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
         self._pending_stats: dict[str, tuple[tuple[int, float, float], float]] = {}
         self._dispatched_stats: dict[str, tuple[int, float, float]] = {}
         self._seen_lock = threading.Lock()
+        # Folder id -> the directories its latest scan could not read, as
+        # ``(filename, errno)`` pairs, so a folder that stays unreadable is
+        # reported when that set changes rather than on every planner cycle.
+        # Only the WorkPlanner thread (``find_task``) touches it, so no lock.
+        self._unreadable_by_folder: dict[
+            int, frozenset[tuple[str | None, int | None]]
+        ] = {}
 
     def finder_name(self) -> str:
         return "MissingWatchFolderImportFinder"
@@ -82,6 +118,7 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
     def find_task(self):
         db_folders = self._load_db_watch_folders()
         if not db_folders:
+            self._unreadable_by_folder.clear()
             return None
         return self._find_task_from_db(db_folders)
 
@@ -110,16 +147,32 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
         last_checked_updates = {}
         observed_paths: set[str] = set()
 
+        registered = {int(entry.id) for entry in watch_folders if entry.id is not None}
+        for removed in self._unreadable_by_folder.keys() - registered:
+            del self._unreadable_by_folder[removed]
+
         for entry in watch_folders:
             if entry.id is None:
                 continue
             folder = entry.folder
             delete_after_import = bool(entry.delete_after_import)
 
-            if not folder or not os.path.isdir(folder):
+            if not folder:
+                continue
+            missing, access_error = watch_folder_state(folder)
+            if missing:
+                continue
+            if access_error is not None:
+                # Nothing to walk, and no scan completed, so ``last_checked``
+                # is left as it was.
+                self._note_unreadable(int(entry.id), folder, [access_error])
                 continue
 
-            for root, _, files in os.walk(folder):
+            # ``os.walk`` skips a directory it cannot list unless ``onerror``
+            # is given, and the files inside are then never offered: nothing
+            # imports and nothing says why. Collect the errors and report them.
+            unreadable: list[OSError] = []
+            for root, _, files in os.walk(folder, onerror=unreadable.append):
                 for file_name in files:
                     file_path = os.path.join(root, file_name)
                     if not self._is_supported_file(file_path):
@@ -139,6 +192,8 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
                                 "import_source_folder": folder,
                             }
                         )
+
+            self._note_unreadable(int(entry.id), folder, unreadable)
 
             last_checked_updates[int(entry.id)] = now_ts
 
@@ -179,6 +234,49 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
             for path in normalized:
                 self._pending_stats.pop(path, None)
                 self._dispatched_stats.pop(path, None)
+
+    def _note_unreadable(
+        self, folder_id: int, folder: str, errors: list[OSError]
+    ) -> None:
+        """Report what *folder* could not be read on this scan, if that changed.
+
+        The planner scans every cycle, many times a second while it is busy, so
+        warning on every scan repeats the same line without end. A warning goes
+        out only when the set of directories that failed differs from the
+        previous scan's, and one info line when the folder can be read again.
+        """
+        current = frozenset((err.filename, err.errno) for err in errors)
+        previous = self._unreadable_by_folder.get(folder_id, frozenset())
+        if current and current != previous:
+            self._warn_unreadable(folder, errors)
+        elif previous and not current:
+            logger.info(
+                "MissingWatchFolderImportFinder: watch folder %s can be read again",
+                folder,
+            )
+        if current:
+            self._unreadable_by_folder[folder_id] = current
+        else:
+            self._unreadable_by_folder.pop(folder_id, None)
+
+    @staticmethod
+    def _warn_unreadable(folder: str, errors: list[OSError]) -> None:
+        """Log one warning for the directories in *folder* this scan could not list.
+
+        One line per folder when the set of directories it cannot read changes,
+        rather than one per directory, so a folder with many locked
+        subdirectories does not flood the log. The first error names the
+        directory and the reason; the count says how much was skipped.
+        """
+        logger.warning(
+            "MissingWatchFolderImportFinder: could not read %d director%s in "
+            "watch folder %s; files there are not imported until the server "
+            "can read them. First error: %s",
+            len(errors),
+            "y" if len(errors) == 1 else "ies",
+            folder,
+            errors[0],
+        )
 
     @staticmethod
     def _stat_signature(file_path: str) -> tuple[int, float, float] | None:
