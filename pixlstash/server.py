@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from pillow_heif import register_heif_opener
 
 
@@ -234,6 +234,56 @@ def _log_install_detection_once(level: int, message: str, *args: object) -> None
     is two lines rather than thousands and is not worth serialising for.
     """
     logger.log(level, message, *args, stacklevel=2)
+
+
+def _declared_names(route) -> set[str]:
+    """Every name the route's request declares: its parameters and their fields.
+
+    Walks the route's dependant and its sub-dependencies the way FastAPI does,
+    taking each parameter's wire name plus every property name in the JSON
+    schema of its type, nested models included. A mapping key or an extra key
+    the caller sent is not in this set: the route never declared it.
+    """
+    names: set[str] = set()
+    pending = [route.dependant]
+    while pending:
+        dependant = pending.pop()
+        pending.extend(dependant.dependencies)
+        for field in (
+            *dependant.path_params,
+            *dependant.query_params,
+            *dependant.header_params,
+            *dependant.cookie_params,
+            *dependant.body_params,
+        ):
+            names.add(field.alias)
+            _collect_property_names(
+                TypeAdapter(field.field_info.annotation).json_schema(), names
+            )
+    return names
+
+
+def _collect_property_names(schema, names: set[str]) -> None:
+    """Add every ``properties`` key found anywhere in ``schema`` to ``names``."""
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            names.update(properties)
+        for value in schema.values():
+            _collect_property_names(value, names)
+    elif isinstance(schema, list):
+        for value in schema:
+            _collect_property_names(value, names)
+
+
+def _masked_location(loc, declared: set[str]) -> tuple:
+    """``loc`` with each part after its source that is not in ``declared`` as ``*``.
+
+    The first part is FastAPI's source label (``body``, ``query``, ``path``,
+    ``header`` or ``cookie``) and is kept as it is.
+    """
+    loc = tuple(loc or ())
+    return (*loc[:1], *(part if part in declared else "*" for part in loc[1:]))
 
 
 class VersionResponse(BaseModel):
@@ -1742,6 +1792,25 @@ class Server(
                 headers["Access-Control-Allow-Origin"] = origin
 
             detail = exc.errors()
+            # A refused request leaves a trace of which field failed and how,
+            # so a client that only showed "could not be read" can be traced to
+            # its cause. Only the error type and the location are logged. Never
+            # ``input`` (the submitted value: a password, a token, a host path),
+            # never ``ctx`` (it can hold the raised exception object) and never
+            # ``msg`` (a validator can format the submitted value into it). A
+            # location part the route does not declare - a mapping key, an
+            # extra key, a list position - is the caller's own text or shape,
+            # so it is written as ``*``.
+            declared = _declared_names(request.scope["route"])
+            logger.warning(
+                "Request validation failed: %s %s errors=%s",
+                request.method,
+                request.url.path,
+                [
+                    (_masked_location(err.get("loc"), declared), err.get("type"))
+                    for err in detail
+                ],
+            )
             for err in detail:
                 if err.get("type") == "string_too_short" and "password" in (
                     err.get("loc") or []
