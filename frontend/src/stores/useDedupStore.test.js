@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { setActivePinia, createPinia } from "pinia";
 
 vi.mock("../api/dedup", () => ({
@@ -106,6 +106,42 @@ function servePage(groups, over = {}) {
     scan: { status: "complete", scanned_pictures: 10, total_pictures: 10 },
     ...over,
   });
+}
+
+/** A promise the test settles by hand, so responses land in a chosen order. */
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/**
+ * Make `mock` hand out one hand-settled promise per call.
+ * @returns {Array<{args: Object, resolve: Function, reject: Function}>} the
+ *   calls, in the order they went on the wire.
+ */
+function holdCalls(mock) {
+  const calls = [];
+  mock.mockImplementation((args) => {
+    const d = deferred();
+    calls.push({ args, resolve: d.resolve, reject: d.reject });
+    return d.promise;
+  });
+  return calls;
+}
+
+/** Let the store's promise chains (handlers, finalizers) run to rest. */
+async function settle() {
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+}
+
+/** `n` queue groups g<from+1>..g<from+n>, in the backend's shape. */
+function groupsFrom(from, n) {
+  return Array.from({ length: n }, (_, i) => group(`g${from + i + 1}`));
 }
 
 beforeEach(() => {
@@ -1504,6 +1540,30 @@ describe("useDedupStore - scope", () => {
 });
 
 describe("useDedupStore - counts", () => {
+  afterEach(() => {
+    // Stops any scan poll a tier change started, so no timer outlives its test.
+    useDedupStore().reset();
+  });
+
+  /** Counts that depend on the effective policy, so a stale reuse shows. */
+  function policyCounts({ policy, scopes }) {
+    const n = policy.embeddingEnabled
+      ? 21
+      : policy.nearEnabled
+        ? 15
+        : policy.threshold === 0.95
+          ? 4
+          : 9;
+    return {
+      unresolved_groups: n,
+      by_tier: {},
+      scopes: (scopes ?? []).map((s) => ({
+        key: scopeKey(s.scopeType, s.scopeId),
+        unresolved_groups: n,
+      })),
+    };
+  }
+
   it("reads the badge, the tier split and the scan in one call", async () => {
     getCounts.mockResolvedValue({
       unresolved_groups: 143,
@@ -1617,6 +1677,409 @@ describe("useDedupStore - counts", () => {
     await store.stack(store.groups[0]);
     await Promise.resolve();
     expect(store.scopeCounts).toEqual({});
+  });
+
+  // The sidebar refresh, a verdict's reconcile, the scan poll and the queue's
+  // own reloads all ask for the counts, often within one frame. Two reads on
+  // the wire at once publish in arrival order, so the older answer could land
+  // last and put the badge back to a number that was already out of date.
+  it("keeps one count read on the wire and lets the newest answer land last", async () => {
+    const calls = holdCalls(getCounts);
+    const store = useDedupStore();
+    const first = store.refreshCounts();
+    const second = store.refreshCounts();
+    expect(getCounts).toHaveBeenCalledTimes(1);
+
+    calls[0].resolve({ unresolved_groups: 9, by_tier: {} });
+    await first;
+    await settle();
+    expect(store.openCount).toBe(9);
+    // The second caller waited for the first read, then asked again.
+    expect(getCounts).toHaveBeenCalledTimes(2);
+
+    calls[1].resolve({ unresolved_groups: 5, by_tier: {} });
+    expect((await second).unresolved_groups).toBe(5);
+    expect(store.openCount).toBe(5);
+  });
+
+  it("folds a burst of callers into one trailing read that asks for every scope", async () => {
+    const calls = holdCalls(getCounts);
+    const store = useDedupStore();
+    const first = store.refreshCounts();
+    const burst = [
+      store.refreshCounts(),
+      store.refreshCounts([{ scopeType: "set", scopeId: 12 }]),
+      store.refreshCounts(),
+      store.refreshCounts([{ scopeType: "folder", scopeId: 3 }]),
+      store.refreshCounts([{ scopeType: "set", scopeId: 12 }]),
+    ];
+    expect(getCounts).toHaveBeenCalledTimes(1);
+
+    calls[0].resolve({ unresolved_groups: 1, by_tier: {}, scopes: [] });
+    await first;
+    await settle();
+    expect(getCounts).toHaveBeenCalledTimes(2);
+    expect(calls[1].args.scopes).toEqual([
+      { scopeType: "set", scopeId: 12 },
+      { scopeType: "folder", scopeId: 3 },
+    ]);
+
+    calls[1].resolve({
+      unresolved_groups: 2,
+      by_tier: {},
+      scopes: [
+        { key: "set:12", unresolved_groups: 6 },
+        { key: "folder:3", unresolved_groups: 1 },
+      ],
+    });
+    const answers = await Promise.all(burst);
+    expect(answers.map((a) => a?.unresolved_groups)).toEqual([2, 2, 2, 2, 2]);
+    await settle();
+    expect(getCounts).toHaveBeenCalledTimes(2);
+    expect(store.openCount).toBe(2);
+    expect(store.scopeCounts).toEqual({ "set:12": 6, "folder:3": 1 });
+  });
+
+  // Logout, login, a share link or a library switch: a count read still on
+  // the wire belongs to the previous session and must not refill the badge.
+  it("discards a count read that was on the wire across a session reset", async () => {
+    const calls = holdCalls(getCounts);
+    const store = useDedupStore();
+    const stale = store.refreshCounts();
+    const waiting = store.refreshCounts();
+    store.reset();
+    // The new session's first read goes straight on the wire, and the next
+    // caller queues behind it rather than behind the old session's read.
+    const fresh = store.refreshCounts();
+    const behindFresh = store.refreshCounts();
+    expect(getCounts).toHaveBeenCalledTimes(2);
+
+    calls[0].resolve({
+      unresolved_groups: 7,
+      by_tier: { exact: 7 },
+      scopes: [{ key: "set:1", unresolved_groups: 7 }],
+      scan: { status: "running", scanned_pictures: 1, total_pictures: 2 },
+    });
+    await stale;
+    await settle();
+    expect(store.openCount).toBe(0);
+    expect(store.byTier).toEqual({});
+    expect(store.scopeCounts).toEqual({});
+    expect(store.isScanning).toBe(false);
+    expect(store.countsLoaded).toBe(false);
+    expect(await stale).toBe(null);
+    // A caller that was waiting behind the old read is answered, not left
+    // hanging, and the old read finishing does not release the new queue.
+    expect(await waiting).toBe(null);
+    expect(getCounts).toHaveBeenCalledTimes(2);
+
+    calls[1].resolve({ unresolved_groups: 3, by_tier: {} });
+    await fresh;
+    await settle();
+    expect(store.openCount).toBe(3);
+    expect(store.countsLoaded).toBe(true);
+    expect(getCounts).toHaveBeenCalledTimes(3);
+    calls[2].resolve({ unresolved_groups: 4, by_tier: {} });
+    expect((await behindFresh).unresolved_groups).toBe(4);
+    expect(store.openCount).toBe(4);
+  });
+
+  // The verdict ticks the badge down at once; a count read that was asked for
+  // before the verdict knows nothing of it and must not tick it back up.
+  it("keeps a verdict's tick-down when an older count read lands after it", async () => {
+    servePage([group("g1"), group("g2")], { total: 2 });
+    stackGroup.mockResolvedValue({});
+    getCounts.mockResolvedValue({ unresolved_groups: 100, by_tier: {} });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    await store.refreshCounts();
+    expect(store.openCount).toBe(100);
+
+    const calls = holdCalls(getCounts);
+    const before = store.refreshCounts();
+    await store.stack(store.groups[0]);
+    expect(store.openCount).toBe(99);
+
+    calls[0].resolve({ unresolved_groups: 100, by_tier: { near: 100 } });
+    await before;
+    await settle();
+    expect(store.openCount).toBe(99);
+    // The rest of that answer still lands.
+    expect(store.byTier).toEqual({ near: 100 });
+    // The verdict's own reconcile goes out after it and has the last word.
+    expect(calls).toHaveLength(2);
+    calls[1].resolve({ unresolved_groups: 98, by_tier: { near: 98 } });
+    await settle();
+    expect(store.openCount).toBe(98);
+    expect(calls).toHaveLength(2);
+  });
+
+  // A tier switched off while a read was on the wire: that read counted
+  // groups the queue no longer shows.
+  it("discards a count read asked for under a tier gate that has since changed", async () => {
+    servePage([]);
+    const store = useDedupStore();
+    await store.loadPolicy();
+    await store.setTierEnabled("near", true);
+    expect(store.openCount).toBe(0);
+
+    const calls = holdCalls(getCounts);
+    const stale = store.refreshCounts();
+    expect(calls[0].args.policy.nearEnabled).toBe(true);
+    await store.setTierEnabled("near", false);
+
+    calls[0].resolve({ unresolved_groups: 50, by_tier: { exact: 10, near: 40 } });
+    expect(await stale).toBe(null);
+    await settle();
+    expect(store.openCount).toBe(0);
+    expect(store.byTier).toEqual({});
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1].args.policy.nearEnabled).toBe(false);
+    calls[1].resolve({ unresolved_groups: 10, by_tier: { exact: 10 } });
+    await settle();
+    expect(store.openCount).toBe(10);
+  });
+
+  // A context menu opened right after a verdict must show the count after
+  // the verdict, not one read before it - and a request that finishes late
+  // must not knock the newer request out of the in-flight map.
+  it("does not let a scope count read from before an invalidation fill the cache", async () => {
+    const calls = holdCalls(getCounts);
+    const store = useDedupStore();
+    const first = store.fetchScopeCount("set", 12);
+    store.invalidateScopeCounts();
+    const second = store.fetchScopeCount("set", 12);
+    expect(getCounts).toHaveBeenCalledTimes(1);
+
+    calls[0].resolve({
+      unresolved_groups: 9,
+      scopes: [{ key: "set:12", unresolved_groups: 9 }],
+    });
+    expect(await first).toBe(null);
+    await settle();
+    expect(store.scopeCounts["set:12"]).toBeUndefined();
+    // The menu that opened after the change asked again.
+    expect(getCounts).toHaveBeenCalledTimes(2);
+    expect(calls[1].args.scopes).toEqual([{ scopeType: "set", scopeId: 12 }]);
+
+    // A third caller joins that newer read rather than starting another.
+    const third = store.fetchScopeCount("set", 12);
+    calls[1].resolve({
+      unresolved_groups: 8,
+      scopes: [{ key: "set:12", unresolved_groups: 8 }],
+    });
+    expect(await second).toBe(8);
+    await settle();
+    expect(getCounts).toHaveBeenCalledTimes(2);
+    expect(await third).toBe(8);
+    expect(store.scopeCounts["set:12"]).toBe(8);
+  });
+
+  // A context menu's cached count was read under one tier gate and threshold.
+  // After either changes it counts other groups, so the menu must ask again.
+  it("re-reads a cached scope count after a tier is switched on", async () => {
+    servePage([]);
+    startScan.mockResolvedValue({
+      status: "complete",
+      scanned_pictures: 10,
+      total_pictures: 10,
+    });
+    const store = useDedupStore();
+    await store.loadPolicy();
+    getCounts.mockImplementation(async (args) => policyCounts(args));
+    expect(await store.fetchScopeCount("set", 12)).toBe(9);
+    await store.setTierEnabled("near", true);
+    await settle();
+    expect(store.openCount).toBe(15);
+    getCounts.mockClear();
+    expect(await store.fetchScopeCount("set", 12)).toBe(15);
+    expect(getCounts).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-reads a cached scope count after a tier is switched off", async () => {
+    servePage([]);
+    startScan.mockResolvedValue({
+      status: "complete",
+      scanned_pictures: 10,
+      total_pictures: 10,
+    });
+    const store = useDedupStore();
+    await store.loadPolicy();
+    await store.setTierEnabled("near", true);
+    await settle();
+    getCounts.mockImplementation(async (args) => policyCounts(args));
+    expect(await store.fetchScopeCount("set", 12)).toBe(15);
+    await store.setTierEnabled("near", false);
+    await settle();
+    expect(store.openCount).toBe(9);
+    expect(await store.fetchScopeCount("set", 12)).toBe(9);
+  });
+
+  it("re-reads a cached scope count after the threshold is raised", async () => {
+    servePage([]);
+    const store = useDedupStore();
+    await store.loadPolicy();
+    getCounts.mockImplementation(async (args) => policyCounts(args));
+    expect(await store.fetchScopeCount("set", 12)).toBe(9);
+    await store.setThreshold(0.95);
+    await settle();
+    expect(store.openCount).toBe(4);
+    expect(await store.fetchScopeCount("set", 12)).toBe(4);
+  });
+
+  it("reuses a cached scope count while the tier gate and threshold hold", async () => {
+    servePage([]);
+    const store = useDedupStore();
+    await store.loadPolicy();
+    getCounts.mockImplementation(async (args) => policyCounts(args));
+    expect(await store.fetchScopeCount("set", 12)).toBe(9);
+    getCounts.mockClear();
+    expect(await store.fetchScopeCount("set", 12)).toBe(9);
+    expect(getCounts).toHaveBeenCalledTimes(0);
+  });
+
+  // A menu that asks while a count read is on the wire joins the next read,
+  // which goes out under whatever tier gate holds when it starts. Its rows must
+  // be cached under that gate, not under the one the menu asked under.
+  it("caches a queued scope count under the gate its read went out under", async () => {
+    servePage([]);
+    startScan.mockResolvedValue({
+      status: "complete",
+      scanned_pictures: 10,
+      total_pictures: 10,
+    });
+    const store = useDedupStore();
+    await store.loadPolicy();
+    const calls = holdCalls(getCounts);
+    // Answer every held read from the policy it was sent under.
+    async function answerAll() {
+      while (calls.length) {
+        for (const call of calls.splice(0)) {
+          call.resolve(policyCounts(call.args));
+        }
+        await settle();
+      }
+    }
+
+    const badge = store.refreshCounts();
+    const menu = store.fetchScopeCount("set", 12);
+    const on = store.setTierEnabled("near", true);
+    await answerAll();
+    await on;
+    await answerAll();
+    await badge;
+    expect(await menu).toBe(15);
+    expect(store.openCount).toBe(15);
+
+    const off = store.setTierEnabled("near", false);
+    await answerAll();
+    await off;
+    await answerAll();
+    expect(store.openCount).toBe(9);
+    // The 15 was counted with near-duplicates on; the menu must not show it.
+    expect(store.scopeCounts["set:12"]).toBeUndefined();
+    const reopened = store.fetchScopeCount("set", 12);
+    await answerAll();
+    expect(await reopened).toBe(9);
+  });
+});
+
+describe("useDedupStore - page requests across a session reset", () => {
+  // `reset()` lets go of the page in flight so the next session never joins
+  // it. When that old request finishes late it must not also let go of the
+  // NEW session's page, or the next scroll starts a second copy of it.
+  it("a late page from before a reset leaves the new session's page joinable", async () => {
+    servePage(groupsFrom(0, 20), { total: 60 });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+
+    const pages = holdCalls(listGroups);
+    const stale = store.loadMore();
+    store.reset();
+    const reload = store.loadFirstPage();
+    pages[1].resolve({ groups: groupsFrom(0, 20), total: 60 });
+    await reload;
+    expect(store.hasMore).toBe(true);
+
+    const fresh = store.loadMore();
+    expect(pages).toHaveLength(3);
+    expect(store.loadingMore).toBe(true);
+    pages[0].resolve({ groups: [group("g99")], total: 60 });
+    await stale;
+    await settle();
+    // The new session's page is still on the wire, so its spinner stays.
+    expect(store.loadingMore).toBe(true);
+
+    const joined = store.loadMore();
+    expect(pages).toHaveLength(3);
+    pages[2].resolve({ groups: groupsFrom(20, 20), total: 60 });
+    await Promise.all([fresh, joined]);
+    expect(store.loadingMore).toBe(false);
+    expect(pages).toHaveLength(3);
+    expect(store.groups.map((g) => g.signature)).toEqual(
+      groupsFrom(0, 40).map((g) => g.signature),
+    );
+  });
+
+  it("a page clears its own spinner on success and on failure", async () => {
+    servePage(groupsFrom(0, 20), { total: 60 });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    const pages = holdCalls(listGroups);
+
+    const ok = store.loadMore();
+    expect(store.loadingMore).toBe(true);
+    pages[0].resolve({ groups: groupsFrom(20, 20), total: 60 });
+    await ok;
+    expect(store.loadingMore).toBe(false);
+
+    const bad = store.loadMore();
+    expect(store.loadingMore).toBe(true);
+    pages[1].reject(new Error("offline"));
+    await bad;
+    expect(store.loadingMore).toBe(false);
+  });
+
+  it("a late upward page from before a reset leaves the new session's joinable", async () => {
+    const serveByOffset = async ({ offset = 0, limit }) => ({
+      groups: groupsFrom(offset, limit),
+      total: 200,
+      offset,
+      limit,
+    });
+    listGroups.mockImplementation(serveByOffset);
+    const store = useDedupStore();
+    await store.loadPolicy();
+    await store.loadFirstPage();
+    await store.focusEnd();
+    expect(store.windowStart).toBe(180);
+
+    const pages = holdCalls(listGroups);
+    const stale = store.loadPrevious();
+    expect(pages).toHaveLength(1);
+    store.reset();
+
+    listGroups.mockImplementation(serveByOffset);
+    await store.loadPolicy();
+    await store.loadFirstPage();
+    await store.focusEnd();
+    expect(store.windowStart).toBe(180);
+
+    const freshPages = holdCalls(listGroups);
+    const fresh = store.loadPrevious();
+    expect(freshPages).toHaveLength(1);
+    pages[0].resolve({ groups: groupsFrom(160, 20), total: 200 });
+    await stale;
+    await settle();
+
+    const joined = store.loadPrevious();
+    expect(freshPages).toHaveLength(1);
+    freshPages[0].resolve({ groups: groupsFrom(160, 20), total: 200 });
+    await Promise.all([fresh, joined]);
+    expect(freshPages).toHaveLength(1);
+    expect(store.windowStart).toBe(160);
+    expect(store.groups).toHaveLength(40);
   });
 });
 
@@ -2028,6 +2491,54 @@ describe("useDedupStore - scans and bulk auto-stack", () => {
       expect(listGroups).toHaveBeenCalledTimes(2);
       store.stopScanPoll();
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A poll stopped while its count read is on the wire (a new destination, a
+  // reset) belongs to the old destination: the answer it was waiting for must
+  // not reload the queue or keep the poll alive.
+  it("a poll stopped mid-tick does not act on the answer it was waiting for", async () => {
+    vi.useFakeTimers();
+    try {
+      const running = {
+        status: "running",
+        tiers: ["exact"],
+        threshold: 0.9,
+        scanned_pictures: 1,
+        total_pictures: 10,
+      };
+      servePage([], { scan: running });
+      getCounts.mockResolvedValue({
+        unresolved_groups: 0,
+        by_tier: {},
+        scopes: [],
+        scan: running,
+      });
+      const store = useDedupStore();
+      await store.openQueue({});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(store.isScanning).toBe(true);
+
+      const calls = holdCalls(getCounts);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(calls).toHaveLength(1);
+      store.stopScanPoll();
+      listGroups.mockClear();
+      startScan.mockClear();
+
+      calls[0].resolve({
+        unresolved_groups: 0,
+        by_tier: {},
+        scopes: [],
+        scan: { status: "complete", scanned_pictures: 10, total_pictures: 10 },
+      });
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(calls).toHaveLength(1);
+      expect(listGroups).not.toHaveBeenCalled();
+      expect(startScan).not.toHaveBeenCalled();
+    } finally {
+      useDedupStore().stopScanPoll();
       vi.useRealTimers();
     }
   });
