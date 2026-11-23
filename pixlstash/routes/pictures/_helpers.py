@@ -23,6 +23,7 @@ from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.service.caption_utils import (
     normalize_hidden_tags,
 )
+from pixlstash.utils.service.scope_table import scope_id_subquery
 
 
 logger = get_logger(__name__)
@@ -132,9 +133,12 @@ def _fetch_hidden_picture_ids(server, request: Request, picture_ids: list[int]):
     hidden_tag_set = {str(tag).strip().lower() for tag in hidden_tags if tag}
 
     def fetch_hidden(session: Session, ids: list[int], tags: set[str]):
+        # Every row of a search or listing, so possibly more ids than SQLite
+        # binds in one statement: read from a temp table instead.
+        id_scope = scope_id_subquery(session, ids, name="_pixlstash_hidden_check_ids")
         rows = session.exec(
             select(Tag.picture_id).where(
-                Tag.picture_id.in_(ids),
+                Tag.picture_id.in_(id_scope),
                 Tag.tag.is_not(None),
                 func.lower(Tag.tag).in_(tags),
             )

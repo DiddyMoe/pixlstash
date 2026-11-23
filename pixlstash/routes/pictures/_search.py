@@ -28,6 +28,7 @@ from pixlstash.utils.service.filter_helpers import (
     project_unassigned_clause,
 )
 from pixlstash.utils.query.predicate_filter import PredicateFilter
+from pixlstash.utils.service.scope_table import scope_id_subquery
 
 from ._helpers import (
     _face_cluster_ids,
@@ -206,15 +207,14 @@ def register_routes(router, server):
             elif str(character_id).isdigit():
 
                 def fetch_character_ids(session, character_id_value):
-                    faces = session.exec(
-                        select(Face).where(Face.character_id == character_id_value)
-                    ).all()
-                    picture_ids = {face.picture_id for face in faces}
-                    if not picture_ids:
-                        return []
+                    # A subquery, not a fetched id list: a person can be in
+                    # more pictures than SQLite binds in one statement.
+                    character_picture_ids = select(Face.picture_id).where(
+                        Face.character_id == character_id_value
+                    )
                     rows = session.exec(
                         select(Picture.id).where(
-                            Picture.id.in_(picture_ids),
+                            Picture.id.in_(character_picture_ids),
                             Picture.deleted.is_(False),
                         )
                     ).all()
@@ -290,9 +290,12 @@ def register_routes(router, server):
                         candidate_pids = list(union_pids)
                     if not candidate_pids:
                         return []
+                    candidate_scope = scope_id_subquery(
+                        session, candidate_pids, name="_pixlstash_search_people_ids"
+                    )
                     rows2 = session.exec(
                         select(Picture.id).where(
-                            Picture.id.in_(candidate_pids),
+                            Picture.id.in_(candidate_scope),
                             Picture.deleted.is_(False),
                         )
                     ).all()
@@ -472,6 +475,11 @@ def register_routes(router, server):
             if not score_map:
                 return []
 
+            # Every picture the search matched, so possibly more ids than
+            # SQLite binds in one statement: passed as a temp-table scope.
+            result_scope = scope_id_subquery(
+                session, score_map.keys(), name="_pixlstash_search_result_ids"
+            )
             sorted_pics = Picture.find(
                 session,
                 sort_mech=sort_mech,
@@ -480,7 +488,7 @@ def register_routes(router, server):
                 select_fields=Picture.metadata_fields(),
                 format=format,
                 only_deleted=only_deleted,
-                id=list(score_map.keys()),
+                id=result_scope,
                 min_score=min_score,
                 unscored=unscored,
                 favourite_only=favourite_only,
