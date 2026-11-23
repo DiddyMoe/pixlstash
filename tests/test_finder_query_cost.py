@@ -905,3 +905,162 @@ def test_likeness_parameters_wait_per_picture_for_quality(tmp_path):
             "the finder must not wait for the other two pictures' quality"
         )
         assert no_row not in _likeness_candidates(vault)
+
+
+# ── description probe ───────────────────────────────────────────────────────
+
+_DESCRIPTION_PROBE = "where (picture.description is null or picture.description like"
+
+
+def _description_queue_with_bound_pattern(session: Session, limit: int) -> list[int]:
+    """The description probe's predicate with its LIKE pattern bound as ``?``.
+
+    This is the query as it was before the pattern was rendered inline, kept
+    here as the reference for "same rows, same order". ``ORDER BY`` ends in the
+    primary key, so its answer does not depend on which plan SQLite picks.
+    """
+    from sqlalchemy import or_
+    from sqlmodel import select
+
+    from pixlstash.db_models import (
+        DESCRIPTION_SENTINEL_ESCAPE_CHAR,
+        DESCRIPTION_SENTINEL_LIKE_PATTERN,
+    )
+    from pixlstash.services.set_lock_service import locked_picture_id_subquery
+
+    return list(
+        session.exec(
+            select(Picture.id)
+            .where(
+                or_(
+                    Picture.description.is_(None),
+                    Picture.description.like(
+                        DESCRIPTION_SENTINEL_LIKE_PATTERN,
+                        escape=DESCRIPTION_SENTINEL_ESCAPE_CHAR,
+                    ),
+                ),
+                ~Picture.id.in_(locked_picture_id_subquery()),
+            )
+            .order_by(Picture.description.is_(None), Picture.id)
+            .limit(limit)
+        ).all()
+    )
+
+
+def _description_queue(vault, limit: int) -> list[int]:
+    from pixlstash.tasks.missing_description_finder import MissingDescriptionFinder
+
+    return [
+        picture.id
+        for picture in vault.db.run_immediate_read_task(
+            lambda session: MissingDescriptionFinder._fetch_missing_descriptions(
+                session, limit
+            )
+        )
+    ]
+
+
+def _seed_descriptions(vault) -> dict[str, int]:
+    """One picture per description shape the probe must classify, plus locks.
+
+    NULL and sentinel rows are interleaved by id, so "sentinels first" and "then
+    by id" are both visible in the order. Returns ``{label: picture id}``.
+    """
+    from pixlstash.db_models import PictureSet, PictureSetMember, PictureStack
+    from pixlstash.db_models.tag import make_description_sentinel
+
+    shapes = [
+        ("null_a", None, False),
+        ("sentinel", make_description_sentinel(), False),
+        ("empty", "", False),
+        ("caption", "a cat on a sofa", False),
+        ("null_b", None, False),
+        ("sentinel_engine", make_description_sentinel("engine-a"), False),
+        # SQLite's LIKE folds ASCII case, so this matches the pattern too.
+        ("sentinel_upper", "__DESCRIPTION::engine-b", False),
+        # The underscores are escaped: neither of these is a sentinel.
+        ("underscore_wildcard", "x_description::", False),
+        ("prefixed", "x__description::", False),
+        ("almost", "__description:", False),
+        ("deleted_null", None, True),
+        ("deleted_sentinel", make_description_sentinel(), True),
+        ("locked_member", None, False),
+        ("stack_sibling", make_description_sentinel(), False),
+        ("null_c", None, False),
+    ]
+
+    def seed(session: Session):
+        ids = {}
+        for label, description, deleted in shapes:
+            picture = Picture(
+                file_path=f"{label}.png",
+                format="png",
+                description=description,
+                deleted=deleted,
+            )
+            session.add(picture)
+            session.flush()
+            ids[label] = picture.id
+        stack = PictureStack(name="stand-in stack")
+        session.add(stack)
+        locked = PictureSet(name="stand-in locked set", locked=True)
+        session.add(locked)
+        session.flush()
+        for label in ("locked_member", "stack_sibling"):
+            session.get(Picture, ids[label]).stack_id = stack.id
+        session.add(PictureSetMember(set_id=locked.id, picture_id=ids["locked_member"]))
+        session.commit()
+        return ids
+
+    return vault.db.run_task(seed)
+
+
+def test_description_probe_is_served_by_its_partial_index(tmp_path):
+    """The probe reads ``ix_picture_description_pending``, not the whole table.
+
+    A partial index whose WHERE contains a LIKE is only usable by a query that
+    carries the identical pattern literal. Bound as ``?`` (SQLAlchemy's default)
+    the planner cannot prove the match and falls back to ``SCAN picture`` on
+    every planner sweep, even when nothing is pending.
+    """
+    with Vault(image_root=str(tmp_path)) as vault:
+        _seed_descriptions(vault)
+
+        with _StatementRecorder(vault.db._engine, _DESCRIPTION_PROBE) as rec:
+            _description_queue(vault, 30)
+
+        plan = _explain(vault, rec.only, rec.parameters[0])
+        assert any("ix_picture_description_pending" in line for line in plan), plan
+        assert "SCAN picture" not in plan, plan
+
+
+def test_description_probe_returns_the_same_rows_in_the_same_order(tmp_path):
+    """Inlining the pattern changes the plan only: same ids, same order.
+
+    Sentinels (a user's reset) come before NULLs (never described), each group
+    by id; empty strings, captions and look-alikes are not pending; deleted
+    pictures are not filtered here; a locked-set member and its stack sibling
+    are excluded.
+    """
+    with Vault(image_root=str(tmp_path)) as vault:
+        ids = _seed_descriptions(vault)
+        expected = [
+            ids[label]
+            for label in (
+                "sentinel",
+                "sentinel_engine",
+                "sentinel_upper",
+                "deleted_sentinel",
+                "null_a",
+                "null_b",
+                "deleted_null",
+                "null_c",
+            )
+        ]
+
+        for limit in (1, 3, 5, len(expected), 100):
+            reference = vault.db.run_immediate_read_task(
+                _description_queue_with_bound_pattern, limit
+            )
+            assert reference == expected[:limit]
+            assert _description_queue(vault, limit) == reference, limit
