@@ -28,6 +28,7 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture, PictureStack
 from pixlstash.db_models.picture_likeness import PictureLikeness
 from pixlstash.server import Server
+from pixlstash.services import dedup_sweep_service
 from pixlstash.services.dedup_sweep_service import (
     CrossStackPolicy,
     ReviewReason,
@@ -389,6 +390,44 @@ def test_group_spanning_two_stacks_is_reported_not_skipped(server):
     assert group.verdict is SweepVerdict.NEEDS_REVIEW
     assert ReviewReason.SPANS_MULTIPLE_STACKS in group.reasons
     assert report.outcome_counts == {SweepOutcome.MERGE_STACKS.value: 1}
+
+
+def test_stack_siblings_load_by_stack_id_and_leave_the_scrapheap_out(
+    server, key_list_plan, monkeypatch
+):
+    """The group's two stacks load their siblings through ``ix_picture_stack_id``.
+
+    Two or more stack ids beside ``deleted IS 0`` lose to ``ix_picture_deleted``
+    without ``sqlite_stat1`` and walk every kept picture. Whatever the shape, a
+    scrapheaped sibling is not proposed with its stack, in one chunk or several.
+    """
+    ids = _seed(
+        server,
+        [
+            {"score": 9, "stack": "left"},
+            {"score": 8, "stack": "left"},
+            {"score": 7, "stack": "left", "deleted": True},
+            {"score": 6, "stack": "right"},
+            {"score": 5, "stack": "right"},
+            {"score": 4, "stack": "right", "deleted": True},
+        ],
+        [(0, 3, 0.99)],
+        stacks=["left", "right"],
+    )
+    with key_list_plan(
+        server.vault.db._engine,
+        "FROM picture \nWHERE picture.stack_id IN (?",
+        "ix_picture_stack_id",
+    ) as plans:
+        report = plan_near_duplicate_sweep(server.vault, SweepPolicy())
+    assert len(plans) == 1, plans
+    group = report.groups[0]
+    assert sorted(group.picture_ids) == [ids[0], ids[1], ids[3], ids[4]]
+    assert sorted(group.linked_member_ids) == [ids[1], ids[4]]
+
+    monkeypatch.setattr(dedup_sweep_service, "ID_CHUNK", 1)
+    group = plan_near_duplicate_sweep(server.vault, SweepPolicy()).groups[0]
+    assert sorted(group.picture_ids) == [ids[0], ids[1], ids[3], ids[4]]
 
 
 def test_cross_stack_merge_disposition_moves_it_to_the_auto_lane(server):

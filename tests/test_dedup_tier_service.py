@@ -1132,6 +1132,56 @@ def test_a_deck_whose_leader_is_scrapheaped_reports_the_next_live_leader(server)
     assert deck["leader_picture_id"] == ids[1]
 
 
+def test_deck_facts_are_read_by_stack_id_and_leave_the_scrapheap_out(
+    server, key_list_plan, monkeypatch
+):
+    """A page touching two stacks reads their members through
+    ``ix_picture_stack_id``, never by walking every kept picture, and the
+    scrapheaped members still count for nothing: not depth, not the face."""
+    ids = _seed(
+        server,
+        [
+            # Stack A: a scrapheaped leader, a live sibling, the duplicate.
+            {"pixel_sha": "a-leader", "deleted": True},
+            {"pixel_sha": "a-b"},
+            {"pixel_sha": "shared", "size_bytes": 100},
+            # Stack B: a live leader, the duplicate, a scrapheaped sibling.
+            {"pixel_sha": "b-leader"},
+            {"pixel_sha": "shared", "size_bytes": 100},
+            {"pixel_sha": "b-gone", "deleted": True},
+            # Stack C: nothing left outside the Scrapheap.
+            {"pixel_sha": "c-a", "deleted": True},
+            {"pixel_sha": "c-b", "deleted": True},
+        ],
+    )
+    stack_a = _stack(server, ids[0:3])
+    stack_b = _stack(server, ids[3:6])
+    stack_c = _stack(server, ids[6:8])
+    _run(server, tiers.run_scan_now_in_session, TierPolicy(), None)
+
+    engine = server.vault.db._engine
+    marker = "FROM picture \nWHERE picture.stack_id IN (?"
+    with key_list_plan(engine, marker, "ix_picture_stack_id") as plans:
+        page, _total, _cursor = _run(server, tiers.page_queue_in_session)
+    assert len(plans) == 1, plans
+
+    assert len(page) == 1, page
+    decks = page[0]["stacks"]
+    assert decks[str(stack_a)]["member_count"] == 2
+    assert decks[str(stack_a)]["leader_picture_id"] == ids[1]
+    assert decks[str(stack_b)]["member_count"] == 2
+    assert decks[str(stack_b)]["leader_picture_id"] == ids[3]
+
+    for chunk in (None, 1):
+        if chunk is not None:
+            monkeypatch.setattr(tiers, "ID_CHUNK", chunk)
+        facts = _run(server, tiers.load_stack_facts, [stack_c, stack_b, None, stack_a])
+        assert sorted(facts) == sorted([stack_a, stack_b])
+        assert facts[stack_a].member_ids == (ids[1], ids[2])
+        assert facts[stack_b].member_ids == (ids[3], ids[4])
+    assert _run(server, tiers.load_stack_facts, []) == {}
+
+
 def test_scoped_counts_are_reported_per_scope(server):
     ids = _seed(
         server,
