@@ -2636,7 +2636,17 @@ function closeAutoStack() {
 async function confirmAutoStack() {
   const result = await store.runAutoStack({ scope: autoStackScope.value });
   closeAutoStack();
-  if (result?.batch_id) {
+  if (result?.outcome === "unknown") {
+    // No answer arrived: the server may still be stacking, may never have
+    // received the request, or may have finished and lost the reply. Only
+    // "not confirmed" is true for all three, so the run is neither reported
+    // as failed nor as running. The announcement is screen-reader only, so the
+    // same sentence is also shown.
+    const sentence =
+      "Auto-stack did not answer, so its outcome is not confirmed: it may still be running, or it may never have reached the server. Check History before running it again.";
+    announcement.value = sentence;
+    noticeStore.info(sentence);
+  } else if (result?.batch_id) {
     const made = Number(result.groups ?? 0).toLocaleString();
     announcement.value = `Created ${made} stacks. Undo reverses the whole run in one step.`;
     // One unstackable group never aborts the run, so a partial result has to be

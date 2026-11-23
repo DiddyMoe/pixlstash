@@ -2655,6 +2655,39 @@ describe("DuplicateQueue - the Auto-stack dry run", () => {
     expect(dialog(wrapper).props("loading")).toBe(false);
     wrapper.unmount();
   });
+
+  // With no answer the client cannot tell a run the server is still working
+  // through from one that never reached it or one whose reply was lost, so
+  // "Could not ... nothing was lost" and "still running" would both be
+  // guesses. The run is reported as unconfirmed, and History is where to look.
+  it.each([
+    ["the client's timeout", "timeout of 60000ms exceeded", "ECONNABORTED"],
+    ["a refused or lost connection", "Network Error", "ERR_NETWORK"],
+  ])(
+    "reports a run with no answer as unconfirmed, not failed: %s",
+    async (_label, message, code) => {
+      autoStackExact
+        .mockResolvedValueOnce({ dry_run: true, groups: 3, pictures: 6 })
+        .mockRejectedValueOnce(Object.assign(new Error(message), { code }));
+      const { wrapper } = await mountWithExactGroups();
+      const notices = useNoticeStore();
+
+      await trigger(wrapper).trigger("click");
+      await flushPromises();
+      dialog(wrapper).vm.$emit("confirm");
+      await flushPromises();
+
+      const unconfirmed =
+        "Auto-stack did not answer, so its outcome is not confirmed: it may still be running, or it may never have reached the server. Check History before running it again.";
+      const said = wrapper.find('[data-testid="dedup-announcement"]').text();
+      expect(said).not.toMatch(/still running/i);
+      expect(said).toBe(unconfirmed);
+      expect(notices.info).toHaveBeenCalledWith(unconfirmed);
+      expect(notices.error).not.toHaveBeenCalled();
+      expect(dialog(wrapper).props("open")).toBe(false);
+      wrapper.unmount();
+    },
+  );
 });
 
 describe("DuplicateQueue: a picture scrapheaped elsewhere", () => {

@@ -81,7 +81,7 @@ copy, reconciled against `routes/dedup.py` as shipped (2026-07-29).
 | `POST /dedup/verdicts/stack` | the "same picture" verdict | `VerdictResponse` |
 | `POST /dedup/verdicts/keep-separate` | the "different pictures" verdict | `VerdictResponse` |
 | `POST /dedup/verdicts/reopen` | un-resolve a group (clearing a stacked verdict also dissolves its stack) | `{ signature, previous_verdict, reopened_at, group_returned_to_queue, batch_id, unstacked_picture_ids }` |
-| `POST /dedup/auto-stack` | bulk-stack the exact tier, `dry_run` first | `{ batch_id, dry_run, groups, pictures, scope, dry_run_summary, results, failures }` |
+| `POST /dedup/auto-stack` | bulk-stack the exact tier, `dry_run` first | `{ batch_id, dry_run, groups, pictures, scope, dry_run_summary, results, failures, blocked, failed, superseded }` |
 | `GET /dedup/mixed-stacks` | live stacks that do not hold together at the given threshold (§19) | `{ threshold, total, kept_total, live_stack_count, offset, limit, next_offset, stacks }` |
 | `POST /dedup/mixed-stacks/{stack_id}/split` | move the stranded members out of a mixed stack (§19) | `{ stack_id, split_picture_ids, remaining_picture_ids, stack_dissolved, batch_id }` |
 | `POST /dedup/mixed-stacks/{stack_id}/unstack` | dissolve a mixed stack (§19) | as split |
@@ -3250,7 +3250,7 @@ Applied (including a partially applied run):
   "results":  [ { …verdict…, "outcome": "applied" } ],
   "failures": [ { "signature": "…", "outcome": "blocked", "status_code": 423,
                   "error": { "code": "set_locked", … } } ],
-  "blocked": 1, "failed": 0 }
+  "blocked": 1, "failed": 0, "superseded": 0 }
 ```
 
 Only the **exact** tier is eligible; near and embedding groups always go through
@@ -3264,6 +3264,41 @@ the queue no matter how confident they look. Every group in the run shares one
 and **the `batch_id` is returned even on a partially applied run**, so work that
 did happen always comes back with its undo handle. Show `blocked` groups to the
 user: they are still in the queue awaiting an individual decision.
+
+**`superseded` counts planned groups the run itself took out of the queue.**
+Stacking one group folds every stack it spans, so a later group in the same
+plan can stop posing a decision (its members already share a stack). The run
+re-checks each group before applying it and skips such a group: nothing is
+written for it, and it is in neither `results` nor `failures`. That is why
+`groups` can be smaller than the dry run's figure with nothing blocked.
+
+**Each group commits on its own**, under the run's `batch_id`. An unexpected
+error while a group is checked or applied (anything other than a guard's
+refusal) ends the run with a 500 after the earlier groups have committed; the
+server logs the batch id and how many groups it applied, and those groups are in
+History under that id.
+
+**The client mints the batch id** (`cli-…`, the same format as
+`newOperationBatchId()`), so it holds the run's undo handle before the request
+leaves, for whatever of the run reaches the server. A large run can outlast the
+client's 60 s timeout while the server keeps stacking. With no answer (a timeout
+or a refused or lost connection), `runAutoStack` reloads the queue and counts as
+after a finished run and returns `{ outcome: "unknown", batch_id }`. The client
+cannot tell a run still going from one that never arrived or one whose reply
+was lost, so the Duplicates view says "Auto-stack did not answer, so its outcome
+is not confirmed: it may still be running, or it may never have reached the
+server. Check History before running it again." It never reports such a run as
+failed and never retries it.
+
+**A supplied `batch_id` must still be on top of History.** An applied run under
+an id that already has applied undoable operations is refused with **409**
+`{ "detail": { "code": "batch_id_not_at_top", "message": "…", "batch_id": "…" } }`
+when the newest applied undoable operation belongs to another batch, because
+appending would split the batch around that operation and neither could then be
+undone. The refusal comes before any write, for an id in the body or in
+`X-Operation-Batch-Id`. A repeat under an id that is still the newest batch
+extends it, and the whole batch is still one undo. `limit` caps the number of
+groups acted on.
 
 ### Not in this API
 
