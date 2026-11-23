@@ -26,11 +26,14 @@ const ENDED_EARLY = ["error", "stopped"];
  * them, the rail describes what is picked, and the sidebar counts them and
  * lights the amber dot while one trains. Held per component they disagreed.
  *
- * Listing a run costs nothing and changes nothing (`api/modelImports.js`), so
- * the list is read whenever it is looked at again; every read is checked
- * against the generation before it writes, because mount, a folder change, a
- * visibility change and a window focus each start one and none cancels the
- * last.
+ * Listing a run changes nothing (`api/modelImports.js`), so the list is read
+ * whenever it is looked at again. It is not free: the server walks the output
+ * root and parses each run's `config.yaml`. So a reader that only wants the
+ * list as it is (mount, focus, visibility, the live poll) passes `join` and
+ * shares the read already in flight for the same folder; any other reader,
+ * which is every one that follows a change, starts its own. Every read is
+ * checked against the generation before it writes, because a newer read
+ * supersedes an older one without cancelling it.
  */
 export const useTrainingRunsStore = defineStore("trainingRuns", () => {
   const folders = useModelFoldersStore();
@@ -239,17 +242,36 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
    * Re-read the runs under the output root.
    *
    * Keeps the reader's place: every still-present card keeps its tick, and the
-   * ticked checkpoints of a single run survive. Cards that have VANISHED drop
-   * out of the selection rather than leaving it pointing at nothing. The folder
-   * id is captured and the request made against THAT, so a read is always
-   * asking about the folder it was started for.
+   * ticked checkpoints of a single run survive (the `single` watcher above
+   * fills them once per run name, so a reload leaves them as they are now).
+   * Cards that have VANISHED drop out of the selection rather than leaving it
+   * pointing at nothing. The folder id is captured and the request made
+   * against THAT, so a read is always asking about the folder it was started
+   * for.
+   *
+   * @param {{join?: boolean}} [options] - `join` shares the read in flight
+   *   for the same folder, if it is still the newest, instead of starting one.
+   *   Only for a reader that wants the list as it is: one that follows a
+   *   change needs a read that started after it, so it must not join.
+   * @returns {Promise<void>} settles once the read has written, or been
+   *   superseded; a reader that joined settles with the read it joined. It
+   *   never rejects: a failure is reported in `error`.
    */
   let generation = 0;
-  async function loadRuns() {
+  /** The newest read of the runs while it is in flight: `{sourceId, gen, request}`. */
+  let runsRead = null;
+  function loadRuns({ join = false } = {}) {
     asked.value = true;
     const sourceId = source.value?.id ?? null;
+    if (
+      join &&
+      sourceId != null &&
+      runsRead?.sourceId === sourceId &&
+      runsRead.gen === generation
+    ) {
+      return runsRead.request;
+    }
     const gen = ++generation;
-    const current = () => gen === generation;
     if (sourceId == null) {
       runs.value = [];
       // A failure was about the root that is gone.
@@ -257,10 +279,18 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
       // This read is over, and it owns the flag as much as any other: an
       // in-flight one is now stale and will decline to clear it.
       loading.value = false;
-      return;
+      return Promise.resolve();
     }
-    const keepSteps = [...chosenSteps.value];
-    const keptSingle = single.value?.name ?? "";
+    const entry = { sourceId, gen, request: null };
+    entry.request = readRuns(sourceId, gen).finally(() => {
+      if (runsRead === entry) runsRead = null;
+    });
+    runsRead = entry;
+    return entry.request;
+  }
+
+  async function readRuns(sourceId, gen) {
+    const current = () => gen === generation;
     loading.value = true;
     error.value = "";
     try {
@@ -268,9 +298,6 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
       if (!current()) return;
       runs.value = found;
       reconcile();
-      if (keptSingle && single.value?.name === keptSingle) {
-        chosenSteps.value = keepSteps;
-      }
     } catch (err) {
       if (!current()) return;
       error.value = errorDetail(err) || "Could not read that folder.";
@@ -298,9 +325,29 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
     anchor.value = byJob.get(anchor.value) ?? anchor.value;
   }
 
+  /**
+   * Re-read the training jobs.
+   *
+   * @param {{join?: boolean}} [options] - as for `loadRuns`: `join` shares
+   *   the newest read in flight; a reader that follows a change must not.
+   * @returns {Promise<void>} settles with the read it started or joined. It
+   *   never rejects: a failure is reported in `jobsFailed`.
+   */
   let jobsGeneration = 0;
-  async function loadJobs() {
+  /** The newest read of the jobs while it is in flight: `{gen, request}`. */
+  let jobsRead = null;
+  function loadJobs({ join = false } = {}) {
+    if (join && jobsRead?.gen === jobsGeneration) return jobsRead.request;
     const gen = ++jobsGeneration;
+    const entry = { gen, request: null };
+    entry.request = readJobs(gen).finally(() => {
+      if (jobsRead === entry) jobsRead = null;
+    });
+    jobsRead = entry;
+    return entry.request;
+  }
+
+  async function readJobs(gen) {
     try {
       const found = await listTrainingJobs();
       if (gen !== jobsGeneration) return;
@@ -318,8 +365,9 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
     reconcile();
   }
 
-  function reload() {
-    return Promise.all([loadRuns(), loadJobs()]);
+  /** Both reads; `options` as for `loadRuns`. */
+  function reload(options) {
+    return Promise.all([loadRuns(options), loadJobs(options)]);
   }
 
   /**

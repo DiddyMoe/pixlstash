@@ -1022,11 +1022,13 @@ describe("staying current without moving the ground", () => {
     expect(checked).toEqual(["Foxglove"]);
   });
 
-  // Mount, a folder change, a visibility change and a window focus each start a
-  // read, and none of them cancels the last, so two are in flight whenever one
-  // is slow. Ordering is not promised: the older read can answer last, and what
-  // it carries is another folder's runs - or the same folder's, from before the
-  // run that just finished existed.
+  // A folder change, an import, a run ending and a hand reload each start a
+  // read of their own while an older one may still be out, so two are in
+  // flight whenever one is slow. Ordering is not promised: the older read can
+  // answer last, and what it carries is another folder's runs - or the same
+  // folder's, from before the run that just finished existed. Mount, focus,
+  // visibility and the live poll only want the list as it is, so they share
+  // the read already out instead of adding to them.
   describe("with two reads in flight", () => {
     const SOURCE_B = {
       id: 4,
@@ -1165,26 +1167,229 @@ describe("staying current without moving the ground", () => {
     });
 
     it("keeps the newer listing when the same folder is read twice", async () => {
-      // Two focus events, no folder change: the older read still must not win,
-      // or a run that has just finished importing comes back.
-      const wrapper = await openWith([run()]);
-      const first = deferred();
-      const second = deferred();
+      // A focus read is out when a run is imported, no folder change: the read
+      // after the import starts after it, and the focus read answering last
+      // must not win, or a run that has just been imported comes back.
+      const wrapper = await openWith([run(), run("Foxglove")]);
+      await tick(wrapper, "Clementine");
+      const events = [];
+      const before = deferred();
+      const after = deferred();
       listRuns
-        .mockReturnValueOnce(first.promise)
-        .mockReturnValueOnce(second.promise);
+        .mockImplementationOnce(() => (events.push("list"), before.promise))
+        .mockImplementationOnce(() => (events.push("list"), after.promise));
+      importRun.mockImplementation(async () => {
+        events.push("import");
+        return { run_name: "Clementine", files: [] };
+      });
+
+      window.dispatchEvent(new Event("focus"));
+      await importBtn(wrapper).trigger("click");
+      await settle(wrapper);
+      after.resolve([run("Foxglove")]);
+      await settle(wrapper);
+      before.resolve([run(), run("Foxglove")]);
+      await settle(wrapper);
+
+      expect(events).toEqual(["list", "import", "list"]);
+      expect(wrapper.findAll(".tr-card-name").map((n) => n.text())).toEqual([
+        "Foxglove",
+      ]);
+    });
+
+    it("reads once when a tab switch fires focus and visibilitychange together", async () => {
+      const wrapper = await openWith([run()]);
+      listRuns.mockClear();
+      listTrainingJobs.mockClear();
+      const read = deferred();
+      listRuns.mockReturnValue(read.promise);
+
       window.dispatchEvent(new Event("focus"));
       document.dispatchEvent(new Event("visibilitychange"));
       await wrapper.vm.$nextTick();
 
-      second.resolve([run("Foxglove")]);
+      expect(listRuns).toHaveBeenCalledTimes(1);
+      expect(listTrainingJobs).toHaveBeenCalledTimes(1);
+      read.resolve([run(), run("Foxglove")]);
       await settle(wrapper);
-      first.resolve([run(), run("Foxglove"), run("Hazel")]);
-      await settle(wrapper);
+      expect(wrapper.findAll(".tr-card")).toHaveLength(2);
+    });
 
-      expect(wrapper.findAll(".tr-card-name").map((n) => n.text())).toEqual([
-        "Foxglove",
-      ]);
+    it("reads once when the sidebar and the grid both ask on mount", async () => {
+      const read = deferred();
+      listRuns.mockReturnValue(read.promise);
+      const store = useModelFoldersStore();
+      store.folders = FOLDERS;
+      store.loaded = true;
+
+      useTrainingRunsStore().ensureLoaded();
+      const wrapper = mount(TrainingRuns, globalOpts);
+      mounted.push(wrapper);
+      await wrapper.vm.$nextTick();
+
+      expect(listRuns).toHaveBeenCalledTimes(1);
+      expect(listTrainingJobs).toHaveBeenCalledTimes(1);
+      read.resolve([run()]);
+      await settle(wrapper);
+      expect(wrapper.findAll(".tr-card")).toHaveLength(1);
+    });
+
+    it("asks again on the live poll only once the last read has answered", async () => {
+      // The poll ticks every few seconds while a run trains; a listing slower
+      // than that must not pile a second read on the first.
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+      try {
+        listTrainingJobs.mockResolvedValue([
+          {
+            id: 7,
+            uuid: "abcd1234ef",
+            name: "Clementine",
+            status: "running",
+            run_name: "Clementine_abcd1234",
+            started_at: "2026-10-01T00:01:00Z",
+            created_at: "2026-10-01T00:00:00Z",
+          },
+        ]);
+        const wrapper = await openWith([run("Clementine_abcd1234")]);
+        expect(useTrainingRunsStore().liveCount).toBe(1);
+        listRuns.mockClear();
+        listTrainingJobs.mockClear();
+        const slow = deferred();
+        listRuns.mockReturnValue(slow.promise);
+        const slowJobs = deferred();
+        listTrainingJobs.mockReturnValue(slowJobs.promise);
+
+        vi.advanceTimersByTime(5000);
+        vi.advanceTimersByTime(5000);
+        await wrapper.vm.$nextTick();
+        expect(listRuns).toHaveBeenCalledTimes(1);
+        expect(listTrainingJobs).toHaveBeenCalledTimes(1);
+
+        slow.resolve([run("Clementine_abcd1234")]);
+        slowJobs.resolve([]);
+        await settle(wrapper);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    describe("after a change made while a read is out", () => {
+      const STARTED = "2026-10-01T00:01:00Z";
+      const ENDED = "2026-10-01T02:00:00Z";
+      const live = {
+        id: 7,
+        uuid: "abcd1234ef",
+        name: "Clementine",
+        status: "running",
+        run_name: "Clementine_abcd1234",
+        started_at: STARTED,
+        created_at: "2026-10-01T00:00:00Z",
+      };
+      const ended = { ...live, status: "completed", completed_at: ENDED };
+
+      it("reads the folder again when a run ends", async () => {
+        // The run's last checkpoint is written as it leaves the live set; a
+        // read that left before that must not stand for the folder.
+        listTrainingJobs.mockResolvedValue([live]);
+        const wrapper = await openWith([run("Clementine_abcd1234")]);
+        const events = [];
+        const before = deferred();
+        const after = deferred();
+        listRuns
+          .mockImplementationOnce(() => (events.push("list"), before.promise))
+          .mockImplementationOnce(() => (events.push("list"), after.promise));
+        listTrainingJobs.mockResolvedValue([ended]);
+
+        window.dispatchEvent(new Event("focus"));
+        await settle(wrapper);
+        expect(events).toEqual(["list", "list"]);
+        const finished = run("Clementine_abcd1234");
+        finished.checkpoints.push({
+          filename: "Clementine_abcd1234_000001500.safetensors",
+          step: 1500,
+          size: 1000,
+        });
+        after.resolve([finished]);
+        await settle(wrapper);
+        before.resolve([run("Clementine_abcd1234")]);
+        await settle(wrapper);
+
+        expect(useTrainingRunsStore().runs[0].checkpoints).toHaveLength(3);
+      });
+
+      it("reads the jobs again once Train longer has queued the run", async () => {
+        listTrainingJobs.mockResolvedValue([ended]);
+        listRuns.mockResolvedValue([run("Clementine_abcd1234")]);
+        const store = useModelFoldersStore();
+        store.folders = FOLDERS;
+        store.loaded = true;
+        const wrapper = mount(TrainingRuns, {
+          global: {
+            ...globalOpts.global,
+            stubs: {
+              ...globalOpts.global.stubs,
+              // The real one reads and starts through the API; only its
+              // answer matters here.
+              TrainLongerPopover: {
+                name: "TrainLongerPopover",
+                emits: ["close", "started"],
+                template: "<div class='tl-stub' />",
+              },
+            },
+          },
+        });
+        mounted.push(wrapper);
+        await settle(wrapper);
+        await wrapper.find(".tr-card").trigger("click");
+        await wrapper.find("[data-testid='tr-pill-train-longer']").trigger("click");
+        await settle(wrapper);
+        const popover = wrapper.findComponent({ name: "TrainLongerPopover" });
+        expect(popover.exists()).toBe(true);
+
+        const events = [];
+        const before = deferred();
+        listTrainingJobs
+          .mockImplementationOnce(() => (events.push("list"), before.promise))
+          .mockImplementationOnce(
+            () => (events.push("list"), Promise.resolve([{ ...live, status: "queued" }])),
+          );
+        window.dispatchEvent(new Event("focus"));
+        events.push("started");
+        popover.vm.$emit("started", { id: 7, status: "queued" });
+        await settle(wrapper);
+        before.resolve([ended]);
+        await settle(wrapper);
+
+        expect(events).toEqual(["list", "started", "list"]);
+        expect(useTrainingRunsStore().jobs.map((j) => j.status)).toEqual(["queued"]);
+      });
+
+      it("reads the jobs again on the way back from a run's page", async () => {
+        // The page can stop its run, or train it longer, and the live poll
+        // keeps reading underneath it: what was out when the reader left the
+        // page may predate what they did there.
+        listTrainingJobs.mockResolvedValue([live]);
+        nav.route.query = { run: "abcd1234ef" };
+        const wrapper = await openWith([run("Clementine_abcd1234")]);
+        expect(wrapper.find(".live-stub").exists()).toBe(true);
+        const events = [];
+        const before = deferred();
+        listTrainingJobs
+          .mockImplementationOnce(() => (events.push("list"), before.promise))
+          .mockImplementationOnce(
+            () => (events.push("list"), Promise.resolve([{ ...live, status: "stopped" }])),
+          );
+
+        window.dispatchEvent(new Event("focus"));
+        events.push("stopped on the page");
+        nav.route.query = {};
+        await settle(wrapper);
+        before.resolve([live]);
+        await settle(wrapper);
+
+        expect(events).toEqual(["list", "stopped on the page", "list"]);
+        expect(useTrainingRunsStore().jobs.map((j) => j.status)).toEqual(["stopped"]);
+      });
     });
   });
 
