@@ -25,6 +25,7 @@ import os
 import json
 import random
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -42,6 +43,8 @@ from PIL import Image
 from fastapi.testclient import TestClient
 from io import BytesIO
 from pathlib import Path
+from sqlalchemy import event as sa_event
+from sqlalchemy import insert as sa_insert
 from sqlalchemy import text
 from sqlmodel import Session, delete, select, update
 from urllib.parse import quote
@@ -2496,3 +2499,176 @@ def test_text_search_answers_503_when_its_encoders_failed_to_load(
     ]
     assert any(reason in message for message in warnings), warnings
     assert not any(query in message for message in warnings), warnings
+
+
+# A searched scope larger than SQLite's variable limit as the test below caps it.
+_LARGE_SCOPE_SIZE = 1200
+_OUTSIDE_SCOPE_SIZE = 50
+_CAPPED_VARIABLE_LIMIT = 999
+_HIDDEN_TAG = "test-hidden"
+
+
+def _seed_large_search_scope(server, client, *, with_hidden_tags):
+    """Seed file-less pictures whose text-search order is known in advance.
+
+    The fake SBERT query embedding points along ``ones``; each picture's text
+    embedding is ``ones + t * alternating`` (the two are orthogonal), so its
+    score falls strictly as ``t`` grows. ``t`` is handed out in a shuffled
+    order, so the score order is not the id order. Pictures outside the scope
+    get the smallest ``t`` and so the best scores: a scope that leaked would
+    put them first.
+
+    Every in-scope picture is in one picture set and has a face of one person.
+    With ``with_hidden_tags`` every tenth in-scope picture also carries
+    ``_HIDDEN_TAG``; it is left off otherwise because a tag adds to the score.
+
+    Returns:
+        ``(set_id, character_id, ranked, hidden)``: ``ranked`` lists the
+        in-scope ids best score first, ``hidden`` the ids carrying the tag.
+    """
+    set_resp = client.post("/picture_sets", json={"name": "test-large-scope"})
+    assert set_resp.status_code == 200, set_resp.text
+    set_id = set_resp.json()["picture_set"]["id"]
+    char_resp = client.post("/characters", json={"name": "test-large-scope"})
+    assert char_resp.status_code == 200, char_resp.text
+    character_id = char_resp.json()["character"]["id"]
+
+    in_scope = list(range(1, _LARGE_SCOPE_SIZE + 1))
+    outside = list(
+        range(_LARGE_SCOPE_SIZE + 1, _LARGE_SCOPE_SIZE + _OUTSIDE_SCOPE_SIZE + 1)
+    )
+    ranks = list(range(_LARGE_SCOPE_SIZE))
+    random.Random(20261123).shuffle(ranks)
+    rank_of = dict(zip(in_scope, ranks))
+    ones = np.ones(384, dtype=np.float32)
+    alternating = np.resize(np.array([1.0, -1.0], dtype=np.float32), 384)
+
+    def embedding(t):
+        return (ones + np.float32(t) * alternating).astype(np.float32).tobytes()
+
+    t_of = {pid: 0.1 + 0.8 * rank_of[pid] / _LARGE_SCOPE_SIZE for pid in in_scope}
+    t_of.update(
+        {pid: 0.01 + 0.08 * j / _OUTSIDE_SCOPE_SIZE for j, pid in enumerate(outside)}
+    )
+    hidden = set(in_scope[::10]) if with_hidden_tags else set()
+
+    def seed(session):
+        session.execute(
+            sa_insert(Picture),
+            [
+                {
+                    "id": pid,
+                    "deleted": False,
+                    "file_path": f"/home/me/pictures/fake-{pid}.png",
+                    "text_embedding": embedding(t_of[pid]),
+                }
+                for pid in in_scope + outside
+            ],
+        )
+        session.execute(
+            sa_insert(PictureSetMember),
+            [{"set_id": set_id, "picture_id": pid} for pid in in_scope],
+        )
+        session.execute(
+            sa_insert(Face),
+            [{"picture_id": pid, "character_id": character_id} for pid in in_scope],
+        )
+        if hidden:
+            session.execute(
+                sa_insert(Tag),
+                [{"picture_id": pid, "tag": _HIDDEN_TAG} for pid in sorted(hidden)],
+            )
+        session.commit()
+
+    server.vault.db.run_task(seed)
+    ranked = sorted(in_scope, key=rank_of.__getitem__)
+    return set_id, character_id, ranked, hidden
+
+
+@pytest.mark.parametrize(
+    "variant", ["set", "set-sorted", "person", "people", "hidden-tags"]
+)
+def test_text_search_over_a_scope_beyond_the_sqlite_variable_limit(
+    server, client, monkeypatch, variant
+):
+    """A text search scoped to more pictures than SQLite will bind succeeds.
+
+    Each variant reaches a different place on the search path that used to
+    bind one parameter per picture: the set scope inside the search itself, the
+    sorted re-read of the results, a person's pictures, several people's
+    pictures, and the hidden-tags check on the results. The search is run once
+    on the normal connection limit and once with every new connection capped
+    below the scope size; both must answer the same rows, in the same order,
+    with the same scores, and that order must be the one the seeded embeddings
+    define.
+    """
+    vault = server.vault
+    planner, runner = vault._work_planner, vault._task_runner
+    # The seeded pictures have no files: keep background work off them.
+    for worker in (planner, runner):
+        if worker is not None:
+            worker.stop()
+    engine = vault.db._engine
+
+    def _cap_variables(dbapi_conn, _record):
+        dbapi_conn.setlimit(
+            sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, _CAPPED_VARIABLE_LIMIT
+        )
+
+    try:
+        monkeypatch.setattr(
+            vault,
+            "generate_text_embedding",
+            lambda text: np.full(384, 0.5, dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            vault,
+            "generate_clip_text_embedding",
+            lambda text: np.full(512, 0.25, dtype=np.float32),
+        )
+        set_id, character_id, ranked, hidden = _seed_large_search_scope(
+            server, client, with_hidden_tags=variant == "hidden-tags"
+        )
+        params = {"query": "test query", "threshold": 0.0}
+        expected = ranked
+        if variant == "set":
+            params["set_id"] = set_id
+        elif variant == "set-sorted":
+            # No picture has a size, so the sort falls through to its id
+            # tie-break: ascending ids, unlike the score order.
+            params.update(set_id=set_id, sort="IMAGE_SIZE", descending="false")
+            expected = sorted(ranked)
+        elif variant == "person":
+            params["character_id"] = character_id
+        elif variant == "people":
+            params.update(character_ids=character_id, character_mode="union")
+        else:
+            resp = client.patch("/users/me/config", json={"hidden_tags": [_HIDDEN_TAG]})
+            assert resp.status_code == 200, resp.text
+            params.update(set_id=set_id, apply_tag_filter="true")
+            expected = [pid for pid in ranked if pid not in hidden]
+            assert hidden and len(expected) > _CAPPED_VARIABLE_LIMIT
+
+        def search():
+            resp = client.get("/pictures/search", params=params)
+            assert resp.status_code == 200, resp.text
+            return [(row["id"], row["likeness_score"]) for row in resp.json()]
+
+        uncapped = search()
+        assert [pid for pid, _ in uncapped] == expected
+
+        sa_event.listen(engine, "connect", _cap_variables)
+        engine.dispose()
+        try:
+            capped = search()
+        finally:
+            sa_event.remove(engine, "connect", _cap_variables)
+            engine.dispose()
+        assert capped == uncapped
+    finally:
+        if variant == "hidden-tags":
+            resp = client.patch("/users/me/config", json={"hidden_tags": []})
+            assert resp.status_code == 200, resp.text
+        for worker in (runner, planner):
+            if worker is not None:
+                worker.start()

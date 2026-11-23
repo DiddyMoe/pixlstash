@@ -6,7 +6,7 @@ import numpy as np
 from datetime import datetime
 
 from enum import Enum, auto, IntEnum
-from sqlalchemy import Float, Index, String, desc, func, or_, text
+from sqlalchemy import Float, Index, Select, String, desc, func, or_, text
 from sqlalchemy.orm import aliased, load_only, selectinload
 from sqlalchemy.types import LargeBinary
 from sqlmodel import (
@@ -792,8 +792,22 @@ class Picture(SQLModel, table=True):
         """
         if candidate_ids is not None and not candidate_ids:
             return []
-        # Imported lazily to avoid a circular import (predicate_filter imports Picture).
+        # Imported lazily to avoid a circular import: predicate_filter imports
+        # Picture, and the utils.service package imports export_utils, which
+        # imports Picture.
         from pixlstash.utils.query.predicate_filter import PredicateFilter
+        from pixlstash.utils.service.scope_table import scope_id_subquery
+
+        # A scope can be a whole picture set or person, more ids than SQLite
+        # binds in one statement, so it is read from a temp table instead. Both
+        # clauses below use the same table.
+        candidate_scope = (
+            scope_id_subquery(
+                session, candidate_ids, name="_pixlstash_search_candidate_ids"
+            )
+            if candidate_ids
+            else None
+        )
 
         # 1. SBERT embedding for tag search (Text-to-Text)
         if query_embedding is None:
@@ -820,8 +834,8 @@ class Picture(SQLModel, table=True):
             ).label("min_tag_dist"),
         ).group_by(Tag.picture_id)
 
-        if candidate_ids:
-            tag_query = tag_query.where(Tag.picture_id.in_(candidate_ids))
+        if candidate_scope is not None:
+            tag_query = tag_query.where(Tag.picture_id.in_(candidate_scope))
 
         tag_subq = tag_query.subquery()
 
@@ -914,8 +928,8 @@ class Picture(SQLModel, table=True):
             for rel_attr in rel_attrs:
                 stmt = stmt.options(selectinload(rel_attr))
 
-        if candidate_ids:
-            stmt = stmt.where(cls.id.in_(candidate_ids))
+        if candidate_scope is not None:
+            stmt = stmt.where(cls.id.in_(candidate_scope))
 
         # Lifecycle + intrinsic predicates via the shared compiler.  semantic_search
         # carries a subset of the vocabulary (no hidden-tags / confidence / face /
@@ -1141,7 +1155,9 @@ class Picture(SQLModel, table=True):
                     )
                 continue
             if hasattr(cls, attr):
-                if isinstance(value, list):
+                # A SELECT (e.g. ``scope_id_subquery``) is a membership test
+                # like a list, without binding one parameter per id.
+                if isinstance(value, (list, Select)):
                     query = query.where(getattr(cls, attr).in_(value))
                 else:
                     query = query.where(getattr(cls, attr) == value)
