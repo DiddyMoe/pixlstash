@@ -13,10 +13,16 @@ is the single place that knows the on-disk format.
 
 Streaming (chunked) compress/decompress is used so a multi-GB snapshot never
 has to be held in memory.
+
+An archive is published all or nothing: it is written to a private temp file
+beside its final name, flushed to disk, and renamed into place, so a crash or a
+cancel never leaves a truncated archive under the name a snapshot row points at.
 """
 
 import os
 import shutil
+import tempfile
+from typing import BinaryIO, Callable, Optional
 
 import zstandard
 
@@ -80,15 +86,68 @@ def is_compressed(path: str) -> bool:
     return path.endswith(".zst")
 
 
-def compress_snapshot(src_sqlite_path: str, dst_zst_path: str) -> int:
+def write_file_atomically(dst_path: str, write: Callable[[BinaryIO], object]) -> None:
+    """Write *dst_path* through a private temp file and publish it with a rename.
+
+    *write* fills a temp file created (mode 0600) in the destination's
+    directory. The temp file is flushed and fsynced, renamed over *dst_path*,
+    and the directory is fsynced so the rename survives a power loss. If
+    *write* raises, or anything before the rename fails, the temp file is
+    removed and *dst_path* is left exactly as it was.
+
+    Args:
+        dst_path: Final path of the file.
+        write: Callable that writes the full contents to the binary handle it
+            is given; what it returns is ignored. It may raise to abandon the
+            write.
+
+    Raises:
+        OSError: If the temp file cannot be written, renamed or synced.
+        Exception: Whatever *write* raises.
+    """
+    directory = os.path.dirname(dst_path) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(dst_path)}.", suffix=".partial", dir=directory
+    )
+    published = False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            write(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, dst_path)
+        published = True
+        _fsync_directory(directory)
+    finally:
+        if not published:
+            try:
+                os.unlink(tmp_path)
+            except OSError as exc:
+                logger.warning(
+                    "snapshot_compression: could not remove the unpublished temp "
+                    "file %s for %s; it stays on disk until removed by hand: %s",
+                    tmp_path,
+                    dst_path,
+                    exc,
+                )
+
+
+def compress_snapshot(
+    src_sqlite_path: str,
+    dst_zst_path: str,
+    check_cancelled: Optional[Callable[[], None]] = None,
+) -> int:
     """Compress a plain SQLite file to a zstd archive.
 
     Streams the source through zstd so the whole DB is never buffered in
-    memory.
+    memory, and publishes the archive with :func:`write_file_atomically`, so
+    *dst_zst_path* either holds the complete archive or is left untouched.
 
     Args:
         src_sqlite_path: Path to the source ``.sqlite`` file.
         dst_zst_path: Destination path for the ``.sqlite.zst`` archive.
+        check_cancelled: Optional callable polled before each chunk is read.
+            It raises to abandon the compression; nothing is published then.
 
     Returns:
         Size of the written archive in bytes.
@@ -98,8 +157,21 @@ def compress_snapshot(src_sqlite_path: str, dst_zst_path: str) -> int:
         zstandard.ZstdError: If compression fails.
     """
     cctx = zstandard.ZstdCompressor(level=_COMPRESSION_LEVEL)
-    with open(src_sqlite_path, "rb") as src, open(dst_zst_path, "wb") as dst:
-        cctx.copy_stream(src, dst, read_size=_CHUNK_SIZE, write_size=_CHUNK_SIZE)
+
+    def _write_archive(dst: BinaryIO) -> None:
+        with (
+            open(src_sqlite_path, "rb") as src,
+            cctx.stream_writer(dst, write_size=_CHUNK_SIZE, closefd=False) as writer,
+        ):
+            while True:
+                if check_cancelled is not None:
+                    check_cancelled()
+                chunk = src.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+                writer.write(chunk)
+
+    write_file_atomically(dst_zst_path, _write_archive)
     size = os.path.getsize(dst_zst_path)
     logger.info(
         "snapshot_compression: compressed %s (%d bytes) → %s (%d bytes)",
@@ -153,3 +225,22 @@ def materialize_snapshot(src_path: str, dst_sqlite_path: str) -> None:
         decompress_snapshot(src_path, dst_sqlite_path)
     else:
         shutil.copy2(src_path, dst_sqlite_path)
+
+
+def _fsync_directory(path: str) -> None:
+    """Flush a directory entry change (a rename) to disk.
+
+    ``os.open`` cannot open a directory on Windows, so this is a no-op there,
+    as in the other publish helpers (``library_backup_service``,
+    ``portable_identity``).
+
+    Args:
+        path: Directory whose entries changed.
+    """
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

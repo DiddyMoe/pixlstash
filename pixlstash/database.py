@@ -1419,20 +1419,9 @@ class VaultDatabase:
             select(Picture).where(Picture.quality > 0.9)
         ).all())
         """
-        # Hold the read side of the engine lock for the whole read so the live
-        # engine cannot be disposed/swapped out from under an open session
-        # during a restore DB-file swap.
-        # Reads never touch the writer, so a FAILED writer still serves them.
-        try:
-            with self._engine_rwlock.read():
-                if self._state not in _READABLE_STATES or self._engine is None:
-                    raise DatabaseUnavailableError("VaultDatabase is closed.")
-                with Session(self._engine) as session:
-                    return func(session, *args, **kwargs)
-        finally:
-            # close() timed out waiting for reads: the last one out releases.
-            if self._release_pending:
-                self._release_engine_when_idle(timeout=0)
+        with self.engine_read_access():
+            with Session(self._engine) as session:
+                return func(session, *args, **kwargs)
 
     @contextmanager
     def exclusive_engine_access(self):
@@ -1445,6 +1434,34 @@ class VaultDatabase:
         """
         with self._engine_rwlock.write():
             yield
+
+    @contextmanager
+    def engine_read_access(self):
+        """Hold the live database file in place for a read off the writer.
+
+        Takes the read side of the engine lock, so the restore DB-file swap
+        (``exclusive_engine_access``) and ``close()``'s engine release wait for
+        the block to end, and refuses with ``DatabaseUnavailableError`` once
+        the database is closing, closed or its engine is gone. Reads never
+        touch the writer, so a FAILED writer still serves them.
+        ``run_immediate_read_task`` reads through it; the snapshot capture
+        holds it while it copies the file on a connection of its own.
+
+        The block must not wait on the writer: a restore swap queued behind it
+        would then wait on the block while the block waits on the swap.
+
+        Raises:
+            DatabaseUnavailableError: If the database no longer serves reads.
+        """
+        try:
+            with self._engine_rwlock.read():
+                if self._state not in _READABLE_STATES or self._engine is None:
+                    raise DatabaseUnavailableError("VaultDatabase is closed.")
+                yield
+        finally:
+            # close() timed out waiting for reads: the last one out releases.
+            if self._release_pending:
+                self._release_engine_when_idle(timeout=0)
 
     def writer_status(self) -> dict:
         """A snapshot of the writer's health for the owner's progress view.

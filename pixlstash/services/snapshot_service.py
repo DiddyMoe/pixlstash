@@ -1,8 +1,10 @@
 """Service layer for vault snapshot creation, listing, and GFS-style retention.
 
-The SnapshotService creates full SQLite snapshots via ``VACUUM INTO``, writes
-a JSON manifest sidecar, records a ``Snapshot`` row in the live DB, and prunes
-old snapshots according to the GFS retention constants.
+The SnapshotService copies the live database with ``VACUUM INTO`` on a
+read-only connection of its own, off the writer, prepares and compresses the
+copy, publishes it with JSON manifest and hash sidecars, records a
+``Snapshot`` row in the live DB, and prunes old snapshots according to the
+GFS retention constants.
 """
 
 import json
@@ -10,23 +12,33 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
-from sqlmodel import select
+from sqlalchemy import func, text
+from sqlmodel import Session, select
 
-from pixlstash.database import DBPriority, _compute_picture_metadata_hash
+from pixlstash.database import (
+    SQLITE_BUSY_TIMEOUT_S,
+    DBPriority,
+    _compute_picture_metadata_hash,
+)
 from pixlstash.db_models import Character, Picture, PictureSet, Project
 from pixlstash.db_models.snapshot import Snapshot
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.portable_identity import sanitize_vault_file
+from pixlstash.services.restore.schema_upgrade import snapshot_engine
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.snapshot_compression import (
     COMPRESSED_SUFFIX,
     compress_snapshot,
     snapshot_scratch_dir,
+    write_file_atomically,
 )
+from pixlstash.utils.sqlite_uri import sqlite_file_uri
 
 if TYPE_CHECKING:
     from pixlstash.vault import Vault
@@ -47,12 +59,93 @@ GFS_KEEP_OPPORTUNISTIC: int = 5
 # Minimum hours between opportunistic snapshots.
 OPPORTUNISTIC_MIN_HOURS: float = 1.0
 
+# SQLite virtual-machine instructions the capture runs between two looks at its
+# cancellation. The probe on a 20 000-row database saw about five per row, so
+# a cancel is seen within a few hundred rows' worth of copying.
+_CAPTURE_PROGRESS_OPS = 1000
+
+# How long ``cancel_inflight`` waits for cancelled snapshots to clean up.
+_CANCEL_WAIT_S = 10.0
+
+# How often a snapshot waiting to register behind a restore checks whether it
+# has been cancelled.
+_REGISTRATION_POLL_S = 0.1
+
+
+class SnapshotCancelledError(RuntimeError):
+    """Raised by ``create_snapshot`` when it was cancelled before it finished.
+
+    Nothing of the cancelled snapshot is left: no archive, no sidecars, no
+    scratch copy and no ``Snapshot`` row.
+    """
+
+
+class SnapshotCancellation:
+    """The cancel flag one ``create_snapshot`` call checks while it works.
+
+    ``cancel()`` may be called from any thread. The capture asks
+    ``should_stop`` from SQLite's progress handler while it copies the
+    database; the later steps call ``raise_if_cancelled`` between steps and
+    between compression chunks.
+
+    Attributes:
+        _event: Set once the snapshot is to stop.
+    """
+
+    def __init__(self, event: Optional[threading.Event] = None) -> None:
+        """Initialise the flag.
+
+        Args:
+            event: The event that is the flag. A task passes its own cancel
+                event, so cancelling the task cancels its snapshot, even a
+                cancel that arrives before the snapshot starts. A fresh, unset
+                one when omitted.
+        """
+        self._event = event if event is not None else threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether ``cancel`` has been called or the event is otherwise set."""
+        return self._event.is_set()
+
+    def cancel(self) -> None:
+        """Ask the snapshot to stop at its next check."""
+        self._event.set()
+
+    def should_stop(self) -> bool:
+        """Return True once the capture should abandon its copy.
+
+        Called from SQLite's progress handler during ``VACUUM INTO``.
+
+        Returns:
+            Whether the snapshot has been cancelled.
+        """
+        return self.cancelled
+
+    def raise_if_cancelled(self) -> None:
+        """Raise if the snapshot has been cancelled.
+
+        Raises:
+            SnapshotCancelledError: If ``cancel`` has been called.
+        """
+        if self.cancelled:
+            raise SnapshotCancelledError(
+                "The snapshot was cancelled before it finished."
+            )
+
 
 class SnapshotService:
     """Creates and manages vault-wide SQLite snapshots (snapshots).
 
     Attributes:
         _vault: Back-reference to the owning Vault.
+        _registration_lock: Held while a snapshot registers its row, and by a
+            full restore from its safety snapshot until it has reinserted the
+            snapshot index (``hold_registrations``). Reentrant, because the
+            restore's own safety snapshot registers on the same thread.
+        _inflight_cond: Guards ``_inflight`` and is notified when it shrinks.
+        _inflight: The cancellation of every ``create_snapshot`` call still
+            running, so ``cancel_inflight`` can stop them.
     """
 
     def __init__(self, vault: "Vault") -> None:
@@ -62,33 +155,63 @@ class SnapshotService:
             vault: The owning Vault instance.
         """
         self._vault = vault
+        self._registration_lock = threading.RLock()
+        self._inflight_cond = threading.Condition()
+        self._inflight: set[SnapshotCancellation] = set()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def create_snapshot(self, kind: str, label: Optional[str] = None) -> Snapshot:
+    def create_snapshot(
+        self,
+        kind: str,
+        label: Optional[str] = None,
+        cancellation: Optional[SnapshotCancellation] = None,
+    ) -> Snapshot:
         """Create a full SQLite snapshot of the live vault database.
 
-        The snapshot is written to
-        ``<vault_root>/snapshots/YYYY/MM/DD/<uuid>.sqlite`` via
-        ``VACUUM INTO``.  A JSON manifest sidecar is written alongside it
-        with resource counts and id-lists.  The ``Snapshot`` row is then
-        inserted in the live DB, GFS retention is applied, and a
-        ``SNAPSHOT_CREATED`` event is emitted.
+        Only the ``Snapshot`` row insert runs on the writer; everything else
+        runs on the calling thread while imports and edits carry on:
+
+        1. ``_capture`` copies the live database into a scratch file with
+           ``VACUUM INTO``, a single read transaction, so the copy is the
+           database exactly as it was committed when the copy began.
+        2. The likeness pipeline tables are emptied in the copy, the manifest
+           and per-picture hash map are read from it, and
+           ``sanitize_vault_file`` scrubs its identity data.
+        3. The copy is compressed to
+           ``<vault_root>/snapshots/YYYY/MM/DD/<uuid>.sqlite.zst`` and the
+           archive and both JSON sidecars are each published by rename, so
+           none is ever seen half-written.
+        4. The row is inserted under the registration lock (see
+           ``hold_registrations``), GFS retention is applied, and a
+           ``SNAPSHOT_CREATED`` event is emitted.
+
+        Nothing is left behind by a failure or a cancel: the scratch copy is
+        always removed, and the archive and sidecars are removed again unless
+        their row was committed.
 
         Args:
             kind: One of ``'DAILY'``, ``'WEEKLY'``, ``'MONTHLY'``,
                 ``'MANUAL'``, or ``'OPPORTUNISTIC'``.
             label: Optional user label (only meaningful for MANUAL
                 snapshots).
+            cancellation: The flag that stops this snapshot; a task that runs
+                it passes one so it can cancel it. ``cancel_inflight`` sets it
+                too. A fresh one is used when omitted.
 
         Returns:
             The newly created ``Snapshot`` row.
 
         Raises:
-            RuntimeError: If the vault database engine is unavailable.
+            SnapshotCancelledError: If the snapshot was cancelled before its
+                row was registered.
+            DatabaseUnavailableError: If the vault database is closing or
+                closed.
         """
+        if cancellation is None:
+            cancellation = SnapshotCancellation()
         vault_root = self._vault.image_root
         db = self._vault.db
 
@@ -109,76 +232,113 @@ class SnapshotService:
         rel_hashes = os.path.join(rel_dir, f"{snapshot_uuid}.hashes.json")
         abs_hashes = os.path.join(vault_root, rel_hashes)
 
-        # --- VACUUM + manifest + Snapshot row (one atomic writer task) --------
-        # The VACUUM INTO, the manifest read (resource counts), and the Snapshot
-        # INSERT all run in a single writer-thread task so they describe one
-        # consistent point-in-time: no other write can interleave between the
-        # snapshot file and the manifest it is paired with.  ``_vacuum_into``
-        # uses its own dedicated connection (see its docstring) but still runs
-        # inside this writer task, so the serialisation guarantee holds.
         logger.info(
             "SnapshotService: creating %s snapshot → %s",
             kind,
             rel_snapshot,
         )
+        # Set on the writer the moment the row is committed: from then on the
+        # files belong to the row and a later failure must not remove them.
+        committed = threading.Event()
 
-        def _create_and_record(session):
-            # VACUUM the live DB into a scratch .sqlite, drop the live
-            # pipeline-state tables, then compress the archive to .sqlite.zst.
-            # The expensive GPU-regenerated blobs (CLIP image/text embeddings,
-            # InsightFace face features) are deliberately KEPT now - zstd makes
-            # carrying them affordable (~3x smaller) so a restore no longer
-            # triggers a full re-embedding / re-detection pass. Only the .zst
-            # is retained; the scratch file is always removed.
-            tmp_dir = tempfile.mkdtemp(
-                prefix="pixlstash_snapshot_", dir=snapshot_scratch_dir(vault_root)
-            )
+        # The scratch copy is the full database. The expensive GPU-regenerated
+        # blobs (CLIP image/text embeddings, InsightFace face features) are
+        # deliberately KEPT - zstd makes carrying them affordable (~3x
+        # smaller) so a restore does not trigger a full re-embedding /
+        # re-detection pass. Only the .zst is retained.
+        tmp_dir = tempfile.mkdtemp(
+            prefix="pixlstash_snapshot_", dir=snapshot_scratch_dir(vault_root)
+        )
+        try:
+            with self._inflight_cond:
+                self._inflight.add(cancellation)
             tmp_sqlite = os.path.join(tmp_dir, "snapshot.sqlite")
-            try:
-                self._vacuum_into(tmp_sqlite)
-                self._prepare_snapshot_for_archive(tmp_sqlite)
-                sanitize_vault_file(tmp_sqlite)
-                byte_size = compress_snapshot(tmp_sqlite, abs_snapshot)
-                if os.name != "nt":
-                    os.chmod(abs_snapshot, 0o600)
-            finally:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
-            manifest, picture_hashes = self._build_manifest(session)
+            self._capture(tmp_sqlite, cancellation)
+            self._checkpoint_after_capture()
+            cancellation.raise_if_cancelled()
+            self._strip_pipeline_tables(tmp_sqlite)
+            # Read before the identity scrub, as the live database was before:
+            # a hash computed here digests what the live row held.
+            manifest, picture_hashes = self._build_manifest(tmp_sqlite)
             manifest["snapshot_uuid"] = snapshot_uuid
             manifest["kind"] = kind
             manifest["created_at"] = now.isoformat()
-
-            with open(abs_manifest, "w", encoding="utf-8") as _fh:
-                json.dump(manifest, _fh, indent=2)
-
+            cancellation.raise_if_cancelled()
+            sanitize_vault_file(tmp_sqlite)
+            cancellation.raise_if_cancelled()
+            byte_size = compress_snapshot(
+                tmp_sqlite,
+                abs_snapshot,
+                check_cancelled=cancellation.raise_if_cancelled,
+            )
+            manifest_json = json.dumps(manifest, indent=2).encode("utf-8")
+            write_file_atomically(abs_manifest, lambda fh: fh.write(manifest_json))
             # Hash-map sidecar (separate so the list endpoint's manifest reads
             # stay lean). compact JSON - no indent - to keep it small.
-            with open(abs_hashes, "w", encoding="utf-8") as _fh:
-                json.dump(picture_hashes, _fh, separators=(",", ":"))
-
-            cp = Snapshot(
-                kind=kind,
-                created_at=now,
-                relative_path=rel_snapshot,
-                manifest_relative_path=rel_manifest,
-                byte_size=byte_size,
-                picture_count=manifest.get("picture_count", 0),
-                schema_version=manifest.get("schema_version", ""),
-                label=label,
-                # Stamped because ``sanitize_vault_file`` above already scrubbed
-                # the scratch database this archive was compressed from. Marking
-                # it here is what makes NULL mean exactly one thing: a legacy
-                # archive written before the hub, which the background scrub
-                # (MissingSnapshotIdentityScrubFinder) still owes work to.
-                identity_scrubbed_at=now,
+            hashes_json = json.dumps(picture_hashes, separators=(",", ":")).encode(
+                "utf-8"
             )
-            session.add(cp)
-            session.commit()
-            session.refresh(cp)
-            return cp
+            write_file_atomically(abs_hashes, lambda fh: fh.write(hashes_json))
 
-        snapshot = db.run_task(_create_and_record, priority=DBPriority.IMMEDIATE)
+            def _record(session):
+                # Checked again here, on the writer: a cancel that lands while
+                # this insert waits behind other writer work must still win.
+                cancellation.raise_if_cancelled()
+                cp = Snapshot(
+                    kind=kind,
+                    created_at=now,
+                    relative_path=rel_snapshot,
+                    manifest_relative_path=rel_manifest,
+                    byte_size=byte_size,
+                    picture_count=manifest.get("picture_count", 0),
+                    schema_version=manifest.get("schema_version", ""),
+                    label=label,
+                    # Stamped because ``sanitize_vault_file`` already scrubbed
+                    # the scratch copy this archive was compressed from. Marking
+                    # it here is what makes NULL mean exactly one thing: a
+                    # legacy archive written before the hub, which the
+                    # background scrub (MissingSnapshotIdentityScrubFinder)
+                    # still owes work to.
+                    identity_scrubbed_at=now,
+                )
+                session.add(cp)
+                session.commit()
+                committed.set()
+                session.refresh(cp)
+                return cp
+
+            self._acquire_registration(cancellation)
+            try:
+                cancellation.raise_if_cancelled()
+                snapshot = db.run_task(_record, priority=DBPriority.IMMEDIATE)
+            finally:
+                self._registration_lock.release()
+        except Exception as exc:
+            if committed.is_set():
+                logger.error(
+                    "SnapshotService: %s snapshot %s failed after its row was "
+                    "committed; its files are kept: %s",
+                    kind,
+                    rel_snapshot,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "SnapshotService: %s snapshot %s not created; removing what "
+                    "it wrote: %s",
+                    kind,
+                    rel_snapshot,
+                    exc,
+                )
+                self._remove_unregistered_files(
+                    (abs_snapshot, abs_manifest, abs_hashes)
+                )
+            raise
+        finally:
+            self._remove_scratch_dir(tmp_dir)
+            with self._inflight_cond:
+                self._inflight.discard(cancellation)
+                self._inflight_cond.notify_all()
 
         # --- GFS retention ------------------------------------------------
         self._apply_gfs_retention(now)
@@ -200,6 +360,51 @@ class SnapshotService:
             snapshot.picture_count,
         )
         return snapshot
+
+    def cancel_inflight(self, timeout: float = _CANCEL_WAIT_S) -> bool:
+        """Cancel every snapshot being created and wait for them to end.
+
+        Each stops at its next check (SQLite's progress handler while it
+        copies, between steps and compression chunks after), removes what it
+        wrote and raises ``SnapshotCancelledError``. ``Vault.stop`` calls this
+        before it stops the workers and closes the database. A snapshot
+        started after this call is not affected.
+
+        Args:
+            timeout: Seconds to wait for the cancelled snapshots to end.
+
+        Returns:
+            True if none is still running, False if the wait timed out.
+        """
+        with self._inflight_cond:
+            for cancellation in self._inflight:
+                cancellation.cancel()
+            finished = self._inflight_cond.wait_for(
+                lambda: not self._inflight, timeout=timeout
+            )
+            still_running = len(self._inflight)
+        if not finished:
+            logger.warning(
+                "SnapshotService: %d cancelled snapshot(s) still running after "
+                "%.1f s; each removes its files when it reaches its next check",
+                still_running,
+                timeout,
+            )
+        return finished
+
+    @contextmanager
+    def hold_registrations(self):
+        """Hold off every snapshot's row registration for the block.
+
+        A full restore holds this from its safety snapshot until it has put
+        the snapshot index back into the restored database, so a snapshot
+        that finishes meanwhile registers its row in the restored database
+        rather than in the one the swap discards. Reentrant: the restore's own
+        safety snapshot registers on the same thread. Capture never takes it,
+        so the lock order stays registration lock, then engine lock.
+        """
+        with self._registration_lock:
+            yield
 
     def list_snapshots(self) -> list[Snapshot]:
         """Return all snapshot rows ordered by creation time (newest first).
@@ -424,8 +629,6 @@ class SnapshotService:
             Schema version string, or empty string on failure.
         """
         try:
-            from sqlalchemy import text
-
             return self._vault.db.run_immediate_read_task(
                 lambda session: (
                     session.exec(
@@ -476,47 +679,132 @@ class SnapshotService:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _vacuum_into(self, abs_snapshot: str) -> None:
-        """Write a clean copy of the live DB to *abs_snapshot* via ``VACUUM INTO``.
+    def _capture(self, dst_sqlite: str, cancellation: SnapshotCancellation) -> None:
+        """Copy the live database to *dst_sqlite* with ``VACUUM INTO``, off the writer.
 
-        Runs on a dedicated short-lived SQLite connection that is closed in a
-        ``finally`` - NOT the writer session's pooled connection.  SQLite keeps
-        an OS file handle on the VACUUM INTO *destination* alive on whichever
-        connection issued the statement until that connection is closed.  The
-        writer session's connection lives in the engine pool for the whole
-        process lifetime, so issuing VACUUM INTO on it left the freshly-written
-        snapshot file open indefinitely; Windows then refuses to delete it
-        (``WinError 32``), which is why ``shutil.rmtree`` of the snapshots dir
-        failed in CI.  POSIX allows unlinking an open file, so this only ever
-        bit Windows.  A dedicated connection releases the handle immediately on
-        ``close()``.
+        The copy is consistent although writes carry on: ``VACUUM INTO`` reads
+        the source in one read transaction, and in WAL mode a reader sees the
+        database as committed when that transaction began, whatever the writer
+        commits meanwhile (https://sqlite.org/lang_vacuum.html,
+        https://sqlite.org/wal.html). The online backup API is not used: it
+        restarts whenever another connection writes the source
+        (https://sqlite.org/backup.html), and the writer always is one.
 
-        The caller already runs this inside the single-threaded writer task, so
-        reading the live DB on a second connection cannot race a concurrent
-        write, and WAL mode lets that read observe all committed rows.
+        The read side of the engine lock is held throughout, so the restore
+        file swap and ``VaultDatabase.close`` wait for the copy to end, and a
+        closing or closed database refuses it. The connection is read-only,
+        its own, and closed before the lock is released: SQLite keeps a
+        handle on the ``VACUUM INTO`` destination until its connection
+        closes, and Windows will not delete a file that is still open.
+
+        A progress handler polls *cancellation*; once it says stop, SQLite
+        aborts the statement (https://sqlite.org/c3ref/progress_handler.html).
 
         Args:
-            abs_snapshot: Absolute path of the snapshot file to create.
-        """
-        db_path = self._vault.db._db_path
-        escaped = abs_snapshot.replace("'", "''")
-        # isolation_level=None keeps the connection in autocommit so VACUUM INTO
-        # is not wrapped in an implicit transaction (SQLite forbids VACUUM inside
-        # an open transaction).
-        conn = sqlite3.connect(db_path, isolation_level=None)
-        try:
-            conn.execute(f"VACUUM INTO '{escaped}'")
-        finally:
-            conn.close()
+            dst_sqlite: Scratch path for the copy; must not exist yet.
+            cancellation: The flag that abandons the copy.
 
-    # Picture columns NULLed before archiving a snapshot. Now EMPTY: the
-    # CLIP image/text embeddings and the cheap derived scores used to be
-    # stripped (and NULL-reset on restore) to save disk, but that forced a
-    # full GPU re-embedding pass on every restore. They are now KEPT inside
-    # the snapshot and the whole archive is zstd-compressed instead, so a
-    # restore comes back fully populated. Left as a tuple so the stripping
-    # loop below stays a no-op rather than special-casing the empty case.
-    _STRIP_PICTURE_COLUMNS: tuple[str, ...] = ()
+        Raises:
+            SnapshotCancelledError: If the copy was abandoned on a cancel.
+            DatabaseUnavailableError: If the database no longer serves reads.
+            sqlite3.Error: If the copy fails.
+        """
+        db = self._vault.db
+        with db.engine_read_access():
+            # isolation_level=None keeps the connection in autocommit: SQLite
+            # refuses VACUUM inside an open transaction.
+            conn = sqlite3.connect(
+                sqlite_file_uri(db._db_path, read_only=True),
+                uri=True,
+                timeout=SQLITE_BUSY_TIMEOUT_S,
+                isolation_level=None,
+            )
+            try:
+                conn.set_progress_handler(
+                    lambda: 1 if cancellation.should_stop() else 0,
+                    _CAPTURE_PROGRESS_OPS,
+                )
+                conn.execute("VACUUM INTO ?", (dst_sqlite,))
+            except sqlite3.OperationalError as exc:
+                if cancellation.cancelled:
+                    raise SnapshotCancelledError(
+                        "The snapshot was cancelled while it copied the database."
+                    ) from exc
+                raise
+            finally:
+                conn.close()
+
+    def _checkpoint_after_capture(self) -> None:
+        """Let the WAL be reused from the start after the capture's long read.
+
+        While the capture's read transaction was open, no checkpoint could
+        move the WAL back to its start past that reader, so the WAL grew with
+        every write made meanwhile (https://sqlite.org/wal.html). One PASSIVE
+        checkpoint through the writer copies those frames into the database so
+        the next writes reuse the file. PASSIVE never waits on readers.
+        """
+        busy, log_frames, checkpointed = self._vault.db.run_task(
+            lambda session: session.exec(text("PRAGMA wal_checkpoint(PASSIVE)")).one(),
+            priority=DBPriority.IMMEDIATE,
+        )
+        logger.debug(
+            "SnapshotService: checkpoint after capture: busy=%s, %s of %s WAL "
+            "frames checkpointed",
+            busy,
+            checkpointed,
+            log_frames,
+        )
+
+    def _acquire_registration(self, cancellation: SnapshotCancellation) -> None:
+        """Take the registration lock, giving up if the snapshot is cancelled.
+
+        A restore holds the lock until it has reinserted the snapshot index,
+        which can take a while; checking the cancellation while waiting lets
+        ``cancel_inflight`` end a snapshot queued behind it.
+
+        Raises:
+            SnapshotCancelledError: If cancelled before the lock was taken.
+        """
+        while not self._registration_lock.acquire(timeout=_REGISTRATION_POLL_S):
+            cancellation.raise_if_cancelled()
+
+    @staticmethod
+    def _remove_unregistered_files(paths) -> None:
+        """Remove the archive and sidecars of a snapshot whose row never committed.
+
+        Args:
+            paths: Absolute paths; those not written yet are skipped.
+        """
+        for path in paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning(
+                    "SnapshotService: could not remove %s, written for a "
+                    "snapshot that was not registered; it stays on disk until "
+                    "removed by hand: %s",
+                    path,
+                    exc,
+                )
+
+    @staticmethod
+    def _remove_scratch_dir(tmp_dir: str) -> None:
+        """Remove a snapshot's scratch directory and the database copy in it.
+
+        Args:
+            tmp_dir: The ``mkdtemp`` directory under the snapshot scratch dir.
+        """
+        try:
+            shutil.rmtree(tmp_dir)
+        except OSError as exc:
+            logger.warning(
+                "SnapshotService: could not remove the scratch dir %s; the "
+                "database copy in it uses disk until removed by hand: %s",
+                tmp_dir,
+                exc,
+            )
 
     # Tables whose entire contents are dropped from a snapshot. These are
     # all regenerable / pipeline-state tables - keeping the snapshot's
@@ -533,87 +821,43 @@ class SnapshotService:
     )
 
     @classmethod
-    def _prepare_snapshot_for_archive(cls, abs_snapshot: str) -> None:
-        """Drop live pipeline-state tables from *abs_snapshot* and re-VACUUM.
+    def _strip_pipeline_tables(cls, snapshot_sqlite: str) -> None:
+        """Empty the likeness pipeline tables in the captured copy.
 
         Empties the ``picturelikeness`` / ``picturelikenessqueue`` /
         ``picturelikenessfrontier`` tables (live similarity progress that the
-        restore path reconstructs from the live DB) and re-VACUUMs to reclaim
-        the freed pages. The expensive per-picture blobs (embeddings, face
-        features, scores) are intentionally retained - see
-        ``_STRIP_PICTURE_COLUMNS``.
+        restore path reconstructs from the live DB). The expensive per-picture
+        blobs (embeddings, face features, scores) are intentionally retained.
+        The freed pages are reclaimed by the ``VACUUM`` in
+        ``sanitize_vault_file``, which runs next.
 
-        Failure is logged and swallowed: an unprepared snapshot is still
-        correct, just larger.  The file is opened with a dedicated connection
-        so the writer thread's session isn't disturbed.
+        The copy is of the live database at the head schema, so every table
+        listed exists; a failure here is a real one and propagates, and the
+        snapshot publishes nothing.
 
         Args:
-            abs_snapshot: Absolute path to the freshly-VACUUMed scratch
-                snapshot (before compression).
+            snapshot_sqlite: Path to the scratch copy (before compression).
+
+        Raises:
+            sqlite3.Error: If a table cannot be emptied.
         """
+        conn = sqlite3.connect(snapshot_sqlite)
         try:
-            conn = sqlite3.connect(abs_snapshot)
-        except Exception as exc:
-            logger.warning(
-                "SnapshotService: could not open snapshot %s for stripping: %s",
-                abs_snapshot,
-                exc,
-            )
-            return
-        try:
-            # Probe existing columns so we never UPDATE a column the
-            # snapshot's schema doesn't have (older snapshots restored
-            # via the alembic-upgrade path may pre-date some columns).
-            cols_present = {
-                row[1] for row in conn.execute("PRAGMA table_info(picture)").fetchall()
-            }
-            null_cols = [c for c in cls._STRIP_PICTURE_COLUMNS if c in cols_present]
-            if null_cols:
-                set_clause = ", ".join(f"{c} = NULL" for c in null_cols)
-                conn.execute(f"UPDATE picture SET {set_clause}")
-
-            # Drop regenerable / pipeline-state tables. Only those that
-            # actually exist in this snapshot's schema - older snapshots
-            # may pre-date some of them.
-            existing_tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            for table_name in cls._STRIP_TABLES_DELETE_ALL:
-                if table_name in existing_tables:
+            with conn:
+                for table_name in cls._STRIP_TABLES_DELETE_ALL:
                     conn.execute(f"DELETE FROM {table_name}")
-
-            conn.commit()
-            # VACUUM reclaims the pages freed by the UPDATEs and DELETEs
-            # above. SQLite requires VACUUM outside a transaction; the
-            # explicit commit above plus isolation_level reset handle that.
-            conn.isolation_level = None
-            conn.execute("VACUUM")
-        except Exception as exc:
-            logger.warning(
-                "SnapshotService: failed to strip regenerable blobs from %s: %s",
-                abs_snapshot,
-                exc,
-                exc_info=True,
-            )
         finally:
-            try:
-                conn.close()
-            except Exception as exc:
-                logger.debug(
-                    "SnapshotService: failed to close snapshot connection %s: %s",
-                    abs_snapshot,
-                    exc,
-                    exc_info=True,
-                )
+            conn.close()
 
-    def _build_manifest(self, session) -> tuple[dict, dict]:
-        """Build the manifest dict and the per-picture hash map.
+    @staticmethod
+    def _build_manifest(snapshot_sqlite: str) -> tuple[dict, dict]:
+        """Build the manifest dict and the per-picture hash map from the copy.
+
+        Read from the captured copy, not the live database, so the manifest
+        describes exactly the rows in the archive.
 
         Args:
-            session: An active read session.
+            snapshot_sqlite: Path to the scratch copy.
 
         Returns:
             ``(manifest, picture_hashes)``. The manifest holds resource counts
@@ -622,8 +866,16 @@ class SnapshotService:
             ``.hashes.json`` sidecar so the list endpoint's manifest reads stay
             lean).
         """
-        from sqlalchemy import func, text
+        engine = snapshot_engine(snapshot_sqlite)
+        try:
+            with Session(engine) as session:
+                return SnapshotService._read_manifest(session)
+        finally:
+            engine.dispose()
 
+    @staticmethod
+    def _read_manifest(session) -> tuple[dict, dict]:
+        """Read the manifest and hash map through *session*; see ``_build_manifest``."""
         # Pull id + metadata_hash together. The hash map lets the interactive
         # restore preview and hash-compare read hashes from the sidecar and
         # never decompress the snapshot archive. NULL hashes (legacy rows the
@@ -674,11 +926,17 @@ class SnapshotService:
         - ``GFS_KEEP_OPPORTUNISTIC`` most-recent OPPORTUNISTIC snapshots.
         - All MANUAL snapshots (user-curated; user must delete them manually).
 
+        Rows are deleted and committed first and their files removed only
+        after, so a failed commit leaves every row pointing at files that are
+        still there. A file that then cannot be removed is an orphan the next
+        prune does not see; that is logged.
+
         Args:
             now: Current UTC datetime (used only for logging).
         """
 
         def _prune(session):
+            pruned = []
             for kind, keep in (
                 ("DAILY", GFS_KEEP_DAILY),
                 ("WEEKLY", GFS_KEEP_WEEKLY),
@@ -690,41 +948,53 @@ class SnapshotService:
                     .where(Snapshot.kind == kind)
                     .order_by(Snapshot.created_at.desc())
                 ).all()
-                to_delete = rows[keep:]
-                for cp in to_delete:
-                    vault_root = self._vault.image_root
-                    for rel_path in (
-                        cp.relative_path,
-                        cp.manifest_relative_path,
-                        self._hashes_relative_path(cp.manifest_relative_path),
-                    ):
-                        try:
-                            abs_path = resolve_path_within(vault_root, rel_path)
-                        except ValueError as exc:
-                            logger.warning(
-                                "SnapshotService: GFS prune refusing to remove "
-                                "a file outside the vault root (snapshot id=%d, "
-                                "rel_path=%s): %s",
-                                cp.id,
-                                rel_path,
-                                exc,
-                            )
-                            continue
-                        try:
-                            if os.path.exists(abs_path):
-                                os.remove(abs_path)
-                        except Exception as exc:
-                            logger.warning(
-                                "SnapshotService: GFS prune could not remove %s: %s",
-                                abs_path,
-                                exc,
-                            )
-                    session.delete(cp)
-                    logger.info(
-                        "SnapshotService: GFS pruned %s snapshot id=%d",
-                        kind,
-                        cp.id,
+                for cp in rows[keep:]:
+                    pruned.append(
+                        (
+                            cp.id,
+                            kind,
+                            (
+                                cp.relative_path,
+                                cp.manifest_relative_path,
+                                self._hashes_relative_path(cp.manifest_relative_path),
+                            ),
+                        )
                     )
+                    session.delete(cp)
             session.commit()
+            for snapshot_id, _kind, rel_paths in pruned:
+                for rel_path in rel_paths:
+                    try:
+                        abs_path = resolve_path_within(vault_root, rel_path)
+                    except ValueError as exc:
+                        logger.warning(
+                            "SnapshotService: GFS prune refusing to remove "
+                            "a file outside the vault root (snapshot id=%d, "
+                            "rel_path=%s): %s",
+                            snapshot_id,
+                            rel_path,
+                            exc,
+                        )
+                        continue
+                    try:
+                        if os.path.exists(abs_path):
+                            os.remove(abs_path)
+                    except OSError as exc:
+                        logger.warning(
+                            "SnapshotService: GFS prune could not remove %s of "
+                            "snapshot id=%d, whose row is already deleted; it "
+                            "stays on disk until removed by hand: %s",
+                            abs_path,
+                            snapshot_id,
+                            exc,
+                        )
+            return pruned
 
-        self._vault.db.run_task(_prune, priority=DBPriority.IMMEDIATE)
+        vault_root = self._vault.image_root
+        pruned = self._vault.db.run_task(_prune, priority=DBPriority.IMMEDIATE)
+        for snapshot_id, kind, _rel_paths in pruned:
+            logger.info(
+                "SnapshotService: GFS pruned %s snapshot id=%d",
+                kind,
+                snapshot_id,
+            )

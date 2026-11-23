@@ -948,6 +948,10 @@ class Vault:
             self._changed_tags_pending_ids.clear()
         if timer is not None:
             timer.cancel()
+        # A snapshot copies and compresses off the writer and can take minutes.
+        # Cancel it first so it removes its files and ends before the workers
+        # are joined and the database is closed under it.
+        self.snapshot_service.cancel_inflight()
         if self._started:
             # Stop the training poll thread first.  This does NOT kill a running
             # external trainer (by policy): it survives the restart and is

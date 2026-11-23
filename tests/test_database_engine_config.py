@@ -760,6 +760,73 @@ def test_nested_immediate_read_does_not_deadlock_close(guarded_db):
     assert guard.closed is True
 
 
+def test_engine_read_access_is_refused_once_closed(guarded_db):
+    """A reader of the database file outside a Session (a snapshot capture)
+    passes the same gate as an immediate read: refused once closed."""
+    db, _guard = guarded_db
+    with db.engine_read_access():
+        assert db._engine is not None
+    db.close()
+    with pytest.raises(DatabaseUnavailableError):
+        with db.engine_read_access():
+            raise AssertionError("entered engine_read_access on a closed database")
+
+
+def test_engine_read_access_holds_off_the_exclusive_engine_swap(guarded_db):
+    """The restore swap takes the engine exclusively; it may not start while
+    a capture is still reading the database file."""
+    db, _guard = guarded_db
+    inside, release, swapped = threading.Event(), threading.Event(), threading.Event()
+
+    def capture():
+        with db.engine_read_access():
+            inside.set()
+            release.wait(timeout=10)
+
+    def swap():
+        with db.exclusive_engine_access():
+            swapped.set()
+
+    reader = _start(capture)
+    swapper = None
+    try:
+        assert inside.wait(timeout=5)
+        swapper = _start(swap)
+        assert not swapped.wait(timeout=0.3), "the swap ran during a capture"
+    finally:
+        release.set()
+    reader.join(timeout=5)
+    swapper.join(timeout=5)
+    assert swapped.is_set()
+
+
+def test_close_during_engine_read_access_releases_when_it_ends(guarded_db, monkeypatch):
+    """close() during a capture keeps the engine and the guard until the
+    capture leaves, and the capture releases them itself."""
+    monkeypatch.setattr(database, "_WRITER_JOIN_TIMEOUT_S", 0.2)
+    db, guard = guarded_db
+    inside, release = threading.Event(), threading.Event()
+
+    def capture():
+        with db.engine_read_access():
+            inside.set()
+            release.wait(timeout=10)
+
+    reader = _start(capture)
+    try:
+        assert inside.wait(timeout=5)
+        closer = _start(db.close)
+        closer.join(timeout=5)
+        assert not closer.is_alive()
+        assert db._engine is not None and guard.closed is False
+    finally:
+        release.set()
+    reader.join(timeout=5)
+    assert not reader.is_alive()
+    assert db._engine is None
+    assert guard.closed is True
+
+
 def test_close_settles_every_queued_task(guarded_db, monkeypatch):
     """Work queued behind a busy writer is refused by close(), never run and
     never left pending. Normal tasks sort after close()'s IMMEDIATE sentinel,

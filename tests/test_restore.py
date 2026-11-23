@@ -40,6 +40,7 @@ from pixlstash.server import Server
 from pixlstash.trusted_sqlite import TrustedSQLiteLocation
 from pixlstash.db_models.user_token import UserToken
 from pixlstash.services import scrapheap_service
+from pixlstash.services import snapshot_service as snapshot_service_module
 from pixlstash.utils.snapshot_compression import (
     compress_snapshot,
     materialize_snapshot,
@@ -857,6 +858,108 @@ def test_concurrent_restore_rejected_with_409(server):
         f"Exactly one restore must be rejected with RestoreInProgressError; "
         f"got {len(rejections)}, errors={errors}"
     )
+
+
+def test_a_snapshot_finished_during_a_restore_is_kept_by_it(server, monkeypatch):
+    """A snapshot that completes while a restore is between reading the
+    snapshot table and swapping the database file is registered in the
+    restored database, not in the one the swap discards."""
+    _create_file(server, "snapshot-race.jpg")
+    _add_picture(server, filename="snapshot-race.jpg", description="v1")
+    target = server.vault.snapshot_service.create_snapshot("MANUAL")
+    db = server.vault.db
+    real_control_task = db.run_control_task
+    real_sanitize = snapshot_service_module.sanitize_vault_file
+    swap_reached, release_swap, raced = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def _hold_before_swap(func, *args, **kwargs):
+        swap_reached.set()
+        release_swap.wait(timeout=30)
+        return real_control_task(func, *args, **kwargs)
+
+    def _note_racing_capture(path):
+        real_sanitize(path)
+        if swap_reached.is_set():
+            raced.set()
+
+    racer_settled = threading.Event()
+
+    class _NotingLock:
+        """The registration lock, noting when a snapshot is kept waiting."""
+
+        def __init__(self, lock):
+            self._lock = lock
+
+        def acquire(self, *args, **kwargs):
+            acquired = self._lock.acquire(*args, **kwargs)
+            if not acquired:
+                racer_settled.set()
+            return acquired
+
+        def release(self):
+            self._lock.release()
+
+        def __enter__(self):
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc_info):
+            self._lock.release()
+
+    service = server.vault.snapshot_service
+    monkeypatch.setattr(db, "run_control_task", _hold_before_swap)
+    monkeypatch.setattr(
+        snapshot_service_module, "sanitize_vault_file", _note_racing_capture
+    )
+    monkeypatch.setattr(
+        service, "_registration_lock", _NotingLock(service._registration_lock)
+    )
+    outcomes: dict = {}
+
+    def _run(key, target_fn):
+        try:
+            outcomes[key] = target_fn()
+        except Exception as exc:
+            outcomes[key] = exc
+        finally:
+            if key == "snapshot":
+                racer_settled.set()
+
+    restorer = threading.Thread(
+        target=_run,
+        args=("restore", lambda: server.vault.restore_service.restore_full(target.id)),
+        daemon=True,
+    )
+    racer = threading.Thread(
+        target=_run,
+        args=("snapshot", lambda: service.create_snapshot("MANUAL")),
+        daemon=True,
+    )
+    restorer.start()
+    try:
+        assert swap_reached.wait(timeout=30), "the restore never reached its swap"
+        racer.start()
+        assert raced.wait(timeout=30), "the racing snapshot never captured"
+        # The swap goes ahead only once the racing snapshot has registered or
+        # been kept waiting to: released earlier, the swap could win by timing.
+        assert racer_settled.wait(timeout=30), "the racing snapshot never registered"
+    finally:
+        release_swap.set()
+        restorer.join(timeout=60)
+        if racer.ident is not None:
+            racer.join(timeout=60)
+    assert not restorer.is_alive() and not racer.is_alive()
+    assert not isinstance(outcomes["restore"], Exception), outcomes
+    assert not outcomes["restore"].errors, outcomes["restore"].errors
+    raced_snapshot = outcomes["snapshot"]
+    assert isinstance(raced_snapshot, Snapshot), outcomes
+    assert raced_snapshot.relative_path in {
+        s.relative_path for s in service.list_snapshots()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4660,3 +4763,114 @@ def test_full_restore_neither_reinstates_nor_clears_the_ai_toolkit_python(
     effective = server.vault._training_config_provider()
     assert effective["python"] == after_snapshot, effective
     assert effective["python"] != at_snapshot
+
+
+def test_retention_during_a_restore_never_lists_a_snapshot_without_its_archive(
+    server, monkeypatch
+):
+    """Retention that prunes while a restore is between reading the snapshot
+    index and putting it back removes a snapshot's row and archive together,
+    or keeps both: every snapshot listed afterwards can still be restored."""
+    _create_file(server, "retention-race.jpg")
+    _add_picture(server, filename="retention-race.jpg", description="v1")
+    service = server.vault.snapshot_service
+    db = server.vault.db
+    target = service.create_snapshot("MANUAL")
+    oldest_daily = service.create_snapshot("DAILY")
+    service.create_snapshot("DAILY")
+    real_control_task = db.run_control_task
+    real_run_task = db.run_task
+    swap_reached, release_swap = threading.Event(), threading.Event()
+    retention_held, release_retention = threading.Event(), threading.Event()
+    outcomes: dict = {}
+
+    def _run(key, target_fn):
+        try:
+            outcomes[key] = target_fn()
+        except Exception as exc:
+            outcomes[key] = exc
+
+    retention = threading.Thread(
+        target=_run,
+        args=(
+            "retention",
+            lambda: service._apply_gfs_retention(datetime.now(timezone.utc)),
+        ),
+        daemon=True,
+    )
+
+    def _hold_before_swap(func, *args, **kwargs):
+        swap_reached.set()
+        release_swap.wait(timeout=30)
+        return real_control_task(func, *args, **kwargs)
+
+    def _hold_after_retention_commit(func, *args, **kwargs):
+        result = real_run_task(func, *args, **kwargs)
+        if threading.current_thread() is retention:
+            retention_held.set()
+            release_retention.wait(timeout=30)
+        return result
+
+    class _NotingLock:
+        """The registration lock, noting when retention is kept waiting."""
+
+        def __init__(self, lock):
+            self._lock = lock
+
+        def acquire(self, blocking=True, timeout=-1):
+            if self._lock.acquire(blocking=False):
+                return True
+            if threading.current_thread() is retention:
+                retention_held.set()
+            return self._lock.acquire(blocking, timeout)
+
+        def release(self):
+            self._lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *exc_info):
+            self.release()
+
+    monkeypatch.setattr(db, "run_control_task", _hold_before_swap)
+    monkeypatch.setattr(db, "run_task", _hold_after_retention_commit)
+    monkeypatch.setattr(
+        service, "_registration_lock", _NotingLock(service._registration_lock)
+    )
+    restorer = threading.Thread(
+        target=_run,
+        args=("restore", lambda: server.vault.restore_service.restore_full(target.id)),
+        daemon=True,
+    )
+    restorer.start()
+    try:
+        assert swap_reached.wait(timeout=30), "the restore never reached its swap"
+        # Only now, with the index read, is the older DAILY snapshot due.
+        monkeypatch.setattr(snapshot_service_module, "GFS_KEEP_DAILY", 1)
+        retention.start()
+        # The swap goes ahead only once retention has committed its prune or
+        # been kept waiting to: released earlier, the swap could win by timing.
+        assert retention_held.wait(timeout=30), "retention never reached its prune"
+        release_swap.set()
+        restorer.join(timeout=60)
+        assert not restorer.is_alive(), "the restore never finished"
+    finally:
+        release_swap.set()
+        release_retention.set()
+        restorer.join(timeout=60)
+        if retention.ident is not None:
+            retention.join(timeout=60)
+    assert not retention.is_alive()
+    assert not isinstance(outcomes.get("retention"), Exception), outcomes
+    assert not isinstance(outcomes["restore"], Exception), outcomes
+    assert not outcomes["restore"].errors, outcomes["restore"].errors
+    listed = service.list_snapshots()
+    missing = [
+        s.relative_path
+        for s in listed
+        if not os.path.isfile(os.path.join(server.vault.image_root, s.relative_path))
+    ]
+    assert missing == [], f"listed snapshots without an archive: {missing}"
+    assert oldest_daily.relative_path not in {s.relative_path for s in listed}
