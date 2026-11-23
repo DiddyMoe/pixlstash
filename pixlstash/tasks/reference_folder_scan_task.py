@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 
 from PIL import Image
+from sqlalchemy.orm import load_only
 from sqlmodel import Session, delete, select
 
 from pixlstash.database import DBPriority
@@ -390,13 +391,41 @@ class ReferenceFolderScanTask(BaseTask):
         # be present in existing_by_path so their file paths are subtracted from
         # `new_paths`; without them, the scan would re-import the same file every
         # time it ran while the picture sat in the scrapheap.
+        #
+        # Only the columns reconciliation reads are loaded: the path and the
+        # scrapheap flag (keying, removal), the pixel hash and size (move
+        # matching), and the sidecar bookkeeping plus description (sidecar
+        # pass). The full row carries the embedding and likeness blobs, which a
+        # root scan of a large library would otherwise pull off disk on every
+        # pass only to drop. The rows are detached once this returns, and
+        # ``raiseload`` makes any other column fail loudly instead of reading
+        # as missing.
         def fetch_existing(session: Session) -> list[Picture]:
             owner = (
                 Picture.reference_folder_id.is_(None)
                 if self._is_root
                 else Picture.reference_folder_id == folder_id
             )
-            return list(session.exec(select(Picture).where(owner)).all())
+            query = (
+                select(Picture)
+                .where(owner)
+                .options(
+                    load_only(
+                        Picture.id,
+                        Picture.file_path,
+                        Picture.pixel_sha,
+                        Picture.size_bytes,
+                        Picture.deleted,
+                        Picture.tags_file,
+                        Picture.tags_file_mtime,
+                        Picture.description_file,
+                        Picture.description_file_mtime,
+                        Picture.description,
+                        raiseload=True,
+                    )
+                )
+            )
+            return list(session.exec(query).all())
 
         existing_pictures: list[Picture] = self._db.run_task(
             fetch_existing, priority=DBPriority.LOW
@@ -593,32 +622,19 @@ class ReferenceFolderScanTask(BaseTask):
             }
 
             def apply_moves(
-                session: Session, pairs: list[tuple[int, str, bool, str]]
-            ) -> list[int]:
-                # Which of these moves did PixlStash make itself? The layout
-                # engine (v1.11 Phase 4b) journals every file it moves, and a
-                # move that is ours is NOT the owner reorganising their library:
-                # reading it as intent is what makes our write come back as a
-                # change, unfile the picture, and start the two flipping each
-                # other for ever over real files. Claimed here, at the one place
-                # that has both paths and a session.
-                ours = claim_own_moves(
-                    session,
-                    [
-                        (self._stored(old_path), self._stored(new_path))
-                        for _, new_path, _, old_path in pairs
-                    ],
-                )
-                # The journal's only other reader is ``LayoutMoveTask``, which
-                # runs only when a picture is due a check - so in a library
-                # where the owner only ever renames things, nothing would ever
-                # prune the rows a rename writes. This scan runs on its own
-                # schedule and is the journal's other consumer, so it is where
-                # the retention window is actually enforced.
-                prune_move_journal(session)
-                external: list[int] = []
-                external_moves: list[tuple[int, str, str]] = []
-                for pic_id, new_path, thumbnail_carried, old_path in pairs:
+                session: Session,
+                pairs: list[tuple[int, str, bool, str, tuple]],
+            ) -> tuple[list[int], list[int]]:
+                # The pairs were decided from rows read before this write was
+                # queued, and another writer - the explicit move route, a
+                # second scan, the purge sweep - may have moved or re-owned one
+                # since. Assigning the scan's path to such a row would overwrite
+                # the newer one, so only a row still as the scan read it is
+                # moved; the next scan judges the rest as they are. Checked on
+                # the writer, where nothing else can change the row before this
+                # transaction commits.
+                current: list[tuple[Picture, str, bool, str]] = []
+                for pic_id, new_path, thumbnail_carried, old_path, seen in pairs:
                     pic = session.get(Picture, pic_id)
                     if pic is None:
                         # The row went between the scan's read and this write -
@@ -635,6 +651,46 @@ class ReferenceFolderScanTask(BaseTask):
                             new_path,
                         )
                         continue
+                    if (pic.file_path, pic.reference_folder_id) != seen:
+                        logger.info(
+                            "Reference folder %s: picture %d changed after this "
+                            "scan read it (now at %s); not moving it to %s. The "
+                            "next scan will reconcile it.",
+                            self._folder_path,
+                            pic_id,
+                            pic.file_path,
+                            new_path,
+                        )
+                        continue
+                    current.append((pic, new_path, thumbnail_carried, old_path))
+                # Which of these moves did PixlStash make itself? The layout
+                # engine (v1.11 Phase 4b) journals every file it moves, and a
+                # move that is ours is NOT the owner reorganising their library:
+                # reading it as intent is what makes our write come back as a
+                # change, unfile the picture, and start the two flipping each
+                # other for ever over real files. Claimed here, at the one place
+                # that has both paths and a session, and only for the moves
+                # actually applied: claiming consumes the journal row.
+                ours = claim_own_moves(
+                    session,
+                    [
+                        (self._stored(old_path), self._stored(new_path))
+                        for _, new_path, _, old_path in current
+                    ],
+                )
+                # The journal's only other reader is ``LayoutMoveTask``, which
+                # runs only when a picture is due a check - so in a library
+                # where the owner only ever renames things, nothing would ever
+                # prune the rows a rename writes. This scan runs on its own
+                # schedule and is the journal's other consumer, so it is where
+                # the retention window is actually enforced.
+                prune_move_journal(session)
+                applied: list[int] = []
+                external: list[int] = []
+                external_moves: list[tuple[int, str, str]] = []
+                for pic, new_path, thumbnail_carried, old_path in current:
+                    pic_id = pic.id
+                    applied.append(pic_id)
                     pic.file_path = self._stored(new_path)
                     # The explicit move route (routes/reference_folders.py) sets
                     # this from the destination basename, and _build_picture
@@ -657,39 +713,49 @@ class ReferenceFolderScanTask(BaseTask):
                     # move_reconciliation_service.record_pending_reviews.
                     record_pending_reviews(session, external_moves)
                 session.commit()
-                return external
+                return applied, external
 
+            # Each pair carries what the decision rested on - the row's stored
+            # path and owner as read - for apply_moves to check. The scrapheap
+            # flag is left out: it says nothing about where the file is, and a
+            # scrapheap row left at a vanished path is deleted outright by the
+            # next scan.
             move_pairs = sorted(
                 (
                     existing_by_path[old].id,
                     new,
                     carried_thumbnails.get(old, False),
                     old,
+                    (existing_by_path[old].file_path, folder_id),
                 )
                 for old, new in moved_paths.items()
                 if existing_by_path[old].id is not None
-            )
-            external_moved_picture_ids = (
-                self._db.run_task(apply_moves, move_pairs, priority=DBPriority.LOW)
-                or []
             )
             # A followed move changes file_path (and with it the thumbnail URL
             # and the download name) on a row an open grid may already be
             # showing, and nothing else in this task reports it: without this the
             # grid keeps the old state until the next full reload.
-            moved_picture_ids = [pic_id for pic_id, _, _, _ in move_pairs]
+            moved_picture_ids, external_moved_picture_ids = self._db.run_task(
+                apply_moves, move_pairs, priority=DBPriority.LOW
+            )
             logger.info(
                 "Reference folder %s: followed %d moved file(s), %d of them "
                 "moved by PixlStash itself.",
                 self._folder_path,
-                len(moved_paths),
-                len(moved_paths) - len(external_moved_picture_ids),
+                len(moved_picture_ids),
+                len(moved_picture_ids) - len(external_moved_picture_ids),
             )
             # A moved file is neither removed nor new.  ``existing_by_path`` is
             # re-keyed as well as narrowed, because the sidecar pass below walks
-            # it by path and would otherwise reconcile at the old location.
+            # it by path and would otherwise reconcile at the old location.  A
+            # pair apply_moves did not apply is dropped from this pass entirely:
+            # its row is no longer what this scan read, so neither its old path
+            # nor its sidecars are this scan's to act on.
+            applied = set(moved_picture_ids)
             for old_path, new_path in moved_paths.items():
                 picture = existing_by_path.pop(old_path)
+                if picture.id not in applied:
+                    continue
                 picture.file_path = new_path
                 existing_by_path[new_path] = picture
             removed_paths -= moved_paths.keys()
@@ -715,20 +781,21 @@ class ReferenceFolderScanTask(BaseTask):
                 database=self._db, pictures=[]
             )._separate_our_own_moves(candidates)
             if repairs:
-                self._db.run_task(
+                repaired = self._db.run_task(
                     MissingFilePurgeTask._repair_moved_pictures,
                     repairs,
                     self._db.image_root,
                     priority=DBPriority.LOW,
                 )
                 # The file is at the repointed path, so it is that row's file
-                # and not a new import.
-                new_paths -= {self._on_disk(path) for _, path, _ in repairs}
+                # and not a new import. A repair the writer skipped as stale is
+                # not imported either: the next scan judges that file afresh.
+                new_paths -= {self._on_disk(path) for _, path, _, _ in repairs}
                 logger.info(
                     "Reference folder %s: repointed %d picture(s) PixlStash "
                     "itself had moved rather than deleting them.",
                     self._folder_path,
-                    len(repairs),
+                    repaired,
                 )
             if deferred:
                 logger.info(
@@ -753,17 +820,62 @@ class ReferenceFolderScanTask(BaseTask):
                     len(settling),
                 )
                 still_missing = []
-            removed_ids = [pic.id for pic in still_missing]
+            # Each id carries what the decision rested on - the row's stored
+            # path, owner and scrapheap flag as read - for delete_removed to
+            # check.
+            removals = [
+                (pic.id, (pic.file_path, folder_id, pic.deleted))
+                for pic in still_missing
+            ]
 
-            def delete_removed(session: Session, ids: list[int]) -> None:
-                for pic_id in ids:
+            def delete_removed(
+                session: Session, decisions: list[tuple[int, tuple]]
+            ) -> list[int]:
+                # Decided from rows read before this write was queued. A row
+                # another writer has since repointed, re-owned or scrapheaped
+                # may now name a live file, and deleting it by id would take its
+                # tags, score and set membership with it. Only a row still as
+                # the scan read it is deleted; the next scan judges the rest as
+                # they are. The decision also rested on the file being absent,
+                # and a file put back at the same path leaves the row as it was
+                # read, so the path is looked at again too. Checked on the
+                # writer, where nothing else can change the row before this
+                # transaction commits.
+                deleted: list[int] = []
+                for pic_id, seen in decisions:
                     pic = session.get(Picture, pic_id)
-                    if pic is not None:
-                        session.delete(pic)
+                    if pic is None:
+                        continue
+                    if (pic.file_path, pic.reference_folder_id, pic.deleted) != seen:
+                        logger.info(
+                            "Reference folder %s: picture %d changed after this "
+                            "scan read it (now at %s); not deleting it. The next "
+                            "scan will reconcile it.",
+                            self._folder_path,
+                            pic_id,
+                            pic.file_path,
+                        )
+                        continue
+                    # lexists, because the walk lists symlinked files, dangling
+                    # ones included.
+                    if os.path.lexists(self._on_disk(pic.file_path)):
+                        logger.info(
+                            "Reference folder %s: picture %d is back at %s; not "
+                            "deleting it.",
+                            self._folder_path,
+                            pic_id,
+                            pic.file_path,
+                        )
+                        continue
+                    session.delete(pic)
+                    deleted.append(pic_id)
                 session.commit()
+                return deleted
 
-            if removed_ids:
-                self._db.run_task(delete_removed, removed_ids, priority=DBPriority.LOW)
+            if removals:
+                removed_ids = self._db.run_task(
+                    delete_removed, removals, priority=DBPriority.LOW
+                )
                 logger.info(
                     "Reference folder %s: removed %d stale picture records.",
                     self._folder_path,
