@@ -27,6 +27,7 @@ from pixlstash.hub.registry import (
     read_vault_uuid,
 )
 from pixlstash.server import Server
+from pixlstash.services import snapshot_service as snapshot_service_module
 from pixlstash.services.library_switch_service import (
     LibrarySwitchError,
     SwitchState,
@@ -455,6 +456,69 @@ class TestFailingToSwitch:
         assert finished.is_set()
         assert server.vault.image_root == library.path
         server.library_switch.switch_to(original.uuid)
+
+    def test_switch_cancels_a_snapshot_running_on_the_old_vault(
+        self, server, tmp_path, monkeypatch
+    ):
+        """Closing the old vault ends a snapshot it is archiving instead of
+        waiting for it or closing the database under it."""
+        library = server.library_registry.create(
+            str(tmp_path / "snapshot-cancel"), "Snapshot cancel"
+        )
+        original = server.library_registry.active_library()
+        retired = server.vault
+        snapshots_dir = os.path.join(retired.image_root, "snapshots")
+
+        def archives():
+            return {
+                os.path.join(dirpath, name)
+                for dirpath, _dirs, names in os.walk(snapshots_dir)
+                for name in names
+                if name.endswith(".sqlite.zst")
+            }
+
+        before = archives()
+        real_compress = snapshot_service_module.compress_snapshot
+        compressing = threading.Event()
+
+        def compress_until_cancelled(src, dst, *args, **kwargs):
+            compressing.set()
+            check_cancelled = kwargs.get("check_cancelled")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if check_cancelled is not None:
+                    check_cancelled()
+                time.sleep(0.01)
+            return real_compress(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(
+            snapshot_service_module, "compress_snapshot", compress_until_cancelled
+        )
+        outcome = {}
+
+        def take_snapshot():
+            try:
+                outcome["snapshot"] = retired.snapshot_service.create_snapshot("MANUAL")
+            except Exception as exc:
+                outcome["error"] = exc
+
+        snapshotter = threading.Thread(target=take_snapshot, daemon=True)
+        snapshotter.start()
+        try:
+            assert compressing.wait(timeout=10), "the snapshot never got to compress"
+            started = time.monotonic()
+            server.library_switch.switch_to(library.uuid)
+            elapsed = time.monotonic() - started
+            snapshotter.join(timeout=10)
+            assert not snapshotter.is_alive(), "the snapshot outlived its vault"
+            assert isinstance(
+                outcome.get("error"), snapshot_service_module.SnapshotCancelledError
+            ), (outcome, elapsed)
+            assert archives() == before
+        finally:
+            snapshotter.join(timeout=30)
+            if server.library_registry.active_library().uuid != original.uuid:
+                server.library_switch.switch_to(original.uuid)
 
     def test_stale_comfyui_output_is_discarded_after_switch(
         self, server, tmp_path, monkeypatch

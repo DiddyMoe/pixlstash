@@ -5,9 +5,13 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
 
 import pytest
+import sqlmodel
 from sqlalchemy import text
 
 from pixlstash.db_models import Picture, User
@@ -18,7 +22,14 @@ from pixlstash.db_models.picture_likeness import (
 )
 from pixlstash.db_models.snapshot import Snapshot
 from pixlstash.server import Server
-from pixlstash.services.snapshot_service import GFS_KEEP_MONTHLY, GFS_KEEP_WEEKLY
+from pixlstash.services import snapshot_service as snapshot_service_module
+from pixlstash.services.snapshot_service import (
+    GFS_KEEP_MONTHLY,
+    GFS_KEEP_OPPORTUNISTIC,
+    GFS_KEEP_WEEKLY,
+    SnapshotService,
+)
+from pixlstash.tasks.ensure_gfs_snapshot_task import EnsureGfsSnapshotTask
 from pixlstash.utils.snapshot_compression import materialize_snapshot
 from tests.utils import wipe_tables
 
@@ -541,6 +552,342 @@ def test_create_snapshot_drops_likeness_pipeline_tables(server):
     )
 
 
+# ---------------------------------------------------------------------------
+# Capture and archiving run off the writer, and publish all or nothing
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_files(server) -> list[str]:
+    """Every file under the vault's snapshots dir, relative to it."""
+    root = os.path.join(server.vault.image_root, "snapshots")
+    found = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            found.append(os.path.relpath(os.path.join(dirpath, name), root))
+    return sorted(found)
+
+
+def _snapshot_paths(server, snapshot) -> list[str]:
+    """The archive and both sidecars a snapshot row points at."""
+    root = server.vault.image_root
+    return [
+        os.path.join(root, snapshot.relative_path),
+        os.path.join(root, snapshot.manifest_relative_path),
+        os.path.join(
+            root,
+            SnapshotService._hashes_relative_path(snapshot.manifest_relative_path),
+        ),
+    ]
+
+
+def _add_described_picture(server, filename: str, description: str) -> int:
+    def _do(session):
+        picture = Picture(
+            file_path=filename, filename=filename, description=description
+        )
+        session.add(picture)
+        session.commit()
+        session.refresh(picture)
+        return picture.id
+
+    return server.vault.db.run_task(_do)
+
+
+def _live_descriptions(server) -> dict[int, str]:
+    return server.vault.db.run_immediate_read_task(
+        lambda session: {
+            picture.id: picture.description
+            for picture in session.exec(sqlmodel.select(Picture)).all()
+        }
+    )
+
+
+def _run_in_thread(target, name: str):
+    """Run ``target`` on a daemon thread; return the thread and its outcome."""
+    outcome: dict = {}
+
+    def _run():
+        try:
+            outcome["result"] = target()
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_run, name=name, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def test_the_writer_keeps_serving_while_an_archive_is_compressed(server, monkeypatch):
+    real_compress = snapshot_service_module.compress_snapshot
+    compressing, release = threading.Event(), threading.Event()
+
+    def _paused_compress(src, dst, *args, **kwargs):
+        compressing.set()
+        release.wait(timeout=30)
+        return real_compress(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(snapshot_service_module, "compress_snapshot", _paused_compress)
+    thread, outcome = _run_in_thread(
+        lambda: server.vault.snapshot_service.create_snapshot("MANUAL"),
+        "test-snapshot",
+    )
+    try:
+        assert compressing.wait(timeout=10), "the snapshot never reached compression"
+        added_id = server.vault.db.submit_task(
+            lambda session: _add_and_return_id(session, "during-compress.jpg")
+        ).result(timeout=5)
+        assert added_id in _live_descriptions(server)
+    finally:
+        release.set()
+        thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert "error" not in outcome, outcome
+    with _open_snapshot(server, outcome["result"]) as conn:
+        captured = {row[0] for row in conn.execute("SELECT id FROM picture")}
+    assert added_id not in captured
+
+
+def _add_and_return_id(session, filename: str) -> int:
+    picture = Picture(file_path=filename, filename=filename)
+    session.add(picture)
+    session.commit()
+    session.refresh(picture)
+    return picture.id
+
+
+def test_writes_during_capture_leave_a_consistent_pre_write_snapshot(server):
+    """Edits, inserts and deletes commit on the writer at every progress check
+    of the capture. The copy is a valid database equal to exactly one state the
+    live database committed, and the writes committed after that state are
+    absent from it.
+
+    Where the first check lands is SQLite's business (on a fresh connection it
+    can come while the schema is loaded, before the copy's read transaction
+    opens), so the test writes at every check and asserts only that the copy
+    is one committed state and not the last one."""
+    kept_id = _add_described_picture(server, "kept.jpg", "before")
+    dropped_id = _add_described_picture(server, "dropped.jpg", "before")
+    db = server.vault.db
+    max_writes = 50
+
+    def _write_generation(session, generation: int):
+        kept = session.get(Picture, kept_id)
+        kept.description = f"edit-{generation}"
+        session.add(kept)
+        if generation == 1:
+            session.delete(session.get(Picture, dropped_id))
+        name = f"added-{generation}.jpg"
+        session.add(Picture(file_path=name))
+        session.commit()
+
+    class _WriteDuringCapture(snapshot_service_module.SnapshotCancellation):
+        def __init__(self):
+            super().__init__()
+            self.writes = 0
+            self.errors = []
+
+        def should_stop(self):
+            if self.writes < max_writes:
+                self.writes += 1
+                generation = self.writes
+                try:
+                    db.submit_task(
+                        lambda session: _write_generation(session, generation)
+                    ).result(timeout=10)
+                except Exception as exc:
+                    self.errors.append(exc)
+                    raise
+            return super().should_stop()
+
+    cancellation = _WriteDuringCapture()
+    snapshot = server.vault.snapshot_service.create_snapshot(
+        "MANUAL", cancellation=cancellation
+    )
+
+    assert cancellation.errors == []
+    writes = cancellation.writes
+    assert writes >= 1, "the capture never polled its cancellation"
+    with _open_snapshot(server, snapshot) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        captured = {
+            file_path: (picture_id, description)
+            for picture_id, file_path, description in conn.execute(
+                "SELECT id, file_path, description FROM picture"
+            )
+        }
+    kept_description = captured["kept.jpg"][1]
+    seen = 0 if kept_description == "before" else int(kept_description[5:])
+    expected = {"kept.jpg"} | {f"added-{n}.jpg" for n in range(1, seen + 1)}
+    if seen == 0:
+        expected.add("dropped.jpg")
+    assert set(captured) == expected, f"the copy mixes states around write {seen}"
+    assert seen < writes, "every write landed in the copy; none ran during it"
+    with open(
+        os.path.join(server.vault.image_root, snapshot.manifest_relative_path)
+    ) as fh:
+        manifest = json.load(fh)
+    assert set(manifest["picture_ids"]) == {pid for pid, _ in captured.values()}
+    assert snapshot.picture_count == len(captured)
+    live = server.vault.db.run_immediate_read_task(
+        lambda session: {
+            picture.file_path: picture.description
+            for picture in session.exec(sqlmodel.select(Picture)).all()
+        }
+    )
+    assert live["kept.jpg"] == f"edit-{writes}" and "dropped.jpg" not in live
+    assert {f"added-{n}.jpg" for n in range(1, writes + 1)} <= set(live)
+
+
+def test_cancel_inflight_ends_a_running_capture_and_leaves_nothing(server):
+    _add_pictures(server, count=2)
+    reading = threading.Event()
+
+    class _HoldUntilCancelled(snapshot_service_module.SnapshotCancellation):
+        def should_stop(self):
+            reading.set()
+            deadline = time.monotonic() + 15
+            while not self.cancelled and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return super().should_stop()
+
+    service = server.vault.snapshot_service
+    thread, outcome = _run_in_thread(
+        lambda: service.create_snapshot("MANUAL", cancellation=_HoldUntilCancelled()),
+        "test-snapshot",
+    )
+    try:
+        assert reading.wait(timeout=10), "the capture never started reading"
+        assert service.cancel_inflight(timeout=10) is True
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "the capture outlived its cancellation"
+    finally:
+        thread.join(timeout=30)
+    assert isinstance(
+        outcome.get("error"), snapshot_service_module.SnapshotCancelledError
+    ), outcome
+    assert _snapshot_files(server) == []
+    assert service.list_snapshots() == []
+
+
+def test_cancelling_the_gfs_task_ends_its_snapshot(server, monkeypatch):
+    real_compress = snapshot_service_module.compress_snapshot
+    compressing = threading.Event()
+
+    def _compress_until_cancelled(src, dst, *args, **kwargs):
+        compressing.set()
+        check_cancelled = kwargs.get("check_cancelled")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if check_cancelled is not None:
+                check_cancelled()
+            time.sleep(0.01)
+        return real_compress(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(
+        snapshot_service_module, "compress_snapshot", _compress_until_cancelled
+    )
+    task = EnsureGfsSnapshotTask(server.vault, kind="DAILY")
+    thread, outcome = _run_in_thread(task.run, "test-gfs-task")
+    try:
+        assert compressing.wait(timeout=10), "the task never reached compression"
+        task.on_cancel()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "the GFS task ignored its cancel"
+    finally:
+        thread.join(timeout=30)
+    assert isinstance(
+        outcome.get("error"), snapshot_service_module.SnapshotCancelledError
+    ), outcome
+    assert _snapshot_files(server) == []
+    assert server.vault.snapshot_service.list_snapshots() == []
+
+
+def test_a_snapshot_publishes_its_archive_and_sidecars_privately(server):
+    snapshot = server.vault.snapshot_service.create_snapshot("MANUAL")
+    paths = _snapshot_paths(server, snapshot)
+    assert all(os.path.isfile(path) for path in paths)
+    assert [name for name in _snapshot_files(server) if "partial" in name] == []
+    if os.name != "nt":
+        for path in paths:
+            assert os.stat(path).st_mode & 0o777 == 0o600, path
+
+
+def test_a_failed_compression_leaves_no_archive_or_sidecars(server, monkeypatch):
+    def _fail_midway(src, dst, *args, **kwargs):
+        with open(dst, "wb") as fh:
+            fh.write(b"test-partial-archive")
+        raise OSError("test-disk-full")
+
+    monkeypatch.setattr(snapshot_service_module, "compress_snapshot", _fail_midway)
+    with pytest.raises(OSError, match="test-disk-full"):
+        server.vault.snapshot_service.create_snapshot("MANUAL")
+    assert _snapshot_files(server) == []
+    assert server.vault.snapshot_service.list_snapshots() == []
+
+
+def test_a_failed_registration_removes_the_published_files(server, monkeypatch):
+    def _refuse_row(**_fields):
+        raise RuntimeError("test-registration-failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(snapshot_service_module, "Snapshot", _refuse_row)
+        with pytest.raises(RuntimeError, match="test-registration-failure"):
+            server.vault.snapshot_service.create_snapshot("MANUAL")
+    assert _snapshot_files(server) == []
+    assert server.vault.snapshot_service.list_snapshots() == []
+
+
+def test_a_failed_table_strip_publishes_nothing(server, monkeypatch):
+    monkeypatch.setattr(
+        SnapshotService,
+        "_STRIP_TABLES_DELETE_ALL",
+        ("picturelikeness", "test_missing_table"),
+    )
+    with pytest.raises(sqlite3.OperationalError, match="test_missing_table"):
+        server.vault.snapshot_service.create_snapshot("MANUAL")
+    assert _snapshot_files(server) == []
+    assert server.vault.snapshot_service.list_snapshots() == []
+
+
+def test_retention_deletes_files_only_after_its_commit(server, monkeypatch):
+    service = server.vault.snapshot_service
+    with monkeypatch.context() as patch:
+        patch.setattr(service, "_apply_gfs_retention", lambda now: None)
+        snapshots = [
+            service.create_snapshot("OPPORTUNISTIC")
+            for _ in range(GFS_KEEP_OPPORTUNISTIC + 1)
+        ]
+
+    def _backdate(session):
+        for age, snapshot in enumerate(reversed(snapshots), start=1):
+            row = session.get(Snapshot, snapshot.id)
+            row.created_at = datetime.now(timezone.utc) - timedelta(hours=age)
+            session.add(row)
+        session.commit()
+
+    server.vault.db.run_task(_backdate)
+    oldest = snapshots[0]
+
+    def _refuse_commit(self):
+        raise RuntimeError("test-commit-failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlmodel.Session, "commit", _refuse_commit)
+        with pytest.raises(RuntimeError, match="test-commit-failure"):
+            service._apply_gfs_retention(datetime.now(timezone.utc))
+    for snapshot in snapshots:
+        for path in _snapshot_paths(server, snapshot):
+            assert os.path.isfile(path), f"{path} deleted before the commit"
+    assert {s.id for s in snapshots} <= {s.id for s in service.list_snapshots()}
+
+    service._apply_gfs_retention(datetime.now(timezone.utc))
+    assert service.get_snapshot(oldest.id) is None
+    for path in _snapshot_paths(server, oldest):
+        assert not os.path.exists(path), f"{path} survived its row"
+    for snapshot in snapshots[1:]:
+        assert all(os.path.isfile(p) for p in _snapshot_paths(server, snapshot))
+
+
 def _add_picture_with_blobs(server) -> int:
     """Helper: add one picture and return its id."""
 
@@ -565,3 +912,93 @@ def _add_picture_with_blobs_named(server, filename: str) -> int:
         return p.id
 
     return server.vault.db.run_task(_do)
+
+
+def test_a_snapshot_cancelled_while_its_row_waits_for_the_writer_leaves_nothing(
+    server, monkeypatch
+):
+    """A cancel that lands after the snapshot queued its row insert, while the
+    writer is still busy with earlier work, ends the snapshot: no row and no
+    files."""
+    _add_pictures(server, count=2)
+    service = server.vault.snapshot_service
+    db = server.vault.db
+    writer_busy, release_writer = threading.Event(), threading.Event()
+    registering, row_queued = threading.Event(), threading.Event()
+    real_acquire = service._acquire_registration
+    real_submit = db.submit_task
+
+    def _occupy_writer(session):
+        writer_busy.set()
+        release_writer.wait(timeout=30)
+
+    def _busy_writer_then_acquire(cancellation):
+        real_submit(_occupy_writer)
+        assert writer_busy.wait(timeout=10), "the writer never took the blocker"
+        real_acquire(cancellation)
+        registering.set()
+
+    def _note_queued(func, *args, **kwargs):
+        future = real_submit(func, *args, **kwargs)
+        if registering.is_set() and threading.current_thread().name == "test-snapshot":
+            row_queued.set()
+        return future
+
+    monkeypatch.setattr(service, "_acquire_registration", _busy_writer_then_acquire)
+    monkeypatch.setattr(db, "submit_task", _note_queued)
+    cancellation = snapshot_service_module.SnapshotCancellation()
+    thread, outcome = _run_in_thread(
+        lambda: service.create_snapshot("MANUAL", cancellation=cancellation),
+        "test-snapshot",
+    )
+    try:
+        assert row_queued.wait(timeout=30), "the snapshot never queued its row"
+        cancellation.cancel()
+    finally:
+        release_writer.set()
+        thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert isinstance(
+        outcome.get("error"), snapshot_service_module.SnapshotCancelledError
+    ), outcome
+    assert _snapshot_files(server) == []
+    assert service.list_snapshots() == []
+
+
+def test_a_running_capture_holds_off_the_database_file_swap(server):
+    """The restore file swap and ``close()`` take the engine lock's write side;
+    while a capture copies the live file the swap must wait, and once the
+    capture ends it goes."""
+    _add_pictures(server, count=2)
+    db = server.vault.db
+    reading, release, swapped = threading.Event(), threading.Event(), threading.Event()
+
+    class _HoldWhileReading(snapshot_service_module.SnapshotCancellation):
+        def should_stop(self):
+            reading.set()
+            release.wait(timeout=15)
+            return super().should_stop()
+
+    def _swap():
+        with db.exclusive_engine_access():
+            swapped.set()
+
+    snapshot_thread, outcome = _run_in_thread(
+        lambda: server.vault.snapshot_service.create_snapshot(
+            "MANUAL", cancellation=_HoldWhileReading()
+        ),
+        "test-snapshot",
+    )
+    swap_thread = None
+    try:
+        assert reading.wait(timeout=10), "the capture never started reading"
+        swap_thread, _ = _run_in_thread(_swap, "test-swap")
+        assert not swapped.wait(timeout=0.5), "the file swap ran during the capture"
+    finally:
+        release.set()
+        snapshot_thread.join(timeout=30)
+    assert not snapshot_thread.is_alive()
+    assert "error" not in outcome, outcome
+    assert swapped.wait(timeout=10), "the file swap never ran after the capture"
+    swap_thread.join(timeout=10)
+    assert not swap_thread.is_alive()

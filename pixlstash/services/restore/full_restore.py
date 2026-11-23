@@ -128,14 +128,21 @@ class FullRestoreMixin:
                 "progress": 0.0,
             }
             try:
-                return self._restore_full_inner(
-                    snapshot_id,
-                    dry_run,
-                    vault_root,
-                    report,
-                    allow_without_safety,
-                    restore_request_lease,
-                )
+                # A snapshot that finishes while this restore runs waits to
+                # register its row until the restore has ended, and so lands
+                # in the restored database. Registered mid-restore, its row
+                # would be lost in the swap and its files orphaned. The safety
+                # snapshot taken below runs on this thread and re-enters the
+                # lock.
+                with self._vault.snapshot_service.hold_registrations():
+                    return self._restore_full_inner(
+                        snapshot_id,
+                        dry_run,
+                        vault_root,
+                        report,
+                        allow_without_safety,
+                        restore_request_lease,
+                    )
             finally:
                 self._active_job = None
         finally:
