@@ -452,9 +452,9 @@ _LABEL_SINK_EXEMPT = {
     ),
     # --- Machine-derived / rule-4-exempt background writes ---
     # NB: description regeneration is NOT rule-4 exempt (rule 3 freezes the
-    # description). description_task._generate_descriptions_batch /
-    # update_descriptions now SKIP locked pics (and MissingDescriptionFinder
-    # excludes them), so they are guarded, not exempt.
+    # description). DescriptionTask._generate_descriptions_batch /
+    # DescriptionTask._write_descriptions now SKIP locked pics (and
+    # MissingDescriptionFinder excludes them), so they are guarded, not exempt.
     ("pixlstash/tasks/text_embedding_task.py", "_run_task"): (
         "in-memory carry-over of the existing description onto a fresh fetch to "
         "compute an embedding; no persistent label change"

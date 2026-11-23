@@ -1118,9 +1118,11 @@ def test_description_regeneration_skips_locked_pic():
             def estimate_vram_mb(self, n, plugin_name=None):
                 return 0
 
+        # Handed as the finder reads them: the task writes a caption only over
+        # the description it was handed.
         pics = [
-            types.SimpleNamespace(id=locked_pic, description="x"),
-            types.SimpleNamespace(id=free_pic, description="x"),
+            types.SimpleNamespace(id=locked_pic, description="frozen-desc"),
+            types.SimpleNamespace(id=free_pic, description=None),
         ]
         task = DescriptionTask(server.vault.db, _StubWorkflow(), pics)
         task._run_task()

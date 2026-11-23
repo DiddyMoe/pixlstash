@@ -38,6 +38,7 @@ from .scoring import match_faces_to_characters
 from pixlstash.startup_permissions import mkdir_private
 from pixlstash.inference.engine import InferenceEngine
 from .utils.image_processing.image_utils import ImageUtils
+from .tasks.description_task import describable_picture_clauses
 from .tasks.face_extraction_task import FaceExtractionTask
 from .tasks.image_embedding_task import ImageEmbeddingTask
 from .tasks.likeness_task import LikenessTask
@@ -2672,9 +2673,10 @@ class Vault:
     @staticmethod
     def _count_missing_descriptions(session: Session) -> int:
         # The same predicate MissingDescriptionFinder selects on: NULL or a
-        # ``__description::`` sentinel, and never a picture frozen by a locked
-        # set. A reset writes the sentinel, not NULL, so counting NULL alone
-        # read "N / N" through an entire regeneration (#1162).
+        # ``__description::`` sentinel, never a picture frozen by a locked set,
+        # and never one in the Scrapheap or without a file. A reset writes the
+        # sentinel, not NULL, so counting NULL alone read "N / N" through an
+        # entire regeneration (#1162).
         result = session.exec(
             select(func.count())
             .select_from(Picture)
@@ -2687,6 +2689,7 @@ class Vault:
                     ),
                 ),
                 ~Picture.id.in_(locked_picture_id_subquery()),
+                *describable_picture_clauses(),
             )
         ).one()
         if isinstance(result, (tuple, list)):

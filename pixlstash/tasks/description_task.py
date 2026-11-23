@@ -10,8 +10,15 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture
 from pixlstash.inference.workflows.description import DescriptionWorkflow
 from pixlstash.pixl_logging import get_logger
+from pixlstash.services.scrapheap_service import file_location_is_unreachable
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
+from pixlstash.tasks.task_outcome import Outcome, Reason, id_sample, outcomes_payload
+from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.image_processing.media_load import (
+    LoadFailure,
+    load_pil_classified,
+)
 from pixlstash.utils.vram_utils import is_vram_oom
 
 if TYPE_CHECKING:
@@ -21,8 +28,44 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def describable_picture_clauses() -> tuple:
+    """The picture rows captioning may touch: not in the Scrapheap, and with a file.
+
+    One definition, because two queries have to answer identically: the
+    selection the work planner runs
+    (``MissingDescriptionFinder._fetch_missing_descriptions``) and the
+    "awaiting captions" number (``Vault._count_missing_descriptions``). A
+    picture one leaves out and the other keeps would sit in the count for ever.
+    A picture restored from the Scrapheap keeps its NULL or sentinel
+    description and is picked up again on the next sweep, so nothing is lost by
+    holding it out while it is deleted.
+    """
+    return (Picture.deleted.is_(False), Picture.file_path.is_not(None))
+
+
 class DescriptionTask(BaseTask):
     """Task for generating and persisting description batches.
+
+    The result reports an outcome for every picture it was handed (see
+    :mod:`pixlstash.tasks.task_outcome`):
+
+    - ``SUCCEEDED``: a caption was written.
+    - ``FAILED_PERMANENT`` (``INFERENCE_ERROR``): the batch captioned other
+      pictures, this one's file decodes, and the model still gave it nothing.
+      Its description is written as ``""``, which the finder never selects.
+    - ``FAILED_PERMANENT`` (``UNDECODABLE``, ``NO_FRAMES``): the file reads
+      and does not decode. Nothing is written; the unprocessable-image
+      registry holds it out of the finders until the file changes.
+    - ``FAILED_RETRYABLE``: nothing is written. ``UNREACHABLE``,
+      ``IO_TRANSIENT``, ``RESOURCE`` or ``LOAD_ERROR`` when the picture's own
+      file cannot be loaded for now; ``BACKEND_UNAVAILABLE`` when the batch
+      captioned nobody whose file loads (the workflow raised, returned
+      nothing, or its model failed to load), which says the backend is down,
+      not that these pictures cannot be captioned.
+    - ``DEFERRED``: not written: cancelled before it was captioned
+      (``CANCELLED``), frozen by a locked set, or, while the batch ran, moved
+      to the Scrapheap or given a description by someone else (see
+      :meth:`_write_descriptions`).
 
     Args:
         database: Vault database instance.
@@ -32,6 +75,15 @@ class DescriptionTask(BaseTask):
     """
 
     CPU_SPILLOVER_REUSE_GRACE_S = 8.0
+    #: The outcome of each load failure of a picture the workflow left
+    #: uncaptioned, apart from an I/O error, whose reason depends on whether
+    #: the file's location is there. The image-embedding stage's table.
+    _LOAD_FAILURE_OUTCOMES = {
+        LoadFailure.UNDECODABLE: (Outcome.FAILED_PERMANENT, Reason.UNDECODABLE),
+        LoadFailure.NO_FRAMES: (Outcome.FAILED_PERMANENT, Reason.NO_FRAMES),
+        LoadFailure.RESOURCE: (Outcome.FAILED_RETRYABLE, Reason.RESOURCE),
+        LoadFailure.UNCLASSIFIED: (Outcome.FAILED_RETRYABLE, Reason.LOAD_ERROR),
+    }
     _cpu_spillover_engine: "InferenceEngine | None" = None
     _cpu_spillover_last_used_at: float = 0.0
     _cpu_spillover_lock = threading.Lock()
@@ -126,42 +178,107 @@ class DescriptionTask(BaseTask):
 
     def _run_task(self):
         if not self._pictures:
-            return {"changed_count": 0, "changed": []}
+            return {"changed_count": 0, "changed": [], **outcomes_payload([])}
 
-        descriptions_generated = self._generate_descriptions_batch(self._pictures)
-        if not descriptions_generated:
-            return {"changed_count": 0, "changed": []}
+        generated, settled = self._generate_descriptions_batch(self._pictures)
+        changed = []
+        if generated:
+            changed = self._db.run_task(
+                self._write_descriptions,
+                generated,
+                {pic.id: pic.description for pic in self._pictures},
+                priority=DBPriority.LOW,
+            )
 
-        def update_descriptions(session: Session, pics):
-            # Defense in depth: a picture frozen by a locked set has a read-only
-            # description (rule 3) - never persist a machine-regenerated caption
-            # onto it, even if one was generated for an in-flight task.
-            locked = locked_picture_ids(session, [pic.id for pic in pics])
-            changed = []
-            for pic in pics:
-                if pic.id in locked:
-                    continue
-                db_pic = session.get(Picture, pic.id)
-                if db_pic is not None:
-                    db_pic.description = pic.description
-                    session.add(db_pic)
-                    changed.append((Picture, pic.id, "description", pic.description))
-            session.commit()
-            return changed
-
-        changed = self._db.run_task(
-            update_descriptions,
-            descriptions_generated,
-            priority=DBPriority.LOW,
-        )
-
+        written = {pid for _, pid, _, _ in changed}
+        outcomes = []
+        for pic in self._pictures:
+            if pic.id in written:
+                outcome = (
+                    (Outcome.SUCCEEDED, None)
+                    if generated[pic.id]
+                    else (Outcome.FAILED_PERMANENT, Reason.INFERENCE_ERROR)
+                )
+            else:
+                # Generated but not written: locked since the batch started,
+                # given a description while it ran, or the row is gone or in
+                # the Scrapheap.
+                outcome = settled.get(pic.id, (Outcome.DEFERRED, None))
+            outcomes.append((pic.id, *outcome))
         return {
             "changed_count": len(changed),
             "changed": changed,
+            **outcomes_payload(outcomes),
         }
 
-    def _generate_descriptions_batch(self, pictures: list[Picture]) -> list[Picture]:
+    @staticmethod
+    def _write_descriptions(
+        session: Session, generated: dict[int, str], read: dict[int, str | None]
+    ) -> list:
+        """Write *generated* (``{pid: description}``) on the writer thread.
+
+        A picture is written only while its description is still the one in
+        *read*, the value the batch was computed from. Inference takes minutes
+        on a slow model, and a person may type a caption, or ask for one from
+        another engine, in the meantime. Their edit is a write on this same
+        thread, so here it is either already in the row or lands after this
+        write; deciding when the batch was queued would let it be overwritten.
+        A picture moved to the Scrapheap while the batch ran is not written
+        either; the finder does not select it again until it is restored.
+
+        Returns the ``changed`` entries of the pictures actually written.
+        """
+        # Defense in depth: a picture frozen by a locked set has a read-only
+        # description (rule 3) - never persist a machine-regenerated caption
+        # onto it, even if one was generated for an in-flight task.
+        locked = locked_picture_ids(session, list(generated))
+        changed = []
+        edited = []
+        scrapped = []
+        for pid, description in generated.items():
+            if pid in locked:
+                continue
+            db_pic = session.get(Picture, pid)
+            if db_pic is None:
+                continue
+            if db_pic.deleted:
+                scrapped.append(pid)
+                continue
+            if db_pic.description != read[pid]:
+                edited.append(pid)
+                continue
+            db_pic.description = description
+            session.add(db_pic)
+            changed.append((Picture, pid, "description", description))
+        if edited:
+            logger.info(
+                "DescriptionTask: %d picture(s) were given a description while "
+                "the batch ran; theirs is kept: %r",
+                len(edited),
+                id_sample(edited),
+            )
+        if scrapped:
+            logger.info(
+                "DescriptionTask: %d picture(s) were moved to the Scrapheap while "
+                "the batch ran; their description is left as it was: %r",
+                len(scrapped),
+                id_sample(scrapped),
+            )
+        session.commit()
+        return changed
+
+    def _generate_descriptions_batch(
+        self, pictures: list[Picture]
+    ) -> tuple[dict[int, str], dict]:
+        """Caption *pictures* and decide what to write for each.
+
+        Returns:
+            ``({pid: description}, {pid: (Outcome, Reason)})``: the
+            descriptions to write (``""`` for a picture the model cannot
+            caption), and the outcome of every picture that gets no write.
+        """
         picture_ids = [pic.id for pic in pictures]
+        settled: dict = {}
         # Drop pictures frozen by a locked set: their description is read-only
         # (rule 3), so never machine-regenerate it. MissingDescriptionFinder also
         # excludes them; this covers the interactive/detection dispatch path too.
@@ -173,10 +290,11 @@ class DescriptionTask(BaseTask):
                 len(locked),
                 sorted(locked),
             )
+            settled.update((pid, (Outcome.DEFERRED, None)) for pid in locked)
             pictures = [pic for pic in pictures if pic.id not in locked]
             picture_ids = [pid for pid in picture_ids if pid not in locked]
             if not pictures:
-                return []
+                return {}, settled
         logger.debug(
             "DescriptionTask: Generating descriptions for batch_size=%s ids=%s",
             len(pictures),
@@ -197,7 +315,6 @@ class DescriptionTask(BaseTask):
             )
             active_workflow = cpu_spillover_engine.description_workflow
 
-        descriptions_generated = []
         try:
             # The event is the task's own, not the workflow's: with CPU
             # spillover the batch runs on a workflow object built fresh on
@@ -221,13 +338,13 @@ class DescriptionTask(BaseTask):
                     exc,
                 )
                 raise
-            import traceback
-
             logger.error(
-                "DescriptionTask failed for ids=%s: %s\n%s",
-                picture_ids,
+                "DescriptionTask failed for ids=%s (plugin=%r); no description "
+                "is changed and the batch is retried later: %s",
+                id_sample(picture_ids),
+                self._engine_override,
                 exc,
-                traceback.format_exc(),
+                exc_info=True,
             )
             batch_results = None
         finally:
@@ -236,38 +353,113 @@ class DescriptionTask(BaseTask):
                     self._cpu_spillover_last_used_at = time.perf_counter()
                 self._release_idle_cpu_spillover_engine(force=False)
 
-        # Blanking is how a picture the model genuinely cannot caption stops
-        # being retried for ever - MissingDescriptionFinder selects only NULL
-        # or a ``__description::`` sentinel, so an empty string is a permanent
-        # exclusion. A cancel is not a failure: it says nothing about these
-        # pictures, so leave them exactly as they were and let the finder pick
-        # them up on the next run.
-        cancelled = self._cancel_event.is_set()
+        results = batch_results or {}
+        generated = {pid: results[pid] for pid in picture_ids if results.get(pid)}
+        uncaptioned = [pic for pic in pictures if pic.id not in generated]
+        if not uncaptioned:
+            return generated, settled
 
-        if not batch_results:
-            if cancelled:
-                return []
-            if self._engine_override:
-                logger.error(
-                    "DescriptionTask: plugin %r failed for ids=%s; "
-                    "description will be cleared.",
-                    self._engine_override,
-                    picture_ids,
-                )
-            for pic in pictures:
-                pic.description = ""
-                descriptions_generated.append(pic)
-            return descriptions_generated
+        # A cancel is not a failure: it says nothing about these pictures, so
+        # leave them exactly as they were and let the finder pick them up on
+        # the next run.
+        if self._cancel_event.is_set():
+            settled.update(
+                (pic.id, (Outcome.DEFERRED, Reason.CANCELLED)) for pic in uncaptioned
+            )
+            return generated, settled
 
+        # The picture's own file first: one that cannot be loaded says nothing
+        # about the model.
+        settled.update(self._settle_file_failures(uncaptioned))
+        loadable = [pic for pic in uncaptioned if pic.id not in settled]
+        if not loadable:
+            return generated, settled
+
+        if not generated:
+            # Nothing in the batch was captioned: the workflow raised, returned
+            # nothing, or its model failed to load (the Florence-2 service logs
+            # that and answers None for every picture). That is the backend,
+            # not these pictures, and blanking them would lose them for good.
+            logger.warning(
+                "DescriptionTask: the batch captioned none of its %d loadable "
+                "pictures (plugin=%r); no description is changed and the batch "
+                "is retried later: %r",
+                len(loadable),
+                self._engine_override,
+                id_sample(pic.id for pic in loadable),
+            )
+            settled.update(
+                (pic.id, (Outcome.FAILED_RETRYABLE, Reason.BACKEND_UNAVAILABLE))
+                for pic in loadable
+            )
+            return generated, settled
+
+        # The model captioned the rest of the batch and gave these nothing.
+        # Blanking is how a picture it genuinely cannot caption stops being
+        # retried for ever - MissingDescriptionFinder selects only NULL or a
+        # ``__description::`` sentinel, so an empty string is a permanent
+        # exclusion.
+        logger.error(
+            "DescriptionTask: no description could be generated for %d "
+            "picture(s) whose file decodes (plugin=%r); clearing them: %r",
+            len(loadable),
+            self._engine_override,
+            id_sample(pic.id for pic in loadable),
+        )
+        generated.update((pic.id, "") for pic in loadable)
+        return generated, settled
+
+    def _settle_file_failures(self, pictures: list[Picture]) -> dict:
+        """The outcome of each picture in *pictures* whose file cannot be loaded.
+
+        Each file is loaded with the image-embedding stage's loader and its
+        failure classified the same way: a file whose whole location is gone
+        (an unmounted drive) is held out of every finder by the registry until
+        the directory is back, as is a file that reads and does not decode
+        until it changes; any other failure is retried later. Only the
+        pictures the workflow left uncaptioned get here, so a batch that
+        captions everyone loads nothing twice.
+
+        Returns:
+            ``{pid: (Outcome, Reason)}`` for the pictures that do not load.
+        """
+        registry = getattr(self._db, "unprocessable_images", None)
+        image_root = getattr(self._db, "image_root", "") or ""
+        settled = {}
         for pic in pictures:
-            description = batch_results.get(pic.id)
-            if description:
-                pic.description = description
-            elif cancelled:
-                # Skipped by the cancel, never attempted. Persist nothing.
+            file_path = getattr(pic, "file_path", None)
+            full_path = ImageUtils.resolve_picture_path(image_root, file_path)
+            if not full_path:
+                logger.error("DescriptionTask: picture %s has no file path", pic.id)
+                settled[pic.id] = (Outcome.FAILED_RETRYABLE, Reason.LOAD_ERROR)
                 continue
-            else:
-                logger.error("Failed to generate description for picture %s", pic.id)
-                pic.description = ""
-            descriptions_generated.append(pic)
-        return descriptions_generated
+            failure = load_pil_classified(full_path, multiframe_count=1).failure
+            if failure is None:
+                continue
+            if failure is LoadFailure.IO_ERROR:
+                unreachable = file_location_is_unreachable(full_path)
+                if unreachable and registry is not None:
+                    registry.mark_unreachable(
+                        pic.id, full_path, reason="image location is not mounted"
+                    )
+                settled[pic.id] = (
+                    Outcome.FAILED_RETRYABLE,
+                    Reason.UNREACHABLE if unreachable else Reason.IO_TRANSIENT,
+                )
+                continue
+            settled[pic.id] = self._LOAD_FAILURE_OUTCOMES[failure]
+            if failure.permanent and registry is not None:
+                registry.mark_unprocessable(
+                    pic.id,
+                    full_path,
+                    reason=f"image could not be decoded ({failure.value})",
+                )
+        if settled:
+            logger.warning(
+                "DescriptionTask: %d picture(s) got no description because "
+                "their file cannot be loaded (%s); no description is changed: %r",
+                len(settled),
+                ", ".join(sorted({reason.value for _, reason in settled.values()})),
+                id_sample(settled),
+            )
+        return settled
