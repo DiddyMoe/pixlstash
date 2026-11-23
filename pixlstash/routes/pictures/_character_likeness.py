@@ -13,7 +13,6 @@ and upload endpoints filter inline via ``fetch_scope_allowed_picture_ids`` /
 ``fetch_scope_allowed_character_ids``.
 """
 
-import asyncio
 from io import BytesIO
 from typing import Optional
 
@@ -679,7 +678,7 @@ def register_routes(router, server):
         ),
         response_model=ScoreCharacterLikenessResponse,
     )
-    async def score_character_likeness(
+    def score_character_likeness(
         request: Request,
         files: list[UploadFile] = File(
             ...,
@@ -734,7 +733,7 @@ def register_routes(router, server):
         # ── Decode uploads to BGR numpy arrays ────────────────────────────
         bgr_images: list[np.ndarray] = []
         for idx, file in enumerate(files):
-            raw_bytes = await file.read()
+            raw_bytes = file.file.read()
             if not raw_bytes:
                 raise HTTPException(
                     status_code=400,
@@ -784,14 +783,11 @@ def register_routes(router, server):
             raise HTTPException(status_code=503, detail="Task runner not available.")
 
         detection_task = FaceDetectionTask(engine, bgr_images)
-        loop = asyncio.get_event_loop()
         # Detection is batched on the GPU; allow a little more headroom per image
         # so a large batch under load does not time out prematurely.
         timeout_s = max(60.0, 2.0 * len(bgr_images))
         try:
-            all_face_results = await loop.run_in_executor(
-                None, task_runner.submit_and_wait, detection_task, timeout_s
-            )
+            all_face_results = task_runner.submit_and_wait(detection_task, timeout_s)
         except TimeoutError as exc:
             logger.error("score_character_likeness: face detection timed out: %s", exc)
             raise HTTPException(

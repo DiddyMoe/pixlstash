@@ -1,4 +1,5 @@
 import base64
+import threading
 from datetime import datetime, timezone
 
 from fastapi import (
@@ -16,6 +17,7 @@ from sqlalchemy import (
     update,
 )
 from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
 from typing import Optional
 
 from pixlstash.database import DBPriority
@@ -1258,6 +1260,27 @@ def register_routes(router, server):
             except Exception:
                 json_body = None
 
+        return await run_in_threadpool(
+            _finish_patch_picture_in_turn, id, request, params, json_body
+        )
+
+    # One PATCH at a time: each compares against the value the previous one wrote.
+    patch_picture_lock = threading.Lock()
+
+    def _finish_patch_picture_in_turn(*args):
+        """Run ``_finish_patch_picture`` whole under ``patch_picture_lock``."""
+        with patch_picture_lock:
+            return _finish_patch_picture(*args)
+
+    def _finish_patch_picture(
+        id: str, request: Request, params: dict, json_body
+    ) -> dict:
+        """The rest of ``patch_picture``, on a worker thread.
+
+        The lookup, the recorded edits, the smart-score reset and the sidecar
+        write all wait on the vault's writer, which would hold the event loop
+        for every other request.
+        """
         try:
             pic_list = server.vault.db.run_task(
                 lambda session: Picture.find(session, id=id, include_deleted=True)

@@ -1053,11 +1053,11 @@ def create_router(server) -> APIRouter:
         summary="Upload an attachment to a project",
         response_model=ProjectAttachmentResponse,
     )
-    async def upload_attachment(request: Request, project_id: int, file: UploadFile):
+    def upload_attachment(request: Request, project_id: int, file: UploadFile):
         server.auth.require_user_id(request)
 
         max_bytes = _max_attachment_bytes()
-        contents = await file.read()
+        contents = file.file.read()
         if len(contents) > max_bytes:
             raise HTTPException(
                 status_code=413,

@@ -14,6 +14,7 @@ from sqlalchemy import (
 )
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
 from typing import Literal, Optional
 
 from pixlstash.db_models import (
@@ -317,7 +318,9 @@ def register_routes(router, server):
         # optional positional `captions` array below is aligned 1:1 to
         # picture_ids - dropping ids here would misalign captions to the wrong
         # pictures.
-        scope_allowed = fetch_scope_allowed_picture_ids(server, request)
+        scope_allowed = await run_in_threadpool(
+            fetch_scope_allowed_picture_ids, server, request
+        )
         if scope_allowed is not None and any(
             pid not in scope_allowed for pid in picture_ids
         ):

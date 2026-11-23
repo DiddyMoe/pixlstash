@@ -19,6 +19,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import load_only
 from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
@@ -144,7 +145,11 @@ def register_routes(router, server):
             )
             return pics[0] if pics else None
 
-        pic = vault.db.run_immediate_read_task(fetch_picture, id)
+        # A worker waits for the engine, not the loop: a restore or library
+        # switch holds it exclusively, and every request would queue behind it.
+        pic = await run_in_threadpool(
+            vault.db.run_immediate_read_task, fetch_picture, id
+        )
         if not pic or not getattr(pic, "file_path", None):
             raise HTTPException(status_code=404, detail="Picture not found")
 

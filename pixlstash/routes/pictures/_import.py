@@ -30,7 +30,6 @@ from sqlalchemy import (
 )
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import select, Session
-from starlette.concurrency import run_in_threadpool
 from typing import Literal, Optional
 
 from pixlstash.database import DBPriority
@@ -767,7 +766,7 @@ def register_routes(router, server):
         description="Starts an asynchronous import of uploaded image/video files (or zip contents) and returns a task id.",
         response_model=ImportStartResponse,
     )
-    async def import_pictures(
+    def import_pictures(
         request: Request,
         file: list[UploadFile] = File(None),
         project_id: int | None = Form(None),
@@ -816,8 +815,9 @@ def register_routes(router, server):
         def _read_zip(upload: UploadFile) -> None:
             """Read an uploaded zip's media and caption entries.
 
-            Blocking file I/O on the spooled temporary file: call it through
-            ``run_in_threadpool``. Each media entry is read whole, because the
+            Blocking file I/O on the spooled temporary file: the route is a
+            plain ``def``, so it runs on a threadpool worker, never on the
+            event loop. Each media entry is read whole, because the
             import takes the media as bytes.
             """
             upload_file = upload.file
@@ -900,9 +900,10 @@ def register_routes(router, server):
                 ext = os.path.splitext(upload.filename)[1].lower()
                 if ext == ".zip":
                     # Read from the spooled temp file, never the whole archive
-                    # as one bytes object, and on a worker thread.
+                    # as one bytes object. This route is a plain ``def``, so the
+                    # read runs on a threadpool worker.
                     try:
-                        await run_in_threadpool(_read_zip, upload)
+                        _read_zip(upload)
                     except zipfile.BadZipFile as exc:
                         logger.error("Invalid zip file: %s", upload.filename)
                         raise HTTPException(
@@ -911,7 +912,7 @@ def register_routes(router, server):
                         ) from exc
                 else:
                     if ext in allowed_caption_exts:
-                        contents = await upload.read(_MAX_SIDECAR_BYTES + 1)
+                        contents = upload.file.read(_MAX_SIDECAR_BYTES + 1)
                         if len(contents) > _MAX_SIDECAR_BYTES:
                             logger.warning(
                                 "Leaving out caption %s: larger than %d bytes",
@@ -922,7 +923,7 @@ def register_routes(router, server):
                     else:
                         # Media is held whole until the import thread writes
                         # it, because the import takes it as bytes.
-                        contents = await upload.read()
+                        contents = upload.file.read()
                     if not contents:
                         continue
                     if len(contents) > _MAX_UPLOAD_BYTES:

@@ -12,7 +12,8 @@ Coverage
 8.  POST as returning session → score upserted, last_active_at refreshed.
 9.  GET after accept → scores returned by session cookie.
 10. Cookie set when set_cookie=True; NOT set when set_cookie=False.
-11. Concurrent session limit: new session refused with 503 when active count at cap.
+11. Concurrent session limit: new session refused with 503 when active count at cap,
+    also when many new sessions arrive at the same moment.
 12. Returning sessions are never blocked by the concurrent limit.
 13. FIFO eviction: oldest session deleted when stored cap reached.
 14. SCORE sort uses guest scores via COALESCE when guest_session_id present.
@@ -20,6 +21,7 @@ Coverage
 16. AuthService.record_guest_activity / count_active_guest_sessions.
 """
 
+import asyncio
 import io
 import json
 import tempfile
@@ -27,6 +29,7 @@ import time
 from typing import Optional
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -488,6 +491,62 @@ def test_concurrent_limit_refuses_new_session():
                 },
             )
             assert r.status_code == 503, f"Expected 503, got {r.status_code}: {r.text}"
+        finally:
+            server.__exit__(None, None, None)
+
+
+def test_new_sessions_arriving_together_are_admitted_only_up_to_the_cap():
+    """The cap check, the new session's row and its count in the tracker are
+    one step, so new guests arriving at once cannot all pass the check before
+    any of them is counted."""
+    with tempfile.TemporaryDirectory() as tmp:
+        server, _, read_token = _setup(tmp, guest_max_concurrent_sessions=1)
+        session_ids = [f"test-arriving-{i}" for i in range(8)]
+        real_record = server.auth.record_guest_activity
+
+        def slow_record(session_id):
+            # Widens the gap between storing a session and counting it, so a
+            # request that checks the cap inside that gap is caught every time.
+            time.sleep(0.05)
+            real_record(session_id)
+
+        async def submit_together():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=server.api),
+                base_url="http://testserver",
+                headers={"Authorization": f"Bearer {read_token}"},
+            ) as guest:
+                # Warm the token cache so every POST reaches the cap check at
+                # once instead of each one verifying the token first.
+                warm = await guest.get(f"{API}/pictures/guest-scores")
+                assert warm.status_code == 200, warm.text
+                return await asyncio.gather(
+                    *(
+                        guest.post(
+                            f"{API}/pictures/guest-scores",
+                            json={"session_id": sid, "set_cookie": False, "scores": {}},
+                        )
+                        for sid in session_ids
+                    )
+                )
+
+        try:
+            server.auth.clear_guest_session_tracking()
+            server.auth.record_guest_activity = slow_record
+            try:
+                responses = asyncio.run(submit_together())
+            finally:
+                del server.auth.record_guest_activity
+
+            codes = {sid: r.status_code for sid, r in zip(session_ids, responses)}
+            admitted = [sid for sid, code in codes.items() if code == 200]
+            assert len(admitted) == 1, f"cap is 1, admitted {admitted}: {codes}"
+            assert sorted(codes.values()) == [200] + [503] * 7, codes
+
+            stored = server.vault.db.run_immediate_read_task(
+                lambda session: session.exec(select(GuestSession.session_id)).all()
+            )
+            assert sorted(stored) == admitted, stored
         finally:
             server.__exit__(None, None, None)
 

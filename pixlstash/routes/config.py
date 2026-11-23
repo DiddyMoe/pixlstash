@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 from sqlmodel import Session, col, select
+from starlette.concurrency import run_in_threadpool
 
 from PIL import Image
 
@@ -673,6 +674,38 @@ def create_router(server) -> APIRouter:
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        return await run_in_threadpool(
+            _finish_patch_me_config_in_turn,
+            request,
+            user_id,
+            patch_data,
+            chip_size,
+            auto_exclusive,
+            start_time,
+        )
+
+    # One PATCH at a time: concurrent PATCHes must apply in the order they commit.
+    patch_me_config_lock = threading.Lock()
+
+    def _finish_patch_me_config_in_turn(*args):
+        """Run ``_finish_patch_me_config`` whole under ``patch_me_config_lock``."""
+        with patch_me_config_lock:
+            return _finish_patch_me_config(*args)
+
+    def _finish_patch_me_config(
+        request: Request,
+        user_id: int,
+        patch_data,
+        chip_size,
+        auto_exclusive,
+        start_time: float,
+    ):
+        """The rest of ``patch_me_config``, on a worker thread.
+
+        Every step below waits on the hub, the vault's writer or both, which
+        would hold the event loop for every other request.
+        """
+
         def _refuse_orphaning_a_link(user, value) -> None:
             """A linked current connection keeps its address (#2194).
 
@@ -1053,14 +1086,14 @@ def create_router(server) -> APIRouter:
         response_model=WatermarkUploadResponse,
         description="Uploads a PNG/JPEG/WebP image to use as the user's watermark.",
     )
-    async def post_me_watermark(file: UploadFile, request: Request):
+    def post_me_watermark(file: UploadFile, request: Request):
         _ensure_secure_when_required(request)
         user_id = server.auth.require_user_id(request)
         if file.content_type not in ("image/png", "image/jpeg", "image/webp"):
             raise HTTPException(
                 status_code=400, detail="Only PNG, JPEG, or WebP images are accepted"
             )
-        data = await file.read()
+        data = file.file.read()
         if len(data) > 4 * 1024 * 1024:
             raise HTTPException(
                 status_code=400, detail="Watermark image must be under 4 MB"

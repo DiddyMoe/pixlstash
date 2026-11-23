@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, text
 from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models.guest_score import GuestScore
@@ -203,6 +204,29 @@ def create_router(server) -> APIRouter:
                 )
             validated_scores[pic_id] = val
 
+        return await run_in_threadpool(
+            _finish_submit_guest_scores,
+            request,
+            session_id,
+            set_cookie,
+            cookie_token,
+            validated_scores,
+            token_public_id,
+        )
+
+    def _finish_submit_guest_scores(
+        request: Request,
+        session_id: str,
+        set_cookie: bool,
+        cookie_token: str | None,
+        validated_scores: dict[int, int],
+        token_public_id: str,
+    ) -> JSONResponse:
+        """The rest of ``submit_guest_scores``, on a worker thread.
+
+        The scope lookup and the score write both wait on the vault, which
+        would hold the event loop for every other request.
+        """
         # Scope guard (BOLA): a READ-scoped share token may only score pictures
         # within its granted resource.  None == owner / unscoped == no filter.
         scope_allowed = fetch_scope_allowed_picture_ids(server, request)
@@ -291,11 +315,11 @@ def create_router(server) -> APIRouter:
         def _run(session: Session):
             handle_session(session)
             session.commit()
+            # Count the session in the same writer callback as the cap check
+            # and the insert, so the next new session's check already sees it.
+            server.auth.record_guest_activity(session_id)
 
         server.vault.db.run_task(_run, priority=DBPriority.IMMEDIATE)
-
-        # Update in-memory active-session tracker
-        server.auth.record_guest_activity(session_id)
 
         logger.info(
             "[guest-scores] POST session=%r set_cookie=%r scores=%r",
