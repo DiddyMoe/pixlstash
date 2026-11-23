@@ -90,6 +90,9 @@ class RestoreReportResponse(BaseModel):
     missing_files_count: Optional[int] = None
     permanently_deleted_count: Optional[int] = None
     upserted_count: Optional[int] = None
+    # Snapshot tags left out because the owner removed them from tagging
+    # (per-resource and batch restores; a full restore does not filter).
+    skipped_excluded: Optional[int] = None
     errors: Optional[Any] = None
     dry_run: Optional[bool] = None
 
@@ -486,6 +489,9 @@ def create_router(server) -> APIRouter:
         ``confirm_restore_dependencies: true`` to also restore the missing
         parents from the snapshot first.
 
+        A tag the owner removed from tagging is not put back;
+        ``skipped_excluded`` counts the snapshot tags left out.
+
         Authentication is required.  Returns a combined RestoreReport.
         """
         try:
@@ -521,6 +527,7 @@ def create_router(server) -> APIRouter:
             "missing_files_count": report.missing_files_count,
             "permanently_deleted_count": report.permanently_deleted_count,
             "upserted_count": report.upserted_count,
+            "skipped_excluded": report.skipped_excluded,
             "errors": report.errors,
         }
 
@@ -601,6 +608,9 @@ def create_router(server) -> APIRouter:
         ``confirm_restore_dependencies: true`` to also restore the missing
         parents from the snapshot first.
 
+        A tag the owner removed from tagging is not put back;
+        ``skipped_excluded`` counts the snapshot tags left out.
+
         Authentication is required.
         """
         try:
@@ -640,6 +650,7 @@ def create_router(server) -> APIRouter:
             "missing_files_count": report.missing_files_count,
             "permanently_deleted_count": report.permanently_deleted_count,
             "upserted_count": report.upserted_count,
+            "skipped_excluded": report.skipped_excluded,
             "errors": report.errors,
         }
 

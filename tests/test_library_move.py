@@ -247,6 +247,26 @@ class TestAMove:
         (arrived,) = _there(server, other, sha)
         assert arrived["tags"] == ["__tag"]
 
+    def test_a_tag_removed_from_tagging_does_not_travel(self, server, owner, other):
+        mixed = _add(server, _png(), tags=["Flux Chin", "harbour"])
+        only_removed = _add(server, _png(), tags=["flux chin"])
+        shas = {pid: _here(server, pid).pixel_sha for pid in (mixed, only_removed)}
+
+        server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+        try:
+            response = _move(owner, other, [mixed, only_removed])
+        finally:
+            server.vault.db.set_tag_exclusions(frozenset())
+
+        assert response.status_code == 200, response.text
+        assert sorted(response.json()["moved"]) == sorted([mixed, only_removed])
+        (arrived,) = _there(server, other, shas[mixed])
+        assert arrived["tags"] == ["harbour"]
+        # It was tagged here, so the other library's tagger is not asked to
+        # tag it again: no tag and no pending marker.
+        (arrived,) = _there(server, other, shas[only_removed])
+        assert arrived["tags"] == []
+
     def test_a_video_moves_like_a_picture(self, server, owner, other, tmp_path):
         path = str(tmp_path / "clip.mp4")
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (32, 32))

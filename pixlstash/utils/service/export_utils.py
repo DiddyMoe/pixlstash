@@ -997,10 +997,16 @@ class ExportUtils:
                         caption_text = pic.description or ""
                         if not caption_text:
                             caption_text = CaptionUtils.build_tag_caption(
-                                pic, tag_format_d
+                                pic,
+                                tag_format_d,
+                                exclusions=server.vault.db.tag_exclusions,
                             )
                     elif caption_mode_d == "tags":
-                        caption_text = CaptionUtils.build_tag_caption(pic, tag_format_d)
+                        caption_text = CaptionUtils.build_tag_caption(
+                            pic,
+                            tag_format_d,
+                            exclusions=server.vault.db.tag_exclusions,
+                        )
 
                     if include_character_name_enabled:
                         character_names = CaptionUtils.build_character_caption(pic)
@@ -1157,7 +1163,7 @@ class ExportUtils:
         # like count_training_pictures; cache per set if large sets make the
         # Train dialog slow to open.
         pics = ExportUtils._training_rows(server, set_id, character_id)
-        return ExportUtils._captions_and_tags(pics)
+        return ExportUtils._captions_and_tags(pics, server.vault.db.tag_exclusions)
 
     @staticmethod
     def _training_rows(server, set_id, character_id, clips=False) -> list:
@@ -1175,9 +1181,14 @@ class ExportUtils:
         )
 
     @staticmethod
-    def _captions_and_tags(pics) -> tuple[list[str], list[list[str]]]:
+    def _captions_and_tags(
+        pics, exclusions: frozenset[str]
+    ) -> tuple[list[str], list[list[str]]]:
         captions = [pic.description or "" for pic in pics]
-        tags = [CaptionUtils.build_tag_caption(pic).split(", ") for pic in pics]
+        tags = [
+            CaptionUtils.build_tag_caption(pic, exclusions=exclusions).split(", ")
+            for pic in pics
+        ]
         return captions, [[t for t in row if t] for row in tags]
 
     @staticmethod
@@ -1205,7 +1216,9 @@ class ExportUtils:
 
         rows = ExportUtils._training_rows(server, set_id, character_id, clips=True)
         pics = [pic for pic in rows if not VideoUtils.is_video_file(pic.file_path)]
-        captions, tags = ExportUtils._captions_and_tags(pics)
+        captions, tags = ExportUtils._captions_and_tags(
+            pics, server.vault.db.tag_exclusions
+        )
         ids = [pic.id for pic in pics]
 
         def near_and_others(session):

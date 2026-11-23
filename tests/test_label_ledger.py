@@ -472,3 +472,61 @@ def test_record_human_labels_never_binds_more_parameters_than_sqlite_takes():
     assert widest <= SQLITE_ID_CHUNK, (
         f"a statement bound {widest} parameters, over the {SQLITE_ID_CHUNK} cap"
     )
+
+
+def test_no_ledger_row_is_invented_for_a_tag_removed_from_tagging():
+    """A human decision about a removed tag never creates a row for it.
+
+    A synthetic row is what the tagger reads back as a human label, so one for
+    a removed tag would keep it in the label space. A row already on file is
+    data about the tag and is marked as usual.
+    """
+    from sqlalchemy import create_engine
+    from sqlmodel import Session, SQLModel
+
+    from pixlstash.utils.service.label_ledger import (
+        NEG,
+        POS,
+        record_human_label,
+        record_human_labels,
+    )
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    try:
+        with Session(engine) as session:
+            session.info["tag_exclusions"] = frozenset(
+                {"malformed hand", "extra digit"}
+            )
+            session.add(
+                TagPrediction(
+                    picture_id=1,
+                    tag="extra digit",
+                    confidence=0.8,
+                    model_version="epoch-50",
+                )
+            )
+            session.flush()
+
+            assert record_human_label(session, 1, "Malformed Hand", NEG) is None
+            record_human_label(session, 1, "extra digit", NEG)
+            record_human_label(session, 1, "waxy skin", NEG)
+            record_human_labels(
+                session,
+                [(2, "malformed hand"), (2, "waxy skin"), (1, "extra digit")],
+                POS,
+            )
+            session.flush()
+
+            rows = {
+                (row.picture_id, row.tag, row.label_state, row.label_source)
+                for row in session.exec(select(TagPrediction)).all()
+            }
+    finally:
+        engine.dispose()
+
+    assert rows == {
+        (1, "extra digit", "POS", "human"),
+        (1, "waxy skin", "NEG", "human"),
+        (2, "waxy skin", "POS", "human"),
+    }

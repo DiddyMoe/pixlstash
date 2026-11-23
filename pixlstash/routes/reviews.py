@@ -216,7 +216,8 @@ def create_router(server) -> APIRouter:
             "whose tagger confidence is closest to the tag's threshold, nearest "
             "first. "
             "``include_reviewed=true`` re-surfaces previously-decided suspects "
-            "into this review. 409 when the tag already has an OPEN review. "
+            "into this review. 409 when the tag already has an OPEN review or was "
+            "removed from tagging. "
             "With ``picture_ids`` no scan runs: every listed picture gets a "
             "card, in the order given, and ``control_share`` mixes in that "
             "share of pictures that already carry a human verdict for the tag "
@@ -395,7 +396,8 @@ def create_router(server) -> APIRouter:
             "Re-runs the review's own candidate source for its tag and frozen "
             "scope. New suspects are appended; the review's decided rows are "
             "never resurrected. Updates ``refreshed_at`` and ``found``. 409 "
-            "for a review of a supplied list, which has no scan."
+            "for a review of a supplied list, which has no scan, or of a tag removed "
+            "from tagging."
         ),
         response_model=RefreshReviewResponse,
     )

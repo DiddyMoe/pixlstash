@@ -15,6 +15,10 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
 from pixlstash.tasks.tag_task import TagTask
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.quality.tag_exclusion import (
+    is_excluded,
+    session_tag_exclusions,
+)
 
 
 logger = get_logger(__name__)
@@ -228,8 +232,12 @@ class TagPredictionBackfillTask(BaseTask):
                 ~has_sentinel,
             )
         ).all()
+        exclusions = session_tag_exclusions(session)
         tags_by_pic_id: dict[int, set] = {}
         for pid, tag in tag_rows:
+            # A tag removed from tagging gets no prediction row.
+            if is_excluded(tag, exclusions):
+                continue
             tags_by_pic_id.setdefault(pid, set()).add(tag)
 
         written = TagTask._write_predictions_from_tags(

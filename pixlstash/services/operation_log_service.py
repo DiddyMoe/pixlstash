@@ -94,6 +94,11 @@ from pixlstash.utils.image_processing.orientation import (
     write_orientation,
 )
 from pixlstash.utils.path_utils import resolve_path_within
+from pixlstash.utils.quality.tag_exclusion import (
+    is_excluded,
+    normalise_tag,
+    session_tag_exclusions,
+)
 from pixlstash.utils.service.label_ledger import MANUAL_MODEL_VERSION, UNKNOWN
 from pixlstash.utils.service.smart_score_invalidation import (
     InteractiveRescoreRegistry,
@@ -793,6 +798,7 @@ def record_payload_operation_in_session(
     source: str = "external",
     origin_client_id: Optional[str] = None,
     batch_id: Optional[str] = None,
+    undoable: bool = True,
 ) -> Operation:
     """Append one operation whose before/after are NOT picture facets.
 
@@ -809,6 +815,8 @@ def record_payload_operation_in_session(
         before: JSON-serialisable state before the change (undo writes it back).
         after: JSON-serialisable state after the change (redo writes it back).
         summary: Human sentence for the undo toast.
+        undoable: ``False`` records a receipt for the activity log that undo
+            never offers; it needs no post-restore hook.
     """
     return _append_operation_row(
         session,
@@ -822,7 +830,7 @@ def record_payload_operation_in_session(
         origin_client_id=origin_client_id,
         batch_id=batch_id,
         summary=summary,
-        undoable=True,
+        undoable=undoable,
         commit=False,
     )
 
@@ -945,7 +953,30 @@ def run_recorded_metadata_task(
 # ---------------------------------------------------------------------------
 
 
+def _refuse_a_removed_tag(tag: str, exclusions: frozenset[str]) -> None:
+    """Refuse a restore that would write *tag* back after the owner removed it.
+
+    The log keeps the whole prior state, so a step is restored exactly or not
+    at all: raising here rolls back everything the restore has written so far,
+    and the step keeps its status.
+
+    Raises:
+        OperationLogError: *tag* is removed from tagging.
+    """
+    if is_excluded(tag, exclusions):
+        raise OperationLogError(
+            f"This change includes '{normalise_tag(tag)}', a tag you removed "
+            "from tagging. Add it back under Settings › Smart score & filters to "
+            "restore it."
+        )
+
+
 def _apply_tags(session: Session, picture_id: int, tags) -> None:
+    """Make the picture's Tag rows exactly the recorded set.
+
+    A tag the owner has removed from tagging is never added back; one the
+    picture still carries is left alone, as are its removals.
+    """
     wanted = {str(tag) for tag in tags or []}
     existing = {
         row.tag: row
@@ -954,7 +985,9 @@ def _apply_tags(session: Session, picture_id: int, tags) -> None:
     for tag, row in existing.items():
         if tag not in wanted:
             session.delete(row)
+    exclusions = session_tag_exclusions(session)
     for tag in sorted(wanted - set(existing)):
+        _refuse_a_removed_tag(tag, exclusions)
         session.add(Tag(picture_id=picture_id, tag=tag))
 
 
@@ -975,11 +1008,16 @@ def _apply_tag_predictions(session: Session, picture_id: int, predictions) -> No
        the tagger never predicted), so that is the only kind an undo may remove.
        A real tagger row written since the recording is left alone and logged -
        deleting it would silently discard model output nobody asked to revert.
+    3. **No row is rebuilt for a tag the owner removed from tagging.** A label
+       on such a tag is data about it; one still on file is updated as usual.
 
     Args:
         session: Pre-opened DB session; the caller commits.
         picture_id: Picture whose prediction rows are being restored.
         predictions: The recorded ``{tag: {field: value}}`` map for this picture.
+
+    Raises:
+        OperationLogError: The state would rebuild a row for a removed tag.
     """
     if not isinstance(predictions, dict):
         return
@@ -989,6 +1027,7 @@ def _apply_tag_predictions(session: Session, picture_id: int, predictions) -> No
             select(TagPrediction).where(TagPrediction.picture_id == picture_id)
         ).all()
     }
+    exclusions = session_tag_exclusions(session)
     for tag, fields in predictions.items():
         if not isinstance(fields, dict):
             logger.warning(
@@ -1001,6 +1040,7 @@ def _apply_tag_predictions(session: Session, picture_id: int, predictions) -> No
             continue
         row = existing.get(tag)
         if row is None:
+            _refuse_a_removed_tag(tag, exclusions)
             row = TagPrediction(
                 picture_id=picture_id,
                 tag=tag,
@@ -1625,6 +1665,8 @@ def apply_state_in_session(
     Raises:
         HTTPException: ``423`` when a locked picture set freezes any target;
             ``410`` when a scrapheap target has since been permanently purged.
+        OperationLogError: The state would add back a tag, or rebuild a label
+            row for one, that the owner has removed from tagging.
     """
     enforce_pictures_not_locked(session, [int(pid) for pid in (state or {})], action)
     _enforce_scrapheap_targets_exist(session, state, action)

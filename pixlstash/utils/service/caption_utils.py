@@ -16,6 +16,11 @@ from pixlstash.utils.caption_file_utils import (
     write_sidecar,
     writeback_target,
 )
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    is_excluded,
+    session_tag_exclusions,
+)
 
 _logger = get_logger(__name__)
 
@@ -39,18 +44,24 @@ class CaptionUtils:
         return tag.replace("_", " ").strip().lower()
 
     @staticmethod
-    def build_tag_caption(picture, tag_format: str = "spaces") -> str:
+    def build_tag_caption(
+        picture, tag_format: str = "spaces", *, exclusions: frozenset[str]
+    ) -> str:
         """Build a comma-separated tag string from a picture's tags.
 
         Args:
             picture: Picture ORM object with a ``tags`` relationship.
             tag_format: ``"spaces"`` (default) keeps tags as-is;
                 ``"underscores"`` replaces spaces with underscores.
+            exclusions: Tags the owner removed from tagging. A picture can
+                still carry one (a locked picture keeps it); it is left out.
         """
         tags = []
         for tag in getattr(picture, "tags", []) or []:
             tag_value = getattr(tag, "tag", None)
             if tag_value is None or is_tag_sentinel(tag_value):
+                continue
+            if is_excluded(tag_value, exclusions):
                 continue
             if tag_format == "underscores":
                 tag_value = tag_value.replace(" ", "_")
@@ -200,7 +211,13 @@ def sync_picture_sidecar(server, pic_id: int) -> list[dict]:
         # Fetch tags via explicit query - avoids triggering the lazy relationship
         # on pic_db (which would interact with cascade="all, delete-orphan").
         tag_rows = session.exec(select(Tag).where(Tag.picture_id == _pic_id)).all()
-        current_tags = [t.tag for t in tag_rows if t.tag and not is_tag_sentinel(t.tag)]
+        # A tag the owner removed from tagging is not written out, though the
+        # picture may still carry it (a locked picture keeps it) and the
+        # returned list still shows it.
+        current_tags = filter_tag_names(
+            [t.tag for t in tag_rows if t.tag and not is_tag_sentinel(t.tag)],
+            session_tag_exclusions(session),
+        )
         fresh_tags = [
             {"id": t.id, "tag": t.tag}
             for t in tag_rows

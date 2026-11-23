@@ -11,6 +11,10 @@ from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.tag import Tag, TAG_PENDING_SENTINEL
 from pixlstash.utils.caption_file_utils import attach_sidecars
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    session_tag_exclusions,
+)
 from pixlstash.pixl_logging import get_logger
 from pixlstash.stacking import (
     assign_picture_to_stack,
@@ -154,13 +158,25 @@ class WatchFolderImportTask(BaseTask):
             def insert_pictures(session: Session, pictures: list[Picture]):
                 session.add_all(pictures)
                 session.flush()
+                exclusions = session_tag_exclusions(session)
+                left_out = 0
                 for pic in pictures:
+                    # A sidecar naming only tags removed from tagging still
+                    # tagged the picture: no sentinel, so the tagger leaves it.
                     sidecar_tags = getattr(pic, "_sidecar_tags", None)
                     if sidecar_tags and pic.id is not None:
-                        for tag_str in sidecar_tags:
+                        permitted = filter_tag_names(sidecar_tags, exclusions)
+                        left_out += len(sidecar_tags) - len(permitted)
+                        for tag_str in permitted:
                             session.add(Tag(picture_id=pic.id, tag=tag_str))
                     else:
                         session.add(Tag(picture_id=pic.id, tag=TAG_PENDING_SENTINEL))
+                if left_out:
+                    logger.debug(
+                        "WatchFolderImportTask: left out %d sidecar tag(s) "
+                        "removed from tagging.",
+                        left_out,
+                    )
                 session.commit()
                 for pic in pictures:
                     session.refresh(pic)

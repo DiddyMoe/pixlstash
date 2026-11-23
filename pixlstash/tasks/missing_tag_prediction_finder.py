@@ -11,6 +11,7 @@ from pixlstash.db_models import (
     TAG_SENTINEL_ESCAPE_CHAR,
 )
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.quality.tag_exclusion import excluded_spellings
 from .base_task_finder import SimpleMissingFinder
 from .tag_prediction_backfill_task import TagPredictionBackfillTask
 from .task_type import TaskType
@@ -101,7 +102,13 @@ class MissingTagPredictionFinder(SimpleMissingFinder):
         has_sentinel = Tag.tag.like(
             TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
         )
-        has_real_tag = Picture.tags.any(and_(Tag.tag.is_not(None), ~has_sentinel))
+        real_tag = [Tag.tag.is_not(None), ~has_sentinel]
+        # A picture whose only real tags were removed from tagging has nothing
+        # to back-fill; selecting it would repeat on every sweep.
+        removed = excluded_spellings(session, Tag.tag)
+        if removed:
+            real_tag.append(~Tag.tag.in_(removed))
+        has_real_tag = Picture.tags.any(and_(*real_tag))
         no_prediction = ~Picture.tag_predictions.any()
         return session.exec(
             select(Picture)

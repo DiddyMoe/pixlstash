@@ -389,6 +389,62 @@ def test_training_captions_reads_each_pictures_caption_and_tags(env):
     assert sorted(tags[1]) == ["beard", "old man"]
 
 
+def test_a_tag_removed_from_tagging_is_left_out_of_training_captions(env):
+    """A picture can still carry a tag the owner removed from tagging (a
+    locked picture keeps it). It is not written into a dataset caption, nor
+    used where tags stand in for a missing description, nor read back as a
+    sample-prompt tag; a picture carrying only such a tag counts as untagged.
+
+    Like the facts test it places its pictures as rows, so it works whichever
+    test ran before it on this module's server.
+    """
+    client, server = env
+    quiesce_background_work(server)
+    set_id = _create_set(client, "RemovedTagSet")
+
+    def place(session):
+        made = []
+        for source, tags in (
+            ("Bad1.png", ("Flux Chin", "beard")),
+            ("Bad2.png", ("flux chin",)),
+        ):
+            rel = f"removed_tag_{len(made)}.png"
+            shutil.copy(
+                os.path.join(PICTURES_DIR, source),
+                os.path.join(server.vault.image_root, rel),
+            )
+            pic = Picture(file_path=rel, imported_at=datetime.now(timezone.utc))
+            session.add(pic)
+            session.commit()
+            session.refresh(pic)
+            session.add_all(Tag(picture_id=pic.id, tag=tag) for tag in tags)
+            session.commit()
+            made.append(pic.id)
+        return made
+
+    for pid in server.vault.db.run_task(place):
+        _add_to_set(client, set_id, pid)
+    written = {}
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+    try:
+        sample_tags = ExportUtils.training_captions(server, set_id=set_id)[1]
+        untagged = ExportUtils.training_facts(server, set_id=set_id)["untagged"]
+        for mode in ("tags", "description"):
+            with tempfile.TemporaryDirectory() as dest_dir:
+                ExportUtils.build_training_dataset(
+                    server, dest_dir=dest_dir, set_id=set_id, caption_mode=mode
+                )
+                caption = os.path.join(dest_dir, "image_00001.txt")
+                with open(caption, encoding="utf-8") as fh:
+                    written[mode] = fh.read().strip()
+    finally:
+        server.vault.db.set_tag_exclusions(frozenset())
+
+    assert sample_tags == [["beard"], []]
+    assert untagged == 1
+    assert written == {"tags": "beard", "description": "beard"}
+
+
 def test_training_facts_count_untagged_near_copies_and_other_people(env):
     """The Train dialog's checks: a picture with no tags trains on the trigger
     word alone, two pictures with the same perceptual hash are near copies,

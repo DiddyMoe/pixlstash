@@ -33,6 +33,7 @@ from pixlstash.db_models import (
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.path_utils import resolve_path_within
+from pixlstash.utils.quality.tag_exclusion import is_excluded, session_tag_exclusions
 
 from ._models import (
     MissingDependenciesError,
@@ -270,6 +271,7 @@ class ResourceRestoreMixin:
                             )
                             total.missing_files_count += sub.missing_files_count
                             total.upserted_count += sub.upserted_count
+                            total.skipped_excluded += sub.skipped_excluded
                             total.errors.extend(sub.errors)
                         except Exception as exc:
                             msg = f"{rtype}/{rid}: {exc}"
@@ -449,8 +451,9 @@ class ResourceRestoreMixin:
                 self._restore_parent_rows(session, candidate_parents, missing)
             return self._upsert_rows(session, snap_rows, valid_picture_ids)
 
-        upserted = self._vault.db.run_task(_check_deps_and_upsert, priority=0)
-        report.upserted_count = upserted
+        report.upserted_count, report.skipped_excluded = self._vault.db.run_task(
+            _check_deps_and_upsert, priority=0
+        )
         return report
 
     def _collect_batch_candidate_parents(
@@ -859,18 +862,23 @@ class ResourceRestoreMixin:
 
     def _upsert_rows(
         self, session: Session, snap_rows: dict, valid_picture_ids: list[int]
-    ) -> int:
+    ) -> tuple[int, int]:
         """Upsert all collected snapshot rows into the live session.
+
+        A snapshot tag the owner has since removed from tagging is not put
+        back: the picture comes back without it, and the count says so.
 
         Args:
             session: Live writer session.
             snap_rows: Collected rows from the snapshot.
             valid_picture_ids: Picture IDs being restored; their picture-scoped
                 dependents (Face/Tag/PSM/PPM) are deleted and re-inserted so
-                the restored pictures mirror the snapshot exactly.
+                the restored pictures mirror the snapshot exactly, less any
+                tag removed from tagging.
 
         Returns:
-            Total number of objects upserted.
+            The number of objects upserted, and the number of snapshot Tag
+            rows left out because their tag is removed from tagging.
         """
 
         count = 0
@@ -970,7 +978,12 @@ class ResourceRestoreMixin:
                 )
             )
             count += 1
+        exclusions = session_tag_exclusions(session)
+        skipped_excluded = 0
         for tag in snap_rows.get("tags", []):
+            if is_excluded(tag.tag, exclusions):
+                skipped_excluded += 1
+                continue
             session.add(Tag(picture_id=tag.picture_id, tag=tag.tag))
             count += 1
         for psm in snap_rows.get("picture_set_members", []):
@@ -997,4 +1010,4 @@ class ResourceRestoreMixin:
         # resource comes back fully populated with no regeneration pass.
 
         session.commit()
-        return count
+        return count, skipped_excluded

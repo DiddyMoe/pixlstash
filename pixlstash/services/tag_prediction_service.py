@@ -19,6 +19,12 @@ from pixlstash.services.set_lock_service import (
     locked_picture_ids,
 )
 from pixlstash.tagger_plugins.pixlstash_tagger import QUALITY_CROP_TAG_WHITELIST
+from pixlstash.utils.quality.tag_exclusion import (
+    TagExcludedError,
+    is_excluded,
+    normalise_tag,
+    session_tag_exclusions,
+)
 from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.service.label_ledger import (
     HUMAN,
@@ -184,10 +190,13 @@ def confirm_tag_prediction_in_session(
 
     Raises:
         KeyError: If no prediction with the given tag exists for the picture.
+        TagExcludedError: *tag* is removed from tagging; nothing is written.
     """
     # Confirming promotes a prediction to a Tag and writes a human POS - label
     # data frozen when the picture is in a locked set.
     enforce_pictures_not_locked(session, [pic_id], "confirm a tag on a locked picture")
+    if is_excluded(tag, session_tag_exclusions(session)):
+        raise TagExcludedError(normalise_tag(tag))
     prediction = session.exec(
         select(TagPrediction).where(
             TagPrediction.picture_id == pic_id,

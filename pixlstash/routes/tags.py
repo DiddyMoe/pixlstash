@@ -13,6 +13,12 @@ from pixlstash.db_models import (
 )
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.quality.tag_exclusion import (
+    TagExcludedError,
+    is_excluded,
+    normalise_tag,
+    session_tag_exclusions,
+)
 from pixlstash.utils.service.caption_utils import (
     serialize_tag_objects,
     sync_picture_sidecar,
@@ -141,6 +147,13 @@ class RestoreClearedTagsResponse(BaseModel):
             "unlock the set to restore them."
         ),
     )
+    skipped_excluded: int = Field(
+        default=0,
+        description=(
+            "Pairs left out because the owner removed the tag from tagging; "
+            "their tag is not put back."
+        ),
+    )
 
 
 def _sync_sidecar(server, pic_id: int) -> list[dict]:
@@ -153,7 +166,10 @@ def create_router(server) -> APIRouter:
     @router.post(
         "/pictures/{id}/tags",
         summary="Add tag to picture",
-        description="Adds a tag to a picture and removes empty-tag sentinel when appropriate.",
+        description=(
+            "Adds a tag to a picture and removes empty-tag sentinel when "
+            "appropriate. Returns 409 for a tag the owner removed from tagging."
+        ),
         response_model=PictureTagsResponse,
     )
     def add_tag_to_picture(request: Request, id: str, payload: dict = Body(...)):
@@ -184,6 +200,8 @@ def create_router(server) -> APIRouter:
             if existing is None:
 
                 def update_picture(session, pic_id, tag):
+                    if is_excluded(tag, session_tag_exclusions(session)):
+                        raise TagExcludedError(normalise_tag(tag))
                     # A picture frozen by a locked set has read-only label data.
                     enforce_pictures_not_locked(
                         session, [pic_id], "add a tag to a locked picture"
@@ -568,7 +586,8 @@ def create_router(server) -> APIRouter:
         summary="Undo a bulk impossible-tags clear",
         description=(
             "Re-add tags removed by a previous /clear and reset their human-label "
-            "ledger entries. Owner-only."
+            "ledger entries. A tag the owner has since removed from tagging is "
+            "not put back; `skipped_excluded` counts those pairs. Owner-only."
         ),
         response_model=RestoreClearedTagsResponse,
     )
@@ -596,12 +615,20 @@ def create_router(server) -> APIRouter:
             )
             for pid in touched:
                 _sync_sidecar(server, pid)
-        return {"status": "success", "restored": result["restored"]}
+        return {
+            "status": "success",
+            "restored": result["restored"],
+            "skipped_excluded": result["skipped_excluded"],
+        }
 
     @router.get(
         "/tags",
         summary="List all tags",
-        description="Returns all unique tag values with their usage count, sorted by count descending then alphabetically.",
+        description=(
+            "Returns all unique tag values with their usage count, sorted by "
+            "count descending then alphabetically. Tags the owner removed from "
+            "tagging are left out."
+        ),
         response_model=list[TagCountResponse],
     )
     def list_all_tags(request: Request):
@@ -630,7 +657,14 @@ def create_router(server) -> APIRouter:
                 rows = session.exec(
                     query.group_by(Tag.tag).order_by(func.count(Tag.id).desc(), Tag.tag)
                 ).all()
-                return [{"tag": tag, "count": count} for tag, count in rows if tag]
+                # A tag the owner removed from tagging is not offered for use,
+                # even while pictures it could not be removed from still carry it.
+                exclusions = session_tag_exclusions(session)
+                return [
+                    {"tag": tag, "count": count}
+                    for tag, count in rows
+                    if tag and not is_excluded(tag, exclusions)
+                ]
 
             return server.vault.db.run_task(fetch)
         except Exception as exc:

@@ -22,6 +22,10 @@ from pixlstash.services.project_membership_service import (
 )
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    session_tag_exclusions,
+)
 
 
 logger = get_logger(__name__)
@@ -347,18 +351,31 @@ class PictureImportTask(BaseTask):
             def insert_pictures(session: Session, pictures: list[Picture]):
                 session.add_all(pictures)
                 session.flush()
+                exclusions = session_tag_exclusions(session)
+                left_out = 0
                 for pic in pictures:
                     # Apply sidecar caption tags when the picture matches one by
                     # basename stem; otherwise seed the pending sentinel so the
-                    # tagger picks it up (mirrors WatchFolderImportTask).
+                    # tagger picks it up (mirrors WatchFolderImportTask). A
+                    # sidecar naming only tags the owner removed from tagging
+                    # still tagged the picture, so it gets no sentinel either.
                     tags = sidecar_tags_by_stem.get(
                         _sidecar_stem(pic.original_file_name or "")
                     )
                     if tags:
-                        for tag_str in tags:
+                        permitted = filter_tag_names(tags, exclusions)
+                        left_out += len(tags) - len(permitted)
+                        for tag_str in permitted:
                             session.add(Tag(picture_id=pic.id, tag=tag_str))
                     else:
                         session.add(Tag(picture_id=pic.id, tag=TAG_PENDING_SENTINEL))
+                if left_out:
+                    logger.debug(
+                        "PictureImportTask: left out %d sidecar tag(s) removed "
+                        "from tagging (staging_id=%s).",
+                        left_out,
+                        self._staging_id,
+                    )
                 session.commit()
                 for pic in pictures:
                     session.refresh(pic)

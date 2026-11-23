@@ -26,6 +26,7 @@ from pixlstash.db_models.tag import (
     DEFAULT_TAG_MERGES,
 )
 from pixlstash.db_models.tag_prediction import TagPrediction
+from pixlstash.utils.quality.tag_exclusion import is_excluded, session_tag_exclusions
 from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK, chunked
 
 if TYPE_CHECKING:
@@ -78,14 +79,15 @@ def not_human_labeled():
 
 def record_human_label(
     session: "Session", picture_id: int, tag: str, state: str
-) -> TagPrediction:
+) -> Optional[TagPrediction]:
     """Upsert the human supervision ledger for one ``(picture, tag)``. No commit.
 
     Snapshots the tagger version/confidence the human was adjudicating (``label_*``)
     from the live prediction row, then marks the row POS/NEG with ``source='human'``.
     Never overwrites the live ``model_version``/``confidence`` (those stay the tagger's).
     Creates a synthetic ``model_version='manual'`` row if none exists, so a removed tag's
-    negative still has somewhere to live.
+    negative still has somewhere to live - except for a tag the owner removed from
+    tagging, which gets no new row: the tagger reads that row back as a label.
 
     Args:
         session: Active DB session (caller commits).
@@ -94,7 +96,8 @@ def record_human_label(
         state: :data:`POS` or :data:`NEG`.
 
     Returns:
-        The (created or updated) :class:`TagPrediction` row.
+        The (created or updated) :class:`TagPrediction` row, or None when there was no
+        row and *tag* is removed from tagging.
     """
     if state not in (POS, NEG):
         raise ValueError(f"label state must be POS or NEG, got {state!r}")
@@ -108,6 +111,8 @@ def record_human_label(
 
     now = datetime.now(timezone.utc)
     if pred is None:
+        if is_excluded(tag, session_tag_exclusions(session)):
+            return None
         pred = _manual_prediction(picture_id, tag, state, now)
         session.add(pred)
     _mark_human(pred, state, now)
@@ -151,7 +156,8 @@ def record_human_labels(
 ) -> None:
     """:func:`record_human_label` over many pairs, in bounded statements. No commit.
 
-    Identical ledger semantics per pair; only the probe differs. One indexed
+    Identical ledger semantics per pair, including no new row for a tag removed
+    from tagging; only the probe differs. One indexed
     ``SELECT`` per ``(picture, tag)`` is one round trip per pair, and the caller
     this exists for - the folder-structure commit's tag assignment - has one
     pair per picture per tag-mapped folder, so on a fresh import that is a
@@ -193,9 +199,12 @@ def record_human_labels(
             )
 
     now = datetime.now(timezone.utc)
+    exclusions = session_tag_exclusions(session)
     for picture_id, tag in wanted:
         pred = existing.get((picture_id, tag))
         if pred is None:
+            if is_excluded(tag, exclusions):
+                continue
             pred = _manual_prediction(picture_id, tag, state, now)
             session.add(pred)
         _mark_human(pred, state, now)

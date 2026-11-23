@@ -32,6 +32,12 @@ from pixlstash.services.set_lock_service import (
 )
 from pixlstash.services.tag_scan_service import DEFAULT_MAX_TWIN_HAMMING
 from pixlstash.utils.near_neighbor import hamming_distance
+from pixlstash.utils.quality.tag_exclusion import (
+    TagExcludedError,
+    is_excluded,
+    normalise_tag,
+    session_tag_exclusions,
+)
 from pixlstash.utils.service.filter_helpers import (
     fetch_tag_review_scope_picture_ids,
 )
@@ -222,6 +228,7 @@ def create_review(
         ReviewConflictError: An OPEN review for the tag already exists.
         ReviewInputError: The list is empty or names a picture that is not in
             the library, or ``control_share`` came without a list.
+        TagExcludedError: The owner removed ``tag`` from tagging.
     """
     if picture_ids is None and control_share:
         raise ReviewInputError("control_share needs picture_ids")
@@ -233,6 +240,8 @@ def create_review(
         )
 
     def _create(session: Session) -> Review | tuple[Review, int]:
+        if is_excluded(tag, session_tag_exclusions(session)):
+            raise TagExcludedError(normalise_tag(tag))
         _assert_set_scope_not_locked(session, set_id)
         open_existing = session.exec(
             select(Review).where(Review.tag == tag, Review.status == OPEN)

@@ -1085,6 +1085,7 @@ class _FakeTaggingWorkflow:
 class _TagDb:
     def __init__(self, image_root: str):
         self.image_root = image_root
+        self.tag_exclusions = frozenset()
 
     def run_immediate_read_task(self, fn, *args, **kwargs):
         return {}  # no faces: the crop pass takes the centre-crop fallback

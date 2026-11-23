@@ -26,6 +26,7 @@ from pixlstash.tasks.anomaly_region_task import (
     AnomalyRegionTask,
 )
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.quality.tag_exclusion import TagExcludedError, is_excluded
 from pixlstash.utils.service.caption_utils import sanitise_tag
 
 from PIL import Image, UnidentifiedImageError
@@ -124,7 +125,7 @@ def register_routes(router, server):
             "the anomaly is diffuse (a global/surface defect), `box` and "
             "`heatmap` are null and `diffuse` is true. Returns 422 if the tag "
             "is not a label the model knows, 404 if the picture does not exist, "
-            "and 503 if the anomaly tagger model cannot be loaded or the GPU "
+            "409 if the owner removed the tag from tagging, and 503 if the anomaly tagger model cannot be loaded or the GPU "
             "worker does not reach the request in time."
         ),
         response_model=AnomalyRegionResponse,
@@ -147,6 +148,11 @@ def register_routes(router, server):
             raise HTTPException(
                 status_code=422, detail="tag query parameter is required"
             )
+        tag_key = sanitise_tag(tag_clean)
+        # A tag the owner removed from tagging is not offered for review, and a
+        # region cached before the removal is not served either.
+        if is_excluded(tag_key, server.vault.db.tag_exclusions):
+            raise TagExcludedError(tag_key)
 
         engine = getattr(server.vault, "_engine", None)
         service = getattr(engine, "pixlstash_tagger_service", None) if engine else None
@@ -156,7 +162,6 @@ def register_routes(router, server):
                 status_code=503, detail="Anomaly tagger is unavailable."
             )
 
-        tag_key = sanitise_tag(tag_clean)
         cached = _cache_get((pic_id, tag_key, int(service.version())))
         if cached is not None:
             return {"picture_id": pic_id, "tag": tag_clean, **cached}

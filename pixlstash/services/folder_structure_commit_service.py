@@ -103,6 +103,11 @@ from pixlstash.utils.library_roots import (
     refuse_overlapping_folder,
 )
 from pixlstash.utils.path_utils import path_is_within
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    is_excluded,
+    session_tag_exclusions,
+)
 from pixlstash.utils.reference_folder_validator import (
     canonical_path,
     validate_reference_folder_accessible,
@@ -963,13 +968,23 @@ def local_import_pictures(
             session.flush()
             # Sidecar tags land as real tags; a picture without any waits for
             # the tagger under the sentinel, as the scan's `_insert_pictures` does.
-            session.add_all(
-                Tag(picture_id=pic.id, tag=tag)
-                for pic in built
-                for tag in (
-                    getattr(pic, "_sidecar_tags", None) or [TAG_PENDING_SENTINEL]
+            # A tag the owner removed from tagging is left out, and a sidecar
+            # naming only such tags still tagged the picture: no sentinel.
+            exclusions = session_tag_exclusions(session)
+            left_out = 0
+            for pic in built:
+                sidecar_tags = getattr(pic, "_sidecar_tags", None)
+                if not sidecar_tags:
+                    session.add(Tag(picture_id=pic.id, tag=TAG_PENDING_SENTINEL))
+                    continue
+                permitted = filter_tag_names(sidecar_tags, exclusions)
+                left_out += len(sidecar_tags) - len(permitted)
+                session.add_all(Tag(picture_id=pic.id, tag=tag) for tag in permitted)
+            if left_out:
+                logger.debug(
+                    "Local import: left out %d sidecar tag(s) removed from tagging.",
+                    left_out,
                 )
-            )
             session.commit()
             return [pic.id for pic in built] + list(taken.values())
 
@@ -1266,6 +1281,9 @@ def _link_pictures(
         )
 
     tag_created: set[str] = set()
+    # A folder named for a tag the owner removed from tagging files no tag.
+    exclusions = session_tag_exclusions(session)
+    left_out: set[str] = set()
 
     # Resolve every folder first, then link. The order is what keeps the cost
     # of this step bounded: with the answers in hand the human-label ledger can
@@ -1281,11 +1299,21 @@ def _link_pictures(
         tag_names = []
         for tag_a in tag_as:
             tag_name = os.path.basename(tag_a.relative_path) or tag_a.relative_path
+            if is_excluded(tag_name, exclusions):
+                left_out.add(tag_name)
+                continue
             tag_names.append(tag_name)
             if tag_name not in tag_created:
                 tag_created.add(tag_name)
                 result.tags_created += 1
         resolved[folder_relpath] = (project_id, character_id, set_id, tag_names)
+    if left_out:
+        logger.debug(
+            "Folder-mapping commit: %d folder tag(s) removed from tagging are "
+            "not filed: %s",
+            len(left_out),
+            sorted(left_out),
+        )
 
     # The owner accepted these folders as tags, so every pair is a human POS and
     # belongs in the label ledger. Without it the tags do not survive: these

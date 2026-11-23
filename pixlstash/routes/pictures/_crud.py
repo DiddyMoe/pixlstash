@@ -52,6 +52,12 @@ from pixlstash.utils.image_processing.orientation import (
     rotate_orientation,
     supports_in_place_rotation,
 )
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    is_excluded,
+    normalise_tag,
+    session_tag_exclusions,
+)
 from pixlstash.utils.service.caption_utils import (
     serialize_tag_objects,
     sync_picture_sidecar,
@@ -221,6 +227,13 @@ class PicturePatchResponse(BaseModel):
 
     status: str
     picture: dict
+    skipped_excluded: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names from a `tags` replacement that were not applied because the "
+            "owner removed them from tagging, normalised."
+        ),
+    )
 
 
 class ScrapheapRestoreResponse(BaseModel):
@@ -1276,6 +1289,7 @@ def register_routes(router, server):
         )
         updated = False
         updated_fields = {}
+        skipped_excluded: list[str] = []
         for key, value in params.items():
             # Validate the key against the mapped CLASS, not the instance:
             # hasattr(pic, "tags") lazy-loads the tags relationship, which raises
@@ -1308,24 +1322,41 @@ def register_routes(router, server):
                         session: Session,
                         pid: int,
                         new_tags: list[str],
-                    ) -> None:
+                    ) -> list[str]:
                         # Tag replacement is label data - frozen on a locked pic.
                         enforce_pictures_not_locked(
                             session, [pid], "replace tags on a locked picture"
                         )
+                        # Names the owner removed from tagging are dropped and
+                        # reported; the rest of the list is applied. With
+                        # nothing left the tags stay, as for an empty list.
+                        exclusions = session_tag_exclusions(session)
+                        permitted = filter_tag_names(new_tags, exclusions)
+                        refused = sorted(
+                            {
+                                normalise_tag(t)
+                                for t in new_tags
+                                if is_excluded(t, exclusions)
+                            }
+                        )
+                        if not permitted:
+                            return refused
                         session.exec(delete(Tag).where(Tag.picture_id == pid))
-                        session.add_all([Tag(picture_id=pid, tag=t) for t in new_tags])
+                        session.add_all([Tag(picture_id=pid, tag=t) for t in permitted])
                         session.flush()
+                        return refused
 
-                    operation_log_service.run_recorded_metadata_task(
-                        server.vault,
-                        _replace_tags,
-                        pic_id,
-                        tag_values,
-                        op_type="pictures.tags.replace",
-                        picture_ids=[pic_id],
-                        summary="Replaced the picture's tags",
-                        **operation_log_service.request_context(request),
+                    skipped_excluded, _operation = (
+                        operation_log_service.run_recorded_metadata_task(
+                            server.vault,
+                            _replace_tags,
+                            pic_id,
+                            tag_values,
+                            op_type="pictures.tags.replace",
+                            picture_ids=[pic_id],
+                            summary="Replaced the picture's tags",
+                            **operation_log_service.request_context(request),
+                        )
                     )
                     updated = True
                 continue
@@ -1401,7 +1432,11 @@ def register_routes(router, server):
         # Write back description to caption sidecar when enabled.
         sync_picture_sidecar(server, picture_id)
 
-        return {"status": "success", "picture": safe_model_dict(pic)}
+        return {
+            "status": "success",
+            "picture": safe_model_dict(pic),
+            "skipped_excluded": skipped_excluded,
+        }
 
     @router.post(
         "/pictures/scrapheap/restore",

@@ -453,6 +453,66 @@ def test_metadata_import_drops_a_tag_task_that_read_the_old_tags(server, tmp_pat
     assert _picture_tags(server, pic_id) == ["sidecar tag"]
 
 
+def test_metadata_import_leaves_out_a_tag_removed_from_tagging(server, tmp_path):
+    """A sidecar read in through the import route brings its permitted tags.
+    One naming only tags the owner removed from tagging leaves the picture
+    untagged and not waiting for the tagger: the sidecar is the tag set."""
+    client = _login_client(server)
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    mixed = _make_image(folder_dir, "mixed.png")
+    only = _make_image(folder_dir, "only.png")
+    mixed_id = _index_picture(server, folder_id, mixed, tags=["old"])
+    only_id = _index_picture(server, folder_id, only, tags=["old"])
+    _write(os.path.splitext(mixed)[0] + "_tags.txt", "flux chin, cat")
+    _write(os.path.splitext(only)[0] + "_tags.txt", "Flux_Chin")
+
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+    try:
+        resp = client.post(
+            f"/reference-folders/{folder_id}/metadata/import",
+            json={"scope_path": folder_dir, "types": ["tags"]},
+        )
+    finally:
+        server.vault.db.set_tag_exclusions(frozenset())
+
+    assert resp.status_code == 200, resp.text
+
+    def every_tag(session: Session):
+        return {
+            pid: sorted(session.exec(select(Tag.tag).where(Tag.picture_id == pid)))
+            for pid in (mixed_id, only_id)
+        }
+
+    assert server.vault.db.run_task(every_tag) == {mixed_id: ["cat"], only_id: []}
+
+
+def test_metadata_export_leaves_out_a_tag_removed_from_tagging(server, tmp_path):
+    """A picture can still carry a tag the owner removed from tagging (a
+    locked picture keeps it). The export route writes the rest, and a picture
+    carrying only such a tag gets no sidecar."""
+    client = _login_client(server)
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    mixed = _make_image(folder_dir, "mixed.png")
+    only = _make_image(folder_dir, "only.png")
+    _index_picture(server, folder_id, mixed, tags=["Flux Chin", "cat"])
+    _index_picture(server, folder_id, only, tags=["flux chin"])
+
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+    try:
+        resp = client.post(
+            f"/reference-folders/{folder_id}/metadata/export",
+            json={"scope_path": folder_dir, "types": ["tags"]},
+        )
+    finally:
+        server.vault.db.set_tag_exclusions(frozenset())
+
+    assert resp.status_code == 200, resp.text
+    assert _read(os.path.splitext(mixed)[0] + "_tags.txt") == "cat"
+    assert not os.path.exists(os.path.splitext(only)[0] + "_tags.txt")
+
+
 def test_scan_reads_separate_tags_and_description_sidecars(server, tmp_path):
     folder_dir = str(tmp_path / "refs")
     folder_id = _make_folder(server, folder_dir)

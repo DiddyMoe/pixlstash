@@ -20,6 +20,7 @@ from sqlmodel import Session, select
 from pixlstash.db_models import Face, Picture, Tag
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.set_lock_service import locked_picture_ids
+from pixlstash.utils.quality.tag_exclusion import is_excluded, session_tag_exclusions
 from pixlstash.utils.service.label_ledger import (
     NEG,
     clear_human_label,
@@ -122,8 +123,18 @@ def _clear_tags_in_session(
     return removed
 
 
-def restore_in_session(session: Session, pairs: list[tuple[int, str]]) -> list[int]:
-    """Re-add removed tags and clear their ledger entries (undo). Returns touched pids."""
+def restore_in_session(
+    session: Session, pairs: list[tuple[int, str]]
+) -> tuple[list[int], int, int]:
+    """Re-add removed tags and clear their ledger entries (undo).
+
+    A tag the owner has since removed from tagging is not put back, and its ledger
+    entry keeps the negative the clear recorded.
+
+    Returns:
+        The touched picture ids, the number of pairs re-added, and the number left
+        out because their tag is removed from tagging.
+    """
     # Skip any picture that has since become frozen by a locked set - restoring a
     # tag onto it would mutate the frozen set's labels.
     locked = locked_picture_ids(session, [pid for pid, _tag in pairs])
@@ -134,6 +145,16 @@ def restore_in_session(session: Session, pairs: list[tuple[int, str]]) -> list[i
             sorted(locked),
         )
         pairs = [(pid, tag) for pid, tag in pairs if pid not in locked]
+    exclusions = session_tag_exclusions(session)
+    permitted = [(pid, tag) for pid, tag in pairs if not is_excluded(tag, exclusions)]
+    skipped_excluded = len(pairs) - len(permitted)
+    if skipped_excluded:
+        logger.info(
+            "Impossible-tag restore: leaving out %d pair(s) whose tag is removed "
+            "from tagging",
+            skipped_excluded,
+        )
+    pairs = permitted
     touched: set[int] = set()
     # Clearing the ledger entries reverses the human NEGs the clear recorded, which
     # moves the scorer's anomaly inputs back - invalidate in one bulk UPDATE.
@@ -152,7 +173,7 @@ def restore_in_session(session: Session, pairs: list[tuple[int, str]]) -> list[i
             session.flush()
             recompute_anomaly_tag_uncertainty(session, pid)
     session.commit()
-    return sorted(touched)
+    return sorted(touched), len(pairs), skipped_excluded
 
 
 def clear_impossible_tags(
@@ -186,17 +207,21 @@ def restore_cleared_tags(vault: "Vault", pairs: list[tuple[int, str]]) -> dict:
     """Vault wrapper for :func:`restore_in_session` (undo).
 
     ``restored`` counts the pairs actually re-added (locked pictures are skipped),
-    and ``skipped_locked`` lists any picture ids frozen by a locked set."""
+    ``skipped_locked`` lists any picture ids frozen by a locked set, and
+    ``skipped_excluded`` counts the pairs left out because their tag is removed
+    from tagging."""
 
     def _run(session, restore_pairs):
         skipped_set = locked_picture_ids(session, [p for p, _t in restore_pairs])
-        touched = restore_in_session(session, restore_pairs)
-        restored_pairs = [p for p, _t in restore_pairs if p not in skipped_set]
-        return touched, sorted(skipped_set), len(restored_pairs)
+        touched, restored, skipped_excluded = restore_in_session(session, restore_pairs)
+        return touched, sorted(skipped_set), restored, skipped_excluded
 
-    touched, skipped_locked, restored_count = vault.db.run_task(_run, list(pairs))
+    touched, skipped_locked, restored_count, skipped_excluded = vault.db.run_task(
+        _run, list(pairs)
+    )
     return {
         "restored": restored_count,
         "picture_ids": touched,
         "skipped_locked": skipped_locked,
+        "skipped_excluded": skipped_excluded,
     }

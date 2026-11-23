@@ -52,6 +52,11 @@ from pixlstash.utils.reference_folder_validator import (
 )
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.path_utils import resolve_path_within
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    is_excluded,
+    session_tag_exclusions,
+)
 from sqlmodel import Session, delete, select
 
 logger = get_logger(__name__)
@@ -1476,9 +1481,16 @@ def create_router(server) -> APIRouter:
                     Tag.picture_id.in_([p.id for p in pictures if p.id is not None])
                 )
             ).all()
+            # A tag the owner removed from tagging is not exported, though a
+            # picture may still carry it (a locked picture keeps it).
+            exclusions = session_tag_exclusions(session)
             tags_by_picture: dict[int, list[str]] = {}
             for picture_id, tag in tag_rows:
-                if tag and not is_tag_sentinel(tag):
+                if (
+                    tag
+                    and not is_tag_sentinel(tag)
+                    and not is_excluded(tag, exclusions)
+                ):
                     tags_by_picture.setdefault(picture_id, []).append(tag)
 
             tags_count = 0
@@ -1572,6 +1584,8 @@ def create_router(server) -> APIRouter:
             descriptions_count = 0
             skipped_count = 0
             retagged: list[int] = []
+            exclusions = session_tag_exclusions(session)
+            left_out = 0
             # A sidecar import deletes+rewrites confirmed Tag rows and overwrites
             # the description on EXISTING pictures - frozen for anything in a
             # locked set. Skip those (counted as skipped) instead of overwriting.
@@ -1601,13 +1615,18 @@ def create_router(server) -> APIRouter:
                     # Only after a successful read: the `[]` an unreadable file
                     # would parse to deletes the picture's tags.
                     if raw_tags is not None:
-                        tags = parse_caption_tags(raw_tags)
+                        # A tag the owner removed from tagging is left out; a
+                        # sidecar naming only such tags still tagged the
+                        # picture, so it gets no sentinel.
+                        raw_names = parse_caption_tags(raw_tags)
+                        tags = filter_tag_names(raw_names, exclusions)
+                        left_out += len(raw_names) - len(tags)
                         session.exec(delete(Tag).where(Tag.picture_id == pic.id))
                         if tags:
                             session.add_all(
                                 [Tag(picture_id=pic.id, tag=tag) for tag in tags]
                             )
-                        else:
+                        elif not raw_names:
                             session.add(
                                 Tag(picture_id=pic.id, tag=TAG_PENDING_SENTINEL)
                             )
@@ -1635,6 +1654,12 @@ def create_router(server) -> APIRouter:
                         dirty = True
                 if dirty:
                     session.add(pic)
+            if left_out:
+                logger.debug(
+                    "Reference-folder metadata import: left out %d sidecar tag(s) "
+                    "removed from tagging.",
+                    left_out,
+                )
             try:
                 session.commit()
             except IntegrityError as exc:
