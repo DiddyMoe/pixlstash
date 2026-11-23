@@ -9,12 +9,16 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { setActivePinia, createPinia } from "pinia";
+import { computed } from "vue";
 
 const listModelFolders = vi.fn();
 const createModelFolder = vi.fn();
 const forgetModelFolder = vi.fn();
 const setDefaultModelFolder = vi.fn();
 const listModelFolderDirs = vi.fn();
+const listModelFolderDevices = vi.fn();
+const getComfyuiReads = vi.fn();
+const renameModelFolder = vi.fn();
 
 vi.mock("../api/modelFolders", () => ({
   MANAGED_KIND: "managed",
@@ -26,6 +30,9 @@ vi.mock("../api/modelFolders", () => ({
   forgetModelFolder: (...a) => forgetModelFolder(...a),
   setDefaultModelFolder: (...a) => setDefaultModelFolder(...a),
   listModelFolderDirs: (...a) => listModelFolderDirs(...a),
+  listModelFolderDevices: (...a) => listModelFolderDevices(...a),
+  getComfyuiReads: (...a) => getComfyuiReads(...a),
+  renameModelFolder: (...a) => renameModelFolder(...a),
 }));
 
 const fetchRows = vi.fn();
@@ -72,6 +79,27 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
 });
+
+/** Let every settled read run its continuations (the timers are fake). */
+async function drain() {
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+}
+
+/** Make `api` answer each call only when the test says so, in call order. */
+function holdAnswers(api) {
+  const answers = [];
+  api
+    .mockReset()
+    .mockImplementation(() => new Promise((resolve) => answers.push(resolve)));
+  return answers;
+}
+
+/** A listing that names the level it lists, so the tests can tell them apart. */
+function answerEveryListing() {
+  listModelFolderDirs
+    .mockReset()
+    .mockImplementation(async (id, path) => ({ folder_id: id, path, dirs: [] }));
+}
 
 describe("scanning", () => {
   it("is scanning while the server says so, and stops polling when it is not", async () => {
@@ -205,23 +233,403 @@ describe("forgetting", () => {
 });
 
 describe("subfolder listings", () => {
-  it("lets a forced read supersede one in flight, and keeps the newer answer", async () => {
+  it("reads once more after a read out when forced, and never shows the older answer", async () => {
     const store = useModelFoldersStore();
-    let answerStale;
-    listModelFolderDirs
-      .mockReset()
-      .mockImplementationOnce(
-        () => new Promise((resolve) => (answerStale = resolve)),
-      )
-      .mockResolvedValueOnce({ dirs: [{ name: "new" }] });
-    const stale = store.loadDirs(1, "");
-    // A scan landed while the first read was out: it must read again.
-    await store.loadDirs(1, "", { force: true });
+    const answers = holdAnswers(listModelFolderDirs);
+    const first = store.loadDirs(1, "");
+    // A scan landed while the first read was out: it must read again, but
+    // not alongside it, or the older answer could land last.
+    const forced = store.loadDirs(1, "", { force: true });
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(1);
+
+    answers[0]({ dirs: [{ name: "old" }] });
+    await drain();
     expect(listModelFolderDirs).toHaveBeenCalledTimes(2);
-    answerStale({ dirs: [{ name: "old" }] });
-    await stale;
+    const entry = store.dirListings.get(store.dirsKey(1, ""));
+    expect(entry.listing).toBe(null);
+    expect(entry.loading).toBe(true);
+
+    answers[1]({ dirs: [{ name: "new" }] });
+    expect(await forced).toEqual({ dirs: [{ name: "new" }] });
+    expect(await first).toEqual({ dirs: [{ name: "new" }] });
     expect(store.dirListings.get(store.dirsKey(1, "")).listing.dirs).toEqual([
       { name: "new" },
+    ]);
+  });
+
+  it("re-reads only the listings something shows, and marks the rest stale", async () => {
+    answerEveryListing();
+    const store = useModelFoldersStore();
+    for (let i = 0; i < 64; i += 1) await store.loadDirs(1, `d${i}`);
+    store.setActiveDirs(Symbol("test-view"), [store.dirsKey(1, "d0")]);
+    listModelFolderDirs.mockClear();
+
+    store.reloadDirs();
+    await drain();
+    expect(listModelFolderDirs.mock.calls).toEqual([[1, "d0"]]);
+    const stale = [...store.dirListings].filter(([, entry]) => entry.stale);
+    expect(stale).toHaveLength(63);
+    expect(store.dirListings.get("1:d0").stale).toBe(false);
+  });
+
+  it("re-reads a stale listing on its next use, still drawing the old one meanwhile", async () => {
+    const store = useModelFoldersStore();
+    listModelFolderDirs.mockReset().mockResolvedValue({ dirs: [{ name: "old" }] });
+    await store.loadDirs(1, "");
+    store.reloadDirs();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(1);
+
+    const answers = holdAnswers(listModelFolderDirs);
+    const next = store.loadDirs(1, "");
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(1);
+    const entry = store.dirListings.get("1:");
+    expect(entry.loading).toBe(true);
+    expect(entry.listing.dirs).toEqual([{ name: "old" }]);
+
+    answers[0]({ dirs: [{ name: "new" }] });
+    expect(await next).toEqual({ dirs: [{ name: "new" }] });
+    expect(store.dirListings.get("1:").stale).toBe(false);
+  });
+
+  it("re-reads a stale listing as soon as something shows it", async () => {
+    answerEveryListing();
+    const store = useModelFoldersStore();
+    await store.loadDirs(1, "");
+    store.reloadDirs();
+    listModelFolderDirs.mockClear();
+
+    store.setActiveDirs(Symbol("test-picker"), ["1:"]);
+    await drain();
+    expect(listModelFolderDirs.mock.calls).toEqual([[1, ""]]);
+    expect(store.dirListings.get("1:").stale).toBe(false);
+  });
+
+  it("reads a listing something starts showing after the cache dropped it", async () => {
+    answerEveryListing();
+    const store = useModelFoldersStore();
+    await store.loadDirs(1, "open");
+    // Nothing shows it (the tree is unmounted), and 256 newer listings push
+    // it out of the cache.
+    for (let i = 0; i < 256; i += 1) await store.loadDirs(1, `d${i}`);
+    expect(store.dirListings.has("1:open")).toBe(false);
+    listModelFolderDirs.mockClear();
+
+    // The tree comes back and says it shows its root and the row left open.
+    store.setActiveDirs(Symbol("test-tree"), ["1:", "1:open"]);
+    await drain();
+    expect(listModelFolderDirs.mock.calls).toEqual([
+      [1, ""],
+      [1, "open"],
+    ]);
+    expect(store.dirListings.get("1:open").listing).toEqual({
+      folder_id: 1,
+      path: "open",
+      dirs: [],
+    });
+  });
+
+  it("stops re-reading a listing once the last thing showing it lets go", async () => {
+    answerEveryListing();
+    const store = useModelFoldersStore();
+    await store.loadDirs(1, "");
+    const tree = Symbol("test-tree");
+    const picker = Symbol("test-picker");
+    store.setActiveDirs(tree, ["1:"]);
+    store.setActiveDirs(picker, ["1:"]);
+
+    store.releaseActiveDirs(picker);
+    listModelFolderDirs.mockClear();
+    store.reloadDirs();
+    await drain();
+    expect(listModelFolderDirs.mock.calls).toEqual([[1, ""]]);
+
+    store.releaseActiveDirs(tree);
+    listModelFolderDirs.mockClear();
+    store.reloadDirs();
+    await drain();
+    expect(listModelFolderDirs).not.toHaveBeenCalled();
+    expect(store.dirListings.get("1:").stale).toBe(true);
+  });
+
+  it("re-reads at most four listings at once", async () => {
+    answerEveryListing();
+    const store = useModelFoldersStore();
+    const shown = [];
+    for (let i = 0; i < 10; i += 1) {
+      await store.loadDirs(1, `d${i}`);
+      shown.push(store.dirsKey(1, `d${i}`));
+    }
+    store.setActiveDirs(Symbol("test-tree"), shown);
+    const answers = holdAnswers(listModelFolderDirs);
+
+    store.reloadDirs();
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(4);
+
+    answers[0]({ dirs: [] });
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(5);
+
+    for (let i = 1; i < 10; i += 1) {
+      answers[i]({ dirs: [] });
+      await drain();
+    }
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(10);
+    expect(listModelFolderDirs.mock.calls.map(([, path]) => path)).toEqual(
+      shown.map((key) => key.slice(2)),
+    );
+  });
+
+  it("keeps the reads a change adds behind listings being read to four at once", async () => {
+    const store = useModelFoldersStore();
+    const answers = holdAnswers(listModelFolderDirs);
+    let answered = 0;
+    const answer = (i) => {
+      answers[i]({ dirs: [] });
+      answered += 1;
+    };
+    const inFlight = () => listModelFolderDirs.mock.calls.length - answered;
+    // Ten open rows being read (a tree mounting), then a change lands.
+    const shown = [];
+    for (let i = 0; i < 10; i += 1) {
+      store.loadDirs(1, `d${i}`);
+      shown.push(store.dirsKey(1, `d${i}`));
+    }
+    store.setActiveDirs(Symbol("test-tree"), shown);
+    store.reloadDirs();
+    await drain();
+    expect(inFlight()).toBe(10);
+
+    for (let i = 0; i < 10; i += 1) answer(i);
+    await drain();
+    expect(inFlight()).toBe(4);
+
+    // Each still gets its one more read, four at a time.
+    for (let i = 10; i < 20; i += 1) {
+      answer(i);
+      await drain();
+      expect(inFlight()).toBeLessThanOrEqual(4);
+    }
+    expect(listModelFolderDirs.mock.calls.slice(10).map(([, path]) => path)).toEqual(
+      shown.map((key) => key.slice(2)),
+    );
+    expect(inFlight()).toBe(0);
+  });
+
+  it("reads a listing once more when a change lands while it is being read", async () => {
+    const store = useModelFoldersStore();
+    const answers = holdAnswers(listModelFolderDirs);
+    const first = store.loadDirs(1, "");
+    // Two changes in a row still cost one more read, not two.
+    store.reloadDirs();
+    store.reloadDirs();
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(1);
+
+    answers[0]({ dirs: [{ name: "before the change" }] });
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(2);
+    expect(store.dirListings.get("1:").listing).toBe(null);
+
+    answers[1]({ dirs: [{ name: "after the change" }] });
+    expect(await first).toEqual({ dirs: [{ name: "after the change" }] });
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves a listing being read to that read when a mount reloads", async () => {
+    const store = useModelFoldersStore();
+    const answers = holdAnswers(listModelFolderDirs);
+    store.loadDirs(1, "");
+    store.reloadDirs({ join: true });
+    answers[0]({ dirs: [] });
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(1);
+  });
+
+  it("writes a listing into the map it already has", async () => {
+    listModelFolderDirs.mockReset().mockResolvedValue({ dirs: [{ name: "a" }] });
+    const store = useModelFoldersStore();
+    const listings = store.dirListings;
+    const drawn = computed(
+      () => store.dirListings.get("1:")?.listing?.dirs.length ?? -1,
+    );
+    expect(drawn.value).toBe(-1);
+    await store.loadDirs(1, "");
+    expect(store.dirListings).toBe(listings);
+    expect(drawn.value).toBe(1);
+  });
+
+  it("keeps at most 256 listings nothing shows or reads, dropping the oldest first", async () => {
+    answerEveryListing();
+    const store = useModelFoldersStore();
+    await store.loadDirs(1, "shown");
+    store.setActiveDirs(Symbol("test-tree"), ["1:shown"]);
+    let answerHeld;
+    listModelFolderDirs.mockImplementationOnce(
+      () => new Promise((resolve) => (answerHeld = resolve)),
+    );
+    const held = store.loadDirs(1, "held");
+    for (let i = 0; i < 300; i += 1) await store.loadDirs(1, `d${i}`);
+
+    const keys = [...store.dirListings.keys()];
+    expect(keys).toHaveLength(258);
+    expect(keys).toContain("1:shown");
+    expect(keys).toContain("1:held");
+    expect(keys).not.toContain("1:d43");
+    expect(keys).toContain("1:d44");
+    expect(keys).toContain("1:d299");
+    answerHeld({ dirs: [] });
+    await held;
+  });
+
+  it("neither shows nor shares a read from before a session reset", async () => {
+    const store = useModelFoldersStore();
+    const answers = holdAnswers(listModelFolderDirs);
+    const before = store.loadDirs(1, "");
+    store.resetForSession();
+    const after = store.loadDirs(1, "");
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(2);
+
+    answers[0]({ dirs: [{ name: "from-the-old-session" }] });
+    expect(await before).toBe(null);
+    expect(store.dirListings.get("1:").listing).toBe(null);
+    expect(store.dirListings.get("1:").loading).toBe(true);
+
+    // The read after the reset is still the one shared.
+    const joined = store.loadDirs(1, "");
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(2);
+    answers[1]({ dirs: [{ name: "fake-new" }] });
+    expect(await after).toEqual({ dirs: [{ name: "fake-new" }] });
+    expect(await joined).toEqual({ dirs: [{ name: "fake-new" }] });
+    expect(store.dirListings.get("1:").listing.dirs).toEqual([
+      { name: "fake-new" },
+    ]);
+  });
+
+  it("never starts a read asked for behind one a session reset dropped", async () => {
+    const store = useModelFoldersStore();
+    const answers = holdAnswers(listModelFolderDirs);
+    store.loadDirs(1, "");
+    const forced = store.loadDirs(1, "", { force: true });
+    store.resetForSession();
+    answers[0]({ dirs: [{ name: "from-the-old-session" }] });
+    await drain();
+    expect(listModelFolderDirs).toHaveBeenCalledTimes(1);
+    expect(await forced).toBe(null);
+    expect(store.dirListings.size).toBe(0);
+  });
+});
+
+describe("registry reads", () => {
+  it("never brings back a folder forgotten while a read was out", async () => {
+    const answers = holdAnswers(listModelFolders);
+    const store = useModelFoldersStore();
+    // A poll's read is out when the owner forgets the folder.
+    const polled = store.refresh({ quiet: true, join: true });
+    const forgot = store.forget(folder());
+    await drain();
+    expect(listModelFolders).toHaveBeenCalledTimes(1);
+
+    // It left before the forget, so it still lists the folder, mid-scan.
+    answers[0]([folder({ scan_status: "running" })]);
+    await drain();
+    expect(store.folders).toEqual([]);
+    expect(store.scanningIds.size).toBe(0);
+    // The forget's own read is out, so the list is still loading.
+    expect(store.loading).toBe(true);
+    expect(listModelFolders).toHaveBeenCalledTimes(2);
+
+    answers[1]([]);
+    expect(await forgot).toBe(true);
+    await polled;
+    expect(store.folders).toEqual([]);
+    expect(store.loaded).toBe(true);
+    expect(store.loading).toBe(false);
+    listModelFolders.mockClear();
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(listModelFolders).not.toHaveBeenCalled();
+  });
+
+  it("shares a read already out with a mount or a poll, and drives' reads always", async () => {
+    const folderAnswers = holdAnswers(listModelFolders);
+    const driveAnswers = holdAnswers(listModelFolderDevices);
+    const store = useModelFoldersStore();
+    store.refresh({ join: true });
+    store.refresh({ quiet: true, join: true });
+    store.refreshDevices();
+    store.refreshDevices();
+
+    folderAnswers[0]([folder()]);
+    driveAnswers[0]([{ device_id: "fake-drive", folder_ids: [1] }]);
+    await drain();
+    expect(listModelFolders).toHaveBeenCalledTimes(1);
+    expect(listModelFolderDevices).toHaveBeenCalledTimes(1);
+    expect(store.folders).toEqual([folder()]);
+    expect(store.devices).toEqual([{ device_id: "fake-drive", folder_ids: [1] }]);
+  });
+
+  it("lets a poll tick share a registry read still out rather than queue another", async () => {
+    listModelFolders.mockResolvedValueOnce([folder({ scan_status: "running" })]);
+    const store = useModelFoldersStore();
+    await store.refresh();
+    const answers = holdAnswers(listModelFolders);
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(3000);
+
+    answers[0]([folder({ scan_status: "running" })]);
+    await drain();
+    expect(listModelFolders).toHaveBeenCalledTimes(1);
+    expect(store.folders).toEqual([folder({ scan_status: "running" })]);
+  });
+
+  it("shows nothing read before a session reset, and shares none of it after", async () => {
+    const folderAnswers = holdAnswers(listModelFolders);
+    const driveAnswers = holdAnswers(listModelFolderDevices);
+    const store = useModelFoldersStore();
+    const before = store.refresh();
+    const drives = store.refreshDevices();
+    store.resetForSession();
+    store.refresh({ join: true });
+    store.refreshDevices();
+    await drain();
+    expect(listModelFolders).toHaveBeenCalledTimes(2);
+    expect(listModelFolderDevices).toHaveBeenCalledTimes(2);
+
+    folderAnswers[0]([folder({ scan_status: "running" })]);
+    driveAnswers[0]([{ device_id: "fake-drive", folder_ids: [1] }]);
+    await before;
+    await drives;
+    expect(store.folders).toEqual([]);
+    expect(store.loaded).toBe(false);
+    expect(store.devices).toEqual([]);
+    expect(store.scanningIds.size).toBe(0);
+    listModelFolders.mockClear();
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(listModelFolders).not.toHaveBeenCalled();
+  });
+
+  it("reads where ComfyUI loads from again after a rename, past a read out", async () => {
+    const answers = holdAnswers(getComfyuiReads);
+    renameModelFolder.mockReset().mockResolvedValue(folder({ path: "/home/me/renamed" }));
+    const store = useModelFoldersStore();
+    const visit = store.loadComfyuiReads();
+    await store.renameFolder(1, "renamed");
+    await drain();
+    expect(getComfyuiReads).toHaveBeenCalledTimes(1);
+
+    answers[0]({ known: true, reads: [{ kind: "loras", path: "/home/me/loras" }] });
+    await drain();
+    expect(store.comfyuiReads.known).toBe(false);
+    expect(getComfyuiReads).toHaveBeenCalledTimes(2);
+
+    answers[1]({ known: true, reads: [{ kind: "loras", path: "/home/me/renamed" }] });
+    await visit;
+    expect(store.comfyuiReads.reads).toEqual([
+      { kind: "loras", path: "/home/me/renamed" },
     ]);
   });
 });

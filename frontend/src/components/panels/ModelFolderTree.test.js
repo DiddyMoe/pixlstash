@@ -238,6 +238,73 @@ describe("ModelFolderTree", () => {
     wrapper.unmount();
   });
 
+  it("draws an open row's subfolders on return after the cache dropped their listing", async () => {
+    let wrapper = mountTree();
+    await flushPromises();
+    await item(wrapper, 1).find(".mft-twist").trigger("click");
+    await flushPromises();
+    await item(wrapper, 1, "Lora").find(".mft-twist").trigger("click");
+    await flushPromises();
+    wrapper.unmount();
+    // Browsing elsewhere (pickers, the folder view) reads 300 other levels.
+    const folders = useModelFoldersStore();
+    for (let i = 0; i < 300; i += 1) await folders.loadDirs(1, `elsewhere${i}`);
+    expect(folders.dirListings.has("1:Lora")).toBe(false);
+
+    wrapper = mountTree();
+    folders.reloadDirs({ join: true });
+    await flushPromises();
+    expect(item(wrapper, 1, "Lora").attributes("aria-expanded")).toBe("true");
+    expect(item(wrapper, 1, "Lora/flux").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("re-reads what a picker shows while it is open, and only marks it stale once closed", async () => {
+    const wrapper = mountTree({ mode: "pick" });
+    await flushPromises();
+    await item(wrapper, 1).find(".mft-twist").trigger("click");
+    await flushPromises();
+    await item(wrapper, 1, "Lora").find(".mft-twist").trigger("click");
+    await flushPromises();
+    const folders = useModelFoldersStore();
+    const read = () =>
+      listModelFolderDirs.mock.calls.map(([id, path]) => `${id}:${path}`).sort();
+
+    listModelFolderDirs.mockClear();
+    folders.reloadDirs();
+    await flushPromises();
+    expect(read()).toEqual(["1:", "1:Lora", "2:"]);
+
+    wrapper.unmount();
+    listModelFolderDirs.mockClear();
+    folders.reloadDirs();
+    await flushPromises();
+    expect(read()).toEqual([]);
+    expect([...folders.dirListings.values()].map((entry) => entry.stale)).toEqual([
+      true,
+      true,
+      true,
+    ]);
+  });
+
+  it("stops re-reading the open rows of a folder that is forgotten", async () => {
+    const wrapper = mountTree();
+    await flushPromises();
+    await item(wrapper, 1).find(".mft-twist").trigger("click");
+    await flushPromises();
+    await item(wrapper, 1, "Lora").find(".mft-twist").trigger("click");
+    await flushPromises();
+    const folders = useModelFoldersStore();
+    folders.folders = FOLDERS.filter((folder) => folder.id !== 1);
+    await flushPromises();
+
+    listModelFolderDirs.mockClear();
+    folders.reloadDirs();
+    await flushPromises();
+    expect(listModelFolderDirs.mock.calls).toEqual([[2, ""]]);
+    wrapper.unmount();
+  });
+
   it("draws a locked folder with its lock, never expandable, and opens it whole", async () => {
     const wrapper = mountTree();
     // Not even before its listing answers, when an unread folder is offered.
@@ -1442,6 +1509,82 @@ describe("ModelFolderTree welcomes the dragged model", () => {
       folderId: 1,
       path: "StableDiffusion",
     });
+    wrapper.unmount();
+  });
+
+  /** Answer each level with `own(path)` models in it and one subfolder below. */
+  function answerWithCounts(names, own) {
+    listModelFolderDirs.mockImplementation(async (id, path) => {
+      if (id !== 1) {
+        return { folder_id: id, path, locked: true, model_count: 0, direct_model_count: 0, bytes: 0, dirs: [] };
+      }
+      return {
+        folder_id: id,
+        path,
+        locked: false,
+        model_count: 100,
+        direct_model_count: own(path),
+        bytes: 0,
+        dirs:
+          path === ""
+            ? names().map((name) => ({ name, path: name, direct_model_count: own(name), has_dirs: true }))
+            : [{ name: "sub", path: `${path}/sub`, direct_model_count: 0, has_dirs: false }],
+      };
+    });
+  }
+
+  async function twist(wrapper, path) {
+    await item(wrapper, 1, path).find(".mft-twist").trigger("click");
+    await flushPromises();
+  }
+
+  it("routes a collapsed parent by the counts read after a change, not the ones before it", async () => {
+    let moved = false;
+    answerWithCounts(
+      () => ["DiffusionModels", "StableDiffusion"],
+      (path) =>
+        ({ DiffusionModels: moved ? 100 : 5, StableDiffusion: moved ? 0 : 50 })[path] ?? 0,
+    );
+    const wrapper = mountTree();
+    await flushPromises();
+    // Open the folder and both children, look, and close them all again.
+    for (const path of ["", "DiffusionModels", "StableDiffusion", "DiffusionModels", "StableDiffusion", ""]) {
+      await twist(wrapper, path);
+    }
+    // A move lands and the sidebar re-reads the listings.
+    moved = true;
+    useModelFoldersStore().reloadDirs();
+    await flushPromises();
+
+    const shelf = useModelShelfStore();
+    shelf.dragCopies = copies("checkpoint");
+    await flushPromises();
+    drag(item(wrapper, 1), "drop");
+    expect(shelf.moveRequest.destination).toEqual({ folderId: 1, path: "DiffusionModels" });
+    wrapper.unmount();
+  });
+
+  it("never routes a collapsed parent into a directory gone from disk", async () => {
+    let gone = false;
+    answerWithCounts(
+      () => (gone ? ["DiffusionModels"] : ["DiffusionModels", "StableDiffusion"]),
+      (path) => ({ DiffusionModels: 3, StableDiffusion: 50 })[path] ?? 0,
+    );
+    const wrapper = mountTree();
+    await flushPromises();
+    for (const path of ["", "StableDiffusion", "StableDiffusion", ""]) {
+      await twist(wrapper, path);
+    }
+    // StableDiffusion is deleted on disk, and a scan lands.
+    gone = true;
+    useModelFoldersStore().reloadDirs();
+    await flushPromises();
+
+    const shelf = useModelShelfStore();
+    shelf.dragCopies = copies("checkpoint");
+    await flushPromises();
+    drag(item(wrapper, 1), "drop");
+    expect(shelf.moveRequest.destination).toEqual({ folderId: 1, path: "DiffusionModels" });
     wrapper.unmount();
   });
 

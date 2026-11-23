@@ -1510,14 +1510,15 @@ export function layoutKind(folder, path) {
  * Where models of each Type belong in the registered folders: the directories
  * ComfyUI loads them from, or for a folder none of its reads lands in, the
  * directories its tool's layout names. A layout directory is only found once
- * its parent has been listed.
+ * its parent has been listed and is not stale.
  *
  * @param {Array<{id: number, path: string, tool?: string}>} folders
- * @param {Map<string, {listing?: Object}>} listings - the folders store's
- *   `dirListings`, keyed `"<folder id>:<path>"`.
+ * @param {Map<string, {listing?: Object, stale?: boolean}>} listings - the
+ *   folders store's `dirListings`, keyed `"<folder id>:<path>"`.
  * @param {Object} reads - see {@link comfyuiReadFor}.
  * @returns {Array<{folderId: number, path: string, kind: string,
- *   count: number}>} `count` is the models directly in it, 0 when unlisted.
+ *   count: number}>} `count` is the models directly in it, 0 when unlisted
+ *   or listed only stale.
  */
 export function modelDestinations(folders, listings, reads) {
   const out = [];
@@ -1525,7 +1526,7 @@ export function modelDestinations(folders, listings, reads) {
     const id = Number(folder.id);
     const counts = new Map();
     for (const [key, entry] of listings ?? []) {
-      if (!key.startsWith(`${id}:`) || !entry?.listing) continue;
+      if (!key.startsWith(`${id}:`) || !entry?.listing || entry.stale) continue;
       counts.set(key.slice(`${id}:`.length), entry.listing.direct_model_count);
       for (const dir of entry.listing.dirs ?? []) {
         if (!counts.has(dir.path)) counts.set(dir.path, dir.direct_model_count);

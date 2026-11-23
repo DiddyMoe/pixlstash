@@ -65,6 +65,7 @@ import ModelsSideBar from "./ModelsSideBar.vue";
 import SidebarResizeHandle from "./SidebarResizeHandle.vue";
 import { useUserPrefsStore } from "../../stores/useUserPrefsStore";
 import { useLibrariesStore } from "../../stores/useLibrariesStore";
+import { useModelFoldersStore } from "../../stores/useModelFoldersStore";
 import { useModelShelfStore } from "../../stores/useModelShelfStore";
 import { useTasksStore } from "../../stores/useTasksStore";
 import { useTrainingStore } from "../../stores/useTrainingStore";
@@ -269,6 +270,37 @@ describe("ModelsSideBar", () => {
     expect(listModelFolderDirs.mock.calls.map((call) => call[0]).sort()).toEqual([
       1, 2,
     ]);
+  });
+
+  it("shares the folder read the shelf already has out when it mounts", async () => {
+    const { listModelFolders } = await import("../../api/modelFolders");
+    let answer;
+    listModelFolders
+      .mockClear()
+      .mockImplementationOnce(() => new Promise((resolve) => (answer = resolve)));
+    useModelFoldersStore().refresh({ join: true });
+    const wrapper = mountBar();
+    await flushPromises();
+    answer(FOLDERS);
+    await flushPromises();
+    expect(listModelFolders).toHaveBeenCalledTimes(1);
+    wrapper.unmount();
+  });
+
+  it("reads each listing it shows once when it comes back after a change", async () => {
+    const { listModelFolderDirs } = await import("../../api/modelFolders");
+    let wrapper = mountBar();
+    await flushPromises();
+    wrapper.unmount();
+    // A move lands while the sidebar is away: what it showed is now stale.
+    useModelFoldersStore().reloadDirs();
+    listModelFolderDirs.mockClear();
+    wrapper = mountBar();
+    await flushPromises();
+    expect(listModelFolderDirs.mock.calls.map((call) => call[0]).sort()).toEqual([
+      1, 2,
+    ]);
+    wrapper.unmount();
   });
 
   it("leaves Training runs for the list when a folder is opened", async () => {

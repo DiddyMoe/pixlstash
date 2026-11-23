@@ -1971,6 +1971,25 @@ describe("where a dragged model belongs", () => {
     ]);
   });
 
+  it("goes only by listings read since the last change on disk", () => {
+    const stale = (entry) => ({ ...entry, stale: true });
+    const none = { known: false, reads: [] };
+    const listings = new Map([
+      ["1:", listing([dir("DiffusionModels", 100), dir("StableDiffusion", 0)])],
+      // Read before a move emptied it, and not read again since.
+      ["1:StableDiffusion", stale(listing([], 50))],
+      // Read before it was deleted: its parent no longer names it.
+      ["1:Lora", stale(listing([], 40))],
+    ]);
+    expect(modelDestinations([sm], listings, none)).toEqual([
+      { folderId: 1, path: "DiffusionModels", kind: "checkpoint", count: 100 },
+      { folderId: 1, path: "StableDiffusion", kind: "checkpoint", count: 0 },
+    ]);
+    // A parent known only from before the change offers nothing yet.
+    const before = new Map([["1:", stale(listing([dir("Lora", 4)]))]]);
+    expect(modelDestinations([sm], before, none)).toEqual([]);
+  });
+
   it("puts a Type on a second line only where the name does not say it", () => {
     const words = (name, ...kinds) =>
       unsaidTypes(name, new Set(kinds)).map((type) => type.label);
