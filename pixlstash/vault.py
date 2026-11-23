@@ -105,6 +105,12 @@ logger = get_logger(__name__)
 #: ends, without the arbiter waiting.
 YIELD_WAIT_S = 2.0
 
+#: How long stopping the vault waits for face extraction's follow-ups: the face
+#: writes still on the writer and the pending-person matches they queue when
+#: they land. Past it the writer is closed anyway: a match that has not run is
+#: dropped, and its pictures keep their pending people.
+FACE_FOLLOWUP_STOP_WAIT_S = 10.0
+
 
 def _move_trained_attachment(
     vault, run: dict, old_sha: Optional[str], new_sha: str
@@ -304,6 +310,12 @@ class Vault:
 
         self._planner_watchers = {}
         self._planner_watchers_lock = threading.Lock()
+        # Face extractions whose follow-up (announcing the landed rows and
+        # matching pending people to them) has not finished, each a future
+        # mapped to its picture ids. stop() waits on them before closing the
+        # writer; see _after_face_writes_land.
+        self._face_followups: dict[Future, list[int]] = {}
+        self._face_followups_lock = threading.Lock()
         self._changed_tags_notify_lock = threading.Lock()
         self._changed_tags_pending_ids: set[int] = set()
         self._changed_tags_flush_timer: threading.Timer | None = None
@@ -921,6 +933,11 @@ class Vault:
 
         Safe to call multiple times; subsequent calls after the first are no-ops.
         Called automatically by ``close()``.
+
+        Once the task runner has stopped, and before the writer is closed, it
+        waits up to ``FACE_FOLLOWUP_STOP_WAIT_S`` for face extraction's
+        follow-ups: the face writes still on the writer and the pending-person
+        matches they queue when they land (see `_after_face_writes_land`).
         """
         with self._changed_tags_notify_lock:
             timer = self._changed_tags_flush_timer
@@ -945,6 +962,9 @@ class Vault:
                 self._work_planner.stop()
             if self._task_runner is not None:
                 self._task_runner.stop()
+        # The task runner has stopped: every face extraction it completed is in
+        # `_face_followups` by now.
+        self._wait_for_face_followups()
         # stop() gives up on a worker after 60 s. Releasing ends in a device-
         # cache flush, and on Metal a flush beside a worker still running a
         # model kills the process, so the models are left for the process exit.
@@ -2046,14 +2066,11 @@ class Vault:
             return
 
         if task.type == "FaceExtractionTask":
-            self._notify_worker_ids_processed(TaskType.FACE_EXTRACTION, changed)
-            picture_ids = result.get("picture_ids") or []
-            if picture_ids:
-                # Do NOT fire CHANGED_FACES here: newly-extracted faces always
-                # have character_id=None so no character sidebar data changes.
-                # _process_pending_character_assignments fires CHANGED_FACES
-                # itself only when it actually assigns a face to a character.
-                self._process_pending_character_assignments(picture_ids)
+            # Do NOT fire CHANGED_FACES here: newly-extracted faces always
+            # have character_id=None so no character sidebar data changes.
+            # _process_pending_character_assignments fires CHANGED_FACES
+            # itself only when it actually assigns a face to a character.
+            self._after_face_writes_land(task, changed, result.get("picture_ids") or [])
             return
 
         if task.type == "DescriptionTask":
@@ -2094,18 +2111,133 @@ class Vault:
                 self.notify(EventType.CHANGED_PICTURES, picture_ids)
                 self.notify(EventType.PICTURE_IMPORTED, picture_ids)
 
-    def _process_pending_character_assignments(self, picture_ids: list[int]) -> None:
+    def _after_face_writes_land(
+        self, task: FaceExtractionTask, changed, picture_ids: list[int]
+    ) -> None:
+        """Announce face extraction and resolve pending people once its rows land.
+
+        The task completes with its face rows still queued on the writer
+        (``task.pending_writes``; see `FaceExtractionTask._run_task`). Doing
+        either at completion acted on faces that were not there yet: a waiter
+        was told they were in, and a pending person was dropped as if the
+        picture had none. The last write's callback runs on the writer
+        thread, so nothing on this path may wait for the writer.
+
+        A write that failed put no rows down: its pictures stay unannounced
+        and their pending people keep waiting for the extraction that lands.
+
+        Until the match it queued has run, or it has settled without one, the
+        completion is held in ``_face_followups`` for `stop` to wait on, so
+        closing the vault does not drop a match the writer has not reached.
+        """
+        tail: Future = Future()
+        with self._face_followups_lock:
+            self._face_followups[tail] = list(picture_ids)
+        writes = list(task.pending_writes)
+        remaining = {"count": len(writes)}
+        lock = threading.Lock()
+
+        def _settled() -> None:
+            match: Future | None = None
+            try:
+                failures = [f.exception() for f in writes if f.exception() is not None]
+                if failures:
+                    logger.warning(
+                        "Face rows for pictures %s did not land (%s); not "
+                        "announcing them and leaving their pending people "
+                        "waiting.",
+                        picture_ids,
+                        failures,
+                    )
+                    return
+                self._notify_worker_ids_processed(TaskType.FACE_EXTRACTION, changed)
+                if picture_ids:
+                    match = self._process_pending_character_assignments(
+                        picture_ids, wait=False
+                    )
+            finally:
+                if match is None:
+                    self._release_face_followup(tail)
+                else:
+                    # Runs after the match's announcement, added to it first.
+                    match.add_done_callback(
+                        lambda _match: self._release_face_followup(tail)
+                    )
+
+        def _one_landed(_future: Future) -> None:
+            with lock:
+                remaining["count"] -= 1
+                last = remaining["count"] == 0
+            if last:
+                _settled()
+
+        if not writes:
+            _settled()
+            return
+        for future in writes:
+            future.add_done_callback(_one_landed)
+
+    def _release_face_followup(self, tail: Future) -> None:
+        """Mark one face extraction's follow-up finished; `stop` stops waiting."""
+        with self._face_followups_lock:
+            self._face_followups.pop(tail, None)
+        tail.set_result(None)
+
+    def _wait_for_face_followups(self) -> None:
+        """Wait, up to ``FACE_FOLLOWUP_STOP_WAIT_S``, for face extraction's
+        follow-ups to finish, so closing the writer does not drop a queued
+        pending-person match. Never called from the writer thread, which is
+        what finishes them."""
+        with self._face_followups_lock:
+            waiting = list(self._face_followups)
+        if not waiting:
+            return
+        _, unfinished = concurrent.futures.wait(
+            waiting, timeout=FACE_FOLLOWUP_STOP_WAIT_S
+        )
+        if not unfinished:
+            return
+        with self._face_followups_lock:
+            left = sorted(
+                {
+                    picture_id
+                    for tail in unfinished
+                    for picture_id in self._face_followups.get(tail, [])
+                }
+            )
+        logger.warning(
+            "Stopping with %s face extraction follow-up(s) unfinished after "
+            "%.1f s, for pictures %s: the writer closes without their "
+            "pending-person match, and those pictures keep their pending people.",
+            len(unfinished),
+            FACE_FOLLOWUP_STOP_WAIT_S,
+            left,
+        )
+
+    def _process_pending_character_assignments(
+        self, picture_ids: list[int], *, wait: bool = True
+    ) -> Future:
         """Honour deferred face-to-character assignments after face extraction runs.
 
         When POST /characters/{id}/faces is called before face extraction has run
         for a picture, the endpoint stores the target character id in
-        Picture.pending_character_id.  This method is called after
-        FaceExtractionTask completes and assigns the largest detected face for
-        each such picture to the stored character, then clears the field.
+        Picture.pending_character_id.  This method is called once the face rows
+        of a FaceExtractionTask have landed and assigns the largest detected
+        face for each such picture to the stored character, then clears the
+        field.
 
         A picture of several people (a run loading their LoRAs) waits in
         ``PicturePendingPerson`` rows instead; its faces are matched to them
         by likeness (``match_faces_to_characters``) and the rows deleted.
+
+        With ``wait=False`` (face extraction's path, which may be on the writer
+        thread) the assignment is queued at HIGH and announced from its
+        future instead of waited for.
+
+        Returns:
+            Future: the queued assignment. With *wait* it has already run and
+            been announced; without, its announcement is the first callback
+            added to it.
         """
 
         def _assign_if_pending(session: Session) -> bool:
@@ -2162,14 +2294,28 @@ class Vault:
             session.commit()
             return assigned_any
 
-        try:
-            assigned = self.db.run_task(_assign_if_pending)
-        except Exception:
-            logger.exception("Failed to process pending character assignments")
-            return
-        if assigned:
-            self.notify(EventType.CHANGED_CHARACTERS)
-            self.notify(EventType.CHANGED_FACES)
+        def _announce(future: Future) -> None:
+            try:
+                assigned = future.result()
+            except Exception:
+                logger.exception(
+                    "Failed to process pending character assignments for pictures %s",
+                    picture_ids,
+                )
+                return
+            if assigned:
+                self.notify(EventType.CHANGED_CHARACTERS)
+                self.notify(EventType.CHANGED_FACES)
+
+        future = self.db.submit_task(
+            _assign_if_pending,
+            priority=DBPriority.IMMEDIATE if wait else DBPriority.HIGH,
+        )
+        if wait:
+            _announce(future)
+        else:
+            future.add_done_callback(_announce)
+        return future
 
     def _notify_worker_ids_processed(self, worker_type: TaskType, changed):
         self._notify_planner_ids_processed(worker_type, changed)
