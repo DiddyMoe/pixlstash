@@ -8,16 +8,19 @@ import gc
 import io
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import event as sa_event
 from sqlalchemy import insert as sa_insert
-from sqlmodel import select
+from sqlalchemy.pool import NullPool
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from pixlstash.db_models import (
     Picture,
@@ -31,6 +34,7 @@ from pixlstash.db_models.tag_prediction import TagPrediction
 from pixlstash.db_models.tag_suggestion import TagSuggestion
 from pixlstash.db_models.tagger_run import TaggerRun
 from pixlstash.server import Server
+from pixlstash.services.tag_health_service import _mismatch_counts
 from pixlstash.utils.quality.anomaly_penalty import DEFAULT_TAG_PRECISION
 from tests.utils import seed_likeness_stable, upload_pictures_and_wait
 
@@ -454,8 +458,6 @@ def test_tag_health_scoped_survives_large_scope():
     ``OperationalError: too many SQL variables``; the temp-table scope path
     keeps them alive and result-identical.
     """
-    from pixlstash.services.tag_health_service import _mismatch_counts
-
     temp_dir, client, server = _setup()
     try:
         n = 1500
@@ -511,6 +513,119 @@ def test_tag_health_scoped_survives_large_scope():
         assert mm.get("bigtag") == 1
     finally:
         _teardown(temp_dir, server)
+
+
+@pytest.fixture(scope="module")
+def mismatch_engine(tmp_path_factory):
+    """A bare vault schema (no server) seeded for the scoped mismatch reads.
+
+    In scope: 1 (stack 1, "extra digit", which folds into "malformed hand"),
+    2 (stack 1), 3 and 4 (stack 2, "test-x"), 5 ("test-y"), 6, and 7 (deleted,
+    stack 1, "malformed hand"). Out of scope: 10 (stack 1) and 2,000 pictures
+    tagged "test-x", half of them in stack 3, so an unscoped read is large.
+    """
+    path = tmp_path_factory.mktemp("mismatch") / "vault.db"
+    engine = create_engine(f"sqlite:///{path}", poolclass=NullPool)
+
+    def _foreign_keys_on(dbapi_conn, _record):
+        dbapi_conn.execute("PRAGMA foreign_keys = ON")
+
+    sa_event.listen(engine, "connect", _foreign_keys_on)
+    try:
+        SQLModel.metadata.create_all(engine)
+        fillers = range(1001, 3001)
+        stack_of = {1: 1, 2: 1, 3: 2, 4: 2, 7: 1, 10: 1}
+        stack_of.update({pid: 3 for pid in fillers if pid % 2})
+        tags = [(1, "extra digit"), (3, "test-x"), (4, "test-x"), (5, "test-y")]
+        tags += [(7, "malformed hand")] + [(pid, "test-x") for pid in fillers]
+        pairs = [(1, 3, 0.99), (1, 2, 0.99), (5, 6, 0.99), (5, 7, 0.99)]
+        pairs += [(6, 10, 0.99), (3, 5, 0.90)]
+        with Session(engine) as session:
+            session.add_all([PictureStack(id=sid) for sid in (1, 2, 3)])
+            session.commit()
+            session.execute(
+                sa_insert(Picture),
+                [
+                    {
+                        "id": pid,
+                        "deleted": pid == 7,
+                        "stack_id": stack_of.get(pid),
+                        "file_path": f"/home/me/pictures/test-{pid}.png",
+                    }
+                    for pid in [1, 2, 3, 4, 5, 6, 7, 10, *fillers]
+                ],
+            )
+            session.execute(
+                sa_insert(Tag), [{"picture_id": p, "tag": t} for p, t in tags]
+            )
+            session.add_all(
+                [
+                    PictureLikeness(
+                        picture_id_a=a, picture_id_b=b, likeness=s, metric="cosine"
+                    )
+                    for a, b, s in pairs
+                ]
+            )
+            session.commit()
+        yield engine
+    finally:
+        sa_event.remove(engine, "connect", _foreign_keys_on)
+        engine.dispose()
+
+
+def _statements_issued(engine, run):
+    """Return ``run()`` and every statement it sent, with its parameters."""
+    issued = []
+
+    def _record(_conn, _cursor, statement, parameters, _context, _executemany):
+        issued.append((statement, parameters))
+
+    sa_event.listen(engine, "before_cursor_execute", _record)
+    try:
+        return run(), issued
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _record)
+
+
+def test_scoped_mismatch_reads_only_the_scoped_pictures(mismatch_engine):
+    """The live-picture and stack reads return the scope's rows, not the library's.
+
+    Each picture-table read is re-run on the same connection (the scope's temp
+    table is still there) to see exactly which pictures it returned.
+    """
+    with Session(mismatch_engine) as session:
+        assert _mismatch_counts(session) == {
+            "malformed hand": 3,
+            "test-x": 1,
+            "test-y": 1,
+        }
+        counts, issued = _statements_issued(
+            mismatch_engine,
+            lambda: _mismatch_counts(session, {1, 2, 3, 4, 5, 6, 7, 99}),
+        )
+        # Stack 1 (1 against 2) and pair (1, 3) give "malformed hand" 2; pair
+        # (5, 6) gives "test-y"; 7 is deleted and 10 is out of scope.
+        assert counts == {"malformed hand": 2, "test-x": 1, "test-y": 1}
+        picture_reads = [
+            (statement, parameters)
+            for statement, parameters in issued
+            if re.search(r"\bFROM picture\b", statement)
+        ]
+        connection = session.connection()
+        read = [
+            {row[0] for row in connection.exec_driver_sql(statement, parameters)}
+            for statement, parameters in picture_reads
+        ]
+    assert read == [{1, 2, 3, 4, 5, 6}, {1, 2, 3, 4}]
+
+
+def test_an_empty_scope_counts_nothing_without_querying(mismatch_engine):
+    with Session(mismatch_engine) as session:
+        counts, issued = _statements_issued(
+            mismatch_engine, lambda: _mismatch_counts(session, set())
+        )
+    assert counts == {}
+    assert issued == []
 
 
 def test_tag_health_scoped_has_model_true_for_older_version_in_scope():
