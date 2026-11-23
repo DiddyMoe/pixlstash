@@ -3605,3 +3605,119 @@ def test_sqlite_connection_string_guardrail_has_teeth():
         assert _hand_built_sqlite_strings(snippet), snippet
     assert not _hand_built_sqlite_strings("u = sqlite_file_uri(p, read_only=True)")
     assert not _hand_built_sqlite_strings('u = f"template-file:{name}".encode()')
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: an ``async def`` never waits on a database itself
+# ---------------------------------------------------------------------------
+# A FastAPI app has one event loop. A coroutine that calls the writer's
+# ``run_task`` (or ``result_or_throw`` on its future) parks that loop until
+# the writer reaches its task, and ``run_immediate_read_task`` parks it while
+# ``exclusive_engine_access()`` holds the engine: every other request,
+# ``GET /version`` included, waits behind it. The waits belong in a plain
+# ``def`` (FastAPI runs it on a threadpool worker) or behind
+# ``await run_in_threadpool(...)``. Lexical by design, so a wait reached
+# through a helper (``fetch_scope_allowed_picture_ids``) is invisible here;
+# the event-loop tests in ``tests/test_operation_log.py`` and
+# ``tests/test_likeness_and_face_search.py`` cover the routes that had one.
+
+# Calls that block their thread until a database task or a task runner
+# finishes.
+_BLOCKING_DATABASE_WAITS = frozenset(
+    {
+        "result_or_throw",
+        "run_control_task",
+        "run_immediate_read_task",
+        "run_recorded_metadata_task",
+        "run_task",
+        "submit_and_wait",
+    }
+)
+
+
+def _blocking_waits_in_coroutines(source: str) -> list[tuple[int, str, str]]:
+    """Return ``(lineno, coroutine, call)`` for every wait an ``async def`` makes.
+
+    A wait inside a nested ``def`` or ``lambda`` is not the coroutine's own:
+    it runs wherever that function is handed, which is how
+    ``run_in_threadpool`` takes it. Passing the method itself
+    (``run_in_threadpool(db.run_task, ...)``) is not a call either.
+    """
+    hits = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        pending = list(node.body)
+        while pending:
+            current = pending.pop()
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(current, ast.Call):
+                func = current.func
+                name = (
+                    func.attr
+                    if isinstance(func, ast.Attribute)
+                    else func.id
+                    if isinstance(func, ast.Name)
+                    else None
+                )
+                if name in _BLOCKING_DATABASE_WAITS:
+                    hits.append((current.lineno, node.name, name))
+            pending.extend(ast.iter_child_nodes(current))
+    return sorted(hits)
+
+
+def test_no_coroutine_waits_on_a_database_itself():
+    """No ``async def`` under ``pixlstash/`` blocks the event loop on a database."""
+    offenders = [
+        f"  {path.relative_to(REPO_ROOT)}:{lineno}: {coroutine} calls {call}()"
+        for path in sorted(PIXLSTASH_DIR.rglob("*.py"))
+        for lineno, coroutine, call in _blocking_waits_in_coroutines(
+            path.read_text("utf-8")
+        )
+    ]
+    assert not offenders, (
+        "An async def waits on a database on the event loop. Make the handler "
+        "a plain def, or hand the wait to a worker with "
+        "`await run_in_threadpool(...)` (docs/backend_architecture.md §13, "
+        "Database):\n" + "\n".join(offenders)
+    )
+
+
+def test_coroutine_wait_guardrail_has_teeth():
+    planted = {
+        "async def h(db):\n    return db.run_task(f)\n": "run_task",
+        "async def h(db):\n    return db.result_or_throw(db.submit_task(f))\n": (
+            "result_or_throw"
+        ),
+        "async def h(db, xs):\n    for x in xs:\n        if x:\n"
+        "            db.run_immediate_read_task(f, x)\n": "run_immediate_read_task",
+        "async def h(db):\n    await send(db.run_task(f))\n": "run_task",
+        "class M:\n    async def dispatch(self, request):\n"
+        "        return self.db.run_immediate_read_task(f)\n": (
+            "run_immediate_read_task"
+        ),
+        "async def h(server):\n    run_recorded_metadata_task(server, f)\n": (
+            "run_recorded_metadata_task"
+        ),
+        "async def h(runner, t):\n    return runner.submit_and_wait(t, 60.0)\n": (
+            "submit_and_wait"
+        ),
+        "async def h(db):\n    return db.run_control_task(f)\n": "run_control_task",
+    }
+    for snippet, call in planted.items():
+        assert [hit[2] for hit in _blocking_waits_in_coroutines(snippet)] == [call], (
+            snippet
+        )
+    sanctioned = [
+        "async def h(db):\n    return await run_in_threadpool(db.run_task, f, 1)\n",
+        "async def h(db):\n    def _tail():\n        return db.run_task(f)\n"
+        "    return await run_in_threadpool(_tail)\n",
+        "async def h(db):\n"
+        "    return await run_in_threadpool(lambda: db.run_immediate_read_task(f))\n",
+        "def h(db):\n    return db.run_task(f)\n",
+        "async def h(loop, runner, t):\n"
+        "    return await loop.run_in_executor(None, runner.submit_and_wait, t)\n",
+    ]
+    for snippet in sanctioned:
+        assert _blocking_waits_in_coroutines(snippet) == [], snippet
