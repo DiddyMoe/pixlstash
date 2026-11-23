@@ -35,6 +35,7 @@ from pixlstash.services import (
     config_service,
     library_settings_service,
     scrapheap_service,
+    tag_exclusion_service,
     workflow_ghost_service,
 )
 from pixlstash.services import run_log, tag_preferences, vram_history
@@ -44,6 +45,7 @@ from pixlstash.resources.arbiter import arbiter
 from pixlstash.telemetry import mark_install_established
 from pixlstash.server_config_io import persist_server_config
 from pixlstash.utils.quality.smart_score_utils import smart_score_penalised_tags
+from pixlstash.utils.quality.tag_exclusion import validate_tag_name
 from pixlstash.utils.service.smart_score_invalidation import (
     changed_penalised_tags,
     invalidate_all_anomaly_scores,
@@ -325,6 +327,80 @@ def create_router(server) -> APIRouter:
 
         smart_score_penalised_tags: Optional[dict] = None
 
+    class PenalisedTagWeightRequest(BaseModel):
+        weight: int = Field(
+            ge=1, le=5, description="How strongly the tag lowers Smart Score, 1-5."
+        )
+
+    class PenalisedTagCleanupRequest(BaseModel):
+        names: Optional[list[str]] = Field(
+            default=None,
+            max_length=500,
+            description=(
+                "Removed tags to take off this library's pictures. Omit for "
+                "every removed tag."
+            ),
+        )
+
+    class PenalisedTagChangeResponse(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        smart_score_penalised_tags: dict = Field(
+            description="The owner's penalised tags after the change, `{tag: weight}`."
+        )
+        excluded: list[str] = Field(
+            description=(
+                "Tags removed from tagging in every library: no tagger, import "
+                "or edit adds them to a picture."
+            )
+        )
+        cleanup: Optional[dict] = Field(
+            default=None,
+            description=(
+                "The job taking removed tags off this library's pictures, as "
+                "`GET /users/me/penalised-tags/cleanup` lists it. `null` when the "
+                "change started none."
+            ),
+        )
+
+    class PenalisedTagCleanupStatusResponse(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        library_uuid: Optional[str] = None
+        excluded: list[str] = Field(description="Tags removed from tagging.")
+        remaining: int = Field(
+            description=(
+                "Pictures in this library, the Scrapheap included, that still "
+                "carry a removed tag and are not locked."
+            )
+        )
+        locked: int = Field(
+            description=(
+                "Pictures in a locked set that carry a removed tag. The cleanup "
+                "leaves them as they are."
+            )
+        )
+        state: Literal["running", "interrupted", "idle"] = Field(
+            description=(
+                "`running` while a job is queued or running, `interrupted` when "
+                "none is and `remaining` is not 0 (start one with POST), "
+                "otherwise `idle`."
+            )
+        )
+        jobs: list[dict] = Field(
+            description=(
+                "This library's recent jobs since the server started, newest "
+                "first: `id`, `names`, `state`, `pictures`, `scrapheap`, "
+                "`locked`, `removed` (`tags`, `predictions`, `suggestions`) "
+                "and `sidecar_failed`."
+            )
+        )
+
+    class PenalisedTagCleanupResponse(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        cleanup: dict = Field(description="The job started.")
+
     class PatchUserConfigResponse(BaseModel):
         model_config = ConfigDict(extra="allow")
 
@@ -590,6 +666,84 @@ def create_router(server) -> APIRouter:
         user = server.auth.get_user_for_request(request)
         config = _config_payload(user, request)
         return {"smart_score_penalised_tags": config["smart_score_penalised_tags"]}
+
+    def _tag_name(name: str) -> str:
+        try:
+            return validate_tag_name(name)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.get(
+        "/users/me/penalised-tags/cleanup",
+        summary="Get the removed-tag cleanup in this library",
+        response_model=PenalisedTagCleanupStatusResponse,
+        description=(
+            "Which tags are removed from tagging, how many of this library's "
+            "pictures still carry one, and the cleanup jobs started since the "
+            "server started. Owner only."
+        ),
+    )
+    def get_me_penalised_tag_cleanup(request: Request):
+        _ensure_secure_when_required(request)
+        return tag_exclusion_service.status(server.vault)
+
+    @router.post(
+        "/users/me/penalised-tags/cleanup",
+        summary="Take removed tags off this library's pictures",
+        response_model=PenalisedTagCleanupResponse,
+        description=(
+            "Starts a job removing the given removed tags (default: all of "
+            "them) from this library's pictures, the Scrapheap included. "
+            "Pictures in a locked set are left as they are. 422 for a name that "
+            "is not removed from tagging, 409 while a job is running. Owner only."
+        ),
+    )
+    def post_me_penalised_tag_cleanup(
+        request: Request, body: PenalisedTagCleanupRequest
+    ):
+        _ensure_secure_when_required(request)
+        names = None if body.names is None else [_tag_name(n) for n in body.names]
+        return {"cleanup": tag_exclusion_service.retry_cleanup(server.vault, names)}
+
+    @router.put(
+        "/users/me/penalised-tags/{tag:path}",
+        summary="Penalise a tag",
+        response_model=PenalisedTagChangeResponse,
+        description=(
+            "Sets the tag's Smart Score weight. A tag removed earlier is allowed "
+            "back into tagging; tags removed from pictures are not restored, and "
+            "a job still removing other tags here is restarted for them. "
+            "Owner only."
+        ),
+    )
+    def put_me_penalised_tag(
+        request: Request, tag: str, body: PenalisedTagWeightRequest
+    ):
+        _ensure_secure_when_required(request)
+        user_id = server.auth.require_user_id(request)
+        return tag_exclusion_service.set_penalised_tag(
+            server, user_id, _tag_name(tag), body.weight
+        )
+
+    @router.delete(
+        "/users/me/penalised-tags/{tag:path}",
+        summary="Remove a penalised tag from tagging and from pictures",
+        response_model=PenalisedTagChangeResponse,
+        description=(
+            "Drops the tag, and the tags merged into it, from the penalised "
+            "tags, stops every library's tagger and imports adding them, and "
+            "starts a job taking them off this library's pictures (see "
+            "`GET /users/me/penalised-tags/cleanup`). Nothing removed can be "
+            "restored. 404 for a tag that is neither penalised nor removed. "
+            "Owner only."
+        ),
+    )
+    def delete_me_penalised_tag(request: Request, tag: str):
+        _ensure_secure_when_required(request)
+        user_id = server.auth.require_user_id(request)
+        return tag_exclusion_service.remove_penalised_tag(
+            server, user_id, _tag_name(tag)
+        )
 
     def _host_ops_allowed(request: Request) -> bool:
         """Whether this request may register and scan model folders.
