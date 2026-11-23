@@ -2,6 +2,7 @@
 
 import gc
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -23,6 +24,7 @@ from pixlstash.db_models import Picture, Review, Tag
 from pixlstash.db_models.tag_prediction import TagPrediction
 from pixlstash.db_models.tag_suggestion import TagSuggestion
 from pixlstash.server import Server
+from pixlstash.services import tag_scan_service
 from pixlstash.services.tag_scan_service import _write_suspects
 from tests.utils import upload_pictures_and_wait
 
@@ -2111,3 +2113,275 @@ def test_writing_suspects_binds_no_parameter_per_picture(suspects_engine):
     assert {pid for (pid, _), row in rows.items() if row.reason == "test-fresh"} == set(
         incoming
     )
+
+
+class _EngineVault:
+    """The ``vault.db`` task dispatch ``scan_tag`` uses, over a bare engine.
+
+    Records the suspects handed to each write so a test can read the scan's
+    output before the diff-insert folds it into existing rows.
+    """
+
+    def __init__(self, engine):
+        self.db = self
+        self.written: list[list[dict]] = []
+        self._engine = engine
+
+    def run_immediate_read_task(self, fn, *args):
+        with Session(self._engine) as session:
+            return fn(session, *args)
+
+    def run_task(self, fn, *args):
+        # scan_tag writes with (_write_suspects, tag, source, suspects, ...).
+        self.written.append(args[2])
+        with Session(self._engine) as session:
+            return fn(session, *args)
+
+
+def _scan_embedding(scale, *direction):
+    """A 512-d float32 blob along *direction* (zero-padded) with norm *scale*."""
+    vec = np.zeros(512, dtype=np.float32)
+    vec[: len(direction)] = direction
+    vec *= scale / np.linalg.norm(vec)
+    return vec.tobytes()
+
+
+def _seed_scan(engine, pictures, tags=(), predictions=()):
+    """Give existing pictures an embedding and dhash, plus tags and predictions.
+
+    *pictures* is ``(id, embedding_blob, perceptual_hash)``, *tags*
+    ``(id, tag)`` and *predictions* ``(id, tag, confidence)``. Every prediction
+    shares one model version and timestamp, so whichever scan test runs first,
+    the fallback's "current model version" is the same.
+    """
+    with Session(engine) as session:
+        for pid, blob, phash in pictures:
+            session.execute(
+                sa_update(Picture)
+                .where(Picture.id == pid)
+                .values(image_embedding=blob, perceptual_hash=phash)
+            )
+        if tags:
+            session.execute(
+                sa_insert(Tag), [{"picture_id": pid, "tag": tag} for pid, tag in tags]
+            )
+        if predictions:
+            session.execute(
+                sa_insert(TagPrediction),
+                [
+                    {
+                        "picture_id": pid,
+                        "tag": tag,
+                        "confidence": confidence,
+                        "model_version": "test-v1",
+                        "status": "PENDING",
+                        "predicted_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+                    }
+                    for pid, tag, confidence in predictions
+                ],
+            )
+        session.commit()
+
+
+def _unparseable_hash_warnings(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == tag_scan_service.__name__
+        and "unparseable perceptual_hash" in record.getMessage()
+    ]
+
+
+# A scope with confirmed examples, so the scan takes the neighbour vote. Two
+# loose clusters with small distinct negative cross similarities, embeddings of
+# unequal norm, one malformed dhash, and one wrong-length blob that is skipped.
+# The skipped row has the lowest id, so the scan reads it first: if its dhash
+# were kept, every later dhash would land on the wrong picture.
+# "extra toe" merges into "malformed foot": 2904 has the concept, not the
+# literal tag, so it votes as a positive but can never be a "remove".
+_VOTE_TAG = "malformed foot"
+_VOTE_PICTURES = (
+    (2900, b"\x00" * 16, "0000000000000000"),
+    (2901, _scan_embedding(3.0, 1, 0, 0, 0, 0, 0.10), "00000000000000ff"),
+    (2902, _scan_embedding(2.0, 0.95, 0, 0.31, 0, 0, 0.12), "ffffffffffffff00"),
+    (2903, _scan_embedding(0.5, 0.90, 0, 0, 0.43, 0, 0.14), "00000000000000fe"),
+    (2904, _scan_embedding(1.5, 0, 1, 0, 0, 0, -0.11), "not-hex"),
+    (2905, _scan_embedding(4.0, 0, 0.92, 0, 0, 0.39, -0.13), "0f0f0f0f0f0f0f0f"),
+)
+_VOTE_TAGS = ((2901, _VOTE_TAG), (2904, "extra toe"))
+
+# A scope with no confirmed example of its tag, so the scan takes the
+# model-confidence fallback. 2913's dhash is malformed.
+_FALLBACK_TAG = "test-fallback-tag"
+_FALLBACK_PICTURES = (
+    (2911, _scan_embedding(1.0, 1, 0.2), "00000000000000aa"),
+    (2912, _scan_embedding(2.0, 0.3, 1), "00000000000000bb"),
+    (2913, _scan_embedding(0.5, 0.5, 0.5, 1), "not-hex"),
+)
+_FALLBACK_PREDICTIONS = (
+    (2911, _FALLBACK_TAG, 0.93),
+    (2912, _FALLBACK_TAG, 0.5),
+    (2913, _FALLBACK_TAG, 0.91),
+)
+
+# Captured from the scan before its vote-only arrays moved onto the vote path.
+_PINNED_VOTE_RESULT = {
+    "tag": _VOTE_TAG,
+    "count": 2,
+    "added": 1,
+    "removed": 1,
+    "scanned": 5,
+    "new": 2,
+    "prev_reviewed": 0,
+}
+_PINNED_VOTE_SUSPECTS = [
+    {
+        "picture_id": 2901,
+        "direction": "remove",
+        "score": 1.0,
+        "twin_picture_id": 2903,
+        "twin_sim": 0.9029,
+        "pos_frac": 0.0,
+        "reason": (
+            "near-duplicate twin 2903 (dhash hamming 1); "
+            "0% of nearest neighbours have the tag"
+        ),
+        "neighbors": [
+            {"picture_id": 2902, "has": False},
+            {"picture_id": 2903, "has": False},
+            {"picture_id": 2904, "has": True},
+            {"picture_id": 2905, "has": False},
+        ],
+    },
+    {
+        "picture_id": 2905,
+        "direction": "add",
+        "score": 1.0,
+        "twin_picture_id": 2904,
+        "twin_sim": 0.9216,
+        "pos_frac": 1.0,
+        "reason": (
+            "near-twin 2904 (sim 0.922) disagrees; "
+            "100% of nearest neighbours have the tag"
+        ),
+        "neighbors": [
+            {"picture_id": 2904, "has": True},
+            {"picture_id": 2901, "has": True},
+            {"picture_id": 2902, "has": False},
+            {"picture_id": 2903, "has": False},
+        ],
+    },
+]
+_PINNED_FALLBACK_RESULT = {
+    "tag": _FALLBACK_TAG,
+    "count": 2,
+    "added": 2,
+    "removed": 0,
+    "scanned": 3,
+    "new": 2,
+    "prev_reviewed": 0,
+}
+_PINNED_FALLBACK_SUSPECTS = [
+    {
+        "picture_id": pid,
+        "direction": "add",
+        "score": score,
+        "twin_picture_id": None,
+        "twin_sim": None,
+        "pos_frac": None,
+        "reason": (
+            f"model is confident ({percent}) but this tag has no confirmed examples yet"
+        ),
+        "neighbors": [],
+    }
+    for pid, score, percent in ((2911, 0.93, "93%"), (2913, 0.91, "91%"))
+]
+
+
+def test_scan_vote_suspects_are_pinned(suspects_engine, caplog):
+    """The neighbour vote's suspects, pinned to the values the scan produced.
+
+    2901 is a "remove" whose displayed twin switches from the CLIP-nearest
+    2902 to its dhash near-duplicate 2903; 2905 is an "add" voted for by the
+    concept-only 2904. Unequal norms mean the similarities are only right
+    if the embeddings were unit-normalised first.
+    """
+    _seed_scan(suspects_engine, _VOTE_PICTURES, tags=_VOTE_TAGS)
+    vault = _EngineVault(suspects_engine)
+    caplog.set_level(logging.WARNING, logger=tag_scan_service.__name__)
+
+    result = tag_scan_service.scan_tag(
+        vault, _VOTE_TAG, picture_ids={pid for pid, _, _ in _VOTE_PICTURES}
+    )
+
+    assert result == _PINNED_VOTE_RESULT
+    assert len(vault.written) == 1
+    assert (
+        sorted(vault.written[0], key=lambda s: s["picture_id"]) == _PINNED_VOTE_SUSPECTS
+    )
+    assert _unparseable_hash_warnings(caplog) == [
+        "scan_tag: unparseable perceptual_hash 'not-hex' for picture 2904; "
+        "excluding from near-duplicate twin selection"
+    ]
+
+
+def test_scan_fallback_suspects_are_pinned(suspects_engine, caplog):
+    """The model-confidence fallback's suspects, pinned to the values it produced."""
+    _seed_scan(suspects_engine, _FALLBACK_PICTURES, predictions=_FALLBACK_PREDICTIONS)
+    vault = _EngineVault(suspects_engine)
+    caplog.set_level(logging.INFO, logger=tag_scan_service.__name__)
+
+    result = tag_scan_service.scan_tag(
+        vault, _FALLBACK_TAG, picture_ids={pid for pid, _, _ in _FALLBACK_PICTURES}
+    )
+
+    assert result == _PINNED_FALLBACK_RESULT
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == tag_scan_service.__name__
+        and "ground-truth positive" in record.getMessage()
+    ] == [
+        f"scan_tag({_FALLBACK_TAG!r}): only 0 ground-truth positive(s) (< floor 1); "
+        "using the confidence-based fallback instead of the kNN vote"
+    ]
+    assert len(vault.written) == 1
+    assert (
+        sorted(vault.written[0], key=lambda s: s["picture_id"])
+        == _PINNED_FALLBACK_SUSPECTS
+    )
+
+
+def test_only_the_vote_path_builds_vote_arrays(suspects_engine, monkeypatch, caplog):
+    """No embedding matrix, dhash parse or label masks without a vote to use them."""
+    _seed_scan(
+        suspects_engine,
+        (
+            (2921, _scan_embedding(1.0, 1, 0.1), "not-hex"),
+            (2922, _scan_embedding(1.0, 0.1, 1), "00000000000000cc"),
+            (2931, _scan_embedding(1.0, 1, 0.3), "00000000000000dd"),
+            (2932, _scan_embedding(1.0, 0.3, 1), "00000000000000ee"),
+        ),
+        tags=((2931, "test-vote-spy"),),
+        predictions=((2921, "test-fallback-spy", 0.95),),
+    )
+    built = []
+    real_vote_arrays = tag_scan_service._vote_arrays
+
+    def _spy(ids, *args):
+        built.append(list(ids))
+        return real_vote_arrays(ids, *args)
+
+    monkeypatch.setattr(tag_scan_service, "_vote_arrays", _spy)
+    caplog.set_level(logging.WARNING, logger=tag_scan_service.__name__)
+
+    fallback = tag_scan_service.scan_tag(
+        _EngineVault(suspects_engine), "test-fallback-spy", picture_ids={2921, 2922}
+    )
+    assert (fallback["scanned"], fallback["added"]) == (2, 1)  # the fallback ran
+    assert (built, _unparseable_hash_warnings(caplog)) == ([], [])
+
+    tag_scan_service.scan_tag(
+        _EngineVault(suspects_engine), "test-vote-spy", picture_ids={2931, 2932}
+    )
+    assert [sorted(ids) for ids in built] == [[2931, 2932]]

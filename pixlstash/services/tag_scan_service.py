@@ -396,30 +396,16 @@ def scan_tag(
 
     ids: list[int] = []
     blobs: list[bytes] = []
-    phash_values: list[int] = []
-    phash_valid: list[bool] = []
+    phashes: list[str | None] = []
     for pic_id, blob, phash in emb_rows:
         if blob is None or len(blob) != EMBEDDING_BYTES:
             continue
         ids.append(pic_id)
         blobs.append(blob)
-        # dhash is stored as a 16-char lowercase hex string (8x8 = 64 bits). Parse to an
-        # int; mark missing/malformed values invalid rather than raising.
-        value = 0
-        valid = False
-        if phash:
-            try:
-                value = int(phash, 16)
-                valid = True
-            except (ValueError, TypeError):
-                logger.warning(
-                    "scan_tag: unparseable perceptual_hash %r for picture %s; "
-                    "excluding from near-duplicate twin selection",
-                    phash,
-                    pic_id,
-                )
-        phash_values.append(value)
-        phash_valid.append(valid)
+        phashes.append(phash)
+    # The loaded rows hold every blob too. Drop them so `blobs` holds the only
+    # references, which _vote_arrays releases before its unit-norm copy.
+    del emb_rows
 
     empty = {
         "tag": tag,
@@ -433,22 +419,6 @@ def scan_tag(
     if len(ids) < 2:
         return empty
 
-    # uint64 so the full 64-bit dhash range round-trips for the XOR/popcount Hamming.
-    phash_ints = np.array(phash_values, dtype=np.uint64)
-    valid_mask = np.array(phash_valid, dtype=bool)
-
-    raw = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(
-        len(ids), EMBEDDING_DIM
-    )
-    # The loaded rows hold every blob too; release both before the unit-norm copy
-    # so the build peaks near two embedding matrices rather than four.
-    del emb_rows, blobs
-    norms = np.linalg.norm(raw, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    emb = raw / norms  # float32 / float32 stays float32: no extra cast copy
-    del raw
-
-    has_literal = np.array([pid in literal for pid in ids], dtype=bool)
     has_concept = np.array([pid in concept for pid in ids], dtype=bool)
     n_ground_truth = int(has_concept.sum())
 
@@ -524,6 +494,9 @@ def scan_tag(
             )
         )
 
+        emb, phash_ints, valid_mask, has_literal = _vote_arrays(
+            ids, blobs, phashes, literal
+        )
         pos_frac, twin_idx, twin_sim, neighbor_idx = knn_disagreement_with_neighbors(
             emb, has_concept, k, max_block_bytes=_KNN_SCRATCH_BYTES
         )
@@ -563,7 +536,7 @@ def scan_tag(
                 # specific pair, not the (possibly discarded) CLIP-nearest twin.
                 candidate_sim = round(float(emb[i] @ emb[j]), 4)
                 if candidate_sim >= min_display_twin_sim:
-                    d = hamming_distance(int(phash_values[i]), int(phash_values[j]))
+                    d = hamming_distance(int(phash_ints[i]), int(phash_ints[j]))
                     display_twin_id = int(ids[j])
                     display_twin_sim = candidate_sim
                     reason = (
@@ -612,6 +585,69 @@ def scan_tag(
         "new": write_stats["new"],
         "prev_reviewed": write_stats["prev_reviewed"],
     }
+
+
+def _vote_arrays(
+    ids: list[int],
+    blobs: list[bytes],
+    phashes: list[str | None],
+    literal: set[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build the arrays only :func:`scan_tag`'s neighbour vote reads.
+
+    The confidence fallback reads none of them, so the scan builds them only
+    once it has taken the vote.
+
+    Args:
+        ids: Scanned picture ids, aligned with ``blobs`` and ``phashes``.
+        blobs: Each picture's ``EMBEDDING_BYTES`` embedding blob. Cleared once
+            joined: the caller passes its only references, so the per-row bytes
+            are released before the unit-norm copy and the build peaks near two
+            embedding matrices.
+        phashes: Each picture's stored dhash, or ``None``.
+        literal: Ids carrying the literal tag (not its merged children).
+
+    Returns:
+        ``(emb, phash_ints, valid_mask, has_literal)`` aligned to ``ids``: the
+        unit-norm float32 embeddings, the uint64 dhash values (0 where invalid),
+        the parseable-dhash mask and the literal-tag mask.
+    """
+    phash_values: list[int] = []
+    phash_valid: list[bool] = []
+    for pic_id, phash in zip(ids, phashes):
+        # dhash is stored as a 16-char lowercase hex string (8x8 = 64 bits). Parse to an
+        # int; mark missing/malformed values invalid rather than raising.
+        value = 0
+        valid = False
+        if phash:
+            try:
+                value = int(phash, 16)
+                valid = True
+            except (ValueError, TypeError):
+                logger.warning(
+                    "scan_tag: unparseable perceptual_hash %r for picture %s; "
+                    "excluding from near-duplicate twin selection",
+                    phash,
+                    pic_id,
+                )
+        phash_values.append(value)
+        phash_valid.append(valid)
+
+    # uint64 so the full 64-bit dhash range round-trips for the XOR/popcount Hamming.
+    phash_ints = np.array(phash_values, dtype=np.uint64)
+    valid_mask = np.array(phash_valid, dtype=bool)
+
+    raw = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(
+        len(ids), EMBEDDING_DIM
+    )
+    blobs.clear()
+    norms = np.linalg.norm(raw, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    emb = raw / norms  # float32 / float32 stays float32: no extra cast copy
+    del raw
+
+    has_literal = np.array([pid in literal for pid in ids], dtype=bool)
+    return emb, phash_ints, valid_mask, has_literal
 
 
 def _write_suspects(
