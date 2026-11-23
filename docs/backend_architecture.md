@@ -7342,6 +7342,54 @@ Catching only `DedupVerdictError` meant a locked group mid-run propagated out
 after earlier groups had already committed — a partially applied mutation whose
 server-minted batch id the caller never saw.
 
+How the applied run (`bulk_auto_stack_in_session`) holds together:
+
+- **One commit per verdict.** The stack and keep-separate verdicts record their
+  operation with `_record_operation(..., commit=False)` and commit once
+  themselves, so the operation row, the stack change and the verdict row land
+  in a single commit (recording used to commit on its own, so every verdict
+  was two commits, the second with nothing left to write). A run therefore
+  commits once per group, and every committed group is a complete undo unit
+  under the batch.
+- **The run iterates scalars, not ORM rows.** A loop over loaded `DedupGroup`
+  objects kept every planned group in the session's identity map across the
+  run, and each per-group commit expired all of them. The applied plan selects
+  `(DedupGroup.id, DedupGroup.signature)`; the dry run still loads groups for
+  its aggregate summary.
+- **Each group is re-checked before it is applied** (`_still_poses_a_decision`).
+  Stacking one group folds every stack it spans, so a later group in the same
+  plan can already share one stack; applying it anyway replaced the earlier
+  group's chosen cover. Such a group is skipped, counted in the response's
+  `superseded`, and written nowhere. The test is the queue's own filter
+  restricted to the group's member rows (`live_groups_filter(group_id)`, the
+  same three `HAVING` clauses). `group_id` leads the primary key of
+  `dedupgroupmember`, so one check is an index range read whose cost does not
+  grow with the library (`test_a_recheck_reads_its_own_group_not_the_library`
+  counts SQLite VM instructions at 200 and 2,000 unrelated groups). It runs
+  only for a group with a member among the pictures this run has already moved
+  (the applied groups' stack-expanded `event_picture_ids`); any other group is
+  as eligible as when the run was planned, because the run is one writer task,
+  so it skips the query. A touched group that still spans two stack units is
+  applied (`test_an_auto_stack_run_still_stacks_a_group_an_earlier_group_only_touched`).
+- **An unexpected error while a group is checked or applied is logged and
+  re-raised.** The re-check and the verdict sit in one `try`, and anything
+  other than a guard's refusal (`DedupVerdictError`, `HTTPException`) is logged
+  with the group's signature, the batch id and how many groups were applied,
+  then re-raised. The writer rolls back only that group; the earlier groups stay
+  committed under the batch and are undone through it. The stale-group prune
+  after the loop is outside that boundary.
+- **A supplied `batch_id` must still be the newest batch in History**
+  (`_refuse_a_buried_batch`). Undo needs a batch to be the newest applied undo
+  unit and contiguous at the top (`operation_log_service.undo_batch_in_session`),
+  so a run that appended to a batch buried under another operation would split
+  it and neither could then be undone. When the supplied id already has applied
+  undoable rows and the newest applied undoable row belongs to another batch,
+  the applied run is refused with 409 `batch_id_not_at_top` before planning or
+  writing anything. A dry run is never refused, and a repeat under an id that is
+  still on top extends the batch. Clients mint their own `cli-…` id for the run
+  so a request that times out still names its undo handle
+  (`docs/integration_architecture.md`, `POST /dedup/auto-stack`).
+
 ### 22.11 Mixed stacks: cohesion scoring, `Keep`, split and unstack (D5/B5)
 
 `pixlstash/services/mixed_stack_service.py`, `pixlstash/db_models/mixed_stack.py`,

@@ -933,7 +933,9 @@ def apply_stack_verdict_in_session(
         actor=actor,
         source=source,
         origin_client_id=origin_client_id,
-        commit=commit,
+        # The row is flushed here and committed below with everything else:
+        # recording it with its own commit made every verdict two commits.
+        commit=False,
     )
     if commit:
         session.commit()
@@ -1028,7 +1030,8 @@ def apply_keep_separate_in_session(
         source=source,
         origin_client_id=origin_client_id,
         empty_diff_target_ids=member_ids,
-        commit=commit,
+        # Flushed here, committed once below (see the stack verdict).
+        commit=False,
     )
     if commit:
         session.commit()
@@ -1544,6 +1547,96 @@ def restore_reopens_in_session(
     )
 
 
+def _still_poses_a_decision(
+    session: Session, group_id: int, touched_picture_ids: set[int]
+) -> bool:
+    """Whether a group planned at the start of a bulk run is still in the queue.
+
+    The run is planned once and applied group by group, and an earlier group can
+    fold the stacks a later one spans, leaving the later group's members in one
+    stack unit. The queue stops showing such a group, so the run must stop too:
+    applying it would force its own cover to the front of the stack the earlier
+    group just built.
+
+    The queue's own filter is the test, restricted to this group's member rows,
+    so one check costs the same however large the library is. It still runs
+    only for a group with a member an earlier group in this run touched, which
+    saves one query per untouched group. Nothing else writes during the run (it
+    is one writer task), the filter reads only its members' stack, deleted and
+    set-lock state and the group's own row, and every picture a stack verdict
+    changes is in its ``event_picture_ids``, the set its undo restores. A group
+    sharing no picture with that set is as eligible as it was when planned.
+
+    Args:
+        session: The run's session.
+        group_id: The planned group.
+        touched_picture_ids: Every picture an applied group in this run changed.
+    """
+    if not touched_picture_ids:
+        return True
+    member_ids = session.exec(
+        select(DedupGroupMember.picture_id).where(DedupGroupMember.group_id == group_id)
+    ).all()
+    if touched_picture_ids.isdisjoint(int(pid) for pid in member_ids):
+        return True
+    still = session.exec(
+        select(DedupGroup.id).where(
+            DedupGroup.id == group_id,
+            DedupGroup.resolved.is_(False),
+            DedupGroup.tier == TIER_EXACT,
+            live_groups_filter(group_id),
+        )
+    ).first()
+    return still is not None
+
+
+def _refuse_a_buried_batch(session: Session, batch_id: str) -> None:
+    """Refuse to extend a supplied batch that is no longer on top of History.
+
+    Undo takes a batch only while it is the newest applied unit and contiguous at
+    the top of History (see ``operation_log_service.undo_batch_in_session``). A
+    run appends every group to the batch it is given, so appending to a batch
+    that another undoable operation has since landed on would split the batch
+    around that operation. History could then undo neither: the batch is stale
+    behind the newer operation, and the newer operation sits inside the batch.
+    A batch with no applied rows yet, or one still on top, is extended as before.
+
+    Args:
+        session: The run's session.
+        batch_id: The batch id the caller supplied.
+
+    Raises:
+        HTTPException: 409 ``batch_id_not_at_top``, before anything is written.
+    """
+    applied = select(Operation.batch_id).where(
+        Operation.status == STATUS_APPLIED, Operation.undoable.is_(True)
+    )
+    own_row = session.exec(applied.where(Operation.batch_id == batch_id).limit(1))
+    if own_row.first() is None:
+        return
+    newest = session.exec(applied.order_by(Operation.id.desc()).limit(1))
+    latest_batch_id = newest.first()
+    if latest_batch_id == batch_id:
+        return
+    logger.info(
+        "[dedup-verdict] auto-stack refused batch %s: the newest applied operation "
+        "belongs to batch %s, so appending would split the batch's undo",
+        batch_id,
+        latest_batch_id,
+    )
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "batch_id_not_at_top",
+            "message": (
+                f"Batch {batch_id} is no longer the newest entry in History, so "
+                "this run cannot join it. Send a new batch id."
+            ),
+            "batch_id": batch_id,
+        },
+    )
+
+
 def bulk_auto_stack_in_session(
     session: Session,
     scope: Optional[DedupScope] = None,
@@ -1573,10 +1666,12 @@ def bulk_auto_stack_in_session(
     Args:
         session: Pre-opened session.
         scope: Restrict to a scope; defaults to the whole vault.
-        batch_id: The shared batch id. Minted when omitted and returned.
+        batch_id: The shared batch id. Minted when omitted and returned. A
+            supplied one that already has applied operations must still be the
+            newest batch in History (see :func:`_refuse_a_buried_batch`).
         dry_run: Count what would happen and write nothing. This is what the
             consent dialog reads.
-        limit: Cap the number of groups acted on, for a paged run.
+        limit: Cap the number of groups acted on.
         actor: Who performed the change, from ``request_context`` in the handler.
         source: WS-envelope source, likewise read from the request.
         origin_client_id: WS-envelope per-tab origin, likewise.
@@ -1585,12 +1680,28 @@ def bulk_auto_stack_in_session(
         The batch id, the counts, and a per-group outcome for **every** group the
         run considered: ``results`` for the applied ones and ``failures`` for the
         rest, each carrying an ``outcome`` of :data:`BULK_REASON_APPLIED`,
-        :data:`BULK_REASON_BLOCKED` or :data:`BULK_REASON_FAILED`. The batch id is
-        always present, so a partially applied run always hands back its undo
-        handle.
+        :data:`BULK_REASON_BLOCKED` or :data:`BULK_REASON_FAILED`, plus
+        ``superseded``, the count of planned groups an earlier group in the same
+        run left with no decision to make (see :func:`_still_poses_a_decision`);
+        nothing is written for those. A returned run always carries its batch
+        id, so a partially applied run hands back its undo handle.
+
+    Raises:
+        HTTPException: 409 from :func:`_refuse_a_buried_batch`, before any
+            write.
+        Exception: Anything the per-group handling does not expect. The groups
+            before it stay committed under the batch, and the error log line
+            names the batch.
     """
     scope = scope or DedupScope()
-    query = select(DedupGroup).where(
+    if batch_id and not dry_run:
+        _refuse_a_buried_batch(session, batch_id)
+    # The dry run aggregates over the group rows. The run itself reads only
+    # (id, signature) scalars: it commits once per group, every commit expires
+    # the whole identity map, and holding G loaded rows across G commits made
+    # each later group pay to reload all of them.
+    columns = (DedupGroup,) if dry_run else (DedupGroup.id, DedupGroup.signature)
+    query = select(*columns).where(
         DedupGroup.resolved.is_(False),
         DedupGroup.tier == TIER_EXACT,
         # THE SAME filter the queue list, the badge and the tier counts apply.
@@ -1640,11 +1751,23 @@ def bulk_auto_stack_in_session(
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     event_picture_ids: set[int] = set()
-    for group in groups:
+    superseded = 0
+    for group_id, signature in groups:
         try:
+            if not _still_poses_a_decision(session, group_id, event_picture_ids):
+                # Not a failure: an earlier group in this run already collapsed
+                # it, so it left the queue too. Nothing is written for it.
+                superseded += 1
+                logger.info(
+                    "[dedup-verdict] auto-stack superseded group %s (batch=%s): an "
+                    "earlier group in this run left it no decision to make",
+                    signature,
+                    batch_id,
+                )
+                continue
             result = apply_stack_verdict_in_session(
                 session,
-                group.signature,
+                signature,
                 batch_id=batch_id,
                 actor=actor,
                 source=source,
@@ -1673,19 +1796,33 @@ def bulk_auto_stack_in_session(
             logger.warning(
                 "[dedup-verdict] auto-stack %s group %s (batch=%s): %s",
                 reason,
-                group.signature,
+                signature,
                 batch_id,
                 detail,
             )
             failures.append(
                 {
-                    "signature": group.signature,
+                    "signature": signature,
                     "outcome": reason,
                     "status_code": status_code,
                     "error": detail,
                 }
             )
             continue
+        except Exception:
+            # Anything else is a defect, not a refusal, so the run stops rather
+            # than guess. Every earlier group has already committed under the
+            # batch, and the caller gets this exception instead of the batch id,
+            # so this line is where the undo handle and the progress survive.
+            logger.exception(
+                "[dedup-verdict] auto-stack stopped at group %s (batch=%s) after "
+                "%d applied group(s); those stay committed under the batch and "
+                "undo with it",
+                signature,
+                batch_id,
+                len(results),
+            )
+            raise
         results.append({**result.as_dict(), "outcome": BULK_REASON_APPLIED})
         # A group can name one member of an already-existing stack. Folding that
         # stack reparents and renumbers every sibling, so aggregate the verdict's
@@ -1694,11 +1831,12 @@ def bulk_auto_stack_in_session(
     prune_stale_groups_in_session(session)
     logger.info(
         "[dedup-verdict] auto-stacked %d exact group(s) under batch %s "
-        "(%d blocked, %d failed)",
+        "(%d blocked, %d failed, %d superseded)",
         len(results),
         batch_id,
         sum(1 for f in failures if f["outcome"] == BULK_REASON_BLOCKED),
         sum(1 for f in failures if f["outcome"] == BULK_REASON_FAILED),
+        superseded,
     )
     return {
         # Always present once anything could have committed, so the caller always
@@ -1712,6 +1850,8 @@ def bulk_auto_stack_in_session(
         "failures": failures,
         "blocked": sum(1 for f in failures if f["outcome"] == BULK_REASON_BLOCKED),
         "failed": sum(1 for f in failures if f["outcome"] == BULK_REASON_FAILED),
+        # Planned groups an earlier group in the run took out of the queue.
+        "superseded": superseded,
         # Wrapper-only broadcast plumbing; removed before the API response.
         "event_picture_ids": sorted(event_picture_ids),
     }
