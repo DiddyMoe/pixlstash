@@ -373,6 +373,48 @@ function groupWithoutPictures(group, removed) {
   };
 }
 
+/**
+ * Why an Auto-stack preview request failed, in the terms the dialog words it.
+ *
+ * Checked in this order because the cases overlap: an aborted or timed-out
+ * request also arrives without a response, and only the remainder is a server
+ * that could not be reached. `detail` is the server's own sentence, or for a
+ * refused body (a list of field errors) the first error's message only: never
+ * its `input`, which echoes the submitted value.
+ *
+ * @param {*} err - the rejection from `autoStackExact`.
+ * @returns {{kind: string, status: (number|null), detail: string}}
+ */
+function autoStackPreviewFailure(err) {
+  const status = Number(err?.response?.status) || null;
+  const served = err?.response?.data?.detail;
+  let detail = "";
+  if (typeof served === "string") {
+    detail = served.trim();
+  } else if (Array.isArray(served) && typeof served[0]?.msg === "string") {
+    detail = served[0].msg.trim();
+  }
+  let kind;
+  if (
+    err?.code === "ERR_CANCELED" ||
+    err?.name === "CanceledError" ||
+    err?.name === "AbortError"
+  ) {
+    kind = "cancelled";
+  } else if (err?.code === "ECONNABORTED" || err?.code === "ETIMEDOUT") {
+    kind = "timeout";
+  } else if (!err?.response) {
+    kind = "network";
+  } else if (status === 400 || status === 422) {
+    kind = "validation";
+  } else if (status === 401 || status === 403) {
+    kind = "forbidden";
+  } else {
+    kind = "server";
+  }
+  return { kind, status, detail };
+}
+
 export const useDedupStore = defineStore("dedup", () => {
   // --- The server's policy, bounds and vocabularies ------------------------
   const policyDefaults = ref(null);
@@ -2703,19 +2745,52 @@ export const useDedupStore = defineStore("dedup", () => {
   onScopeDispose(stopScanPoll);
 
   /**
-   * Preview the bulk auto-stack of the exact tier.
-   * @returns {Promise<Object|null>} the dry-run report.
+   * The scope the queue is showing, as a value that later scope changes leave
+   * alone: what the Auto-stack dialog previews and then applies.
+   *
+   * @returns {{scopeType: string, scopeId: (string|number|null)}}
    */
-  async function previewAutoStack() {
+  function currentScope() {
+    return { scopeType: scopeType.value, scopeId: scopeId.value };
+  }
+
+  /**
+   * Preview the bulk auto-stack of the exact tier.
+   *
+   * A failure is returned, not swallowed: the dialog has to tell a refused
+   * request from a timeout from a server fault, and a bare `null` erased all
+   * three into one generic line.
+   *
+   * @param {Object} [options]
+   * @param {{scopeType: string, scopeId: (string|number|null)}} [options.scope]
+   *   the scope to preview; the queue's current scope when omitted.
+   * @param {AbortSignal} [options.signal] - cancels the request.
+   * @returns {Promise<{ok: true, data: Object}|{ok: false, error: {kind: string,
+   *   status: (number|null), detail: string}}>} the dry-run report, or why
+   *   there is none. `kind` is `validation` (400/422), `forbidden` (401/403),
+   *   `server` (any other status), `timeout`, `network` (no response) or
+   *   `cancelled` (the signal fired).
+   */
+  async function previewAutoStack({ scope = currentScope(), signal } = {}) {
     try {
-      return await autoStackExact({
+      const data = await autoStackExact({
         dryRun: true,
-        scopeType: scopeType.value,
-        scopeId: scopeId.value,
+        scopeType: scope.scopeType,
+        scopeId: scope.scopeId,
+        signal,
       });
+      return { ok: true, data };
     } catch (err) {
-      console.warn("[dedup] failed to preview the auto-stack", err);
-      return null;
+      const failure = autoStackPreviewFailure(err);
+      if (failure.kind !== "cancelled") {
+        console.warn(
+          `[dedup] failed to preview the auto-stack for ${scope.scopeType}` +
+            `${scope.scopeId == null ? "" : ` ${scope.scopeId}`}` +
+            ` (${failure.kind}${failure.status ? ` ${failure.status}` : ""})`,
+          err,
+        );
+      }
+      return { ok: false, error: failure };
     }
   }
 
@@ -2725,16 +2800,21 @@ export const useDedupStore = defineStore("dedup", () => {
    * The whole run coalesces into one operation batch, so the receipt it raises
    * reverses every stack it created with a single undo.
    *
+   * @param {Object} [options]
+   * @param {{scopeType: string, scopeId: (string|number|null)}} [options.scope]
+   *   the scope to stack: the one the user previewed, so a scope change while
+   *   the dialog was open cannot redirect the run. The queue's current scope
+   *   when omitted.
    * @returns {Promise<Object|null>} the run report, carrying `batch_id` and any
    *   `failures`.
    */
-  async function runAutoStack() {
+  async function runAutoStack({ scope = currentScope() } = {}) {
     busy.value = true;
     try {
       const result = await autoStackExact({
         dryRun: false,
-        scopeType: scopeType.value,
-        scopeId: scopeId.value,
+        scopeType: scope.scopeType,
+        scopeId: scope.scopeId,
       });
       invalidateScopeCounts();
       // The whole run is one operation batch; the same response-driven
@@ -3360,6 +3440,7 @@ export const useDedupStore = defineStore("dedup", () => {
     reopen,
     triggerScan,
     stopScanPoll,
+    currentScope,
     previewAutoStack,
     runAutoStack,
     // mixed stacks (the third page)

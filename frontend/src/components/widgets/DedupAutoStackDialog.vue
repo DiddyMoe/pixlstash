@@ -7,8 +7,9 @@
  *     :open="autoStackOpen"
  *     :preview="dryRun"
  *     :loading="dryRunLoading"
+ *     :preview-error="dryRunError"
  *     :busy="autoStackRunning"
- *     @close="autoStackOpen = false"
+ *     @close="closeAutoStack"
  *     @confirm="runAutoStack"
  *   />
  *
@@ -52,12 +53,15 @@ const props = defineProps({
   /** True while the dry run is in flight. */
   loading: { type: Boolean, default: false },
   /**
-   * True when the dry run could not be read. Without this a failed preview and
-   * a genuinely empty one are the same screen: a column of zeroes and a
-   * disabled button, which says "there is nothing to stack" when the truth is
-   * "nobody was able to ask".
+   * Why the dry run could not be read, or null when it was: the store's
+   * `{ kind, status, detail }` (`useDedupStore.previewAutoStack`). Without this
+   * a failed preview and a genuinely empty one are the same screen: a column of
+   * zeroes and a disabled button, which says "there is nothing to stack" when
+   * the truth is "nobody was able to ask". The kind picks the sentence, so a
+   * refused request, a missing permission and a timeout each read as what they
+   * are.
    */
-  previewFailed: { type: Boolean, default: false },
+  previewError: { type: Object, default: null },
   /** True while the real run is in flight. */
   busy: { type: Boolean, default: false },
 });
@@ -105,6 +109,46 @@ const ROWS = [
 const summary = computed(() => props.preview?.dry_run_summary ?? null);
 
 /**
+ * True while no figure from the dry run may be shown: in flight, failed, or
+ * not asked yet. A count printed in any of those states is one nobody has
+ * seen the server report.
+ */
+const figuresUnknown = computed(
+  () => props.loading || Boolean(props.previewError) || !props.preview,
+);
+
+/**
+ * The sentence for a failed dry run, or "" when there is none to say.
+ *
+ * A cancelled request says nothing: it was cancelled because the dialog moved
+ * on. Retrying helps after a timeout, an unreachable server or a server fault,
+ * so those say how; it does not help a refused request or a missing
+ * permission, so those say why instead.
+ */
+const failureSentence = computed(() => {
+  const error = props.previewError;
+  if (!error) return "";
+  const retry = "so these counts are unknown. Close this and try again.";
+  switch (error.kind) {
+    case "cancelled":
+      return "";
+    case "validation": {
+      const reason = String(error.detail || "").trim();
+      if (!reason) return "The server refused the preview request.";
+      return `The server refused the preview request: ${reason}${/[.!?]$/.test(reason) ? "" : "."}`;
+    }
+    case "forbidden":
+      return "You don't have permission to stack duplicates here.";
+    case "timeout":
+      return `The preview took too long to answer, ${retry}`;
+    case "network":
+      return `The server could not be reached, ${retry}`;
+    default:
+      return `The preview failed on the server, ${retry}`;
+  }
+});
+
+/**
  * Groups this run would stack.
  *
  * Read from the summary's per-tier split, which is the same number the
@@ -140,11 +184,17 @@ const coversGainingMetadata = computed(
 );
 
 const canConfirm = computed(
-  () =>
-    !props.loading &&
-    !props.busy &&
-    !props.previewFailed &&
-    stacksToCreate.value > 0,
+  () => !figuresUnknown.value && !props.busy && stacksToCreate.value > 0,
+);
+
+/**
+ * The confirm label. While the count is unknown it drops the number rather
+ * than printing a zero nobody reported; the button is disabled then anyway.
+ */
+const confirmLabel = computed(() =>
+  figuresUnknown.value
+    ? "Create stacks"
+    : `Create ${stacksToCreate.value.toLocaleString()} stacks`,
 );
 
 /**
@@ -152,7 +202,7 @@ const canConfirm = computed(
  *
  * While the dry run is in flight every row shows an en dash rather than a
  * spinner, so the dialog keeps its height and nothing moves under the pointer
- * when the counts land.
+ * when the counts land. A failed dry run keeps the dashes.
  */
 function rowValue(key) {
   // Deletion is a property of the feature, not a number the server reports:
@@ -164,7 +214,7 @@ function rowValue(key) {
   if (key === "queueRemaining") {
     return (Number(props.queueRemaining) || 0).toLocaleString();
   }
-  if (props.loading || props.previewFailed) return "–";
+  if (figuresUnknown.value) return "–";
   if (key === "groups") return stacksToCreate.value.toLocaleString();
   if (key === "pictures") return picturesCollapsed.value.toLocaleString();
   if (key === "coversGainingMetadata") {
@@ -187,10 +237,9 @@ function rowValue(key) {
       moves onto the stack. Near-duplicates stay in the queue for you to review.
     </p>
 
-    <p v-if="previewFailed" class="as-failed" role="status">
+    <p v-if="failureSentence" class="as-failed" role="status">
       <v-icon size="16" class="as-icon">mdi-alert-outline</v-icon>
-      The preview could not be read, so these counts are unknown. Close this and
-      try again.
+      {{ failureSentence }}
     </p>
 
     <dl class="as-rows">
@@ -218,7 +267,7 @@ function rowValue(key) {
         :disabled="!canConfirm"
         @click="emit('confirm')"
       >
-        Create {{ stacksToCreate.toLocaleString() }} stacks
+        {{ confirmLabel }}
       </AppButton>
     </template>
   </AppDialog>

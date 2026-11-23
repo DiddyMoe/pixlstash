@@ -737,10 +737,10 @@
       :open="autoStackOpen"
       :preview="autoStackPreview"
       :loading="autoStackLoading"
-      :preview-failed="autoStackPreviewFailed"
+      :preview-error="autoStackError"
       :busy="store.busy"
       :queue-remaining="store.queueOnlyCount"
-      @close="autoStackOpen = false"
+      @close="closeAutoStack"
       @confirm="confirmAutoStack"
     />
 
@@ -1088,7 +1088,15 @@ const compareOpen = ref(false);
 const autoStackOpen = ref(false);
 const autoStackLoading = ref(false);
 const autoStackPreview = ref(null);
-const autoStackPreviewFailed = ref(false);
+const autoStackError = ref(null);
+// The scope the open dialog previewed, frozen when it opened, so confirming
+// stacks exactly what the user was shown even if the queue moved meanwhile.
+const autoStackScope = ref(null);
+// Each opening's dry run has a token and its own abort controller. A reply
+// that lands after a newer opening, or after the dialog closed, belongs to no
+// dialog on screen and is dropped.
+let autoStackRunToken = 0;
+let autoStackAbort = null;
 const announcement = ref("");
 
 // Which thumbnails are currently flashing their lock chip, and on which row.
@@ -2574,22 +2582,60 @@ async function onKeepMixed(stack) {
   });
 }
 
-/** Open the bulk dialog on its dry run, so the preview is never stale. */
+/** Drop the dialog's in-flight dry run: cancel the request, ignore its reply. */
+function abandonAutoStackPreview() {
+  autoStackRunToken += 1;
+  autoStackAbort?.abort();
+  autoStackAbort = null;
+}
+
+/**
+ * Open the bulk dialog on its dry run, so the preview is never stale.
+ *
+ * The scope is frozen here, so the preview and the run it consents to act on
+ * the same scope. A newer opening abandons this one's request: a slow first
+ * reply must not land over the second opening's figures.
+ */
 async function openAutoStack() {
+  abandonAutoStackPreview();
+  const token = autoStackRunToken;
+  const controller = new AbortController();
+  autoStackAbort = controller;
+  const scope = store.currentScope();
+  autoStackScope.value = scope;
   autoStackOpen.value = true;
   autoStackLoading.value = true;
-  autoStackPreviewFailed.value = false;
-  const preview = await store.previewAutoStack();
-  autoStackPreview.value = preview;
+  autoStackPreview.value = null;
+  autoStackError.value = null;
+  const result = await store.previewAutoStack({
+    scope,
+    signal: controller.signal,
+  });
+  if (token !== autoStackRunToken) return;
+  autoStackAbort = null;
   // A failed dry run must not render as a confident row of zeroes: that reads
   // as "there is nothing to stack" when the truth is "nobody asked".
-  autoStackPreviewFailed.value = !preview;
+  if (result.ok) {
+    autoStackPreview.value = result.data;
+  } else {
+    autoStackError.value = result.error;
+  }
   autoStackLoading.value = false;
 }
 
-async function confirmAutoStack() {
-  const result = await store.runAutoStack();
+/** Close the bulk dialog and abandon whatever its dry run still owes it. */
+function closeAutoStack() {
+  abandonAutoStackPreview();
   autoStackOpen.value = false;
+  autoStackLoading.value = false;
+  autoStackPreview.value = null;
+  autoStackError.value = null;
+  autoStackScope.value = null;
+}
+
+async function confirmAutoStack() {
+  const result = await store.runAutoStack({ scope: autoStackScope.value });
+  closeAutoStack();
   if (result?.batch_id) {
     const made = Number(result.groups ?? 0).toLocaleString();
     announcement.value = `Created ${made} stacks. Undo reverses the whole run in one step.`;
@@ -2999,6 +3045,8 @@ onBeforeUnmount(() => {
   // Leaving the destination mid-jump must stop the paging, not let it keep
   // fetching a queue nobody is looking at.
   store.cancelEndChase();
+  // The same for an Auto-stack dry run still in flight.
+  abandonAutoStackPreview();
   if (flashTimer) {
     clearTimeout(flashTimer);
     flashTimer = null;

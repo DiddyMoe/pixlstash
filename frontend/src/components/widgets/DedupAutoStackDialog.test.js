@@ -48,7 +48,7 @@ function mountDialog(props = {}) {
   });
 }
 
-/** The footer buttons, in render order: Cancel, Create N stacks. */
+/** The footer buttons, in render order: Cancel, Create (N) stacks. */
 function footerButtons(wrapper) {
   return wrapper.findAllComponents(AppButton);
 }
@@ -154,7 +154,10 @@ describe("DedupAutoStackDialog: the confirmation", () => {
   // column of zeroes reads as "there is nothing to stack" when the truth is
   // "nobody was able to ask".
   it("says so when the dry run could not be read", () => {
-    const wrapper = mountDialog({ preview: null, previewFailed: true });
+    const wrapper = mountDialog({
+      preview: null,
+      previewError: { kind: "server", status: 500, detail: "" },
+    });
     expect(wrapper.find(".as-failed").exists()).toBe(true);
     expect(
       wrapper.findAll(".as-row").map((r) => r.find(".as-value").text()),
@@ -166,6 +169,89 @@ describe("DedupAutoStackDialog: the confirmation", () => {
 
   it("stays quiet about failure on a dry run that worked", () => {
     expect(mountDialog().find(".as-failed").exists()).toBe(false);
+  });
+
+  // "Create 0 stacks" under a failure notice is a figure nobody reported: the
+  // label drops its number whenever the rows above it are dashes.
+  it.each([
+    ["in flight", { preview: null, loading: true }],
+    [
+      "failed",
+      {
+        preview: null,
+        previewError: { kind: "timeout", status: null, detail: "" },
+      },
+    ],
+    [
+      "failed after an earlier answer",
+      { previewError: { kind: "server", status: 502, detail: "" } },
+    ],
+  ])("names no count while the dry run is %s", (_state, props) => {
+    const wrapper = mountDialog(props);
+    const button = footerButtons(wrapper)[1];
+    expect(button.text()).toBe("Create stacks");
+    expect(button.find("button").attributes("disabled")).toBeDefined();
+    expect(
+      wrapper.findAll(".as-row").map((r) => r.find(".as-value").text()),
+    ).toEqual(["–", "–", "–", "88", "0"]);
+  });
+
+  // Each failure says what happened and, where retrying can help, how; a
+  // refused request names the server's own reason.
+  it.each([
+    [
+      "a refused body",
+      {
+        kind: "validation",
+        status: 422,
+        detail: "Input should be a valid boolean",
+      },
+      "The server refused the preview request: Input should be a valid boolean.",
+    ],
+    [
+      "a refused request whose reason ends its own sentence",
+      { kind: "validation", status: 400, detail: "Unknown scope." },
+      "The server refused the preview request: Unknown scope.",
+    ],
+    [
+      "a refused request with no reason",
+      { kind: "validation", status: 422, detail: "" },
+      "The server refused the preview request.",
+    ],
+    [
+      "a missing permission",
+      { kind: "forbidden", status: 403, detail: "Not allowed" },
+      "You don't have permission to stack duplicates here.",
+    ],
+    [
+      "a timeout",
+      { kind: "timeout", status: null, detail: "" },
+      "The preview took too long to answer, so these counts are unknown. Close this and try again.",
+    ],
+    [
+      "an unreachable server",
+      { kind: "network", status: null, detail: "" },
+      "The server could not be reached, so these counts are unknown. Close this and try again.",
+    ],
+    [
+      "a server fault",
+      { kind: "server", status: 500, detail: "" },
+      "The preview failed on the server, so these counts are unknown. Close this and try again.",
+    ],
+  ])("words %s as what it was", (_label, previewError, sentence) => {
+    const wrapper = mountDialog({ preview: null, previewError });
+    expect(wrapper.find(".as-failed").text()).toBe(sentence);
+  });
+
+  // A cancelled request was cancelled because the dialog moved on; it is not a
+  // failure to report, and its counts are still unknown.
+  it("says nothing about a cancelled dry run and still names no count", () => {
+    const wrapper = mountDialog({
+      preview: null,
+      previewError: { kind: "cancelled", status: null, detail: "" },
+    });
+    expect(wrapper.find(".as-failed").exists()).toBe(false);
+    expect(footerButtons(wrapper)[1].text()).toBe("Create stacks");
   });
 
   // The consent has to describe what the run actually does to the copies it
