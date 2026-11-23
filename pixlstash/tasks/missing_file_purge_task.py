@@ -121,7 +121,7 @@ class MissingFilePurgeTask(BaseTask):
             len(self._pictures),
         )
 
-        purged = self._db.run_task(self._purge_pictures, missing)
+        purged = self._db.run_task(self._purge_pictures, missing, image_root)
         logger.info("MissingFilePurgeTask: purged %s picture record(s).", purged)
         return {"purged": purged, "repaired": repaired, "deferred": deferred}
 
@@ -155,10 +155,11 @@ class MissingFilePurgeTask(BaseTask):
         * no journal row at all - a genuine deletion, purged as before.
 
         Returns ``(repairs, deferred_count, still_missing)``, each repair a
-        ``(picture_id, landed_path, came_back_to_our_source)`` triple - the flag
-        says which end of the journal row the file turned up at, which is what
-        :meth:`_repair_moved_pictures` needs to know whether Phase 5 is owed a
-        review as well as a repoint.
+        ``(picture_id, landed_path, came_back_to_our_source, seen_path)``
+        tuple - the flag says which end of the journal row the file turned up
+        at, which is what :meth:`_repair_moved_pictures` needs to know whether
+        Phase 5 is owed a review as well as a repoint, and ``seen_path`` is the
+        row's path as read here, the end the journal row was matched against.
         """
         by_id: dict = {pic.id: pic for pic in candidates if pic.file_path}
         if not by_id:
@@ -221,7 +222,9 @@ class MissingFilePurgeTask(BaseTask):
                 deferred += 1
                 continue
             if os.path.isfile(landed):
-                repairs.append((pic.id, landed_path, pic.id in came_back))
+                repairs.append(
+                    (pic.id, landed_path, pic.id in came_back, pic.file_path)
+                )
                 continue
             deferred += 1
             logger.warning(
@@ -275,12 +278,28 @@ class MissingFilePurgeTask(BaseTask):
         queues one as well, which is the safe direction: the row is a question
         for the owner, never an applied change, and finishing the undo is what
         it would have asked anyway.
+
+        **A repair is only applied to a row still at the path it was decided
+        on.** The journal row was matched against the path read before this
+        write was queued; a row repointed since by another writer is somewhere
+        newer, and writing the journal's end over it would point the picture at
+        a file that may have moved on. It is left for the next pass.
         """
         repaired = 0
         came_back: list = []
-        for picture_id, new_path, came_back_to_our_source in repairs:
+        for picture_id, new_path, came_back_to_our_source, seen_path in repairs:
             picture = session.get(Picture, picture_id)
             if picture is None:
+                continue
+            if picture.file_path != seen_path:
+                logger.info(
+                    "MissingFilePurgeTask: not repointing picture %s to %s - it "
+                    "moved from %s to %s after this pass read it.",
+                    picture_id,
+                    new_path,
+                    seen_path,
+                    picture.file_path,
+                )
                 continue
             logger.info(
                 "MissingFilePurgeTask: repointing picture %s from %s to %s - "
@@ -309,12 +328,44 @@ class MissingFilePurgeTask(BaseTask):
         return repaired
 
     @staticmethod
-    def _purge_pictures(session: Session, pictures: list) -> int:
-        """Delete picture rows and log them to deleted_file_log."""
+    def _purge_pictures(session: Session, pictures: list, image_root) -> int:
+        """Delete picture rows and log them to deleted_file_log.
+
+        *pictures* are the rows as read before this write was queued. One that
+        another writer has since repointed, re-owned or scrapheaped may name a
+        live file now, so it is neither deleted nor logged - the ledger entry
+        would bar its old path from ever being imported again - and is left for
+        the next pass to judge as it is. The same goes for a row whose file is
+        back at its path, resolved against *image_root* as :meth:`_run_task`
+        resolved it: the purge rested on that file being absent.
+        """
         purged = 0
         now = datetime.now(timezone.utc)
 
         for pic in pictures:
+            db_pic = session.get(Picture, pic.id)
+            if db_pic is not None and (
+                db_pic.file_path,
+                db_pic.reference_folder_id,
+                db_pic.deleted,
+            ) != (pic.file_path, pic.reference_folder_id, pic.deleted):
+                logger.info(
+                    "MissingFilePurgeTask: not purging picture %s - it changed "
+                    "after this pass read it (now at %s).",
+                    pic.id,
+                    db_pic.file_path,
+                )
+                continue
+            if os.path.isfile(
+                ImageUtils.resolve_picture_path(image_root, pic.file_path)
+            ):
+                logger.info(
+                    "MissingFilePurgeTask: not purging picture %s - its file is "
+                    "back at %s.",
+                    pic.id,
+                    pic.file_path,
+                )
+                continue
             # Log the deletion only if not already recorded. The path is stored
             # as an opaque hash (path_sha), never in cleartext.
             if pic.file_path:
@@ -344,7 +395,6 @@ class MissingFilePurgeTask(BaseTask):
                     already_logged.file_removed = True
                     session.add(already_logged)
 
-            db_pic = session.get(Picture, pic.id)
             if db_pic is not None:
                 session.delete(db_pic)
                 purged += 1
