@@ -213,6 +213,17 @@ const SAVE_DEBOUNCE_MS = 500;
 let saveTimer = null;
 /** Bumped per edit, so a response for a superseded edit is not applied. */
 let editSeq = 0;
+/**
+ * The edit the server is known to hold. Behind `editSeq` while a save is
+ * scheduled or in flight, when the server would count the layout it holds
+ * rather than the one on screen.
+ */
+let storedEditSeq = 0;
+/**
+ * Bumped per count, and by every edit, so a count read for a layout or sweep
+ * that is no longer on screen is not applied.
+ */
+let previewSeq = 0;
 
 function scheduleSave(next) {
   // The one place the layout is frozen for the duration of a run, and it is
@@ -234,8 +245,10 @@ function setUnfiled(name) {
 }
 
 function scheduleWrite(patch) {
-  // The count on the bar now describes a layout nobody is looking at.
+  // The count on the bar now describes a layout nobody is looking at, and so
+  // does a count still being read: dropped, so it cannot land and clear this.
   countStale.value = true;
+  dropCount();
   editSeq += 1;
   const seq = editSeq;
   window.clearTimeout(saveTimer);
@@ -256,6 +269,7 @@ async function save(next, seq = ++editSeq) {
     // A newer edit is already queued: applying this response would snap the
     // builder back to the layout the owner has moved on from.
     if (seq !== editSeq) return;
+    storedEditSeq = seq;
     applySettings(body);
     await refreshPreview();
   } catch (err) {
@@ -265,6 +279,8 @@ async function save(next, seq = ++editSeq) {
     // recorded. Re-read rather than leave it showing a layout that was refused.
     try {
       applySettings(await getLayoutSettings());
+      // The builder now shows the layout the server holds, so it can be counted.
+      if (seq === editSeq) storedEditSeq = seq;
     } catch {
       // Already covered by the error above.
     }
@@ -452,23 +468,45 @@ const canMove = computed(
 );
 
 /**
+ * Drop the count in flight, if any. Its answer is for a layout or sweep that is
+ * no longer on screen, so it must neither land nor be what `previewing` waits on.
+ */
+function dropCount() {
+  previewSeq += 1;
+  previewing.value = false;
+}
+
+/**
  * Re-read the plan. **Never touches `lastRun`.** Its `batchId` is the only
  * route back to a move that has already happened, and a re-count is not a
  * reason to throw one away.
  */
 async function refreshPreview() {
+  dropCount();
+  const seq = previewSeq;
   if (!isOn.value) {
     preview.value = null;
     countStale.value = false;
     return;
   }
+  // The layout on screen is not saved yet, so the server would count the one it
+  // holds. The count stays stale; the save counts again when it lands.
+  if (storedEditSeq !== editSeq) return;
   previewing.value = true;
   try {
-    preview.value = await getLayoutMigrationPreview({
+    const plan = await getLayoutMigrationPreview({
       sweepUnfiled: sweepUnfiled.value,
     });
+    // A newer count was asked for, or an edit dropped this one: applying it
+    // would put a number beside the verb for a layout or sweep not on screen.
+    if (seq !== previewSeq) return;
+    preview.value = plan;
     countStale.value = false;
   } catch (err) {
+    if (seq !== previewSeq) {
+      console.warn("Dropped a failed layout count that was superseded:", err);
+      return;
+    }
     preview.value = null;
     // Only when the run has not already said something more specific: "the
     // move stopped part way, press Move again" is what the owner has to act
@@ -478,7 +516,7 @@ async function refreshPreview() {
         errorDetail(err) || err?.message || "Could not count what would move.";
     }
   } finally {
-    previewing.value = false;
+    if (seq === previewSeq) previewing.value = false;
   }
 }
 
