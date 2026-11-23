@@ -12,38 +12,15 @@
 // picture now occupies that slot: the tagged card keeps its stale tags (no
 // indicator) and an unrelated card is corrupted with someone else's data.
 //
-// ImageGrid.vue (~7.4k lines) is impractical to mount, so this reproduces the
-// write-back verbatim. Keep in sync with ImageGrid.vue's fetchThumbnailsBatch.
+// fetchThumbnailsBatch hands its rows to writeThumbnailBatch, tested here
+// directly; ImageGridThumbnailVersion.test.js covers the batch end to end.
 
 import { describe, it, expect } from "vitest";
+import { writeThumbnailBatch } from "../../utils/thumbnailWriteback.js";
 
-// Verbatim copy of the write-back loop, with `byIdentity` toggling the fix so the
-// test can prove the positional version is genuinely broken.
-function writeBack(allGridImages, gridImages, start, byIdentity) {
-  const movedIndexById = new Map();
-  if (byIdentity) {
-    for (let i = 0; i < allGridImages.length; i += 1) {
-      const existingId = allGridImages[i]?.id;
-      if (existingId == null) continue;
-      const key = String(existingId);
-      if (!movedIndexById.has(key)) movedIndexById.set(key, i);
-    }
-  }
-  for (let i = 0; i < gridImages.length; i++) {
-    const img = gridImages[i];
-    if (img.id == null) continue;
-    let targetIndex = start + i;
-    if (byIdentity) {
-      if (String(allGridImages[targetIndex]?.id) !== String(img.id)) {
-        const moved = movedIndexById.get(String(img.id));
-        if (moved === undefined) continue;
-        targetIndex = moved;
-      }
-    }
-    img.idx = targetIndex;
-    allGridImages[targetIndex] = img;
-  }
-  return allGridImages;
+function writeBack(grid, batch, start) {
+  writeThumbnailBatch(grid, batch, start);
+  return grid;
 }
 
 // The grid as it looked when the batch was snapshotted.
@@ -74,14 +51,29 @@ function gridAfterReposition() {
   ];
 }
 
+/** `rows`, behind a proxy that records every slot read. */
+function watchedGrid(rows) {
+  const reads = [];
+  const grid = new Proxy(rows, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) reads.push(Number(key));
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  return { grid, reads };
+}
+
+function pictures(count) {
+  return Array.from({ length: count }, (_, i) => ({ id: i + 1, idx: i }));
+}
+
+function answered(rows) {
+  return rows.map((row) => ({ ...row, thumbnail: `test-thumb-${row.id}` }));
+}
+
 describe("thumbnail batch write-back", () => {
   it("lands the problem indicator on the card that moved", () => {
-    const result = writeBack(
-      gridAfterReposition(),
-      batchResponse(),
-      0,
-      true,
-    );
+    const result = writeBack(gridAfterReposition(), batchResponse(), 0);
     const byId = Object.fromEntries(result.map((img) => [img.id, img]));
     expect(byId[2].penalised_tags).toEqual(["bad anatomy"]);
     // And nobody else was given picture 2's tags.
@@ -90,27 +82,108 @@ describe("thumbnail batch write-back", () => {
   });
 
   it("keeps positional behaviour when nothing moved", () => {
-    const result = writeBack(initialGrid(), batchResponse(), 0, true);
+    const result = writeBack(initialGrid(), batchResponse(), 0);
     expect(result.map((img) => img.id)).toEqual([1, 2, 3]);
     expect(result[1].penalised_tags).toEqual(["bad anatomy"]);
     expect(result.map((img) => img.idx)).toEqual([0, 1, 2]);
   });
 
-  it("positional write-back silently undoes the reposition", () => {
+  it("keeps a reposition made while the batch was out", () => {
     const before = gridAfterReposition().map((img) => img.id);
     expect(before).toEqual([1, 3, 2]);
 
-    const result = writeBack(
-      gridAfterReposition(),
-      batchResponse(),
+    const result = writeBack(gridAfterReposition(), batchResponse(), 0);
+
+    // Writing the pre-move snapshot back by slot reverts the grid to the order
+    // the batch was built against, so the card the user just tagged jumps back
+    // to where it was; merging by slot instead hands each card a neighbour's
+    // fields.
+    expect(result.map((img) => img.id)).toEqual([1, 3, 2]);
+    expect(result.map((img) => img.penalised_tags)).toEqual([
+      [],
+      [],
+      ["bad anatomy"],
+    ]);
+  });
+
+  it("skips a picture that left the grid while the batch was out", () => {
+    // Sliced from [1, 2, 3]; picture 2 has since collapsed into a stack.
+    const card3 = { id: 3, penalised_tags: [] };
+    const grid = [{ id: 1, penalised_tags: [] }, card3];
+    const written = writeThumbnailBatch(grid, batchResponse().slice(0, 2), 0);
+
+    expect(written.map(({ row }) => row.id)).toEqual([1]);
+    expect(grid[1]).toBe(card3);
+  });
+
+  it("never looks past the batch's own slots when nothing moved", () => {
+    const { grid, reads } = watchedGrid(pictures(1000));
+    const batch = answered(pictures(1000).slice(100, 150));
+
+    const written = writeThumbnailBatch(grid, batch, 100);
+
+    expect(written).toHaveLength(50);
+    expect(reads.filter((slot) => slot < 100 || slot >= 150)).toEqual([]);
+  });
+
+  it("scans the grid once however many rows of the batch moved", () => {
+    const rows = pictures(1000);
+    const batch = answered(rows.slice(0, 10));
+    // Three of the batch's pictures were repositioned to the end of the grid.
+    const movedIds = new Set([2, 5, 8]);
+    const reordered = [
+      ...rows.filter((row) => !movedIds.has(row.id)),
+      ...rows.filter((row) => movedIds.has(row.id)),
+    ];
+    const { grid, reads } = watchedGrid(reordered);
+
+    writeThumbnailBatch(grid, batch, 0);
+
+    // Slot 500 is neither in the batch's window nor where a moved row landed:
+    // only a scan of the whole grid reads it.
+    expect(reads.filter((slot) => slot === 500)).toHaveLength(1);
+    expect(grid.slice(997).map((card) => card.thumbnail)).toEqual([
+      "test-thumb-2",
+      "test-thumb-5",
+      "test-thumb-8",
+    ]);
+  });
+
+  it("lands a moved row on the first card with its id", () => {
+    // An expanded stack repeats its leader's id on a member row.
+    const grid = [{ id: 9 }, { id: 2 }, { id: 7 }, { id: 2 }];
+    writeThumbnailBatch(grid, [{ id: 2, thumbnail: "test-thumb-2" }], 0);
+
+    expect(grid[1].thumbnail).toBe("test-thumb-2");
+    expect(grid[3].thumbnail).toBeUndefined();
+  });
+
+  it("skips a row that was still a placeholder when sliced", () => {
+    const placeholder = { id: null, idx: 0 };
+    const grid = [placeholder];
+    const written = writeThumbnailBatch(
+      grid,
+      [{ id: null, idx: 0, thumbnail: null, faces: [] }],
       0,
-      false,
     );
 
-    // Every slot in the window is overwritten from the pre-move snapshot, so the
-    // grid reverts to the order the batch was built against and the card the user
-    // just tagged jumps back to where it was. Writing by identity preserves the
-    // move (asserted above).
-    expect(result.map((img) => img.id)).toEqual([1, 2, 3]);
+    expect(written).toEqual([]);
+    expect(grid[0]).toBe(placeholder);
+  });
+
+  it("merges only the batch's fields into the card as it is now", () => {
+    // Rated while the batch was out; the batch's copy predates the click.
+    const grid = [{ id: 1, rating: 4, thumbnail: "test-thumb-old" }];
+    writeThumbnailBatch(
+      grid,
+      [{ id: 1, rating: 2, thumbnail: null, penalised_tags: ["test-tag"] }],
+      0,
+    );
+
+    expect(grid[0].rating).toBe(4);
+    expect(grid[0].penalised_tags).toEqual(["test-tag"]);
+    // No URL in the answer: the card keeps the one it has.
+    expect(grid[0].thumbnail).toBe("test-thumb-old");
+    expect(grid[0].score).toBe(0);
   });
 });

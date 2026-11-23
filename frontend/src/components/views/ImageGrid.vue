@@ -1341,6 +1341,7 @@ import { useScopedNotice } from "../../composables/useScopedNotice";
 import { buildPurgeBadge } from "../../utils/retention.js";
 import { buildLockedDeleteMessage } from "../../utils/lockedDelete.js";
 import { buildLibraryMoveMessage } from "../../utils/libraryMove.js";
+import { writeThumbnailBatch } from "../../utils/thumbnailWriteback.js";
 import {
   cutFaceSuggestions,
   referenceFaceCount,
@@ -2523,7 +2524,7 @@ function completeSmartScoreProgress(loadId, measuredDurationMs, wasSuccessful) {
   }
   // Deliberately not "failed". This branch is reached for a superseded fetch
   // as often as for a real error (useGridFetch passes wasSuccessful false
-  // whenever `lastRequestId` has moved on), and announcing a failure every
+  // whenever its load epoch has moved on), and announcing a failure every
   // time a user re-sorts quickly is a worse lie than saying nothing.
   smartScoreProgress.status = "idle";
   smartScoreProgress.visible = false;
@@ -2663,7 +2664,10 @@ onMounted(() => {
           !Array.isArray(allGridImages.value) ||
           allGridImages.value.length === 0
         ) {
-          fetchAllGridImages().then(() => {
+          // The first load only needs the view loaded, not re-read: it shares
+          // a load already running for the view and is skipped if the view
+          // loaded moments ago.
+          fetchAllGridImages({ join: true }).then(() => {
             updateVisibleThumbnails();
           });
         }
@@ -7657,32 +7661,31 @@ watch(
 // ============================================================
 // MEDIA FILTERING + EMPTY STATE
 // ============================================================
-function filterImagesByMediaType(images) {
-  let filtered = images;
-  if (filterStore.mediaTypeFilter === "images") {
-    filtered = filtered.filter((img) => {
-      if (!img) return false;
-      const candidates = [img.name, img.id, img.format]
-        .filter(Boolean)
-        .map((v) => (typeof v === "string" ? v : ""));
-      return candidates.some((val) => isSupportedImageFile(val));
-    });
-  } else if (filterStore.mediaTypeFilter === "videos") {
-    filtered = filtered.filter((img) => {
-      if (!img) return false;
-      const candidates = [img.name, img.id, img.format]
-        .filter(Boolean)
-        .map((v) => (typeof v === "string" ? v : ""));
-      return candidates.some((val) => isSupportedVideoFile(val));
-    });
-  }
-  return filtered;
+function rowMatchesMedia(img, accept) {
+  const candidates = [img.name, img.id, img.format]
+    .filter(Boolean)
+    .map((v) => (typeof v === "string" ? v : ""));
+  return candidates.some((val) => accept(val));
 }
 
-const filteredGridCount = computed(() => {
-  if (!allGridImages.value) return 0;
-  return filterImagesByMediaType(allGridImages.value).length;
+// The grid narrowed to the Images/Videos filter: filtered once per change of
+// the grid or the filter, never per scroll. "All" passes the grid through as
+// is. A placeholder (a slot the stream has not filled yet, `id == null`) is
+// kept: the stream is already narrowed by format on the server, and keeping it
+// leaves every row at its `idx`, the slot the render window and the card
+// layout both index by.
+const mediaFilteredGridImages = computed(() => {
+  const images = allGridImages.value;
+  if (!images) return [];
+  const mode = filterStore.mediaTypeFilter;
+  if (mode !== "images" && mode !== "videos") return images;
+  const accept = mode === "images" ? isSupportedImageFile : isSupportedVideoFile;
+  return images.filter(
+    (img) => img && (img.id == null || rowMatchesMedia(img, accept)),
+  );
 });
+
+const filteredGridCount = computed(() => mediaFilteredGridImages.value.length);
 
 const EMPTY_STATE_DELAY_MS = 350;
 const emptyStateDelayPassed = ref(false);
@@ -7920,9 +7923,7 @@ const gridImagesToRender = computed(() => {
     console.warn("allGridImages is undefined");
     return [];
   }
-
-  const filtered = filterImagesByMediaType(allGridImages.value);
-  return filtered.slice(renderStart.value, renderEnd.value);
+  return mediaFilteredGridImages.value.slice(renderStart.value, renderEnd.value);
 });
 
 const imageCardRefs = new Map();
@@ -7965,20 +7966,6 @@ function handleImageCardFocus(image) {
 // ============================================================
 // THUMBNAIL BATCH FETCH
 // ============================================================
-// The card fields a thumbnail batch is the authority for; everything else on a
-// card belongs to whoever last wrote it.
-const THUMBNAIL_BATCH_FIELDS = [
-  "thumbnail",
-  "thumbnail_width",
-  "thumbnail_height",
-  "square_crop_x",
-  "square_crop_y",
-  "square_crop_side",
-  "faces",
-  "detections",
-  "penalised_tags",
-];
-
 async function fetchThumbnailsBatch(start, end, meta = {}) {
   if (start === undefined || start === null) {
     start = renderStart.value;
@@ -8148,62 +8135,18 @@ async function fetchThumbnailsBatch(start, end, meta = {}) {
     if (requestEpoch !== thumbnailRequestEpoch.value) {
       return;
     }
-    // id → current slot, for results whose slot moved while the batch was in
-    // flight. Built once per batch (not per image) so the write-back stays linear.
-    // First occurrence wins: an expanded stack can repeat a picture id, and the
-    // leader row is the one a positional write would have targeted.
-    const movedIndexById = new Map();
-    for (let i = 0; i < allGridImages.value.length; i += 1) {
-      const existingId = allGridImages.value[i]?.id;
-      if (existingId == null) continue;
-      const key = String(existingId);
-      if (!movedIndexById.has(key)) movedIndexById.set(key, i);
-    }
-    for (let i = 0; i < gridImages.length; i++) {
-      const img = gridImages[i];
-      // Skip null-id slots: the snapshot was taken before the grid was fully
-      // populated and a concurrent BG batch may have since written real data
-      // into this slot. Writing a stale null-id object would wipe that data.
-      if (img.id == null) {
-        continue;
-      }
-      // Resolve the picture's CURRENT slot rather than trusting start + i.
-      // gridImages was sliced out of allGridImages before the await above, and a
-      // smart-score reposition (repositionImageBySmartScore → _spliceAndReinsert)
-      // re-orders allGridImages *without* bumping thumbnailRequestEpoch, so the
-      // epoch guard cannot catch it. Adding a penalised tag does exactly that: the
-      // card moves, and a positional write-back would drop this refreshed
-      // penalised_tags payload onto whichever picture now occupies the slot -
-      // leaving the just-tagged card with stale data (no problem indicator) and
-      // corrupting an unrelated card. The original index is still preferred when it
-      // holds the right picture, so the common no-movement case is unchanged.
-      let targetIndex = start + i;
-      if (String(allGridImages.value[targetIndex]?.id) !== String(img.id)) {
-        const moved = movedIndexById.get(String(img.id));
-        if (moved === undefined) {
-          // Picture left the grid entirely (filtered out, or collapsed into a
-          // stack) - nothing to update.
-          continue;
-        }
-        targetIndex = moved;
-      }
-      img.idx = targetIndex;
-      // Merge what the batch owns into the card as it is NOW, rather than put
-      // back the copy taken before the await: anything that changed while the
-      // request was out (a star click, a tag, a stack count) lives on the
-      // current card, and writing the stale copy over it reverted the rating
-      // just made with the backend already holding the new one.
-      const currentCard = allGridImages.value[targetIndex];
-      const merged = { ...currentCard, idx: targetIndex };
-      for (const field of THUMBNAIL_BATCH_FIELDS) merged[field] = img[field];
-      // A batch that carried no URL keeps what the card has now.
-      merged.thumbnail = img.thumbnail ?? currentCard?.thumbnail ?? null;
-      merged.score = currentCard?.score ?? 0;
-      allGridImages.value[targetIndex] = merged;
-      if (img.thumbnail) {
-        clearThumbnailRetry(img.id);
+    // By identity, not by slot: gridImages was sliced before the await above,
+    // and a smart-score reposition (repositionImageBySmartScore →
+    // _spliceAndReinsert) re-orders allGridImages *without* bumping
+    // thumbnailRequestEpoch, so the epoch guard cannot see the move. Adding a
+    // penalised tag does exactly that; a positional write would land the
+    // refreshed penalised_tags on whichever picture now holds the slot.
+    const written = writeThumbnailBatch(allGridImages.value, gridImages, start);
+    for (const { row, slot } of written) {
+      if (row.thumbnail) {
+        clearThumbnailRetry(row.id);
       } else {
-        scheduleThumbnailRetry(img.id, targetIndex, requestEpoch);
+        scheduleThumbnailRetry(row.id, slot, requestEpoch);
       }
     }
     loadedRanges.value.push([start, end]);
