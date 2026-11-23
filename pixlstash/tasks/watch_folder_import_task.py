@@ -18,6 +18,7 @@ from pixlstash.stacking import (
     parse_stack_tags_from_filename,
     parse_workflow_tag_from_filename,
 )
+from pixlstash.services import import_dedup_service
 from pixlstash.services.layout_move_service import resolve_placement
 from pixlstash.tasks.base_task import BaseTask
 
@@ -83,6 +84,7 @@ class WatchFolderImportTask(BaseTask):
 
             try:
                 pixel_sha = ImageUtils.calculate_hash_from_file_path(file_path)
+                size_bytes = os.path.getsize(file_path)
             except Exception as exc:
                 logger.warning(
                     "Failed to hash watched file %s: %s (will retry on next scan)",
@@ -93,14 +95,40 @@ class WatchFolderImportTask(BaseTask):
                 self._processed_count += 1
                 continue
 
-            def find_existing(session: Session, hash_value: str):
-                return session.exec(
-                    select(Picture).where(Picture.pixel_sha == hash_value)
-                ).first()
-
-            existing = self._db.run_task(find_existing, pixel_sha)
-            if existing:
-                logger.debug("Already have picture with sha %s, skipping", pixel_sha)
+            # The sampled hash only narrows the search: a file is skipped only
+            # when a picture has the same size and the same full content. A
+            # match in the Scrapheap is skipped too and left there, because a
+            # file kept in a watch folder is offered again after every restart
+            # and restoring it each time would undo the owner's cleanup.
+            candidates = self._db.run_task(
+                import_dedup_service.load_match_candidates_in_session,
+                [(pixel_sha, size_bytes)],
+            )
+            existing = None
+            if candidates:
+                try:
+                    full_sha = ImageUtils.calculate_full_hash_from_file_path(file_path)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to read watched file %s in full: %s "
+                        "(will retry on next scan)",
+                        file_path,
+                        exc,
+                    )
+                    failed_paths.append(file_path)
+                    self._processed_count += 1
+                    continue
+                existing = import_dedup_service.confirmed_match(
+                    candidates,
+                    (pixel_sha, size_bytes, full_sha),
+                    self._db.image_root,
+                )
+            if existing is not None:
+                logger.debug(
+                    "Already have picture %d with the content of %s, skipping",
+                    existing.id,
+                    file_path,
+                )
                 self._processed_count += 1
                 continue
 
