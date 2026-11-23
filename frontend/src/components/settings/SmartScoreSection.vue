@@ -1,7 +1,8 @@
 <script setup>
-import { onMounted, ref, watch } from "vue";
+import { onWatcherCleanup, reactive, ref, watch } from "vue";
 import { getUserConfig, patchUserConfig } from "../../api/config";
 import { useNoticeStore } from "../../stores/useNoticeStore";
+import { useUserPrefsStore } from "../../stores/useUserPrefsStore";
 import { VSwitch } from "vuetify/components";
 import SettingsSection from "./SettingsSection.vue";
 import SettingsChipGrid from "./SettingsChipGrid.vue";
@@ -20,6 +21,8 @@ const emit = defineEmits(["update:hidden-tags", "update:apply-tag-filter"]);
 // save failure raises a notice as well as the inline error. The notice is a
 // no-op on screen until the maintainer's design pass mounts the notice host.
 const noticeStore = useNoticeStore();
+// Owns the penalised-tag edit queue, which outlives this pane.
+const prefs = useUserPrefsStore();
 
 // ── Tag filter (hidden tags) - moved here from Behaviour ──────────────────────
 const hiddenTags = ref([]);
@@ -100,11 +103,21 @@ async function setApplyTagFilter(value) {
   }
 }
 
+// The list on screen is always the last one the server accepted: a read that
+// was applied, or an edit whose PATCH succeeded. Nothing is shown before then.
 const smartScorePenalisedTags = ref([]);
 const smartScoreTagInput = ref("");
-const smartScoreTagsLoading = ref(false);
 const smartScoreTagsError = ref("");
 const smartScoreTagsSuccess = ref("");
+// Chips whose removal is queued or being saved; their X shows the spinner.
+const removingTags = reactive(new Set());
+// False until a read or an edit has given the list a known value, so an edit
+// made before the first read lands cannot save a list built from nothing.
+let penalisedLoaded = false;
+// Bumped when a read starts and when an edit is accepted. A read applies its
+// list only if nothing newer has happened since it started.
+let listEpoch = 0;
+let successTimer = null;
 
 const smartScoreImportanceOptions = [
   { value: 1, label: "Mild" },
@@ -163,84 +176,112 @@ function serializeSmartScoreTags(entries) {
   return { d, payload };
 }
 
-async function fetchData() {
-  smartScoreTagsLoading.value = true;
+function acceptPenalisedTags(tags) {
+  smartScorePenalisedTags.value = tags;
+  penalisedLoaded = true;
+}
+
+async function fetchData(signal) {
+  const epoch = ++listEpoch;
   smartScoreTagsError.value = "";
   smartScoreTagInput.value = "";
   smartScoreTagsSuccess.value = "";
   try {
-    const config = await getUserConfig();
-    smartScorePenalisedTags.value = SmartScoreTags(
-      config?.smart_score_penalised_tags,
-    );
+    // An edit still saving, perhaps from a pane closed before this one
+    // opened, would make this read stale: read the list it leaves instead.
+    await prefs.penalisedEditsSettled();
+    if (signal.aborted) return;
+    const config = await getUserConfig({ signal });
+    // Closed (or reopened) while this read was out: a newer read owns the pane.
+    if (signal.aborted) return;
+    // An edit accepted since this read started is newer than what it returned.
+    if (epoch === listEpoch) {
+      acceptPenalisedTags(SmartScoreTags(config?.smart_score_penalised_tags));
+    }
     hiddenTags.value = normalizeHiddenTags(config?.hidden_tags);
     emit("update:hidden-tags", hiddenTags.value);
     applyTagFilter.value = Boolean(config?.apply_tag_filter);
     emit("update:apply-tag-filter", applyTagFilter.value);
-  } catch {
+  } catch (e) {
+    if (signal.aborted) return;
+    console.error("Failed to load smart score settings:", e);
     smartScoreTagsError.value = "Failed to load smart score settings.";
-  } finally {
-    smartScoreTagsLoading.value = false;
   }
 }
 
-async function saveSmartScoreTags(nextTags) {
-  smartScoreTagsLoading.value = true;
-  smartScoreTagsError.value = "";
-  smartScoreTagsSuccess.value = "";
+function showSaved() {
+  smartScoreTagsSuccess.value = "Saved.";
+  clearTimeout(successTimer);
+  successTimer = setTimeout(() => {
+    smartScoreTagsSuccess.value = "";
+  }, 2000);
+}
+
+// Runs one queued edit. `edit` maps the last accepted list to the next one.
+// It never rejects, so one failed edit does not stop the edits behind it.
+async function runPenalisedEdit(edit) {
   try {
-    const { d, payload } = serializeSmartScoreTags(nextTags);
+    if (!penalisedLoaded) {
+      const config = await getUserConfig();
+      acceptPenalisedTags(SmartScoreTags(config?.smart_score_penalised_tags));
+    }
+    const { d, payload } = serializeSmartScoreTags(
+      edit(smartScorePenalisedTags.value),
+    );
     await patchUserConfig({ smart_score_penalised_tags: payload });
-    smartScorePenalisedTags.value = d;
-    smartScoreTagsSuccess.value = "Saved.";
+    listEpoch += 1;
+    acceptPenalisedTags(d);
+    showSaved();
   } catch (e) {
+    // The list stays at the last accepted value: nothing was shown early.
     smartScoreTagsError.value =
       errorDetail(e) || "Failed to update smart score tags.";
     noticeStore.error(smartScoreTagsError.value);
-  } finally {
-    smartScoreTagsLoading.value = false;
-    if (smartScoreTagsSuccess.value) {
-      setTimeout(() => {
-        smartScoreTagsSuccess.value = "";
-      }, 2000);
-    }
   }
 }
 
-async function addSmartScoreTag() {
+function queuePenalisedEdit(edit) {
+  // A new click starts a new outcome; an earlier failure stays on screen
+  // until then, because that edit really was not saved.
+  smartScoreTagsError.value = "";
+  smartScoreTagsSuccess.value = "";
+  return prefs.queuePenalisedEdit(() => runPenalisedEdit(edit));
+}
+
+function addSmartScoreTag() {
   const trimmed = smartScoreTagInput.value.trim().toLowerCase();
   if (!trimmed) return;
-  const next = SmartScoreTags([
-    ...smartScorePenalisedTags.value,
-    { tag: trimmed, weight: 3 },
-  ]);
   smartScoreTagInput.value = "";
-  await saveSmartScoreTags(next);
+  return queuePenalisedEdit((list) => [...list, { tag: trimmed, weight: 3 }]);
 }
 
-async function removeSmartScoreTag(tag) {
-  const next = SmartScoreTags(
-    smartScorePenalisedTags.value.filter((t) => t.tag !== tag),
-  );
-  await saveSmartScoreTags(next);
+function removeSmartScoreTag(tag) {
+  removingTags.add(tag);
+  return queuePenalisedEdit((list) =>
+    list.filter((entry) => entry.tag !== tag),
+  ).finally(() => removingTags.delete(tag));
 }
 
-async function updateSmartScoreTagWeight(tag, weight) {
-  const next = SmartScoreTags(
-    smartScorePenalisedTags.value.map((entry) =>
+function updateSmartScoreTagWeight(tag, weight) {
+  return queuePenalisedEdit((list) =>
+    list.map((entry) =>
       entry.tag === tag ? { ...entry, weight: clampImportance(weight) } : entry,
     ),
   );
-  await saveSmartScoreTags(next);
 }
 
-onMounted(fetchData);
-
+// The dialog's content is unmounted after it closes and mounted again with
+// `open` already true, so the read belongs to an immediate watcher. Closing,
+// or reopening during the close animation, aborts the read in flight.
 watch(
   () => props.open,
   (isOpen) => {
-    if (isOpen) fetchData();
+    if (!isOpen) return;
+    const controller = new AbortController();
+    onWatcherCleanup(() => controller.abort());
+    fetchData(controller.signal);
   },
+  { immediate: true },
 );
 </script>
 
@@ -257,6 +298,7 @@ watch(
           v-for="entry in smartScorePenalisedTags"
           :key="entry.tag"
           :label="entry.tag"
+          :busy="removingTags.has(entry.tag)"
           @remove="removeSmartScoreTag(entry.tag)"
         >
           <div class="smart-score-importance">
@@ -264,7 +306,7 @@ watch(
               compact
               :model-value="entry.weight"
               :options="smartScoreImportanceOptions"
-              :disabled="smartScoreTagsLoading"
+              :disabled="removingTags.has(entry.tag)"
               @update:model-value="
                 (value) => updateSmartScoreTagWeight(entry.tag, value)
               "

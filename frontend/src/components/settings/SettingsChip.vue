@@ -13,10 +13,14 @@
       type="button"
       class="s-chip__remove"
       aria-label="Remove"
+      :disabled="busy"
+      :aria-busy="busy ? 'true' : undefined"
       @click="emit('remove')"
     >
       <Tooltip text="Remove" activator="parent" :describe="false" />
-      <v-icon size="15">mdi-close</v-icon>
+      <v-icon size="15" :class="{ 'mdi-spin': busy }">{{
+        busy ? "mdi-loading" : "mdi-close"
+      }}</v-icon>
     </button>
   </div>
 </template>
@@ -29,6 +33,9 @@ defineProps({
   label: { type: String, default: "" },
   meta: { type: String, default: "" },
   metaColor: { type: String, default: "" },
+  // The chip's removal is being saved. The X becomes the spinner and cannot be
+  // pressed again until the save settles; the parent clears it either way.
+  busy: { type: Boolean, default: false },
 });
 
 const emit = defineEmits(["remove"]);
@@ -71,8 +78,24 @@ const emit = defineEmits(["remove"]);
   justify-content: center;
 }
 
-.s-chip__remove:hover {
+.s-chip__remove:hover:not(:disabled) {
   color: rgb(var(--v-theme-surface-error));
   background: var(--hover-wash);
+}
+
+/* Pending, not disabled: the spinner is what tells the user the click landed,
+   so the button does not fade, and `progress` says the rest of the pane is
+   still live. */
+.s-chip__remove:disabled {
+  cursor: progress;
+}
+
+/* The spinner keeps turning under reduced motion: the global reset would
+   freeze it into a broken ring. @mdi/font animates `::before`. */
+@media (prefers-reduced-motion: reduce) {
+  .s-chip__remove .mdi-spin::before {
+    animation-duration: 2s !important;
+    animation-iteration-count: infinite !important;
+  }
 }
 </style>

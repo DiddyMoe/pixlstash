@@ -23,6 +23,15 @@ describe("api/config", () => {
     expect(result).toEqual({ hidden_tags: ["a"] });
   });
 
+  it("getUserConfig passes an abort signal to the request", async () => {
+    apiClient.get.mockResolvedValue({ data: {} });
+    const controller = new AbortController();
+    await getUserConfig({ signal: controller.signal });
+    expect(apiClient.get).toHaveBeenCalledWith("/users/me/config", {
+      signal: controller.signal,
+    });
+  });
+
   it("patchUserConfig PATCHes the partial and returns the body", async () => {
     apiClient.patch.mockResolvedValue({ data: { ok: true } });
     const partial = { apply_tag_filter: true };
