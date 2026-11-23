@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Union
 from fastapi import HTTPException
 from sqlalchemy import event as sa_event
 from sqlalchemy import or_
+from sqlalchemy.orm import defer
 from sqlmodel import Session, select
 
 from pixlstash.db_models import (
@@ -219,6 +220,19 @@ class OperationLogError(Exception):
 # State capture
 # ---------------------------------------------------------------------------
 
+# Large Picture columns no facet reads. The capture runs twice per recorded
+# operation over every affected picture, on the writer thread, so the picture
+# SELECT leaves them out. ``defer`` rather than ``load_only``: mutation code in
+# the same session may read any other column, and ``load_only`` would turn each
+# such read into a lazy SELECT per picture.
+_CAPTURE_DEFERRED_COLUMNS = (
+    Picture.text_embedding,
+    Picture.image_embedding,
+    Picture.ocr_text,
+    Picture.ocr_words,
+    Picture.likeness_parameters,
+)
+
 
 def _normalize_ids(picture_ids: Iterable[Any]) -> list[int]:
     """Sorted, de-duplicated, positive int ids; non-numeric entries dropped."""
@@ -298,7 +312,11 @@ def capture_state_in_session(session: Session, picture_ids) -> dict[str, dict]:
         session, ids, name="_pixlstash_operation_picture_ids"
     )
     state: dict[str, dict] = {}
-    pictures = session.exec(select(Picture).where(Picture.id.in_(picture_scope))).all()
+    pictures = session.exec(
+        select(Picture)
+        .options(*(defer(column) for column in _CAPTURE_DEFERRED_COLUMNS))
+        .where(Picture.id.in_(picture_scope))
+    ).all()
     for picture in pictures:
         if picture.id is None:
             continue

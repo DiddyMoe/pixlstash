@@ -1516,6 +1516,35 @@ def test_a_second_change_pushes_the_check_out_again(stamped):
     )
 
 
+def test_a_picture_loaded_before_the_stamp_can_still_clear_it(stamped):
+    """The marker stamps through Core, so it must expire the loaded picture.
+
+    Otherwise that picture keeps its pre-stamp ``None`` in memory, the engine's
+    ``picture.layout_check_due_at = None`` is no change at all to the ORM, no
+    UPDATE is issued, and the stamp it meant to clear stays due.
+    """
+    session = stamped["session"]
+    picture = session.get(Picture, stamped["picture_id"])
+    assert picture.layout_check_due_at is None
+    session.add(
+        PictureProjectMember(
+            picture_id=stamped["picture_id"], project_id=stamped["other_project_id"]
+        )
+    )
+    session.flush()
+    stamp = session.exec(
+        select(Picture.layout_check_due_at).where(Picture.id == stamped["picture_id"])
+    ).one()
+    assert stamp is not None, "the membership change stamped nothing"
+
+    picture.layout_check_due_at = None
+    session.add(picture)
+    session.commit()
+    assert _due(session, stamped["picture_id"]) is None, (
+        "clearing the stamp on a picture loaded before it was written left it due"
+    )
+
+
 def test_nothing_is_stamped_in_a_library_with_no_layout(stamped):
     session = stamped["session"]
     settings = session.exec(select(LibrarySettings)).first()

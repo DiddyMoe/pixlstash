@@ -1787,7 +1787,7 @@ class Vault:
                 session.exec(
                     update(Picture)
                     .where(Picture.id.in_(present))
-                    .values(description=sentinel)
+                    .values(description=sentinel, metadata_hash=None)
                 )
                 found.extend(present)
             session.commit()
