@@ -1481,8 +1481,8 @@ import {
   isRangeOverlap,
   normalizePluginProgressMessage,
   rangeCovers,
-  sleep,
 } from "../../utils/utils.js";
+import { pollUntilSettled } from "../../utils/pollUntilSettled";
 import {
   isLockedRefusal,
   lockedSets,
@@ -9071,6 +9071,97 @@ function exportPictureParams() {
   return params.toString();
 }
 
+// An export is followed until the server says it is over, however long that
+// takes (see utils/pollUntilSettled.js): a big one runs well past ten minutes.
+const EXPORT_STILL_WORKING_MS = 10 * 60 * 1000;
+// One controller per export being followed; Abort and unmount end them all, as
+// the one cancel flag always did.
+const exportFollowers = new Set();
+
+function showExportStatus(body) {
+  exportProgress.status = body?.status || "in_progress";
+  exportProgress.processed = body?.processed || 0;
+  exportProgress.total = body?.total || 0;
+}
+
+/**
+ * Poll an export's status until the server reports it completed or failed, or
+ * answers that it no longer knows it, or `signal` ends the follow.
+ *
+ * The status route has no failure reason and no cancel: `status` is
+ * "in_progress" until the job sets "completed" or "failed". A status request
+ * already in flight on abort is answered and dropped, not cancelled, because
+ * getExportStatus takes no signal; no request or wait follows it.
+ *
+ * @param {string} taskId
+ * @param {AbortSignal} signal
+ * @returns {ReturnType<typeof pollUntilSettled>}
+ */
+function followExport(taskId, signal) {
+  return pollUntilSettled({
+    fetchStatus: () => getExportStatus(taskId),
+    isTerminal: (body) =>
+      body?.status === "completed" || body?.status === "failed",
+    progressOf: (body) => `${body?.processed || 0}/${body?.total || 0}`,
+    onStatus: (body, { idleMs }) => {
+      showExportStatus(body);
+      exportProgress.message =
+        idleMs >= EXPORT_STILL_WORKING_MS
+          ? "Still working on the server; no progress for 10 min"
+          : "Exporting images...";
+    },
+    onTransientError: (error, { failures }) => {
+      // Once per outage: the follow keeps asking until the server answers.
+      if (failures === 1) {
+        console.warn("Export status unreachable; asking again", taskId, error);
+      }
+      exportProgress.message = "Reconnecting to the server...";
+    },
+    signal,
+  });
+}
+
+/**
+ * Close an export the client stopped following before the server said it was
+ * over. Neither way is a failure: an aborted follow was Abort (the card says
+ * cancelled) or the grid closing (a notice says so); an unknown one is a
+ * definitive refusal from the status route, which leaves the export's fate
+ * unknown. Returns false for a settled follow, which the caller finishes.
+ *
+ * @param {Object} followed - what followExport resolved to.
+ * @param {string} key - the notice key of this kind of export.
+ * @param {{left: string, gone: string, refused: string}} texts - the notice
+ *   when the grid closed, when the server no longer has the export (404), and
+ *   the lead-in to the server's reason for any other refusal.
+ * @returns {boolean}
+ */
+function endUnsettledExport(followed, key, texts) {
+  if (followed.state === "aborted") {
+    if (exportProgress.cancelRequested) {
+      exportProgress.status = "cancelled";
+      exportProgress.message = "Export cancelled.";
+      exportProgress.visible = false;
+    } else {
+      noticeStore.warning(texts.left, { key });
+    }
+    return true;
+  }
+  if (followed.state === "unknown") {
+    console.warn("Lost track of an export", key, followed.error);
+    exportProgress.visible = false;
+    exportProgress.status = "idle";
+    exportProgress.message = "";
+    noticeStore.warning(
+      followed.error?.response?.status === 404
+        ? texts.gone
+        : `${texts.refused} ${errorDetail(followed.error)}`,
+      { key },
+    );
+    return true;
+  }
+  return false;
+}
+
 async function exportCurrentViewToZip(options = {}) {
   const exportType = options.exportType || "full";
   const captionMode = options.captionMode || "description";
@@ -9110,6 +9201,24 @@ async function exportCurrentViewToZip(options = {}) {
   const extraParamString = extraParams.toString();
   const exportQuery = [params, extraParamString].filter(Boolean).join("&");
 
+  const texts = {
+    left:
+      "Left the grid before the ZIP export finished, so it won't download. " +
+      "Export again to get it.",
+    gone:
+      "Lost track of this export: the server no longer has it (it restarted, " +
+      "or the library changed). Export again to download the ZIP.",
+    refused: "Lost track of this export.",
+  };
+  // Registered before the start request, so an Abort during it is honoured,
+  // and settled by the abort itself rather than by a request in flight.
+  const follower = new AbortController();
+  follower.signal.addEventListener(
+    "abort",
+    () => endUnsettledExport({ state: "aborted" }, "export-zip", texts),
+    { once: true },
+  );
+  exportFollowers.add(follower);
   try {
     exportProgress.visible = true;
     exportProgress.status = "starting";
@@ -9124,43 +9233,21 @@ async function exportCurrentViewToZip(options = {}) {
       throw new Error("Missing task_id from export response.");
     }
 
-    let downloadUrl = null;
-    const maxAttempts = 600; // 600 × 1s = 10 minute timeout; suitable for very large collections
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      if (exportProgress.cancelRequested) {
-        exportProgress.status = "cancelled";
-        exportProgress.message = "Export cancelled.";
-        exportProgress.visible = false;
-        return;
-      }
-      const statusBody = await getExportStatus(taskId);
-      const status = statusBody?.status;
-      exportProgress.status = status || "in_progress";
-      exportProgress.processed = statusBody?.processed || 0;
-      exportProgress.total = statusBody?.total || 0;
-      exportProgress.message =
-        status === "completed"
-          ? "Finalizing download..."
-          : "Exporting images...";
-      if (status === "completed") {
-        downloadUrl = statusBody?.download_url;
-        break;
-      }
-      if (status === "failed") {
-        throw new Error("Export failed on server.");
-      }
-      await sleep(1000);
+    const followed = await followExport(taskId, follower.signal);
+    // Already settled by the abort listener above.
+    if (followed.state === "aborted") return;
+    // From here on the export is the server's answer, not a follow.
+    exportFollowers.delete(follower);
+    if (endUnsettledExport(followed, "export-zip", texts)) return;
+    showExportStatus(followed.status);
+    if (followed.status?.status === "failed") {
+      throw new Error("Export failed on server.");
     }
+    exportProgress.message = "Finalizing download...";
 
-    if (exportProgress.cancelRequested) {
-      exportProgress.status = "cancelled";
-      exportProgress.message = "Export cancelled.";
-      exportProgress.visible = false;
-      return;
-    }
-
+    const downloadUrl = followed.status?.download_url;
     if (!downloadUrl) {
-      throw new Error("Export timed out waiting for ZIP.");
+      throw new Error("Export finished without a download link.");
     }
 
     const { blob, filename } = await downloadExport(downloadUrl);
@@ -9178,6 +9265,10 @@ async function exportCurrentViewToZip(options = {}) {
       exportProgress.message = "";
     }, 2000);
   } catch (e) {
+    if (follower.signal.aborted) {
+      console.warn("ZIP export request failed after it was stopped", e);
+      return;
+    }
     exportProgress.status = "failed";
     exportProgress.message = "Export failed";
     console.error("ZIP export failed", e);
@@ -9188,13 +9279,22 @@ async function exportCurrentViewToZip(options = {}) {
       exportProgress.status = "idle";
       exportProgress.message = "";
     }, 4000);
+  } finally {
+    exportFollowers.delete(follower);
   }
 }
 
 function abortExport() {
   if (!exportProgress.visible) return;
   exportProgress.cancelRequested = true;
+  for (const follower of exportFollowers) follower.abort();
 }
+
+// Leaving the grid ends the follow as well: no further status request or wait
+// for a card nobody can see.
+onUnmounted(() => {
+  for (const follower of exportFollowers) follower.abort();
+});
 
 // Local-owner counterpart to exportCurrentViewToZip (#291): writes straight
 // into a folder on this machine instead of packaging a ZIP to download, then
@@ -9241,6 +9341,27 @@ async function exportCurrentViewToFolder(options = {}) {
   const extraParamString = extraParams.toString();
   const exportQuery = [params, extraParamString].filter(Boolean).join("&");
 
+  const texts = {
+    left:
+      `Left the grid before the export to ${destination} finished. The server ` +
+      "keeps writing it there.",
+    // The server forgets a folder export once it has reported it finished, so
+    // this can also follow a lost reply to that report.
+    gone:
+      `Lost track of the export to ${destination}: the server no longer has it ` +
+      "(it restarted, or the library changed). Check that folder before " +
+      "exporting again.",
+    refused: `Lost track of the export to ${destination}.`,
+  };
+  // Registered before the start request, so an Abort during it is honoured,
+  // and settled by the abort itself rather than by a request in flight.
+  const follower = new AbortController();
+  follower.signal.addEventListener(
+    "abort",
+    () => endUnsettledExport({ state: "aborted" }, "export-folder", texts),
+    { once: true },
+  );
+  exportFollowers.add(follower);
   try {
     exportProgress.visible = true;
     exportProgress.status = "starting";
@@ -9255,42 +9376,19 @@ async function exportCurrentViewToFolder(options = {}) {
       throw new Error("Missing task_id from export response.");
     }
 
-    let completedBody = null;
-    const maxAttempts = 600; // 600 × 1s = 10 minute timeout; suitable for very large collections
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      if (exportProgress.cancelRequested) {
-        exportProgress.status = "cancelled";
-        exportProgress.message = "Export cancelled.";
-        exportProgress.visible = false;
-        return;
-      }
-      const statusBody = await getExportStatus(taskId);
-      const status = statusBody?.status;
-      exportProgress.status = status || "in_progress";
-      exportProgress.processed = statusBody?.processed || 0;
-      exportProgress.total = statusBody?.total || 0;
-      exportProgress.message =
-        status === "completed" ? "Opening folder..." : "Exporting images...";
-      if (status === "completed") {
-        completedBody = statusBody;
-        break;
-      }
-      if (status === "failed") {
-        throw new Error("Export failed on server.");
-      }
-      await sleep(1000);
+    // Ended here rather than in the catch below, whose 403/404/409 copy
+    // describes the destination and would misread a status-route refusal.
+    const followed = await followExport(taskId, follower.signal);
+    // Already settled by the abort listener above.
+    if (followed.state === "aborted") return;
+    exportFollowers.delete(follower);
+    if (endUnsettledExport(followed, "export-folder", texts)) return;
+    const completedBody = followed.status;
+    showExportStatus(completedBody);
+    if (completedBody?.status === "failed") {
+      throw new Error("Export failed on server.");
     }
-
-    if (exportProgress.cancelRequested) {
-      exportProgress.status = "cancelled";
-      exportProgress.message = "Export cancelled.";
-      exportProgress.visible = false;
-      return;
-    }
-
-    if (!completedBody) {
-      throw new Error("Export timed out.");
-    }
+    exportProgress.message = "Opening folder...";
 
     const count = exportProgress.processed;
     // The folder the picker returned, not one read back off the status route:
@@ -9318,6 +9416,10 @@ async function exportCurrentViewToFolder(options = {}) {
       exportProgress.message = "";
     }, 2000);
   } catch (e) {
+    if (follower.signal.aborted) {
+      console.warn("Folder export request failed after it was stopped", e);
+      return;
+    }
     exportProgress.status = "failed";
     exportProgress.message = "Export failed";
     console.error("Folder export failed", e);
@@ -9336,6 +9438,8 @@ async function exportCurrentViewToFolder(options = {}) {
       exportProgress.status = "idle";
       exportProgress.message = "";
     }, 4000);
+  } finally {
+    exportFollowers.delete(follower);
   }
 }
 
