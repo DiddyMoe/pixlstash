@@ -485,3 +485,77 @@ describe("emptying the scrapheap refreshes the grid", () => {
     });
   }
 });
+
+describe("stack counts while a view streams in", () => {
+  // 12,000 pictures: a 200-row first batch, a 200-row early tail, then
+  // background batches from offset 200. Row 300, in the first background
+  // batch, is a stack of two; the request at offset 5200 is held.
+  const TOTAL = 12_000;
+  function streamWithHeldBatch() {
+    let rejectLater;
+    let laterAsked = false;
+    const later = new Promise((_, reject) => {
+      rejectLater = reject;
+    });
+    apiGet.mockImplementation((url) => {
+      const u = String(url);
+      if (u.includes("/summary")) {
+        return Promise.resolve({ data: { image_count: TOTAL } });
+      }
+      if (u.includes("/pictures/count")) {
+        return Promise.resolve({ data: { count: TOTAL } });
+      }
+      if (u.includes("/pictures/stream")) {
+        const params = new URL(u, "http://test").searchParams;
+        const offset = Number(params.get("offset"));
+        const limit = Number(params.get("batch_limit"));
+        if (offset === 5200) {
+          laterAsked = true;
+          return later;
+        }
+        const pictures = Array.from({ length: limit }, (_, i) => ({
+          id: offset + i + 1,
+          name: `test-${offset + i + 1}.png`,
+          ...(offset + i === 300 ? { stack_id: 77, stack_count: 2 } : {}),
+        }));
+        return Promise.resolve({ data: { pictures } });
+      }
+      return Promise.resolve({ data: [] });
+    });
+    return { laterAsked: () => laterAsked, rejectLater: (e) => rejectLater(e) };
+  }
+
+  const lastStackStats = (wrapper) =>
+    wrapper.emitted("update:stack-stats")?.at(-1)?.[0];
+
+  it("counts a stack from a background batch before the load finishes", async () => {
+    const reads = streamWithHeldBatch();
+    const wrapper = mountGrid();
+    try {
+      await vi.waitFor(() => expect(reads.laterAsked()).toBe(true));
+      await nextTick();
+
+      expect(wrapper.vm.allGridImages[300]?.stack_count).toBe(2);
+      expect(lastStackStats(wrapper)).toEqual({ expanded: 0, total: 1 });
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it("still counts it when a later batch fails behind the lightbox", async () => {
+    const reads = streamWithHeldBatch();
+    const wrapper = mountGrid();
+    try {
+      await vi.waitFor(() => expect(reads.laterAsked()).toBe(true));
+      wrapper.vm.$.setupState.lightboxOpen = true;
+      reads.rejectLater(new Error("test-later-batch-failed"));
+      await vi.waitFor(() => expect(wrapper.vm.imagesError).toBeTruthy());
+      await nextTick();
+
+      expect(wrapper.vm.allGridImages[300]?.stack_count).toBe(2);
+      expect(lastStackStats(wrapper)).toEqual({ expanded: 0, total: 1 });
+    } finally {
+      wrapper.unmount();
+    }
+  });
+});
