@@ -12,9 +12,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import sqlmodel
-from sqlalchemy import text
+from sqlalchemy import event, text, update as sa_update
 
-from pixlstash.db_models import Picture, User
+from pixlstash.database import _compute_picture_metadata_hash
+from pixlstash.db_models import Picture, Tag, User
 from pixlstash.db_models.picture_likeness import (
     PictureLikeness,
     PictureLikenessFrontier,
@@ -75,6 +76,7 @@ def clean_db(server):
             PictureLikeness,
             PictureLikenessQueue,
             PictureLikenessFrontier,
+            Tag,
             Picture,
         ],
     )
@@ -189,6 +191,139 @@ def test_snapshot_picture_count_matches(server):
         manifest = json.load(fh)
     assert manifest["picture_count"] == 4
     assert len(manifest["picture_ids"]) == 4
+
+
+# ---------------------------------------------------------------------------
+# Hash sidecar: pictures whose metadata_hash is NULL
+# ---------------------------------------------------------------------------
+
+
+def _add_tagged_pictures(server, count: int) -> list[int]:
+    """Add ``count`` pictures with two tags each; return their ids in order."""
+
+    def _do(session):
+        pictures = [
+            Picture(file_path=f"tagged_{i}.jpg", filename=f"tagged_{i}.jpg")
+            for i in range(count)
+        ]
+        session.add_all(pictures)
+        session.flush()
+        for picture in pictures:
+            session.add(Tag(picture_id=picture.id, tag=f"test-tag-{picture.id}"))
+            session.add(Tag(picture_id=picture.id, tag="test-shared"))
+        session.commit()
+        return [picture.id for picture in pictures]
+
+    return server.vault.db.run_task(_do)
+
+
+def _null_metadata_hashes(server, picture_ids) -> None:
+    """Clear ``metadata_hash`` with a Core UPDATE, as a never-stamped row has it."""
+    table = Picture.__table__
+
+    def _do(session):
+        session.execute(
+            sa_update(table)
+            .where(table.c.id.in_(list(picture_ids)))
+            .values(metadata_hash=None)
+        )
+        session.commit()
+
+    server.vault.db.run_task(_do)
+
+
+def _record_manifest_statements(monkeypatch) -> list[str]:
+    """Record every SQL statement sent through the engine the manifest opens."""
+    statements: list[str] = []
+    real_engine = snapshot_service_module.snapshot_engine
+
+    def _recording_engine(path):
+        engine = real_engine(path)
+
+        def _record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", _record)
+        return engine
+
+    monkeypatch.setattr(snapshot_service_module, "snapshot_engine", _recording_engine)
+    return statements
+
+
+def test_null_hashes_in_the_sidecar_match_the_per_picture_helper(server):
+    """A NULL ``metadata_hash`` is computed for the sidecar, and the map is the
+    one the per-picture helper gives: the stored hash where there is one, the
+    helper's digest where there is not. More NULL rows than one batch,
+    interleaved with stored ones, so a batch boundary that drops or misplaces
+    an id shows."""
+    picture_ids = _add_tagged_pictures(server, 660)
+    null_ids = [pid for index, pid in enumerate(picture_ids) if index % 10]
+    _null_metadata_hashes(server, null_ids)
+
+    def _per_picture_map(session):
+        stored = dict(
+            session.exec(sqlmodel.select(Picture.id, Picture.metadata_hash)).all()
+        )
+        return stored, {
+            str(pid): stored[pid] or _compute_picture_metadata_hash(session, pid)
+            for pid in picture_ids
+        }
+
+    stored, expected = server.vault.db.run_immediate_read_task(_per_picture_map)
+    assert {pid for pid, value in stored.items() if value is None} == set(null_ids)
+    assert len(null_ids) > 500, "the NULL rows must span more than one batch"
+
+    service = server.vault.snapshot_service
+    snapshot = service.create_snapshot("MANUAL")
+
+    assert service.load_picture_hashes(snapshot.id) == expected
+
+
+def test_null_hash_statements_grow_per_batch_not_per_picture(server, monkeypatch):
+    """Hashing the NULL rows for the sidecar costs a handful of statements per
+    batch of 500 pictures, not five per picture: 600 and 1,200 NULL rows both
+    stay at or under the bound (five fixed manifest reads plus five per batch;
+    1,200 rows are three batches)."""
+    max_statements = 20
+    statements = _record_manifest_statements(monkeypatch)
+    picture_ids = []
+    counts = {}
+    for count in (600, 1200):
+        picture_ids += _add_tagged_pictures(server, count - len(picture_ids))
+        _null_metadata_hashes(server, picture_ids)
+        statements.clear()
+        snapshot = server.vault.snapshot_service.create_snapshot("MANUAL")
+        counts[count] = len(statements)
+        hashes = server.vault.snapshot_service.load_picture_hashes(snapshot.id)
+        assert set(hashes) == {str(pid) for pid in picture_ids}
+
+    assert all(n <= max_statements for n in counts.values()), (
+        f"statements per NULL-hash population: {counts}"
+    )
+
+
+def test_null_hashes_are_computed_in_batches_of_at_most_500(server, monkeypatch):
+    """The batched hash helper holds every picture it was asked for until it
+    returns, so the manifest hands it at most 500 ids at a time; every NULL row
+    goes in exactly one batch, and no row with a stored hash goes in any."""
+    picture_ids = _add_tagged_pictures(server, 1100)
+    null_ids = [pid for index, pid in enumerate(picture_ids) if index % 10]
+    _null_metadata_hashes(server, null_ids)
+    real_helper = snapshot_service_module._compute_picture_metadata_hashes
+    batches: list[list[int]] = []
+
+    def _recording_helper(session, ids):
+        batches.append(list(ids))
+        return real_helper(session, ids)
+
+    monkeypatch.setattr(
+        snapshot_service_module, "_compute_picture_metadata_hashes", _recording_helper
+    )
+    server.vault.snapshot_service.create_snapshot("MANUAL")
+
+    assert len(batches) > 1
+    assert max(len(batch) for batch in batches) <= 500
+    assert sorted(pid for batch in batches for pid in batch) == sorted(null_ids)
 
 
 # ---------------------------------------------------------------------------
