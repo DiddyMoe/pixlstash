@@ -66,6 +66,7 @@ vi.mock("vue-router", () => ({
 
 import { isReadOnly, sessionContext } from "../../utils/apiClient";
 import { FACE_DRAG_MIME, PICTURE_DRAG_MIME } from "../../utils/media.js";
+import { useNoticeStore } from "../../stores/useNoticeStore";
 import {
   resetShareDragForTests,
   runShareDrag,
@@ -97,11 +98,12 @@ function respond(url) {
   return { data: [] };
 }
 
-async function mountSidebar() {
+async function mountSidebar(stubs = {}) {
   const wrapper = mount(SideBar, {
     shallow: true,
     props: { backendUrl: "/api/v1" },
     global: {
+      stubs,
       config: {
         compilerOptions: { isCustomElement: (tag) => tag.startsWith("v-") },
       },
@@ -388,4 +390,71 @@ describe("sidebar rows take a desktop drag-out", () => {
     expect(wrapper.emitted("images-moved")).toBeUndefined();
     wrapper.unmount();
   });
+});
+
+// A dropped folder can hold files the browser will not hand over (moved away
+// mid-drag, or no permission). The rows import the rest and say how many.
+describe("sidebar rows say how many dropped items could not be read", () => {
+  /** A folder drop: one readable picture, one the browser refuses. */
+  function folderTransfer() {
+    const fileEntry = (name, file) => ({
+      isFile: true,
+      isDirectory: false,
+      name,
+      fullPath: `/shoot/${name}`,
+      file: (ok, fail) =>
+        file ? ok(file) : fail?.(new DOMException("gone", "NotFoundError")),
+    });
+    const children = [
+      fileEntry("keep.jpg", new File(["x"], "keep.jpg")),
+      fileEntry("gone.jpg", null),
+    ];
+    const entry = {
+      isFile: false,
+      isDirectory: true,
+      name: "shoot",
+      fullPath: "/shoot",
+      createReader: () => {
+        let done = false;
+        return {
+          readEntries(cb) {
+            if (done) return cb([]);
+            done = true;
+            cb(children);
+          },
+        };
+      },
+    };
+    return {
+      types: ["Files"],
+      dropEffect: "",
+      effectAllowed: "copy",
+      files: [new File([], "shoot")],
+      items: [{ kind: "file", webkitGetAsEntry: () => entry }],
+      getData: () => "",
+    };
+  }
+  const unreadableNotices = () =>
+    useNoticeStore().notices.filter((n) => n.key === "import-unreadable-items");
+
+  for (const [rowKind, title] of [
+    ["set", `${SET.name} (`],
+    ["person", `${ADA.name} (`],
+  ]) {
+    it(`warns once for a folder dropped on a ${rowKind} row, and imports the rest`, async () => {
+      const startImport = vi.fn();
+      const wrapper = await mountSidebar({
+        ImageImporter: { render: () => null, methods: { startImport } },
+      });
+      await fire(rowByTitle(wrapper, title), "drop", folderTransfer());
+
+      expect(startImport.mock.calls[0][0].map((f) => f.name)).toEqual([
+        "keep.jpg",
+      ]);
+      expect(unreadableNotices().map((n) => [n.text, n.count])).toEqual([
+        ["1 item could not be read and was skipped", 1],
+      ]);
+      wrapper.unmount();
+    });
+  }
 });

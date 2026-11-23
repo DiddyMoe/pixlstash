@@ -6,6 +6,7 @@ import {
   isModelFile,
   isSupportedImportFile,
   isWorkflowFile,
+  unreadableDropReporter,
 } from "../utils/media.js";
 import { addModelFile } from "../api/modelFiles";
 import { errorDetail } from "../utils/apiError";
@@ -114,6 +115,7 @@ export function useWindowFileImport({ sidebarRef }) {
       dataTransfer,
       {
         accept: (file) => isSupportedImportFile(file) || isModelFile(file),
+        onUnreadable: unreadableDropReporter(dataTransfer),
       },
     );
     return {

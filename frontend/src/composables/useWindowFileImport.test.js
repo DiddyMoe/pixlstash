@@ -108,6 +108,49 @@ function dropFolder(folderName, ...names) {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * A folder drop where some files cannot be read (moved away mid-drag, or no
+ * permission): the browser hands their entries an error instead of a File.
+ */
+function dropFolderWithUnreadable(folderName, readable, unreadable) {
+  const fileEntry = (name, file) => ({
+    isFile: true,
+    isDirectory: false,
+    name,
+    fullPath: `/${folderName}/${name}`,
+    file: (ok, fail) =>
+      file ? ok(file) : fail?.(new DOMException("gone", "NotFoundError")),
+  });
+  const children = [
+    ...readable.map((name) => fileEntry(name, new File(["x"], name))),
+    ...unreadable.map((name) => fileEntry(name, null)),
+  ];
+  const entry = {
+    isFile: false,
+    isDirectory: true,
+    name: folderName,
+    fullPath: `/${folderName}`,
+    createReader: () => {
+      let done = false;
+      return {
+        readEntries(cb) {
+          if (done) return cb([]);
+          done = true;
+          cb(children);
+        },
+      };
+    },
+  };
+  const event = new Event("drop", { bubbles: true, cancelable: true });
+  event.dataTransfer = {
+    files: [new File([], folderName)],
+    items: [{ kind: "file", webkitGetAsEntry: () => entry }],
+    types: ["Files"],
+  };
+  document.body.dispatchEvent(event);
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 /** The desktop shell's answer to "where did this file come from?". */
 function withDesktopShell(pathByName) {
   window.pixlstashDesktop = {
@@ -263,6 +306,18 @@ describe("useWindowFileImport", () => {
     expect(addModelFile).toHaveBeenCalledWith("/runs/out/lora.safetensors", null);
     expect(startLocalImport.mock.calls[0][0].map((f) => f.name)).toEqual([
       "sample-01.jpg",
+    ]);
+  });
+
+  it("says how many dropped items could not be read, and imports the rest", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await dropFolderWithUnreadable("shoot", ["keep.jpg"], ["gone.jpg"]);
+    expect(startLocalImport.mock.calls[0][0].map((f) => f.name)).toEqual([
+      "keep.jpg",
+    ]);
+    const warnings = notices.notices.filter((n) => n.level === "warning");
+    expect(warnings.map((n) => [n.text, n.count])).toEqual([
+      ["1 item could not be read and was skipped", 1],
     ]);
   });
 

@@ -21,6 +21,10 @@ vi.mock("../api/pictures", () => ({ makeShareCopies: vi.fn() }));
 import { isReadOnly } from "../utils/apiClient";
 import { makeShareCopies } from "../api/pictures";
 import { resetShareDragForTests } from "../utils/shareDrag.js";
+import {
+  extractSupportedImportFilesFromDataTransfer,
+  unreadableDropReporter,
+} from "../utils/media.js";
 import { useNoticeStore } from "../stores/useNoticeStore";
 import { useGridDragDrop } from "./useGridDragDrop.js";
 
@@ -29,12 +33,12 @@ let finishDrag;
 let startShareDrag;
 let now = 0;
 
-function grid(selected = [1, 2]) {
+function grid(selected = [1, 2], importer = null) {
   return useGridDragDrop(
     {
       selectedImageIds: ref(selected),
       touchSelectMode: ref(false),
-      imageImporterRef: ref(null),
+      imageImporterRef: ref(importer),
       thumbnailRefs: {},
       dragPreviewRefs: {},
       prefetchFullImage: () => {},
@@ -256,5 +260,75 @@ describe("a drop on the grid that imports nothing", () => {
     await done;
     const last = useNoticeStore().notices.at(-1);
     expect(last.text).toContain("None of those files are a supported");
+  });
+});
+
+describe("a grid drop with items that could not be read", () => {
+  /** A dropped folder holding one readable picture and one the browser refuses. */
+  function folderDrop() {
+    const fileEntry = (name, file) => ({
+      isFile: true,
+      isDirectory: false,
+      name,
+      fullPath: `/shoot/${name}`,
+      file: (ok, fail) =>
+        file ? ok(file) : fail?.(new DOMException("gone", "NotFoundError")),
+    });
+    const children = [
+      fileEntry("keep.jpg", new File(["x"], "keep.jpg")),
+      fileEntry("gone.jpg", null),
+    ];
+    const entry = {
+      isFile: false,
+      isDirectory: true,
+      name: "shoot",
+      fullPath: "/shoot",
+      createReader: () => {
+        let done = false;
+        return {
+          readEntries(cb) {
+            if (done) return cb([]);
+            done = true;
+            cb(children);
+          },
+        };
+      },
+    };
+    return {
+      dataTransfer: {
+        types: ["Files"],
+        files: [new File([], "shoot")],
+        items: [{ kind: "file", webkitGetAsEntry: () => entry }],
+        getData: () => "",
+      },
+    };
+  }
+  const unreadableNotices = () =>
+    useNoticeStore().notices.filter((n) => n.key === "import-unreadable-items");
+
+  beforeEach(() => {
+    delete window.pixlstashDesktop;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  it("says one item was skipped and imports the rest", async () => {
+    const importer = { startImport: vi.fn() };
+    await grid([1, 2], importer).handleGridDrop(folderDrop());
+    expect(importer.startImport.mock.calls[0][0].map((f) => f.name)).toEqual([
+      "keep.jpg",
+    ]);
+    expect(unreadableNotices().map((n) => [n.text, n.count])).toEqual([
+      ["1 item could not be read and was skipped", 1],
+    ]);
+  });
+
+  it("does not say it again for a drop the window's handler already walked", async () => {
+    const event = folderDrop();
+    // The window's capture handler walks every drop before the grid does.
+    await extractSupportedImportFilesFromDataTransfer(event.dataTransfer, {
+      onUnreadable: unreadableDropReporter(event.dataTransfer),
+    });
+    await grid([1, 2], { startImport: vi.fn() }).handleGridDrop(event);
+    expect(unreadableNotices().map((n) => n.count)).toEqual([1]);
   });
 });

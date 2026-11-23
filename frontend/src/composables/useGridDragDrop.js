@@ -5,6 +5,7 @@ import {
   isInternalImageDrag,
   isVideo,
   setInternalDragPayload,
+  unreadableDropReporter,
 } from "../utils/media.js";
 import { useNoticeStore } from "../stores/useNoticeStore";
 import { useSelectionStore } from "../stores/useSelectionStore";
@@ -200,6 +201,7 @@ export function useGridDragDrop(
     const carriedFiles = isFileDrag(e.dataTransfer);
     const files = await extractSupportedImportFilesFromDataTransfer(
       e.dataTransfer,
+      { onUnreadable: unreadableDropReporter(e.dataTransfer) },
     );
     if (!files.length) {
       noticeStore.warning(
