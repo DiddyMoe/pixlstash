@@ -565,6 +565,48 @@ def test_the_job_list_names_a_running_runs_last_logged_phase():
         _teardown(temp_dir, server)
 
 
+def test_the_job_list_does_not_carry_a_runs_curve_log_or_config():
+    """A listing reads each run's summary, never its large text columns."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        run_id, _ = _seed_job(server, log_tail="step 3000/3000\n")
+        rows = training_runs.list_runs(server.vault.hub, server.vault.library_uuid)
+        row = next(row for row in rows if row["id"] == run_id)
+        carried = {
+            "loss_curve",
+            "log_tail",
+            "rendered_config",
+            "dataset_picture_ids",
+            "report",
+            "sample_image_paths",
+        }
+        assert not carried & row.keys()
+        assert row["status"] == "completed"
+        assert row["step"] == 3000
+        # The full row still has them: one run is read whole.
+        assert (
+            carried
+            <= training_runs.get_run(
+                server.vault.hub, server.vault.library_uuid, run_id
+            ).keys()
+        )
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_the_job_list_names_a_run_by_its_training_folder():
+    """A run in the shelf's folder is listed under that folder's run name."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        _, job_uuid = _seed_job(
+            server, name="folderrun", training_folder="/home/me/ai-toolkit/output"
+        )
+        listed = {j["uuid"]: j for j in owner.get("/training/jobs").json()}
+        assert listed[job_uuid]["run_name"] == f"folderrun_{job_uuid[:8]}"
+    finally:
+        _teardown(temp_dir, server)
+
+
 def test_list_jobs_scoped_token_forbidden():
     temp_dir, owner, server, read_token = _setup()
     try:
@@ -634,6 +676,21 @@ def test_job_status_owner_works():
         assert body["step"] == 1500
         assert body["progress"] == 0.5
         assert body["latest_loss"] == 0.4
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_job_status_has_no_latest_loss_without_a_readable_curve(caplog):
+    """No curve, an empty one or an unreadable one: no latest loss, never a 500."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        for stored in (None, "[]", "not json", json.dumps([{"step": 1}])):
+            job_id, _ = _seed_job(server, loss_curve=stored)
+            with caplog.at_level("WARNING"):
+                r = owner.get(f"/training/jobs/{job_id}/status")
+            assert r.status_code == 200, r.text
+            assert r.json()["latest_loss"] is None, stored
+        assert caplog.text.count("Could not parse loss_curve") == 1
     finally:
         _teardown(temp_dir, server)
 

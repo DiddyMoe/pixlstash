@@ -37,9 +37,11 @@ from pixlstash.resources.aitoolkit_tenant import AiToolkitProbe
 from pixlstash.services import training_service as training_service_module
 from pixlstash.services.training_service import TrainingService
 from pixlstash.training import measurements, presets
+from pixlstash.training import local_ai_toolkit as local_ai_toolkit_module
 from pixlstash.training.backend import TrainingProgress
 from pixlstash.training.local_ai_toolkit import LocalAiToolkit
 from pixlstash.vault import Vault
+from tests.training.fake_run import _init_loss_db, _log_step
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _FAST_TEMPLATE_PATH = os.path.join(_THIS_DIR, "fast_template.json")
@@ -1637,6 +1639,178 @@ def test_a_poll_does_not_undo_a_cancel_the_trainer_has_not_seen_yet(hub, repo_di
     training_runs.update_run(hub, "cancelled-job", status="running")
     service._persist_progress("cancelled-job", running, handle)
     assert _job_status(hub, "cancelled-job").status == "running"
+
+
+def _write_loss_log(path, points):
+    """Log ``(step, loss)`` *points* the way the trainer does (WAL, per step)."""
+    con = _init_loss_db(path)
+    try:
+        for step, loss in points:
+            _log_step(con, step, loss)
+    finally:
+        con.close()
+
+
+def _stored_steps(hub, job_uuid):
+    """The steps of the loss curve stored on the run, or None if none is."""
+    stored = _job_status(hub, job_uuid).loss_curve
+    return None if stored is None else [p["step"] for p in json.loads(stored)]
+
+
+def test_a_loss_log_that_cannot_be_read_keeps_the_stored_curve(
+    hub, repo_dir, tmp_path, monkeypatch, caplog
+):
+    """A poll that could not read the loss log leaves the stored curve alone.
+
+    The trainer holds the log locked while it writes and a restarted run
+    replaces it; neither means the run has no loss, and the poll that meets
+    it can be the last one before the run is finished.
+    """
+    monkeypatch.setattr(local_ai_toolkit_module, "_SQLITE_BUSY_TIMEOUT_MS", 1)
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    training_runs.create_run(
+        hub,
+        library_uuid=_LIBRARY_UUID,
+        uuid="unread-loss",
+        name="unread",
+        set_id=None,
+        character_id=_CHARACTER_ID,
+        base_model="m",
+        trigger_word="t",
+    )
+    backend = LocalAiToolkit(str(tmp_path), sys.executable)
+    handle = LocalAiToolkit.handle_for(str(tmp_path / "work"), "unread-loss", "unread")
+    os.makedirs(handle.save_root)
+    _write_loss_log(handle.loss_db_path, [(1, 0.9), (2, 0.7), (3, 0.6)])
+
+    service._persist_progress("unread-loss", backend.progress(handle), handle)
+    assert _stored_steps(hub, "unread-loss") == [1, 2, 3]
+
+    # Locked: the writer holds the log exclusively for the whole poll.
+    writer = sqlite3.connect(handle.loss_db_path, isolation_level=None)
+    try:
+        writer.execute("PRAGMA locking_mode=EXCLUSIVE")
+        writer.execute("INSERT OR REPLACE INTO steps(step, wall_time) VALUES(4, 0)")
+        with caplog.at_level("WARNING"):
+            service._persist_progress("unread-loss", backend.progress(handle), handle)
+    finally:
+        writer.close()
+    assert _stored_steps(hub, "unread-loss") == [1, 2, 3]
+    assert "Could not read loss DB" in caplog.text
+
+    # Missing: a restarted run has not written its new log yet.
+    os.replace(handle.loss_db_path, str(tmp_path / "moved-loss_log.db"))
+    service._persist_progress("unread-loss", backend.progress(handle), handle)
+    assert _stored_steps(hub, "unread-loss") == [1, 2, 3]
+
+    # A log that is there and holds no points is read, and stored as none.
+    _write_loss_log(handle.loss_db_path, [])
+    service._persist_progress("unread-loss", backend.progress(handle), handle)
+    assert _stored_steps(hub, "unread-loss") is None
+
+
+def _polled_run(hub, repo_dir, monkeypatch, job_uuid, fail_first=False):
+    """A service with a running run, and the columns of each progress write.
+
+    With *fail_first*, the first write raises the way a busy hub does.
+    """
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    training_runs.create_run(
+        hub,
+        library_uuid=_LIBRARY_UUID,
+        uuid=job_uuid,
+        name="polled",
+        set_id=None,
+        character_id=_CHARACTER_ID,
+        base_model="m",
+        trigger_word="t",
+    )
+    training_runs.update_run(hub, job_uuid, status="running")
+    writes = []
+    real_update = training_runs.update_run
+
+    def update_run(hub_, run_uuid, **fields):
+        # A new phase is written on its own; it is not a progress write.
+        if set(fields) != {"phase_log"}:
+            writes.append(set(fields))
+            if fail_first and len(writes) == 1:
+                raise sqlite3.OperationalError("database is locked")
+        return real_update(hub_, run_uuid, **fields)
+
+    monkeypatch.setattr(training_runs, "update_run", update_run)
+    return service, writes
+
+
+def _training(step, curve, samples=("/home/me/out/sample_0.png",)):
+    """A running trainer's progress; each call builds new lists."""
+    return TrainingProgress(
+        status="running",
+        info="Training",
+        step=step,
+        total_steps=10,
+        speed="",
+        loss_curve=[{"step": s, "loss": loss} for s, loss in curve],
+        samples=list(samples),
+    )
+
+
+def test_an_unchanged_poll_does_not_rewrite_the_run(
+    hub, repo_dir, monkeypatch, tmp_path
+):
+    """A poll that finds nothing new (loading, sampling, a slow step) writes nothing."""
+    service, writes = _polled_run(hub, repo_dir, monkeypatch, "idle-job")
+    log = tmp_path / "log.txt"
+    log.write_text("step 2/10\n")
+    handle = SimpleNamespace(log_path=str(log))
+
+    service._persist_progress("idle-job", _training(2, [(1, 0.9), (2, 0.8)]), handle)
+    service._persist_progress("idle-job", _training(2, [(1, 0.9), (2, 0.8)]), handle)
+
+    assert len(writes) == 1
+    assert _stored_steps(hub, "idle-job") == [1, 2]
+
+
+def test_a_poll_whose_write_failed_writes_again(hub, repo_dir, monkeypatch):
+    """A write the hub refused is made again by the next poll, even unchanged."""
+    service, writes = _polled_run(hub, repo_dir, monkeypatch, "retry-job", True)
+    handle = SimpleNamespace(log_path="")
+
+    service._persist_progress("retry-job", _training(2, [(1, 0.9), (2, 0.8)]), handle)
+    assert _stored_steps(hub, "retry-job") is None
+    service._persist_progress("retry-job", _training(2, [(1, 0.9), (2, 0.8)]), handle)
+
+    assert len(writes) == 2
+    assert _stored_steps(hub, "retry-job") == [1, 2]
+    assert _job_status(hub, "retry-job").step == 2
+
+
+def test_a_grown_curve_rewrites_only_what_changed(hub, repo_dir, monkeypatch, tmp_path):
+    """A new step writes the step and the curve, not the log or samples again."""
+    service, writes = _polled_run(hub, repo_dir, monkeypatch, "growing-job")
+    log = tmp_path / "log.txt"
+    log.write_text("step 2/10\n")
+    handle = SimpleNamespace(log_path=str(log))
+
+    service._persist_progress("growing-job", _training(2, [(1, 0.9)]), handle)
+    service._persist_progress("growing-job", _training(3, [(1, 0.9), (3, 0.7)]), handle)
+
+    assert writes[1] == {"status", "step", "loss_curve"}
+    assert _stored_steps(hub, "growing-job") == [1, 3]
+    stored = _job_status(hub, "growing-job")
+    assert stored.log_tail == "step 2/10\n"
+    assert json.loads(stored.sample_image_paths) == ["/home/me/out/sample_0.png"]
 
 
 # ---------------------------------------------------------------------------

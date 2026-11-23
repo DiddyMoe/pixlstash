@@ -287,6 +287,11 @@ class TrainingService:
         # phase writes nothing; loaded from the row the first time it is needed.
         self._phase_logs: dict[str, list[dict]] = {}
         self._phase_lock = threading.Lock()
+        # Each polled run's progress columns as last written, so a poll that
+        # changed nothing writes nothing and one that did writes only what
+        # changed. Read and set under ``_active_lock``; dropped when the run's
+        # polling ends.
+        self._persisted: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1172,32 +1177,37 @@ class TrainingService:
         watch = watch if watch is not None else _Watch()
         deferred = bool(self._resolution(job_uuid).get("previews_deferred"))
         progress = backend.progress(handle)
-        while not self._stop.is_set():
-            self._persist_progress(job_uuid, progress, handle)
-            phase = live_view.phase_of(
-                progress.status, progress.info, progress.step, None
-            )
-            self._observe(handle, progress, lease, watch, phase)
-            self._maybe_shrink(job_uuid, lease, watch, progress, deferred)
-            self._emit_progress(
-                job_uuid,
-                status=progress.status,
-                current=progress.step,
-                total=progress.total_steps,
-                message=progress.info,
-            )
-            alive = backend.is_alive(handle)
-            terminal = progress.status in _TERMINAL_PROGRESS_STATUSES
-            if not alive and terminal:
-                break
-            if not alive and not terminal:
-                # Process gone but status not terminal; let the adapter reconcile
-                # the real end state (interrupted → error), then stop.
-                progress = backend.reconcile(handle)
+        try:
+            while not self._stop.is_set():
                 self._persist_progress(job_uuid, progress, handle)
-                break
-            self._stop.wait(self.poll_interval_s)
-            progress = backend.progress(handle)
+                phase = live_view.phase_of(
+                    progress.status, progress.info, progress.step, None
+                )
+                self._observe(handle, progress, lease, watch, phase)
+                self._maybe_shrink(job_uuid, lease, watch, progress, deferred)
+                self._emit_progress(
+                    job_uuid,
+                    status=progress.status,
+                    current=progress.step,
+                    total=progress.total_steps,
+                    message=progress.info,
+                )
+                alive = backend.is_alive(handle)
+                terminal = progress.status in _TERMINAL_PROGRESS_STATUSES
+                if not alive and terminal:
+                    break
+                if not alive and not terminal:
+                    # Process gone but status not terminal; let the adapter
+                    # reconcile the real end state (interrupted → error), then stop.
+                    progress = backend.reconcile(handle)
+                    self._persist_progress(job_uuid, progress, handle)
+                    break
+                self._stop.wait(self.poll_interval_s)
+                progress = backend.progress(handle)
+        finally:
+            # The next loop over this run starts by writing every column again.
+            with self._active_lock:
+                self._persisted.pop(job_uuid, None)
         return progress
 
     # ------------------------------------------------------------------
@@ -2072,26 +2082,35 @@ class TrainingService:
 
     def _job_status(self, job_uuid: str) -> str | None:
         """A job's persisted status, or None when it is gone."""
-        run = training_runs.get_run_by_uuid(self._hub, job_uuid)
-        return run["status"] if run is not None else None
+        return training_runs.get_run_status(self._hub, job_uuid)
 
-    def _update_job(self, job_uuid: str, **fields) -> None:
+    def _update_job(self, job_uuid: str, **fields) -> bool:
         """Update columns on a training run by uuid.
 
         Args:
             job_uuid: The job uuid.
             **fields: Column names → values to set.
+
+        Returns:
+            True when the row was written. False, after logging why, when no
+            run has that uuid or the write failed.
         """
         try:
-            if not training_runs.update_run(self._hub, job_uuid, **fields):
-                logger.warning("_update_job: no job with uuid=%s", job_uuid)
+            if training_runs.update_run(self._hub, job_uuid, **fields):
+                return True
+            logger.warning("_update_job: no job with uuid=%s", job_uuid)
         except Exception:
             logger.exception("Failed to update job %s with %s", job_uuid, list(fields))
+        return False
 
     def _persist_progress(
         self, job_uuid: str, progress: TrainingProgress, handle
     ) -> None:
         """Persist the live progress fields onto the job row.
+
+        Only the columns that changed since this run's last write are written,
+        and nothing when none did and the row already holds the status. A loss
+        curve the backend could not read leaves the stored one as it is.
 
         Args:
             job_uuid: The job uuid.
@@ -2099,26 +2118,41 @@ class TrainingService:
             handle: The job handle (for reading the log tail).
         """
         status = progress.status if progress.status != "unknown" else "running"
-        log_tail = self._read_log_tail(handle.log_path)
+        values = {
+            "step": progress.step,
+            "total_steps": progress.total_steps,
+            "sample_image_paths": progress.samples or None,
+            "log_tail": self._read_log_tail(handle.log_path),
+        }
+        # A curve of None is one the backend could not read this poll, so the
+        # stored curve stays; an empty one was read and has no points.
+        if progress.loss_curve is not None:
+            values["loss_curve"] = progress.loss_curve or None
         # The trainer reports running for a while after a cancel; the row's
         # "stopping" stands until the trainer reaches an end state. The read and
         # the write sit under the lock cancel writes "stopping" under.
         with self._active_lock:
-            if status == "running" and self._job_status(job_uuid) == "stopping":
+            row_status = self._job_status(job_uuid)
+            if status == "running" and row_status == "stopping":
                 status = "stopping"
-            self._update_job(
-                job_uuid,
-                status=status,
-                step=progress.step,
-                total_steps=progress.total_steps,
-                loss_curve=json.dumps(progress.loss_curve)
-                if progress.loss_curve
-                else None,
-                sample_image_paths=(
-                    json.dumps(progress.samples) if progress.samples else None
-                ),
-                log_tail=log_tail,
-            )
+            # Lists compare with ``==``, which is cheaper than encoding them.
+            # A backend never changes a list it has returned, so what the
+            # snapshot holds is what was written.
+            written = self._persisted.get(job_uuid, {})
+            changed = {
+                column: value
+                for column, value in values.items()
+                if column not in written or written[column] != value
+            }
+            if changed or status != row_status:
+                fields = dict(changed)
+                for column in ("loss_curve", "sample_image_paths"):
+                    if fields.get(column) is not None:
+                        fields[column] = json.dumps(fields[column])
+                # A failed write leaves the snapshot as it was, so the next
+                # poll writes these columns again.
+                if self._update_job(job_uuid, status=status, **fields):
+                    self._persisted[job_uuid] = {**written, **changed}
         # A completed trainer is imported next: `_finalize` writes completed_at.
         self._note_phase(
             job_uuid, live_view.phase_of(status, progress.info, progress.step, None)

@@ -61,6 +61,32 @@ FINISHED_STATUSES = ("completed", "stopped", "error")
 # deferred previews or being imported, and ``_finalize`` writes completed_at.
 _COMPLETED_BUT_BUSY = "(status = 'completed' AND completed_at IS NULL)"
 
+# The columns a run listing carries: what the job list shows, plus what it
+# derives a run's folder name and phase from. The large text columns (loss
+# curve, log tail, rendered config, picture ids, report) stay out, so listing
+# long runs does not read curves nobody shows. A field the list starts to show
+# is added here. The list reads ``phase_log`` with ``.get``, so leaving it out
+# would quietly drop a running run's phase instead of failing.
+_SUMMARY_COLUMNS: tuple[str, ...] = (
+    "id",
+    "uuid",
+    "name",
+    "status",
+    "phase_log",
+    "set_id",
+    "character_id",
+    "base_model",
+    "trigger_word",
+    "step",
+    "total_steps",
+    "created_at",
+    "started_at",
+    "completed_at",
+    "training_folder",
+    "error",
+    "dataset_snapshot_id",
+)
+
 
 def create_run(
     hub: HubDatabase,
@@ -136,6 +162,49 @@ def get_run_by_uuid(hub: HubDatabase, run_uuid: str) -> Optional[dict]:
     return dict(row) if row is not None else None
 
 
+def get_run_status(hub: HubDatabase, run_uuid: str) -> Optional[str]:
+    """One run's status by its uuid, whichever library holds it, or None.
+
+    For the worker, which checks the status on every poll of a run and needs
+    none of the run's other columns.
+    """
+    row = hub.fetchone("SELECT status FROM training_run WHERE uuid = ?", (run_uuid,))
+    return str(row[0]) if row is not None else None
+
+
+# The loss of a stored curve's last point, read in SQL so the status poll never
+# loads the curve. NULL when there is no curve, it has no points, or it is not
+# valid JSON. The last index is computed rather than written ``$[#-1]``: that
+# form needs SQLite 3.31, and on a malformed curve it raises instead of
+# returning NULL.
+_LATEST_LOSS_SQL = (
+    "CASE WHEN json_valid(loss_curve) AND json_array_length(loss_curve) > 0 "
+    "THEN json_extract(loss_curve, "
+    "'$[' || (json_array_length(loss_curve) - 1) || '].loss') END"
+)
+
+
+def get_run_status_summary(
+    hub: HubDatabase, library_uuid: str, run_id: int
+) -> Optional[dict]:
+    """One run's status fields and its latest loss, without its curve.
+
+    For the status poll. The row holds ``id``, ``uuid``, ``status``, ``step``,
+    ``total_steps``, ``report`` and ``error``, plus ``latest_loss`` (the last
+    curve point's loss, or None) and ``loss_curve_malformed`` (true when a
+    stored curve is not valid JSON). None when the run is absent or in another
+    library.
+    """
+    row = hub.fetchone(
+        "SELECT id, uuid, status, step, total_steps, report, error, "
+        f"{_LATEST_LOSS_SQL} AS latest_loss, "
+        "(loss_curve <> '' AND NOT json_valid(loss_curve)) AS loss_curve_malformed "
+        "FROM training_run WHERE id = ? AND library_uuid = ?",
+        (run_id, library_uuid),
+    )
+    return dict(row) if row is not None else None
+
+
 def list_runs(
     hub: HubDatabase,
     library_uuid: str,
@@ -143,7 +212,12 @@ def list_runs(
     set_id: Optional[int] = None,
     character_id: Optional[int] = None,
 ) -> list[dict]:
-    """The library's runs, newest first, optionally for one set or character."""
+    """The library's runs as summaries, newest first.
+
+    Optionally only one set's or one character's runs. Each row holds only
+    :data:`_SUMMARY_COLUMNS`, not the whole run: read one run with
+    :func:`get_run` for its curve, log, config and report.
+    """
     clauses = ["library_uuid = ?"]
     params: list = [library_uuid]
     if set_id is not None:
@@ -153,7 +227,7 @@ def list_runs(
         clauses.append("character_id = ?")
         params.append(character_id)
     rows = hub.fetchall(
-        "SELECT * FROM training_run WHERE "
+        f"SELECT {', '.join(_SUMMARY_COLUMNS)} FROM training_run WHERE "
         + " AND ".join(clauses)
         + " ORDER BY created_at DESC, id DESC",
         tuple(params),
@@ -284,6 +358,8 @@ __all__ = [
     "delete_run",
     "get_run",
     "get_run_by_uuid",
+    "get_run_status",
+    "get_run_status_summary",
     "list_runs",
     "next_queued_run",
     "unfinished_runs",
