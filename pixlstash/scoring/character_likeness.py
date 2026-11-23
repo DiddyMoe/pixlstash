@@ -173,7 +173,9 @@ def select_reference_faces_for_character(
         return representatives
 
     fallback_row = session.exec(
-        base_query.order_by(desc(Picture.score), Picture.created_at.asc(), Picture.id)
+        base_query.order_by(
+            desc(Picture.score), Picture.created_at.asc(), Picture.id
+        ).limit(1)
     ).first()
     if fallback_row:
         fallback_face = fallback_row[0]

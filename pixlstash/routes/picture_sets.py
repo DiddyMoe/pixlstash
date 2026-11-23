@@ -947,11 +947,13 @@ def create_router(server) -> APIRouter:
             select(PictureSet.set_icon)
             .where(PictureSet.set_icon.in_(_SET_ICONS))
             .order_by(PictureSet.id.desc())
+            .limit(1)
         ).first()
         last_color = session.exec(
             select(PictureSet.set_color)
             .where(PictureSet.set_color.in_(_SET_COLORS))
             .order_by(PictureSet.id.desc())
+            .limit(1)
         ).first()
         icon = _next_from_palette(
             _SET_ICONS, last_icon, {row[0] for row in siblings if row[0]}

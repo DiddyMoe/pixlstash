@@ -2165,6 +2165,7 @@ def _select_undo_target(session: Session, operation_id: Optional[int]) -> Operat
         .where(Operation.status == STATUS_APPLIED)
         .where(Operation.undoable.is_(True))
         .order_by(Operation.id.desc())
+        .limit(1)
     ).first()
     if operation is None:
         raise OperationLogError("Nothing to undo")
@@ -2184,6 +2185,7 @@ def _enforce_latest_undo_unit(session: Session, operation: Operation) -> None:
         .where(Operation.status == STATUS_APPLIED)
         .where(Operation.undoable.is_(True))
         .order_by(Operation.id.desc())
+        .limit(1)
     ).first()
     if latest is None:
         raise OperationLogError("Nothing to undo")
@@ -2220,6 +2222,7 @@ def _enforce_latest_undo_unit(session: Session, operation: Operation) -> None:
             )
         )
         .order_by(Operation.id.desc())
+        .limit(1)
     ).first()
     if latest.batch_id != operation.batch_id or conflict is not None:
         blocker = conflict or latest
@@ -2329,6 +2332,7 @@ def redo_in_session(
         select(Operation)
         .where(Operation.status == STATUS_UNDONE)
         .order_by(Operation.id.desc())
+        .limit(1)
     ).first()
     if operation is None:
         raise OperationLogError("Nothing to redo")
@@ -2386,11 +2390,13 @@ def undo_state_in_session(session: Session) -> dict:
         .where(Operation.status == STATUS_APPLIED)
         .where(Operation.undoable.is_(True))
         .order_by(Operation.id.desc())
+        .limit(1)
     ).first()
     next_redo = session.exec(
         select(Operation)
         .where(Operation.status == STATUS_UNDONE)
         .order_by(Operation.id.desc())
+        .limit(1)
     ).first()
     return {
         "can_undo": next_undo is not None,

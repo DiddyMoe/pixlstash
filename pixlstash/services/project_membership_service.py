@@ -314,6 +314,7 @@ def reconcile_entity_projects_change(
                 select(PictureProjectMember.project_id)
                 .where(PictureProjectMember.picture_id == int(pic.id))
                 .order_by(PictureProjectMember.project_id.asc())
+                .limit(1)
             ).first()
             pic.project_id = (
                 int(fallback_project_id) if fallback_project_id is not None else None

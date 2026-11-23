@@ -605,6 +605,7 @@ def register_routes(router, server):
                                 PictureProjectMember.project_id != project_id_target,
                             )
                             .order_by(PictureProjectMember.project_id.asc())
+                            .limit(1)
                         ).first()
                         pic.project_id = (
                             int(fallback_project_id)
