@@ -445,6 +445,16 @@ def create_router(server) -> APIRouter:
                 "the owner's."
             ),
         )
+        database_writer: Optional[dict] = Field(
+            default=None,
+            description=(
+                "The health of the library database's single writer "
+                "(`VaultDatabase.writer_status()`): state (open, closing, "
+                "closed or failed), alive, queue_depth, current_task and "
+                "current_task_seconds, last_session_failure and "
+                "failed_reason. Null for any token but the owner's."
+            ),
+        )
 
     class WatchFoldersResponse(BaseModel):
         model_config = ConfigDict(extra="allow")
@@ -1221,7 +1231,11 @@ def create_router(server) -> APIRouter:
             "downloads lists the model downloads running or just ended "
             "(`POST /model-downloads`), likewise for the owner only. "
             "resources is the VRAM arbiter's snapshot, null for any token but "
-            "the owner's."
+            "the owner's. "
+            "database_writer is the library database writer's health "
+            "(state, alive, queue depth, the task in hand and the last "
+            "session it had to discard), likewise null for any token but the "
+            "owner's."
         ),
     )
     def get_workers_progress(request: Request):
@@ -1255,6 +1269,13 @@ def create_router(server) -> APIRouter:
             # the runs, since a lease label names a workflow.
             "resources": (
                 arbiter().snapshot()
+                if server.auth.is_unscoped_owner_request(request)
+                else None
+            ),
+            # Names internal task callables and carries raw error text: the
+            # owner's alone.
+            "database_writer": (
+                server.vault.db.writer_status()
                 if server.auth.is_unscoped_owner_request(request)
                 else None
             ),
