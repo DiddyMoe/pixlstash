@@ -22,23 +22,35 @@ Covers the three things the design rests on:
    ``anomaly_tag_uncertainty`` recomputed and the cached smart score dropped.
    A half-undo - the tag back but the rejection still on file - is the failure
    these tests exist to prevent.
+6. **Read cost** - the history lookups build only the row they act on, and the
+   read-only listing and search paths never queue on the single writer or
+   issue a write. A thumbnail batch stays on the writer queue: it reads a
+   picture's geometry and its face boxes from one committed state.
 """
 
 import gc
 import io
 import json
 import os
+import re
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from sqlalchemy import event
+from sqlalchemy import inspect as sa_inspect
 from sqlmodel import delete, select, update
 
 from pixlstash.db_models import (
+    DEFAULT_SMART_SCORE_PENALIZED_TAGS,
+    Character,
+    Face,
     Operation,
     Picture,
     PictureSet,
@@ -1242,6 +1254,99 @@ def test_undo_with_nothing_to_undo_is_409(client, server):
     assert client.post(f"{API}/operations/redo").status_code == 409
 
 
+@contextmanager
+def _hydrated_operation_ids():
+    """Collect the id of every ``Operation`` the ORM builds inside the block.
+
+    The ``load`` event fires once per row a query materialises into a session,
+    so this sees every row the SQL returned, not only the one the caller kept.
+    ``reset_operation_log`` empties the table before each test, so every row
+    seen here belongs to the calling test.
+    """
+    loaded: list[int] = []
+
+    def _on_load(target, _context):
+        loaded.append(target.id)
+
+    event.listen(Operation, "load", _on_load)
+    try:
+        yield loaded
+    finally:
+        event.remove(Operation, "load", _on_load)
+
+
+def test_history_lookups_build_only_the_operation_they_act_on(client, server):
+    """Undo state, undo and redo each hydrate just the row they return.
+
+    ``Result.first()`` adds no LIMIT and an ORM result is buffered, so an
+    unlimited "newest applied" lookup builds the whole applied history to keep
+    one row. Two rows on each side of the history make that visible.
+    """
+    picture_id = _upload(client)
+    for tag in ("one", "two", "three", "four"):
+        response = client.post(f"{API}/pictures/{picture_id}/tags", json={"tag": tag})
+        assert response.status_code == 200, response.text
+    four, three, two, one = [op["id"] for op in _operations(server)]
+    for _ in range(2):
+        assert client.post(f"{API}/operations/undo").status_code == 200
+
+    with _hydrated_operation_ids() as loaded:
+        state = client.get(f"{API}/operations/undo-state").json()
+    assert state["next_undo"]["id"] == two
+    assert state["next_redo"]["id"] in (three, four)
+    assert sorted(loaded) == sorted([two, state["next_redo"]["id"]])
+
+    with _hydrated_operation_ids() as loaded:
+        response = client.post(f"{API}/operations/undo")
+    assert response.status_code == 200, response.text
+    assert [op["id"] for op in response.json()["operations"]] == [two]
+    assert loaded == [two]
+
+    next_redo = client.get(f"{API}/operations/undo-state").json()["next_redo"]["id"]
+    with _hydrated_operation_ids() as loaded:
+        response = client.post(f"{API}/operations/redo")
+    assert response.status_code == 200, response.text
+    assert [op["id"] for op in response.json()["operations"]] == [next_redo]
+    assert loaded == [next_redo]
+    assert one not in loaded
+
+
+def test_stale_batch_check_builds_only_the_newest_blocking_operation(client, server):
+    """The interleaved-batch refusal names, and builds, one blocking row."""
+    picture_id = _upload(client)
+    batch_id = operation_log_service.new_batch_id()
+
+    def add_tag(session, tag):
+        session.add(Tag(picture_id=picture_id, tag=tag))
+        session.flush()
+
+    def record(tag, op_type, batch=None):
+        _result, operation = operation_log_service.run_recorded_metadata_task(
+            server.vault,
+            add_tag,
+            tag,
+            op_type=op_type,
+            picture_ids=[picture_id],
+            batch_id=batch,
+        )
+        return operation["id"]
+
+    oldest_member = record("batched-a", "test.batch", batch_id)
+    record("unrelated-older", "test.unrelated")
+    newest_blocker = record("unrelated-newer", "test.unrelated")
+    newest_member = record("batched-b", "test.batch", batch_id)
+
+    with _hydrated_operation_ids() as loaded:
+        response = client.post(f"{API}/operations/batches/{batch_id}/undo")
+
+    assert response.status_code == 409, response.text
+    assert (
+        f"operation {newest_blocker} must be undone first"
+        in (response.json()["detail"])
+    )
+    assert sorted(loaded) == sorted([newest_member, oldest_member, newest_blocker])
+
+
 def test_batch_undo_reverts_the_whole_bulk_action_in_one_call(client, server):
     """One bulk action = one batch id = one Undo, exactly as the sweep needs.
 
@@ -2405,3 +2510,254 @@ def test_a_server_minted_batch_id_is_namespaced():
         operation_log_service.SERVER_BATCH_ID_PREFIX
     )
     assert operation_log_service.new_batch_id() != operation_log_service.new_batch_id()
+
+
+# ---------------------------------------------------------------------------
+# Read-only listing paths stay off the single writer
+# ---------------------------------------------------------------------------
+
+# The table a write statement targets. Reads may still fill a connection-local
+# TEMP scope table (``scope_id_subquery``); only a library table counts.
+_WRITE_TARGET = re.compile(
+    r"^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|UPDATE(?:\s+OR\s+\w+)?"
+    r"|DELETE\s+FROM)\s+[\"`\[]?(\w+)",
+    re.IGNORECASE,
+)
+
+# Long enough for a cold CPU-only listing, far short of "never": a request that
+# waits on the held writer does not return until the hold is released.
+_READ_DEADLINE_S = 10
+
+
+@contextmanager
+def _writer_held(server):
+    """Occupy the vault's single writer thread for the duration of the block.
+
+    A control task runs on the writer thread itself, so while it waits nothing
+    else queued on the writer (``run_task``) can start.
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def _hold():
+        started.set()
+        release.wait()
+
+    held = server.vault.db.submit_control_task(_hold)
+    try:
+        assert started.wait(timeout=30), "the writer never picked up the hold"
+        yield
+    finally:
+        release.set()
+        held.result(timeout=30)
+
+
+@contextmanager
+def _vault_writes(server):
+    """Collect every write to a library table the vault engine executes in the block."""
+    engine = server.vault.db._engine
+    library_tables = set(sa_inspect(engine).get_table_names())
+    assert {"picture", "tag", "face"} <= library_tables
+    writes: list[str] = []
+
+    def _before_cursor_execute(
+        _conn, _cursor, statement, _parameters, _context, _executemany
+    ):
+        target = _WRITE_TARGET.match(statement)
+        if target and target.group(1).lower() in library_tables:
+            writes.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _before_cursor_execute)
+    try:
+        yield writes
+    finally:
+        event.remove(engine, "before_cursor_execute", _before_cursor_execute)
+
+
+def test_read_only_listing_paths_neither_wait_on_the_writer_nor_write(
+    client, server, monkeypatch
+):
+    """Search and the special listing modes answer while the writer is busy.
+
+    These paths only read. Queued on the single writer they wait behind every
+    pending write and hold back the next one; as immediate reads they answer
+    while a write is still running. The writer is held for the whole check, so
+    a request routed through it never returns, and no statement may write.
+    """
+    # Text search encodes its query on the request thread; no model is needed
+    # to exercise the read that follows.
+    monkeypatch.setattr(server.vault, "generate_text_embedding", lambda _query: None)
+    monkeypatch.setattr(
+        server.vault, "generate_clip_text_embedding", lambda _query: None
+    )
+    penalised_tag = next(iter(DEFAULT_SMART_SCORE_PENALIZED_TAGS))
+    live_id = _upload(client)
+    scrapped_id = _upload(client)
+    assert client.delete(f"{API}/pictures/{scrapped_id}").status_code == 200
+
+    def _seed(session):
+        character = Character(name="Barrier Person")
+        session.add(character)
+        session.flush()
+        session.add(
+            Face(
+                picture_id=live_id,
+                character_id=character.id,
+                bbox_=json.dumps([1, 1, 8, 8]),
+            )
+        )
+        session.add(Tag(picture_id=live_id, tag=penalised_tag))
+        session.commit()
+        return character.id
+
+    character_id = server.vault.db.run_task(_seed)
+    missing_character_id = character_id + 1000
+
+    requests = {
+        "text search": lambda: client.get(
+            f"{API}/pictures/search",
+            params={"query": penalised_tag, "threshold": 0.01},
+        ),
+        "likeness sort": lambda: client.get(
+            f"{API}/pictures",
+            params={
+                "sort": "CHARACTER_LIKENESS",
+                "character_id": missing_character_id,
+                "reference_character_id": missing_character_id,
+            },
+        ),
+        "unassigned count": lambda: client.get(
+            f"{API}/pictures/count", params={"character_id": "UNASSIGNED"}
+        ),
+        "unassigned list": lambda: client.get(
+            f"{API}/pictures", params={"character_id": "UNASSIGNED"}
+        ),
+        "scrapheap count": lambda: client.get(
+            f"{API}/pictures/count", params={"only_deleted": "true"}
+        ),
+        # Filtered to a live picture so the page is empty: a non-empty Scrapheap
+        # page then reads its retention fields through the writer queue, which
+        # would hide whether the listing read itself does.
+        "scrapheap list": lambda: client.get(
+            f"{API}/pictures", params={"only_deleted": "true", "id": live_id}
+        ),
+        "no-project list": lambda: client.get(
+            f"{API}/pictures", params={"project_id": "UNASSIGNED"}
+        ),
+    }
+
+    responses = {}
+    blocked = []
+    with ThreadPoolExecutor(max_workers=len(requests)) as pool:
+        with _writer_held(server), _vault_writes(server) as writes:
+            for label, send in requests.items():
+                pending = pool.submit(send)
+                try:
+                    responses[label] = pending.result(timeout=_READ_DEADLINE_S)
+                except TimeoutError:
+                    blocked.append(label)
+
+    assert blocked == [], f"waited on the held writer: {blocked}"
+    assert writes == [], f"a read-only path wrote: {writes}"
+    for label, response in responses.items():
+        assert response.status_code == 200, f"{label}: {response.text}"
+
+    def _ids(response):
+        payload = response.json()
+        rows = payload["pictures"] if isinstance(payload, dict) else payload
+        return {int(row["id"]) for row in rows}
+
+    # The answers are the library's, not an error path's empty default. The
+    # Scrapheap holds only this test's picture (``reset_operation_log``).
+    assert responses["scrapheap count"].json()["count"] == 1
+    assert live_id in _ids(responses["no-project list"])
+
+
+def test_thumbnail_faces_and_geometry_come_from_one_committed_state(
+    client, server, monkeypatch
+):
+    """A thumbnail batch never pairs old picture geometry with new face boxes.
+
+    The face boxes come back scaled by the picture's thumbnail and source
+    dimensions, which the batch reads in one statement and the faces in the
+    next. A rotation rewrites both in one commit. If that commit can land
+    between the two statements, the boxes are scaled by geometry that no
+    longer belongs to them and the overlay lands in the wrong place.
+
+    The write is forced into that gap: it is submitted when the request's own
+    read issues its first face statement, and the response must still carry
+    the state from before it.
+    """
+    picture_id = _upload(client)
+    old_bbox = [2, 2, 6, 4]
+    new_bbox = [4, 2, 8, 6]
+
+    def _seed(session):
+        picture = session.get(Picture, picture_id)
+        # A 2x bitmap, so a mapped box differs from the stored one.
+        picture.thumbnail_width = picture.width * 2
+        picture.thumbnail_height = picture.height * 2
+        face = Face(picture_id=picture_id, bbox_=json.dumps(old_bbox))
+        session.add(face)
+        session.commit()
+        return face.id, picture.width
+
+    face_id, width = server.vault.db.run_task(_seed)
+
+    def _rotation_shaped_write(session):
+        session.get(Face, face_id).bbox_ = json.dumps(new_bbox)
+        picture = session.get(Picture, picture_id)
+        picture.thumbnail_width = None
+        picture.thumbnail_height = None
+        session.commit()
+
+    engine = server.vault.db._engine
+    writer = server.vault.db._task_worker
+    armed = threading.Event()
+    readers = []
+    writes = []
+    find = Picture.find.__func__
+
+    # The shared server's background work also reads this picture, on task-runner
+    # threads and on the writer thread, where it loads the faces too. Only the
+    # request's own read may trigger the write, so remember the thread that runs
+    # its `Picture.find` and fire on that thread alone.
+    def _tracking_find(cls, session, *args, **kwargs):
+        if armed.is_set() and picture_id in (kwargs.get("id") or ()):
+            readers.append(threading.current_thread())
+        return find(cls, session, *args, **kwargs)
+
+    monkeypatch.setattr(Picture, "find", classmethod(_tracking_find))
+
+    def _between_picture_and_faces(
+        _conn, _cursor, statement, _parameters, _context, _executemany
+    ):
+        if not armed.is_set() or "FROM face" not in statement:
+            return
+        if not readers or threading.current_thread() is not readers[-1]:
+            return
+        armed.clear()
+        writes.append(server.vault.db.submit_task(_rotation_shaped_write))
+        # On the writer thread the write can only run after this read; waiting
+        # there would deadlock. Off it, let the write commit before the faces load.
+        if threading.current_thread() is not writer:
+            writes[-1].result(timeout=30)
+
+    event.listen(engine, "before_cursor_execute", _between_picture_and_faces)
+    try:
+        armed.set()
+        response = client.post(f"{API}/pictures/thumbnails", json={"ids": [picture_id]})
+    finally:
+        armed.clear()
+        event.remove(engine, "before_cursor_execute", _between_picture_and_faces)
+    assert len(writes) == 1, "the thumbnail request never loaded the picture's faces"
+    writes[0].result(timeout=30)
+    assert response.status_code == 200, response.text
+
+    thumbnail = response.json()[str(picture_id)]
+    boxes = {face["id"]: face["bbox"] for face in thumbnail["faces"]}
+    # The picture row was read before the write, so the face must be too.
+    assert thumbnail["thumbnail_width"] == width * 2
+    assert boxes[face_id] == [c * 2 for c in old_bbox], (
+        f"geometry from before the write, face box from after it: {boxes[face_id]}"
+    )

@@ -494,7 +494,9 @@ def register_routes(router, server):
             log_semantic_results(f"sorted_{sort_mech.key.name}", sorted_results)
             return sorted_results
 
-        results = server.vault.db.run_task(find_by_text, query, offset, limit)
+        results = server.vault.db.run_immediate_read_task(
+            find_by_text, query, offset, limit
+        )
         if results:
             hidden_ids = _fetch_hidden_picture_ids(
                 server,

@@ -1093,7 +1093,7 @@ def select_pictures_for_listing(
                 status_code=400,
                 detail="reference_character_id is required for CHARACTER_LIKENESS sort",
             )
-        candidate_ids = server.vault.db.run_task(
+        candidate_ids = server.vault.db.run_immediate_read_task(
             fetch_smart_score_candidate_ids,
             character_id,
             only_deleted,
@@ -1220,7 +1220,7 @@ def select_pictures_for_listing(
                     project_id_raw,
                 )
         if count_only:
-            return server.vault.db.run_task(
+            return server.vault.db.run_immediate_read_task(
                 Picture.find_unassigned,
                 count_only=True,
                 project_id=unassigned_project_id,
@@ -1259,7 +1259,7 @@ def select_pictures_for_listing(
                     else None
                 ),
             )
-        pics = server.vault.db.run_task(
+        pics = server.vault.db.run_immediate_read_task(
             Picture.find_unassigned,
             sort_mech=sort_mech,
             offset=offset,
@@ -1307,7 +1307,7 @@ def select_pictures_for_listing(
         pics = _record_sql_count(pics)
     elif only_deleted:
         if count_only:
-            return server.vault.db.run_task(
+            return server.vault.db.run_immediate_read_task(
                 Picture.find,
                 count_only=True,
                 only_deleted=True,
@@ -1328,7 +1328,7 @@ def select_pictures_for_listing(
                 guest_token_public_id=guest_token_public_id,
                 **query_params,
             )
-        pics = server.vault.db.run_task(
+        pics = server.vault.db.run_immediate_read_task(
             Picture.find,
             sort_mech=sort_mech,
             offset=offset,
@@ -1559,7 +1559,9 @@ def select_pictures_for_listing(
                     ).all()
                     return list(rows)
 
-                project_pic_ids = server.vault.db.run_task(get_unassigned_project_ids)
+                project_pic_ids = server.vault.db.run_immediate_read_task(
+                    get_unassigned_project_ids
+                )
                 if not project_pic_ids:
                     return _empty_result()
                 existing_ids = query_params.get("id")
