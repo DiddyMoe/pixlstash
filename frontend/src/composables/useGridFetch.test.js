@@ -1,16 +1,24 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { ref, reactive } from "vue";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { ref, reactive, effectScope } from "vue";
 import { setActivePinia, createPinia } from "pinia";
 import { useSortStore } from "../stores/useSortStore.js";
 import { useFilterStore } from "../stores/useFilterStore.js";
 import { useSelectionStore } from "../stores/useSelectionStore.js";
 import { useInboxStore } from "../stores/useInboxStore.js";
 import { useDedupStore } from "../stores/useDedupStore.js";
+import { useProjectStore } from "../stores/useProjectStore.js";
 import { useGridFetch } from "./useGridFetch.js";
 import { useSearchStore } from "../stores/useSearchStore.js";
 import { filterChips } from "../utils/filterChips.js";
+import { notifySessionReset, sessionContext } from "../utils/apiClient";
 import {
   getPictureCount,
+  getLikenessGroups,
+  faceSearch,
+  characterFaceSearch,
+  setLikenessSearch,
+  likenessSearch,
+  listPicturesByIds,
   searchPictures,
   streamPictures,
 } from "../api/pictures";
@@ -23,10 +31,19 @@ vi.mock("../api/pictures", () => ({
   streamPictures: vi.fn(),
   getLikenessGroups: vi.fn(),
   faceSearch: vi.fn(),
+  characterFaceSearch: vi.fn(),
+  setLikenessSearch: vi.fn(),
   likenessSearch: vi.fn(),
   searchPictures: vi.fn(),
   listPicturesByIds: vi.fn(),
 }));
+
+// Each harness runs in its own effect scope, as it would inside ImageGrid's
+// setup; stopping it is the component unmounting.
+const harnessScopes = [];
+afterEach(() => {
+  while (harnessScopes.length) harnessScopes.pop().stop();
+});
 
 // Build a minimal harness for useGridFetch. Covers the lightbox-defer path
 // (returns before any network call) and the streaming path (count + stream
@@ -36,6 +53,7 @@ function makeHarness({
   lightboxOpen = false,
   selectedSort = "DATE_TAKEN",
   storeOverrides = {},
+  extraRefs = {},
 } = {}) {
   // The composable reads the query's filter, sort and selection facets
   // straight from the stores, so every harness needs a live Pinia.
@@ -73,8 +91,13 @@ function makeHarness({
     exportProgress: reactive({ visible: false, percent: 0, message: "" }),
     reverseImageSearchPictureIds: ref([]),
     faceLikenessSearchFaceId: ref(null),
+    faceSearchCharacter: ref(null),
+    faceSearchRanked: ref(null),
+    setSuggestSet: ref(null),
+    setSuggestRanked: ref(null),
     textSearchResults: ref(null),
   };
+  Object.assign(refs, extraRefs);
 
   const sortStore = useSortStore();
   sortStore.selectedSort = selectedSort;
@@ -100,14 +123,50 @@ function makeHarness({
     onGridFetchDone: vi.fn(),
   };
 
-  const grid = useGridFetch(refs, props, callbacks);
+  const scope = effectScope();
+  harnessScopes.push(scope);
+  const grid = scope.run(() => useGridFetch(refs, props, callbacks));
   return {
     grid,
     refs,
     callbacks,
+    scope,
     startSmartScoreProgress,
     completeSmartScoreProgress,
   };
+}
+
+// A promise the test settles by hand, to hold a read in flight.
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+// A read that never answers on its own and rejects the way Axios does once its
+// signal is aborted.
+function readUntilAborted(signal) {
+  return new Promise((_, reject) => {
+    signal.addEventListener("abort", () => {
+      const error = new Error("canceled");
+      error.name = "CanceledError";
+      reject(error);
+    });
+  });
+}
+
+// The stream answers by view: the person-7 view has one picture, the library
+// view two, so a row in the grid says which load wrote it.
+function streamByView(query) {
+  return Promise.resolve({
+    pictures: query.includes("character_id=7")
+      ? [{ id: 70 }]
+      : [{ id: 1 }, { id: 2 }],
+  });
 }
 
 describe("useGridFetch sort-progress lifecycle", () => {
@@ -458,5 +517,701 @@ describe("useGridFetch: the Inbox and Imported from", () => {
     // A filter, not the view: its row in the menu adds it to the base itself.
     const base = new URLSearchParams(grid.buildFilterCountBaseQuery());
     expect(base.has("import_source_folder")).toBe(false);
+  });
+});
+
+describe("useGridFetch: the same-view key follows what the reads ask for", () => {
+  afterEach(() => {
+    sessionContext.value = null;
+  });
+
+  it.each([
+    ["minScoreFilter", 3],
+    ["maxScoreFilter", 4],
+    ["unscoredOnlyFilter", true],
+    ["smartScoreBucketFilter", "3-4"],
+    ["resolutionBucketFilter", "lt1mp"],
+    ["tagFilter", ["test-hat"]],
+    ["tagRejectedFilter", ["test-hat"]],
+    ["tagConfidenceAboveFilter", ["test-hat:0.80"]],
+    ["tagConfidenceBelowFilter", ["test-hat:0.80"]],
+    ["faceBboxFilter", "with_face"],
+    ["sharedOnlyFilter", true],
+  ])("changes when %s changes", (name, value) => {
+    const { grid } = makeHarness();
+    const before = grid.buildGridFetchKey();
+
+    useFilterStore()[name] = value;
+
+    expect(grid.buildGridFetchKey()).not.toBe(before);
+  });
+
+  it("changes when the selected sets move to another project", () => {
+    const { grid, refs } = makeHarness();
+    useSelectionStore().selectedSetIds = [3, 4];
+    refs.hasSetSelection.value = true;
+    refs.isSetOverlapView.value = true;
+    refs.normalizedSelectedSetIds.value = [3, 4];
+    const projectStore = useProjectStore();
+    projectStore.projectViewMode = "project";
+    projectStore.setProjectIds = { 3: 1, 4: 1 };
+    const before = grid.buildGridFetchKey();
+
+    projectStore.setProjectIds = { 3: 2, 4: 2 };
+
+    expect(grid.buildGridFetchKey()).not.toBe(before);
+  });
+
+  it("changes with the session of a guest who declined scoring consent", () => {
+    const { grid, refs } = makeHarness();
+    sessionContext.value = { scope: "READ" };
+    refs.guestConsentState.value = "rejected";
+    refs.guestSessionId.value = "test-guest-session-1";
+    const before = grid.buildGridFetchKey();
+
+    refs.guestSessionId.value = "test-guest-session-2";
+
+    expect(grid.buildGridFetchKey()).not.toBe(before);
+  });
+
+  describe("the key carries what the reads send", () => {
+    beforeEach(() => {
+      for (const read of [
+        getPictureCount,
+        streamPictures,
+        getLikenessGroups,
+        faceSearch,
+        characterFaceSearch,
+        setLikenessSearch,
+        likenessSearch,
+        searchPictures,
+        listPicturesByIds,
+      ]) {
+        read.mockReset();
+      }
+      streamPictures.mockImplementation(streamByView);
+    });
+
+    it.each([
+      [
+        "stream count",
+        () => {},
+        () =>
+          getPictureCount.mock.calls[0][0].replace(
+            "stack_leaders_only=true",
+            "",
+          ),
+      ],
+      [
+        "likeness groups",
+        () => {
+          useSortStore().selectedSort = "LIKENESS_GROUPS";
+        },
+        () => getLikenessGroups.mock.calls[0][1],
+      ],
+      [
+        "text search",
+        () => {
+          useSearchStore().searchQuery = "coffee";
+        },
+        () => searchPictures.mock.calls[0][1].query,
+      ],
+    ])("carries the query the %s read sends", async (_read, arrange, sent) => {
+      getPictureCount.mockResolvedValue({ count: 1 });
+      getLikenessGroups.mockResolvedValue([{ id: 1 }]);
+      searchPictures.mockResolvedValue([{ id: 1 }]);
+      const { grid } = makeHarness();
+      useFilterStore().minScoreFilter = 3;
+      arrange();
+
+      await grid.fetchAllGridImages({ force: true });
+
+      const query = sent();
+      expect(query).toContain("min_score=3");
+      expect(Object.values(JSON.parse(grid.buildGridFetchKey()))).toContain(
+        query,
+      );
+    });
+  });
+});
+
+describe("useGridFetch: one load at a time", () => {
+  beforeEach(() => {
+    for (const read of [
+      getPictureCount,
+      streamPictures,
+      getLikenessGroups,
+      faceSearch,
+      characterFaceSearch,
+      setLikenessSearch,
+      likenessSearch,
+      searchPictures,
+      listPicturesByIds,
+    ]) {
+      read.mockReset();
+    }
+    streamPictures.mockImplementation(streamByView);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("shares the running read with a second call for the same view that joins it", async () => {
+    const count = deferred();
+    getPictureCount.mockReturnValueOnce(count.promise);
+    const { grid, refs } = makeHarness();
+
+    const first = grid.fetchAllGridImages();
+    const second = grid.fetchAllGridImages({ join: true });
+    expect(getPictureCount).toHaveBeenCalledTimes(1);
+
+    count.resolve({ count: 2 });
+    await Promise.all([first, second]);
+    expect(getPictureCount).toHaveBeenCalledTimes(1);
+    expect(streamPictures).toHaveBeenCalledTimes(1);
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([1, 2]);
+  });
+
+  it("never lets a superseded load write its rows, even within one millisecond", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    const libraryCount = deferred();
+    getPictureCount
+      .mockReturnValueOnce(libraryCount.promise)
+      .mockResolvedValueOnce({ count: 1 });
+    const { grid, refs } = makeHarness();
+
+    const libraryLoad = grid.fetchAllGridImages();
+    useSelectionStore().selectedCharacter = 7;
+    await grid.fetchAllGridImages();
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([70]);
+
+    // The library's count answers late, after the person view has loaded.
+    libraryCount.resolve({ count: 2 });
+    await libraryLoad;
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([70]);
+    expect(streamPictures).toHaveBeenCalledTimes(1);
+    expect(grid.lastFetchSuccess.value.key).toBe(grid.buildGridFetchKey());
+  });
+
+  it("cancels the running read when the view changes", async () => {
+    getPictureCount
+      .mockImplementationOnce((_query, { signal }) => readUntilAborted(signal))
+      .mockResolvedValueOnce({ count: 1 });
+    const { grid } = makeHarness();
+
+    const libraryLoad = grid.fetchAllGridImages();
+    const librarySignal = getPictureCount.mock.calls[0][1].signal;
+    useSelectionStore().selectedCharacter = 7;
+    const personLoad = grid.fetchAllGridImages();
+
+    expect(librarySignal.aborted).toBe(true);
+    expect(getPictureCount.mock.calls[1][1].signal.aborted).toBe(false);
+    await Promise.all([libraryLoad, personLoad]);
+  });
+
+  it("a filter change during a load cancels it and never publishes its rows", async () => {
+    const heldCount = deferred();
+    getPictureCount
+      .mockReturnValueOnce(heldCount.promise)
+      .mockResolvedValueOnce({ count: 1 });
+    streamPictures.mockImplementation((query) =>
+      Promise.resolve({
+        pictures: query.includes("min_score=5")
+          ? [{ id: 50 }]
+          : [{ id: 1 }, { id: 2 }],
+      }),
+    );
+    const { grid, refs } = makeHarness();
+
+    const unfiltered = grid.fetchAllGridImages();
+    const unfilteredSignal = getPictureCount.mock.calls[0][1].signal;
+    useFilterStore().minScoreFilter = 5;
+    const filtered = grid.fetchAllGridImages({ force: true });
+
+    expect(unfilteredSignal.aborted).toBe(true);
+    expect(getPictureCount).toHaveBeenCalledTimes(2);
+    expect(getPictureCount.mock.calls[1][0]).toContain("min_score=5");
+
+    // The cancelled load's count answers anyway: its rows must not land.
+    heldCount.resolve({ count: 2 });
+    await Promise.all([unfiltered, filtered]);
+    expect(streamPictures).toHaveBeenCalledTimes(1);
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([50]);
+  });
+
+  it("a filter change during a text search cancels it and never publishes its rows", async () => {
+    const heldSearch = deferred();
+    searchPictures
+      .mockReturnValueOnce(heldSearch.promise)
+      .mockResolvedValueOnce([{ id: 50 }]);
+    const { grid, refs } = makeHarness();
+    useSearchStore().searchQuery = "coffee";
+
+    const unfiltered = grid.fetchAllGridImages();
+    await vi.waitFor(() => expect(searchPictures).toHaveBeenCalledTimes(1));
+    const unfilteredSignal = searchPictures.mock.calls[0][1].signal;
+    useFilterStore().minScoreFilter = 5;
+    const filtered = grid.fetchAllGridImages({ force: true });
+
+    expect(unfilteredSignal.aborted).toBe(true);
+    await vi.waitFor(() => expect(searchPictures).toHaveBeenCalledTimes(2));
+    expect(searchPictures.mock.calls[1][1].query).toContain("min_score=5");
+
+    // The cancelled search answers anyway: its rows must not land.
+    heldSearch.resolve([{ id: 1 }, { id: 2 }]);
+    await Promise.all([unfiltered, filtered]);
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([50]);
+  });
+
+  it("fails a cancelled load silently", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    getPictureCount
+      .mockImplementationOnce((_query, { signal }) => readUntilAborted(signal))
+      .mockResolvedValueOnce({ count: 1 });
+    const { grid, refs } = makeHarness();
+
+    const libraryLoad = grid.fetchAllGridImages();
+    useSelectionStore().selectedCharacter = 7;
+    const personLoad = grid.fetchAllGridImages();
+    const outcome = await libraryLoad;
+    await personLoad;
+
+    expect(outcome?.error ?? null).toBe(null);
+    expect(grid.imagesError.value).toBe(null);
+    expect(grid.lastFetchError.value.key).toBe("");
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([70]);
+    expect(warn).not.toHaveBeenCalledWith(
+      "[useGridFetch] Grid fetch failed",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("queues exactly one re-read behind the running load for forced calls", async () => {
+    const count = deferred();
+    getPictureCount
+      .mockReturnValueOnce(count.promise)
+      .mockResolvedValue({ count: 2 });
+    const { grid } = makeHarness();
+
+    const plain = grid.fetchAllGridImages();
+    const forcedA = grid.fetchAllGridImages({ force: true });
+    const forcedB = grid.fetchAllGridImages({ force: true });
+    expect(getPictureCount).toHaveBeenCalledTimes(1);
+
+    count.resolve({ count: 2 });
+    await Promise.all([plain, forcedA, forcedB]);
+    expect(getPictureCount).toHaveBeenCalledTimes(2);
+    expect(streamPictures).toHaveBeenCalledTimes(2);
+    // The re-read started only once the first load had read its rows, so it
+    // sees whatever changed while that load was running.
+    expect(getPictureCount.mock.invocationCallOrder[1]).toBeGreaterThan(
+      streamPictures.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("an unforced call during a load gets exactly one re-read after it", async () => {
+    const count = deferred();
+    getPictureCount
+      .mockReturnValueOnce(count.promise)
+      .mockResolvedValueOnce({ count: 1 });
+    streamPictures
+      .mockResolvedValueOnce({ pictures: [{ id: 1 }, { id: 2 }] })
+      .mockResolvedValueOnce({ pictures: [{ id: 2 }] });
+    const { grid, refs } = makeHarness();
+
+    const load = grid.fetchAllGridImages();
+    // Two refreshes for the same view arrive while the first read is out, as
+    // after deleting a picture the read may already have counted.
+    const refreshA = grid.fetchAllGridImages();
+    const refreshB = grid.fetchAllGridImages();
+    expect(getPictureCount).toHaveBeenCalledTimes(1);
+
+    count.resolve({ count: 2 });
+    await Promise.all([load, refreshA, refreshB]);
+    expect(getPictureCount).toHaveBeenCalledTimes(2);
+    expect(streamPictures).toHaveBeenCalledTimes(2);
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([2]);
+  });
+
+  it("re-reads after a set-suggestion load that seats the strength cut", async () => {
+    const ranked = deferred();
+    const row = (id, likeness) => ({
+      picture_id: id,
+      likeness,
+      cohesion: 0.5,
+      tags_matched: 0,
+      tags_total: 0,
+    });
+    setLikenessSearch
+      .mockReturnValueOnce(ranked.promise)
+      .mockResolvedValue([row(1, 0.9)]);
+    listPicturesByIds.mockResolvedValue([{ id: 1 }, { id: 2 }]);
+    const { grid, refs } = makeHarness({
+      extraRefs: { setSuggestThreshold: ref(null), setSuggestMinTags: ref(0) },
+    });
+    refs.setSuggestSet.value = { id: 6 };
+
+    const load = grid.fetchAllGridImages({ force: true });
+    const refresh = grid.fetchAllGridImages();
+    ranked.resolve([row(1, 0.9), row(2, 0.8)]);
+    await Promise.all([load, refresh]);
+
+    expect(setLikenessSearch).toHaveBeenCalledTimes(2);
+  });
+
+  describe("just after a load completes", () => {
+    beforeEach(() => {
+      // The second call comes within the de-dup windows.
+      vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+      getPictureCount
+        .mockResolvedValueOnce({ count: 2 })
+        .mockResolvedValueOnce({ count: 1 });
+      streamPictures
+        .mockResolvedValueOnce({ pictures: [{ id: 1 }, { id: 2 }] })
+        .mockResolvedValueOnce({ pictures: [{ id: 2 }] });
+    });
+
+    it("an unforced call re-reads", async () => {
+      const { grid, refs } = makeHarness();
+
+      await grid.fetchAllGridImages();
+      await grid.fetchAllGridImages();
+
+      expect(getPictureCount).toHaveBeenCalledTimes(2);
+      expect(refs.allGridImages.value.map((img) => img.id)).toEqual([2]);
+    });
+
+    it("a call that joins does not", async () => {
+      const { grid, refs } = makeHarness();
+
+      await grid.fetchAllGridImages();
+      await grid.fetchAllGridImages({ join: true });
+
+      expect(getPictureCount).toHaveBeenCalledTimes(1);
+      expect(refs.allGridImages.value.map((img) => img.id)).toEqual([1, 2]);
+    });
+  });
+
+  describe("just after a load fails", () => {
+    beforeEach(() => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+      getPictureCount
+        .mockRejectedValueOnce(new Error("test-count-failed"))
+        .mockResolvedValueOnce({ count: 2 });
+    });
+
+    it("an unforced call reads again", async () => {
+      const { grid, refs } = makeHarness();
+
+      await grid.fetchAllGridImages();
+      await grid.fetchAllGridImages();
+
+      expect(getPictureCount).toHaveBeenCalledTimes(2);
+      expect(grid.imagesError.value).toBe(null);
+      expect(refs.allGridImages.value.map((img) => img.id)).toEqual([1, 2]);
+    });
+
+    it("a call that joins does not", async () => {
+      const { grid } = makeHarness();
+
+      await grid.fetchAllGridImages();
+      await grid.fetchAllGridImages({ join: true });
+
+      expect(getPictureCount).toHaveBeenCalledTimes(1);
+      expect(grid.imagesError.value).toBe("test-count-failed");
+    });
+  });
+
+  it("drops a queued re-read when the view changes before it starts", async () => {
+    const count = deferred();
+    getPictureCount
+      .mockReturnValueOnce(count.promise)
+      .mockResolvedValue({ count: 1 });
+    const { grid, refs } = makeHarness();
+
+    const libraryLoad = grid.fetchAllGridImages();
+    const forced = grid.fetchAllGridImages({ force: true });
+    useSelectionStore().selectedCharacter = 7;
+    const personLoad = grid.fetchAllGridImages();
+    count.resolve({ count: 2 });
+    await Promise.all([libraryLoad, forced, personLoad]);
+
+    expect(getPictureCount).toHaveBeenCalledTimes(2);
+    expect(getPictureCount.mock.calls[1][0]).toContain("character_id=7");
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([70]);
+  });
+
+  it("drops a queued re-read when the view moves on before its own load is asked for", async () => {
+    const count = deferred();
+    getPictureCount.mockReturnValueOnce(count.promise);
+    const { grid } = makeHarness();
+
+    const libraryLoad = grid.fetchAllGridImages();
+    const forced = grid.fetchAllGridImages({ force: true });
+    // The selection has changed, but the grid has not yet asked for that view.
+    useSelectionStore().selectedCharacter = 7;
+    count.resolve({ count: 2 });
+    await Promise.all([libraryLoad, forced]);
+
+    expect(getPictureCount).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a queued re-read on a session reset", async () => {
+    const count = deferred();
+    getPictureCount.mockReturnValueOnce(count.promise);
+    const { grid } = makeHarness();
+
+    const load = grid.fetchAllGridImages();
+    const forced = grid.fetchAllGridImages({ force: true });
+    notifySessionReset("test");
+    count.resolve({ count: 2 });
+    await Promise.all([load, forced]);
+
+    expect(getPictureCount).toHaveBeenCalledTimes(1);
+  });
+
+  it("never lets a finished, superseded load clear the newer load's state", async () => {
+    const libraryCount = deferred();
+    const personCount = deferred();
+    getPictureCount
+      .mockReturnValueOnce(libraryCount.promise)
+      .mockReturnValueOnce(personCount.promise);
+    const { grid } = makeHarness();
+
+    const libraryLoad = grid.fetchAllGridImages();
+    useSelectionStore().selectedCharacter = 7;
+    const personLoad = grid.fetchAllGridImages();
+    libraryCount.resolve({ count: 2 });
+    await libraryLoad;
+
+    expect(grid.imagesLoading.value).toBe(true);
+    expect(grid.gridReady.value).toBe(false);
+    // The person view is still the running load: a call that joins shares it
+    // rather than starting a load of its own.
+    const joined = grid.fetchAllGridImages({ join: true });
+    expect(getPictureCount).toHaveBeenCalledTimes(2);
+
+    personCount.resolve({ count: 1 });
+    await Promise.all([personLoad, joined]);
+    expect(grid.imagesLoading.value).toBe(false);
+  });
+
+  it("cancels the running load on a session reset and reads afresh after it", async () => {
+    getPictureCount
+      .mockImplementationOnce((_query, { signal }) => readUntilAborted(signal))
+      .mockResolvedValue({ count: 2 });
+    const { grid, refs } = makeHarness();
+
+    const load = grid.fetchAllGridImages();
+    const signal = getPictureCount.mock.calls[0][1].signal;
+    notifySessionReset("test");
+
+    expect(signal.aborted).toBe(true);
+    expect(grid.imagesLoading.value).toBe(false);
+    await load;
+    expect(refs.allGridImages.value).toEqual([]);
+    expect(grid.imagesError.value).toBe(null);
+
+    await grid.fetchAllGridImages();
+    expect(getPictureCount).toHaveBeenCalledTimes(2);
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([1, 2]);
+  });
+
+  it("does not debounce the first read after a session reset", async () => {
+    getPictureCount.mockResolvedValue({ count: 2 });
+    const { grid } = makeHarness();
+
+    await grid.fetchAllGridImages();
+    notifySessionReset("test");
+    await grid.fetchAllGridImages({ join: true });
+
+    expect(getPictureCount).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not record success for a load superseded while its stacks refresh", async () => {
+    getPictureCount.mockResolvedValue({ count: 1 });
+    searchPictures.mockResolvedValue([{ id: 5 }]);
+    const { grid, refs, callbacks } = makeHarness();
+    const stacks = deferred();
+    callbacks.refreshExpandedStacksAfterFetch.mockReturnValueOnce(
+      stacks.promise,
+    );
+    const searchStore = useSearchStore();
+    const selection = useSelectionStore();
+    const allPictures = selection.selectedCharacter;
+
+    searchStore.searchQuery = "coffee";
+    const searchLoad = grid.fetchAllGridImages();
+    await vi.waitFor(() =>
+      expect(callbacks.refreshExpandedStacksAfterFetch).toHaveBeenCalled(),
+    );
+    searchStore.searchQuery = "";
+    selection.selectedCharacter = 7;
+    await grid.fetchAllGridImages();
+    stacks.resolve();
+    await searchLoad;
+
+    // Straight back to the search: it must read again, not be taken as
+    // already on screen.
+    selection.selectedCharacter = allPictures;
+    searchStore.searchQuery = "coffee";
+    await grid.fetchAllGridImages({ join: true });
+    expect(searchPictures).toHaveBeenCalledTimes(2);
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([5]);
+  });
+
+  it("cancels the running load when the grid is torn down", async () => {
+    getPictureCount.mockImplementationOnce((_query, { signal }) =>
+      readUntilAborted(signal),
+    );
+    const { grid, scope } = makeHarness();
+
+    const load = grid.fetchAllGridImages();
+    scope.stop();
+
+    expect(getPictureCount.mock.calls[0][1].signal.aborted).toBe(true);
+    await load;
+    expect(grid.imagesError.value).toBe(null);
+  });
+
+  it.each([
+    [
+      "stream",
+      () => {
+        // Large enough for a first batch, an early tail and a background batch.
+        getPictureCount.mockResolvedValue({ count: 3000 });
+      },
+      () => {
+        expect(streamPictures).toHaveBeenCalledTimes(3);
+        return [
+          getPictureCount.mock.calls[0][1],
+          ...streamPictures.mock.calls.map((call) => call[1]),
+        ];
+      },
+    ],
+    [
+      "likeness groups",
+      () => {
+        useSortStore().selectedSort = "LIKENESS_GROUPS";
+      },
+      () => [getLikenessGroups.mock.calls[0][2]],
+    ],
+    [
+      "person suggestion",
+      (refs) => {
+        refs.faceSearchCharacter.value = { id: 4 };
+      },
+      () => [
+        characterFaceSearch.mock.calls[0][1],
+        listPicturesByIds.mock.calls[0][1],
+      ],
+    ],
+    [
+      "set suggestion",
+      (refs) => {
+        refs.setSuggestSet.value = { id: 6 };
+      },
+      () => [
+        setLikenessSearch.mock.calls[0][1],
+        listPicturesByIds.mock.calls[0][1],
+      ],
+    ],
+    [
+      "face likeness",
+      (refs) => {
+        refs.faceLikenessSearchFaceId.value = 9;
+      },
+      () => [faceSearch.mock.calls[0][1], listPicturesByIds.mock.calls[0][1]],
+    ],
+    [
+      "reverse image",
+      (refs) => {
+        refs.reverseImageSearchPictureIds.value = [5];
+      },
+      () => [
+        likenessSearch.mock.calls[0][1],
+        listPicturesByIds.mock.calls[0][1],
+      ],
+    ],
+    [
+      "text search",
+      () => {
+        useSearchStore().searchQuery = "coffee";
+      },
+      () => [searchPictures.mock.calls[0][1]],
+    ],
+  ])("hands every %s read the load's abort signal", async (_mode, arrange, reads) => {
+    getPictureCount.mockResolvedValue({ count: 1 });
+    getLikenessGroups.mockResolvedValue([{ id: 1 }]);
+    faceSearch.mockResolvedValue([{ picture_id: 1 }]);
+    characterFaceSearch.mockResolvedValue([{ picture_id: 1 }]);
+    setLikenessSearch.mockResolvedValue([{ picture_id: 1 }]);
+    likenessSearch.mockResolvedValue([{ picture_id: 1 }]);
+    listPicturesByIds.mockResolvedValue([{ id: 1 }]);
+    searchPictures.mockResolvedValue([{ id: 1 }]);
+    const { grid, refs } = makeHarness();
+    arrange(refs);
+
+    await grid.fetchAllGridImages({ force: true });
+
+    for (const options of reads()) {
+      expect(options.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+});
+
+describe("useGridFetch: a failed batch fails the load", () => {
+  // 3000 pictures stream as a first batch, an early tail ending at the count,
+  // and one background batch between them.
+  const TOTAL = 3000;
+  const isTail = ({ offset, batchLimit }) => offset + batchLimit === TOTAL;
+
+  beforeEach(() => {
+    getPictureCount.mockReset();
+    streamPictures.mockReset();
+    getPictureCount.mockResolvedValue({ count: TOTAL });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reports a failed early tail as a failed load, not a shorter grid", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const tailError = new Error("test-tail-failed");
+    streamPictures.mockImplementation((_query, batch) =>
+      isTail(batch)
+        ? Promise.reject(tailError)
+        : Promise.resolve({ pictures: [{ id: batch.offset + 1 }] }),
+    );
+    const { grid } = makeHarness();
+
+    const outcome = await grid.fetchAllGridImages();
+
+    expect(outcome.success).toBe(false);
+    expect(outcome.error).toBe(tailError);
+    expect(grid.imagesError.value).toBe("test-tail-failed");
+    expect(grid.lastFetchError.value.key).toBe(grid.buildGridFetchKey());
+    expect(grid.lastFetchSuccess.value.key).not.toBe(grid.buildGridFetchKey());
+  });
+
+  it("reports the first batch's failure when the tail fails as well", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const firstError = new Error("test-first-failed");
+    streamPictures.mockImplementation((_query, batch) =>
+      Promise.reject(isTail(batch) ? new Error("test-tail-failed") : firstError),
+    );
+    const { grid } = makeHarness();
+
+    const outcome = await grid.fetchAllGridImages();
+    // Let the tail's rejection settle inside this test, so an unhandled one is
+    // reported against it.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(outcome.error).toBe(firstError);
+    expect(grid.imagesError.value).toBe("test-first-failed");
   });
 });

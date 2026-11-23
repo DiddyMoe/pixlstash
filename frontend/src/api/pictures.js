@@ -12,6 +12,18 @@ import {
 } from "../utils/apiClient";
 import { unwrap } from "../utils/unwrap";
 
+// The grid's reads take an optional AbortSignal so a superseded load can cancel
+// them. Without one the request keeps its config-less shape.
+function getCancellable(url, signal) {
+  return signal ? apiClient.get(url, { signal }) : apiClient.get(url);
+}
+
+function postCancellable(url, signal) {
+  return signal
+    ? apiClient.post(url, undefined, { signal })
+    : apiClient.post(url);
+}
+
 /**
  * The URL a browser loads a picture's thumbnail from.
  *
@@ -96,13 +108,14 @@ export async function getPictureThumbnailBlob(id, { cacheBuster } = {}) {
  * grid uses it to size its placeholder scroll area before any row has loaded.
  *
  * @param {string} [query=""] - pre-encoded filter query string, no leading `?`.
+ * @param {{signal?: AbortSignal}} [options]
  * @returns {Promise<Object>} the response body, whose `count` is the total.
  */
-export async function getPictureCount(query = "") {
+export async function getPictureCount(query = "", { signal } = {}) {
   const url = query
     ? `/pictures/count?${query}`
     : `/pictures/count`;
-  return unwrap(apiClient.get(url));
+  return unwrap(getCancellable(url, signal));
 }
 
 /**
@@ -116,14 +129,16 @@ export async function getPictureCount(query = "") {
  * @param {Object} options
  * @param {number} options.offset
  * @param {number} options.batchLimit
+ * @param {AbortSignal} [options.signal]
  * @returns {Promise<Object>} the response body, whose `pictures` is the batch.
  */
 export async function streamPictures(
   query,
-  { offset, batchLimit },
+  { offset, batchLimit, signal },
 ) {
-  return unwrap(apiClient.get(
+  return unwrap(getCancellable(
     `/pictures/stream?${query}&offset=${offset}&batch_limit=${batchLimit}`,
+    signal,
   ));
 }
 
@@ -132,16 +147,19 @@ export async function streamPictures(
  *
  * @param {number|string} threshold - similarity cut-off.
  * @param {string} [query=""] - pre-encoded filter query string.
+ * @param {{signal?: AbortSignal}} [options]
  * @returns {Promise<Array<Object>>} the grouped pictures (the response body).
  */
 export async function getLikenessGroups(
   threshold,
   query = "",
+  { signal } = {},
 ) {
-  return unwrap(apiClient.get(
+  return unwrap(getCancellable(
     `/pictures/likeness-groups?threshold=${encodeURIComponent(threshold)}${
       query ? `&${query}` : ""
     }`,
+    signal,
   ));
 }
 
@@ -158,19 +176,21 @@ export async function getLikenessGroups(
  * @param {Object} [options]
  * @param {number} [options.topN=500]
  * @param {number} [options.threshold] - minimum likeness to include.
+ * @param {AbortSignal} [options.signal]
  * @returns {Promise<Array<Object>>} ranked matches (the response body).
  */
 export async function faceSearch(
   sourceFaceId,
-  { topN = 500, threshold } = {},
+  { topN = 500, threshold, signal } = {},
 ) {
   const params = new URLSearchParams({
     source_face_id: String(sourceFaceId),
     top_n: String(topN),
   });
   if (threshold != null) params.append("threshold", String(threshold));
-  return unwrap(apiClient.post(
+  return unwrap(postCancellable(
     `/pictures/face-search?${params.toString()}`,
+    signal,
   ));
 }
 
@@ -198,6 +218,7 @@ export async function faceSearch(
  *   than the UI's default cut so the slider can be widened without a refetch.
  * @param {boolean} [options.excludeAssigned=true]
  * @param {boolean} [options.includeReferenceScores=true]
+ * @param {AbortSignal} [options.signal]
  * @returns {Promise<Array<Object>>} ranked matches (the response body).
  */
 export async function characterFaceSearch(
@@ -207,6 +228,7 @@ export async function characterFaceSearch(
     threshold = 0.5,
     excludeAssigned = true,
     includeReferenceScores = true,
+    signal,
   } = {},
 ) {
   const params = new URLSearchParams({
@@ -220,8 +242,9 @@ export async function characterFaceSearch(
   if (includeReferenceScores) {
     params.append("include_reference_scores", "true");
   }
-  return unwrap(apiClient.post(
+  return unwrap(postCancellable(
     `/pictures/face-search?${params.toString()}`,
+    signal,
   ));
 }
 
@@ -240,9 +263,10 @@ export async function characterFaceSearch(
  * slider's useful range is unknown until `cohesion` comes back.
  *
  * @param {number|string} setId
+ * @param {{signal?: AbortSignal}} [options]
  * @returns {Promise<Array<Object>>} ranked matches (the response body).
  */
-export async function setLikenessSearch(setId) {
+export async function setLikenessSearch(setId, { signal } = {}) {
   const params = new URLSearchParams({
     source_set_id: String(setId),
     top_n: "500",
@@ -250,8 +274,9 @@ export async function setLikenessSearch(setId) {
     exclude_set_id: String(setId),
     include_tag_counts: "true",
   });
-  return unwrap(apiClient.post(
+  return unwrap(postCancellable(
     `/pictures/likeness-search?${params.toString()}`,
+    signal,
   ));
 }
 
@@ -265,11 +290,12 @@ export async function setLikenessSearch(setId) {
  * @param {Object} [options]
  * @param {number} [options.topN=500]
  * @param {number} [options.threshold=0.05]
+ * @param {AbortSignal} [options.signal]
  * @returns {Promise<Array<Object>>} ranked matches (the response body).
  */
 export async function likenessSearch(
   sourcePictureIds,
-  { topN = 500, threshold = 0.05 } = {},
+  { topN = 500, threshold = 0.05, signal } = {},
 ) {
   const params = new URLSearchParams();
   sourcePictureIds.forEach((id) =>
@@ -277,8 +303,9 @@ export async function likenessSearch(
   );
   params.append("top_n", String(topN));
   params.append("threshold", String(threshold));
-  return unwrap(apiClient.post(
+  return unwrap(postCancellable(
     `/pictures/likeness-search?${params.toString()}`,
+    signal,
   ));
 }
 
@@ -291,14 +318,16 @@ export async function likenessSearch(
  * @param {number} [options.topN=10000]
  * @param {string} [options.query=""] - pre-encoded filter query string to
  *   narrow the search to the current scope.
+ * @param {AbortSignal} [options.signal]
  * @returns {Promise<Array<Object>>} the matching pictures (the response body).
  */
 export async function searchPictures(
   text,
-  { threshold = 0.1, topN = 10000, query = "" } = {},
+  { threshold = 0.1, topN = 10000, query = "", signal } = {},
 ) {
-  return unwrap(apiClient.get(
+  return unwrap(getCancellable(
     `/pictures/search?query=${encodeURIComponent(text)}&threshold=${threshold}&top_n=${topN}${query ? `&${query}` : ""}`,
+    signal,
   ));
 }
 
@@ -983,13 +1012,14 @@ export async function clearGuestScoreSession() {
  * @param {Object} [options]
  * @param {string} [options.fields] - projection, e.g. `"grid"`; omitted for
  *   the full record.
+ * @param {AbortSignal} [options.signal]
  * @returns {Promise<Array<Object>>} the pictures (the response body).
  */
-export async function listPicturesByIds(ids, { fields } = {}) {
+export async function listPicturesByIds(ids, { fields, signal } = {}) {
   const params = new URLSearchParams();
   ids.forEach((id) => params.append("id", String(id)));
   if (fields) params.append("fields", fields);
-  return unwrap(apiClient.get(`/pictures?${params.toString()}`));
+  return unwrap(getCancellable(`/pictures?${params.toString()}`, signal));
 }
 
 /**
