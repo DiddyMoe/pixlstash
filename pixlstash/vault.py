@@ -38,6 +38,7 @@ from .scoring import match_faces_to_characters
 from pixlstash.startup_permissions import mkdir_private
 from pixlstash.inference.engine import InferenceEngine
 from .utils.image_processing.image_utils import ImageUtils
+from .tasks.description_task import describable_picture_clauses
 from .tasks.face_extraction_task import FaceExtractionTask
 from .tasks.image_embedding_task import ImageEmbeddingTask
 from .tasks.likeness_task import LikenessTask
@@ -2684,10 +2685,10 @@ class Vault:
     def _count_missing_descriptions(self, session: Session) -> int:
         # The same predicate MissingDescriptionFinder selects on: NULL or a
         # ``__description::`` sentinel, never a picture frozen by a locked
-        # set, and never a suppressed one (undecodable or unreachable), which
-        # the finder will not hand out. A reset writes the sentinel, not NULL,
-        # so counting NULL alone read "N / N" through an entire regeneration
-        # (#1162).
+        # set, never one in the Scrapheap or without a file, and never a
+        # suppressed one (undecodable or unreachable), which the finder will
+        # not hand out. A reset writes the sentinel, not NULL, so counting NULL
+        # alone read "N / N" through an entire regeneration (#1162).
         suppressed_ids = self.db.unprocessable_images.active_suppressed_ids()
         result = session.exec(
             select(func.count())
@@ -2701,6 +2702,7 @@ class Vault:
                     ),
                 ),
                 ~Picture.id.in_(locked_picture_id_subquery()),
+                *describable_picture_clauses(),
                 not_in_json(Picture.id, suppressed_ids),
             )
         ).one()

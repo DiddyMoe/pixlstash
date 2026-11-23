@@ -12,7 +12,9 @@ four things happened:
 - ``FAILED_RETRYABLE``: the environment failed (backend, I/O, memory, writer,
   a decode that did not return in time); the file is presumed healthy and is
   retried later, never marked broken.
-- ``FAILED_PERMANENT``: the file's bytes were read and cannot be decoded.
+- ``FAILED_PERMANENT``: retrying will not help: the file's bytes were read
+  and cannot be decoded, or, for ``DESCRIPTION``, the model gave a picture
+  whose file decodes no caption while captioning others (``INFERENCE_ERROR``).
 - ``DEFERRED``: not attempted (cancelled, or not started before the task
   stopped waiting for its decodes).
 
