@@ -53,6 +53,11 @@ const selectedSnapshotId = ref(null);
 const preview = ref(null);
 const previewLoading = ref(false);
 const previewError = ref("");
+/**
+ * Bumped per preview read, so a preview read for a snapshot picked earlier
+ * never lands over the one picked since: Restore runs the latest pick.
+ */
+let previewSeq = 0;
 
 // Restore execution state.
 const restoring = ref(false);
@@ -130,16 +135,29 @@ watch(
 );
 
 async function fetchPreview(cpId) {
+  previewSeq += 1;
+  const seq = previewSeq;
   previewLoading.value = true;
   previewError.value = "";
   preview.value = null;
   try {
-    preview.value = await store.previewRestore(cpId, props.resources);
+    const answer = await store.previewRestore(cpId, props.resources);
+    // A later pick asked for its own preview, so this one describes a restore
+    // the Restore button would not run.
+    if (seq !== previewSeq) return;
+    preview.value = answer;
   } catch (err) {
+    if (seq !== previewSeq) {
+      console.warn(
+        "Dropped a failed restore preview that was superseded:",
+        err,
+      );
+      return;
+    }
     previewError.value =
       errorDetail(err) || err?.message || "Failed to load preview.";
   } finally {
-    previewLoading.value = false;
+    if (seq === previewSeq) previewLoading.value = false;
   }
 }
 
