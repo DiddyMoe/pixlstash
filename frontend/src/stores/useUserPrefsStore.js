@@ -15,6 +15,39 @@ export const useUserPrefsStore = defineStore("userPrefs", () => {
   const hiddenTags = ref([]);
   const applyTagFilter = ref(false);
   const penalisedTagWeights = ref({});
+
+  // Penalised-tag edits (Settings › Smart score) run one at a time, in click
+  // order. The PATCH replaces the whole list, so each edit is applied to the
+  // list the previous one left, at its turn, rather than to the list on screen
+  // when it was clicked. The queue lives here, not in the pane, because the
+  // settings dialog unmounts its content when it closes: a pane opened while
+  // an earlier pane's edit is saving queues behind it, and reads the list only
+  // once it has settled.
+  let penalisedEditTail = Promise.resolve();
+
+  /**
+   * Run `run` once every penalised-tag edit queued before it has settled.
+   * @param {() => Promise<*>} run - one edit.
+   * @returns {Promise<*>} what `run` returns, a rejection included.
+   */
+  function queuePenalisedEdit(run) {
+    const outcome = penalisedEditTail.then(run);
+    // The tail only marks when the queue is idle, so a rejected edit reaches
+    // its caller through `outcome` and still lets the edits behind it run.
+    penalisedEditTail = outcome.then(
+      () => undefined,
+      (error) => {
+        console.error("A queued penalised-tag edit failed:", error);
+      },
+    );
+    return outcome;
+  }
+
+  /** Resolves, never rejects, once every edit queued so far has settled. */
+  function penalisedEditsSettled() {
+    return penalisedEditTail;
+  }
+
   const checkForUpdates = ref(null); // null = undecided, true/false = user choice
   const sidebarThumbnailSize = ref(isReadOnly.value ? 32 : 48);
   // Expanded (non-docked) sidebar width in px. Drag-resizable, clamped 120–300.
@@ -189,6 +222,8 @@ export const useUserPrefsStore = defineStore("userPrefs", () => {
     hiddenTags,
     applyTagFilter,
     penalisedTagWeights,
+    queuePenalisedEdit,
+    penalisedEditsSettled,
     checkForUpdates,
     sidebarThumbnailSize,
     sidebarWidth,

@@ -14,11 +14,16 @@ import json
 import tempfile
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlmodel import Session, delete, select
 
 from pixlstash.db_models import Picture
 from pixlstash.db_models.pending_score_invalidation import PendingScoreInvalidation
-from pixlstash.db_models.tag import Tag
+from pixlstash.db_models.tag import (
+    DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
+    DEFAULT_SMART_SCORE_PENALIZED_TAGS,
+    Tag,
+)
 from pixlstash.server import Server
 from pixlstash.utils.service.smart_score_invalidation import (
     apply_pending_invalidations,
@@ -73,6 +78,13 @@ def _pending(server):
     return server.vault.db.run_immediate_read_task(
         lambda session: session.exec(select(PendingScoreInvalidation)).all()
     )
+
+
+def _owner_client(server) -> TestClient:
+    client = TestClient(server.api)
+    response = client.post("/login", json={"username": "pend", "password": "pendpass1"})
+    assert response.status_code == 200, response.text
+    return client
 
 
 class TestRecording:
@@ -222,3 +234,38 @@ class TestTheSettingsHandler:
         assert response.status_code == 200, response.text
         assert _score_of(server, picture_id) is None
         assert _pending(server) == [], "the record should be consumed inline"
+
+    def test_removing_the_last_row_rescores_only_pictures_carrying_it(self, server):
+        """The diff is taken against ``{}``, not against the shipped defaults."""
+        client = _owner_client(server)
+        response = client.patch(
+            "/api/v1/users/me/config",
+            json={"smart_score_penalised_tags": {"test-last-tag": 4}},
+        )
+        assert response.status_code == 200, response.text
+        removed = _picture_with_tag(server, "test-last-tag")
+        default_name = next(iter(DEFAULT_SMART_SCORE_PENALIZED_TAGS))
+        control = _picture_with_tag(server, default_name, score=3.1)
+
+        response = client.patch(
+            "/api/v1/users/me/config", json={"smart_score_penalised_tags": {}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert _score_of(server, removed) is None
+        assert _score_of(server, control) == pytest.approx(3.1)
+
+    def test_a_non_finite_weight_is_saved_with_the_default_weight(self, server):
+        """An infinite weight is as unusable as a word, not a server error."""
+        client = _owner_client(server)
+
+        response = client.patch(
+            "/api/v1/users/me/config",
+            json={"smart_score_penalised_tags": {"test-tag": "inf", "test-other": 4}},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["config"]["smart_score_penalised_tags"] == {
+            "test-tag": DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
+            "test-other": 4,
+        }

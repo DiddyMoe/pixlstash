@@ -13,15 +13,22 @@ outside: one flat config object, two databases behind it.
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
-from pixlstash.db_models import User
+from pixlstash.db_models import Picture, User
 from pixlstash.db_models.library_settings import LibrarySettings
+from pixlstash.db_models.tag import DEFAULT_SMART_SCORE_PENALIZED_TAGS
+from pixlstash.scoring.smart_score import (
+    get_smart_score_penalised_tags_from_request,
+    resolve_penalised_tag_weights,
+)
 from pixlstash.server import Server
 from pixlstash.services import library_settings_service
+from pixlstash.utils.quality.smart_score_utils import resolve_owner_penalised_tags
 from tests.utils import reset_owner_auth
 
 API = "/api/v1"
@@ -191,6 +198,41 @@ class TestItFollowsTheLibrary:
             server.library_switch.switch_to(original.uuid)
 
 
+class TestTheOwnersPenalisedTable:
+    """An emptied penalised table is the owner's choice, not a missing value.
+
+    A missing or unreadable value still means the shipped defaults. A saved
+    ``{}`` means "penalise nothing", and every reader has to agree: the settings
+    response, request scoring and background scoring.
+    """
+
+    def test_a_missing_or_unreadable_value_reads_as_the_defaults(self, server):
+        assert resolve_owner_penalised_tags(None) == DEFAULT_SMART_SCORE_PENALIZED_TAGS
+        assert (
+            resolve_owner_penalised_tags("not json")
+            == DEFAULT_SMART_SCORE_PENALIZED_TAGS
+        )
+
+    def test_an_emptied_table_stays_empty_for_every_reader(self, server):
+        client = _owner(server)
+
+        response = client.patch(
+            f"{API}/users/me/config", json={"smart_score_penalised_tags": {}}
+        )
+
+        assert response.status_code == 200, response.text
+        config = client.get(f"{API}/users/me/config").json()
+        assert config["smart_score_penalised_tags"] == {}
+        assert client.get(f"{API}/users/me/penalised-tags").json() == {
+            "smart_score_penalised_tags": {}
+        }
+        owner_request = SimpleNamespace(
+            state=SimpleNamespace(auth_user_id=server.auth.user.id), cookies={}
+        )
+        assert get_smart_score_penalised_tags_from_request(server, owner_request) == {}
+        assert resolve_penalised_tag_weights(server.auth) == {}
+
+
 class TestTheSettingsFingerprint:
     """The library records *that* the owner's weights changed, never what they are.
 
@@ -344,6 +386,36 @@ class TestCatchingUpADormantLibrary:
             lambda session: session.get(Picture, picture_id).smart_score
         )
         assert score == pytest.approx(3.3)
+
+    def test_emptying_the_table_while_closed_invalidates_on_open(self, server):
+        """Removing every penalised tag is a change, not a return to the defaults."""
+        client = _owner(server)
+        library = server.library_registry.active_library()
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db,
+            library.settings_salt,
+            resolve_owner_penalised_tags(None),
+        )
+
+        def _add(session: Session):
+            picture = Picture(file_path="/tmp/emptied.png", smart_score=4.4)
+            session.add(picture)
+            session.commit()
+            session.refresh(picture)
+            return picture.id
+
+        picture_id = server.vault.db.run_task(_add)
+        response = client.patch(
+            f"{API}/users/me/config", json={"smart_score_penalised_tags": {}}
+        )
+        assert response.status_code == 200, response.text
+
+        server.reconcile_library_settings(server.vault, library)
+
+        score = server.vault.db.run_immediate_read_task(
+            lambda session: session.get(Picture, picture_id).smart_score
+        )
+        assert score is None, "an emptied table must not hash like the defaults"
 
     def test_the_first_ever_reconcile_invalidates_nothing(self, server):
         """A library that has never recorded one has nothing to repair."""

@@ -13,10 +13,16 @@ const CONFIG_URL = "/users/me/config";
 
 /**
  * Fetch the current user's configuration blob.
+ * @param {Object} [options]
+ * @param {AbortSignal} [options.signal] - cancels the request when aborted.
  * @returns {Promise<Object>} the config object (the response body).
  */
-export async function getUserConfig() {
-  return unwrap(apiClient.get(`${CONFIG_URL}`));
+export async function getUserConfig({ signal } = {}) {
+  return unwrap(
+    signal
+      ? apiClient.get(`${CONFIG_URL}`, { signal })
+      : apiClient.get(`${CONFIG_URL}`),
+  );
 }
 
 /**

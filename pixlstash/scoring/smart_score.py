@@ -20,7 +20,6 @@ from sqlmodel import Session, select
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     DEFAULT_SMART_SCORE_PENALIZED_TAGS,
-    DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
     Face,
     Picture,
     Quality,
@@ -33,7 +32,7 @@ from pixlstash.services.tagger_run_service import get_latest_tag_precisions
 from pixlstash.utils.quality.anomaly_penalty import ANOMALY_PENALTY_TAGS
 from pixlstash.utils.quality.smart_score_utils import (
     SmartScoreUtils,
-    smart_score_penalised_tags,
+    resolve_owner_penalised_tags,
 )
 from pixlstash.utils.service.anomaly_thresholds import resolve_anomaly_apply_thresholds
 from pixlstash.utils.service.label_ledger import HUMAN, NEG, POS
@@ -115,10 +114,8 @@ def get_smart_score_penalised_tags_from_request(server, request):
         lambda session: session.get(User, user_id),
         priority=DBPriority.IMMEDIATE,
     )
-    return smart_score_penalised_tags(
-        user.smart_score_penalised_tags if user else None,
-        DEFAULT_SMART_SCORE_PENALIZED_TAGS,
-        default_weight=DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
+    return resolve_owner_penalised_tags(
+        user.smart_score_penalised_tags if user else None
     )
 
 
@@ -346,9 +343,10 @@ def resolve_penalised_tag_weights(auth_service) -> dict:
 
     The user's table *replaces* the shipped defaults rather than merging with them - that
     is the contract of
-    :func:`~pixlstash.utils.quality.smart_score_utils.smart_score_penalised_tags`, which
-    only returns the fallback when the stored value is absent or unparseable. A tag the
-    user deleted is therefore genuinely no longer penalised.
+    :func:`~pixlstash.utils.quality.smart_score_utils.resolve_owner_penalised_tags`, which
+    only returns the defaults when the stored value is absent or unparseable; a saved
+    empty table stays empty. A tag the user deleted is therefore genuinely no longer
+    penalised, including the last one.
 
     This is the resolution the background
     :class:`~pixlstash.tasks.smart_score_task.SmartScoreTask` uses; the request-scoped
@@ -377,11 +375,7 @@ def resolve_penalised_tag_weights(auth_service) -> dict:
             "the shipped DEFAULT_SMART_SCORE_PENALIZED_TAGS seed."
         )
         return dict(DEFAULT_SMART_SCORE_PENALIZED_TAGS)
-    return smart_score_penalised_tags(
-        user.smart_score_penalised_tags,
-        DEFAULT_SMART_SCORE_PENALIZED_TAGS,
-        default_weight=DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
-    )
+    return resolve_owner_penalised_tags(user.smart_score_penalised_tags)
 
 
 def attach_anomaly_inputs(

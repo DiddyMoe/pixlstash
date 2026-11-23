@@ -57,8 +57,7 @@ from pixlstash.services import (
     tag_group_service,
     workflow_ghost_service,
 )
-from pixlstash.utils.quality.smart_score_utils import smart_score_penalised_tags
-from pixlstash.db_models.tag import DEFAULT_SMART_SCORE_PENALIZED_TAGS
+from pixlstash.utils.quality.smart_score_utils import resolve_owner_penalised_tags
 from pixlstash.startup_checks import StartupChecks
 from pixlstash.startup_permissions import mkdir_private
 from pixlstash.hub.bootstrap import (
@@ -1230,9 +1229,8 @@ class Server(
         if library is None:
             return
         try:
-            penalised = smart_score_penalised_tags(
-                getattr(self._user, "smart_score_penalised_tags", None),
-                DEFAULT_SMART_SCORE_PENALIZED_TAGS,
+            penalised = resolve_owner_penalised_tags(
+                getattr(self._user, "smart_score_penalised_tags", None)
             )
             library_settings_service.reconcile_settings_fingerprint(
                 vault.db, library.settings_salt, penalised
