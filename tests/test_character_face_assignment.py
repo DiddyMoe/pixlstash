@@ -12,18 +12,25 @@ face model.
 """
 
 import os
+import sqlite3
 import tempfile
+from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from pixlstash.db_models import Character, Picture
+from pixlstash.database import create_configured_engine
+from pixlstash.db_models import Character, Picture, Tag
 from pixlstash.db_models.face import Face
 from pixlstash.scoring import (
     compute_character_likeness_for_faces,
     match_faces_to_characters,
+    select_reference_faces_for_character,
 )
 from pixlstash.server import Server
 from pixlstash.services import operation_log_service
@@ -633,3 +640,247 @@ def test_people_with_no_references_take_the_largest_faces_in_turn(library):
     assert match_faces_to_characters(
         library, [small, large], [first, second, third]
     ) == {large.id: first, small.id: second}
+
+
+# --- reference faces for a person with no reference cluster ----------------
+
+EARLIEST = datetime(2024, 1, 1, tzinfo=timezone.utc)
+T0 = datetime(2025, 1, 1, tzinfo=timezone.utc)
+T1 = datetime(2025, 2, 1, tzinfo=timezone.utc)
+T2 = datetime(2025, 3, 1, tzinfo=timezone.utc)
+T3 = datetime(2025, 4, 1, tzinfo=timezone.utc)
+
+
+@pytest.fixture(params=[False, True], ids=["scan-order", "reversed-scan-order"])
+def any_scan_order(request, library):
+    """The vault read in SQLite's own row order, then in reverse.
+
+    ``reverse_unordered_selects`` flips the order rows come back in wherever
+    no ORDER BY fixes it, so a choice that leans on that order rather than
+    on its sort key changes between the two runs.
+    """
+    dbapi = library.connection().connection.dbapi_connection
+    dbapi.execute(f"PRAGMA reverse_unordered_selects = {int(request.param)}")
+    try:
+        yield library
+    finally:
+        dbapi.execute("PRAGMA reverse_unordered_selects = 0")
+
+
+@contextmanager
+def _variable_limit(session, limit):
+    """Lower how many parameters SQLite binds per statement, then restore it."""
+    dbapi = session.connection().connection.dbapi_connection
+    previous = dbapi.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+    dbapi.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+    try:
+        yield
+    finally:
+        dbapi.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+
+def _picture(session, created_at, *tags, score=None, deleted=False):
+    """A picture taken at *created_at* carrying *tags*; return its id."""
+    picture = Picture(
+        file_path="ref.png", created_at=created_at, score=score, deleted=deleted
+    )
+    session.add(picture)
+    session.commit()
+    for tag in tags:
+        session.add(Tag(picture_id=picture.id, tag=tag))
+    session.commit()
+    return picture.id
+
+
+def _face(session, character_id, picture_id, face_index=0, features=ALONG_X):
+    """A face of *character_id* on *picture_id*; return its id."""
+    face = Face(
+        picture_id=picture_id,
+        face_index=face_index,
+        character_id=character_id,
+        bbox=SMALL_BBOX,
+        features=features,
+    )
+    session.add(face)
+    session.commit()
+    return face.id
+
+
+def _reference_ids(session, character_id, max_refs=10):
+    faces = select_reference_faces_for_character(session, character_id, max_refs)
+    return [face.id for face in faces]
+
+
+def test_unrated_references_leave_flawed_pictures_for_last(any_scan_order):
+    """Penalised tags count summed and in any case; age breaks the ties."""
+    session = any_scan_order
+    person = _person(session, "a")
+    # Seeded in reverse of the expected order, so row order alone is wrong.
+    _face(session, person, _picture(session, T0, "bad anatomy"))  # 5: left out
+    double = _face(session, person, _picture(session, T0, "noise", "Waxy Skin"))
+    three = _face(session, person, _picture(session, T0, "Incorrect Reflection"))
+    light = _face(session, person, _picture(session, T0, "WATERMARK"))  # 1
+    undated = _face(session, person, _picture(session, None))
+    unflawed = _face(
+        session, person, _picture(session, T1, "Silicone Breasts", "smile")
+    )
+
+    assert _reference_ids(session, person) == [unflawed, undated, light, three, double]
+    assert _reference_ids(session, person, max_refs=3) == [unflawed, undated, light]
+
+
+def test_unrated_reference_ties_go_by_picture_then_face(any_scan_order):
+    session = any_scan_order
+    person = _person(session, "a")
+    someone_else = _person(session, "b")
+    # Older than everything below, and never a reference of "a".
+    _face(session, person, _picture(session, EARLIEST, deleted=True))
+    _face(session, person, _picture(session, EARLIEST), features=None)
+    _face(session, someone_else, _picture(session, EARLIEST))
+    _face(session, person, None)
+    oldest = _face(session, person, _picture(session, T0))
+    shared = _picture(session, T1)
+    first_on_shared = _face(session, person, shared, face_index=0)
+    second_on_shared = _face(session, person, shared, face_index=1)
+    lower, higher = _picture(session, T2), _picture(session, T2)
+    on_higher = _face(session, person, higher)  # the lower face id
+    on_lower = _face(session, person, lower)
+
+    assert _reference_ids(session, person) == [
+        oldest,
+        first_on_shared,
+        second_on_shared,
+        on_lower,
+        on_higher,
+    ]
+
+
+def test_rated_references_come_first_and_only_once(any_scan_order):
+    session = any_scan_order
+    person = _person(session, "a")
+    _face(session, person, _picture(session, EARLIEST, score=5, deleted=True))
+    late_five = _face(session, person, _picture(session, T3, score=5))
+    early_five = _face(session, person, _picture(session, T1, score=5))
+    # The oldest picture: first in line again once the unrated ones are read.
+    four = _face(session, person, _picture(session, EARLIEST, score=4))
+    _face(session, person, _picture(session, T0, "noise", score=0))  # left out
+    three = _face(session, person, _picture(session, T0, score=3))
+    unrated = _face(session, person, _picture(session, T2))
+
+    assert _reference_ids(session, person) == [
+        early_five,
+        late_five,
+        four,
+        three,
+        unrated,
+    ]
+    assert _reference_ids(session, person, max_refs=2) == [early_five, late_five]
+    assert _reference_ids(session, person, max_refs=3) == [
+        early_five,
+        late_five,
+        four,
+    ]
+    assert _reference_ids(session, person, max_refs=4) == [
+        early_five,
+        late_five,
+        four,
+        three,
+    ]
+
+
+def test_a_person_with_few_faces_gets_each_of_them_once(any_scan_order):
+    session = any_scan_order
+    person = _person(session, "a")
+    four = _face(session, person, _picture(session, T1, score=4))
+    unrated = _face(session, person, _picture(session, T0, "noise"))
+    _face(session, person, _picture(session, EARLIEST), features=None)
+
+    assert _reference_ids(session, person) == [four, unrated]
+    assert _reference_ids(session, _person(session, "nobody")) == []
+
+
+def test_references_for_a_person_on_more_pictures_than_sqlite_binds(library):
+    """Lowered here to 20 parameters a statement; a desktop SQLite stops at
+    32766, which a person on that many pictures used to hit."""
+    person = _person(library, "a")
+    faces = [
+        _face(library, person, _picture(library, T0 + timedelta(days=day)))
+        for day in range(40)
+    ]
+    library.add(Tag(picture_id=library.get(Face, faces[0]).picture_id, tag="noise"))
+    library.commit()
+
+    with _variable_limit(library, 20):
+        assert _reference_ids(library, person) == faces[1:6]
+
+
+def test_references_load_the_chosen_faces_and_no_pictures(library):
+    person = _person(library, "a")
+    five = _face(library, person, _picture(library, T0, score=5))
+    four = _face(library, person, _picture(library, T0, score=4))
+    unrated = [
+        _face(library, person, _picture(library, T1 + timedelta(days=day)))
+        for day in range(12)
+    ]
+    library.expunge_all()
+    loaded = Counter()
+
+    def count(target, _context):
+        loaded[type(target).__name__] += 1
+
+    event.listen(Face, "load", count)
+    event.listen(Picture, "load", count)
+    try:
+        ids = _reference_ids(library, person)
+    finally:
+        event.remove(Face, "load", count)
+        event.remove(Picture, "load", count)
+
+    assert ids == [five, four, *unrated[:3]]
+    assert loaded == {"Face": 5}
+
+
+def test_a_reference_deleted_while_references_are_chosen_leaves_five(tmp_path):
+    """Face search, character sheets and training previews read beside the
+    writer, which can delete a face (a face-model refresh, a picture deleted
+    for good) while the references are being chosen. The person still gets
+    five: the face as it was read, or the next one in line."""
+    path = str(tmp_path / "vault.db")
+    engine = create_configured_engine(path)
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        person = _person(session, "a")
+        faces = [
+            _face(session, person, _picture(session, T0 + timedelta(days=day)))
+            for day in range(7)
+        ]
+    deleted = []
+
+    def delete_once_ranked(conn, cursor, statement, parameters, context, many):
+        # The ranking read: faces joined to pictures, neither ordered nor
+        # limited in SQL.
+        ranking = " ".join(statement.split())
+        if deleted or not ranking.startswith("SELECT face.id"):
+            return
+        if "JOIN picture" not in ranking or "LIMIT" in ranking:
+            return
+        if "ORDER BY" in ranking:
+            return
+        writer = sqlite3.connect(path)
+        try:
+            writer.execute("DELETE FROM face WHERE id = ?", (faces[0],))
+            writer.commit()
+        finally:
+            writer.close()
+        deleted.append(faces[0])
+
+    event.listen(engine, "after_cursor_execute", delete_once_ranked)
+    try:
+        with Session(engine) as session:
+            ids = _reference_ids(session, person)
+    finally:
+        event.remove(engine, "after_cursor_execute", delete_once_ranked)
+        engine.dispose()
+
+    assert deleted == [faces[0]]
+    assert ids in (faces[:5], faces[1:6])
