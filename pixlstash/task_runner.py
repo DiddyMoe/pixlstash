@@ -75,8 +75,15 @@ class TaskRunner:
         )
         self._queue_seq = itertools.count()
         self._stop = threading.Event()
+        # Every worker started and not yet seen to exit, for ``stop()`` to join.
         self._threads: list[threading.Thread] = []
+        # One slot per worker, so one that dies is replaced under its own name
+        # and one still alive - however long its task runs - never is. Under
+        # ``_lock``, like the restart counts and the last failure.
+        self._cpu_workers: list[Optional[threading.Thread]] = [None] * self._num_workers
         self._gpu_worker: Optional[threading.Thread] = None
+        self._lane_restarts = {"cpu": 0, "gpu": 0}
+        self._last_lane_failure: Optional[dict[str, str]] = None
         self._lock = threading.Lock()
         self._active_task_lock = threading.Lock()
         self._active_tasks: dict[int, BaseTask] = {}  # thread ident -> running task
@@ -177,7 +184,11 @@ class TaskRunner:
         Returns:
             Number of tasks cancelled.
         """
-        cancelled = 0
+        # The tasks waiting out a GPU backoff are taken first, then the queues
+        # drained: a backoff that ends meanwhile moves its task onto a queue
+        # under the same lock (see ``_requeue``), so it is caught by the drain
+        # rather than landing on a queue already drained.
+        cancelled = self._cancel_requeued("drained from the queue")
         for q in (self._queue, self._gpu_queue):
             while True:
                 try:
@@ -186,9 +197,8 @@ class TaskRunner:
                     break
                 if isinstance(queued_task, _StopTask):
                     continue
-                self._cancel_queued_task(queued_task, "drained from the queue")
-                cancelled += 1
-        cancelled += self._cancel_requeued("drained from the queue")
+                if self._cancel_queued_task(queued_task, "drained from the queue"):
+                    cancelled += 1
         logger.debug(
             "TaskRunner %s: cancelled %d pending task(s).", self._name, cancelled
         )
@@ -247,6 +257,18 @@ class TaskRunner:
                     self._preempted.pop(task.id, None)
                 continue
             stopped.append(task.type)
+        # Backoffs before the queue, for the reason ``cancel_pending_tasks``
+        # gives.
+        with self._active_task_lock:
+            waiting = [
+                task_id
+                for task_id, (_timer, task) in self._requeued.items()
+                if task.queue_type == QueueType.GPU and not self._interactive(task)
+            ]
+        for task_id in waiting:
+            task = self._take_requeued(task_id)
+            if task is not None and self._cancel_queued_task(task, reason):
+                stopped.append(task.type)
         kept = []
         while True:
             try:
@@ -257,21 +279,10 @@ class TaskRunner:
             if isinstance(queued_task, _StopTask) or self._interactive(queued_task):
                 kept.append(item)
                 continue
-            self._cancel_queued_task(queued_task, reason)
-            stopped.append(queued_task.type)
+            if self._cancel_queued_task(queued_task, reason):
+                stopped.append(queued_task.type)
         for item in kept:
             self._gpu_queue.put(item)
-        with self._active_task_lock:
-            waiting = [
-                task_id
-                for task_id, (_timer, task) in self._requeued.items()
-                if task.queue_type == QueueType.GPU and not self._interactive(task)
-            ]
-        for task_id in waiting:
-            task = self._take_requeued(task_id)
-            if task is not None:
-                self._cancel_queued_task(task, reason)
-                stopped.append(task.type)
         if stopped:
             logger.warning(
                 "TaskRunner %s: stopped %d GPU task(s) (%s): %s",
@@ -361,7 +372,12 @@ class TaskRunner:
             self._requeue_counts.pop(task.id, None)
             return True, lease
         if task.allow_cpu_spillover():
+            # Recorded before the task is switched over: a task switched and
+            # then not recorded would wait out the backoff below still set for
+            # the CPU, and run there on the GPU lease it is granted next time.
+            cpu_lease: Optional[Lease] = None
             try:
+                cpu_lease = self._arbiter.note_on_cpu(task.type, task.type)
                 task.enable_cpu_spillover()
                 logger.info(
                     "Task %s (%s) moved to the CPU: the GPU has no room for %s MB",
@@ -370,7 +386,7 @@ class TaskRunner:
                     need_mb,
                 )
                 self._requeue_counts.pop(task.id, None)
-                return True, self._arbiter.note_on_cpu(task.type, task.type)
+                return True, cpu_lease
             except Exception as exc:
                 logger.warning(
                     "Task %s (%s) could not move to the CPU, so it waits for "
@@ -379,6 +395,8 @@ class TaskRunner:
                     task.type,
                     exc,
                 )
+                if cpu_lease is not None:
+                    self._give_back(task, cpu_lease)
         attempts = self._requeue_counts.get(task.id, 0)
         self._requeue_counts[task.id] = attempts + 1
         # The exponent is capped: a task that waits out a long GPU run is requeued
@@ -397,9 +415,25 @@ class TaskRunner:
         )
         timer = threading.Timer(delay, self._requeue, args=(task.id, work_queue))
         timer.daemon = True
+        # Entered before the timer starts, so a timer that fires at once finds
+        # its task. A timer that never started must not leave the entry behind:
+        # the task is failed by the caller, and a later cancel taking the entry
+        # would settle it a second time. The stop is read under the lock
+        # ``stop()``'s backoff sweep takes: an entry made first is found by the
+        # sweep, and a refusal that lands after it is cancelled here rather than
+        # left waiting behind a timer nobody will cancel.
         with self._active_task_lock:
-            self._requeued[task.id] = (timer, task)
-        timer.start()
+            stopped = self._stop.is_set()
+            if not stopped:
+                self._requeued[task.id] = (timer, task)
+        if stopped:
+            self._cancel_queued_task(task, "runner stopped")
+            return False, None
+        try:
+            timer.start()
+        except BaseException:
+            self._take_requeued(task.id)
+            raise
         return False, None
 
     def _take_requeued(self, task_id: str) -> Optional[BaseTask]:
@@ -412,15 +446,20 @@ class TaskRunner:
         return entry[1]
 
     def _requeue(self, task_id: str, work_queue: queue.PriorityQueue) -> None:
+        # Taken off the backoff and put on the queue under one hold of the lock,
+        # so a canceller that takes the backoffs and then drains the queues
+        # finds the task in one place or the other, never between the two.
         with self._active_task_lock:
             entry = self._requeued.pop(task_id, None)
-        if entry is None:
-            return
-        task = entry[1]
-        if self._stop.is_set():
+            if entry is None:
+                return
+            task = entry[1]
+            stopped = self._stop.is_set()
+            if not stopped:
+                work_queue.put((task.priority, next(self._queue_seq), task))
+        if stopped:
             self._cancel_queued_task(task, "runner stopped")
             return
-        work_queue.put((task.priority, next(self._queue_seq), task))
         if self._stop.is_set():
             # stop() may have drained the queue between the check and the put.
             self._drain(work_queue, "runner stopped")
@@ -441,37 +480,81 @@ class TaskRunner:
         cancelled = 0
         for task_id in task_ids:
             task = self._take_requeued(task_id)
-            if task is not None:
-                self._cancel_queued_task(task, reason)
+            if task is not None and self._cancel_queued_task(task, reason):
                 cancelled += 1
         return cancelled
 
     def start(self):
+        """Start the workers, or replace any that died since; safe to repeat.
+
+        A stopped runner starts afresh once its old workers have exited, and
+        not before: started beside a worker that outlived ``stop()``, a new
+        GPU worker would run a second GPU task at once.
+        """
         with self._lock:
-            self._threads = [t for t in self._threads if t.is_alive()]
-            if self._threads:
-                return
-            self._closed = False
-            self._stop.clear()
-        for i in range(self._num_workers):
-            t = threading.Thread(
-                target=self._run,
-                args=(self._queue,),
-                name=f"{self._name}-cpu-{i}",
-                daemon=True,
-            )
-            t.start()
-            self._threads.append(t)
-        # Single dedicated GPU worker - one task at a time, priority-ordered.
-        gpu_worker = threading.Thread(
-            target=self._run,
-            args=(self._gpu_queue,),
-            name=f"{self._name}-gpu",
-            daemon=True,
+            if self._closed or self._stop.is_set():
+                self._threads = [t for t in self._threads if t.is_alive()]
+                if self._threads:
+                    return
+                self._closed = False
+                self._stop.clear()
+                self._cpu_workers = [None] * self._num_workers
+                self._gpu_worker = None
+            for slot, worker in enumerate(self._cpu_workers):
+                if worker is None:
+                    self._cpu_workers[slot] = self._start_worker(
+                        self._queue, f"{self._name}-cpu-{slot}"
+                    )
+            # Single dedicated GPU worker - one task at a time, priority-ordered.
+            if self._gpu_worker is None:
+                self._gpu_worker = self._start_worker(
+                    self._gpu_queue, f"{self._name}-gpu"
+                )
+            self._replace_dead_workers_locked()
+
+    def _start_worker(
+        self, work_queue: queue.PriorityQueue, name: str
+    ) -> threading.Thread:
+        """Start one worker on *work_queue*; call under ``_lock``."""
+        worker = threading.Thread(
+            target=self._run, args=(work_queue,), name=name, daemon=True
         )
-        gpu_worker.start()
-        self._threads.append(gpu_worker)
-        self._gpu_worker = gpu_worker
+        worker.start()
+        self._threads.append(worker)
+        return worker
+
+    def _replace_dead_workers_locked(self) -> None:
+        """Start a worker in place of each one that has exited; under ``_lock``.
+
+        Only a worker that has *exited* is replaced. One still alive is left
+        alone however long its task runs: a second worker on the GPU queue
+        would run two GPU tasks at once. A slot never started stays empty -
+        a runner nobody started is not brought up by this.
+        """
+        for slot, worker in enumerate(self._cpu_workers):
+            if worker is not None and not worker.is_alive():
+                self._cpu_workers[slot] = self._replace_worker(
+                    worker, "cpu", self._queue
+                )
+        if self._gpu_worker is not None and not self._gpu_worker.is_alive():
+            self._gpu_worker = self._replace_worker(
+                self._gpu_worker, "gpu", self._gpu_queue
+            )
+
+    def _replace_worker(
+        self, dead: threading.Thread, lane: str, work_queue: queue.PriorityQueue
+    ) -> threading.Thread:
+        self._lane_restarts[lane] += 1
+        logger.error(
+            "TaskRunner %s: worker %s had stopped; starting a replacement "
+            "(%s restart %d).",
+            self._name,
+            dead.name,
+            lane,
+            self._lane_restarts[lane],
+        )
+        self._threads = [t for t in self._threads if t is not dead]
+        return self._start_worker(work_queue, dead.name)
 
     def stop(self):
         with self._lock:
@@ -514,8 +597,22 @@ class TaskRunner:
                 )
 
     def submit(self, task: BaseTask) -> str:
+        """Queue *task*; it settles exactly once, through the callbacks.
+
+        Also replaces any worker that has died, so work queued behind a lost
+        worker runs again from the next submission on.
+
+        Raises:
+            RuntimeError: The runner is stopped. A stop that lands while the
+                task is being queued does not raise: the task is cancelled
+                instead, as the stop would have cancelled it had it been
+                queued a moment earlier.
+        """
         if self._closed or self._stop.is_set():
             raise RuntimeError(f"TaskRunner {self._name} is stopped.")
+        # Queued again, a task object is a fresh run (see ``on_queued``), and
+        # its settlement is a fresh one too.
+        task._done_event.clear()
         try:
             task.on_queued()
         except Exception as exc:
@@ -528,7 +625,17 @@ class TaskRunner:
         target_queue = (
             self._gpu_queue if task.queue_type == QueueType.GPU else self._queue
         )
-        target_queue.put((task.priority, next(self._queue_seq), task))
+        with self._lock:
+            # Checked again under the lock ``stop()`` closes the runner under:
+            # a stop during ``on_queued()`` has drained the queues already, and
+            # a task put on one now would never run and never settle.
+            closed = self._closed or self._stop.is_set()
+            if not closed:
+                self._replace_dead_workers_locked()
+                target_queue.put((task.priority, next(self._queue_seq), task))
+        if closed:
+            self._cancel_queued_task(task, "runner stopped")
+            return task.id
         qsize = target_queue.qsize()
         logger.debug(
             "TaskRunner %s: submitted task id=%s type=%s queue=%s queue_depth=%s",
@@ -592,21 +699,92 @@ class TaskRunner:
         """True while the GPU worker thread runs, even one that outlived ``stop()``."""
         return self._gpu_worker is not None and self._gpu_worker.is_alive()
 
+    def lane_health(self) -> dict[str, Any]:
+        """Whether the workers are there to run what is queued, for the owner.
+
+        ``degraded`` is True while the runner is meant to be running and a
+        worker has exited: the work queued for its lane waits until the next
+        submission replaces it (``submit``). A runner that was never started,
+        or was stopped, is not degraded; nothing is meant to run.
+
+        Returns:
+            ``running``, ``degraded``, ``last_failure`` (the latest worker
+            that exited, ``{"worker", "error", "at"}``, or None),
+            ``waiting_for_gpu_memory`` (tasks in a GPU backoff), and per lane
+            (``cpu``, ``gpu``) ``alive``, ``total``, ``restarts`` and
+            ``queued``.
+        """
+        with self._lock:
+            running = self._gpu_worker is not None and not (
+                self._closed or self._stop.is_set()
+            )
+            cpu_alive = sum(
+                1 for w in self._cpu_workers if w is not None and w.is_alive()
+            )
+            gpu_alive = int(self.gpu_worker_alive())
+            restarts = dict(self._lane_restarts)
+            last_failure = (
+                dict(self._last_lane_failure) if self._last_lane_failure else None
+            )
+        with self._active_task_lock:
+            waiting = len(self._requeued)
+        return {
+            "running": running,
+            "degraded": running and (cpu_alive < self._num_workers or not gpu_alive),
+            "last_failure": last_failure,
+            "waiting_for_gpu_memory": waiting,
+            "cpu": {
+                "alive": cpu_alive,
+                "total": self._num_workers,
+                "restarts": restarts["cpu"],
+                "queued": self._queue.qsize(),
+            },
+            "gpu": {
+                "alive": gpu_alive,
+                "total": 1,
+                "restarts": restarts["gpu"],
+                "queued": self._gpu_queue.qsize(),
+            },
+        }
+
     def _run(self, work_queue: queue.PriorityQueue):
         logger.debug("TaskRunner %s worker started.", self._name)
-        while not self._stop.is_set():
-            try:
-                _priority, _seq, task = work_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+        try:
+            while not self._stop.is_set():
+                try:
+                    _priority, _seq, task = work_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-            if isinstance(task, _StopTask):
-                continue
+                if isinstance(task, _StopTask):
+                    continue
 
-            try:
-                self._handle(task, work_queue)
-            except Exception as exc:
-                self._fail_unhandled(task, exc)
+                try:
+                    self._handle(task, work_queue)
+                except BaseException as exc:
+                    self._fail_unhandled(task, exc)
+        except BaseException as exc:
+            # Whatever a task raises is caught above. What reaches here is a
+            # fault in the loop itself - a malformed queue item, a failure
+            # while failing a task - and it ends this worker, with the work
+            # queued behind it waiting. Recorded for ``lane_health()``; the
+            # next ``submit()`` or ``start()`` replaces the worker.
+            worker = threading.current_thread().name
+            with self._lock:
+                self._last_lane_failure = {
+                    "worker": worker,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "at": datetime.now(UTC).isoformat(),
+                }
+            logger.error(
+                "TaskRunner %s worker %s stopped unexpectedly; the work queued "
+                "for it waits until the next submission replaces it: %r",
+                self._name,
+                worker,
+                exc,
+                exc_info=True,
+            )
+            return
 
         logger.debug("TaskRunner %s stopped.", self._name)
 
@@ -650,12 +828,36 @@ class TaskRunner:
             # that OOMed.
             if task.vram_oom_attempts:
                 # It got there in the end - say so, rather than leaving the
-                # user's last card reading "retrying".
-                self._report_vram_oom(
-                    task, task.attempts_used, final=False, recovered=True
-                )
-        except Exception as exc:
+                # user's last card reading "retrying". Guarded on its own: the
+                # work is done, and a failed announcement must not reach the
+                # handler below and settle a COMPLETED task with an error.
+                try:
+                    self._report_vram_oom(
+                        task, task.attempts_used, final=False, recovered=True
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Task %s (%s) completed, but its GPU out-of-memory "
+                        "recovery could not be announced: %s",
+                        task.id,
+                        task.type,
+                        exc,
+                        exc_info=True,
+                    )
+        except BaseException as exc:
+            # BaseException, as concurrent.futures settles a work item: a task
+            # raising SystemExit is that task's failure, not this worker's
+            # end. Let through, it would end the worker silently, with the
+            # task never settled and everything queued behind it stranded.
             error = exc
+            if not isinstance(exc, Exception):
+                logger.error(
+                    "Task %s (%s) raised %s; it is failed and the worker goes on.",
+                    task.id,
+                    task.type,
+                    type(exc).__name__,
+                    exc_info=True,
+                )
             preempted_by = self._preempted.get(task.id)
             if preempted_by is not None:
                 # Stopped to make room, whatever the task raised on the
@@ -687,75 +889,90 @@ class TaskRunner:
             else:
                 logger.warning("Task %s (%s) failed: %s", task.id, task.type, exc)
         finally:
-            with self._active_task_lock:
-                self._active_tasks.pop(thread_ident, None)
-                self._leased_on_gpu.discard(task.id)
-                self._preempted.pop(task.id, None)
-            if lease is not None:
-                try:
-                    lease.release()
-                except Exception as exc:
-                    # Logged, not raised: the completion callbacks below must
-                    # still fire, or the finder never releases its claims.
-                    logger.error(
-                        "Task %s (%s) could not give back its GPU lease: %s",
-                        task.id,
-                        task.type,
-                        exc,
-                        exc_info=True,
-                    )
-            # Always flush PyTorch's CUDA allocator cache after a GPU-queue
-            # task so that activation tensors (data, not models) are returned
-            # promptly.  CPU-queue tasks only flush when they held a VRAM
-            # reservation.
-            if task.queue_type == QueueType.GPU:
-                try:
-                    empty_device_cache()
-                except Exception:
-                    logger.warning(
-                        "Failed to flush CUDA cache after task %s (%s): %s",
-                        task.id,
-                        task.type,
-                        traceback.format_exc(),
-                    )
-                # Collect Python objects freed during inference (e.g. preloaded
-                # image dicts) and trim glibc's malloc arena so that resident
-                # set size drops back towards the true working set.
-                gc.collect()
-                if platform.system().lower().startswith("linux"):
+            try:
+                with self._active_task_lock:
+                    self._active_tasks.pop(thread_ident, None)
+                    self._leased_on_gpu.discard(task.id)
+                    self._preempted.pop(task.id, None)
+                if lease is not None:
+                    self._give_back(task, lease)
+                # Always flush PyTorch's CUDA allocator cache after a GPU-queue
+                # task so that activation tensors (data, not models) are returned
+                # promptly.  CPU-queue tasks only flush when they held a VRAM
+                # reservation.
+                if task.queue_type == QueueType.GPU:
                     try:
-                        trim = getattr(ctypes.CDLL("libc.so.6"), "malloc_trim", None)
-                        if trim is not None:
-                            trim(0)
+                        empty_device_cache()
                     except Exception:
                         logger.warning(
-                            "Failed to trim malloc arena after task %s (%s): %s",
+                            "Failed to flush CUDA cache after task %s (%s): %s",
                             task.id,
                             task.type,
                             traceback.format_exc(),
                         )
-            elif lease is not None and not lease.on_cpu:
-                try:
-                    empty_device_cache()
-                except Exception:
-                    logger.warning(
-                        "Failed to flush CUDA cache after task %s (%s): %s",
-                        task.id,
-                        task.type,
-                        traceback.format_exc(),
-                    )
-            elapsed_s = time.perf_counter() - task_start
-            logger.debug(
-                "TaskRunner %s: finished task id=%s type=%s status=%s elapsed=%.3fs.",
-                self._name,
+                    # Collect Python objects freed during inference (e.g. preloaded
+                    # image dicts) and trim glibc's malloc arena so that resident
+                    # set size drops back towards the true working set.
+                    gc.collect()
+                    if platform.system().lower().startswith("linux"):
+                        try:
+                            trim = getattr(
+                                ctypes.CDLL("libc.so.6"), "malloc_trim", None
+                            )
+                            if trim is not None:
+                                trim(0)
+                        except Exception:
+                            logger.warning(
+                                "Failed to trim malloc arena after task %s (%s): %s",
+                                task.id,
+                                task.type,
+                                traceback.format_exc(),
+                            )
+                elif lease is not None and not lease.on_cpu:
+                    try:
+                        empty_device_cache()
+                    except Exception:
+                        logger.warning(
+                            "Failed to flush CUDA cache after task %s (%s): %s",
+                            task.id,
+                            task.type,
+                            traceback.format_exc(),
+                        )
+                elapsed_s = time.perf_counter() - task_start
+                logger.debug(
+                    "TaskRunner %s: finished task id=%s type=%s status=%s elapsed=%.3fs.",
+                    self._name,
+                    task.id,
+                    task.type,
+                    task.status,
+                    elapsed_s,
+                )
+            finally:
+                # Whatever the clean-up above raised, the task has settled and
+                # its owner must hear so: the finder's claims and the
+                # planner's in-flight slot are given back only here. What was
+                # raised still reaches ``_run``, which logs it.
+                self._fire_task_complete_callbacks(task, error)
+
+    @staticmethod
+    def _give_back(task: BaseTask, lease: Lease) -> None:
+        """Release *lease*, logging rather than raising.
+
+        Whoever calls this still has the task to settle: the completion
+        callbacks must fire after it, or the finder never releases its claims.
+        """
+        try:
+            lease.release()
+        except Exception as exc:
+            logger.error(
+                "Task %s (%s) could not give back its GPU lease: %s",
                 task.id,
                 task.type,
-                task.status,
-                elapsed_s,
+                exc,
+                exc_info=True,
             )
-            self._fire_task_complete_callbacks(task, error)
 
-    def _fail_unhandled(self, task: BaseTask, exc: Exception) -> None:
+    def _fail_unhandled(self, task: BaseTask, exc: BaseException) -> None:
         """Fail a task the worker could not finish, and keep the worker going.
 
         Reached only when something raised while the runner was handling a
@@ -778,7 +995,10 @@ class TaskRunner:
             exc,
             exc_info=True,
         )
-        self._requeue_counts.pop(task.id, None)
+        # A settled task holds no pending retry: one left in the backoff would
+        # be taken by a later cancel and settled a second time. Also clears
+        # its attempt count.
+        self._take_requeued(task.id)
         if task._done_event.is_set():
             return
         task.error = str(exc)
@@ -801,7 +1021,7 @@ class TaskRunner:
                     callback_exc,
                 )
 
-    def _cancel_queued_task(self, task: BaseTask, reason: str):
+    def _cancel_queued_task(self, task: BaseTask, reason: str) -> bool:
         """Cancel a task that will never run and release everything it holds.
 
         The completion callbacks are the only path that gives a task's resources
@@ -815,8 +1035,23 @@ class TaskRunner:
         Args:
             task: The task being cancelled; it has been taken off its queue.
             reason: Why it was cancelled, for the log and the callback error.
+
+        Returns:
+            True if this call cancelled it; False if it had already settled, so
+            a caller counting what it cancelled does not count it.
         """
         self._requeue_counts.pop(task.id, None)
+        if task._done_event.is_set():
+            # Settled already, and its owner told: a second settlement would
+            # free the planner's slot and the finder's claims twice.
+            logger.debug(
+                "Task %s (%s) already settled as %s; not cancelling it (%s).",
+                task.id,
+                task.type,
+                task.status,
+                reason,
+            )
+            return False
         try:
             task.on_cancel()
         except Exception as exc:
@@ -834,6 +1069,7 @@ class TaskRunner:
             task,
             TaskCancelledError(f"Task {task.id} ({task.type}) cancelled: {reason}"),
         )
+        return True
 
 
 class _StopTask(BaseTask):

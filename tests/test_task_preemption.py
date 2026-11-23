@@ -19,7 +19,7 @@ import pytest
 from pixlstash.resources.arbiter import LeaseState, ResourceArbiter
 from pixlstash.resources.ledger import DeviceReading
 from pixlstash.task_runner import TaskCancelledError, TaskRunner
-from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
+from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority, TaskStatus
 from pixlstash.tasks.missing_ocr_finder import MissingOcrFinder
 from pixlstash.vault import Vault
 
@@ -698,3 +698,493 @@ def test_a_lease_that_will_not_release_still_settles_the_task():
         assert runner.gpu_worker_alive()
     finally:
         runner.stop()
+
+
+# ── every accepted task settles exactly once ────────────────────────────────
+# A task's completion callbacks are what give back the finder's claimed
+# pictures and the planner's in-flight slot. Never firing strands them for the
+# session; firing twice frees them twice. Every path below ends in exactly one.
+
+
+class _NeverRoom(ResourceArbiter):
+    """Never has GPU memory to give."""
+
+    def try_light(self, *args, **kwargs):
+        return None
+
+
+class _QuickCpuTask(BaseTask):
+    def __init__(self):
+        super().__init__(task_type="ImportTask")
+
+    def _run_task(self):
+        return "done"
+
+
+class _SpillableGpuTask(_QuickGpuTask):
+    def __init__(self):
+        super().__init__()
+        self.on_cpu = False
+
+    def allow_cpu_spillover(self):
+        return True
+
+    def enable_cpu_spillover(self):
+        self.on_cpu = True
+
+
+@pytest.fixture
+def fake_timers(monkeypatch):
+    """``threading.Timer`` that records each backoff and starts no thread.
+
+    ``fire()`` runs what the timer would have run; ``start_error`` makes
+    ``start()`` raise, as it does when no thread can be started.
+    """
+    timers = SimpleNamespace(made=[], start_error=None)
+
+    class _FakeTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.interval = interval
+            self.function = function
+            self.args = args or ()
+            self.cancelled = False
+            timers.made.append(self)
+
+        def start(self):
+            if timers.start_error is not None:
+                raise timers.start_error
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(threading, "Timer", _FakeTimer)
+    return timers
+
+
+def _settling_runner(name, arbiter=None):
+    """A runner and the endings its callbacks saw, ``task id -> [error, ...]``."""
+    runner = TaskRunner(
+        name=name,
+        resource_arbiter=arbiter or ResourceArbiter(_NoCard(), usage=lambda: None),
+    )
+    endings: dict[str, list] = {}
+    runner.add_task_complete_callback(
+        lambda task, error: endings.setdefault(task.id, []).append(error)
+    )
+    return runner, endings
+
+
+def test_a_task_refused_over_a_thousand_times_keeps_the_capped_backoff(fake_timers):
+    """The real dequeue, admit and requeue cycle, run past where ``2**attempts``
+    stops fitting a float: every backoff is still the capped number."""
+    runner, _endings = _settling_runner(
+        "requeue-cycles", _NeverRoom(_NoCard(), usage=lambda: None)
+    )
+    work_queue = queue.PriorityQueue()
+    task = _QuickGpuTask()
+    for _ in range(1100):
+        runner._handle(task, work_queue)
+        fake_timers.made[-1].fire()
+        _priority, _seq, dequeued = work_queue.get_nowait()
+        assert dequeued is task
+    intervals = [timer.interval for timer in fake_timers.made]
+    assert len(intervals) == 1100
+    assert intervals[:5] == [1.0, 2.0, 4.0, 8.0, 15.0]
+    assert set(intervals[4:]) == {runner.VRAM_REQUEUE_MAX_S}
+    assert runner._requeue_counts[task.id] == 1100
+
+
+def test_a_backoff_that_cannot_start_leaves_no_entry_behind(fake_timers):
+    fake_timers.start_error = RuntimeError("test-cannot-start-thread")
+    runner, _endings = _settling_runner(
+        "timer-fails", _NeverRoom(_NoCard(), usage=lambda: None)
+    )
+    task = _QuickGpuTask()
+    with pytest.raises(RuntimeError, match="test-cannot-start-thread"):
+        runner._admit(task, queue.PriorityQueue())
+    assert task.id not in runner._requeued
+
+
+def test_a_task_whose_backoff_cannot_start_settles_once(fake_timers):
+    """Failed by its worker, and not found again by the stop that follows."""
+    fake_timers.start_error = RuntimeError("test-cannot-start-thread")
+    runner, endings = _settling_runner(
+        "timer-fails", _NeverRoom(_NoCard(), usage=lambda: None)
+    )
+    runner.start()
+    task = _QuickGpuTask()
+    try:
+        runner.submit(task)
+        assert _until(lambda: task.id in endings), "the task never settled"
+        assert task.status == TaskStatus.FAILED
+        assert runner.gpu_worker_alive()
+    finally:
+        runner.stop()
+    assert len(endings[task.id]) == 1
+    assert isinstance(endings[task.id][0], RuntimeError)
+
+
+def test_a_task_refused_after_stop_swept_the_backoffs_is_cancelled(fake_timers):
+    """A refusal that lands once ``stop()`` has swept the backoffs is cancelled,
+    not parked behind a timer the stop will never cancel."""
+    runner, endings = _settling_runner(
+        "refused-after-stop", _NeverRoom(_NoCard(), usage=lambda: None)
+    )
+    runner.stop()  # never started: this is the moment after the sweep
+    task = _QuickGpuTask()
+
+    assert runner._admit(task, queue.PriorityQueue()) == (False, None)
+
+    assert task.id not in runner._requeued
+    assert task.status == TaskStatus.CANCELLED
+    assert len(endings[task.id]) == 1
+    assert isinstance(endings[task.id][0], TaskCancelledError)
+    assert task.id not in runner._requeue_counts
+
+
+def test_failing_a_task_takes_it_out_of_its_backoff(fake_timers):
+    runner, endings = _settling_runner(
+        "fail-backoff", _NeverRoom(_NoCard(), usage=lambda: None)
+    )
+    task = _QuickGpuTask()
+    assert runner._admit(task, queue.PriorityQueue()) == (False, None)
+    timer = fake_timers.made[-1]
+
+    runner._fail_unhandled(task, RuntimeError("test-handling-failure"))
+
+    assert task.id not in runner._requeued
+    assert timer.cancelled
+    assert runner.cancel_pending_tasks() == 0
+    assert task.status == TaskStatus.FAILED
+    assert len(endings[task.id]) == 1
+
+
+def test_a_task_that_already_settled_is_not_cancelled_again():
+    runner, endings = _settling_runner("settled-twice")
+    task = _QuickGpuTask()
+    task.run()
+    runner._requeued[task.id] = (threading.Timer(60, lambda: None), task)
+
+    runner.stop()
+
+    assert task.status == TaskStatus.COMPLETED
+    assert task.id not in endings
+    assert not task._cancel_event.is_set()
+
+
+@pytest.mark.parametrize("cancel", ["cancel_pending_tasks", "preempt_gpu"])
+def test_a_cancel_counts_only_the_tasks_it_cancelled(cancel):
+    """Settled tasks found on the queue or in a backoff are skipped, and not
+    counted among the work the cancel stopped."""
+    runner, endings = _settling_runner("count-cancelled")
+    settled_queued, settled_waiting, live = (
+        _QuickGpuTask(),
+        _QuickGpuTask(),
+        _QuickGpuTask(),
+    )
+    settled_queued.run()
+    settled_waiting.run()
+    runner._gpu_queue.put((live.priority, 0, live))
+    runner._gpu_queue.put((settled_queued.priority, 1, settled_queued))
+    runner._requeued[settled_waiting.id] = (
+        threading.Timer(60, lambda: None),
+        settled_waiting,
+    )
+
+    if cancel == "preempt_gpu":
+        assert runner.preempt_gpu("preempted by test") == [live.type]
+    else:
+        assert runner.cancel_pending_tasks() == 1
+
+    assert list(endings) == [live.id]
+
+
+def test_a_task_object_queued_again_settles_again():
+    """``on_queued`` makes a re-queued task object a fresh run, so the stop that
+    drains it still tells its owner."""
+    runner, endings = _settling_runner("queued-again")
+    task = _QuickGpuTask()
+    task.run()
+    runner.submit(task)  # never started: it stays queued
+
+    runner.stop()
+
+    assert task.status == TaskStatus.CANCELLED
+    assert len(endings[task.id]) == 1
+    assert isinstance(endings[task.id][0], TaskCancelledError)
+
+
+def test_the_owner_hears_of_a_task_when_the_clean_up_after_it_fails(monkeypatch):
+    def _boom():
+        raise RuntimeError("test-clean-up-failure")
+
+    monkeypatch.setattr("pixlstash.task_runner.platform", SimpleNamespace(system=_boom))
+    runner, endings = _settling_runner("clean-up-fails")
+    runner.start()
+    try:
+        first, second = _QuickGpuTask(), _QuickGpuTask()
+        runner.submit(first)
+        runner.submit(second)
+        assert _until(lambda: second.id in endings), "the callbacks never fired"
+        assert endings[first.id] == [None]
+        assert first.status == TaskStatus.COMPLETED
+        assert runner.gpu_worker_alive()
+    finally:
+        runner.stop()
+
+
+def test_a_task_the_cpu_cannot_record_stays_set_for_the_gpu(fake_timers):
+    class _CpuLedgerFails(_NeverRoom):
+        def note_on_cpu(self, *args, **kwargs):
+            raise RuntimeError("test-cpu-ledger-failure")
+
+    runner, _endings = _settling_runner(
+        "spill-fails", _CpuLedgerFails(_NoCard(), usage=lambda: None)
+    )
+    task = _SpillableGpuTask()
+    assert runner._admit(task, queue.PriorityQueue()) == (False, None)
+    assert task.on_cpu is False, "switched to the CPU, then sent to wait for the GPU"
+    assert task.id in runner._requeued
+
+
+def test_a_recovery_notice_that_fails_leaves_the_task_completed():
+    class _OutOfMemoryOnce(_QuickGpuTask):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def _run_task(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+            return "done"
+
+    def _report(task, attempt, final, recovered=False):
+        if recovered:
+            raise RuntimeError("test-notifier-failure")
+
+    runner, endings = _settling_runner("recovery-notice")
+    runner.VRAM_OOM_RETRY_PAUSE_S = 0.01
+    runner._report_vram_oom = _report
+    runner.start()
+    try:
+        task = _OutOfMemoryOnce()
+        runner.submit(task)
+        assert _until(lambda: task.id in endings), "the task never settled"
+        assert task.vram_oom_attempts == 1
+        assert task.status == TaskStatus.COMPLETED
+        assert endings[task.id] == [None]
+    finally:
+        runner.stop()
+
+
+class _ExitingTask(_QuickGpuTask):
+    """Raises ``SystemExit`` while it works, or while it is being admitted."""
+
+    def __init__(self, where):
+        super().__init__()
+        self._where = where
+
+    def estimated_vram_mb(self):
+        if self._where == "admission":
+            raise SystemExit("test-exit")
+        return 0
+
+    def _run_task(self):
+        if self._where == "work":
+            raise SystemExit("test-exit")
+        return "done"
+
+
+@pytest.mark.parametrize("where", ["work", "admission"])
+def test_a_task_raising_system_exit_fails_and_its_worker_goes_on(where):
+    runner, endings = _settling_runner("system-exit")
+    runner.start()
+    try:
+        exiting = _ExitingTask(where)
+        runner.submit(exiting)
+        assert _until(lambda: exiting.id in endings), "the task never settled"
+        assert exiting.status == TaskStatus.FAILED
+        assert len(endings[exiting.id]) == 1
+        assert isinstance(endings[exiting.id][0], SystemExit)
+        health = runner.lane_health()
+        assert health["last_failure"] is None
+        assert (health["gpu"]["alive"], health["gpu"]["restarts"]) == (1, 0)
+
+        after = _QuickGpuTask()
+        runner.submit(after)
+        assert _until(lambda: after.id in endings), "the worker did not go on"
+        assert after.status == TaskStatus.COMPLETED
+    finally:
+        runner.stop()
+
+
+# ── a worker that dies is seen, reported and replaced ──────────────────────
+
+
+@pytest.mark.parametrize("lane", ["cpu", "gpu"])
+def test_a_worker_that_dies_is_reported_and_replaced(lane):
+    runner, endings = _settling_runner("lane-death")
+    runner.start()
+
+    def _worker():
+        return runner._gpu_worker if lane == "gpu" else runner._cpu_workers[0]
+
+    def _kill():
+        # Not a (priority, seq, task) triple: the worker loop itself fails on
+        # it, outside any task.
+        worker = _worker()
+        (runner._gpu_queue if lane == "gpu" else runner._queue).put((0, -1))
+        worker.join(5)
+        assert not worker.is_alive()
+        return worker
+
+    try:
+        assert runner.lane_health()["degraded"] is False
+        dead = _kill()
+        health = runner.lane_health()
+        assert (health["running"], health["degraded"]) == (True, True)
+        assert health[lane]["alive"] == 0
+        assert health["last_failure"]["worker"] == dead.name
+        assert health["last_failure"]["error"].startswith("ValueError")
+
+        task = _QuickGpuTask() if lane == "gpu" else _QuickCpuTask()
+        runner.submit(task)
+        assert _until(lambda: task.id in endings), "the lane never ran again"
+        assert task.status == TaskStatus.COMPLETED
+        health = runner.lane_health()
+        assert health["degraded"] is False
+        assert (health[lane]["alive"], health[lane]["restarts"]) == (1, 1)
+        alive_named = [t for t in threading.enumerate() if t.name == dead.name]
+        assert len(alive_named) == 1
+
+        # start() replaces one too.
+        _kill()
+        runner.start()
+        health = runner.lane_health()
+        assert health["degraded"] is False
+        assert health[lane]["restarts"] == 2
+    finally:
+        runner.stop()
+
+    health = runner.lane_health()
+    assert (health["running"], health["degraded"]) == (False, False)
+    with pytest.raises(RuntimeError):
+        runner.submit(_QuickGpuTask())
+    assert not runner.is_running(), "a stopped runner brought a worker back"
+    assert runner.lane_health()[lane]["restarts"] == 2
+
+
+def test_a_worker_busy_with_a_long_task_is_not_replaced():
+    runner, endings = _settling_runner("busy-lane")
+    runner.start()
+    long_task = _HeldGpuTask()
+    try:
+        runner.submit(long_task)
+        assert long_task.started.wait(5)
+        queued = _QuickGpuTask()
+        runner.submit(queued)
+
+        gpu_workers = [t for t in threading.enumerate() if t.name == "busy-lane-gpu"]
+        assert len(gpu_workers) == 1, "a second GPU worker beside a busy one"
+        health = runner.lane_health()
+        assert health["degraded"] is False
+        assert health["gpu"]["restarts"] == 0
+
+        long_task.release.set()
+        assert _until(lambda: queued.id in endings)
+    finally:
+        long_task.release.set()
+        runner.stop()
+
+
+# ── a backoff that ends while the queue is cancelled is cancelled with it ──
+
+
+class _CancelsDuringPut(queue.PriorityQueue):
+    """Runs a canceller on another thread from inside the first ``put``.
+
+    Lets the canceller run between taking a task off its backoff and putting
+    it on the queue, if anything lets it in there.
+    """
+
+    def __init__(self, cancel):
+        super().__init__()
+        self._cancel = cancel
+        self.canceller = None
+
+    def put(self, item, *args, **kwargs):
+        if self.canceller is None:
+            self.canceller = threading.Thread(target=self._cancel)
+            self.canceller.start()
+            # Long enough for a canceller that is not held off to finish.
+            self.canceller.join(0.5)
+        super().put(item, *args, **kwargs)
+
+
+@pytest.mark.parametrize("cancel", ["cancel_pending_tasks", "preempt_gpu"])
+def test_a_backoff_ending_during_a_cancel_is_cancelled_too(cancel):
+    runner, endings = _settling_runner("backoff-race")
+
+    def canceller():
+        if cancel == "preempt_gpu":
+            runner.preempt_gpu("preempted by test")
+        else:
+            runner.cancel_pending_tasks()
+
+    work_queue = _CancelsDuringPut(canceller)
+    runner._gpu_queue = work_queue
+    task = _QuickGpuTask()
+    runner._requeued[task.id] = (threading.Timer(60, lambda: None), task)
+
+    runner._requeue(task.id, work_queue)
+    work_queue.canceller.join(5)
+
+    assert task.status == TaskStatus.CANCELLED, "left on a queue already cancelled"
+    assert len(endings[task.id]) == 1
+    assert work_queue.empty()
+
+
+class _BackoffEndsOnceDrained(queue.PriorityQueue):
+    """Ends a backoff on another thread the first time a drain finds it empty.
+
+    Puts the backoff's end just after a canceller has looked at the queue.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.end_backoff = None
+        self.ended = None
+
+    def get_nowait(self):
+        try:
+            return super().get_nowait()
+        except queue.Empty:
+            if self.ended is None and self.end_backoff is not None:
+                self.ended = threading.Thread(target=self.end_backoff)
+                self.ended.start()
+                self.ended.join(5)
+            raise
+
+
+@pytest.mark.parametrize("cancel", ["cancel_pending_tasks", "preempt_gpu"])
+def test_a_backoff_ending_just_after_a_cancel_drains_is_cancelled_too(cancel):
+    runner, endings = _settling_runner("backoff-after-drain")
+    work_queue = _BackoffEndsOnceDrained()
+    runner._gpu_queue = work_queue
+    task = _QuickGpuTask()
+    runner._requeued[task.id] = (threading.Timer(60, lambda: None), task)
+    work_queue.end_backoff = lambda: runner._requeue(task.id, work_queue)
+
+    if cancel == "preempt_gpu":
+        runner.preempt_gpu("preempted by test")
+    else:
+        runner.cancel_pending_tasks()
+
+    assert work_queue.ended is not None, "the drain never looked at the queue"
+    assert task.status == TaskStatus.CANCELLED, "landed on a queue already drained"
+    assert len(endings[task.id]) == 1
+    assert work_queue.empty()

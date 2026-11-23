@@ -143,7 +143,9 @@ class BaseTask(ABC):
                     )
                     if on_vram_oom is not None:
                         on_vram_oom(self, attempt, exc)
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException, so a task raising SystemExit is FAILED like any
+            # other failure rather than left RUNNING; re-raised for the runner.
             self.error = str(exc)
             self.status = TaskStatus.FAILED
             raise
