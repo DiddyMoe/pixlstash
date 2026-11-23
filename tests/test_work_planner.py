@@ -997,7 +997,11 @@ def _run_burst(tasks: list) -> WorkPlanner:
     runner = _FastCompleteRunner()
     planner = WorkPlanner(task_runner=runner, task_finders=[_ListedTaskFinder(tasks)])
     runner.on_submit = lambda task: planner.on_task_complete(task, task.error)
-    assert planner._run_finders_once() is True
+    # A turn finds at most one task per slot plus one, so a burst longer than
+    # that takes several sweeps.
+    for _ in tasks:
+        if not planner._run_finders_once():
+            break
     assert planner._run_finders_once() is False
     return planner
 
