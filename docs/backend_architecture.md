@@ -684,6 +684,7 @@ Public guest scoring and shared-link endpoints.
 | DELETE | /api/v1/model-stacks/{stack_id}                                               | model_shelf     | Break a stack apart                                           |
 | PATCH  | /api/v1/model-stacks/{stack_id}/cover                                         | model_shelf     | Choose which member covers a stack                            |
 | DELETE | /api/v1/model-stacks/{stack_id}/members/{model_id}                            | model_shelf     | Take one model out of a stack                                 |
+| GET    | /api/v1/models                                                                | model_shelf     | List the shelf's models of several kinds at once              |
 | PATCH  | /api/v1/models                                                                | model_shelf     | Correct what the shelf records about one or more models       |
 | POST   | /api/v1/models/base-model-lookup                                              | model_shelf     | Fill empty base models from Civitai, by file hash             |
 | GET    | /api/v1/models/base-models                                                    | model_shelf     | Completion targets for the base-model field                   |
@@ -4380,6 +4381,19 @@ changes under an already-filed recipe. Both argue for resolving the id to a
 digest at file time; that is a design decision of its own, not a third branch
 here, and until it is taken the id is the only identity the executed graph
 carries.
+
+**One model's counts are read by index, not off the whole map.** A shelf list
+pays the whole-library tally and the full scan of `workflow_recipe_asset` once
+per request; the adapter detail (`GET /adapters/{sha256}`) passes `model_ids`
+instead, and `_picture_counts_for` reads only the asset rows that can reach that
+model — a filename one of its copies is called, or its digest at 64, 12 or 10
+digits — then tallies kept pictures over just the recipes those rows name
+(`read_recipe_activity`). Every digest on the shelf is still read, because
+whether a short hash names this model alone is a question about the others.
+Both paths split the tiers in one loop, `_tiered_counts`, so the narrowed entry
+is that model's row of the whole map;
+`tests/test_workflow_library.py::test_one_models_counts_equal_its_row_of_the_whole_map`
+holds that on shared filenames, ambiguous and short hashes, and copies.
 
 **The read side is `routes/workflows.py`, and it joins nothing.** The Workflows
 view (implementation plan §F1/§F2) asks the hub which workflows exist and the
@@ -9461,8 +9475,12 @@ adapters, checkpoints, unclassified — none of which requested `engine`. So the
 backend had answered `file_kind=engine` since #876, this document claimed the
 engines were "on the shelf for completeness", and nothing on the shelf had ever
 displayed one. The fourth block (`filters.engines`, on by default) is what makes
-that sentence true. A row's block comes from `blockOf`, so engines refetch and
-are replaced independently of the other three.
+that sentence true. A row's block comes from `blockOf`, so engine rows are
+replaced only when the engines block is read. The block costs no request of its
+own: the shelf reads every ticked block in one `GET /models`, one repeated
+`file_kind` per kind, so the whole-page lookups behind the rows (locations,
+attachments, picture counts and the rest) are paid once per read rather than
+once per kind.
 
 **`movable` describes the folder, and gains a fourth value.** It says how a
 folder moves, not whether a route to move it is built yet:

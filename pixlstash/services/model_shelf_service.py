@@ -30,7 +30,7 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Collection, Optional
 
 from sqlalchemy import func
 from sqlmodel import Session, delete, select
@@ -68,6 +68,7 @@ from pixlstash.services.workflow_hash import (
 from pixlstash.services.workflow_identity import CHECKPOINT_WIDGETS, match_type
 from pixlstash.services.workflow_library_service import (
     cover_order,
+    read_recipe_activity,
     recipe_filed_pictures,
     recipe_latest_pictures,
     recipe_picture_counts,
@@ -567,7 +568,9 @@ def effective_trigger_words(
     return [], None
 
 
-def fetch_picture_counts(hub, vault) -> dict[int, dict[str, int]]:
+def fetch_picture_counts(
+    hub, vault, *, model_ids: Optional[Collection[int]] = None
+) -> dict[int, dict[str, int]]:
     """How many kept pictures in the active library used each model, by tier.
 
     ``verified`` counts pictures whose recipe names the model by its digest (a
@@ -584,22 +587,118 @@ def fetch_picture_counts(hub, vault) -> dict[int, dict[str, int]]:
     and heals by itself when a model is added to the shelf later. A name that
     was forgotten matches nothing.
 
+    Args:
+        model_ids: Count only these models (:func:`_picture_counts_for`), for
+            a caller showing a few rows rather than the shelf. ``None`` counts
+            every model off one vault-wide tally and one scan of the asset
+            table, which is what a whole shelf costs once and a single model
+            should not.
+
     Returns:
         ``{model_id: {"verified": n, "by_filename": n}}``, models no kept
-        picture used absent.
+        picture used absent. A narrowed call's entry for a model is exactly
+        that model's entry in the whole map.
     """
+    if model_ids is not None:
+        return _picture_counts_for(hub, vault, set(model_ids))
     pictures = vault.db.run_task(recipe_picture_counts, priority=DBPriority.IMMEDIATE)
     if not pictures:
         return {}
     by_name, by_digest, _filenames, _names = recipe_asset_index(hub)
-    sorted_digests = sorted(by_digest)
+    return _tiered_counts(
+        hub.fetchall(
+            "SELECT structural_hash, widget_name, normalized_filename "
+            "FROM workflow_recipe_asset"
+        ),
+        pictures,
+        by_name,
+        by_digest,
+    )
 
+
+def _picture_counts_for(hub, vault, wanted: set[int]) -> dict[int, dict[str, int]]:
+    """:func:`fetch_picture_counts` for *wanted* only, read by index.
+
+    An asset row reaches a model in only two ways, so only those rows are
+    read: a filename one of its copies is called, or a ``*_sha256`` value its
+    digest could be - all 64 digits, or the 10 or 12 an A1111 short hash
+    keeps, the only lengths :func:`digests_with_prefix` accepts. Every digest
+    on the shelf is still read, because whether a short hash names this model
+    or two is a question about the others. The tally is then taken over just
+    the recipes those rows name, and the tiers are the whole map's
+    (:func:`_tiered_counts`).
+    """
+    if not wanted:
+        return {}
+    by_name: dict[str, set[int]] = {}
+    for batch in chunked(sorted(wanted)):
+        placeholders = ",".join("?" * len(batch))
+        for row in hub.fetchall(
+            f"SELECT id, filename FROM model WHERE id IN ({placeholders}) "
+            "AND filename IS NOT NULL",
+            tuple(batch),
+        ):
+            by_name.setdefault(normalized_filename(row["filename"]), set()).add(
+                row["id"]
+            )
+        for row in hub.fetchall(
+            f"SELECT model_id, relpath FROM model_file "
+            f"WHERE model_id IN ({placeholders})",
+            tuple(batch),
+        ):
+            by_name.setdefault(normalized_filename(row["relpath"]), set()).add(
+                row["model_id"]
+            )
+    by_digest = {
+        row["sha256"].lower(): row["id"]
+        for row in hub.fetchall("SELECT id, sha256 FROM model WHERE sha256 IS NOT NULL")
+    }
+    values = set(by_name)
+    for digest, model_id in by_digest.items():
+        if model_id in wanted:
+            values.update((digest[:10], digest[:12], digest))
+    rows = []
+    for batch in chunked(sorted(values)):
+        placeholders = ",".join("?" * len(batch))
+        rows.extend(
+            hub.fetchall(
+                "SELECT structural_hash, widget_name, normalized_filename "
+                f"FROM workflow_recipe_asset WHERE normalized_filename "
+                f"IN ({placeholders})",
+                tuple(batch),
+            )
+        )
+    if not rows:
+        return {}
+    activity = read_recipe_activity(
+        vault, sorted({row["structural_hash"] for row in rows})
+    )
+    pictures = {recipe: figures.pictures for recipe, figures in activity.items()}
+    counts = _tiered_counts(rows, pictures, by_name, by_digest)
+    # A row read for one of these models' filenames can still be a digest
+    # widget whose value names some other model alone; that model's other rows
+    # were never read, so its figure here would be partial.
+    return {model_id: tiers for model_id, tiers in counts.items() if model_id in wanted}
+
+
+def _tiered_counts(
+    asset_rows, pictures: dict[str, int], by_name, by_digest
+) -> dict[int, dict[str, int]]:
+    """Split the kept pictures of *asset_rows*' recipes into the two tiers.
+
+    Args:
+        asset_rows: ``workflow_recipe_asset`` rows (``structural_hash``,
+            ``widget_name``, ``normalized_filename``).
+        pictures: ``{structural_hash: kept pictures}``; a recipe absent has
+            none kept.
+        by_name: ``{normalized basename: model ids}``, as
+            :func:`recipe_asset_index` builds it.
+        by_digest: ``{lowercase sha256: model id}``, every digest on the shelf.
+    """
+    sorted_digests = sorted(by_digest)
     verified: dict[int, set[str]] = {}
     named: dict[int, set[str]] = {}
-    for row in hub.fetchall(
-        "SELECT structural_hash, widget_name, normalized_filename "
-        "FROM workflow_recipe_asset"
-    ):
+    for row in asset_rows:
         recipe = row["structural_hash"]
         if recipe not in pictures:
             continue

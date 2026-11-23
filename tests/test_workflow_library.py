@@ -103,6 +103,7 @@ from pixlstash.services.model_shelf_service import (
 from pixlstash.services.model_workflow_sets import create_set, delete_set, set_declines
 from pixlstash.services.workflow_library_service import (
     read_card_picture_ids,
+    recipe_activity,
     recipe_picture_counts,
 )
 from pixlstash.services.scrapheap_service import purge_scrapheap_pictures
@@ -2864,6 +2865,237 @@ def test_an_a1111_short_hash_is_verified_only_when_unambiguous(store):
             conn.executemany("DELETE FROM model WHERE id = ?", [(m,) for m in models])
     # No shelf digest starts with it: it names a model this shelf does not hold.
     assert "0123456789" in model_ghost_names(store.hub)
+
+
+def recorded_recipe(hub, recipe, assets):
+    """One recipe on the hub naming *assets*, ``(widget_name, value)`` each."""
+    with hub.transaction() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO workflow_topology "
+            "(topology_hash, hash_version, node_count, first_seen_at) "
+            "VALUES (?, 'v1', 1, '2026-09-01T00:00:00Z')",
+            (f"topo-{recipe}",),
+        )
+        conn.execute(
+            "INSERT INTO workflow_recipe "
+            "(structural_hash, topology_hash, hash_version, node_count, first_seen_at) "
+            "VALUES (?, ?, 'v1', 1, '2026-09-01T00:00:00Z')",
+            (recipe, f"topo-{recipe}"),
+        )
+        conn.executemany(
+            "INSERT INTO workflow_recipe_asset "
+            "(structural_hash, widget_name, normalized_filename) VALUES (?, ?, ?)",
+            [(recipe, widget, value) for widget, value in assets],
+        )
+
+
+def picture_made_by(store, recipe, name, *, deleted=False):
+    def insert(session):
+        picture = Picture(
+            file_path=name, deleted=deleted, workflow_structural_hash=recipe
+        )
+        session.add(picture)
+        session.commit()
+        return picture.id
+
+    return store.vault.run_task(insert)
+
+
+def set_deleted(store, picture_id, deleted):
+    store.vault.run_task(
+        lambda session: (
+            setattr(session.get(Picture, picture_id), "deleted", deleted),
+            session.commit(),
+        )
+    )
+
+
+def test_one_models_counts_equal_its_row_of_the_whole_map(store):
+    """Counting a few models' pictures answers what the whole-library map does.
+
+    The narrowed read reaches only the asset rows that can name the models it
+    was asked about, so every rule that decides a tier is in the fixture: a
+    whole digest named by filename too (counted once, as verified), unique 10-
+    and 12-digit A1111 prefixes, a prefix two digests share (left to the
+    filename tier), two models sharing a filename, a copy filed under another
+    name, a file whose bare name reads as another model's short hash, models
+    with no digest, digest values that name nothing (upper case, blank), and a
+    recipe whose only kept picture is binned and restored.
+    """
+    hub = store.hub
+    vault = SimpleNamespace(db=store.vault)
+
+    def digest(label):
+        return hashlib.sha256(f"test-{label}".encode()).hexdigest()
+
+    whole, ten, twelve = digest("whole"), digest("ten"), digest("twelve")
+    shared = "fedcba9876"
+    # The hub is shared by the module and `model` is not in the wipe.
+    models: list[int] = []
+    folder = None
+    try:
+        with hub.transaction() as conn:
+
+            def add(filename, sha256, file_kind="adapter"):
+                models.append(
+                    conn.execute(
+                        "INSERT INTO model (file_kind, kind, sha256, filename, "
+                        "provenance) VALUES (?, ?, ?, ?, 'external')",
+                        (
+                            file_kind,
+                            "lora" if file_kind == "adapter" else None,
+                            sha256,
+                            filename,
+                        ),
+                    ).lastrowid
+                )
+                return models[-1]
+
+            m_whole = add("whole.safetensors", whole)
+            m_ten = add("ten.safetensors", ten, "checkpoint")
+            m_twelve = add("twelve.safetensors", twelve)
+            m_twin = add("twin-a.safetensors", shared + "1" * 54, "checkpoint")
+            m_twin_b = add("twin-b.safetensors", shared + "2" * 54, "checkpoint")
+            m_same = add("Same.safetensors", digest("same"))
+            m_same_b = add("same.safetensors", None, "vae")
+            m_copied = add("original.safetensors", digest("copied"), "text_encoder")
+            m_bare = add("bare.safetensors", None, "upscaler")
+            # Its asset rows are read for this name, and one of them is the
+            # digest widget naming `m_twelve`, which is not its to count.
+            m_hex_name = add(twelve[:12], None, "vae")
+            m_unused = add("unused.safetensors", digest("unused"))
+            folder = conn.execute(
+                "INSERT INTO model_folder (path, kind, movable) "
+                "VALUES ('/models/test-counts', 'user', 'per_item')"
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO model_file (model_id, model_folder_id, relpath, state) "
+                "VALUES (?, ?, 'sub/Renamed.safetensors', 'present')",
+                (m_copied, folder),
+            )
+
+        recorded_recipe(
+            hub,
+            "counts-whole",
+            [("adapter_sha256", whole), ("lora_name", "whole.safetensors")],
+        )
+        recorded_recipe(hub, "counts-ten", [("ckpt_sha256", ten[:10])])
+        recorded_recipe(hub, "counts-twelve", [("lora_sha256", twelve[:12])])
+        recorded_recipe(
+            hub,
+            "counts-shared",
+            [("ckpt_sha256", shared), ("ckpt_name", "twin-a.safetensors")],
+        )
+        recorded_recipe(hub, "counts-same", [("lora_name", "same.safetensors")])
+        recorded_recipe(hub, "counts-copy", [("clip_name", "renamed.safetensors")])
+        recorded_recipe(
+            hub,
+            "counts-bare",
+            [
+                ("model_name", "bare.safetensors"),
+                ("vae_sha256", whole.upper()),
+                ("clip_sha256", ""),
+            ],
+        )
+        recorded_recipe(hub, "counts-binned", [("unet_name", "bare.safetensors")])
+        for recipe, copies in (
+            ("counts-whole", 2),
+            ("counts-ten", 1),
+            ("counts-twelve", 1),
+            ("counts-shared", 1),
+            ("counts-same", 3),
+            ("counts-copy", 1),
+            ("counts-bare", 1),
+        ):
+            for n in range(copies):
+                picture_made_by(store, recipe, f"{recipe}-{n}.png")
+        binned = picture_made_by(
+            store, "counts-binned", "counts-binned.png", deleted=True
+        )
+
+        def agrees_with_the_whole_map():
+            whole_map = fetch_picture_counts(hub, vault)
+            for model_id in models:
+                assert fetch_picture_counts(hub, vault, model_ids=[model_id]) == (
+                    {model_id: whole_map[model_id]} if model_id in whole_map else {}
+                ), f"model {model_id} counts differently on its own"
+            everyone = [row["id"] for row in hub.fetchall("SELECT id FROM model")]
+            assert fetch_picture_counts(hub, vault, model_ids=everyone) == whole_map
+            assert fetch_picture_counts(hub, vault, model_ids=[]) == {}
+            return {model_id: whole_map.get(model_id) for model_id in models}
+
+        def tiers(verified, by_filename):
+            return {"verified": verified, "by_filename": by_filename}
+
+        expected = {
+            m_whole: tiers(2, 0),
+            m_ten: tiers(1, 0),
+            m_twelve: tiers(1, 0),
+            m_twin: tiers(0, 1),
+            m_twin_b: None,
+            m_same: tiers(0, 3),
+            m_same_b: tiers(0, 3),
+            m_copied: tiers(0, 1),
+            m_bare: tiers(0, 1),
+            m_hex_name: None,
+            m_unused: None,
+        }
+        # The premise: the fixture reaches every tier, so agreement means
+        # something.
+        assert agrees_with_the_whole_map() == expected
+
+        set_deleted(store, binned, False)
+        assert agrees_with_the_whole_map() == {**expected, m_bare: tiers(0, 2)}
+
+        set_deleted(store, binned, True)
+        assert agrees_with_the_whole_map() == expected
+    finally:
+        with hub.transaction() as conn:
+            if folder is not None:
+                conn.execute(
+                    "DELETE FROM model_file WHERE model_folder_id = ?", (folder,)
+                )
+                conn.execute("DELETE FROM model_folder WHERE id = ?", (folder,))
+            conn.executemany("DELETE FROM model WHERE id = ?", [(m,) for m in models])
+
+
+def test_recipe_activity_reads_past_the_bound_parameter_ceiling(store):
+    """A model can be named by more recipes than one ``IN`` may bind.
+
+    Pinned to SQLite's historical 999-variable floor with ``setlimit`` and
+    restored after, at a size under any modern default, so a failure can only
+    come from the ceiling. The two counted recipes sit in different chunks.
+    """
+    hashes = [f"counts-recipe-{n:04d}" for n in range(1500)]
+    first, last = hashes[0], hashes[-1]
+    picture_made_by(store, first, "ceiling-first.png")
+    picture_made_by(store, last, "ceiling-last-a.png")
+    picture_made_by(store, last, "ceiling-last-b.png")
+    picture_made_by(store, last, "ceiling-last-binned.png", deleted=True)
+
+    def probe(session):
+        raw = session.connection().connection
+        previous = raw.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+        raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        try:
+            # A plain `.in_()` at this size is what the ceiling refuses, so the
+            # call below is not passing for want of a big enough list.
+            with pytest.raises(OperationalError, match="too many SQL variables"):
+                session.exec(
+                    select(Picture.id).where(
+                        Picture.workflow_structural_hash.in_(hashes)
+                    )
+                ).all()
+            return recipe_activity(session, hashes)
+        finally:
+            raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+    activity = store.vault.run_immediate_read_task(probe)
+
+    assert {key: row.pictures for key, row in activity.items()} == {
+        first: 1,
+        last: 2,
+    }
 
 
 # ---------------------------------------------------------------------------
