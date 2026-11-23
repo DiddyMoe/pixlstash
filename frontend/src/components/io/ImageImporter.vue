@@ -12,6 +12,7 @@ import {
   stageFiles,
 } from "../../api/pictureImport";
 import { errorDetail } from "../../utils/apiError";
+import { importRelativePath } from "../../utils/media";
 import {
   abortableSleep,
   isTransientError,
@@ -560,6 +561,10 @@ async function startImport(files, options = {}) {
 
       const batch = files.slice(i, i + BATCH_SIZE);
       const batchKeys = fileKeys.slice(i, i + BATCH_SIZE);
+      // Where each file sat in the drop, so a caption tags only the picture in
+      // its own folder. Part of the batch the key names: every resend sends
+      // the same paths.
+      const batchRelpaths = batch.map(importRelativePath);
       const batchBytes = batch.reduce((sum, f) => sum + (f.size || 0), 0);
       const batchTimeoutMs =
         overrideTimeout ??
@@ -613,6 +618,7 @@ async function startImport(files, options = {}) {
             stagingId: currentStagingId,
             files: batch,
             keys: batchKeys,
+            relpaths: batchRelpaths,
             idempotencyKey: batchKey,
             signal: controller.signal,
             timeoutMs: batchTimeoutMs,

@@ -27,6 +27,7 @@ import {
   stageFiles,
 } from "../../api/pictureImport";
 import { useTasksStore } from "../../stores/useTasksStore";
+import { extractSupportedImportFilesFromDataTransfer } from "../../utils/media";
 import ImageImporter from "./ImageImporter.vue";
 
 // What the import API functions reject with: axios errors, with a `response`
@@ -124,6 +125,49 @@ function pictures(count) {
     { length: count },
     (_, i) => new File(["x"], `fake-${i}.png`, { type: "image/png" }),
   );
+}
+
+/**
+ * A drop of folders as the browser's entries API hands it over, for example
+ * `{ "/a": ["x.png"] }`: each folder lists its files once, then nothing more.
+ */
+function folderDrop(tree) {
+  const folders = Object.entries(tree).map(([folder, names]) => {
+    const children = names.map((name) => {
+      const file = new File(["x"], name, { lastModified: 1700000000000 });
+      return {
+        isFile: true,
+        isDirectory: false,
+        name,
+        fullPath: `${folder}/${name}`,
+        file: (ok) => ok(file),
+      };
+    });
+    return {
+      isFile: false,
+      isDirectory: true,
+      name: folder.slice(1),
+      fullPath: folder,
+      createReader: () => {
+        let listed = false;
+        return {
+          readEntries: (ok) => {
+            const batch = listed ? [] : children;
+            listed = true;
+            ok(batch);
+          },
+        };
+      },
+    };
+  });
+  return {
+    types: ["Files"],
+    files: [],
+    items: folders.map((entry) => ({
+      kind: "file",
+      webkitGetAsEntry: () => entry,
+    })),
+  };
 }
 
 function onlyRun(store) {
@@ -237,6 +281,33 @@ describe("ImageImporter upload", () => {
     expect(keys[2]).not.toBe(keys[0]);
     expect(commitStaging).toHaveBeenCalledTimes(1);
     expect(importer.emitted("import-error")).toBeUndefined();
+  });
+
+  it("sends where each file sat in the drop, the same again on a resend", async () => {
+    stageFiles
+      .mockRejectedValueOnce(networkError())
+      .mockImplementation(uploadAnsweringAfter(10));
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const onUnreadable = vi.fn();
+    const dropped = await extractSupportedImportFilesFromDataTransfer(
+      folderDrop({ "/a": ["x.png", "x.txt"], "/b": ["x.png"] }),
+      { onUnreadable },
+    );
+    // Every folder listed cleanly: the paths below come from a whole walk.
+    expect(onUnreadable).not.toHaveBeenCalled();
+    const importer = mountImporter();
+
+    const run = importer.vm.startImport([...dropped, ...pictures(1)]);
+    await vi.advanceTimersByTimeAsync(20000);
+    await run;
+
+    const sent = stageFiles.mock.calls.map(([args]) => args.relpaths);
+    // A picked file has no place in a drop, so it goes as a loose file.
+    const paths = ["/a/x.png", "/a/x.txt", "/b/x.png", ""];
+    expect(sent).toEqual([paths, paths]);
+    const keys = stageFiles.mock.calls.map(([args]) => args.idempotencyKey);
+    expect(keys[1]).toBe(keys[0]);
+    expect(commitStaging).toHaveBeenCalledTimes(1);
   });
 
   it("asks again while the server is still taking the same batch", async () => {

@@ -45,7 +45,9 @@ import { apiClient } from "../utils/apiClient";
  * ENDPOINTS (final, all under /api/v1, mutating routes OWNER_ONLY):
  *   POST   {backendUrl}/pictures/import/staging                   → { staging_id, safe_threshold }
  *   POST   {backendUrl}/pictures/import/staging/{id}/files         multipart `file` (repeatable), with an
- *                                                                 optional `key` per file, in the same order;
+ *                                                                 optional `key` and `relpath` per file, in
+ *                                                                 the same order (400 invalid_relpath for a
+ *                                                                 `..` segment, a NUL or an overlong path);
  *                                                                 header `Idempotency-Key` names the batch
  *                                                                 → { staging_id, staged, received[], skipped[],
  *                                                                     replayed }
@@ -162,6 +164,11 @@ export async function openStagingSession({
  * @param {File[]} args.files
  * @param {string[]} [args.keys]  One handle per file, same order; named back in
  *   the status `outcomes[]`.
+ * @param {string[]} [args.relpaths]  Where each file sat in the drop
+ *   (`importRelativePath`), same order; `""` or missing for a loose file. Sent
+ *   as one `relpath` per file so a caption only tags the picture in its own
+ *   folder. A resend must pass the same paths: they are part of the batch the
+ *   `idempotencyKey` names.
  * @param {string} [args.idempotencyKey]  The batch's identity, the same on
  *   every resend of it, so the server stages it once.
  * @param {AbortSignal} [args.signal]
@@ -174,6 +181,7 @@ export async function stageFiles({
   stagingId,
   files,
   keys = [],
+  relpaths = [],
   idempotencyKey,
   signal,
   timeoutMs,
@@ -182,6 +190,10 @@ export async function stageFiles({
   const formData = new FormData();
   files.forEach((file) => formData.append("file", file));
   keys.forEach((key) => formData.append("key", key));
+  // One per file, so the server pairs them by position.
+  files.forEach((_file, index) =>
+    formData.append("relpath", relpaths[index] ?? ""),
+  );
   const headers = { "Content-Type": "multipart/form-data" };
   // A structured-field string (RFC 8941), so the quotes are part of it.
   if (idempotencyKey) headers["Idempotency-Key"] = `"${idempotencyKey}"`;
