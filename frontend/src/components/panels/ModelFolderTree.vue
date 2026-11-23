@@ -1634,6 +1634,28 @@ watch(
   { immediate: true },
 );
 
+// The listings this tree shows, so a change on disk re-reads these and only
+// marks the rest stale: each registered folder's own level, and every open
+// row, one under a closed parent included (it is drawn open again when the
+// parent reopens). Rows of a folder no longer registered are left out.
+const dirsOwner = Symbol("ModelFolderTree");
+watch(
+  () => {
+    const ids = new Set(shelfFolders.value.map((folder) => Number(folder.id)));
+    const keys = [...ids].map((id) => foldersStore.dirsKey(id, ""));
+    for (const key of expanded.value) {
+      const [, id, ...path] = key.split(":");
+      if (ids.has(Number(id))) {
+        keys.push(foldersStore.dirsKey(id, path.join(":")));
+      }
+    }
+    return keys;
+  },
+  (keys) => foldersStore.setActiveDirs(dirsOwner, keys),
+  { immediate: true },
+);
+onBeforeUnmount(() => foldersStore.releaseActiveDirs(dirsOwner));
+
 defineExpose({ reveal });
 </script>
 

@@ -4054,14 +4054,21 @@ const openDriveName = computed(
 );
 
 // The open level, read fresh on every open: the tree's copy may be from
-// before a move.
+// before a move. Registered as shown (after the read starts, so that read
+// serves it), so a change on disk while it is open re-reads it too.
+const shownDirs = Symbol("ModelShelf");
 watch(
   () => (inFolder.value ? store.folderScope : null),
   (scope) => {
     if (scope) foldersStore.loadDirs(scope.folderId, scope.path, { force: true });
+    foldersStore.setActiveDirs(
+      shownDirs,
+      scope ? [foldersStore.dirsKey(scope.folderId, scope.path)] : [],
+    );
   },
   { immediate: true },
 );
+onBeforeUnmount(() => foldersStore.releaseActiveDirs(shownDirs));
 
 /** The open folder's subfolders (a locked folder's listing has none). */
 const subfolders = computed(() => {
@@ -4675,9 +4682,10 @@ onMounted(() => {
   // NOT `quiet`: that suppresses the folder store's `loading`, and the folders
   // dialog reads it. Opening the dialog while this first fetch is in flight
   // would show an empty list with no "Reading the registered folders…" state.
-  // Unawaited already means it does not hold up the shelf.
+  // Unawaited already means it does not hold up the shelf. Shared with the
+  // sidebar's read when both mount at once.
   foldersStore.refreshDevices();
-  foldersStore.refresh();
+  foldersStore.refresh({ join: true });
   // Where ComfyUI loads each kind from, for the folder marks (#2205).
   foldersStore.loadComfyuiReads();
   // The names, colours and thumbnails behind the assignment rings. Cached

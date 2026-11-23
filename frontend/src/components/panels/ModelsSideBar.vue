@@ -270,10 +270,11 @@ onMounted(() => {
   // The counts need the sets ("In no set yet"); the tree needs the folders,
   // their drives and a fresh read of each listing it shows. Re-read in place,
   // not dropped: the open rows draw whole from the last visit's listings
-  // rather than opening one level at a time.
+  // rather than opening one level at a time. A listing, folder or drive read
+  // already out (the tree's own, or the shelf's mounting with it) is shared.
   store.loadWorkflowSets();
-  foldersStore.reloadDirs();
-  foldersStore.refresh({ quiet: true });
+  foldersStore.reloadDirs({ join: true });
+  foldersStore.refresh({ quiet: true, join: true });
   foldersStore.refreshDevices();
   // The Training runs row counts them wherever the workspace is.
   runsStore.ensureLoaded();

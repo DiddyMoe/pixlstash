@@ -31,6 +31,15 @@ const SCAN_IN_FLIGHT = new Set(["pending", "running"]);
 const NO_COMFYUI_READS = Object.freeze({ known: false, reads: [] });
 
 /**
+ * How many listings `reloadDirs` re-reads at once. Each read walks a directory
+ * on disk, possibly on a slow or offline mount; a conservative bound.
+ */
+const DIRS_READ_SLOTS = 4;
+
+/** How many listings nothing shows are kept before the oldest are dropped. */
+const DORMANT_LISTINGS = 256;
+
+/**
  * The registered model folders, and the scans running against them.
  *
  * Nobody starts a scan: the server scans a folder when it is added, whenever a
@@ -57,9 +66,71 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
   const announcing = new Set();
 
   let pollHandle = null;
-  // Discards a read that was already on the wire when the credential changed,
-  // the same guard `useLibrariesStore.refresh` takes.
-  let epoch = 0;
+
+  /**
+   * Every read this store has out, by what it reads: `"folders"`, `"devices"`,
+   * `"comfyui"`, or a listing's `dirsKey` (always `"<id>:<path>"`, so the two
+   * kinds never collide). See `readOnce`.
+   */
+  const reads = new Map();
+
+  /**
+   * Run `start` as the one read of `key`, so two reads of the same thing are
+   * never out at once and an older answer never lands after a newer one.
+   *
+   * With `join`, a caller shares the read already out: right for a mount or a
+   * poll, which needs an answer, not one newer than anything. Without it (the
+   * default, for a caller that has just changed something) the read out may
+   * have left before the change, so it stops being current, which keeps its
+   * answer off the screen, and one more read starts once it settles. Every
+   * caller in between shares that one, and every promise handed out resolves
+   * to the newest answer.
+   *
+   * @param {string} key - what is read.
+   * @param {(isCurrent: () => boolean) => Promise<*>} start - issues the read
+   *   and publishes its answer only while `isCurrent()`. Must not reject.
+   * @param {{join?: boolean}} [options]
+   * @returns {Promise<*>} what the newest read resolved to, or null for a read
+   *   a session reset dropped.
+   */
+  function readOnce(key, start, { join = false } = {}) {
+    const out = reads.get(key);
+    if (!out) return launch(key, start);
+    if (join) return out.promise;
+    if (!out.next) {
+      out.current = false;
+      out.next = out.settled.then(() =>
+        out.dropped ? null : launch(key, start),
+      );
+    }
+    return out.next;
+  }
+
+  /** Start one read of `key`; `readOnce` decides when. */
+  function launch(key, start) {
+    const read = { current: true, dropped: false, next: null };
+    // Registered before `start` runs, so what it writes first already counts
+    // this key as being read.
+    reads.set(key, read);
+    read.settled = start(() => read.current).finally(() => {
+      // Identity-checked: a read a reset dropped must not unregister the one
+      // that replaced it. One with a read to follow stays until that starts.
+      if (reads.get(key) === read && !read.next) reads.delete(key);
+    });
+    read.promise = read.settled.then(
+      (answer) => read.next ?? (read.dropped ? null : answer),
+    );
+    return read.promise;
+  }
+
+  /** Abandon every read out: none may publish, and none is shared again. */
+  function dropReads() {
+    for (const read of reads.values()) {
+      read.current = false;
+      read.dropped = true;
+    }
+    reads.clear();
+  }
 
   const scanningIds = computed(
     () =>
@@ -142,13 +213,23 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
 
   /**
    * One level of subfolders per `"<folder id>:<path>"`: `{loading, listing,
-   * error}`. Shared by the Folders tree and the folder view, so the folder
-   * that is open is read once. Replaced wholesale so templates react.
+   * error, stale}`. Shared by the Folders trees and the folder view, so a
+   * folder shown in both is read once. Entries are written in place (a
+   * reactive Map tracks `get`, `set` and iteration), never by copying the map.
+   * `stale` marks a listing a change on disk may have outdated while nothing
+   * showed it: it is still drawn, and re-read on its next use.
    */
   const dirListings = ref(new Map());
-  const dirsInFlight = new Map();
-  /** Per key, the newest request: only it may write its answer. */
-  const dirsLatest = new Map();
+
+  /**
+   * The listings something on screen shows: owner → its keys, and key → how
+   * many owners show it. Only these are re-read when a change lands.
+   */
+  const dirsShownBy = new Map();
+  const dirsShown = new Map();
+
+  /** Re-reads waiting for a slot. Replaced on a session reset. */
+  let dirsQueue = { waiting: new Set(), running: 0 };
 
   /**
    * The sidebar tree's open rows, kept here so they outlive the sidebar: a
@@ -163,8 +244,19 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
     return `${Number(id)}:${path}`;
   }
 
+  /** The folder id and path a `dirsKey` names. */
+  function splitDirsKey(key) {
+    const at = key.indexOf(":");
+    return { id: Number(key.slice(0, at)), path: key.slice(at + 1) };
+  }
+
   /**
-   * Read one level of a registered folder, once unless `force`.
+   * Read one level of a registered folder: once, unless `force` or the cached
+   * listing is stale.
+   *
+   * A read of the same level already out is shared. A forced read (asked for
+   * after a change in the folder) cannot use one that may have left before
+   * the change, so it waits for that one and reads once more: see `readOnce`.
    *
    * @param {number} id - the registered folder.
    * @param {string} [path=""] - POSIX, relative to it.
@@ -176,37 +268,117 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
   async function loadDirs(id, path = "", { force = false } = {}) {
     const key = dirsKey(id, path);
     const known = dirListings.value.get(key);
-    if (!force && known?.listing) return known.listing;
-    // A forced read supersedes one in flight: that one may have left before
-    // the scan or move that asked for this.
-    if (!force && dirsInFlight.has(key)) return dirsInFlight.get(key);
-    const startedAt = epoch;
-    const ticket = {};
-    dirsLatest.set(key, ticket);
-    const put = (entry) => {
-      if (startedAt !== epoch || dirsLatest.get(key) !== ticket) return;
-      dirListings.value = new Map(dirListings.value).set(key, entry);
-    };
-    put({ loading: true, listing: known?.listing ?? null, error: "" });
-    const request = listModelFolderDirs(id, path)
-      .then((listing) => {
-        put({ loading: false, listing, error: "" });
-        return listing;
-      })
-      .catch((err) => {
-        console.warn(`Could not list model folder ${id} at "${path}"`, err);
-        put({
+    if (!force && known?.listing && !known.stale) return known.listing;
+    return readOnce(key, (isCurrent) => readDirs(id, path, key, isCurrent), {
+      join: !force,
+    });
+  }
+
+  /** One read of one level, written to `dirListings` while it is current. */
+  async function readDirs(id, path, key, isCurrent) {
+    const before = dirListings.value.get(key);
+    // The listing already drawn stays up while it is re-read.
+    putDirs(key, {
+      loading: true,
+      listing: before?.listing ?? null,
+      error: "",
+      stale: Boolean(before?.stale),
+    });
+    try {
+      const listing = await listModelFolderDirs(id, path);
+      if (isCurrent()) {
+        putDirs(key, { loading: false, listing, error: "", stale: false });
+      }
+      return listing;
+    } catch (err) {
+      console.warn(`Could not list model folder ${id} at "${path}"`, err);
+      if (isCurrent()) {
+        putDirs(key, {
           loading: false,
           listing: null,
           error: errorDetail(err) || "Could not read this folder.",
+          stale: false,
         });
-        return null;
-      })
-      .finally(() => {
-        if (dirsInFlight.get(key) === request) dirsInFlight.delete(key);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Write one listing in place. A new key drops the oldest listings nothing
+   * shows or reads, so that counting it there are at most `DORMANT_LISTINGS`:
+   * browsing a large tree does not grow the cache without end. Only a read
+   * writes here, so the new key itself is never dropped.
+   */
+  function putDirs(key, entry) {
+    const listings = dirListings.value;
+    const added = !listings.has(key);
+    listings.set(key, entry);
+    if (!added) return;
+    const dormant = [];
+    for (const known of listings.keys()) {
+      if (!dirsShown.has(known) && !reads.has(known)) dormant.push(known);
+    }
+    // `+ 1`: the new key, being read now, is not in `dormant` but soon will be.
+    for (let i = 0; i < dormant.length + 1 - DORMANT_LISTINGS; i += 1) {
+      listings.delete(dormant[i]);
+    }
+  }
+
+  /**
+   * Say which listings `owner` shows, replacing what it said before. A listing
+   * some owner shows is kept and re-read by `reloadDirs`; one that turns up
+   * stale or not cached is re-read now. Each Folders tree (pickers included)
+   * and the folder view registers, and releases on unmount.
+   *
+   * @param {symbol} owner - one per consumer.
+   * @param {Iterable<string>} keys - `dirsKey`s.
+   */
+  function setActiveDirs(owner, keys) {
+    const before = dirsShownBy.get(owner) ?? new Set();
+    const now = new Set(keys);
+    for (const key of before) {
+      if (now.has(key)) continue;
+      const owners = dirsShown.get(key) - 1;
+      if (owners) dirsShown.set(key, owners);
+      else dirsShown.delete(key);
+    }
+    for (const key of now) {
+      if (before.has(key)) continue;
+      dirsShown.set(key, (dirsShown.get(key) ?? 0) + 1);
+      const known = dirListings.value.get(key);
+      if ((!known || known.stale) && !reads.has(key)) queueDirs(key);
+    }
+    if (now.size) dirsShownBy.set(owner, now);
+    else dirsShownBy.delete(owner);
+  }
+
+  /** `owner` shows no listing any more. */
+  function releaseActiveDirs(owner) {
+    setActiveDirs(owner, []);
+  }
+
+  /**
+   * Re-read a listing as soon as one of `DIRS_READ_SLOTS` is free. One being
+   * read then gets one more read after that one (see `readOnce`), and keeps its
+   * slot until that read settles, so a trailing read counts against the bound.
+   */
+  function queueDirs(key) {
+    dirsQueue.waiting.add(key);
+    pumpDirs(dirsQueue);
+  }
+
+  function pumpDirs(queue) {
+    for (const key of queue.waiting) {
+      if (queue.running >= DIRS_READ_SLOTS) return;
+      queue.waiting.delete(key);
+      queue.running += 1;
+      const { id, path } = splitDirsKey(key);
+      loadDirs(id, path, { force: true }).finally(() => {
+        queue.running -= 1;
+        pumpDirs(queue);
       });
-    dirsInFlight.set(key, request);
-    return request;
+    }
   }
 
   /**
@@ -216,9 +388,16 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
    */
   const comfyuiReads = ref(NO_COMFYUI_READS);
 
-  /** Ask once per shelf visit; ComfyUI's folders rarely move under it. */
-  async function loadComfyuiReads() {
-    const startedAt = epoch;
+  /**
+   * Ask once per shelf visit, and again after a rename; ComfyUI's folders
+   * rarely move under it. Not shared: after a rename the answer must be newer
+   * than the rename.
+   */
+  function loadComfyuiReads() {
+    return readOnce("comfyui", readComfyui);
+  }
+
+  async function readComfyui(isCurrent) {
     let answer = NO_COMFYUI_READS;
     try {
       const body = await getComfyuiReads();
@@ -226,18 +405,56 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
     } catch (err) {
       console.warn("Could not read where ComfyUI loads models from", err);
     }
-    if (startedAt === epoch) comfyuiReads.value = answer;
+    if (isCurrent()) comfyuiReads.value = answer;
   }
 
   /**
-   * Re-read every listing already shown, in place: a scan, a move or an added
-   * file changes counts and folders under rows that are open. Clearing instead
-   * would fold every open row shut.
+   * After a change on disk (a scan, a move, an added file): re-read in place
+   * the listings something shows, and mark the rest stale so each is re-read
+   * when next used. A listing being read gets one more read after that one,
+   * which may have left before the change. Every read this starts waits in
+   * the queue, so at most `DIRS_READ_SLOTS` of them are out at a time.
+   * Clearing instead would fold every open row shut.
+   *
+   * @param {{join?: boolean}} [options] - `join` for a mount, which brings
+   *   back listings from an earlier visit rather than reporting a change: a
+   *   listing already being read is left to that read.
    */
-  function reloadDirs() {
-    for (const key of dirListings.value.keys()) {
-      const at = key.indexOf(":");
-      loadDirs(Number(key.slice(0, at)), key.slice(at + 1), { force: true });
+  function reloadDirs({ join = false } = {}) {
+    for (const [key, entry] of dirListings.value) {
+      if (reads.has(key)) {
+        if (!join) queueDirs(key);
+      } else if (dirsShown.has(key)) {
+        queueDirs(key);
+      } else if (!entry.stale) {
+        dirListings.value.set(key, { ...entry, stale: true });
+      }
+    }
+  }
+
+  /**
+   * Re-read the drive capacities.
+   *
+   * Its own call, and its own failure. The route stats the filesystem, so an
+   * offline mount can make it slow or make it fail, and neither may take the
+   * folder list down with it: without capacities the shelf still draws its
+   * bands, it just cannot draw a meter in them. Always shares a read already
+   * out: its callers are mounts.
+   */
+  function refreshDevices() {
+    return readOnce("devices", readDevices, { join: true });
+  }
+
+  async function readDevices(isCurrent) {
+    try {
+      const next = await listModelFolderDevices();
+      if (isCurrent()) devices.value = next;
+    } catch (err) {
+      console.warn("Could not read the model drives' capacity", err);
+      // Not surfaced as `error`: that field drives the folder dialog's alert,
+      // and a drive we could not measure is not a reason to tell the owner
+      // their folders could not be read.
+      if (isCurrent()) devices.value = [];
     }
   }
 
@@ -247,49 +464,35 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
    * @param {Object} [options]
    * @param {boolean} [options.quiet=false] - true for a poll, which must not
    *   flash the list's loading state on every tick.
+   * @param {boolean} [options.join=false] - share a read already out: for a
+   *   mount or a poll. A caller that has just changed a folder leaves it
+   *   false, so the answer it waits for left after the change.
+   * @returns {Promise<void>}
    */
-  /**
-   * Re-read the drive capacities.
-   *
-   * Its own call, and its own failure. The route stats the filesystem, so an
-   * offline mount can make it slow or make it fail, and neither may take the
-   * folder list down with it: without capacities the shelf still draws its
-   * bands, it just cannot draw a meter in them.
-   */
-  async function refreshDevices() {
-    const startedAt = epoch;
-    try {
-      const next = await listModelFolderDevices();
-      if (startedAt !== epoch) return;
-      devices.value = next;
-    } catch (err) {
-      if (startedAt !== epoch) return;
-      // Not surfaced as `error`: that field drives the folder dialog's alert,
-      // and a drive we could not measure is not a reason to tell the owner
-      // their folders could not be read.
-      devices.value = [];
-      console.warn("Could not read the model drives' capacity", err);
-    }
-  }
-
-  async function refresh({ quiet = false } = {}) {
-    const startedAt = epoch;
+  function refresh({ quiet = false, join = false } = {}) {
     if (!quiet) loading.value = true;
     error.value = "";
+    return readOnce("folders", readFolders, { join });
+  }
+
+  async function readFolders(isCurrent) {
     try {
       const next = await listModelFolders();
-      if (startedAt !== epoch) return;
+      if (!isCurrent()) return;
       folders.value = next;
       loaded.value = true;
       announceFinishedScans();
       if (scanningIds.value.size) startPolling();
       else stopPolling();
     } catch (err) {
-      if (startedAt !== epoch) return;
-      error.value =
-        errorDetail(err) || "Could not read the registered model folders.";
+      if (isCurrent()) {
+        error.value =
+          errorDetail(err) || "Could not read the registered model folders.";
+      } else {
+        console.warn("A superseded read of the model folders failed", err);
+      }
     } finally {
-      if (startedAt === epoch && !quiet) loading.value = false;
+      if (isCurrent()) loading.value = false;
     }
   }
 
@@ -325,7 +528,10 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
 
   function startPolling() {
     if (pollHandle !== null) return;
-    pollHandle = setInterval(() => refresh({ quiet: true }), POLL_MS);
+    pollHandle = setInterval(
+      () => refresh({ quiet: true, join: true }),
+      POLL_MS,
+    );
   }
 
   function stopPolling() {
@@ -518,9 +724,16 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
    * so none of it may survive into a share or read-only session that is never
    * allowed to ask for it. Any scan being waited on is abandoned with it: the
    * server carries on, but this session no longer has standing to poll.
+   *
+   * A read already out answers for the previous credential: it must not
+   * publish, and a read asked for after this must not share it. What each
+   * consumer shows is kept: consumers are still mounted, and say what they
+   * show as it changes.
    */
   function resetForSession() {
-    epoch += 1;
+    dropReads();
+    dirsQueue.waiting.clear();
+    dirsQueue = { waiting: new Set(), running: 0 };
     stopPolling();
     folders.value = [];
     devices.value = [];
@@ -564,6 +777,8 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
     loadComfyuiReads,
     loadDirs,
     reloadDirs,
+    setActiveDirs,
+    releaseActiveDirs,
     refresh,
     refreshDevices,
     add,
