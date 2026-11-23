@@ -1,5 +1,6 @@
 import contextvars
 import functools
+import gc
 import hashlib
 import inspect
 import itertools
@@ -14,8 +15,8 @@ import time
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
-from concurrent.futures import Future
-from enum import IntEnum
+from concurrent.futures import Future, InvalidStateError
+from enum import IntEnum, StrEnum
 from typing import Optional
 from sqlalchemy import (
     bindparam as sa_bindparam,
@@ -507,37 +508,62 @@ class _EngineRWLock:
         self._readers = 0
         self._writers_waiting = 0
         self._writer_active = False
+        # Read depth per thread: a thread already inside a read re-enters
+        # without waiting (a waiting writer cannot proceed before that
+        # thread's outer read ends anyway, so waiting would deadlock).
+        self._local = threading.local()
+
+    def held_by_current_thread(self) -> bool:
+        """True if the calling thread is inside a ``read()`` block."""
+        return getattr(self._local, "depth", 0) > 0
 
     @contextmanager
     def read(self):
+        depth = getattr(self._local, "depth", 0)
         with self._cond:
-            while self._writer_active or self._writers_waiting > 0:
-                self._cond.wait()
+            if depth == 0:
+                while self._writer_active or self._writers_waiting > 0:
+                    self._cond.wait()
             self._readers += 1
+        self._local.depth = depth + 1
         try:
             yield
         finally:
+            self._local.depth = depth
             with self._cond:
                 self._readers -= 1
                 if self._readers == 0:
                     self._cond.notify_all()
 
-    @contextmanager
-    def write(self):
+    def acquire_write(self, timeout=None) -> bool:
+        """Take the write side; False if readers still hold it after ``timeout`` s."""
         with self._cond:
             self._writers_waiting += 1
             try:
-                while self._writer_active or self._readers > 0:
-                    self._cond.wait()
+                acquired = self._cond.wait_for(
+                    lambda: not self._writer_active and self._readers == 0, timeout
+                )
             finally:
                 self._writers_waiting -= 1
-            self._writer_active = True
+            if acquired:
+                self._writer_active = True
+            else:
+                # Readers parked behind this writer may go again.
+                self._cond.notify_all()
+            return acquired
+
+    def release_write(self) -> None:
+        with self._cond:
+            self._writer_active = False
+            self._cond.notify_all()
+
+    @contextmanager
+    def write(self):
+        self.acquire_write()
         try:
             yield
         finally:
-            with self._cond:
-                self._writer_active = False
-                self._cond.notify_all()
+            self.release_write()
 
 
 # Priority enum for DB operations
@@ -546,6 +572,33 @@ class DBPriority(IntEnum):
     MEDIUM = 20
     HIGH = 10
     IMMEDIATE = 0
+
+
+# How long close() waits for the writer to finish the task in hand. A writer
+# still busy after that keeps the engine and releases it itself (see close()).
+_WRITER_JOIN_TIMEOUT_S = 10
+
+
+class WriterState(StrEnum):
+    """Lifecycle of a ``VaultDatabase`` and its writer thread.
+
+    OPEN accepts work. CLOSING and CLOSED refuse every task and every read.
+    FAILED means the writer loop itself broke: writes are refused, while reads
+    still run because they never touch the writer.
+    """
+
+    OPEN = "open"
+    CLOSING = "closing"
+    CLOSED = "closed"
+    FAILED = "failed"
+
+
+# The states in which run_immediate_read_task may open a session.
+_READABLE_STATES = frozenset({WriterState.OPEN, WriterState.FAILED})
+
+
+class DatabaseUnavailableError(RuntimeError):
+    """The vault database refused a task: it is closing, closed or its writer failed."""
 
 
 # Database task for the queue
@@ -583,6 +636,18 @@ class DatabaseTask:
         if not isinstance(other, DatabaseTask):
             return NotImplemented
         return (self.priority, self.sequence) == (other.priority, other.sequence)
+
+
+def _task_label(func) -> str:
+    """``module.qualname`` of a task's callable, for logs and ``writer_status()``."""
+    name = getattr(func, "__qualname__", None) or type(func).__qualname__
+    module = getattr(func, "__module__", None)
+    return f"{module}.{name}" if module else name
+
+
+def _writer_failed_message(reason: str) -> str:
+    """The refusal every task gets once the writer loop has failed."""
+    return f"VaultDatabase writer has failed ({reason}); task refused."
 
 
 logger = get_logger(__name__)
@@ -1171,78 +1236,95 @@ class VaultDatabase:
         # Write queue and worker
         self._task_queue = queue.PriorityQueue()
         self._task_worker_stop_event = threading.Event()
-        self._close_lock = threading.Lock()
+        # Re-entrant: a done-callback settled by close()'s own drain may call
+        # close() again on the same thread; it then sees CLOSING and returns.
+        self._close_lock = threading.RLock()
+        # Makes "is the writer accepting work?" and the queue put one step, so
+        # a task is either refused or queued ahead of close()'s drain, never
+        # stranded behind it. Separate from _close_lock, which close() holds
+        # across the writer join: a submit (possibly from a done-callback on
+        # the writer thread itself) must never wait on that.
+        self._admission_lock = threading.Lock()
+        # _state, _failed_reason, _writer_running and _release_pending
+        # change only under _admission_lock.
+        self._state = WriterState.OPEN
+        self._failed_reason = None
+        self._writer_running = True
+        self._release_pending = False
+        # Writer-thread bookkeeping for writer_status(): (label, monotonic
+        # start) of the task in hand, and the last discarded session.
+        self._current_task = None
+        self._last_session_failure = None
         # Fences immediate reads against the live-DB file swap (see
-        # exclusive_engine_access / run_immediate_read_task).
+        # exclusive_engine_access / run_immediate_read_task) and against the
+        # engine release in close().
         self._engine_rwlock = _EngineRWLock()
-        self._closed = False
         self._task_worker = threading.Thread(target=self._task_worker_loop, daemon=True)
         self._task_worker.start()
 
     @property
     def is_open(self) -> bool:
-        return not self._closed and self._engine is not None
+        """True while the database serves reads (OPEN, or FAILED with reads only)."""
+        return self._state in _READABLE_STATES and self._engine is not None
 
     def close(self):
-        """
-        Cleanly close the database engine and stop the worker thread.
-        """
-        import gc
+        """Stop the writer, refuse queued work and release the engine.
 
+        Every task still queued is settled with ``DatabaseUnavailableError``.
+        The engine and the location guard are released only once the writer
+        has stopped: a writer still inside a task after the join timeout holds
+        a pooled connection, so it releases them itself when that task returns.
+        """
         with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
+            with self._admission_lock:
+                if self._state in (WriterState.CLOSING, WriterState.CLOSED):
+                    return
+                self._state = WriterState.CLOSING
 
-            try:
-                self._task_worker_stop_event.set()
-                self._task_queue.put(DatabaseTask(DBPriority.IMMEDIATE, None))
-                if self._task_worker:
-                    self._task_worker.join(timeout=10)
-                    if self._task_worker.is_alive():
-                        logger.warning(
-                            "VaultDatabase: worker thread did not stop cleanly before engine disposal."
-                        )
-                self._task_worker = None
-            except Exception as e:
-                logger.warning(
-                    f"VaultDatabase: Exception during worker thread stop: {e}"
+            self._task_worker_stop_event.set()
+            self._task_queue.put(DatabaseTask(DBPriority.IMMEDIATE, None))
+            if threading.current_thread() is self._task_worker:
+                logger.error(
+                    "VaultDatabase.close() was called from the writer thread "
+                    "(a task or done-callback); the engine is released when "
+                    "the writer returns from it."
                 )
+            else:
+                self._task_worker.join(timeout=_WRITER_JOIN_TIMEOUT_S)
 
-            while True:
-                try:
-                    pending = self._task_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if getattr(pending, "func", None) is None:
-                    continue
-                if not pending.future.done():
-                    pending.future.set_exception(
-                        RuntimeError("VaultDatabase is closed; task cancelled.")
-                    )
+            self._reject_queued("VaultDatabase is closed; task cancelled.")
 
-            if hasattr(self, "_engine") and self._engine:
-                try:
-                    self._engine.dispose()
-                    self._engine = None
-                    logger.info("VaultDatabase: SQLAlchemy engine disposed.")
-                except Exception as e:
-                    logger.warning(
-                        f"VaultDatabase: Exception during engine dispose: {e}"
-                    )
+            with self._admission_lock:
+                self._state = WriterState.CLOSED
+                writer_running = self._writer_running
+                self._release_pending = True
 
-            # Only after every SQLite connection is disposed may the guard fd
-            # be closed: closing it earlier releases the process's POSIX locks
-            # on the vault file out from under the live connections (see the
-            # comment in __init__).
-            if getattr(self, "_location_guard", None) is not None:
-                try:
-                    self._location_guard.close()
-                except OSError as e:
-                    logger.warning(
-                        f"VaultDatabase: Exception closing location guard: {e}"
-                    )
-                self._location_guard = None
+            if writer_running:
+                label, started = self._current_task or ("<between tasks>", None)
+                age = "?" if started is None else f"{time.monotonic() - started:.1f}"
+                logger.error(
+                    "VaultDatabase: the writer is still running %s after %s s; "
+                    "the engine and the location guard stay open until it "
+                    "returns, then the writer releases them.",
+                    label,
+                    age,
+                )
+                return
+            if self._engine_rwlock.held_by_current_thread():
+                logger.error(
+                    "VaultDatabase.close() was called from inside an immediate "
+                    "read; the engine is released when that read returns."
+                )
+                return
+            if not self._release_engine_when_idle(timeout=_WRITER_JOIN_TIMEOUT_S):
+                logger.error(
+                    "VaultDatabase: %d immediate read(s) still running after "
+                    "%s s; the engine and the location guard stay open until "
+                    "the last one returns, then it releases them.",
+                    self._engine_rwlock._readers,
+                    _WRITER_JOIN_TIMEOUT_S,
+                )
+                return
 
         gc.collect()
         logger.info("VaultDatabase.close called, resources released.")
@@ -1274,14 +1356,19 @@ class VaultDatabase:
 
         future = db.submit_task(update_picture_quality, "pic123", 0.95)
         result = future.result()
+
+        Every returned future is settled exactly once: with the callback's
+        result or the exception it raised (after the session is rolled back
+        and closed), with ``CancelledError`` if it was cancelled before the
+        writer started it, or with ``DatabaseUnavailableError`` if the
+        database is closing, closed or its writer has failed. A refused
+        submission comes back already failed rather than queued.
+
+        Done-callbacks added to the future run on the writer thread. They must
+        not block on the writer (``run_task``, ``future.result()`` of another
+        writer task) and must not raise.
         """
-        if self._closed:
-            future = Future()
-            future.set_exception(RuntimeError("VaultDatabase is closed."))
-            return future
-        task = DatabaseTask(priority, func, args, kwargs)
-        self._task_queue.put(task)
-        return task.future
+        return self._enqueue(DatabaseTask(priority, func, args, kwargs))
 
     # --- Synchronous API ---
     def run_task(self, func, *args, priority=DBPriority.IMMEDIATE, **kwargs):
@@ -1309,15 +1396,12 @@ class VaultDatabase:
 
         Control tasks always run at IMMEDIATE priority and skip the
         ``self._engine is None`` precondition (a swap is permitted to recreate
-        the engine), but still honor ``self._closed``.
+        the engine), but are refused like any task once the database is
+        closing, closed or failed. Settlement follows ``submit_task``.
         """
-        if self._closed:
-            future = Future()
-            future.set_exception(RuntimeError("VaultDatabase is closed."))
-            return future
-        task = DatabaseTask(DBPriority.IMMEDIATE, func, args, kwargs, is_control=True)
-        self._task_queue.put(task)
-        return task.future
+        return self._enqueue(
+            DatabaseTask(DBPriority.IMMEDIATE, func, args, kwargs, is_control=True)
+        )
 
     def run_control_task(self, func, *args, **kwargs):
         """Submit a control task and wait for it to complete. See ``submit_control_task``."""
@@ -1338,11 +1422,17 @@ class VaultDatabase:
         # Hold the read side of the engine lock for the whole read so the live
         # engine cannot be disposed/swapped out from under an open session
         # during a restore DB-file swap.
-        with self._engine_rwlock.read():
-            if self._closed or self._engine is None:
-                raise RuntimeError("VaultDatabase is closed.")
-            with Session(self._engine) as session:
-                return func(session, *args, **kwargs)
+        # Reads never touch the writer, so a FAILED writer still serves them.
+        try:
+            with self._engine_rwlock.read():
+                if self._state not in _READABLE_STATES or self._engine is None:
+                    raise DatabaseUnavailableError("VaultDatabase is closed.")
+                with Session(self._engine) as session:
+                    return func(session, *args, **kwargs)
+        finally:
+            # close() timed out waiting for reads: the last one out releases.
+            if self._release_pending:
+                self._release_engine_when_idle(timeout=0)
 
     @contextmanager
     def exclusive_engine_access(self):
@@ -1355,6 +1445,33 @@ class VaultDatabase:
         """
         with self._engine_rwlock.write():
             yield
+
+    def writer_status(self) -> dict:
+        """A snapshot of the writer's health for the owner's progress view.
+
+        ``state`` is a ``WriterState`` value; ``alive`` whether the writer
+        thread runs; ``queue_depth`` approximate; ``current_task`` and
+        ``current_task_seconds`` the task in hand (None between tasks);
+        ``last_session_failure`` the last session the writer had to discard
+        (``at`` epoch seconds, ``task``, ``step``, ``error``); ``failed_reason``
+        why the writer loop failed, if it did.
+        """
+        with self._admission_lock:
+            state = self._state
+            failed_reason = self._failed_reason
+        current = self._current_task
+        last_failure = self._last_session_failure
+        return {
+            "state": state.value,
+            "alive": self._task_worker.is_alive(),
+            "queue_depth": self._task_queue.qsize(),
+            "current_task": current[0] if current else None,
+            "current_task_seconds": (
+                round(time.monotonic() - current[1], 1) if current else None
+            ),
+            "last_session_failure": dict(last_failure) if last_failure else None,
+            "failed_reason": failed_reason,
+        }
 
     @staticmethod
     def result_or_throw(future: Future):
@@ -1383,57 +1500,290 @@ class VaultDatabase:
                 caller.f_lineno,
             )
             raise
-        except Exception:
+        except Exception as exc:
+            # The caught exception, not future.exception(): for a cancelled
+            # future that call raises again and this line is never logged.
             frame = inspect.currentframe()
             caller = frame.f_back
             logger.error(
-                f"Database task failed: {future.exception()} at {caller.f_code.co_filename}:{caller.f_lineno}\n"
+                f"Database task failed: {exc!r} at {caller.f_code.co_filename}:{caller.f_lineno}\n"
                 f"Full stack trace:\n{traceback.format_exc()}"
             )
             raise
 
+    def _enqueue(self, task: DatabaseTask) -> Future:
+        """Queue ``task`` if the writer accepts work, else return it pre-failed."""
+        with self._admission_lock:
+            if self._state is WriterState.OPEN:
+                self._task_queue.put(task)
+                return task.future
+            state = self._state
+            failed_reason = self._failed_reason
+        if state is WriterState.FAILED:
+            message = _writer_failed_message(failed_reason)
+            logger.warning(
+                "VaultDatabase: refused %s, the writer has failed (%s).",
+                _task_label(task.func),
+                failed_reason,
+            )
+        else:
+            message = "VaultDatabase is closed."
+        task.future.set_exception(DatabaseUnavailableError(message))
+        return task.future
+
     def _task_worker_loop(self):
-        while True:
-            try:
-                task = self._task_queue.get(timeout=0.2)
-            except queue.Empty:
-                if self._task_worker_stop_event.is_set():
+        task = None
+        try:
+            while True:
+                task = None
+                try:
+                    task = self._task_queue.get(timeout=0.2)
+                except queue.Empty:
+                    if self._task_worker_stop_event.is_set():
+                        break
+                    continue
+
+                if task.func is None:
                     break
-                continue
+                self._execute(task)
+        except BaseException as exc:
+            # Every per-task path is contained in _execute, so only the loop
+            # machinery itself gets here.
+            self._fail_writer(exc, task)
+        finally:
+            with self._admission_lock:
+                self._writer_running = False
+                release = self._release_pending
+            if release and self._release_engine_when_idle(timeout=0):
+                logger.info(
+                    "VaultDatabase: the writer returned after close(); "
+                    "the engine is released."
+                )
 
-            if task.func is None:
-                break
-
-            if self._closed:
-                if not task.future.done():
-                    task.future.set_exception(RuntimeError("VaultDatabase is closed."))
-                continue
-
-            if task.is_control:
+    def _execute(self, task: DatabaseTask) -> None:
+        """Run one task and settle its future exactly once."""
+        label = _task_label(task.func)
+        if not task.future.set_running_or_notify_cancel():
+            logger.info(
+                "VaultDatabase: skipped %s, cancelled before it started.", label
+            )
+            return
+        self._current_task = (label, time.monotonic())
+        try:
+            if self._state is not WriterState.OPEN:
+                result, error = (
+                    None,
+                    DatabaseUnavailableError("VaultDatabase is closed."),
+                )
+            elif task.is_control:
                 # Control op: runs without a session so it can dispose and
                 # re-create the engine without leaving an open Session bound
-                # to a now-disposed engine (whose __exit__ would try to return
+                # to a now-disposed engine (whose close would try to return
                 # connections to the disposed pool, possibly via the
                 # after_flush metadata-hash hook).
-                try:
-                    result = task._context.run(task.func, *task.args, **task.kwargs)
-                    task.future.set_result(result)
-                except Exception as e:
-                    task.future.set_exception(e)
-                continue
+                result, error = self._invoke(task, label)
+            elif self._engine is None:
+                result, error = (
+                    None,
+                    DatabaseUnavailableError("VaultDatabase is closed."),
+                )
+            else:
+                result, error = self._run_in_session(task, label)
+        finally:
+            self._current_task = None
+        self._settle(task, label, result, error)
 
-            if self._engine is None:
-                if not task.future.done():
-                    task.future.set_exception(RuntimeError("VaultDatabase is closed."))
-                continue
+    def _invoke(self, task: DatabaseTask, label: str, *lead):
+        """Call the task's callable; return ``(result, None)`` or ``(None, exc)``."""
+        try:
+            return task._context.run(task.func, *lead, *task.args, **task.kwargs), None
+        except BaseException as exc:
+            # The stdlib executors capture BaseException too: whatever the
+            # callable raises belongs to its caller, never to the writer.
+            if not isinstance(exc, Exception):
+                logger.warning(
+                    "VaultDatabase: %s raised %r; passing it to the caller.",
+                    label,
+                    exc,
+                )
+            return None, exc
 
-            with Session(self._engine) as session:
-                _attach_session_hooks(session)
-                try:
-                    result = task._context.run(
-                        task.func, session, *task.args, **task.kwargs
-                    )
-                    task.future.set_result(result)
-                except Exception as e:
-                    session.rollback()
-                    task.future.set_exception(e)
+    def _run_in_session(self, task: DatabaseTask, label: str):
+        """Run a normal task in its own session, then roll back or close it.
+
+        The session is gone before the future settles. A session step that
+        fails is discarded (connection invalidated) and the writer continues.
+        A callback's exception reaches the caller unchanged, with any rollback
+        or close failure attached as a note; a result survives a close failure
+        because whatever the callback committed is already committed.
+        """
+        session = None
+        try:
+            session = Session(self._engine)
+            _attach_session_hooks(session)
+        except BaseException as exc:
+            self._discard_session(session, label, "open", exc)
+            return None, exc
+
+        result, error = self._invoke(task, label, session)
+        if error is not None:
+            try:
+                session.rollback()
+            except BaseException as rollback_error:
+                error.add_note(
+                    f"Rolling back the session also failed: {rollback_error!r}"
+                )
+                self._discard_session(session, label, "rollback", rollback_error)
+                return None, error
+        try:
+            session.close()
+        except BaseException as close_error:
+            if error is not None:
+                error.add_note(f"Closing the session also failed: {close_error!r}")
+            self._discard_session(session, label, "close", close_error)
+        return result, error
+
+    def _discard_session(self, session, label: str, step: str, exc: BaseException):
+        """Log and record a failed session step, then invalidate the session."""
+        logger.error(
+            "VaultDatabase: session %s failed for %s; discarding the session.",
+            step,
+            label,
+            exc_info=exc,
+        )
+        self._last_session_failure = {
+            "at": time.time(),
+            "task": label,
+            "step": step,
+            "error": repr(exc),
+        }
+        if session is None:
+            return
+        try:
+            session.invalidate()
+        except BaseException:
+            logger.error(
+                "VaultDatabase: invalidating the session after a failed %s for %s "
+                "also failed; its connection is left to the pool.",
+                step,
+                label,
+                exc_info=True,
+            )
+
+    def _settle(self, task: DatabaseTask, label: str, result, error) -> None:
+        """Deliver one outcome to ``task.future``; the writer survives either way."""
+        try:
+            if error is None:
+                task.future.set_result(result)
+            else:
+                task.future.set_exception(error)
+        except InvalidStateError:
+            logger.error(
+                "VaultDatabase: %s was already settled; dropping its %s. This is "
+                "a bug: every task must be settled exactly once.",
+                label,
+                "result" if error is None else f"exception {error!r}",
+                exc_info=True,
+            )
+        except BaseException:
+            # concurrent.futures catches an Exception from a done-callback but
+            # lets a BaseException through after the future is already done.
+            logger.error(
+                "VaultDatabase: a done-callback of %s raised; the future is "
+                "settled but its remaining done-callbacks did not run.",
+                label,
+                exc_info=True,
+            )
+
+    def _reject_queued(self, message: str) -> None:
+        """Settle every queued task with ``DatabaseUnavailableError(message)``."""
+        refused = []
+        while True:
+            try:
+                task = self._task_queue.get_nowait()
+            except queue.Empty:
+                break
+            if task.func is None:
+                continue
+            label = _task_label(task.func)
+            if not task.future.set_running_or_notify_cancel():
+                logger.info(
+                    "VaultDatabase: skipped %s, cancelled before it started.", label
+                )
+                continue
+            refused.append(label)
+            self._settle(task, label, None, DatabaseUnavailableError(message))
+        if refused:
+            logger.warning(
+                "VaultDatabase: refused %d queued task(s) (%s): %s",
+                len(refused),
+                message,
+                ", ".join(refused),
+            )
+
+    def _fail_writer(self, exc: BaseException, task) -> None:
+        """Fail closed after the writer loop itself broke.
+
+        New writes are refused from here on and every task already accepted
+        is settled. Like the stdlib executor workers, this logs and does not
+        re-raise: the thread ends either way.
+        """
+        logger.critical(
+            "VaultDatabase: the writer loop failed; refusing every write from now on.",
+            exc_info=exc,
+        )
+        with self._admission_lock:
+            if self._state is WriterState.OPEN:
+                self._state = WriterState.FAILED
+            self._failed_reason = f"{type(exc).__name__}: {exc}"
+            message = _writer_failed_message(self._failed_reason)
+        if task is not None and task.func is not None and not task.future.done():
+            if task.future.running() or task.future.set_running_or_notify_cancel():
+                label = _task_label(task.func)
+                self._settle(task, label, None, DatabaseUnavailableError(message))
+        self._reject_queued(message)
+
+    def _release_engine_when_idle(self, timeout) -> bool:
+        """Release the engine once close() asked for it and nothing holds it.
+
+        True once released. False while the writer is still running or an
+        immediate read still holds the engine after ``timeout`` s; whichever
+        of them finishes last calls this again with ``timeout=0``.
+        """
+        with self._admission_lock:
+            if not self._release_pending or self._writer_running:
+                return not self._release_pending
+        if not self._engine_rwlock.acquire_write(timeout):
+            return False
+        try:
+            with self._admission_lock:
+                if not self._release_pending:
+                    return True
+                self._release_pending = False
+            self._release_engine()
+        finally:
+            self._engine_rwlock.release_write()
+        return True
+
+    def _release_engine(self) -> None:
+        """Dispose the engine, then close the location guard.
+
+        The caller holds the write side of the engine lock, so no immediate
+        read is in flight and none can start on a disposed engine. Only after
+        every SQLite connection is disposed may the guard fd be closed:
+        closing it earlier releases the process's POSIX locks on the vault
+        file out from under the live connections (see the comment in __init__).
+        """
+        if self._engine is not None:
+            try:
+                self._engine.dispose()
+                self._engine = None
+                logger.info("VaultDatabase: SQLAlchemy engine disposed.")
+            except Exception as e:
+                logger.warning(f"VaultDatabase: Exception during engine dispose: {e}")
+        if self._location_guard is not None:
+            try:
+                self._location_guard.close()
+            except OSError as e:
+                logger.warning(f"VaultDatabase: Exception closing location guard: {e}")
+            self._location_guard = None

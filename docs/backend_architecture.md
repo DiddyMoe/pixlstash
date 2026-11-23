@@ -2319,6 +2319,71 @@ The fix is an additive column, `public_id`: 128 bits of randomness as lowercase 
 - All writes are serialised through `VaultDatabase`'s task queue (single writer); reads run in parallel.
 - **No model inference runs inside a database task.** An encode on the writer thread blocks every write for the length of the model call. Encode on the calling thread and pass the result in as a value: text search (`GET /pictures/search`) encodes before its `db.run_immediate_read_task` read and export by query before `db.run_task`, and `Picture.semantic_search` takes `query_embedding` / `clip_query_embedding`. `tests/test_server.py` asserts both routes encode off the writer thread.
 
+#### The writer's failure and settlement contract
+
+Request handlers, `run_task` and the task runner all block on the future a
+submission returns, so a future that is never settled hangs its caller for
+good, and a writer thread that dies strands every later write. `VaultDatabase`
+(`pixlstash/database.py`) therefore holds to this contract, tested in
+`tests/test_database_engine_config.py`:
+
+- **Every accepted future is settled exactly once**: with the callback's
+  result, with the exception it raised (the same object), with
+  `CancelledError` when it was cancelled before the writer started it, or with
+  `DatabaseUnavailableError` (a `RuntimeError`) when the database is closing,
+  closed or its writer has failed. A refused submission comes back already
+  failed; it is never queued.
+- **Start gate.** The writer calls `set_running_or_notify_cancel()` before a
+  task runs: a task cancelled while queued never runs, and a running write can
+  no longer be cancelled, because it may commit.
+- **What the callback raises belongs to its caller**, `BaseException`
+  included (`asyncio.CancelledError` is one), never to the writer.
+- **Session steps are per task.** The writer builds each session explicitly.
+  If opening it (construction or the session hooks), rolling it back or
+  closing it fails, that session is discarded (`Session.invalidate()` drops
+  its connection, and SQLite drops an uncommitted transaction with it), the
+  failure is logged and kept as `last_session_failure`, and the writer takes
+  the next task. A rollback or close failure is attached to the callback's
+  own exception as a note and never replaces it. A close failure after a
+  successful callback still returns the result: what it committed is
+  committed. The future settles only once the session is closed.
+- **Done-callbacks run on the writer thread.** They must not block on the
+  writer and must not raise. One that raises a `BaseException` (which
+  `concurrent.futures` lets escape `set_result`) is logged and the writer
+  carries on. Futures settled by `close()`'s drain run their callbacks on the
+  closing thread instead; a `close()` called again from one of them returns
+  at once (`_close_lock` is re-entrant), and the outer `close()` finishes.
+- **A failure of the writer loop itself fails closed.** Anything raised
+  outside a task moves the state to `failed` with a CRITICAL log, settles the
+  task in hand and every queued task with `DatabaseUnavailableError` naming
+  the reason, and refuses every later write. Immediate reads keep working and
+  `is_open` stays true: they never touch the writer, and the owner's progress
+  view has to be able to report the failure. Recovery is a restart.
+- **Admission cannot race close.** `_admission_lock` covers the state check
+  and the queue put in `_enqueue` and every state change, so a submission
+  either lands before `close()` drains the queue (and is run or refused) or
+  sees the closed state.
+- **`close()`** moves to `closing`, stops the writer (sentinel, then a join
+  bounded by `_WRITER_JOIN_TIMEOUT_S`), refuses whatever is still queued,
+  moves to `closed`, then disposes the engine and closes the location guard
+  under the write side of `_engine_rwlock`. That release waits up to
+  `_WRITER_JOIN_TIMEOUT_S` for in-flight `run_immediate_read_task` calls. If
+  reads are still running after that, `close()` logs an ERROR and keeps the
+  engine and the guard open, and the last read to finish releases them.
+  Called from inside a read, `close()` returns at once and that read releases
+  them when it ends. A thread already inside a read opens a nested read
+  without waiting behind `close()`. A writer still inside a task after the
+  join holds a pooled connection, so `close()` logs it and leaves the engine
+  and the guard open; the writer releases both itself when the task returns.
+  Reads are refused from `closing` on. Called from the writer thread (a task
+  or a done-callback), `close()` skips the join.
+- **Status.** `writer_status()` reports `state` (`open`, `closing`, `closed`,
+  `failed`), `alive`, `queue_depth`, `current_task` and
+  `current_task_seconds`, `last_session_failure` and `failed_reason`.
+  `GET /workers/progress` carries it as `database_writer` for the unscoped
+  owner only, null for any narrower token, since it names internal callables
+  and carries raw error text.
+
 ### Stored path containment (#776)
 
 `Snapshot.relative_path` and `Picture.file_path` are database values, so a

@@ -440,6 +440,16 @@ def create_router(server) -> APIRouter:
                 "owner's."
             ),
         )
+        database_writer: Optional[dict] = Field(
+            default=None,
+            description=(
+                "The health of the library database's single writer "
+                "(`VaultDatabase.writer_status()`): state (open, closing, "
+                "closed or failed), alive, queue_depth, current_task and "
+                "current_task_seconds, last_session_failure and "
+                "failed_reason. Null for any token but the owner's."
+            ),
+        )
 
     class WatchFoldersResponse(BaseModel):
         model_config = ConfigDict(extra="allow")
@@ -1219,7 +1229,11 @@ def create_router(server) -> APIRouter:
             "resources is the VRAM arbiter's snapshot, null for any token but "
             "the owner's. lanes says whether the task runner's CPU and GPU "
             "workers are alive (degraded when one has exited), likewise null "
-            "for any token but the owner's."
+            "for any token but the owner's. "
+            "database_writer is the library database writer's health "
+            "(state, alive, queue depth, the task in hand and the last "
+            "session it had to discard), likewise null for any token but the "
+            "owner's."
         ),
     )
     def get_workers_progress(request: Request):
@@ -1263,6 +1277,13 @@ def create_router(server) -> APIRouter:
                 task_runner.lane_health()
                 if server.auth.is_unscoped_owner_request(request)
                 and task_runner is not None
+                else None
+            ),
+            # Names internal task callables and carries raw error text: the
+            # owner's alone.
+            "database_writer": (
+                server.vault.db.writer_status()
+                if server.auth.is_unscoped_owner_request(request)
                 else None
             ),
         }

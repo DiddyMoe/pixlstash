@@ -13,6 +13,8 @@ from pixlstash.resources.ledger import Ledger
 from pixlstash.services import config_service
 from pixlstash.tasks.dedup_scan_task import DedupScanTask
 from pixlstash.tasks.task_type import TaskType
+from tests.authz_guard import assert_real_route
+from tests.utils import API_PREFIX, bearer_client, mint_read_token
 
 
 def _setup():
@@ -69,6 +71,17 @@ def test_workers_progress_has_expected_keys():
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["lanes"] is None, "a READ token was told of the workers"
+        # The database writer's health is the owner's: it names internal
+        # task callables and carries raw error text.
+        writer = data["database_writer"]
+        assert (writer["state"], writer["alive"]) == ("open", True)
+        path = f"{API_PREFIX}/workers/progress"
+        assert_real_route(server.api, "GET", path)
+        reader = bearer_client(server, mint_read_token(client, "test-read-token"))
+        resp = reader.get(path)
+        assert resp.status_code == 200, resp.text
+        assert "workers" in resp.json()
+        assert resp.json()["database_writer"] is None
         # Asserted on a warm server rather than in a file of its own: the GPU
         # out-of-memory retry announces itself through this notifier, and
         # without the wiring the toast never leaves the machine
