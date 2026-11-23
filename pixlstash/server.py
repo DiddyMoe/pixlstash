@@ -27,7 +27,6 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from pillow_heif import register_heif_opener
@@ -283,6 +282,84 @@ def _masked_location(loc, declared: set[str]) -> tuple:
     """
     loc = tuple(loc or ())
     return (*loc[:1], *(part if part in declared else "*" for part in loc[1:]))
+
+
+def _client_errors(errors) -> list[dict]:
+    """``errors`` as a 422 answers them: each one's type, location and message.
+
+    Pydantic's error also carries ``input`` (the submitted value: a password, a
+    token, a host path), ``ctx`` (the raised exception object, or the values a
+    check compared against) and, when asked for, ``url``. None of them is
+    answered. ``msg`` is a template a validator can format the submitted value
+    into (``'<value>' is not a model file``), so every text value of the
+    error's ``input`` is written as ``*`` in it, where it appears as sent or in
+    a ``repr`` spelling. A value a validator reshaped first (its case changed,
+    a slice of it, two values joined with nothing between them) is text this
+    cannot recognise, so a validator never reshapes a submitted value it puts
+    in its message. The location is kept as it is: it is the field's address,
+    the key of a mapping entry included.
+
+    Every value answered is a string or a list of strings and integers, so the
+    body needs no encoder; the exception object in ``ctx`` is never written.
+    """
+    return [
+        {
+            "type": error.get("type"),
+            "loc": list(error.get("loc") or ()),
+            "msg": _without_submitted_text(
+                str(error.get("msg", "")), error.get("input")
+            ),
+        }
+        for error in errors
+    ]
+
+
+def _without_submitted_text(msg: str, submitted) -> str:
+    """``msg`` with each text value found anywhere in ``submitted`` written as ``*``.
+
+    Values only, never mapping keys: a model's keys are its field names, which
+    a message names on purpose. A value is also matched in both ``repr``
+    spellings without the quotes: its own, the way ``{value!r}`` writes an
+    escaped character, and the one it has inside a longer text that holds both
+    quote kinds, where ``'`` is written ``\\'`` (``{label + "/" + name!r}``). The
+    longest value goes first, so one that contains another is replaced whole,
+    and a value that starts or ends with a word character is matched only as a
+    whole word there, so ``in`` leaves ``integer`` intact. A value that is
+    itself a word of the message is starred there too: a garbled message, never
+    an echoed value. Numbers are left alone: they read the same as the bounds a
+    message states (``at most 8 characters``).
+    """
+    texts: set[str] = set()
+    pending = [submitted]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            texts.update(
+                text
+                for text in (
+                    value,
+                    value.strip(),
+                    repr(value)[1:-1],
+                    # With a '"' after it the repr is single-quoted, as the
+                    # longer text's is: the value's part has its "'" escaped.
+                    repr(value + '"')[1:-2],
+                )
+                if text.strip()
+            )
+        elif isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            pending.extend(value)
+    for text in sorted(texts, key=len, reverse=True):
+        if text not in msg:
+            continue
+        pattern = re.escape(text)
+        if re.match(r"\w", text[0]):
+            pattern = r"(?<!\w)" + pattern
+        if re.match(r"\w", text[-1]):
+            pattern += r"(?!\w)"
+        msg = re.sub(pattern, "*", msg)
+    return msg
 
 
 class VersionResponse(BaseModel):
@@ -1823,16 +1900,16 @@ class Server(
 
             return JSONResponse(
                 status_code=422,
-                # NOTE for validator authors: whatever a validator puts in its
-                # ValueError text reaches the caller in this body, so it must
-                # not carry a host path, a credential or the input value.
+                # The caller is told which field failed and how: no ``input``,
+                # ``ctx`` or ``url``, and the submitted text starred out of
+                # ``msg`` where it appears as sent (see _client_errors).
                 #
-                # Encoded, not handed to JSONResponse raw: a validator that
-                # raises ValueError puts the exception OBJECT in the error's
-                # ``ctx`` (pydantic v2), which json.dumps cannot write, and the
-                # handler for a 422 would then itself fail with a 500. FastAPI's
-                # own default handler encodes for this reason.
-                content={"detail": jsonable_encoder(detail)},
+                # NOTE for validator authors: a validator's ValueError text
+                # still reaches the caller here, so it must not carry a host
+                # path or a credential, nor a submitted value reshaped (case,
+                # slice, run into another with nothing between): the starring
+                # finds a value only as sent or in a repr spelling.
+                content={"detail": _client_errors(detail)},
                 headers=headers,
             )
 
