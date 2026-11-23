@@ -1218,7 +1218,7 @@ def create_router(server) -> APIRouter:
                 session.exec(
                     update(Picture)
                     .where(Picture.pending_character_id == character_id)
-                    .values(pending_character_id=None)
+                    .values(pending_character_id=None, metadata_hash=None)
                 )
                 # Deleting a person never deletes a set: its child sets move to
                 # the top level with their pictures (#2124).

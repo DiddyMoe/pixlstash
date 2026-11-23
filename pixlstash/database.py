@@ -25,6 +25,7 @@ from sqlalchemy import (
     update as sa_update,
     select as sa_select,
 )
+from sqlalchemy.orm import defer
 from sqlalchemy.orm.util import identity_key
 from sqlmodel import create_engine, Session
 from fastapi import HTTPException
@@ -55,8 +56,9 @@ from pixlstash.db_models.picture_move import PictureMove  # noqa: F401
 # Picture metadata-hash helpers
 # ---------------------------------------------------------------------------
 
-# Columns excluded from the metadata hash; matches _diff_picture's _SKIP set
-# in restore_service.py so that the hash detects exactly what the preview does.
+# Columns excluded from the metadata hash; matches the ``_SKIP`` set in
+# ``services/restore/preview.py::_diff_picture`` so that the hash detects exactly
+# what the preview does.
 _HASH_SKIP_COLS: frozenset = frozenset(
     {
         "id",
@@ -74,7 +76,25 @@ _HASH_SKIP_COLS: frozenset = frozenset(
         # every hash computed before the columns existed.
         "ocr_text",
         "ocr_words",
+        # Derived from the pixels and regenerable. A new picture holds an
+        # in-memory array, which the digest skips, and reads back as bytes,
+        # which it would hash: the first hash, written in the session that
+        # created the picture, would never match a later recompute.
+        "likeness_parameters",
     }
+)
+
+# Large columns in ``_HASH_SKIP_COLS`` that the hash SELECT leaves out. The
+# digest never reads a skipped column, so not fetching them changes no hash; it
+# only stops the writer thread reading kilobytes of embedding per dirty picture
+# while it holds the write lock. Only skipped columns may be listed: a hashed
+# one would be lazy-loaded once per picture by the digest loop.
+_HASH_DEFERRED_COLS: tuple[str, ...] = (
+    "text_embedding",
+    "image_embedding",
+    "ocr_text",
+    "ocr_words",
+    "likeness_parameters",
 )
 
 
@@ -124,9 +144,15 @@ def _compute_picture_metadata_hashes(session: Session, picture_ids) -> dict[int,
         # same in-memory values ``session.get`` used to return - including the
         # ndarray columns that must be skipped and the datetimes that must be
         # ``isoformat``-ed. A Core select would hand back raw driver values and
-        # silently change the digest.
+        # silently change the digest. ``defer`` (not ``load_only``) drops only the
+        # unread large columns from the SELECT and does not unload them from an
+        # instance that is already in the identity map.
         for pic in (
-            session.execute(sa_select(Picture).where(Picture.id.in_(chunk)))
+            session.execute(
+                sa_select(Picture)
+                .options(*(defer(getattr(Picture, c)) for c in _HASH_DEFERRED_COLS))
+                .where(Picture.id.in_(chunk))
+            )
             .scalars()
             .all()
         ):
@@ -241,16 +267,77 @@ def _compute_picture_metadata_hash(session: Session, picture_id: int) -> Optiona
     return _compute_picture_metadata_hashes(session, (picture_id,)).get(picture_id)
 
 
+# Columns whose write alone cannot move the digest: every skipped column except
+# ``metadata_hash`` itself, so a hash written by hand is still replaced by the
+# recompute rather than persisted as is.
+_HASH_RECOMPUTE_EXEMPT: frozenset = _HASH_SKIP_COLS - {"metadata_hash"}
+
+
+def _picture_needs_rehash(picture) -> bool:
+    """Whether flushing this dirty, persistent picture can change its digest.
+
+    ``session.dirty`` means "an attribute was set", not "a hashed value moved".
+    The derived-data tasks rewrite scores, embeddings and OCR text on every
+    picture in the library, and a same-value assignment changes nothing, so
+    recomputing for those would cost the writer the hash reads and UPDATE for a
+    value that cannot move. Everything else still recomputes:
+
+    * a stored hash that is NULL or not loaded, so a skipped-column write still
+      initialises a picture that has no hash yet;
+    * any modified relationship (stack, tags, sets, ...). Appending a picture
+      from the other side (``picture_set.members.append(picture)`` with
+      ``picture.picture_sets`` unloaded) queues a pending change that shows no
+      attribute history, so this reads which keys SQLAlchemy marked modified
+      rather than trusting history alone;
+    * a modified hashed column whose value actually differs.
+
+    Args:
+        picture: A ``Picture`` in ``session.dirty`` that already has an id.
+
+    Returns:
+        False only when every modified attribute is a skipped column, or a
+        hashed column assigned the value it already had.
+    """
+    try:
+        state = sa_inspect(picture)
+        stored = state.attrs.metadata_hash.loaded_value
+        if not isinstance(stored, str) or not stored:
+            return True
+        column_keys = state.mapper.column_attrs
+        for key in set(state.attrs.keys()) - state.unmodified:
+            if key in _HASH_RECOMPUTE_EXEMPT:
+                continue
+            if key in column_keys and not state.attrs[key].history.has_changes():
+                continue
+            return True
+        return False
+    except Exception:
+        logger.warning(
+            "Hash tracker: could not read the changes on picture %r; recomputing "
+            "its metadata hash so a real change is not skipped.",
+            picture.__dict__.get("id"),
+            exc_info=True,
+        )
+        return True
+
+
 def _before_flush_hash_tracker(session, flush_context, instances) -> None:
-    """Record picture IDs whose metadata hash needs recomputing after flush."""
+    """Record picture IDs whose metadata hash needs recomputing after flush.
+
+    New and deleted pictures always recompute, as does the picture behind any
+    new, changed or deleted tag, face or set / project membership row. A dirty
+    picture recomputes only when :func:`_picture_needs_rehash` says the flush
+    can move its digest.
+    """
     dirty_pids: set = session.info.setdefault("_hash_dirty_pids", set())
     new_pics: list = session.info.setdefault("_hash_new_pics", [])
-    for obj in itertools.chain(session.new, session.dirty, session.deleted):
+    dirty = session.dirty  # rebuilt on every access; once per flush, not per row
+    for obj in itertools.chain(session.new, dirty, session.deleted):
         if isinstance(obj, Picture):
-            if obj.id is not None:
-                dirty_pids.add(obj.id)
-            else:
+            if obj.id is None:
                 new_pics.append(obj)
+            elif obj not in dirty or _picture_needs_rehash(obj):
+                dirty_pids.add(obj.id)
         elif isinstance(obj, Tag) and obj.picture_id is not None:
             dirty_pids.add(obj.picture_id)
         elif isinstance(obj, Face) and obj.picture_id is not None:
@@ -305,8 +392,9 @@ def _after_flush_hash_updater(session, flush_context) -> None:
         )
         for pid in new_hashes:
             # Expire the in-memory attribute so it reflects the new value
-            # on next access (the Core UPDATE bypasses ORM tracking).
-            cached = session.identity_map.get((Picture, (pid,)))
+            # on next access (the Core UPDATE bypasses ORM tracking). The map is
+            # keyed by the full identity key, not ``(Picture, (pid,))``.
+            cached = session.identity_map.get(identity_key(Picture, pid))
             if cached is not None:
                 session.expire(cached, ["metadata_hash"])
 
@@ -428,7 +516,9 @@ def _after_flush_layout_marker(session, flush_context) -> None:
             .values(layout_check_due_at=due_at)
         )
         for pid in dirty_pids:
-            cached = session.identity_map.get((Picture, (pid,)))
+            # Expire it, or a picture already loaded keeps reading the old
+            # value and setting that value again writes nothing.
+            cached = session.identity_map.get(identity_key(Picture, pid))
             if cached is not None:
                 session.expire(cached, ["layout_check_due_at"])
 

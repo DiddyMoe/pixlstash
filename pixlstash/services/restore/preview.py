@@ -992,6 +992,8 @@ class PreviewMixin:
             "ocr_text",
             "ocr_words",
             "metadata_hash",
+            # Derived from the pixels and regenerable, like the scores above.
+            "likeness_parameters",
         }
         changed: list[str] = []
         for col in type(snap_pic).model_fields:

@@ -803,7 +803,8 @@ def register_routes(router, server):
                             score_updates,
                             value=Picture.id,
                             else_=Picture.score,
-                        )
+                        ),
+                        metadata_hash=None,
                     )
                 )
 
@@ -901,7 +902,7 @@ def register_routes(router, server):
                 session.exec(
                     update(Picture)
                     .where(Picture.id.in_(scope_id_subquery(session, changed)))
-                    .values(favourite=on)
+                    .values(favourite=on, metadata_hash=None)
                 )
                 session.flush()
             return sorted(int(pid) for pid in changed)

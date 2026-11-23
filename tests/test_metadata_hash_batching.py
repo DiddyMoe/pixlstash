@@ -35,12 +35,19 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pytest
-from sqlalchemy import event, inspect as sa_inspect, select as sa_select
+from fastapi.testclient import TestClient
+from sqlalchemy import (
+    event,
+    inspect as sa_inspect,
+    select as sa_select,
+    update as sa_update,
+)
 
 from pixlstash.database import (
     _HASH_SKIP_COLS,
     _compute_picture_metadata_hash,
     _compute_picture_metadata_hashes,
+    _picture_needs_rehash,
 )
 from pixlstash.db_models import (
     Character,
@@ -49,12 +56,18 @@ from pixlstash.db_models import (
     PictureProjectMember,
     PictureSet,
     PictureSetMember,
+    PictureStack,
     Project,
 )
 from pixlstash.db_models.snapshot import Snapshot
 from pixlstash.db_models.tag import Tag
 from pixlstash.server import Server
+from pixlstash.services.operation_log_service import capture_state_in_session
+from pixlstash.tasks.ocr_task import OcrTask
+from pixlstash.tasks.text_score_task import TextScoreTask
 from tests.utils import wipe_tables
+
+API = "/api/v1"
 
 
 # ---------------------------------------------------------------------------
@@ -162,9 +175,21 @@ def clean_db(server):
             Project,
             Character,
             Picture,
+            PictureStack,
         ],
     )
     yield
+
+
+@pytest.fixture(scope="module")
+def client(server):
+    """A client logged in as the owner, for the tests that go through a route."""
+    client = TestClient(server.api)
+    response = client.post(
+        f"{API}/login", json={"username": "testuser", "password": "testpassword"}
+    )
+    assert response.status_code == 200, response.text
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +438,9 @@ class _HashHookStatementCounter:
       flush's own ``INSERT INTO tag`` and any ``UPDATE picture SET <other>`` are
       excluded, so what remains grows only if the hook goes back to per-picture
       work.
+
+    ``statements`` keeps a truncated copy for failure messages; ``full_statements``
+    keeps the whole SQL, for assertions on which columns a SELECT fetches.
     """
 
     def __init__(self, server):
@@ -420,6 +448,7 @@ class _HashHookStatementCounter:
         self._thread_ident = None
         self.count = 0
         self.statements: list[str] = []
+        self.full_statements: list[str] = []
 
     def bind_current_thread(self) -> None:
         self._thread_ident = threading.get_ident()
@@ -435,6 +464,7 @@ class _HashHookStatementCounter:
         if is_hash_write or is_hash_read:
             self.count += 1
             self.statements.append(collapsed[:140])
+            self.full_statements.append(collapsed)
 
     def __enter__(self):
         event.listen(self._engine, "before_cursor_execute", self._on_execute)
@@ -535,3 +565,543 @@ def test_all_dirty_pictures_get_their_own_hash_in_one_flush(server):
         "pictures dirtied in one flush share a hash; the executemany UPDATE is "
         "not binding per-row values"
     )
+
+
+# ---------------------------------------------------------------------------
+# Columns the writer-thread picture SELECTs fetch
+# ---------------------------------------------------------------------------
+
+
+# Large columns that neither the digest nor the operation capture reads. An
+# image embedding alone is kilobytes per row, and both SELECTs run on the single
+# writer thread inside the open write transaction.
+_UNREAD_LARGE_COLUMNS = (
+    "image_embedding",
+    "text_embedding",
+    "ocr_text",
+    "ocr_words",
+    "likeness_parameters",
+)
+
+
+def _picture_entity_selects(statements: list[str]) -> list[str]:
+    """The full-entity ``SELECT ... FROM picture`` statements among *statements*.
+
+    ``picture.description`` is a plain hashed column, so it is in the column list
+    of every entity select and in none of the narrow Tag / Face / membership
+    reads; requiring it also proves the recorder saw the whole column list.
+    """
+    return [
+        sql
+        for sql in statements
+        if sql.startswith("select")
+        and re.search(r"\bfrom picture\b", sql)
+        and "picture.description" in sql
+    ]
+
+
+def test_hash_select_does_not_fetch_unread_large_columns(server):
+    """The hook's picture SELECT leaves out the large columns the digest skips.
+
+    The digest is unchanged by this (it never reads them, which the two
+    byte-compatibility tests above pin); what changes is how many bytes the
+    writer reads per dirty picture while it holds the write lock.
+    """
+    picture_ids = _create_pictures(server, 2)
+    with _HashHookStatementCounter(server) as counter:
+        _tag_pictures_in_one_flush(server, counter, picture_ids)
+
+    entity_selects = _picture_entity_selects(counter.full_statements)
+    assert entity_selects, (
+        "the hook issued no picture entity SELECT, so this test checks nothing. "
+        f"Seen: {counter.statements}"
+    )
+    for sql in entity_selects:
+        fetched = [col for col in _UNREAD_LARGE_COLUMNS if f"picture.{col}" in sql]
+        assert not fetched, (
+            f"the metadata-hash SELECT fetches {fetched}, which the digest never "
+            f"reads: {sql[:400]}"
+        )
+
+
+def test_operation_capture_select_does_not_fetch_unread_large_columns(server):
+    """The operation-log capture reads scalar facets only, so it fetches no BLOBs.
+
+    It runs twice for every recorded operation over every affected picture, on
+    the writer thread.
+    """
+    picture_ids = _create_pictures(server, 2)
+
+    with _HashHookStatementCounter(server) as counter:
+
+        def _capture(session):
+            counter.bind_current_thread()
+            return capture_state_in_session(session, picture_ids)
+
+        state = server.vault.db.run_task(_capture)
+
+    assert sorted(state) == sorted(str(pid) for pid in picture_ids), (
+        f"the capture lost a picture: {sorted(state)}"
+    )
+    entity_selects = _picture_entity_selects(counter.full_statements)
+    assert entity_selects, (
+        "the capture issued no picture entity SELECT, so this test checks "
+        f"nothing. Seen: {counter.statements}"
+    )
+    for sql in entity_selects:
+        fetched = [col for col in _UNREAD_LARGE_COLUMNS if f"picture.{col}" in sql]
+        assert not fetched, (
+            f"the operation capture SELECT fetches {fetched}, which it never "
+            f"reads: {sql[:400]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Which picture writes recompute the hash
+# ---------------------------------------------------------------------------
+#
+# The stored hash must always equal a from-scratch recompute; within that, a
+# write that changes nothing the digest reads must not pay for one. Every test
+# below checks the first property, and the cost tests check the second.
+
+
+def _create_described_picture(server) -> int:
+    def _do(session):
+        pic = Picture(
+            file_path="rehash.jpg",
+            filename="rehash.jpg",
+            description="test-description",
+        )
+        session.add(pic)
+        session.commit()
+        return pic.id
+
+    return server.vault.db.run_task(_do)
+
+
+def _stored_and_fresh(server, picture_id: int) -> tuple:
+    """The persisted hash, and a from-scratch recompute of the same row."""
+
+    def _read(session):
+        stored = session.execute(
+            sa_select(Picture.metadata_hash).where(Picture.id == picture_id)
+        ).scalar_one()
+        return stored, _compute_picture_metadata_hashes(session, [picture_id]).get(
+            picture_id
+        )
+
+    return server.vault.db.run_immediate_read_task(_read)
+
+
+def _counted_write(server, picture_id: int, mutate) -> _HashHookStatementCounter:
+    """Load the picture, then count the hook's statements for *mutate* + commit.
+
+    The picture is loaded before the counter is bound, so its own SELECT is not
+    counted and a writer's ``session.get`` hits the identity map.
+    """
+    with _HashHookStatementCounter(server) as counter:
+
+        def _do(session):
+            pic = session.get(Picture, picture_id)
+            counter.bind_current_thread()
+            mutate(session, pic)
+            session.commit()
+
+        server.vault.db.run_task(_do)
+    return counter
+
+
+def test_same_value_assignment_neither_rehashes_nor_moves_the_hash(server):
+    """Assigning a column its current value marks the picture dirty, nothing more."""
+    picture_id = _create_described_picture(server)
+    before, fresh_before = _stored_and_fresh(server, picture_id)
+    assert before is not None and before == fresh_before, "seed is not settled"
+
+    def _reassign(session, pic):
+        pic.description = pic.description
+        pic.score = pic.score
+        session.add(pic)
+
+    counter = _counted_write(server, picture_id, _reassign)
+
+    assert counter.count == 0, (
+        f"a same-value assignment recomputed the hash: {counter.statements}"
+    )
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after == before == fresh
+
+
+def _write_text_score(session, pic):
+    TextScoreTask._persist_text_scores(session, [(pic.id, 0.42)])
+
+
+def _write_ocr_text(session, pic):
+    OcrTask._persist_text(session, {pic.id: [[{"text": "test-word"}]]})
+
+
+def _write_text_embedding(session, pic):
+    # The shape of ``TextEmbeddingTask.run``'s nested ``update_pictures``.
+    db_pic = session.get(Picture, pic.id)
+    db_pic.text_embedding = np.ones(8, dtype=np.float32).tobytes()
+    session.add(db_pic)
+
+
+@pytest.mark.parametrize(
+    ("writer", "column"),
+    [
+        (_write_text_score, "text_score"),
+        (_write_ocr_text, "ocr_text"),
+        (_write_text_embedding, "text_embedding"),
+    ],
+    ids=["text_score", "ocr_text", "text_embedding"],
+)
+def test_derived_column_write_issues_no_hash_statements(server, writer, column):
+    """A write to columns the digest skips leaves the hash alone, for free.
+
+    These are the background writers that touch every picture in the library,
+    each one a ``session.get`` loop on the writer thread.
+    """
+    picture_id = _create_described_picture(server)
+    before, _ = _stored_and_fresh(server, picture_id)
+
+    counter = _counted_write(server, picture_id, writer)
+
+    written = server.vault.db.run_immediate_read_task(
+        lambda session: session.execute(
+            sa_select(getattr(Picture, column)).where(Picture.id == picture_id)
+        ).scalar_one()
+    )
+    assert written is not None, f"the writer did not write {column}"
+    assert counter.count == 0, (
+        f"a {column}-only write recomputed the hash: {counter.statements}"
+    )
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after == before == fresh
+
+
+def test_mixed_derived_and_hashed_write_rehashes(server):
+    picture_id = _create_described_picture(server)
+    before, _ = _stored_and_fresh(server, picture_id)
+
+    def _mixed(session, pic):
+        pic.text_score = 0.42
+        pic.description = "test-description-edited"
+
+    _counted_write(server, picture_id, _mixed)
+
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after == fresh, "a description edit beside a derived score left a stale hash"
+    assert after != before
+
+
+def _null_stored_hash(session, picture_id: int) -> None:
+    # Core, on the table rather than the mapper, so no flush hook sees it: the
+    # state a row is left in by a migration that resets the column.
+    session.execute(
+        sa_update(Picture.__table__)
+        .where(Picture.__table__.c.id == picture_id)
+        .values(metadata_hash=None)
+    )
+
+
+def test_null_stored_hash_is_initialised_by_a_derived_write(server):
+    picture_id = _create_described_picture(server)
+
+    def _reset(session):
+        _null_stored_hash(session, picture_id)
+        session.commit()
+
+    server.vault.db.run_task(_reset)
+    assert _stored_and_fresh(server, picture_id)[0] is None
+
+    _counted_write(
+        server, picture_id, lambda session, pic: setattr(pic, "text_score", 0.42)
+    )
+
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after is not None, "a NULL hash survived a write to its picture"
+    assert after == fresh
+
+
+def test_unloaded_stored_hash_is_initialised_by_a_derived_write(server):
+    """With the hash attribute unloaded the tracker cannot see it, so it recomputes."""
+    picture_id = _create_described_picture(server)
+
+    def _null_then_expire(session, pic):
+        _null_stored_hash(session, picture_id)
+        session.expire(pic, ["metadata_hash"])
+        assert "metadata_hash" in sa_inspect(pic).unloaded
+        pic.text_score = 0.42
+
+    _counted_write(server, picture_id, _null_then_expire)
+
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after is not None, "a NULL hash survived a write to its picture"
+    assert after == fresh
+
+
+def test_explicit_hash_write_is_replaced_by_the_recompute(server):
+    picture_id = _create_described_picture(server)
+
+    _counted_write(
+        server,
+        picture_id,
+        lambda session, pic: setattr(pic, "metadata_hash", "test-not-a-digest"),
+    )
+
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after == fresh, f"an assigned hash was persisted as is: {after!r}"
+
+
+def test_stack_assignment_alone_rehashes(server):
+    """``pic.stack = ...`` changes only relationship state until the flush.
+
+    The ``stack_id`` column, which the digest reads, is filled in by the flush
+    itself, so a tracker that looked only at column history would skip it.
+    """
+    picture_id = _create_described_picture(server)
+    before, _ = _stored_and_fresh(server, picture_id)
+
+    _counted_write(
+        server, picture_id, lambda session, pic: setattr(pic, "stack", PictureStack())
+    )
+
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after == fresh, "joining a stack left a stale hash"
+    assert after != before
+
+
+def _create_picture_set(session) -> int:
+    picture_set = PictureSet(name="test-set")
+    session.add(picture_set)
+    session.commit()
+    return picture_set.id
+
+
+def test_set_membership_added_from_the_set_side_rehashes(server):
+    """``picture_set.members.append(pic)`` with ``pic.picture_sets`` unloaded.
+
+    The link row is written by the relationship, not as a ``PictureSetMember``
+    object, so the dirty picture is the only signal. Its pending backref change
+    is not visible as attribute history, so a tracker that skips pictures with
+    no history would leave the hash stale after a real membership change.
+    """
+    picture_id = _create_described_picture(server)
+    set_id = server.vault.db.run_task(_create_picture_set)
+    before, _ = _stored_and_fresh(server, picture_id)
+
+    def _append(session, pic):
+        assert "picture_sets" in sa_inspect(pic).unloaded, (
+            "the collection is loaded, so this no longer exercises the backref case"
+        )
+        # Bound to a name: the identity map holds an unmodified object weakly,
+        # so a bare ``session.get(...).members`` loses its parent mid-append.
+        picture_set = session.get(PictureSet, set_id)
+        picture_set.members.append(pic)
+
+    _counted_write(server, picture_id, _append)
+
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after == fresh, "joining a set from the set side left a stale hash"
+    assert after != before
+
+
+def test_rolled_back_write_leaves_no_stale_hash(server):
+    picture_id = _create_described_picture(server)
+    before, _ = _stored_and_fresh(server, picture_id)
+
+    def _edit_then_roll_back(session):
+        pic = session.get(Picture, picture_id)
+        pic.description = "test-description-rolled-back"
+        session.flush()
+        in_transaction = session.execute(
+            sa_select(Picture.metadata_hash).where(Picture.id == picture_id)
+        ).scalar_one()
+        session.rollback()
+        return in_transaction
+
+    in_transaction = server.vault.db.run_task(_edit_then_roll_back)
+    assert in_transaction != before, "the flush did not rehash inside the transaction"
+    after, fresh = _stored_and_fresh(server, picture_id)
+    assert after == before == fresh
+
+    counter = _counted_write(
+        server, picture_id, lambda session, pic: setattr(pic, "text_score", 0.42)
+    )
+    assert counter.count == 0, counter.statements
+    assert _stored_and_fresh(server, picture_id) == (before, before)
+
+
+class _UnmappedStandIn:
+    """Not a mapped object, so reading its change state raises."""
+
+    def __init__(self, picture_id: int) -> None:
+        self.id = picture_id
+
+
+def test_unreadable_change_state_recomputes_and_warns(caplog):
+    """If the tracker cannot tell what changed, it pays for a recompute and says so."""
+    with caplog.at_level("WARNING", logger="pixlstash.database"):
+        assert _picture_needs_rehash(_UnmappedStandIn(7)) is True
+    warnings = [r for r in caplog.records if r.name == "pixlstash.database"]
+    assert any("picture 7" in r.getMessage() for r in warnings), (
+        f"no warning naming the picture: {[r.getMessage() for r in warnings]}"
+    )
+
+
+# A Core write of a hashed input never reaches the flush hooks, and a later
+# derived write (text score, OCR, embedding) does not recompute a non-NULL hash.
+# So each Core writer below must set ``metadata_hash`` to NULL in its own
+# statement; otherwise the picture matches a snapshot it no longer equals.
+
+
+def _no_setup(session, picture_id: int) -> None:
+    return None
+
+
+def _rate(client, server, picture_id: int, _context) -> None:
+    response = client.post(
+        f"{API}/pictures/apply-scores",
+        json={"scores": {str(picture_id): 5}, "only_unscored": False},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["updated_ids"] == [picture_id]
+
+
+def _favourite(client, server, picture_id: int, _context) -> None:
+    response = client.post(
+        f"{API}/pictures/favourite",
+        json={"picture_ids": [picture_id], "favourite": True},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["updated_ids"] == [picture_id]
+
+
+def _reset_description(client, server, picture_id: int, _context) -> None:
+    assert server.vault.reset_descriptions([picture_id]) == 1
+
+
+def _join_two_projects(session, picture_id: int) -> int:
+    """Member of two projects, pointing at the one that survives the delete."""
+    deleted = Project(name="test-project-deleted")
+    kept = Project(name="test-project-kept")
+    session.add(deleted)
+    session.add(kept)
+    session.flush()
+    session.add(PictureProjectMember(picture_id=picture_id, project_id=deleted.id))
+    session.add(PictureProjectMember(picture_id=picture_id, project_id=kept.id))
+    picture = session.get(Picture, picture_id)
+    picture.project_id = kept.id
+    session.commit()
+    return deleted.id
+
+
+def _delete_project(client, server, picture_id: int, project_id: int) -> None:
+    response = client.delete(f"{API}/projects/{project_id}")
+    assert response.status_code == 200, response.text
+
+
+def _queue_for_character(session, picture_id: int) -> int:
+    """Waiting for a face of the character, with none extracted yet."""
+    character = Character(name="test-character")
+    session.add(character)
+    session.flush()
+    picture = session.get(Picture, picture_id)
+    picture.pending_character_id = character.id
+    session.commit()
+    return character.id
+
+
+def _delete_character(client, server, picture_id: int, character_id: int) -> None:
+    response = client.delete(f"{API}/characters/{character_id}")
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    ("setup", "write"),
+    [
+        (_no_setup, _rate),
+        (_no_setup, _favourite),
+        (_no_setup, _reset_description),
+        (_join_two_projects, _delete_project),
+        (_queue_for_character, _delete_character),
+    ],
+    ids=[
+        "rating",
+        "favourite",
+        "description_reset",
+        "project_delete",
+        "character_delete",
+    ],
+)
+def test_core_write_of_a_hashed_input_leaves_no_stale_hash(
+    server, client, setup, write
+):
+    picture_id = _create_described_picture(server)
+    context = server.vault.db.run_task(setup, picture_id)
+    stored, fresh = _stored_and_fresh(server, picture_id)
+    assert stored is not None and stored == fresh, "seed is not settled"
+    snapshot_id = server.vault.snapshot_service.create_snapshot("MANUAL").id
+
+    write(client, server, picture_id, context)
+
+    stored, fresh = _stored_and_fresh(server, picture_id)
+    assert stored in (None, fresh), "the write left a stale stored hash"
+
+    derived = server.vault.db.run_task(
+        TextScoreTask._persist_text_scores, [(picture_id, 0.42)]
+    )
+    assert derived, "the derived write found no picture"
+
+    stored, fresh = _stored_and_fresh(server, picture_id)
+    assert stored in (None, fresh), "a derived write kept a stale stored hash"
+    compared = server.vault.restore_service.compare_hashes(snapshot_id, [picture_id])
+    assert compared["changed_ids"] == [picture_id], compared
+
+
+# ---------------------------------------------------------------------------
+# Likeness parameters are derived, so neither the hash nor the preview reads them
+# ---------------------------------------------------------------------------
+#
+# A new picture carries an in-memory array that the database hands back as
+# bytes. Hashing the column made a picture's first hash, computed in the same
+# session as its insert, one that no later recompute reproduces.
+
+
+def test_import_shape_stores_the_hash_a_recompute_gives(server):
+    """The import shape: insert, flush for the id, add a tag, commit."""
+
+    def _import(session):
+        pic = Picture(file_path="import.jpg", filename="import.jpg")
+        session.add_all([pic])
+        session.flush()
+        session.add(Tag(picture_id=pic.id, tag="test-tag"))
+        session.commit()
+        return pic.id
+
+    picture_id = server.vault.db.run_task(_import)
+
+    stored, fresh = _stored_and_fresh(server, picture_id)
+    assert stored is not None
+    assert stored == fresh, "the import stored a hash no recompute reproduces"
+
+
+def test_restore_preview_does_not_list_likeness_parameters(server):
+    """A recomputed likeness vector is not a change the owner made."""
+    picture_id = _create_described_picture(server)
+
+    def _set_likeness(session):
+        pic = session.get(Picture, picture_id)
+        pic.likeness_parameters = np.ones(4, dtype=np.float32).tobytes()
+        session.commit()
+
+    server.vault.db.run_task(_set_likeness)
+    snapshot_side = server.vault.db.run_immediate_read_task(
+        lambda session: session.get(Picture, picture_id)
+    )
+    snapshot_side.likeness_parameters = np.zeros(4, dtype=np.float32).tobytes()
+    snapshot_side.description = "test-description-before"
+
+    changed = server.vault.restore_service._diff_picture(snapshot_side, True)
+
+    assert changed == ["description"], changed

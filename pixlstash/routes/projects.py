@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Body, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field as PydanticField
-from sqlalchemy import delete, exists, func
+from sqlalchemy import delete, exists, func, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -620,6 +620,17 @@ def create_router(server) -> APIRouter:
                 picture_set.project_id = remaining[0] if remaining else None
                 session.add(picture_set)
 
+            session.exec(
+                update(Picture)
+                .where(
+                    Picture.id.in_(
+                        select(PictureProjectMember.picture_id).where(
+                            PictureProjectMember.project_id == pid
+                        )
+                    )
+                )
+                .values(metadata_hash=None)
+            )
             session.exec(
                 delete(PictureProjectMember).where(
                     PictureProjectMember.project_id == pid

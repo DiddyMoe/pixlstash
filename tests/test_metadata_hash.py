@@ -79,6 +79,35 @@ def _hash_of(server, pic_id: int) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# A picture already in the session reads the hash its flush wrote
+# ---------------------------------------------------------------------------
+
+
+def test_loaded_picture_reads_the_hash_its_flush_wrote(server):
+    """The hook writes the hash through Core, which the ORM never sees.
+
+    It must expire the attribute on a picture already in the session, or that
+    picture reads the hash from before the flush for the rest of the task while
+    the row holds the new one.
+    """
+    pic_id = _add_picture(server).id
+
+    def _tag_and_read(session):
+        pic = session.get(Picture, pic_id)
+        before = pic.metadata_hash
+        session.add(Tag(picture_id=pic_id, tag="test-tag"))
+        session.flush()
+        stored = session.exec(
+            select(Picture.metadata_hash).where(Picture.id == pic_id)
+        ).one()
+        return before, stored, pic.metadata_hash
+
+    before, stored, in_memory = server.vault.db.run_task(_tag_and_read)
+    assert stored != before, "the tag flush did not rehash the picture"
+    assert in_memory == stored, "the loaded picture still reads the old hash"
+
+
+# ---------------------------------------------------------------------------
 # Picture-column mutation: SHOULD change the hash (sanity)
 # ---------------------------------------------------------------------------
 
