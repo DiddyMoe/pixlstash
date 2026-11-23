@@ -43,10 +43,23 @@ import of a file they still have.
 default. The queries below are the import paths' own, so widening the match to
 soft-deleted rows cannot leak deleted pictures into any listing, search, count,
 export or dedup query that relies on the existing exclusion.
+
+**One import decides at a time.** An import looks up matches, decides which
+files are new and then inserts them. Two imports of the same new content that
+overlap would both decide "new" and both insert. Each batch of a staged
+import, and a ComfyUI generation import, hold :func:`serialised_import` from
+the lookup to the insert, so the second one looks up after the first one's
+rows exist. The one-shot import route, the watch folder and plugin or
+edit-copy outputs do not take it, so they can still add the same new picture
+as an overlapping import. The database cannot enforce this
+instead: ``pixel_sha`` is not unique, because a sampled-hash collision is two
+different pictures that both belong in the library.
 """
 
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 from sqlmodel import Session, select
 
@@ -60,6 +73,23 @@ logger = get_logger(__name__)
 # SQLite caps the number of bound parameters per statement; the import batches
 # can be thousands of files, so the ``IN`` list is chunked.
 _SHA_QUERY_CHUNK = 500
+
+# Held by an import from its match lookup to the insert of the pictures that
+# lookup decided are new. Not reentrant: take it once per lookup and insert.
+_IMPORT_LOCK = threading.Lock()
+
+
+@contextmanager
+def serialised_import() -> Iterator[None]:
+    """Hold while looking up matches and inserting the pictures they decide.
+
+    The holder's lookup sees every picture an earlier holder inserted, so two
+    overlapping imports of the same new file add it once. Keep the span short:
+    every other import waits for it. Never take it on the database writer
+    thread, which the holder waits on.
+    """
+    with _IMPORT_LOCK:
+        yield
 
 
 @dataclass(frozen=True)
