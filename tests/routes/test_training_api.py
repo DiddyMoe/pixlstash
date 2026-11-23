@@ -35,7 +35,7 @@ from fastapi.testclient import TestClient
 
 from pixlstash.hub import dataset_snapshots, training_runs
 from pixlstash.resources import comfyui_tenant
-from pixlstash.resources.arbiter import Tenant, arbiter
+from pixlstash.resources.arbiter import Lease, LeaseKind, Tenant, arbiter
 from pixlstash.routes import training as training_routes
 from pixlstash.routes.training import _redact_host_paths
 from pixlstash.training import preset_updates, presets
@@ -934,13 +934,24 @@ def test_live_view_rows_from_disk_keep_the_documented_shape():
         _teardown(temp_dir, server)
 
 
-def test_a_run_that_ended_without_a_finish_time_has_no_growing_last_phase():
+def test_a_run_that_ended_without_a_finish_time_has_no_growing_last_phase(
+    monkeypatch,
+):
     temp_dir, owner, server, read_token = _setup()
     try:
         job_id, _, _, _ = _live_run(server, temp_dir, status="error")
         phases = owner.get(f"/training/jobs/{job_id}/live").json()["phases"]
         assert phases[-1] == {"phase": "training", "seconds": None}
         assert phases[1]["seconds"] == 155.0
+
+        # The lease is read as it is. The snapshot reads every tenant first,
+        # and a hung ComfyUI held the live view and the job list for its
+        # timeout on every poll.
+        snapshots = []
+        snapshot = arbiter().snapshot
+        monkeypatch.setattr(
+            arbiter(), "snapshot", lambda: snapshots.append(True) or snapshot()
+        )
 
         # A queued run whose lease is granted is being probed: the worker's
         # phase telemetry on the lease says so, as the row cannot (#2120).
@@ -955,9 +966,11 @@ def test_a_run_that_ended_without_a_finish_time_has_no_growing_last_phase():
             live = owner.get(f"/training/jobs/{queued_id}/live").json()
             assert live["phase"] == "checking"
             assert live["downloading"] is False  # the probe has no log yet
+            assert not snapshots, "the live view read every tenant to find its lease"
             # The job list says so too, for the runs grid's card.
             listed = {j["uuid"]: j for j in owner.get("/training/jobs").json()}
             assert listed[queued_uuid]["phase"] == "checking"
+            assert not snapshots, "the job list read every tenant to find its leases"
             # The probe's log ends on a model download: the view says so, and
             # stops once the download is complete.
             probe_log = LocalAiToolkit.handle_for(
@@ -984,6 +997,51 @@ def test_a_run_that_ended_without_a_finish_time_has_no_growing_last_phase():
         )
         listed = {j["uuid"]: j for j in owner.get("/training/jobs").json()}
         assert listed[queued_uuid]["phase"] is None
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_the_live_view_shows_why_a_run_waits_and_the_card_it_asked_for(
+    monkeypatch,
+):
+    """A waiting run's lease gives the live view its reason, and the card
+    whose memory its telemetry draws."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        queued_id, queued_uuid = _seed_job(server, status="queued", step=0)
+        waiting = Lease(
+            tenant=Tenant.AITOOLKIT,
+            label="test-run",
+            kind=LeaseKind.HEAVY,
+            device="GPU-test-asked-for",
+            job_id=queued_uuid,
+            waiting_reason={
+                "code": "vram",
+                "text": "test-short-of-memory",
+                "comfyui_closing": True,
+            },
+        )
+        monkeypatch.setattr(arbiter(), "leases", lambda tenant=None: [waiting])
+        cards = {
+            "GPU-test-asked-for": types.SimpleNamespace(
+                total_mb=16384, used_mb=4096, measurable=True
+            )
+        }
+        fake_ledger = types.SimpleNamespace(
+            device=cards.get,
+            pixlstash_device=lambda: "GPU-test-pixlstash",
+            processes=lambda uuid=None: {},
+        )
+        monkeypatch.setattr(training_routes, "ledger", lambda: fake_ledger)
+        live = owner.get(f"/training/jobs/{queued_id}/live").json()
+        assert live["waiting"] == {
+            "code": "vram",
+            "text": "test-short-of-memory",
+            "comfyui": True,
+        }
+        assert live["telemetry"]["gpu"]["total_mb"] == 16384, (
+            "not the card the run asked for"
+        )
     finally:
         _teardown(temp_dir, server)
 
