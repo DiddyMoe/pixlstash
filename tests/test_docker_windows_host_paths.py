@@ -46,6 +46,8 @@ def test_docker_accepts_windows_absolute_host_paths(monkeypatch):
                 )
                 assert import_response.status_code == 200, import_response.text
                 assert import_response.json()["host_path"] == windows_host_path
+                # Registered before the folder is mounted: kept, and flagged.
+                assert import_response.json()["missing"] is True
 
 
 def test_docker_rejects_relative_host_paths(monkeypatch):
@@ -85,6 +87,20 @@ def test_docker_rejects_relative_host_paths(monkeypatch):
                 assert (
                     import_response.json().get("detail")
                     == "Host path must be an absolute path."
+                )
+
+                # In Docker the container path alone cannot be shown to the owner.
+                no_host_response = client.post(
+                    "/import-folders",
+                    json={
+                        "folder": "/data/import/pictures-003",
+                        "delete_after_import": False,
+                    },
+                )
+                assert no_host_response.status_code == 400, no_host_response.text
+                assert (
+                    no_host_response.json().get("detail")
+                    == "Host path is required in Docker mode."
                 )
 
 

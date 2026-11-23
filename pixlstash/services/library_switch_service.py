@@ -339,11 +339,14 @@ class LibrarySwitchService:
     def _what_is_holding_the_library(self) -> Optional[str]:
         """Name the long-running work a switch is waiting on, when it can be.
 
-        The coordinator counts readers; it does not know what they are. These
-        two are the only holders that keep a lease for minutes rather than
+        The coordinator counts readers; it does not know what they are. A
+        folder-mapping commit, a one-shot import and a committed upload import
+        are the holders that keep the library for minutes rather than
         milliseconds, so they are what an owner is actually waiting on when a
-        switch refuses. Returns ``None`` when nothing recognisable is running,
-        and the caller falls back to the coordinator's own words.
+        switch refuses. An upload batch still being received is named too: it
+        holds its request's lease until the last file is written. Returns
+        ``None`` when nothing recognisable is running, and the caller falls
+        back to the coordinator's own words.
         """
         with self._server.folder_structure_commit_lock:
             commit = self._server.folder_structure_commit
@@ -355,6 +358,19 @@ class LibrarySwitchService:
                 "running",
             ):
                 return "an import is still running"
+        receiving = False
+        for session in list(self._server.staging_sessions.values()):
+            with session["lock"]:
+                task = session.get("task")
+                status = getattr(getattr(task, "status", None), "value", None)
+                if session["stage"] == "committing" or status in (
+                    "pending",
+                    "running",
+                ):
+                    return "an import is still running"
+                receiving = receiving or session["inflight"] > 0
+        if receiving:
+            return "an upload is still being received"
         return None
 
     def _swap(self, target: Library) -> Library:

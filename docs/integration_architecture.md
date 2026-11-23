@@ -17,7 +17,7 @@
 7. [WebSocket Channels](#7-websocket-channels)
 8. [Real-Time Event Contract](#8-real-time-event-contract)
 9. [Image & Thumbnail Serving](#9-image--thumbnail-serving)
-10. [File Uploads (Import)](#10-file-uploads-import)
+10. [File Uploads (Import)](#10-file-uploads-import) — incl. [10.2 Upload staging: retries, commit and cancel](#102-upload-staging-retries-commit-and-cancel)
 11. [Long-Running Operations](#11-long-running-operations) — incl. [11.3 Work waiting for the GPU](#113-work-waiting-for-the-gpu)
 12. [Configuration Sync](#12-configuration-sync)
 13. [Error Handling Contract](#13-error-handling-contract)
@@ -2528,6 +2528,95 @@ scrapheaped picture name its id once; they are the pictures the import restored.
 `scrapheap_service.restore_pictures`, the same function behind `POST /pictures/scrapheap/restore`, so the restore
 is one undoable `pictures.scrapheap.restore` operation and broadcasts `CHANGED_PICTURES` with
 `change_kind: "restored"` (§8), which the grid already consumes.
+
+### 10.2 Upload staging: retries, commit and cancel
+
+The staging routes let a client resend any call whose reply it never got, without
+losing a file, staging one twice or starting a second import. The server owns
+the session's files at every moment: an upload batch while it is being received,
+the import task from commit on, the reaper only when neither does. Each refusal
+below that concerns ownership is a `409` whose `detail` is an object
+`{code, message, stage, task_id}`, so the client can follow an import that is
+already running instead of reporting a failure. Other refusals keep the string
+`detail` of §13 unless the table shows an object.
+
+**Uploading a batch: `POST /pictures/import/staging/{id}/files`.** An optional
+`Idempotency-Key` request header (IETF httpapi draft *The Idempotency-Key HTTP
+Header Field*) names the batch: a Structured Field string, normally quoted
+(`Idempotency-Key: "<uuid>"`), 1 to 255 printable ASCII characters, chosen once
+per batch and sent unchanged on every retry of it. The key is scoped to the
+staging session and forgotten when the session is reaped; there is no other
+expiry. The server fingerprints the batch from each part's `key` field,
+filename and size, in order. Without the header every request stages its files.
+
+| Situation | Status | Body |
+|---|---|---|
+| Batch staged | 200 | `{staging_id, staged, received[], skipped[], sidecars, replayed: false}` |
+| Retry of a batch already staged under this key | 200 | the first answer, with `replayed: true`; nothing is staged again |
+| Retry while the first attempt is still being received | 409 | `{code: "batch_in_progress", message}` |
+| The key was used for different parts | 422 | `{code: "idempotency_key_mismatch", message}` |
+| Malformed key | 400 | `{code: "invalid_idempotency_key", message}` |
+| Session cancelled, committing or committed, including during this upload | 409 | `{code: "staging_closed", message, stage, task_id}` |
+| The batch would take the session past 50,000 files | 413 | `{code: "staging_file_limit", message, limit, staged}` |
+| The library volume filled up while writing | 507 | `{code: "insufficient_storage", message, free_bytes}` (`free_bytes` is `null` when unreadable) |
+
+A batch is staged whole or not at all. On any refusal (the table's, a file or
+zip over its size limit, or a dropped connection) none of its files stays on
+disk, a zip's extracted entries included, and its key is not remembered, so
+the same request may simply be sent again. A retry of an accepted batch is
+answered even after the session was committed. `skipped[]` lists files the
+server could not use (unsupported, empty, unreadable); a full disk is never
+reported as skipped.
+
+**Committing: `POST /pictures/import/staging/{id}/commit`** is idempotent per
+session.
+
+| Situation | Status | Body |
+|---|---|---|
+| Import started | 200 | `{staging_id, task_id, staged_count, replayed: false}` |
+| Already committed (any later stage) | 200 | the same `task_id`, `replayed: true`; no second import |
+| Another commit is handing the session over | 409 | `code: "commit_in_progress"` |
+| An upload is still being received | 409 | `code: "uploads_in_flight"` |
+| The session was cancelled | 409 | `code: "staging_closed"` |
+| Nothing staged; face worker unavailable | 400 | string |
+| The drop target was deleted / its set locked since open | 404 / 409 | string |
+| Free space on the library volume cannot be read | 503 | string |
+| Not enough free space for the import | 507 | string |
+| The library is switching, or the server has no task runner | 503 | string |
+
+Every refusal after the session was claimed puts it back to `staging`, so the
+client may upload more or commit again. A commit that races server shutdown,
+after the task runner has stopped, fails with 500 and is put back the same way.
+From commit until the import settles the task holds a library read lease, so
+`POST /libraries/active` waits its bounded time and then answers 409 "This
+library is busy: an import is still running" (backend: Active-library
+switching).
+
+**Cancelling: `DELETE /pictures/import/staging/{id}`** answers
+`{staging_id, stage: "cancelled", staged, total, processed: 0, cleanup}`.
+`cleanup` is `done` when the files are gone, or `deferred` when an upload was
+still being received: that upload is refused with `staging_closed` and removes
+the files as it ends. Once committed, cancel is 409 `import_committed` and the
+import runs on.
+
+**Status: `GET /pictures/import/staging/{id}/status`.** `stage` is `staging`,
+`committing` (the brief hand-over), `importing`, `completed`, `failed` or
+`cancelled`. While `importing`, `phase` is `queued` (waiting for a worker),
+`processing` (checking and reading in each file; `processed` counts these),
+`persisting` (writing every new picture in one transaction, then its project,
+set and character membership) or `finalizing` (restoring Scrapheap matches,
+removing the staged files); otherwise `null`. No new picture exists before
+`persisting`.
+
+**Lifetime.** The reaper runs each time a staging session is opened. A session
+idle for an hour, or finished and unpolled for five minutes, is reaped with its
+keys. The reaper never touches a session with an upload in flight, a commit in
+progress or an import queued or running, and keeps one whose directory it could
+not remove so the next run retries. A failed import removes its staged files. A
+`.staging/` entry no session owns (a restart between upload and commit) is
+removed by the next reaper run once it is older than the idle TTL.
+
+The one-shot `POST /pictures/import` (the ComfyUI node's route) is unchanged.
 
 
 ---
