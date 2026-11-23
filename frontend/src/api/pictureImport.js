@@ -45,15 +45,27 @@ import { apiClient } from "../utils/apiClient";
  * ENDPOINTS (final, all under /api/v1, mutating routes OWNER_ONLY):
  *   POST   {backendUrl}/pictures/import/staging                   → { staging_id, safe_threshold }
  *   POST   {backendUrl}/pictures/import/staging/{id}/files         multipart `file` (repeatable), with an
- *                                                                 optional `key` per file, in the same order
- *                                                                 → { staging_id, staged, received[], skipped[] }
- *   POST   {backendUrl}/pictures/import/staging/{id}/commit        → { staging_id, task_id, staged_count }
- *                                                                   400 empty/face-worker-down, 409 committed, 507 disk
+ *                                                                 optional `key` per file, in the same order;
+ *                                                                 header `Idempotency-Key` names the batch
+ *                                                                 → { staging_id, staged, received[], skipped[],
+ *                                                                     replayed }
+ *   POST   {backendUrl}/pictures/import/staging/{id}/commit        → { staging_id, task_id, staged_count, replayed }
+ *                                                                   400 empty/face-worker-down, 409 in progress
+ *                                                                   or closed, 507 disk
  *   DELETE {backendUrl}/pictures/import/staging/{id}               (pre-commit only) → { stage:"cancelled", … }
- *   GET    {backendUrl}/pictures/import/staging/{id}/status        → { stage, staged, total, processed, task_id,
- *          ?outcomes_from=N                                             imported_count, duplicate_count, scrapheaped_count,
- *                                                                       scrapheaped_picture_ids[], failed_count,
- *                                                                       cancelled_count, error, outcomes[] }
+ *                                                                   409 import_committed once handed off
+ *   GET    {backendUrl}/pictures/import/staging/{id}/status        → { stage, phase, staged, total, processed,
+ *          ?outcomes_from=N                                             task_id, imported_count, duplicate_count,
+ *                                                                       scrapheaped_count, scrapheaped_picture_ids[],
+ *                                                                       failed_count, cancelled_count, error,
+ *                                                                       outcomes[] }
+ *
+ * RESENDING IS SAFE: a batch whose reply was lost (a timeout, a dropped
+ * connection, a 5xx) is sent again under the SAME `Idempotency-Key`, and the
+ * server answers from its record of the first request instead of staging the
+ * files twice (`replayed: true`). A commit is the same: committing again after
+ * it was accepted returns the original `task_id` with `replayed: true`, so a
+ * lost commit reply is reconciled rather than run twice.
  *
  * PER-FILE OUTCOMES (#2512): each file is streamed with the client's own `key`,
  * and the status carries `outcomes[]` - `{ key, outcome, picture_id }` for every
@@ -135,6 +147,8 @@ export async function openStagingSession({
  * @property {number} staged     Total files staged in this session so far.
  * @property {string[]} received Original filenames accepted in this request.
  * @property {string[]} skipped  Filenames rejected (unsupported/empty) in this request.
+ * @property {boolean} replayed  The server answered a resend of a batch it had
+ *   already accepted, from that first reply; nothing was staged twice.
  * @property {Object} raw
  */
 
@@ -148,6 +162,8 @@ export async function openStagingSession({
  * @param {File[]} args.files
  * @param {string[]} [args.keys]  One handle per file, same order; named back in
  *   the status `outcomes[]`.
+ * @param {string} [args.idempotencyKey]  The batch's identity, the same on
+ *   every resend of it, so the server stages it once.
  * @param {AbortSignal} [args.signal]
  * @param {number} [args.timeoutMs]
  * @param {(e: ProgressEvent) => void} [args.onUploadProgress]
@@ -158,6 +174,7 @@ export async function stageFiles({
   stagingId,
   files,
   keys = [],
+  idempotencyKey,
   signal,
   timeoutMs,
   onUploadProgress,
@@ -165,13 +182,16 @@ export async function stageFiles({
   const formData = new FormData();
   files.forEach((file) => formData.append("file", file));
   keys.forEach((key) => formData.append("key", key));
+  const headers = { "Content-Type": "multipart/form-data" };
+  // A structured-field string (RFC 8941), so the quotes are part of it.
+  if (idempotencyKey) headers["Idempotency-Key"] = `"${idempotencyKey}"`;
   const res = await apiClient.post(
     IMPORT_ENDPOINTS.stageFiles(backendUrl, stagingId),
     formData,
     {
       signal,
       timeout: timeoutMs,
-      headers: { "Content-Type": "multipart/form-data" },
+      headers,
       onUploadProgress,
     },
   );
@@ -180,6 +200,7 @@ export async function stageFiles({
     staged: d.staged ?? 0,
     received: Array.isArray(d.received) ? d.received : [],
     skipped: Array.isArray(d.skipped) ? d.skipped : [],
+    replayed: d.replayed === true,
     raw: d,
   };
 }
@@ -188,12 +209,15 @@ export async function stageFiles({
  * @typedef {Object} CommitResult
  * @property {string|null} taskId     Background PictureImportTask id.
  * @property {number} stagedCount     Files handed off to the import.
+ * @property {boolean} replayed       Answered from an earlier accepted commit.
  * @property {Object} raw
  */
 
 /**
  * Safe handoff - commit the session, enqueuing the background import.
- * Throws on 400 (empty / face worker down), 409 (already committed), 507 (disk).
+ * Throws on 400 (empty / face worker down), 409 (a commit or upload still in
+ * progress, or the session closed), 507 (disk). Committing again once the
+ * import has started answers 200 with the same `task_id` and `replayed`.
  *
  * @param {Object} args
  * @param {string} args.backendUrl
@@ -208,6 +232,7 @@ export async function commitStaging({ backendUrl, stagingId }) {
   return {
     taskId: d.task_id ?? null,
     stagedCount: d.staged_count ?? 0,
+    replayed: d.replayed === true,
     raw: d,
   };
 }
@@ -230,7 +255,11 @@ export async function cancelStaging({ backendUrl, stagingId }) {
 
 /**
  * @typedef {Object} StagingStatus
- * @property {string} stage           staging | importing | completed | failed | cancelled.
+ * @property {string} stage           staging | committing | importing | completed | failed | cancelled.
+ * @property {string|null} phase      While importing: queued (waiting for the
+ *   task runner), processing (checking each file), persisting (adding the new
+ *   pictures, all at once at the end), finalizing. Null otherwise, and from a
+ *   server that does not report it.
  * @property {number} staged          Files staged into the session.
  * @property {number} total           Total the import is working through.
  * @property {number} processed       Files processed so far (Phase B).
@@ -261,20 +290,25 @@ export async function cancelStaging({ backendUrl, stagingId }) {
  * @param {string} args.backendUrl
  * @param {string} args.stagingId
  * @param {number} [args.outcomesFrom] How many outcomes the caller already has.
+ * @param {AbortSignal} [args.signal] Stops the request when the follower stops.
  * @returns {Promise<StagingStatus>}
  */
 export async function fetchStagingStatus({
   backendUrl,
   stagingId,
   outcomesFrom = 0,
+  signal,
 }) {
+  const config = { params: { outcomes_from: outcomesFrom } };
+  if (signal) config.signal = signal;
   const res = await apiClient.get(
     IMPORT_ENDPOINTS.status(backendUrl, stagingId),
-    { params: { outcomes_from: outcomesFrom } },
+    config,
   );
   const d = res?.data ?? {};
   return {
     stage: d.stage || "staging",
+    phase: d.phase ?? null,
     staged: d.staged ?? 0,
     total: d.total ?? 0,
     processed: d.processed ?? 0,

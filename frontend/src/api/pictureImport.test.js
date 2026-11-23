@@ -8,10 +8,96 @@ vi.mock("../utils/apiClient", () => ({
 }));
 
 import { apiClient } from "../utils/apiClient";
-import { fetchStagingStatus, IMPORT_ENDPOINTS } from "./pictureImport";
+import {
+  commitStaging,
+  fetchStagingStatus,
+  IMPORT_ENDPOINTS,
+  stageFiles,
+} from "./pictureImport";
 
 beforeEach(() => {
   apiClient.get.mockReset();
+  apiClient.post.mockReset();
+});
+
+describe("api/pictureImport: resending a batch", () => {
+  it("sends the batch's key as a quoted Idempotency-Key header", async () => {
+    apiClient.post.mockResolvedValue({ data: { staged: 1 } });
+    await stageFiles({
+      backendUrl: "/be",
+      stagingId: "s1",
+      files: [new File(["x"], "a.png")],
+      idempotencyKey: "batch-key-1",
+    });
+    const config = apiClient.post.mock.calls[0][2];
+    // The server reads a structured-field string: the quotes are part of it.
+    expect(config.headers["Idempotency-Key"]).toBe('"batch-key-1"');
+    expect(config.headers["Content-Type"]).toBe("multipart/form-data");
+  });
+
+  it("sends no Idempotency-Key when the caller has none", async () => {
+    apiClient.post.mockResolvedValue({ data: { staged: 1 } });
+    await stageFiles({
+      backendUrl: "/be",
+      stagingId: "s1",
+      files: [new File(["x"], "a.png")],
+    });
+    const config = apiClient.post.mock.calls[0][2];
+    expect(config.headers).not.toHaveProperty("Idempotency-Key");
+  });
+
+  it("says when the server answered a resend from its first reply", async () => {
+    apiClient.post.mockResolvedValue({
+      data: { staged: 2, received: ["a.png"], replayed: true },
+    });
+    const batch = await stageFiles({
+      backendUrl: "/be",
+      stagingId: "s1",
+      files: [new File(["x"], "a.png")],
+      idempotencyKey: "batch-key-1",
+    });
+    expect(batch.replayed).toBe(true);
+  });
+
+  it("says when a commit was answered from an earlier commit", async () => {
+    apiClient.post.mockResolvedValue({
+      data: { task_id: "t-1", staged_count: 2, replayed: true },
+    });
+    const commit = await commitStaging({ backendUrl: "/be", stagingId: "s1" });
+    expect(commit.taskId).toBe("t-1");
+    expect(commit.replayed).toBe(true);
+  });
+});
+
+describe("api/pictureImport: what the server is doing", () => {
+  it("passes the importer's phase through, null once it is over", async () => {
+    apiClient.get.mockResolvedValueOnce({
+      data: { stage: "importing", phase: "persisting" },
+    });
+    apiClient.get.mockResolvedValueOnce({ data: { stage: "completed" } });
+    const running = await fetchStagingStatus({
+      backendUrl: "",
+      stagingId: "s",
+    });
+    const done = await fetchStagingStatus({ backendUrl: "", stagingId: "s" });
+    expect(running.phase).toBe("persisting");
+    expect(done.phase).toBeNull();
+  });
+
+  it("hands an abort signal to the request when given one", async () => {
+    apiClient.get.mockResolvedValue({ data: { stage: "importing" } });
+    const controller = new AbortController();
+    await fetchStagingStatus({
+      backendUrl: "",
+      stagingId: "s",
+      outcomesFrom: 3,
+      signal: controller.signal,
+    });
+    expect(apiClient.get).toHaveBeenCalledWith(
+      IMPORT_ENDPOINTS.status("", "s"),
+      { params: { outcomes_from: 3 }, signal: controller.signal },
+    );
+  });
 });
 
 describe("api/pictureImport: staging status buckets", () => {
