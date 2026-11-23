@@ -5,6 +5,7 @@ import functools
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import stat
 import threading
@@ -95,6 +96,10 @@ _STAGING_TERMINAL_GRACE_S = 300  # keep a finished session briefly for a last po
 
 # An ``Idempotency-Key`` longer than this is refused; a UUID needs 36.
 _IDEMPOTENCY_KEY_MAX_LEN = 255
+
+# A ``relpath`` form field longer than this is refused. It only names the
+# folder a dropped file sat in, and a browser path is far shorter.
+_RELPATH_MAX_LEN = 4096
 
 # Write errors that mean the volume holding the staging dir is full or over
 # quota. A batch that hits one is refused with 507 rather than reported as a
@@ -286,12 +291,60 @@ def _parse_idempotency_key(raw: Optional[str]) -> Optional[str]:
     return value
 
 
-def _batch_fingerprint(files: list[UploadFile], keys: list[str]) -> str:
-    """Identify a batch's payload: each part's client key, filename and size.
+def _relpath_folder(raw: str) -> str:
+    """The folder a dropped file sat in, read from its ``relpath`` form field.
+
+    ``relpath`` is the dropped entry's path as the browser reports it
+    (``/holiday/beach/x.png``). The caller controls it, so it is only ever a
+    label that groups a caption with the media beside it: it is never joined
+    to a filesystem path, opened or stored. A value that climbs (a ``..``
+    segment), carries a NUL or is overlong is refused rather than tidied,
+    because a browser never sends one. A backslash is not a separator, so
+    ``a\\b\\x.png`` is a file name at the top of the drop.
+
+    Returns:
+        The folder as a ``/``-joined label with no leading ``/``, or ``""``
+        for a file at the top of the drop or one sent without a path.
+
+    Raises:
+        HTTPException: 400 ``invalid_relpath`` for a refused value.
+    """
+    if "\x00" in raw or len(raw) > _RELPATH_MAX_LEN or ".." in raw.split("/"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_relpath",
+                "message": (
+                    "Each relpath must be a path inside the drop of at most "
+                    f"{_RELPATH_MAX_LEN} characters, with no '..' segment or "
+                    "NUL character."
+                ),
+            },
+        )
+    return posixpath.dirname(posixpath.normpath(raw.lstrip("/") or "."))
+
+
+def _zip_member_folder(upload_folder: str, member_name: str) -> str:
+    """The folder label of a zip member: the zip's own folder in the drop,
+    then the member's folder inside the archive.
+
+    Like ``_relpath_folder`` this only groups captions with media and is
+    never used as a path, so an odd member name is not refused here.
+    """
+    inner = posixpath.dirname(posixpath.normpath(member_name.lstrip("/") or "."))
+    return posixpath.join(upload_folder, inner) if inner else upload_folder
+
+
+def _batch_fingerprint(
+    files: list[UploadFile], keys: list[str], folders: list[str]
+) -> str:
+    """Identify a batch's payload: each part's client key, filename, size and
+    folder label.
 
     A retried batch carries the same parts in the same order, so it matches; a
-    different batch sent under a reused key does not. Hashing the content is
-    not needed to tell those apart.
+    different batch sent under a reused key does not, including the same files
+    regrouped into other folders. Hashing the content is not needed to tell
+    those apart.
     """
     parts = []
     for index, upload in enumerate(files):
@@ -300,7 +353,12 @@ def _batch_fingerprint(files: list[UploadFile], keys: list[str]) -> str:
         size = handle.tell()
         handle.seek(0)
         parts.append(
-            [keys[index] if index < len(keys) else None, upload.filename or "", size]
+            [
+                keys[index] if index < len(keys) else None,
+                upload.filename or "",
+                size,
+                folders[index],
+            ]
         )
     encoded = json.dumps(parts, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -748,8 +806,11 @@ def register_routes(router, server):
         logger.debug("Importing pictures to folder: " + str(dest_folder))
         os.makedirs(dest_folder, exist_ok=True)
         uploaded_files = []
-        uploaded_file_stems: list[str] = []
-        sidecar_text_by_stem: dict[str, str] = {}
+        # Captions and media are paired by ``(folder, stem)``: a caption only
+        # tags media with its stem in the same folder. A plain upload has no
+        # folder; a zip member's folder is its directory inside the archive.
+        uploaded_file_keys: list[tuple[str, str]] = []
+        sidecar_text_by_key: dict[tuple[str, str], str] = {}
         allowed_caption_exts = {".txt"}
 
         def _read_zip(upload: UploadFile) -> None:
@@ -804,7 +865,10 @@ def register_routes(router, server):
                     if not data:
                         continue
                     base_name = os.path.basename(info.filename)
-                    stem = _normalise_sidecar_stem(base_name)
+                    sidecar_key = (
+                        _zip_member_folder("", info.filename),
+                        _normalise_sidecar_stem(base_name),
+                    )
                     if is_caption:
                         if len(data) > _MAX_SIDECAR_BYTES:
                             logger.warning(
@@ -815,13 +879,13 @@ def register_routes(router, server):
                                 _MAX_SIDECAR_BYTES,
                             )
                             continue
-                        sidecar_text_by_stem.setdefault(
-                            stem,
+                        sidecar_text_by_key.setdefault(
+                            sidecar_key,
                             data.decode("utf-8", errors="ignore"),
                         )
                         continue
                     uploaded_files.append((data, inner_ext, base_name))
-                    uploaded_file_stems.append(stem)
+                    uploaded_file_keys.append(sidecar_key)
                     added += 1
                 if added == 0:
                     logger.warning(
@@ -870,9 +934,8 @@ def register_routes(router, server):
                             ),
                         )
                     if ext in allowed_caption_exts:
-                        stem = _normalise_sidecar_stem(upload.filename)
-                        sidecar_text_by_stem.setdefault(
-                            stem,
+                        sidecar_text_by_key.setdefault(
+                            ("", _normalise_sidecar_stem(upload.filename)),
                             contents.decode("utf-8", errors="ignore"),
                         )
                         continue
@@ -883,7 +946,9 @@ def register_routes(router, server):
                         )
                         continue
                     uploaded_files.append((contents, ext, upload.filename))
-                    uploaded_file_stems.append(_normalise_sidecar_stem(upload.filename))
+                    uploaded_file_keys.append(
+                        ("", _normalise_sidecar_stem(upload.filename))
+                    )
         else:
             logger.error("No files provided for import")
             raise HTTPException(status_code=400, detail="No image provided")
@@ -899,21 +964,22 @@ def register_routes(router, server):
         logger.info(
             "Import request received: files=%d, sidecar_txt=%d, project_id=%s, total_bytes=%d",
             len(uploaded_files),
-            len(sidecar_text_by_stem),
+            len(sidecar_text_by_key),
             project_id,
             total_import_bytes_log,
         )
 
-        sidecar_tags_by_stem: dict[str, list[str]] = {}
-        if sidecar_text_by_stem:
-            media_stem_set = set(uploaded_file_stems)
-            for stem, raw_text in sidecar_text_by_stem.items():
-                # Only consume caption sidecars that have a corresponding media file.
-                if stem not in media_stem_set:
+        sidecar_tags_by_key: dict[tuple[str, str], list[str]] = {}
+        if sidecar_text_by_key:
+            media_key_set = set(uploaded_file_keys)
+            for sidecar_key, raw_text in sidecar_text_by_key.items():
+                # Only consume caption sidecars that have a media file with the
+                # same stem in the same folder.
+                if sidecar_key not in media_key_set:
                     continue
                 parsed_tags = _parse_sidecar_tags(raw_text)
                 if parsed_tags:
-                    sidecar_tags_by_stem[stem] = parsed_tags
+                    sidecar_tags_by_key[sidecar_key] = parsed_tags
 
         total_import_bytes = sum(len(data) for data, *_ in uploaded_files)
         free_bytes = shutil.disk_usage(dest_folder).free
@@ -1057,8 +1123,8 @@ def register_routes(router, server):
                 scrapheaped_picture_ids: list[int] = []
                 seen_scrapheaped_ids: set[int] = set()
                 seen_new_fingerprints = set()
-                for stem, _, fingerprint in zip(
-                    uploaded_file_stems, uploaded_files, fingerprints
+                for sidecar_key, _, fingerprint in zip(
+                    uploaded_file_keys, uploaded_files, fingerprints
                 ):
                     # Three disjoint outcomes per uploaded file. `existing_map`
                     # and `scrapheaped_map` are disjoint by construction (a live
@@ -1117,14 +1183,13 @@ def register_routes(router, server):
 
                     if (
                         pic.id is not None
-                        and stem in sidecar_tags_by_stem
-                        and sidecar_tags_by_stem[stem]
+                        and sidecar_tags_by_key.get(sidecar_key)
                         # A restored match comes back as it was: its tags are
                         # not replaced (it may sit in a locked set).
                         and fingerprint not in scrapheaped_map
                     ):
                         picture_id_sidecar_tags[pic.id].update(
-                            sidecar_tags_by_stem[stem]
+                            sidecar_tags_by_key[sidecar_key]
                         )
 
                 if duplicate_count:
@@ -1589,8 +1654,10 @@ def register_routes(router, server):
             "character_id": payload.character_id,
             "declared_total": declared_total,
             "staged_files": [],
-            # stem -> raw sidecar text, from .txt uploads and zip .txt entries.
-            "sidecar_text_by_stem": {},
+            # (folder, stem) -> raw sidecar text, from .txt uploads and zip
+            # .txt entries. The folder is a label from the upload's relpath
+            # and the zip member's directory, never a filesystem path.
+            "sidecar_text_by_key": {},
             "task": None,
             "task_id": None,
             "origin_client_id": origin_client_id,
@@ -1637,13 +1704,20 @@ def register_routes(router, server):
             "Unsupported or empty files are skipped and reported. A batch is "
             "staged whole or not at all: a refused batch (409, 413, 507) leaves "
             "none of its files behind.\n\n"
+            "Folders: send one `relpath` field per `file`, in the same order, "
+            "with the path the file had in the drop (`/holiday/x.png`). It "
+            "only pairs a `.txt` caption with the media of the same name in "
+            "the same folder; the staged file is still named by the server. "
+            "A relpath with a `..` segment, a NUL or over 4096 characters gets "
+            "400 `invalid_relpath` and stages nothing.\n\n"
             "Retrying safely: send an `Idempotency-Key` header, a quoted string "
             "such as a UUID, chosen once per batch and reused by every retry of "
             "it. A retry of a batch the session already accepted returns the "
             'original answer with `"replayed": true` and stages nothing again. '
             "A retry while the first attempt is still being staged gets 409 "
-            "`batch_in_progress`. The same key sent with different files gets "
-            "422 `idempotency_key_mismatch`. Keys are scoped to the staging "
+            "`batch_in_progress`. The same key sent with different files, or "
+            "the same files in other folders, gets 422 "
+            "`idempotency_key_mismatch`. Keys are scoped to the staging "
             "session and expire with it: when the session is reaped (idle for "
             "an hour, or a few minutes after its import finished) its keys are "
             "forgotten. Without the header every request stages its files."
@@ -1655,6 +1729,7 @@ def register_routes(router, server):
         staging_id: str,
         file: list[UploadFile] = File(None),
         key: list[str] = Form(None),
+        relpath: list[str] = Form(None),
         idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     ):
         session = _get_session_or_404(request, staging_id)
@@ -1664,7 +1739,14 @@ def register_routes(router, server):
         # import can say which file each outcome belongs to (#2512). Optional:
         # a caller that sends none gets ``None`` keys.
         keys: list[str] = list(key or [])
-        fingerprint = _batch_fingerprint(file, keys) if batch_key and file else None
+        # The folder each file sat in, from one ``relpath`` field per ``file``
+        # in the same order; a file without one is at the top of the drop.
+        # Every value is checked before anything is admitted or written.
+        folders = [_relpath_folder(value) for value in relpath or []]
+        folders += [""] * (len(file or []) - len(folders))
+        fingerprint = (
+            _batch_fingerprint(file, keys, folders) if batch_key and file else None
+        )
 
         # Admission. An admitted request holds an upload lease (``inflight``)
         # until its ``finally``: while any is held nobody commits, reaps or
@@ -1724,12 +1806,13 @@ def register_routes(router, server):
         # file of the batch is on disk (the publish step below), so a refused
         # or failed batch never leaves part of itself staged.
         batch_entries: list[dict] = []
-        batch_sidecars: dict[str, str] = {}
+        batch_sidecars: dict[tuple[str, str], str] = {}
         # Every file this batch created, removed again if the batch is refused.
         written_paths: list[str] = []
         received: list[str] = []
         skipped: list[str] = []
         current_key: Optional[str] = None
+        current_folder = ""
         published = False
 
         def _check_file_cap() -> None:
@@ -1787,6 +1870,7 @@ def register_routes(router, server):
                     "file_path": dest_path,
                     "original_file_name": os.path.basename(info.filename),
                     "client_key": current_key,
+                    "sidecar_folder": _zip_member_folder(current_folder, info.filename),
                 }
             )
             return True
@@ -1862,7 +1946,10 @@ def register_routes(router, server):
                             )
                         elif data:
                             batch_sidecars.setdefault(
-                                _normalise_sidecar_stem(base_name),
+                                (
+                                    _zip_member_folder(current_folder, info.filename),
+                                    _normalise_sidecar_stem(base_name),
+                                ),
                                 data.decode("utf-8", errors="ignore"),
                             )
                         continue
@@ -1875,13 +1962,14 @@ def register_routes(router, server):
         try:
             for upload_index, upload in enumerate(file):
                 current_key = keys[upload_index] if upload_index < len(keys) else None
+                current_folder = folders[upload_index]
                 if not upload.filename:
                     continue
                 ext = os.path.splitext(upload.filename)[1].lower()
 
-                # --- Caption sidecar (.txt): stored by stem, matched to an
-                # image at commit; mirrors the one-shot import's
-                # sidecar_text_by_stem. ---
+                # --- Caption sidecar (.txt): stored by folder and stem,
+                # matched to an image at commit; mirrors the one-shot import's
+                # sidecar_text_by_key. ---
                 if ext in STAGING_ALLOWED_CAPTION_EXTS:
                     try:
                         await upload.seek(0)
@@ -1896,7 +1984,7 @@ def register_routes(router, server):
                             skipped.append(upload.filename)
                             continue
                         batch_sidecars.setdefault(
-                            _normalise_sidecar_stem(upload.filename),
+                            (current_folder, _normalise_sidecar_stem(upload.filename)),
                             raw.decode("utf-8", errors="ignore"),
                         )
                         received.append(upload.filename)
@@ -1984,6 +2072,7 @@ def register_routes(router, server):
                         "file_path": dest_path,
                         "original_file_name": os.path.basename(upload.filename),
                         "client_key": current_key,
+                        "sidecar_folder": current_folder,
                     }
                 )
                 received.append(upload.filename)
@@ -2002,15 +2091,17 @@ def register_routes(router, server):
                 if len(staged_files) + len(batch_entries) > _STAGING_MAX_FILES:
                     raise _staging_file_limit(len(staged_files))
                 staged_files.extend(batch_entries)
-                sidecar_text_by_stem: dict[str, str] = session["sidecar_text_by_stem"]
-                for stem, text in batch_sidecars.items():
-                    sidecar_text_by_stem.setdefault(stem, text)
+                sidecar_text_by_key: dict[tuple[str, str], str] = session[
+                    "sidecar_text_by_key"
+                ]
+                for sidecar_key, text in batch_sidecars.items():
+                    sidecar_text_by_key.setdefault(sidecar_key, text)
                 response = {
                     "staging_id": staging_id,
                     "staged": len(staged_files),
                     "received": received,
                     "skipped": skipped,
-                    "sidecars": len(sidecar_text_by_stem),
+                    "sidecars": len(sidecar_text_by_key),
                     "replayed": False,
                 }
                 if record is not None:
@@ -2118,7 +2209,9 @@ def register_routes(router, server):
                 raise HTTPException(status_code=400, detail="No staged files to import")
             session["stage"] = "committing"
             staged_files: list[dict] = list(session["staged_files"])
-            sidecar_text_by_stem: dict[str, str] = dict(session["sidecar_text_by_stem"])
+            sidecar_text_by_key: dict[tuple[str, str], str] = dict(
+                session["sidecar_text_by_key"]
+            )
 
         task: Optional[PictureImportTask] = None
         library_lease = None
@@ -2139,28 +2232,34 @@ def register_routes(router, server):
                 session["set_id"], session["character_id"], session["project_id"]
             )
 
-            # Resolve caption sidecars to their images by basename stem, parsing
-            # each via the one-shot import's tag rule (comma-separated tag
-            # lists). Orphan sidecars (no matching staged image) are logged and
+            # Resolve caption sidecars to their images by folder and basename
+            # stem, parsing each via the one-shot import's tag rule
+            # (comma-separated tag lists). A caption only matches an image in
+            # its own folder; one at the top of the drop only matches an image
+            # there. Orphan sidecars (no matching staged image) are logged and
             # skipped, not applied.
-            sidecar_tags_by_stem: dict[str, list[str]] = {}
-            if sidecar_text_by_stem:
-                media_stems = {
-                    _normalise_sidecar_stem(entry.get("original_file_name") or "")
+            sidecar_tags_by_key: dict[tuple[str, str], list[str]] = {}
+            if sidecar_text_by_key:
+                media_keys = {
+                    (
+                        entry["sidecar_folder"],
+                        _normalise_sidecar_stem(entry.get("original_file_name") or ""),
+                    )
                     for entry in staged_files
                 }
-                for stem, raw_text in sidecar_text_by_stem.items():
-                    if stem not in media_stems:
+                for sidecar_key, raw_text in sidecar_text_by_key.items():
+                    if sidecar_key not in media_keys:
                         logger.info(
-                            "Staging %s: caption sidecar '%s' has no matching "
-                            "image; skipping",
+                            "Staging %s: caption sidecar %r in folder %r has no "
+                            "matching image; skipping",
                             staging_id,
-                            stem,
+                            sidecar_key[1],
+                            sidecar_key[0],
                         )
                         continue
                     parsed = _parse_sidecar_tags(raw_text)
                     if parsed:
-                        sidecar_tags_by_stem[stem] = parsed
+                        sidecar_tags_by_key[sidecar_key] = parsed
 
             # Guard against committing more than the vault can hold: the
             # background import copies each staged file into the canonical vault
@@ -2212,7 +2311,7 @@ def register_routes(router, server):
                 project_id=session["project_id"],
                 set_id=session["set_id"],
                 character_id=session["character_id"],
-                sidecar_tags_by_stem=sidecar_tags_by_stem,
+                sidecar_tags_by_key=sidecar_tags_by_key,
                 staging_id=staging_id,
                 staging_dir=session["staging_dir"],
                 origin_client_id=session["origin_client_id"],

@@ -1,6 +1,7 @@
 // media.js - Shared media/file helpers for PixlStash frontend
 
 import { isOwnShareCopyDrop, outgoingDragIds } from "./shareDrag.js";
+import { useNoticeStore } from "../stores/useNoticeStore";
 
 export const PIL_IMAGE_EXTENSIONS = [
   "jpg",
@@ -178,8 +179,32 @@ export function isSupportedImportFile(file) {
   );
 }
 
+// The path each file had in the drop (`/holiday/beach/x.png`), for files a
+// folder walk found. Kept beside the File rather than on it: a File's own
+// properties are read-only, and only the walk knows where the file sat.
+const _dropPaths = new WeakMap();
+
+// How many unreadable items a report names; the count covers all of them.
+const _UNREADABLE_EXAMPLES = 5;
+
+/**
+ * The path a dropped file had inside the drop, such as `/holiday/x.png`, or
+ * `""` for a file that did not come from a folder walk (a file picker, or a
+ * browser without the entries API). The import sends it with the file so a
+ * caption only tags the picture in its own folder.
+ *
+ * @param {File} file
+ * @returns {string}
+ */
+export function importRelativePath(file) {
+  return (file && _dropPaths.get(file)) || "";
+}
+
 function _fileDedupKey(file) {
-  const name = file?.name || "";
+  // A walked file is told apart by its place in the drop, so `a/x.png` and
+  // `b/x.png` are both kept. The leading `/` is dropped so a top-level file
+  // the drop also lists as `dataTransfer.files` still counts once.
+  const name = importRelativePath(file).replace(/^\/+/, "") || file?.name || "";
   const size = Number.isFinite(file?.size) ? file.size : 0;
   const lastModified = Number.isFinite(file?.lastModified)
     ? file.lastModified
@@ -195,51 +220,117 @@ function _addIfSupportedFile(file, uniqueMap, accept) {
   }
 }
 
+/**
+ * Note one item the walk could not read, and log why.
+ *
+ * @param {{count: number, examples: string[]}} unreadable - the drop's tally.
+ * @param {object} entry - the file or folder entry that failed.
+ * @param {*} error - what the browser reported.
+ */
+function _noteUnreadable(unreadable, entry, error) {
+  const path = entry?.fullPath || entry?.name || "";
+  unreadable.count += 1;
+  if (unreadable.examples.length < _UNREADABLE_EXAMPLES) {
+    unreadable.examples.push(path);
+  }
+  console.warn("Skipping a dropped item that could not be read:", path, error);
+}
+
+/**
+ * Every entry a folder lists, batch by batch. Settles on an error too, with
+ * the entries listed before it, so one unreadable folder cannot stall the drop.
+ *
+ * @returns {Promise<{entries: object[], error: *}>} `error` is null when the
+ *   whole listing was read.
+ */
 function _readAllWebkitDirectoryEntries(reader) {
   return new Promise((resolve) => {
     const entries = [];
     const readBatch = () => {
-      reader.readEntries((batch) => {
-        if (!batch || batch.length === 0) {
-          resolve(entries);
-          return;
-        }
-        entries.push(...batch);
-        readBatch();
-      });
+      try {
+        reader.readEntries(
+          (batch) => {
+            if (!batch || batch.length === 0) {
+              resolve({ entries, error: null });
+              return;
+            }
+            entries.push(...batch);
+            readBatch();
+          },
+          (error) => resolve({ entries, error }),
+        );
+      } catch (error) {
+        resolve({ entries, error });
+      }
     };
     readBatch();
   });
 }
 
-async function _collectFromWebkitEntry(entry, uniqueMap, accept) {
+async function _collectFromWebkitEntry(entry, uniqueMap, accept, unreadable) {
   if (!entry) return;
   if (entry.isFile) {
     await new Promise((resolve) => {
       entry.file(
         (file) => {
+          if (entry.fullPath) _dropPaths.set(file, entry.fullPath);
           _addIfSupportedFile(file, uniqueMap, accept);
           resolve();
         },
-        () => resolve(),
+        (error) => {
+          _noteUnreadable(unreadable, entry, error);
+          resolve();
+        },
       );
     });
     return;
   }
   if (!entry.isDirectory) return;
+  let listing;
   try {
-    const reader = entry.createReader();
-    const entries = await _readAllWebkitDirectoryEntries(reader);
-    for (const child of entries) {
-      await _collectFromWebkitEntry(child, uniqueMap, accept);
-    }
-  } catch {
-    // Ignore directory traversal errors and continue with other items.
+    listing = await _readAllWebkitDirectoryEntries(entry.createReader());
+  } catch (error) {
+    _noteUnreadable(unreadable, entry, error);
+    return;
   }
+  // A folder whose listing failed part-way still gives up what it listed.
+  if (listing.error) _noteUnreadable(unreadable, entry, listing.error);
+  for (const child of listing.entries) {
+    await _collectFromWebkitEntry(child, uniqueMap, accept, unreadable);
+  }
+}
+
+// Drops already warned about. The window's drop handler and the element under
+// the pointer can both walk one drop; the user hears about it once.
+const _reportedDrops = new WeakSet();
+
+/**
+ * An `onUnreadable` for `extractSupportedImportFilesFromDataTransfer` that
+ * shows one warning for the drop, however many handlers walk it.
+ *
+ * @param {DataTransfer} dataTransfer - the drop being walked.
+ * @returns {(report: {count: number, examples: string[]}) => void}
+ */
+export function unreadableDropReporter(dataTransfer) {
+  return ({ count }) => {
+    if (dataTransfer && typeof dataTransfer === "object") {
+      if (_reportedDrops.has(dataTransfer)) return;
+      _reportedDrops.add(dataTransfer);
+    }
+    useNoticeStore().warning(
+      count === 1
+        ? "1 item could not be read and was skipped"
+        : `${count} items could not be read and were skipped`,
+      { key: "import-unreadable-items" },
+    );
+  };
 }
 
 /**
  * Every file in a drop that `accept` wants, directories walked.
+ *
+ * A file found by walking a folder carries its path in the drop, read with
+ * `importRelativePath`.
  *
  * @param {DataTransfer} dataTransfer - the drop's payload.
  * @param {object} [options]
@@ -248,10 +339,16 @@ async function _collectFromWebkitEntry(entry, uniqueMap, accept) {
  *   out of the same drop must widen this and split the result itself rather
  *   than call twice: the walk is destructive on Safari, which empties the
  *   DataTransfer on the first `await`, so a second pass returns nothing.
+ * @param {(report: {count: number, examples: string[]}) => void}
+ *   [options.onUnreadable] - called once, after the walk, when any file or
+ *   folder could not be read: how many, and up to five of their paths. The
+ *   readable files are still returned. `unreadableDropReporter` makes one that
+ *   warns the user.
+ * @returns {Promise<File[]>}
  */
 export async function extractSupportedImportFilesFromDataTransfer(
   dataTransfer,
-  { accept = isSupportedImportFile } = {},
+  { accept = isSupportedImportFile, onUnreadable } = {},
 ) {
   if (!dataTransfer) return [];
   // A drag-out dropped back onto the window carries PixlStash's own share
@@ -297,8 +394,9 @@ export async function extractSupportedImportFilesFromDataTransfer(
   // --- All synchronous DataTransfer access is done. Now we can safely await.
   // ---
 
+  const unreadable = { count: 0, examples: [] };
   for (const entry of webkitEntries) {
-    await _collectFromWebkitEntry(entry, unique, accept);
+    await _collectFromWebkitEntry(entry, unique, accept, unreadable);
   }
 
   for (const file of fallbackFiles) {
@@ -309,6 +407,7 @@ export async function extractSupportedImportFilesFromDataTransfer(
     _addIfSupportedFile(file, unique, accept);
   }
 
+  if (unreadable.count > 0 && onUnreadable) onUnreadable(unreadable);
   return Array.from(unique.values());
 }
 

@@ -2550,7 +2550,25 @@ Header Field*) names the batch: a Structured Field string, normally quoted
 per batch and sent unchanged on every retry of it. The key is scoped to the
 staging session and forgotten when the session is reaped; there is no other
 expiry. The server fingerprints the batch from each part's `key` field,
-filename and size, in order. Without the header every request stages its files.
+filename, size and folder label (below), in order, so the same files regrouped
+into other folders under a reused key are a mismatch. Without the header every
+request stages its files.
+
+**Where each file sat: `relpath`.** An optional `relpath` form field per `file`
+part, in the same order, holds the path the drop gave the file (the entries
+API's `fullPath`, `/holiday/beach/x.png`); a part with no place in a drop (a
+picked file) sends `""`, and a request may leave the field out. The server
+keeps only the folder, `holiday/beach`, as a label: leading `/` removed, `//`
+and `./` tidied, a backslash read as part of a name. A caption `.txt` pairs
+with the media of the same basename stem **in the same folder**, so `a/x.txt`
+tags only `a/x.png`, and a caption at the top of the drop pairs only with media
+at the top. A zip's members add their folder inside the archive to the zip's
+own. The label is never joined to a filesystem path, opened, or written to the
+database: every
+staged file is written under the session's staging folder with a fresh uuid
+name, whatever `relpath` said. The one-shot `POST /pictures/import` takes no
+`relpath`: its loose files count as the top of the drop, and a zip's members
+pair within their folders inside the archive.
 
 | Situation | Status | Body |
 |---|---|---|
@@ -2559,6 +2577,7 @@ filename and size, in order. Without the header every request stages its files.
 | Retry while the first attempt is still being received | 409 | `{code: "batch_in_progress", message}` |
 | The key was used for different parts | 422 | `{code: "idempotency_key_mismatch", message}` |
 | Malformed key | 400 | `{code: "invalid_idempotency_key", message}` |
+| A `relpath` has a `..` segment or a NUL, or is over 4,096 characters | 400 | `{code: "invalid_relpath", message}`; nothing of the batch is written |
 | Session cancelled, committing or committed, including during this upload | 409 | `{code: "staging_closed", message, stage, task_id}` |
 | The batch would take the session past 50,000 files | 413 | `{code: "staging_file_limit", message, limit, staged}` |
 | The library volume filled up while writing | 507 | `{code: "insufficient_storage", message, free_bytes}` (`free_bytes` is `null` when unreadable) |

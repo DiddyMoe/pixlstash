@@ -113,7 +113,8 @@ class PictureImportTask(BaseTask):
             operation and announces it, which needs more than the database.
         _db: The application ``VaultDatabase``.
         _staged_files: List of ``{"file_path", "original_file_name"}`` staged
-            entries to ingest.
+            entries to ingest. An entry may also carry ``client_key`` and
+            ``sidecar_folder``, the folder label its captions are matched in.
         _project_id: Optional project the imported pictures are added to.
         _staging_id: The staging-session id (carried into the result/logs).
         _staging_dir: Absolute path of the staging directory to remove when done.
@@ -137,7 +138,7 @@ class PictureImportTask(BaseTask):
         project_id: Optional[int] = None,
         set_id: Optional[int] = None,
         character_id: Optional[int] = None,
-        sidecar_tags_by_stem: Optional[dict[str, list[str]]] = None,
+        sidecar_tags_by_key: Optional[dict[tuple[str, str], list[str]]] = None,
         staging_id: str,
         staging_dir: Optional[str] = None,
         origin_client_id: Optional[str] = None,
@@ -156,9 +157,11 @@ class PictureImportTask(BaseTask):
             character_id: Optional character id every imported picture is
                 associated with (a drop-to-character target; deferred via
                 ``Picture.pending_character_id`` until face extraction runs).
-            sidecar_tags_by_stem: Optional map of ``basename stem -> [tags]``
-                parsed from ``.txt`` caption sidecars, applied to the matching
-                imported picture (mirrors the one-shot import).
+            sidecar_tags_by_key: Optional map of ``(folder, basename stem) ->
+                [tags]`` parsed from ``.txt`` caption sidecars, applied to the
+                imported picture with that stem whose staged entry has that
+                ``sidecar_folder`` (``""`` when it has none). Mirrors the
+                one-shot import.
             staging_id: The staging-session id this task finishes.
             staging_dir: Absolute path of the staging directory to remove on
                 completion (best-effort cleanup).
@@ -187,7 +190,7 @@ class PictureImportTask(BaseTask):
         self._project_id = project_id
         self._set_id = set_id
         self._character_id = character_id
-        self._sidecar_tags_by_stem = sidecar_tags_by_stem or {}
+        self._sidecar_tags_by_key = sidecar_tags_by_key or {}
         self._staging_id = staging_id
         self._staging_dir = staging_dir
         self._origin_client_id = origin_client_id
@@ -466,7 +469,9 @@ class PictureImportTask(BaseTask):
         """
         fingerprints = [fp for _entry, fp in batch if fp is not None]
         decided: list[tuple[dict, str, Optional[int]]] = []
-        new_pictures: list[Picture] = []
+        # Each new picture with the staged entry it came from, whose folder
+        # its caption is matched in.
+        new_pictures: list[tuple[Picture, dict]] = []
         with import_dedup_service.serialised_import():
             live: dict = {}
             scrapheaped: dict = {}
@@ -496,7 +501,7 @@ class PictureImportTask(BaseTask):
                     entry, fingerprint, match, tally, subfolder
                 )
                 if pic is not None:
-                    new_pictures.append(pic)
+                    new_pictures.append((pic, entry))
                 decided.append((entry, outcome, picture_id))
                 self._processed_count += 1
 
@@ -504,18 +509,23 @@ class PictureImportTask(BaseTask):
             imported_ids: list[int] = []
             if new_pictures:
                 tally.built_count += len(new_pictures)
-                sidecar_tags_by_stem = self._sidecar_tags_by_stem
+                sidecar_tags_by_key = self._sidecar_tags_by_key
 
-                def insert_pictures(session: Session, pictures: list[Picture]):
-                    session.add_all(pictures)
+                def insert_pictures(
+                    session: Session, pictures: list[tuple[Picture, dict]]
+                ):
+                    session.add_all([pic for pic, _entry in pictures])
                     session.flush()
-                    for pic in pictures:
-                        # Apply sidecar caption tags when the picture matches
-                        # one by basename stem; otherwise seed the pending
-                        # sentinel so the tagger picks it up (mirrors
-                        # WatchFolderImportTask).
-                        tags = sidecar_tags_by_stem.get(
-                            _sidecar_stem(pic.original_file_name or "")
+                    for pic, entry in pictures:
+                        # Apply sidecar caption tags when a caption in the
+                        # picture's own folder has its basename stem; otherwise
+                        # seed the pending sentinel so the tagger picks it up
+                        # (mirrors WatchFolderImportTask).
+                        tags = sidecar_tags_by_key.get(
+                            (
+                                entry.get("sidecar_folder", ""),
+                                _sidecar_stem(pic.original_file_name or ""),
+                            )
                         )
                         if tags:
                             for tag_str in tags:
@@ -527,7 +537,7 @@ class PictureImportTask(BaseTask):
                     # The flush assigned the ids. Read them before the commit
                     # so nothing after it can fail an insert that is already
                     # in the library.
-                    ids = [pic.id for pic in pictures]
+                    ids = [pic.id for pic, _entry in pictures]
                     session.commit()
                     return ids
 

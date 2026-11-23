@@ -69,6 +69,36 @@ describe("api/pictureImport: resending a batch", () => {
   });
 });
 
+describe("api/pictureImport: where each file sat in the drop", () => {
+  it("sends one relpath per file, in file order", async () => {
+    apiClient.post.mockResolvedValue({ data: { staged: 3 } });
+    await stageFiles({
+      backendUrl: "/be",
+      stagingId: "s1",
+      files: [
+        new File(["x"], "x.png"),
+        new File(["x"], "x.png"),
+        new File(["x"], "y.png"),
+      ],
+      relpaths: ["/a/x.png", "/b/x.png", ""],
+    });
+    const form = apiClient.post.mock.calls[0][1];
+    expect(form.getAll("relpath")).toEqual(["/a/x.png", "/b/x.png", ""]);
+    expect(form.getAll("file")).toHaveLength(3);
+  });
+
+  it("sends an empty relpath for each file the caller has no path for", async () => {
+    apiClient.post.mockResolvedValue({ data: { staged: 2 } });
+    await stageFiles({
+      backendUrl: "/be",
+      stagingId: "s1",
+      files: [new File(["x"], "a.png"), new File(["x"], "b.png")],
+    });
+    const form = apiClient.post.mock.calls[0][1];
+    expect(form.getAll("relpath")).toEqual(["", ""]);
+  });
+});
+
 describe("api/pictureImport: what the server is doing", () => {
   it("passes the importer's phase through, null once it is over", async () => {
     apiClient.get.mockResolvedValueOnce({

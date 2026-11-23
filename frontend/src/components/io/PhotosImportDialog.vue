@@ -4,6 +4,7 @@ import {
   extractSupportedImportFilesFromDataTransfer,
   isSupportedImportFile,
   IMPORT_FILE_ACCEPT,
+  unreadableDropReporter,
 } from "../../utils/media.js";
 import { listProjects } from "../../api/projects.js";
 import ProjectEditor from "../editors/ProjectEditor.vue";
@@ -96,7 +97,9 @@ function getSupportedFiles(fileList) {
 
 async function getSupportedFilesFromDataTransfer(dataTransfer) {
   if (!dataTransfer) return [];
-  return extractSupportedImportFilesFromDataTransfer(dataTransfer);
+  return extractSupportedImportFilesFromDataTransfer(dataTransfer, {
+    onUnreadable: unreadableDropReporter(dataTransfer),
+  });
 }
 
 function openLocalPicker() {

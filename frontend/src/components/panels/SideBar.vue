@@ -75,6 +75,7 @@ import {
   isInternalImageDrag,
   isPictureDrag,
   readInternalDragPayload,
+  unreadableDropReporter,
 } from "../../utils/media.js";
 import {
   PROJECT_VIEW_MODE,
@@ -4100,6 +4101,7 @@ async function handleDropOnSet(setId, event) {
   ) {
     const files = await extractSupportedImportFilesFromDataTransfer(
       event.dataTransfer,
+      { onUnreadable: unreadableDropReporter(event.dataTransfer) },
     );
     if (!files.length) return;
     // Thread the drop target into the staging session so the backend associates
@@ -4221,6 +4223,7 @@ async function onCharacterDrop(characterId, event) {
   ) {
     const files = await extractSupportedImportFilesFromDataTransfer(
       event.dataTransfer,
+      { onUnreadable: unreadableDropReporter(event.dataTransfer) },
     );
     if (!files.length) return;
     // Thread the drop target into the staging session so the backend associates
