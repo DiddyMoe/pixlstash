@@ -20,6 +20,7 @@ likeness worker cannot write rows underneath the assertions.
 
 import gc
 import json
+import logging
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -1081,7 +1082,13 @@ def test_auto_stack_defaults_to_a_dry_run():
 def test_auto_stack_applies_under_one_batch_id():
     temp_dir, client, server, ids, _token, _set_id = _env()
     try:
-        response = client.post(AUTO_STACK_URL, json={"dry_run": False})
+        # The exact body the duplicate queue sends to apply (``api/dedup.js``
+        # ``autoStackExact``), so a request-model change that refuses the real
+        # client fails here rather than in the user's dialog.
+        response = client.post(
+            AUTO_STACK_URL,
+            json={"scope": {"scope_type": "global"}, "dry_run": False},
+        )
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["dry_run"] is False
@@ -1206,7 +1213,16 @@ def test_every_candidate_carries_a_thumbnail_cache_version():
 def test_the_auto_stack_dry_run_carries_the_consent_aggregates():
     temp_dir, client, server, _ids, _token, _set_id = _env()
     try:
-        body = client.post(AUTO_STACK_URL, json={}).json()
+        # The exact body the Auto-stack dialog sends for its preview. An empty
+        # body would only exercise the server's defaults (pinned separately by
+        # ``test_auto_stack_defaults_to_a_dry_run``) and leave the real
+        # client's payload with no contract test.
+        response = client.post(
+            AUTO_STACK_URL,
+            json={"scope": {"scope_type": "global"}, "dry_run": True},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
         summary = body["dry_run_summary"]
         assert summary["groups"] == body["groups"] == 1
         assert summary["pictures"] == body["pictures"] == 2
@@ -1214,6 +1230,38 @@ def test_the_auto_stack_dry_run_carries_the_consent_aggregates():
         # The seeded cover carries the only tag and the only score, so it gains
         # nothing from the union.
         assert summary["covers_gaining_metadata"] == 0
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_a_refused_auto_stack_request_is_logged_without_its_input(caplog):
+    """A 422 leaves a server log line naming the route and the refused field.
+
+    Without it a refused preview left no trace at all: the client showed a
+    generic failure and the server log was silent. The line carries where and
+    why only, never the submitted value, which for another route could be a
+    password or a token.
+    """
+    temp_dir, client, server, _ids, _token, _set_id = _env()
+    try:
+        with caplog.at_level(logging.WARNING, logger="pixlstash.server"):
+            response = client.post(
+                AUTO_STACK_URL,
+                json={"scope": {"scope_type": "global"}, "dry_run": "fake-maybe"},
+            )
+        assert response.status_code == 422, response.text
+        lines = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "pixlstash.server"
+            and record.levelno == logging.WARNING
+            and "Request validation failed" in record.getMessage()
+        ]
+        assert len(lines) == 1, caplog.text
+        assert "POST /api/v1/dedup/auto-stack" in lines[0]
+        assert "dry_run" in lines[0]
+        assert "bool_parsing" in lines[0]
+        assert "fake-maybe" not in caplog.text
     finally:
         _teardown(temp_dir, server)
 

@@ -7172,10 +7172,20 @@ from offering a Stack the verdict would refuse:
   group at once, so at 30,140 exact groups its group, picture and tag queries
   each bound tens of thousands of parameters and died with `too many SQL
   variables`; all three now scope through `scope_id_subquery`
-  (`utils/service/scope_table.py`), which binds none. The three scopes carry
-  **distinct temp-table names** because they are live at the same time and the
-  picture scope is read again after the stack scope is materialised, so a shared
-  name would clobber it and return wrong counts rather than raising. Separately,
+  (`utils/service/scope_table.py`), which binds none. The four scopes (groups,
+  members, pictures, stacks) carry **distinct temp-table names** because they
+  are live at the same time and the picture scope is read again after the stack
+  scope is materialised, so a shared name would clobber it and return wrong
+  counts rather than raising. **The member read is two indexed reads, never a
+  join to `picture`** (2026-11-22): the planned groups' members through
+  `ix_dedupgroupmember_group_id`, then which of them are live through the member
+  scope. Joined in one statement, SQLite (no `ANALYZE` statistics) drove the
+  join from `picture` through `ix_picture_deleted` and probed every live picture
+  once per group, so the preview grew with library size times group count: 87 s
+  at 8,000 groups on a synthetic library, past the client's 60 s timeout,
+  against 0.4 s now. The members come back **ordered by `position`**, the order
+  `_load_group` reads a group in, because the cover fallback takes the first
+  live member and it must be the one the run makes the cover. Separately,
   `bulk_auto_stack` sends `dry_run=true` to `run_immediate_read_task`, **not**
   the serialised writer queue: the preview returns before minting a batch id and
   writes nothing, but on the writer it held the single write thread for its whole

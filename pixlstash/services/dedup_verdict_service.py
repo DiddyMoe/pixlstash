@@ -620,7 +620,7 @@ def _dry_run_summary_in_session(
     # a real library plans tens of thousands of groups and hundreds of thousands
     # of members. One bound parameter per id blows SQLite's
     # ``SQLITE_MAX_VARIABLE_NUMBER`` and the preview dies with "too many SQL
-    # variables" (#751, reported at 30,140 exact groups). The three scopes below
+    # variables" (#751, reported at 30,140 exact groups). The four scopes below
     # carry DISTINCT names on purpose: they are live at the same time and the
     # picture scope is read again *after* the stack scope is materialised, so a
     # shared name would clobber it and silently return wrong counts rather than
@@ -630,16 +630,37 @@ def _dry_run_summary_in_session(
         [int(group.id) for group in groups],
         name="_pixlstash_dry_run_group_ids",
     )
-    members_by_group: dict[int, list[int]] = defaultdict(list)
-    for group_id, picture_id in session.exec(
+    # Members first, then which of them are live: two indexed reads. Joined to
+    # ``picture`` in one statement, SQLite (no ANALYZE statistics) drives the
+    # join from ``picture`` through ``ix_picture_deleted`` and probes every live
+    # picture once per planned group, which grows with library size times group
+    # count and outlasted the client's timeout on a library with thousands of
+    # groups. Ordered by ``position`` because that is the order the run reads a
+    # group in (:func:`_load_group`): the cover fallback below takes the first
+    # member, and it has to be the one the run would make the cover.
+    member_rows = session.exec(
         select(DedupGroupMember.group_id, DedupGroupMember.picture_id)
-        .join(Picture, Picture.id == DedupGroupMember.picture_id)
-        .where(
-            DedupGroupMember.group_id.in_(group_scope),
-            Picture.deleted.is_(False),
-        )
-    ).all():
-        members_by_group[int(group_id)].append(int(picture_id))
+        .where(DedupGroupMember.group_id.in_(group_scope))
+        .order_by(DedupGroupMember.group_id, DedupGroupMember.position)
+    ).all()
+    member_scope = scope_id_subquery(
+        session,
+        (int(picture_id) for _group_id, picture_id in member_rows),
+        name="_pixlstash_dry_run_member_ids",
+    )
+    live_ids = {
+        int(picture_id)
+        for picture_id in session.exec(
+            select(Picture.id).where(
+                Picture.id.in_(member_scope),
+                Picture.deleted.is_(False),
+            )
+        ).all()
+    }
+    members_by_group: dict[int, list[int]] = defaultdict(list)
+    for group_id, picture_id in member_rows:
+        if int(picture_id) in live_ids:
+            members_by_group[int(group_id)].append(int(picture_id))
 
     # Frozen members are dropped from every figure below: the real run skips
     # them, so counting them would make the consent dialog promise pictures that

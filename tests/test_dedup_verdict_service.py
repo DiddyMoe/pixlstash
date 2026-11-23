@@ -2320,7 +2320,10 @@ def test_the_dry_run_still_counts_a_cover_that_gains_from_an_unfrozen_twin(serve
             # The stored preselection is the frozen one, so the preview has to
             # move the cover exactly as the real run does.
             {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 4.9},
-            {"pixel_sha": "aaa", "size_bytes": 100},
+            # Ranked second on smart score, so the run moves the cover here. A
+            # tag also ranks a member up, so the tagged twin must not outrank
+            # it, or the moved cover would already carry the tag.
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 4.0},
             {"pixel_sha": "aaa", "size_bytes": 100, "tags": ["sunset"]},
         ],
     )
@@ -2332,6 +2335,10 @@ def test_the_dry_run_still_counts_a_cover_that_gains_from_an_unfrozen_twin(serve
     ]
     assert summary["pictures"] == 2
     assert summary["covers_gaining_tags"] == 1
+
+    _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    # The run did move the cover to the untagged twin the preview counted.
+    assert _picture(server, ids[1]).stack_position == 0
 
 
 # ── the batched lock lookup refuses to guess ──────────────────────────────────
@@ -2869,3 +2876,143 @@ def test_the_dry_run_does_not_occupy_the_writer_queue(server):
         assert "bulk_auto_stack_in_session" in writer_calls
     finally:
         server.vault.db.run_task = real_run_task
+
+
+# ── the preview's member read ─────────────────────────────────────────────────
+
+
+def _picture_walks(plan: list[str]) -> list[str]:
+    """The plan lines that visit every live picture rather than named ones.
+
+    ``picture`` reached through ``ix_picture_deleted`` on ``deleted`` alone, or
+    scanned outright, costs the whole library; reached by ``rowid`` it costs the
+    pictures asked for.
+    """
+    return [
+        line
+        for line in plan
+        if line.startswith("SCAN picture")
+        or (line.startswith("SEARCH picture") and line.endswith("(deleted=?)"))
+    ]
+
+
+def test_the_dry_run_reads_members_through_their_group_not_the_library(server):
+    """The preview's member read must cost the groups, not the library.
+
+    Joined to ``picture`` in one statement, SQLite (this database never runs
+    ``ANALYZE``) drove the read from ``picture`` and probed every live picture
+    once per planned group, so a library with thousands of groups outlasted the
+    client's timeout. The plan does not depend on the row counts, so a small
+    library shows it: every statement the summary runs over its own scopes is
+    explained on its own connection, while those scopes exist.
+    """
+    specs = []
+    for index in range(3):
+        specs.extend(
+            [
+                {"pixel_sha": f"sha{index}", "size_bytes": 100 + index},
+                {"pixel_sha": f"sha{index}", "size_bytes": 100 + index},
+            ]
+        )
+    _seed(server, specs)
+    _scan(server)
+
+    engine = server.vault.db._engine
+    plans: list[list[str]] = []
+
+    def explain(_conn, cursor, statement, parameters, _context, executemany):
+        collapsed = " ".join(statement.split()).lower()
+        if executemany or not collapsed.startswith("select"):
+            return
+        if "_pixlstash_dry_run_" not in collapsed:
+            return
+        rows = cursor.connection.execute(
+            "EXPLAIN QUERY PLAN " + statement, parameters
+        ).fetchall()
+        plans.append([str(row[-1]) for row in rows])
+
+    event.listen(engine, "after_cursor_execute", explain)
+    try:
+        report = _run(
+            server, verdicts.bulk_auto_stack_in_session, None, None, True, None
+        )
+    finally:
+        event.remove(engine, "after_cursor_execute", explain)
+
+    assert report["dry_run_summary"]["groups"] == 3
+    assert plans, "the summary ran no statement over its scopes"
+    # Members are found through their group's index...
+    assert any(
+        line.startswith("SEARCH dedupgroupmember") and line.endswith("(group_id=?)")
+        for plan in plans
+        for line in plan
+    ), plans
+    # ...and no statement walks the library to find them.
+    assert [walk for plan in plans for walk in _picture_walks(plan)] == [], plans
+
+
+def test_the_dry_run_leaves_out_a_member_scrapheaped_after_the_scan(server):
+    """A member deleted since the scan is neither promised nor a source of tags.
+
+    The scan wrote three members; the run reads only the live ones
+    (:func:`verdicts._load_group`), so the preview must too.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 4.9},
+            {"pixel_sha": "aaa", "size_bytes": 100},
+            {"pixel_sha": "aaa", "size_bytes": 100, "tags": ["fake-portrait"]},
+        ],
+    )
+    _scan(server)
+
+    def scrapheap(session):
+        picture = session.get(Picture, ids[2])
+        picture.deleted = True
+        session.add(picture)
+        session.commit()
+
+    _run(server, scrapheap)
+
+    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    summary = report["dry_run_summary"]
+    assert summary["groups"] == 1
+    assert summary["pictures"] == 2
+    assert summary["covers_gaining_tags"] == 0
+
+
+def test_the_dry_run_moves_a_frozen_cover_where_the_run_moves_it(server):
+    """The preview's fallback cover is the member the run makes the cover.
+
+    The stored preselection is frozen, so both fall back to the first stackable
+    member. The run reads a group in ``position`` (ranking) order; the preview
+    read it in whatever order its join produced, which for these ids put the
+    starred twin first and promised no score lift where the run makes one.
+    """
+    ids = _seed(
+        server,
+        [
+            # Ranked first, so the scan preselects it; then frozen.
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 4.9},
+            # Ranked last on smart score, but the only one the owner starred.
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 1.0, "score": 5},
+            # Ranked second: the run's fallback cover, with nothing starred.
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 3.0},
+        ],
+    )
+    _lock_set(server, "Frozen", [ids[0]])
+    _scan(server)
+
+    summary = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)[
+        "dry_run_summary"
+    ]
+    assert summary["pictures"] == 2
+    # The run's cover (ids[2]) gains the twin's star.
+    assert summary["covers_gaining_score"] == 1
+
+    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    assert report["dry_run"] is False
+    # The run did put ids[2] in front, so the preview described this run.
+    assert _picture(server, ids[2]).stack_position == 0
+    assert _picture(server, ids[1]).stack_position != 0
