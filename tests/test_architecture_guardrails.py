@@ -3115,7 +3115,16 @@ _PRIVATE_ADDRESS_FLAT_DIRS = (".", "frontend")
 # docs/reviews/ is gitignored and machine-local, so a fresh checkout is not
 # guaranteed to have it and nothing CI-enforced may read it (CLAUDE.md, and
 # the same rule that keeps the authz coverage matrix in docs/ proper).
-_PRIVATE_ADDRESS_SKIP = ("docs/reviews",)
+# The electron/ entries are build outputs, gitignored in electron/.gitignore: a
+# local build bundles a Python interpreter and its third-party site-packages
+# there, and nothing in them can be pushed.
+_PRIVATE_ADDRESS_SKIP = (
+    "docs/reviews",
+    "electron/dist/",
+    "electron/dist-test/",
+    "electron/release/",
+    "electron/resources/",
+)
 _PRIVATE_ADDRESS_SUFFIXES = frozenset(
     {
         ".cfg",
