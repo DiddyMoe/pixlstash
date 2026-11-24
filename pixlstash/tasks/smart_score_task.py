@@ -1,7 +1,7 @@
 import logging
 import time
 
-from sqlalchemy import bindparam, desc, func, update
+from sqlalchemy import bindparam, case, func, update
 from sqlalchemy.orm import load_only
 from sqlmodel import Session, select
 
@@ -366,6 +366,26 @@ class SmartScoreTask(BaseTask):
         if isinstance(result, (tuple, list)):
             return result[0]
         return result or 0
+
+    @classmethod
+    def count_progress(cls, session: Session) -> tuple[int, int]:
+        """Return ``(scorable, remaining)`` for the Tasks panel, in one pass.
+
+        *scorable* is every picture the scorer can work on (it has an embedding
+        and is not deleted), and *remaining* the share of those still without a
+        score, the same population :meth:`count_remaining` counts. Against the
+        whole library's picture count the row could only ever read "N / N".
+        """
+        scorable, remaining = session.exec(
+            select(
+                func.count(),
+                func.count(case((Picture.smart_score.is_(None), 1))),
+            )
+            .select_from(Picture)
+            .where(Picture.image_embedding.is_not(None))
+            .where(Picture.deleted.is_(False))
+        ).one()
+        return int(scorable or 0), int(remaining or 0)
 
     @staticmethod
     def find_pictures_missing_smart_score(session: Session, limit: int) -> list:

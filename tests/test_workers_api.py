@@ -7,7 +7,9 @@ import tempfile
 import types
 
 from fastapi.testclient import TestClient
+from sqlmodel import Session
 
+from pixlstash.db_models import Picture
 from pixlstash.server import Server
 from pixlstash.resources.ledger import Ledger
 from pixlstash.services import config_service
@@ -136,6 +138,89 @@ def test_checkpoint_hash_does_not_report_the_picture_library_as_its_progress(
         # the honest answer is zero - never the picture library's total.
         assert snapshot["total"] == 0
         assert snapshot["current"] == 0
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_smart_score_progress_counts_what_is_left_to_score(monkeypatch):
+    """The Smart score row counts scorable pictures and the ones still unscored.
+
+    It used to fall through to `planner_managed`, so a full re-score of the
+    library read "N / N" from start to finish. The sentinel picture count is
+    what tells the branches apart, as in the Checkpoint Hash test above.
+    """
+    temp_dir, _client, server = _setup()
+    try:
+        # Nothing may score or embed these between the insert and the read.
+        server.vault._work_planner.stop()
+        embedding = b"\x00" * 16
+
+        def _insert(session: Session):
+            session.add_all(
+                [
+                    Picture(file_path="/tmp/s1.png", image_embedding=embedding),
+                    Picture(file_path="/tmp/s2.png", image_embedding=embedding),
+                    Picture(
+                        file_path="/tmp/s3.png",
+                        image_embedding=embedding,
+                        smart_score=0.4,
+                    ),
+                    # Neither of these is the scorer's to work on.
+                    Picture(file_path="/tmp/s4.png"),
+                    Picture(
+                        file_path="/tmp/s5.png",
+                        image_embedding=embedding,
+                        deleted=True,
+                    ),
+                ]
+            )
+            session.commit()
+
+        server.vault.db.run_task(_insert)
+        monkeypatch.setattr(
+            server.vault, "_count_total_pictures", lambda _session: 4242
+        )
+
+        snapshot = server.vault.get_worker_progress()[TaskType.SMART_SCORE.value]
+
+        assert snapshot["label"] == "smart_scored"
+        assert (snapshot["total"], snapshot["current"], snapshot["remaining"]) == (
+            3,
+            1,
+            2,
+        )
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_a_worker_with_no_count_of_its_own_reports_none(monkeypatch):
+    """The generic branch must not lend a worker the library's picture total.
+
+    Lent, it rendered a running worker as "N / N", finished. The library is also
+    counted once per snapshot, not once per worker type.
+    """
+    temp_dir, _client, server = _setup()
+    try:
+        calls = []
+
+        def _sentinel(_session):
+            calls.append(1)
+            return 4242
+
+        monkeypatch.setattr(server.vault, "_count_total_pictures", _sentinel)
+
+        workers = server.vault.get_worker_progress()
+
+        generic = workers[TaskType.PIXEL_SHA.value]
+        assert generic["label"] == "planner_managed"
+        assert (generic["total"], generic["current"]) == (0, 0)
+        # The sentinel still reaches the picture-scoped rows.
+        assert workers[TaskType.QUALITY.value]["total"] == 4242
+        assert len(calls) == 1
     finally:
         server.close()
         temp_dir.cleanup()

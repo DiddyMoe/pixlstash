@@ -2313,13 +2313,17 @@ class Vault:
 
     def _build_worker_progress_snapshot(self) -> dict:
         progress = {}
+        # Counted once per snapshot. It used to be re-counted for every worker
+        # type (39 full counts per poll), although only the picture-scoped
+        # branches below read it.
+        library_total = int(
+            self.db.run_immediate_read_task(self._count_total_pictures) or 0
+        )
         for worker_type in TaskType.all():
             # When set by a branch below, this overrides the finder-based
             # activity check (used by user-triggered tasks that have no finder).
             worker_active_override = None
-            total = int(
-                self.db.run_immediate_read_task(self._count_total_pictures) or 0
-            )
+            total = library_total
             if worker_type == TaskType.DESCRIPTION:
                 missing = int(
                     self.db.run_immediate_read_task(self._count_missing_descriptions)
@@ -2581,6 +2585,15 @@ class Vault:
                     or 0
                 )
                 label = "orientations_read"
+            elif worker_type == TaskType.SMART_SCORE:
+                # Counted over the pictures the scorer can work on. Left in
+                # `planner_managed` below it read "N / N" from the first second
+                # of a full re-score to the last, so the row said the library
+                # was done while every picture in it was being scored again.
+                total, missing = self.db.run_immediate_read_task(
+                    SmartScoreTask.count_progress
+                ) or (0, 0)
+                label = "smart_scored"
             elif worker_type == TaskType.THUMBNAIL_GENERATION:
                 # Whole-frame bitmap regeneration (MissingThumbnailFinder). After
                 # the v1.8.0 upgrade this counted the entire library; a fresh
@@ -2590,6 +2603,12 @@ class Vault:
                 )
                 label = "thumbnails_generated"
             else:
+                # A worker with no count of its own reports none. Borrowing the
+                # library's picture total with nothing remaining rendered every
+                # such row as "N / N", finished, while it ran: the trap the
+                # Orientation, Checkpoint Hash, Workflow cards and Smart score
+                # rows each fell into before getting a count of their own.
+                total = 0
                 missing = 0
                 label = "planner_managed"
             worker_active = (
