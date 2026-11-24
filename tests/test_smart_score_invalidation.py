@@ -49,7 +49,7 @@ from pixlstash.utils.service.smart_score_invalidation import (
     invalidate_all_anomaly_scores,
     invalidate_for_penalised_tag_change,
 )
-from tests.utils import upload_pictures_and_wait
+from tests.utils import stop_planner_and_settle, upload_pictures_and_wait
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
 
@@ -192,9 +192,10 @@ def _set_smart_score(server, pic_id, value=0.5, with_embedding=True):
     """Give the picture a stored smart score (and an embedding so the finder sees it)."""
 
     # Uploads require live workers, but every caller below is about to inspect
-    # deliberately controlled intermediate score state. Stop the finder before
-    # making that state visible so it cannot claim the row between assertions.
-    server.vault._work_planner.stop()
+    # deliberately controlled intermediate score state. Stop the finders, and
+    # wait out the tasks they already handed off, before making that state
+    # visible so nothing claims or rewrites the row between assertions.
+    stop_planner_and_settle(server)
 
     def _apply(session):
         pic = session.get(Picture, pic_id)
@@ -344,7 +345,7 @@ def test_confirm_registers_origin_stamped_rescore_refresh():
     try:
         edited = _upload_picture(client, "Bad1.png")
         pending = _upload_picture(client, "Bad2.png")  # keeps the backfill in flight
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         _prepare_for_scoring(server, pending)  # embedding + NULL score
 
         _seed_prediction(server, edited, PENALISED_TAG, confidence=0.8)
@@ -1064,7 +1065,7 @@ def test_background_task_scores_and_honours_the_users_penalised_tags():
 
         # Drive the finder by hand: the live WorkPlanner would otherwise claim and score
         # the same picture concurrently, making the assertions below racy.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
 
         finder = server.vault._planner_work_finders[TaskType.SMART_SCORE]
         assert hasattr(finder, "_vault"), "finder must carry the vault for thresholds"
@@ -1273,7 +1274,7 @@ def test_interactive_edit_refreshes_card_without_waiting_for_backfill_drain():
         # A second unscored picture keeps the backfill in flight: count_remaining() > 0.
         pending = _upload_picture(client, "Bad2.png")
         # Stop the planner so no background task races us to score/consume.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         _prepare_for_scoring(server, pending)  # embedding + NULL score
 
         # The edited card is scored, then a user edit (tab "tab-a") NULLs and registers it.
@@ -1324,7 +1325,7 @@ def test_full_backfill_emits_once_at_drain_not_per_batch():
             _upload_picture(client, n)
             for n in ("Bad1.png", "Bad2.png", "Reference1.png")
         ]
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         for p in pics:
             _prepare_for_scoring(server, p)  # embedding + NULL score
 
@@ -1371,7 +1372,7 @@ def test_own_origin_edit_does_not_also_pill_on_drain():
     try:
         edited = _upload_picture(client, "Bad1.png")
         # Stop the planner so no background task races us; this edit is the only work.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
 
         # Score, then a real add-penalised-tag from tab "tab-a" NULLs and registers it.
         _set_smart_score(server, edited, 0.5)
@@ -1425,7 +1426,7 @@ def test_drain_still_fires_for_unregistered_ids_alongside_own_origin():
     try:
         edited = _upload_picture(client, "Bad1.png")  # registered under tab-a
         background = _upload_picture(client, "Bad2.png")  # never registered
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
 
         _set_smart_score(server, edited, 0.5)
         assert (
@@ -1474,7 +1475,7 @@ def test_cas_skipped_id_is_not_announced_and_stays_registered():
     try:
         persisted_pic = _upload_picture(client, "Bad1.png")
         skipped_pic = _upload_picture(client, "Bad2.png")
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         # Both registered interactive from the same tab.
         server.vault.interactive_rescore_registry.record(
             [persisted_pic, skipped_pic], "tab-x"
@@ -1531,7 +1532,7 @@ def test_over_cap_demoted_id_falls_back_to_bulk_drain_emit():
     try:
         recorded = _upload_picture(client, "Bad1.png")
         demoted = _upload_picture(client, "Bad2.png")
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
 
         # Shrink the cap so the second interactive id overflows and is demoted.
         server.vault.interactive_rescore_registry = InteractiveRescoreRegistry(
@@ -1589,7 +1590,7 @@ def test_persist_writes_batch_as_single_bulk_statement():
         # Stop the planner after upload (import needs its workers) but before scoring, so
         # no background SmartScoreTask races our manual persist and overwrites the
         # hand-set scores with a real recompute.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         for pid in pic_ids:
             _prepare_for_scoring(server, pid)
 
@@ -1639,8 +1640,10 @@ def test_persist_preserves_metadata_hash():
     try:
         pic_id = _upload_picture(client)
         # Stop the planner after upload (import needs its workers) but before scoring, so
-        # no background SmartScoreTask races our manual persist.
-        server.vault._work_planner.stop()
+        # no background SmartScoreTask races our manual persist. The settle matters here
+        # too: a ComfyUI extraction the upload queued rewrites ``metadata_hash`` itself,
+        # and landing between the two reads it failed this test on a slow run.
+        stop_planner_and_settle(server)
         _prepare_for_scoring(server, pic_id)
 
         h0 = server.vault.db.run_task(lambda s: s.get(Picture, pic_id).metadata_hash)
@@ -1671,7 +1674,7 @@ def test_persist_excludes_picture_deleted_mid_flight():
         pic_id = _upload_picture(client)
         # Stop the planner after upload (import needs its workers) but before scoring, so
         # no background SmartScoreTask races our manual persist.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         _prepare_for_scoring(server, pic_id)
         gone_id = 9_999_999  # never existed → stands in for a hard-deleted row
 
