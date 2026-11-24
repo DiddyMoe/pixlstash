@@ -208,10 +208,13 @@ def test_predictions_never_record_a_tag_removed_from_tagging(tmp_path):
 
 
 class _FakeDb:
-    """Minimal stand-in for the vault database `_load_pic` and marking need."""
+    """Minimal stand-in for the vault database `_load_pic`, the preload and
+    marking need."""
 
     def __init__(self, image_root, registry=None):
         self.image_root = image_root
+        # Nothing removed from tagging, so the preload builds quality crops.
+        self.tag_exclusions = frozenset()
         if registry is not None:
             self.unprocessable_images = registry
 
@@ -522,7 +525,9 @@ def test_removing_one_crop_tag_keeps_the_crop_pass(tmp_path):
     )._tag_pictures_batch()
 
     assert workflow.crop_scores_requested is not None
-    assert db.face_fetches == 1
+    # Once for the preload's crops, once by the crop pass, which checks the
+    # faces have not changed since.
+    assert db.face_fetches == 2
 
 
 class _FakeFace:

@@ -503,26 +503,39 @@ class TagTask(BaseTask):
             FACE_CROP_SCALE if workflow.whole_face_crop() else None,
         )
 
+    def _crop_pass_wanted(self) -> bool:
+        """Whether a quality crop could keep anything it finds.
+
+        True while one tag a crop can own is still allowed in tagging. With
+        every one removed, all a crop finds would be dropped at the write, so
+        the face lookup and the crop model are skipped, in the preload as in
+        the batch.
+        """
+        excluded = self._db.tag_exclusions
+        return any(set(tags) - excluded for tags in CROP_TAGS_BY_KIND.values())
+
     def _preload_images(self, workflow: TaggingWorkflow | None = None) -> None:
         workflow = workflow or self._tagging_workflow
         preloaded = {}
         crops = {}
         key = self._crop_settings(workflow)
         _plugin, target, face_scale = key
-        try:
-            pic_ids = [p.id for p in self._pictures]
-            faces_by_pic = self._db.run_immediate_read_task(
-                lambda session: self._fetch_faces_for_pictures(session, pic_ids)
-            )
-        except Exception as exc:
-            # The batch builds the crops itself, reloading each original.
-            logger.warning(
-                "TagTask %s: could not read faces for the preload; the quality "
-                "crops will be built from a second decode: %s",
-                self.id,
-                exc,
-            )
-            faces_by_pic = None
+        faces_by_pic = None
+        # The batch skips the crop pass then: read no faces, cut no crops.
+        if self._crop_pass_wanted():
+            try:
+                pic_ids = [p.id for p in self._pictures]
+                faces_by_pic = self._db.run_immediate_read_task(
+                    lambda session: self._fetch_faces_for_pictures(session, pic_ids)
+                )
+            except Exception as exc:
+                # The batch builds the crops itself, reloading each original.
+                logger.warning(
+                    "TagTask %s: could not read faces for the preload; the "
+                    "quality crops will be built from a second decode: %s",
+                    self.id,
+                    exc,
+                )
 
         def _load_one(pic):
             if self._preload_cancel.is_set():
@@ -1120,11 +1133,7 @@ class TagTask(BaseTask):
                 # With every tag a crop can own removed from tagging, all it
                 # finds would be dropped at the write: skip the face lookup and
                 # the crop model. One permitted crop tag keeps the whole pass.
-                excluded = self._db.tag_exclusions
-                crop_wanted = any(
-                    set(tags) - excluded for tags in CROP_TAGS_BY_KIND.values()
-                )
-                crop_batch = batch if crop_wanted else []
+                crop_batch = batch if self._crop_pass_wanted() else []
                 try:
                     crop_fetch_start = time.perf_counter()
                     pic_ids = [p.id for p in crop_batch]
