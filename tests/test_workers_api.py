@@ -13,6 +13,7 @@ from pixlstash.db_models import Picture
 from pixlstash.server import Server
 from pixlstash.resources.ledger import Ledger
 from pixlstash.services import config_service
+from pixlstash.tasks.dedup_auto_stack_task import DedupAutoStackTask
 from pixlstash.tasks.dedup_scan_task import DedupScanTask
 from pixlstash.tasks.task_type import TaskType
 from tests.authz_guard import assert_real_route
@@ -116,6 +117,40 @@ def test_an_active_dedup_scan_never_reports_terminal_task_progress(monkeypatch):
         assert snapshot["current"] == 5
         assert snapshot["total"] == 6
         assert snapshot["remaining"] == 1
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_an_active_auto_stack_run_reports_its_own_groups_as_task_progress(
+    monkeypatch,
+):
+    """The Auto-stack row counts the run's groups, never the library's pictures,
+    and like the scan it holds back the last unit until the task has left the
+    runner's active set."""
+    temp_dir, _client, server = _setup()
+    try:
+        task = DedupAutoStackTask(server.vault, run_id=1)
+        task._set_progress(6, 6)
+        original = server.vault._task_runner.get_active_tasks_of_type
+
+        def active_tasks(task_type):
+            if task_type == "DedupAutoStackTask":
+                return [task]
+            return original(task_type)
+
+        monkeypatch.setattr(
+            server.vault._task_runner, "get_active_tasks_of_type", active_tasks
+        )
+        workers = server.vault.get_worker_progress()
+        snapshot = workers[TaskType.DEDUP_AUTO_STACK.value]
+        assert snapshot["label"] == "duplicate_auto_stack"
+        assert snapshot["active"] is True
+        assert snapshot["current"] == 5
+        assert snapshot["total"] == 6
+        assert snapshot["remaining"] == 1
+        assert workers[TaskType.DEDUP_SCAN.value]["active"] is False
     finally:
         server.close()
         temp_dir.cleanup()

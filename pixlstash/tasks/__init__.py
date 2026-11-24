@@ -48,6 +48,8 @@ from .orientation_task import OrientationTask
 from .missing_orientation_finder import MissingOrientationFinder
 from .dedup_scan_task import DedupScanTask
 from .dedup_scan_finder import DedupScanFinder
+from .dedup_auto_stack_task import DedupAutoStackTask
+from .dedup_auto_stack_finder import DedupAutoStackFinder
 
 __all__ = [
     "TaskType",
@@ -99,4 +101,6 @@ __all__ = [
     "MissingOrientationFinder",
     "DedupScanTask",
     "DedupScanFinder",
+    "DedupAutoStackTask",
+    "DedupAutoStackFinder",
 ]

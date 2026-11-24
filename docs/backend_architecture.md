@@ -435,7 +435,7 @@ Tests: `tests/test_smart_sets.py`.
 ### `dedup.py`
 The vault-wide near-duplicate sweep, **dry run only** (v1.9 Lane E). `GET /dedup/sweep/policy` returns the server's default confidence policy plus the bounds and closed vocabularies a client should build its controls from; `POST /dedup/sweep/dry-run` resolves every near-duplicate group in the vault under a supplied policy and returns the plan behind "N groups auto-collapse, M need review". Both are `owner_only` (a vault-wide aggregate cannot be narrowed to a share token's scope without leaking out-of-scope counts — the same reasoning as `tag_health`), and neither writes anything. All logic lives in [services/dedup_sweep_service.py](../pixlstash/services/dedup_sweep_service.py); the handlers only translate the request body into a `SweepPolicy` and serialise the `SweepReport`. Execution (applying a plan) and the auto-at-import policy are later work; the dry-run planner already accepts an optional `operation_batch_id` so a future apply step can correlate a plan with the operation-log batch that undoes it.
 
-The same module also serves the **v1.9 tiered Duplicates queue** — `GET /dedup/policy`, `GET /dedup/groups`, `POST /dedup/counts`, `POST /dedup/scan`, `POST /dedup/verdicts/{stack,keep-separate,reopen}` and `POST /dedup/auto-stack`. Every one of them is `owner_only` for the same reasoning plus, for the verdict routes, the fact that they mutate stacks across arbitrary pictures. Detection lives in [services/dedup_tier_service.py](../pixlstash/services/dedup_tier_service.py) and verdicts in [services/dedup_verdict_service.py](../pixlstash/services/dedup_verdict_service.py); the handlers only build a `TierPolicy` / `DedupScope` (a bad one is a 400, never a silent retune) and call a service wrapper. See §22 for the tiers, the hash decision, the bucket design, the cover formula and the verdict memory, and `docs/integration_architecture.md` §19 for the request/response contract.
+The same module also serves the **v1.9 tiered Duplicates queue** — `GET /dedup/policy`, `GET /dedup/groups`, `POST /dedup/counts`, `POST /dedup/scan`, `POST /dedup/verdicts/{stack,keep-separate,reopen}`, `POST /dedup/auto-stack` (the auto-stack preview) and the background auto-stack runs: `POST /dedup/auto-stack/runs`, `GET /dedup/auto-stack/runs/latest`, `GET /dedup/auto-stack/runs/{run_id}` and `POST /dedup/auto-stack/runs/{run_id}/{cancel,revert}`. Every one of them is `owner_only` for the same reasoning plus, for the verdict and run routes, the fact that they mutate stacks across arbitrary pictures. Detection lives in [services/dedup_tier_service.py](../pixlstash/services/dedup_tier_service.py), verdicts in [services/dedup_verdict_service.py](../pixlstash/services/dedup_verdict_service.py) and the auto-stack run record in [services/dedup_auto_stack_service.py](../pixlstash/services/dedup_auto_stack_service.py) (§22.13); the handlers only build a `TierPolicy` / `DedupScope` (a bad one is a 400, never a silent retune) and call a service wrapper. See §22 for the tiers, the hash decision, the bucket design, the cover formula and the verdict memory, and `docs/integration_architecture.md` §19 for the request/response contract.
 
 ### `config.py`
 | Method | Path | Purpose |
@@ -646,7 +646,12 @@ Public guest scoring and shared-link endpoints.
 | GET    | /api/v1/characters/{id}/{field}                                               | characters      | Get character field                                           |
 | GET    | /api/v1/check-session                                                         | auth            | Check Session                                                 |
 | GET    | /api/v1/checkpoints                                                           | model_shelf     | List checkpoints on the shelf                                 |
-| POST   | /api/v1/dedup/auto-stack                                                      | dedup           | Bulk auto-stack the exact tier                                |
+| POST   | /api/v1/dedup/auto-stack                                                      | dedup           | Count what auto-stacking the exact tier would do              |
+| POST   | /api/v1/dedup/auto-stack/runs                                                 | dedup           | Start auto-stacking the exact tier in the background          |
+| GET    | /api/v1/dedup/auto-stack/runs/latest                                          | dedup           | The newest auto-stack run                                     |
+| GET    | /api/v1/dedup/auto-stack/runs/{run_id}                                        | dedup           | An auto-stack run's status and progress                       |
+| POST   | /api/v1/dedup/auto-stack/runs/{run_id}/cancel                                 | dedup           | Stop an auto-stack run                                        |
+| POST   | /api/v1/dedup/auto-stack/runs/{run_id}/revert                                 | dedup           | Undo an auto-stack run in the background                      |
 | POST   | /api/v1/dedup/counts                                                          | dedup           | Live duplicate counts, global and scoped                      |
 | GET    | /api/v1/dedup/groups                                                          | dedup           | One page of the duplicate queue                               |
 | GET    | /api/v1/dedup/mixed-stacks                                                    | dedup           | Live stacks whose members do not all match                    |
@@ -2485,7 +2490,9 @@ Selected milestones:
 
 | 0149 | `ix_picture_description_pending` (the description probe's partial index, see §7's note on probe cost) and `ix_tag_prediction_predicted_at` on `(predicted_at DESC, id)`, which serves `tag_health_service.latest_model_version` without sorting `tag_prediction`. Schema-only. Both are declared on the models, so the baseline already builds them on a fresh vault; create and drop are guarded on the index name |
 
-Current head: `0149_add_description_and_prediction_time_indexes`.
+| 0150 | `dedupautostackrun`: one row per background auto-stack run or revert of one, its counters and the History segments it recorded (§22.13). Additive: a new table, created only when absent, with no `NULL` reset. |
+
+Current head: `0150_add_dedup_auto_stack_run`.
 
 ### 12.1 Two revisions numbered 0086, and why the chain was spliced
 
@@ -6697,6 +6704,8 @@ Metadata mutation sites call `operation_log_service.run_recorded_metadata_task(v
 
 Recorded content (`op_type` / `target_ids` / `before_state` / `after_state` / `actor` / `source` / `created_at`) is written once and never rewritten. The only mutable columns are the lifecycle markers `status` (`applied` → `undone` → `superseded`) and `undone_at`, which *append* the fact that an operation was reverted rather than erasing it. Recording a new operation supersedes the redo stack (classic linear undo history) by advancing those markers — no row is deleted. `tests/test_operation_log.py::test_log_is_append_only_across_undo_and_redo` pins this.
 
+**Redo replays what was undone last, which is the OLDEST undone row.** Undo walks history newest first and recording supersedes every undone row, so the undone rows are always one contiguous suffix of history, undone from its newest end. Redo used to pick the newest undone row, so after two undos it laid the later operation's after-state over a history that had not reached it, and the older redo that followed rolled the pictures back to the middle state while both rows read `applied`. `_next_redo_in_session` (shared by `redo_in_session` and `undo_state_in_session`'s `next_redo`) takes the oldest. It matters most after an auto-stack revert, which undoes many segments in one run (§22.13). Pinned by `tests/test_operation_log.py::test_redo_after_two_undos_replays_the_older_operation_first`.
+
 ### Origin discipline (§15) applies on both sides
 
 `source` / `origin_client_id` are read from the **request**, in the handler, on the request's own task (`operation_log_service.request_context`), then passed explicitly downstream and carried in the WS event `data` dict when undo announces itself. The service never reads `origin_client_id_var` — it runs on the DB worker thread where that contextvar is dead, the same hazard `test_source_origin_read_from_data_only` pins for the broadcaster. Both directions are tested: `tests/test_operation_log.py::test_service_module_never_reads_the_origin_contextvar` (an AST check, so a future edit cannot reintroduce the read) and `tests/test_ws_broadcaster.py::test_operation_log_undo_emits_origin_in_data_not_from_the_contextvar` (the producer side of the envelope contract).
@@ -7066,8 +7075,10 @@ Two consequences, both deliberate:
   than the digest alone. The member lookup still goes through the `pixel_sha`
   index; the size only splits what that lookup returns.
 - **Exact matches still go through a consent dialog.** `POST /dedup/auto-stack`
-  defaults to `dry_run=true`; the design deliberately does not stack exact matches
-  at import without the user seeing the count first. The worst case of a false
+  only counts (a `dry_run=false` body is a 400 `apply_runs_in_background`), and
+  the run that stacks, `POST /dedup/auto-stack/runs`, is started from the dialog
+  once the user has seen that count (§22.13). The design deliberately does not
+  stack exact matches at import without the user seeing the count first. The worst case of a false
   exact match is two different pictures in one *stack*, which is reversible with
   one keystroke and destroys nothing.
 
@@ -7252,9 +7263,10 @@ stack the page touches in one chunked query, alongside the single
 would make the deck an N+1 on the one query the queue page is measured by
 (`test_the_deck_rollup_costs_one_query_for_the_whole_page` pins it).
 
-### 22.6 Persistence: four tables
+### 22.6 Persistence: five tables
 
-`pixlstash/db_models/dedup.py`, migration `0088_add_dedup_tier_tables`:
+`pixlstash/db_models/dedup.py`, migration `0088_add_dedup_tier_tables`
+(`dedupautostackrun`: `0150_add_dedup_auto_stack_run`):
 
 - **`dedupgroup` / `dedupgroupmember`** — the found-groups cache. Detection
   *upserts on `signature`*, so a rescan refreshes rows instead of duplicating
@@ -7266,8 +7278,8 @@ would make the deck an N+1 on the one query the queue page is measured by
   is also perceptually identical, so every near-enabled scan rediscovers every
   exact pair under the same signature — and the upsert originally wrote
   `row.tier` unconditionally. An exact pair silently demoted to `near`
-  disappeared from the exact-only default view **and** from
-  `POST /dedup/auto-stack`, which only ever acts on `exact`. Tier, confidence,
+  disappeared from the exact-only default view **and** from auto-stack,
+  which only ever acts on `exact`. Tier, confidence,
   evidence and cover move together (they describe one finding); membership is
   refreshed either way, because the signature pins the member *content keys* and
   a re-import can give the same content new picture ids. Pinned by
@@ -7304,6 +7316,10 @@ would make the deck an N+1 on the one query the queue page is measured by
   `test_two_groups_sharing_a_digest_but_not_a_size_stay_distinct`.
 - **`dedupscan`** — one row per scope key, both the scan *request* (status
   `pending`) and the "scanned N of M" progress readout.
+- **`dedupautostackrun`** — one row per auto-stack run or revert of one, the
+  same request-and-readout shape as `dedupscan`: the start route writes it
+  `pending`, the task keeps its counters current, and it lists the History
+  segments the run recorded (§22.13).
 
 `prune_stale_groups_in_session()` removes groups whose live membership has
 dropped below two, so the sidebar badge cannot be inflated by scrapheaped
@@ -7333,8 +7349,9 @@ that, which is why there isn't one: the surviving rows are invisible to every
 read and the next verdict or scan clears them. The reads that apply the rule are
 the four in `dedup_tier_service` (`count_unresolved_in_session`,
 `count_by_tier_in_session`, `count_unresolved_and_by_tier_in_session`,
-`page_queue_in_session`), `bulk_auto_stack_in_session` in `dedup_verdict_service`,
-**and** the grid's `stack_state="unresolved"` filter in
+`page_queue_in_session`), auto-stack's `_auto_stack_candidates` in
+`dedup_verdict_service` (the preview and the run's plan) **and** the
+grid's `stack_state="unresolved"` filter in
 `utils/query/predicate_filter.py`, which was the one that leaked: it keyed on
 `DedupGroup.resolved` alone, so a scrapheaped partner kept marking its survivor
 as unresolved long after the group had left the queue and the badge.
@@ -7391,8 +7408,8 @@ verdict between two pages.
   ordering was meaningless there (user report). Its cursor encodes
   `"1|d|<decided_at iso>|<group id>"`; the two cursor kinds reject each other
   with a 400, so a queue cursor can never resume a decided page at a silently
-  wrong position (or vice versa). The id tie-break keeps a same-instant run (a
-  bulk auto-stack) stable across page seams. Redo re-stamps `decided_at` so a
+  wrong position (or vice versa). The id tie-break keeps a same-instant run (an
+  auto-stack slice) stable across page seams. Redo re-stamps `decided_at` so a
   redone decision honestly sorts to the top — see §22.10.
 - **The decided page has its own filter, `verdict` (2026-07-30).** The tier gate
   is not in force there, so the repeatable `verdict` query param narrows the page
@@ -7580,7 +7597,8 @@ from offering a Stack the verdict would refuse:
   and the tier split (read together by `count_unresolved_and_by_tier_in_session`
   for `POST /dedup/counts`, which tests live groups once for both)
   all apply one identical rule and cannot disagree, and since **D1**
-  (2026-08-01) so does `POST /dedup/auto-stack`, which used to filter on the
+  (2026-08-01) so does auto-stack (its preview and its run's plan), which used
+  to filter on the
   weaker `stackable_groups_filter` (two unfrozen live members, nothing about
   stack units) and therefore planned 62 groups behind a badge that said 3. Both
   filters are built on `locked_picture_id_subquery`, the single SQL definition of
@@ -7604,9 +7622,10 @@ from offering a Stack the verdict would refuse:
   matched member to be promoted instead, silently re-covering a curated stack.
   It is relaxed no further: an unrelated id: including the leader of a stack
   this group does not touch: is still a `DedupVerdictError`.
-- **`POST /dedup/auto-stack`** filters its own candidate query with
-  `_live_groups_filter` (**D1**, 2026-08-01), the queue's own filter, so the
-  run plans exactly the population the list shows and the badge counts. It used
+- **Auto-stack** filters its candidate query (`_auto_stack_candidates`, shared
+  by the preview and the run's plan) with `_live_groups_filter` (**D1**,
+  2026-08-01), the queue's own filter, so the run plans exactly the population
+  the list shows and the badge counts. It used
   `stackable_groups_filter`, whose silence about stack units let already
   collapsed groups through: 62 planned against a badge of 3, of which 59 created
   nothing and 21 would have had their cover replaced, since the run passes no
@@ -7639,12 +7658,12 @@ from offering a Stack the verdict would refuse:
   against 0.4 s now. The members come back **ordered by `position`**, the order
   `_load_group` reads a group in, because the cover fallback takes the first
   live member and it must be the one the run makes the cover. Separately,
-  `bulk_auto_stack` sends `dry_run=true` to `run_immediate_read_task`, **not**
-  the serialised writer queue: the preview returns before minting a batch id and
-  writes nothing, but on the writer it held the single write thread for its whole
-  duration and every stack verdict queued behind it, so the queue answered "Could
-  not stack that group" until the preview finished. An applied run is a real
-  mutation and still goes through `run_task`.
+  the preview (`preview_auto_stack`) runs on `run_immediate_read_task`, **not**
+  the serialised writer queue: it writes nothing, but on the writer it held the
+  single write thread for its whole duration and every stack verdict queued
+  behind it, so the queue answered "Could not stack that group" until the
+  preview finished. The run is a real mutation and goes through the writer, in
+  bounded LOW-priority slices (§22.13).
 
 Partial success is scoped to **dedup** deliberately. The manual `POST /stacks`
 routes still refuse whole-request: they act on exactly the pictures the user
@@ -7661,21 +7680,26 @@ live share token for that set immediately reaches it — the picture, its tags, 
 
 - **Not new.** An ordinary `POST /stacks` does exactly the same thing; this is the
   shipped stack-atomic membership model, not a dedup regression.
-- **What is new is the amplification.** `POST /dedup/auto-stack` with
-  `dry_run=false` applies it to **every exact group in the vault** behind one
-  consent dialog. The dry run reports `groups` / `pictures` and a
-  `dry_run_summary`, but **not** how many shared sets or live tokens would gain
-  members.
+- **What is new is the amplification.** An auto-stack run
+  (`POST /dedup/auto-stack/runs`) applies it to **every exact group in the
+  vault** behind one consent dialog. The preview (`POST /dedup/auto-stack`)
+  reports `groups` / `pictures` and a `dry_run_summary`, but **not** how many
+  shared sets or live tokens would gain members.
 - **Blast radius.** Bounded to the owner's own sharing decisions: only sets and
   projects that already have an outstanding token, and only pictures the owner has
   just declared duplicates of something already in that set.
-- **Compensating controls.** `dry_run=true` is the default; the union is additive
-  and reversible through the operation log; tokens are owner-minted and READ-only;
-  a locked set refuses the union outright.
+- **Compensating controls.** The count comes first: the dialog shows the
+  preview, and nothing is applied until the owner confirms it; the union is
+  additive and reversible through the operation log and the run's own revert
+  (§22.13); tokens are owner-minted and READ-only; a locked set refuses the
+  union outright.
 - **Ruling: accepted** for the single-owner product. **Revisit** at the start of
-  any multi-user work, and immediately if bulk auto-stack is ever wired to run
+  any multi-user work, and immediately if auto-stack is ever wired to run
   unattended (at import or on a schedule) — unattended bulk membership widening is
-  a different risk and this acceptance does not cover it.
+  a different risk and this acceptance does not cover it. **Running in the
+  background (§22.13) is not unattended**: the owner still starts each run from
+  the dialog, after its count, and can stop or revert it. The background run
+  removes the wait, not the consent.
 - **Recommended, not implemented:** a `shared_sets_affected` count in the dry-run
   summary so the consent dialog can say so out loud.
 
@@ -7689,10 +7713,17 @@ Every verdict — stack **and** keep-separate — records **exactly one**
   `run_recorded_metadata_task`; going through them would write a second row and
   "one verdict, one undo" would stop being true. `_stack_members` stacks
   in-session and `_record_operation` records once around the whole verdict.
-- **Bulk auto-stack shares one `batch_id`** across every group in the run, so
-  `POST /operations/batches/{batch_id}/undo` reverses the lot in one step. The
-  response carries the `batch_id` **even when the run only partially applied**
-  (see below), so work that happened is never left without a way to reverse it.
+- **An auto-stack run records into bounded History segments and is undone by
+  its own revert.** Each segment is one `batch_id` of at most
+  `SEGMENT_GROUP_CAP` (250) groups, so one Ctrl+Z or
+  `POST /operations/batches/{batch_id}/undo` reverses one segment, about a
+  second or two of writer time, rather than the whole run in one callback (an
+  undo costs 5-9 ms a group measured on a synthetic library, so a
+  100,000-group batch would hold the writer for 8-15 minutes). The run row lists
+  its segments in `segment_batch_ids`, each committed before anything is
+  stacked into it, so work that happened is never left without a way to reverse
+  it, and `POST /dedup/auto-stack/runs/{run_id}/revert` undoes them newest
+  first, one per slice (§22.13).
 - **The snapshot is stack-expanded**, taken over `expand_picture_ids_to_stacks`
   with `include_deleted=True`: folding a stack reparents co-members the group
   never named, and `normalize_stack_positions` renumbers soft-deleted members too
@@ -7787,7 +7818,7 @@ Every verdict — stack **and** keep-separate — records **exactly one**
   keep-separate, auto-stack and — since the clear-decision fix — reopen) take
   a `Request` and read the context there.
 
-**A bulk run is never aborted by one bad group.** The locked-set guards raise
+**An auto-stack run is never aborted by one bad group.** The locked-set guards raise
 `HTTPException(423)`, so the loop catches that alongside `DedupVerdictError`,
 rolls back just that iteration, and records the group under an explicit outcome:
 `applied`, `blocked` (a guard refused it) or `failed` (it could not be resolved).
@@ -7795,53 +7826,60 @@ Catching only `DedupVerdictError` meant a locked group mid-run propagated out
 after earlier groups had already committed — a partially applied mutation whose
 server-minted batch id the caller never saw.
 
-How the applied run (`bulk_auto_stack_in_session`) holds together:
+How one slice of a run (`auto_stack_groups_in_session`) holds together:
 
 - **One commit per verdict.** The stack and keep-separate verdicts record their
   operation with `_record_operation(..., commit=False)` and commit once
   themselves, so the operation row, the stack change and the verdict row land
   in a single commit (recording used to commit on its own, so every verdict
-  was two commits, the second with nothing left to write). A run therefore
+  was two commits, the second with nothing left to write). A slice therefore
   commits once per group, and every committed group is a complete undo unit
-  under the batch.
-- **The run iterates scalars, not ORM rows.** A loop over loaded `DedupGroup`
+  under its segment.
+- **The run carries ids, not ORM rows.** A loop over loaded `DedupGroup`
   objects kept every planned group in the session's identity map across the
-  run, and each per-group commit expired all of them. The applied plan selects
-  `(DedupGroup.id, DedupGroup.signature)`; the dry run still loads groups for
-  its aggregate summary.
-- **Each group is re-checked before it is applied** (`_still_poses_a_decision`).
-  Stacking one group folds every stack it spans, so a later group in the same
-  plan can already share one stack; applying it anyway replaced the earlier
-  group's chosen cover. Such a group is skipped, counted in the response's
-  `superseded`, and written nowhere. The test is the queue's own filter
+  run, and each per-group commit expired all of them. The plan
+  (`plan_auto_stack_in_session`) selects `DedupGroup.id` once, when the run
+  starts, and a slice reads each signature in its re-check; the preview still
+  loads groups for its aggregate summary.
+- **Every group is re-checked just before it is applied**
+  (`_recheck_planned_group`), in the writer callback that stacks it. The run
+  spans thousands of callbacks and anything may write between two slices: the
+  user deciding a group by hand, a scan retiring one, a stack edit, a picture
+  leaving the scope. Within the run, stacking one group folds every stack it
+  spans, so a later group can already share one stack, and applying it anyway
+  replaced the earlier group's chosen cover. A group that no longer poses an
+  exact decision in the run's scope is skipped, counted in `superseded`, and
+  written nowhere. The test is the queue's own filter
   restricted to the group's member rows (`live_groups_filter(group_id)`, the
   same three `HAVING` clauses). `group_id` leads the primary key of
   `dedupgroupmember`, so one check is an index range read whose cost does not
   grow with the library (`test_a_recheck_reads_its_own_group_not_the_library`
-  counts SQLite VM instructions at 200 and 2,000 unrelated groups). It runs
-  only for a group with a member among the pictures this run has already moved
-  (the applied groups' stack-expanded `event_picture_ids`); any other group is
-  as eligible as when the run was planned, because the run is one writer task,
-  so it skips the query. A touched group that still spans two stack units is
-  applied (`test_an_auto_stack_run_still_stacks_a_group_an_earlier_group_only_touched`).
-- **An unexpected error while a group is checked or applied is logged and
-  re-raised.** The re-check and the verdict sit in one `try`, and anything
-  other than a guard's refusal (`DedupVerdictError`, `HTTPException`) is logged
-  with the group's signature, the batch id and how many groups were applied,
-  then re-raised. The writer rolls back only that group; the earlier groups stay
-  committed under the batch and are undone through it. The stale-group prune
-  after the loop is outside that boundary.
-- **A supplied `batch_id` must still be the newest batch in History**
-  (`_refuse_a_buried_batch`). Undo needs a batch to be the newest applied undo
-  unit and contiguous at the top (`operation_log_service.undo_batch_in_session`),
-  so a run that appended to a batch buried under another operation would split
-  it and neither could then be undone. When the supplied id already has applied
-  undoable rows and the newest applied undoable row belongs to another batch,
-  the applied run is refused with 409 `batch_id_not_at_top` before planning or
-  writing anything. A dry run is never refused, and a repeat under an id that is
-  still on top extends the batch. Clients mint their own `cli-…` id for the run
-  so a request that times out still names its undo handle
-  (`docs/integration_architecture.md`, `POST /dedup/auto-stack`).
+  counts SQLite VM instructions at 200 and 2,000 unrelated groups), so checking
+  every group, rather than only those an earlier group touched as the
+  single-callback run did, costs well under a millisecond against tens to
+  stack one. A touched group that still spans two stack units is applied
+  (`test_an_auto_stack_run_still_stacks_a_group_an_earlier_group_only_touched`).
+- **An unexpected error while a group is checked or applied stops the run.**
+  The re-check and the verdict sit in one `try`, and anything other than a
+  guard's refusal (`DedupVerdictError`, `HTTPException`) is rolled back for that
+  group, logged with the group's signature, the batch id and how many groups
+  the slice applied, and raised as `AutoStackSliceError`, which carries the
+  slice's report up to the failing group. The run absorbs those counts, so the
+  groups that committed are counted and revertable, and ends `failed` with
+  `error_code` `unexpected_error` (`test_a_failing_group_fails_the_run_and_keeps_what_committed`).
+- **The run chooses its segment, not the client** (`_segment_for_slice`).
+  Undo needs a batch to be the newest applied undo unit and contiguous at the
+  top (`operation_log_service.undo_batch_in_session`), so a slice that appended
+  to a batch buried under another operation would split it and neither could
+  then be undone. Before each slice the run keeps its current segment only
+  while the slice still fits under the cap **and** that segment is still the
+  newest applied undoable batch; otherwise it starts a new one
+  (`test_an_edit_between_slices_starts_a_new_segment_and_blocks_the_revert`,
+  `test_no_segment_holds_more_groups_than_the_cap`). The client no longer
+  mints a `cli-…` batch id for the run (the single-request run did, so that a
+  timed-out request still named its undo handle, and a buried one was refused
+  with 409 `batch_id_not_at_top`); it sends a `request_id` that makes the start
+  idempotent instead, and the run row is the handle.
 
 ### 22.11 Mixed stacks: cohesion scoring, `Keep`, split and unstack (D5/B5)
 
@@ -8252,6 +8290,100 @@ Both routes are `OWNER_ONLY` in `ROUTE_POLICIES` with no inline scope check
 (§16.1); the rationale and the both-direction test coverage
 (`tests/test_keep_cover_only.py`) are in
 `docs/authz-coverage-matrix.md`.
+
+### 22.13 Auto-stack runs in the background
+
+`pixlstash/services/dedup_auto_stack_service.py` (the run record and every
+rule), `pixlstash/tasks/dedup_auto_stack_finder.py` and
+`pixlstash/tasks/dedup_auto_stack_task.py` (`TaskType.DEDUP_AUTO_STACK`), the
+`dedupautostackrun` table (§22.6, migration `0150_add_dedup_auto_stack_run`).
+The wire contract is `docs/integration_architecture.md` §11.4 and §19.
+
+**Why a run, not a request.** Auto-stack used to stack the whole exact tier
+inside one `POST /dedup/auto-stack` and one writer callback. A group costs
+14-24 ms to stack (measured on a synthetic library at 2,000 and 20,000 groups,
+growing with the library), so a 100,000-group tier is roughly half an hour to
+forty minutes of writer time: the client's 60 s timeout reported "did not
+answer" while the server carried on, every other write queued behind it, and
+the user could not see progress, stop it, or tell what it had done. The fix is
+the asynchronous request-reply pattern (Azure's "Asynchronous Request-Reply",
+Google AIP-151 long-running operations): the start route writes a
+`dedupautostackrun` row and answers `202 Accepted` with its address and a
+`Retry-After`, a task works it, and the row is the progress readout any tab can
+poll.
+
+**The run works in bounded LOW slices.** `DedupAutoStackFinder` turns the
+oldest `pending` row into a `DedupAutoStackTask` (`max_inflight_tasks` 1; it
+claims no pictures). The task plans once, as a read on
+`run_immediate_read_task` (`plan_auto_stack_in_session`, ids only), then stacks
+`SLICE_GROUPS` (40) groups per `DBPriority.LOW` writer callback
+(`apply_slice_in_session`), about half a second to a second each, so every
+interactive write gets the writer between two slices: the same rule as the
+dedup scan's (§22.8, "a commit is not a scheduling boundary; a queued callback
+is"). Only ids and plain dicts cross a slice boundary. Each slice re-checks
+every group it stacks (§22.10). A revert run undoes the target run's segments
+newest first, one segment per slice (`revert_segment_in_session`), and
+announces each restore through `operation_log_service.announce_restore`, the
+same announcement Ctrl+Z makes.
+
+**Counters.** `total` / `processed` are planned groups for an apply run and
+History segments for a revert. `applied` is groups stacked, or for a revert
+stacked groups put back in the queue (one per stack operation undone).
+`superseded` is planned groups that had left the queue by their turn, or
+segments with nothing left to undo. `blocked` / `failed` count per-group
+refusals and errors; the first `FAILURES_KEPT` (50) are kept with their reason.
+An apply run that stacked anything prunes stale groups once when it finishes
+(`finish_run_in_session`), as every verdict path does.
+
+**Rules the service owns.**
+
+- **One active run** (apply or revert), so two runs never interleave their
+  segments; a second start is 409 `auto_stack_run_active`, carrying the active
+  run (`test_only_one_run_may_be_active`).
+- **A start is idempotent by `request_id`** (Google AIP-155; the IETF
+  Idempotency-Key draft's semantics in a body field). The same id with the same
+  parameters returns the run it created (200, not a second 202), and the same
+  id with different parameters is 422 `request_id_reused`
+  (`test_a_replayed_request_id_returns_the_run_it_started`). The client resends
+  an unanswered start under the same id, which is what makes "did not answer"
+  safe to retry.
+- **Cancel is durable and lands on a slice boundary.** A `pending` run is
+  cancelled at once; a `running` one gets `cancel_requested` and stops before
+  its next slice, keeping what it committed; an ended run is returned
+  unchanged, so a repeated cancel is harmless
+  (`test_cancelling_a_queued_run_stops_it_before_anything_is_stacked`,
+  `test_cancelling_a_running_run_stops_it_at_the_next_slice`).
+- **A revert refuses to undo around somebody else's edit.** Each segment goes
+  through `operation_log_service.undo_batch_in_session`, so a segment buried
+  under a later operation raises `OperationLogError` and the revert ends
+  `blocked` with `history_moved_on` rather than skipping it; segments already
+  undone count as `superseded`. `can_revert` stays true while any segment
+  still has something to undo, so a revert that stopped at an unrelated edit is
+  finished by reverting again once that edit is undone; when nothing is left,
+  the request is 409 `nothing_to_revert`
+  (`test_a_revert_undoes_the_whole_run_and_only_once`). A revert run itself
+  cannot be reverted (409 `not_an_apply_run`), nor can an active run.
+- **A run is never resumed.** When the runner cancels the task (the server is
+  stopping) the task closes the row `interrupted` with `server_restarted` at
+  `DBPriority.IMMEDIATE`; if the process died before even that,
+  `Vault.start()` runs `interrupt_orphaned_runs_in_session` before the planner
+  starts, so no task can own the row yet
+  (`test_a_server_stopping_mid_run_closes_it_interrupted`,
+  `test_a_queued_run_left_by_a_previous_process_is_interrupted`,
+  `test_a_restart_closes_a_run_the_previous_process_was_working`). What it
+  committed stays committed and revertable, and the user decides whether to
+  run again. Resuming was rejected: a run that picks itself back up after a
+  restart, with nobody having asked, is the unattended case accepted risk A1
+  (§22.9) excludes.
+- **Change events are coalesced.** The task gathers each slice's
+  stack-expanded `event_picture_ids` and sends one `pictures_changed` at most
+  every `NOTIFY_INTERVAL_S` (2 s), plus a final flush, under the starting
+  request's origin, so the tab that started the run can tell its own run's
+  events from another tab's
+  (`test_a_run_announces_its_pictures_coalesced_with_the_origin`).
+
+**Redo after a revert** replays the segment the revert undid last, the oldest,
+first: see §21, "Redo replays what was undone last".
 
 ---
 

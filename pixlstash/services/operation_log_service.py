@@ -2384,6 +2384,24 @@ def undo_batch_in_session(
     return [serialize(member) for member in members], touched, sorted(facets), lifecycle
 
 
+def _next_redo_in_session(session: Session) -> Optional[Operation]:
+    """The operation Redo replays next: the one undone most recently.
+
+    Undo walks history newest-first and recording anything new supersedes every
+    undone row (:func:`_append_operation_row`), so the undone rows are always one
+    contiguous suffix of history and the most recently undone is the OLDEST of
+    them. Replaying a newer one first would lay its after-state over a history
+    that has not reached it, and the older redo after it would roll that back
+    while both rows read applied.
+    """
+    return session.exec(
+        select(Operation)
+        .where(Operation.status == STATUS_UNDONE)
+        .order_by(Operation.id.asc())
+        .limit(1)
+    ).first()
+
+
 def redo_in_session(
     session: Session,
     registry: Optional[InteractiveRescoreRegistry] = None,
@@ -2391,12 +2409,7 @@ def redo_in_session(
     image_root: Optional[str] = None,
 ) -> tuple[list[dict], list[int], list[str], dict[str, list[int]]]:
     """Re-apply the most recently undone operation (and its whole batch)."""
-    operation = session.exec(
-        select(Operation)
-        .where(Operation.status == STATUS_UNDONE)
-        .order_by(Operation.id.desc())
-        .limit(1)
-    ).first()
+    operation = _next_redo_in_session(session)
     if operation is None:
         raise OperationLogError("Nothing to redo")
     members = _batch_members_in_session(session, operation, STATUS_UNDONE)
@@ -2455,12 +2468,7 @@ def undo_state_in_session(session: Session) -> dict:
         .order_by(Operation.id.desc())
         .limit(1)
     ).first()
-    next_redo = session.exec(
-        select(Operation)
-        .where(Operation.status == STATUS_UNDONE)
-        .order_by(Operation.id.desc())
-        .limit(1)
-    ).first()
+    next_redo = _next_redo_in_session(session)
     return {
         "can_undo": next_undo is not None,
         "can_redo": next_redo is not None,
@@ -2496,9 +2504,16 @@ def get_operation(vault: "Vault", operation_id: int) -> Optional[dict]:
     return vault.db.run_task(_fetch)
 
 
-def _finish(
+def announce_restore(
     vault: "Vault", members, touched, facets, lifecycle, origin_client_id
 ) -> dict:
+    """Announce a committed undo/redo and shape the response body.
+
+    Runs after the restore's commit, off the DB writer: emits the change events
+    for the touched pictures and facets and clears the stats cache when a
+    non-picture operation moved. Shared by Ctrl+Z, Ctrl+Shift+Z, a named batch
+    undo and the auto-stack run revert, which restores one segment per slice.
+    """
     _emit(vault, touched, set(facets), origin_client_id, lifecycle)
     # A restore of a non-picture operation (a tag-group move) announces no
     # picture, so no event clears the stats cache, yet a stats query narrowed
@@ -2529,7 +2544,9 @@ def undo(
         origin_client_id,
         vault.image_root,
     )
-    return _finish(vault, members, touched, facets, lifecycle, origin_client_id)
+    return announce_restore(
+        vault, members, touched, facets, lifecycle, origin_client_id
+    )
 
 
 def undo_batch(
@@ -2543,7 +2560,9 @@ def undo_batch(
         origin_client_id,
         vault.image_root,
     )
-    return _finish(vault, members, touched, facets, lifecycle, origin_client_id)
+    return announce_restore(
+        vault, members, touched, facets, lifecycle, origin_client_id
+    )
 
 
 def redo(vault: "Vault", origin_client_id: Optional[str] = None) -> dict:
@@ -2554,4 +2573,6 @@ def redo(vault: "Vault", origin_client_id: Optional[str] = None) -> dict:
         origin_client_id,
         vault.image_root,
     )
-    return _finish(vault, members, touched, facets, lifecycle, origin_client_id)
+    return announce_restore(
+        vault, members, touched, facets, lifecycle, origin_client_id
+    )

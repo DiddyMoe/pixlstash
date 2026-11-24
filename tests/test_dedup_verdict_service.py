@@ -77,6 +77,34 @@ def _run(server, fn, *args):
     return server.vault.db.run_task(fn, *args, priority=DBPriority.IMMEDIATE)
 
 
+def _auto_stack_in_session(
+    session,
+    scope=None,
+    batch_id=None,
+    dry_run=False,
+    limit=None,
+    actor=None,
+    source="external",
+    origin_client_id=None,
+):
+    """Preview auto-stack, or plan it and stack every planned group in one slice.
+
+    Built from the functions a background run calls (plan once, then
+    ``auto_stack_groups_in_session`` per slice, then the prune its finish does),
+    so these tests exercise the per-group rules on the path a run takes. Slicing,
+    History segments and the run row are the run service's, covered in
+    ``tests/test_dedup_auto_stack_runs.py``.
+    """
+    if dry_run:
+        return verdicts.preview_auto_stack_in_session(session, scope, limit)
+    group_ids = verdicts.plan_auto_stack_in_session(session, scope, limit)
+    report = verdicts.auto_stack_groups_in_session(
+        session, group_ids, scope, batch_id, actor, source, origin_client_id
+    )
+    tiers.prune_stale_groups_in_session(session)
+    return report
+
+
 def _seed(server, specs):
     def insert(session):
         picture_ids = []
@@ -599,11 +627,10 @@ def _seed_two_exact_groups(server):
 def test_the_dry_run_counts_and_writes_nothing(server):
     ids = _seed_two_exact_groups(server)
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     assert report["dry_run"] is True
     assert report["groups"] == 2
     assert report["pictures"] == 4
-    assert report["results"] == []
     assert all(_picture(server, pid).stack_id is None for pid in ids)
     assert _run(server, tiers.count_unresolved_in_session, None, None) == 2
 
@@ -611,8 +638,7 @@ def test_the_dry_run_counts_and_writes_nothing(server):
 def test_auto_stack_shares_one_batch_id_across_every_group(server):
     ids = _seed_two_exact_groups(server)
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
-    assert report["dry_run"] is False
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     assert report["groups"] == 2
     batch_id = report["batch_id"]
     assert batch_id
@@ -659,7 +685,7 @@ def test_auto_stack_never_touches_the_near_tier(server):
 
     _scan(server)
     _run(server, add_near_group)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     assert report["groups"] == 1
     near_policy = TierPolicy(near_enabled=True)
     assert _run(server, tiers.count_unresolved_in_session, near_policy, None) == 1
@@ -679,7 +705,7 @@ def test_auto_stack_never_touches_the_near_tier(server):
 def test_auto_stack_respects_a_limit(server):
     _seed_two_exact_groups(server)
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, 1)
+    report = _run(server, _auto_stack_in_session, None, None, False, 1)
     assert report["groups"] == 1
     assert _run(server, tiers.count_unresolved_in_session, None, None) == 1
 
@@ -687,7 +713,7 @@ def test_auto_stack_respects_a_limit(server):
 def test_no_verdict_ever_deletes_a_picture(server):
     ids = _seed_two_exact_groups(server)
     _scan(server)
-    _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    _run(server, _auto_stack_in_session, None, None, False, None)
     live = _run(
         server,
         lambda session: [int(row) for row in session.exec(select(Picture.id)).all()],
@@ -906,7 +932,7 @@ def test_the_snapshot_covers_stack_siblings_the_group_never_named(server):
 def test_bulk_auto_stack_reverses_with_one_batch_undo(server):
     ids = _seed_two_exact_groups(server)
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     batch_id = report["batch_id"]
     assert report["groups"] == 2
     rows = _operations(server)
@@ -925,7 +951,7 @@ def test_undoing_any_member_of_the_batch_reverts_the_whole_run(server):
     """Batch semantics: a partially-undone bulk action cannot exist."""
     ids = _seed_two_exact_groups(server)
     _scan(server)
-    _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    _run(server, _auto_stack_in_session, None, None, False, None)
     first_id = _operations(server)[0].id
 
     _run(server, operation_log_service.undo_in_session, first_id)
@@ -1124,7 +1150,7 @@ def test_a_locked_group_is_never_planned_into_a_bulk_run(server):
     _lock_picture_in_a_set(server, ids[2])  # a member of the middle group
     _scan(server)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
 
     assert report["batch_id"]
     assert report["groups"] == 2
@@ -1169,11 +1195,10 @@ def test_an_http_exception_mid_run_does_not_abort_the_bulk_run(server, monkeypat
         return real(session, signature, *args, **kwargs)
 
     monkeypatch.setattr(verdicts, "apply_stack_verdict_in_session", refuse_the_second)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
 
     # The run completed rather than raising, and handed back its undo handle.
     assert report["batch_id"]
-    assert report["dry_run"] is False
     assert report["groups"] == 2
     assert report["blocked"] == 1
     assert report["failed"] == 0
@@ -1193,7 +1218,7 @@ def test_the_returned_batch_id_reverses_exactly_the_applied_groups(server):
     ids = _seed_three_exact_groups(server)
     _lock_picture_in_a_set(server, ids[2])
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     batch_id = report["batch_id"]
 
     rows = _operations(server)
@@ -1210,7 +1235,7 @@ def test_a_blocked_group_leaves_no_partial_write_of_its_own(server):
     ids = _seed_three_exact_groups(server)
     _lock_picture_in_a_set(server, ids[2])
     _scan(server)
-    _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    _run(server, _auto_stack_in_session, None, None, False, None)
 
     # No stack row was left behind for the blocked group (_stack_members flushes
     # a PictureStack before the lock guard runs), and no verdict was recorded.
@@ -1271,7 +1296,7 @@ def test_bulk_auto_stack_attributes_every_row_in_the_batch(server):
     _scan(server)
     _run(
         server,
-        verdicts.bulk_auto_stack_in_session,
+        _auto_stack_in_session,
         None,
         None,
         False,
@@ -1364,7 +1389,7 @@ def test_the_dry_run_summary_counts_covers_that_gain_metadata(server):
         ],
     )
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     summary = report["dry_run_summary"]
     assert summary["groups"] == 2
     assert summary["groups_by_tier"] == {"exact": 2, "near": 0, "embedding": 0}
@@ -1393,7 +1418,7 @@ def test_the_dry_run_summary_counts_no_gain_from_a_removed_tag(server):
     )
     server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     assert report["dry_run_summary"]["covers_gaining_tags"] == 1
 
 
@@ -1409,7 +1434,7 @@ def test_the_dry_run_summary_counts_a_score_lift(server):
         ],
     )
     _scan(server)
-    summary = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)[
+    summary = _run(server, _auto_stack_in_session, None, None, True, None)[
         "dry_run_summary"
     ]
     assert summary["covers_gaining_score"] == 1
@@ -1457,9 +1482,7 @@ def test_the_dry_run_counts_folded_stacks_by_stack_id_without_the_scrapheap(
         "picture.stack_id IN (SELECT _pixlstash_dry_run_stack_ids.id",
         "ix_picture_stack_id",
     ):
-        report = _run(
-            server, verdicts.bulk_auto_stack_in_session, None, None, True, None
-        )
+        report = _run(server, _auto_stack_in_session, None, None, True, None)
     assert report["groups"] == 2
     # Both pairs and each stack's kept sibling; never ids[5] or ids[7].
     assert report["dry_run_summary"]["pictures"] == 6
@@ -1469,7 +1492,7 @@ def test_the_dry_run_counts_folded_stacks_by_stack_id_without_the_scrapheap(
 def test_an_applied_run_carries_no_dry_run_summary(server):
     _seed_two_exact_groups(server)
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     assert "dry_run_summary" not in report
 
 
@@ -1958,7 +1981,7 @@ def test_probe_bulk_auto_stack_never_grows_a_locked_set(server):
     set_id = _lock_set(server, "Frozen", [ids[2], ids[3]])
     _scan(server)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
 
     assert _set_member_ids(server, set_id) == {ids[2], ids[3]}
     assert _picture(server, ids[2]).stack_id is None
@@ -2176,7 +2199,7 @@ def test_clearing_one_group_of_a_bulk_batch_leaves_the_others_alone(server):
     """
     ids = _seed_two_exact_groups(server)
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     assert report["groups"] == 2
     first, second = report["results"]
 
@@ -2433,7 +2456,7 @@ def test_the_dry_run_excludes_frozen_members_from_its_counts(server):
     _lock_set(server, "Frozen", [ids[2]])
     _scan(server)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     assert report["groups"] == 1
     assert report["pictures"] == 2, "the frozen member is not promised"
     assert report["dry_run_summary"]["pictures"] == 2
@@ -2452,7 +2475,7 @@ def test_the_dry_run_omits_a_group_with_no_stackable_decision(server):
     _lock_set(server, "Frozen", [ids[1]])
     _scan(server)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     assert report["groups"] == 0
     assert report["pictures"] == 0
 
@@ -2475,13 +2498,13 @@ def test_the_dry_run_still_counts_a_cover_that_gains_from_an_unfrozen_twin(serve
     _lock_set(server, "Frozen", [ids[0]])
     _scan(server)
 
-    summary = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)[
+    summary = _run(server, _auto_stack_in_session, None, None, True, None)[
         "dry_run_summary"
     ]
     assert summary["pictures"] == 2
     assert summary["covers_gaining_tags"] == 1
 
-    _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    _run(server, _auto_stack_in_session, None, None, False, None)
     # The run did move the cover to the untagged twin the preview counted.
     assert _picture(server, ids[1]).stack_position == 0
 
@@ -2517,7 +2540,7 @@ def test_the_lock_lookup_raises_rather_than_calling_an_unknown_id_unfrozen(serve
 
 # ── D1: auto-stack plans the population the queue shows ───────────────────────
 #
-# `bulk_auto_stack_in_session` used to filter on `stackable_groups_filter`, which
+# Auto-stack used to plan with `stackable_groups_filter`, which
 # says nothing about stack units, while the queue list and both counts filter on
 # `_live_groups_filter`, which requires two. On a real library that meant 62
 # planned groups behind a badge that said 3: the other 59 were already collapsed
@@ -2583,11 +2606,11 @@ def test_auto_stack_never_plans_a_fully_collapsed_group(server):
 
     # The queue already hides it; the run must agree.
     assert _run(server, tiers.count_unresolved_in_session, None, None) == 0
-    dry = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    dry = _run(server, _auto_stack_in_session, None, None, True, None)
     assert dry["groups"] == 0
     assert dry["pictures"] == 0
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     assert report["groups"] == 0
     assert report["results"] == []
     assert report["failures"] == []
@@ -2616,11 +2639,11 @@ def test_auto_stack_still_plans_a_genuinely_unstacked_group(server):
     _scan(server)
     _stack_pictures(server, [ids[0], ids[1]], name="collapsed")
 
-    dry = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    dry = _run(server, _auto_stack_in_session, None, None, True, None)
     assert dry["groups"] == 1
     assert dry["pictures"] == 2
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     assert report["groups"] == 1
     assert report["failures"] == []
     stacked = {int(pid) for item in report["results"] for pid in item["picture_ids"]}
@@ -2646,41 +2669,10 @@ def test_auto_stack_still_plans_a_group_that_folds_a_stack_in(server):
     _scan(server)
     stack_id = _stack_pictures(server, [ids[1], ids[2]], name="pre-existing")
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
     assert report["groups"] == 1
     assert report["event_picture_ids"] == sorted(ids)
     assert {_picture(server, pid).stack_id for pid in ids} == {stack_id}
-
-
-def test_bulk_wrapper_emits_aggregated_ids_and_keeps_them_out_of_response():
-    notifications = []
-
-    class FakeDatabase:
-        def run_task(self, func, *args):
-            assert func is verdicts.bulk_auto_stack_in_session
-            return {
-                "dry_run": False,
-                "results": [{"picture_ids": [1, 2]}],
-                "event_picture_ids": [1, 2, 3],
-            }
-
-    class FakeVault:
-        db = FakeDatabase()
-
-        def notify(self, event_type, payload):
-            notifications.append((event_type, payload))
-
-    report = verdicts.bulk_auto_stack(
-        FakeVault(), source="test", origin_client_id="tab-1"
-    )
-
-    assert "event_picture_ids" not in report
-    assert notifications[0][1] == {
-        "picture_ids": [1, 2, 3],
-        "origin_client_id": "tab-1",
-        "change_kind": "updated",
-        "source": "test",
-    }
 
 
 # ── B2: the cover may be a folded stack's leader ──────────────────────────────
@@ -2891,7 +2883,7 @@ def test_the_dry_run_counts_the_pictures_a_fold_would_move(server):
     _stack_pictures(server, [ids[1], ids[2]], name="deck")
     _scan(server)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     assert report["groups"] == 1
     assert report["pictures"] == 3
     assert report["dry_run_summary"]["pictures"] == 3
@@ -2905,7 +2897,7 @@ def test_the_dry_run_does_not_inflate_a_group_with_no_stack(server):
     """B4 negative: loose groups still count exactly their own members."""
     _seed_two_exact_groups(server)
     _scan(server)
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     assert report["groups"] == 2
     assert report["pictures"] == 4
     assert report["dry_run_summary"]["pictures"] == 4
@@ -2929,7 +2921,7 @@ def test_the_dry_run_counts_a_shared_stack_once(server):
     _stack_pictures(server, [ids[0], ids[2]], name="shared")
     _scan(server)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     assert report["groups"] == 2
     # Four distinct pictures would move, not six.
     assert report["pictures"] == 4
@@ -2974,7 +2966,7 @@ def test_the_dry_run_survives_the_sqlite_variable_ceiling(server):
     _scan(server)
     _force_variable_limit(server)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
 
     assert report["dry_run"] is True
     assert report["groups"] == 1001
@@ -2986,10 +2978,12 @@ def test_the_dry_run_survives_the_sqlite_variable_ceiling(server):
 def test_the_dry_run_does_not_occupy_the_writer_queue(server):
     """Regression for #751, second half: a read-only preview blocked every write.
 
-    ``bulk_auto_stack`` sent the dry run to the serialised writer thread, so a
-    slow preview held it and each stack verdict queued behind it until the run
-    finished, so the queue answered "Could not stack that group" the whole time.
-    The preview writes nothing, so it must not take the writer at all.
+    The preview used to go to the serialised writer thread, so a slow preview
+    held it and each stack verdict queued behind it until the run finished, so
+    the queue answered "Could not stack that group" the whole time. The preview
+    writes nothing, so it must not take the writer at all. (Applying is a
+    background run whose slices do take it; see
+    ``tests/test_dedup_auto_stack_runs.py``.)
     """
     _seed(
         server,
@@ -3009,18 +3003,12 @@ def test_the_dry_run_does_not_occupy_the_writer_queue(server):
 
     server.vault.db.run_task = spy
     try:
-        report = verdicts.bulk_auto_stack(server.vault, None, None, True, None)
-        assert report["dry_run"] is True
-        assert report["groups"] == 1
-        assert "bulk_auto_stack_in_session" not in writer_calls
-
-        # The applied run is a real mutation and still belongs on the writer.
-        writer_calls.clear()
-        applied = verdicts.bulk_auto_stack(server.vault, None, None, False, None)
-        assert applied["dry_run"] is False
-        assert "bulk_auto_stack_in_session" in writer_calls
+        report = verdicts.preview_auto_stack(server.vault, None, None)
     finally:
         server.vault.db.run_task = real_run_task
+    assert report["dry_run"] is True
+    assert report["groups"] == 1
+    assert writer_calls == [], "the preview took the writer"
 
 
 # ── the preview's member read ─────────────────────────────────────────────────
@@ -3078,9 +3066,7 @@ def test_the_dry_run_reads_members_through_their_group_not_the_library(server):
 
     event.listen(engine, "after_cursor_execute", explain)
     try:
-        report = _run(
-            server, verdicts.bulk_auto_stack_in_session, None, None, True, None
-        )
+        report = _run(server, _auto_stack_in_session, None, None, True, None)
     finally:
         event.remove(engine, "after_cursor_execute", explain)
 
@@ -3120,7 +3106,7 @@ def test_the_dry_run_leaves_out_a_member_scrapheaped_after_the_scan(server):
 
     _run(server, scrapheap)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, True, None)
     summary = report["dry_run_summary"]
     assert summary["groups"] == 1
     assert summary["pictures"] == 2
@@ -3149,15 +3135,14 @@ def test_the_dry_run_moves_a_frozen_cover_where_the_run_moves_it(server):
     _lock_set(server, "Frozen", [ids[0]])
     _scan(server)
 
-    summary = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)[
+    summary = _run(server, _auto_stack_in_session, None, None, True, None)[
         "dry_run_summary"
     ]
     assert summary["pictures"] == 2
     # The run's cover (ids[2]) gains the twin's star.
     assert summary["covers_gaining_score"] == 1
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
-    assert report["dry_run"] is False
+    _run(server, _auto_stack_in_session, None, None, False, None)
     # The run did put ids[2] in front, so the preview described this run.
     assert _picture(server, ids[2]).stack_position == 0
     assert _picture(server, ids[1]).stack_position != 0
@@ -3269,7 +3254,7 @@ def test_an_auto_stack_run_commits_once_per_group_and_holds_no_group_rows(server
     def run(session):
         event.listen(session, "before_commit", count_group_rows)
         try:
-            return verdicts.bulk_auto_stack_in_session(session, None, None, False, None)
+            return _auto_stack_in_session(session, None, None, False, None)
         finally:
             event.remove(session, "before_commit", count_group_rows)
 
@@ -3332,7 +3317,7 @@ def test_an_auto_stack_run_leaves_a_group_an_earlier_group_collapsed(server):
     first, _second = _planned_signatures(server)
     first_cover = _preselected_cover(server, first)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
 
     stacks = {_picture(server, pid).stack_id for pid in ids.values()}
     assert len(stacks) == 1
@@ -3366,7 +3351,7 @@ def test_an_auto_stack_run_still_stacks_a_group_an_earlier_group_only_touched(se
     stack_id = _stack_pictures(server, [stacked_a, stacked_b])
     _scan(server)
 
-    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, False, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
 
     assert report["groups"] == 2
     assert report["superseded"] == 0
@@ -3446,8 +3431,8 @@ def _two_stack_library(background: int):
 def test_a_recheck_reads_its_own_group_not_the_library():
     """Re-checking one touched group costs the same however big the library is.
 
-    The run re-checks every group an earlier group touched, so a check whose
-    cost grows with the library makes the whole run quadratic. SQLite VM
+    A run re-checks every planned group just before stacking it, so a check
+    whose cost grows with the library makes the whole run quadratic. SQLite VM
     instructions keep the measure deterministic: ten times as many unrelated
     groups must not cost anything like ten times the work.
     """
@@ -3465,8 +3450,11 @@ def test_a_recheck_reads_its_own_group_not_the_library():
                 raw = session.connection().connection.dbapi_connection
                 raw.set_progress_handler(tick, 1)
                 try:
-                    # Group 2 is pictures 3 and 4, one in each stack; 3 was touched.
-                    answer = verdicts._still_poses_a_decision(session, 2, {3})
+                    # Group 2 is pictures 3 and 4, one in each stack.
+                    answer = (
+                        verdicts._recheck_planned_group(session, 2, tiers.DedupScope())
+                        is not None
+                    )
                 finally:
                     raw.set_progress_handler(None, 0)
         finally:
@@ -3505,10 +3493,10 @@ def test_an_unexpected_error_mid_run_is_logged_with_its_batch_and_raised(
 
     monkeypatch.setattr(verdicts, "apply_stack_verdict_in_session", break_on_the_second)
     with caplog.at_level(logging.ERROR, logger=verdicts.logger.name):
-        with pytest.raises(RuntimeError, match="stand-in failure"):
+        with pytest.raises(verdicts.AutoStackSliceError) as stopped:
             _run(
                 server,
-                verdicts.bulk_auto_stack_in_session,
+                _auto_stack_in_session,
                 None,
                 batch_id,
                 False,
@@ -3516,6 +3504,11 @@ def test_an_unexpected_error_mid_run_is_logged_with_its_batch_and_raised(
             )
 
     assert len(seen) == 2, "the run stops at the error"
+    assert isinstance(stopped.value.__cause__, RuntimeError)
+    # The run counts what committed before the stop from the error's report.
+    assert stopped.value.signature == seen[1]
+    assert stopped.value.report["groups"] == 1
+    assert stopped.value.report["batch_id"] == batch_id
     errors = [
         record
         for record in caplog.records
@@ -3544,22 +3537,22 @@ def test_an_error_in_the_recheck_is_logged_with_its_batch_and_raised(
     _seed_three_exact_groups(server)
     _scan(server)
     batch_id = verdicts.new_batch_id()
-    second = _planned_signatures(server)[1]
-    real = verdicts._still_poses_a_decision
+    second = _run(server, verdicts.plan_auto_stack_in_session, None, None)[1]
+    real = verdicts._recheck_planned_group
     calls: list[int] = []
 
-    def break_on_the_second(session, group_id, touched_picture_ids):
+    def break_on_the_second(session, group_id, scope):
         calls.append(group_id)
         if len(calls) == 2:
             raise RuntimeError("stand-in failure")
-        return real(session, group_id, touched_picture_ids)
+        return real(session, group_id, scope)
 
-    monkeypatch.setattr(verdicts, "_still_poses_a_decision", break_on_the_second)
+    monkeypatch.setattr(verdicts, "_recheck_planned_group", break_on_the_second)
     with caplog.at_level(logging.ERROR, logger=verdicts.logger.name):
-        with pytest.raises(RuntimeError, match="stand-in failure"):
+        with pytest.raises(verdicts.AutoStackSliceError) as stopped:
             _run(
                 server,
-                verdicts.bulk_auto_stack_in_session,
+                _auto_stack_in_session,
                 None,
                 batch_id,
                 False,
@@ -3572,7 +3565,10 @@ def test_an_error_in_the_recheck_is_logged_with_its_batch_and_raised(
         if record.levelno >= logging.ERROR and batch_id in record.getMessage()
     ]
     assert len(errors) == 1, caplog.text
-    assert second in errors[0].getMessage()
+    # The re-check reads the signature, so a failed one names the group's id.
+    assert f"id {second}" in errors[0].getMessage()
     assert errors[0].exc_info is not None
+    assert stopped.value.signature == f"id {second}"
+    assert stopped.value.report["groups"] == 1
     # The first group committed under the supplied batch, and nothing else did.
     assert [row.batch_id for row in _operations(server)] == [batch_id]

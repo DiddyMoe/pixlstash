@@ -20,6 +20,7 @@ const stores = vi.hoisted(() => ({
   fetchLocked: vi.fn(),
   invalidateScopeCounts: vi.fn(),
   refreshCounts: vi.fn(),
+  resumeAutoStackRun: vi.fn(),
 }));
 vi.mock("../stores/useEntityListsStore", () => ({
   useEntityListsStore: () => ({ invalidate: stores.invalidate }),
@@ -31,6 +32,7 @@ vi.mock("../stores/useDedupStore", () => ({
   useDedupStore: () => ({
     invalidateScopeCounts: stores.invalidateScopeCounts,
     refreshCounts: stores.refreshCounts,
+    resumeAutoStackRun: stores.resumeAutoStackRun,
   }),
 }));
 
@@ -98,5 +100,16 @@ describe("useSidebarRefresh", () => {
     sidebarRef.value = remounted;
     await nextTick();
     expect(remounted.refreshSidebar).not.toHaveBeenCalled();
+  });
+
+  // A background Auto-stack run outlives the tab that started it, so a
+  // reloaded tab has to find it again on whatever screen it lands, before its
+  // History steps start arriving as receipts of this tab's own. The app-level
+  // refresh is the one place every screen goes through; the store makes the
+  // calls after the first a no-op.
+  it("asks the duplicates store to pick up a background Auto-stack run", () => {
+    api.refreshSidebar();
+    expect(stores.resumeAutoStackRun).toHaveBeenCalledTimes(1);
+    expect(stores.resumeAutoStackRun).toHaveBeenCalledWith();
   });
 });

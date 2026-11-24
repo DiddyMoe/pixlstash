@@ -1784,6 +1784,9 @@ const tmLabelMap = {
   smart_scored: "Smart score",
   text_read: "Text in pictures",
   object_detection: "Object detection",
+  // The background Auto-stack run on the Duplicates screen: its groups, or for
+  // an undo its History steps (`Vault` names the counter).
+  duplicate_auto_stack: "Auto-stack",
 };
 
 const tmWorkerLabelMap = {

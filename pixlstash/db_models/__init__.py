@@ -6,6 +6,7 @@ from .adapter_attachment import (  # noqa: F401
 from .character import Character  # noqa: F401
 from .character_reference import CharacterReferenceMember  # noqa: F401
 from .dedup import (  # noqa: F401
+    DedupAutoStackRun,
     DedupGroup,
     DedupGroupMember,
     DedupScan,

@@ -97,6 +97,9 @@ from pixlstash.services.model_shelf_service import (
 )
 from pixlstash.db_models.adapter_attachment import ENTITY_CHARACTER, ENTITY_SET
 from pixlstash.services.restore import RestoreService
+from pixlstash.services.dedup_auto_stack_service import (
+    interrupt_orphaned_runs_in_session,
+)
 from pixlstash.hub.registry import VAULT_FILENAME
 from pixlstash.trusted_sqlite import TrustedSQLiteLocation
 from pixlstash.utils.path_utils import LibraryRootsUnavailable
@@ -434,6 +437,14 @@ class Vault:
         self._planner_work_finders[TaskType.PENDING_SCORE_INVALIDATION] = (
             PendingScoreInvalidationFinder(vault=self)
         )
+        # Works the background auto-stack runs the Duplicates screen requests.
+        # Needs the Vault, not just the database: a run announces the pictures
+        # it stacks and a revert restores through the undo registry.
+        from pixlstash.tasks.dedup_auto_stack_finder import DedupAutoStackFinder
+
+        self._planner_work_finders[TaskType.DEDUP_AUTO_STACK] = DedupAutoStackFinder(
+            vault=self
+        )
         self._model_folder_watcher = None
         # The one finder here that works on the HUB rather than on this vault:
         # a model folder is a fact about the machine, so the checkpoints it
@@ -577,6 +588,12 @@ class Vault:
         """
         if self._disable_background_workers or self._started:
             return
+        # An auto-stack run the previous process left pending or running has no
+        # task to own it any more. Close it as interrupted before the planner can
+        # queue it: a run is never resumed, the user decides whether to run again.
+        self.db.run_task(
+            interrupt_orphaned_runs_in_session, priority=DBPriority.IMMEDIATE
+        )
         # A trainer that outlived the restart gets its card before PixlStash's
         # own GPU workers start, so none of them loads a model under it.
         self.training_service.adopt_live_runs()
@@ -2495,6 +2512,31 @@ class Vault:
         finder_name = finder.finder_name()
         return self._work_planner.inflight_count(finder_name) > 0
 
+    def _task_phase_progress(self, task_type: TaskType) -> tuple[int, int, bool]:
+        """Progress of a task that counts its own work, read from the task.
+
+        For tasks whose denominator is their own work (a duplicate scan's
+        phases, an auto-stack run's groups) rather than the library's pictures.
+
+        Returns:
+            ``(total, missing, active)``; ``(0, 0, False)`` when none is running.
+        """
+        active_tasks = (
+            self._task_runner.get_active_tasks_of_type(task_type.value)
+            if self._task_runner is not None
+            else []
+        )
+        if not active_tasks:
+            return 0, 0, False
+        snapshots = [task.task_progress() for task in active_tasks]
+        total = max(1, sum(snapshot[1] for snapshot in snapshots))
+        processed = sum(snapshot[0] for snapshot in snapshots)
+        # The task remains active for a tiny interval after its final DB slice
+        # returns. Never advertise terminal progress until TaskRunner has
+        # actually removed it from the active set.
+        processed = min(processed, total - 1)
+        return total, total - processed, True
+
     def _build_worker_progress_snapshot(self) -> dict:
         progress = {}
         # Counted once per snapshot. It used to be re-counted for every worker
@@ -2715,25 +2757,16 @@ class Vault:
                 # generic library total, which otherwise renders a misleading
                 # "N / N" while the active task is still running.
                 label = "duplicate_scan"
-                active_dedup_tasks = (
-                    self._task_runner.get_active_tasks_of_type("DedupScanTask")
-                    if self._task_runner is not None
-                    else []
+                total, missing, worker_active_override = self._task_phase_progress(
+                    TaskType.DEDUP_SCAN
                 )
-                if active_dedup_tasks:
-                    snapshots = [task.task_progress() for task in active_dedup_tasks]
-                    total = max(1, sum(snapshot[1] for snapshot in snapshots))
-                    processed = sum(snapshot[0] for snapshot in snapshots)
-                    # The task remains active for a tiny interval after its final
-                    # DB slice returns. Never advertise terminal progress until
-                    # TaskRunner has actually removed it from the active set.
-                    processed = min(processed, total - 1)
-                    missing = total - processed
-                    worker_active_override = True
-                else:
-                    total = 0
-                    missing = 0
-                    worker_active_override = False
+            elif worker_type == TaskType.DEDUP_AUTO_STACK:
+                # Counts the run's planned groups (or, for a revert, its History
+                # segments), not the library: same reason as the scan above.
+                label = "duplicate_auto_stack"
+                total, missing, worker_active_override = self._task_phase_progress(
+                    TaskType.DEDUP_AUTO_STACK
+                )
             elif worker_type == TaskType.CHECKPOINT_HASH:
                 # The one worker here whose denominator is the model shelf and
                 # not the picture library. Left in the `planner_managed` default

@@ -57,7 +57,12 @@ import {
   keepGroupSeparate,
   applyVerdictBatch,
   reopenGroup,
-  autoStackExact,
+  previewAutoStackExact,
+  startAutoStackRun,
+  getAutoStackRun,
+  getLatestAutoStackRun,
+  cancelAutoStackRun,
+  revertAutoStackRun,
   listMixedStacks,
   splitMixedStack,
   keepMixedStack,
@@ -373,26 +378,102 @@ function groupWithoutPictures(group, removed) {
   };
 }
 
+// --- Auto-stack runs ---------------------------------------------------------
+
 /**
- * Why an Auto-stack preview request failed, in the terms the dialog words it.
+ * The poll interval when an active run's answer names none, and the bounds a
+ * named one is held to. The server's `Retry-After` is the interval; a value
+ * outside these bounds is read as a mistake rather than as a reason to spin or
+ * to fall silent for minutes. Failed reads back off from the default up to the
+ * ceiling.
+ */
+const AUTO_STACK_POLL_MS = 2000;
+const AUTO_STACK_POLL_MIN_MS = 500;
+const AUTO_STACK_POLL_MAX_MS = 30000;
+
+/**
+ * A start or an undo whose answer never arrived is sent again under the same
+ * request id, which the server answers with the run it already has rather
+ * than a second one. These are the waits before the second and third attempt;
+ * after them the caller hears that no answer came, and confirming again sends
+ * the same id once more.
+ */
+const AUTO_STACK_SUBMIT_RETRY_MS = Object.freeze([1000, 3000]);
+
+/** The operation a stack verdict records: the only kind a run writes. */
+const OP_TYPE_STACK = "dedup.stack";
+
+/**
+ * How many of this tab's newest stack gestures are remembered, so a manual
+ * stack that lands while a run is active still raises its own receipt. Only a
+ * gesture still between its request and its narration needs remembering.
+ */
+const OWN_STACK_GESTURE_MEMORY = 64;
+
+/** Which ended run the user dismissed from the banner, per browser. */
+const AUTO_STACK_DISMISSED_KEY = "pixlstash:dedupAutoStackDismissed";
+
+/**
+ * A run's identity for the dismissal memory. The id alone is not enough: a
+ * different or rebuilt library numbers its runs from 1 again.
+ *
+ * @param {Object|null} run
+ * @returns {string|null}
+ */
+function autoStackRunKey(run) {
+  return run ? `${run.id}:${run.created_at ?? ""}` : null;
+}
+
+/** Read which run the user dismissed, or null when none (or unreadable). */
+function storedDismissedAutoStackRun() {
+  try {
+    return window.localStorage?.getItem(AUTO_STACK_DISMISSED_KEY) ?? null;
+  } catch (err) {
+    // Private mode, or storage disabled by policy. Showing a finished run's
+    // banner again is a fine outcome; a thrown getter is not.
+    console.warn(
+      "[dedup] could not read which auto-stack run was dismissed; showing it",
+      err,
+    );
+    return null;
+  }
+}
+
+/** Resolve after `ms`, for a retry's pause. */
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Why an Auto-stack request failed, in the terms the dialog and the banner
+ * word it.
  *
  * Checked in this order because the cases overlap: an aborted or timed-out
  * request also arrives without a response, and only the remainder is a server
  * that could not be reached. `detail` is the server's own sentence, or for a
  * refused body (a list of field errors) the first error's message only: never
- * its `input`, which echoes the submitted value.
+ * its `input`, which echoes the submitted value. The run routes refuse with a
+ * structured detail, `{code, message, run}`: `code` is the machine-readable
+ * reason and `run` the run a refusal is about, such as the one already active.
  *
- * @param {*} err - the rejection from `autoStackExact`.
- * @returns {{kind: string, status: (number|null), detail: string}}
+ * @param {*} err - the rejection from a `../api/dedup` auto-stack call.
+ * @returns {{kind: string, status: (number|null), detail: string,
+ *   code: (string|null), run: (Object|null)}}
  */
-function autoStackPreviewFailure(err) {
+function autoStackFailure(err) {
   const status = Number(err?.response?.status) || null;
   const served = err?.response?.data?.detail;
   let detail = "";
+  let code = null;
+  let run = null;
   if (typeof served === "string") {
     detail = served.trim();
   } else if (Array.isArray(served) && typeof served[0]?.msg === "string") {
     detail = served[0].msg.trim();
+  } else if (served && typeof served === "object") {
+    if (typeof served.message === "string") detail = served.message.trim();
+    if (typeof served.code === "string") code = served.code;
+    if (served.run && typeof served.run === "object") run = served.run;
   }
   let kind;
   if (
@@ -409,10 +490,12 @@ function autoStackPreviewFailure(err) {
     kind = "validation";
   } else if (status === 401 || status === 403) {
     kind = "forbidden";
+  } else if (status === 409) {
+    kind = "conflict";
   } else {
     kind = "server";
   }
-  return { kind, status, detail };
+  return { kind, status, detail, code, run };
 }
 
 export const useDedupStore = defineStore("dedup", () => {
@@ -2242,6 +2325,27 @@ export const useDedupStore = defineStore("dedup", () => {
     return { action: "ignored", reason: `change-kind-${changeKind ?? "none"}` };
   }
 
+  // This tab's newest stack gestures, newest last (a Set keeps insertion
+  // order). An auto-stack run records `dedup.stack` operations under this
+  // tab's origin, and its newest segment can land before the poll has named
+  // it, so while a run is active the receipt filter holds back every
+  // `dedup.stack` operation except the ones this tab's own gestures sent.
+  const ownStackGestures = new Set();
+
+  /**
+   * Remember a stack gesture's batch id before its request leaves, so the
+   * operation it records is narrated even while a run is active.
+   *
+   * @param {string} batchId
+   */
+  function rememberOwnStackGesture(batchId) {
+    if (!batchId) return;
+    ownStackGestures.add(batchId);
+    if (ownStackGestures.size > OWN_STACK_GESTURE_MEMORY) {
+      ownStackGestures.delete(ownStackGestures.values().next().value);
+    }
+  }
+
   /**
    * Raise the standard action receipt for a verdict that recorded an
    * operation.
@@ -2312,8 +2416,11 @@ export const useDedupStore = defineStore("dedup", () => {
     // decided row must be inert, not a silent re-stack.
     if (showingDecided.value) return null;
     const targets = verdictTargets(group);
+    // Minted here, on both paths, so it is known before the request leaves:
+    // see rememberOwnStackGesture.
+    const gestureId = batchId || newOperationBatchId();
+    rememberOwnStackGesture(gestureId);
     if (targets.length > 1) {
-      const gestureId = batchId || newOperationBatchId();
       busy.value = true;
       try {
         const result = await applyVerdictBatch(
@@ -2350,7 +2457,7 @@ export const useDedupStore = defineStore("dedup", () => {
         busy.value = false;
       }
     }
-    const result = await stackOne(group, { batchId });
+    const result = await stackOne(group, { batchId: gestureId });
     if (result?.batch_id) narrateVerdictOperation();
     return result
       ? { ...result, gesture_skipped: result.skipped ?? [] }
@@ -2890,15 +2997,14 @@ export const useDedupStore = defineStore("dedup", () => {
    */
   async function previewAutoStack({ scope = currentScope(), signal } = {}) {
     try {
-      const data = await autoStackExact({
-        dryRun: true,
+      const data = await previewAutoStackExact({
         scopeType: scope.scopeType,
         scopeId: scope.scopeId,
         signal,
       });
       return { ok: true, data };
     } catch (err) {
-      const failure = autoStackPreviewFailure(err);
+      const failure = autoStackFailure(err);
       if (failure.kind !== "cancelled") {
         console.warn(
           `[dedup] failed to preview the auto-stack for ${scope.scopeType}` +
@@ -2911,67 +3017,453 @@ export const useDedupStore = defineStore("dedup", () => {
     }
   }
 
+  // --- Auto-stack runs ----------------------------------------------------
+  // Applying the exact tier is a background run on the server, an asynchronous
+  // request-reply: the start answers at once with the run, and this store
+  // follows it by polling at the interval the server names until it ends. The
+  // run does not depend on this tab. A reload, another tab or a later visit
+  // finds it again through the newest run, and History holds its stacks as
+  // steps of a bounded size, so nothing here is the run's only record.
+  const autoStackRun = ref(null);
+  const autoStackRunActive = computed(() =>
+    Boolean(autoStackRun.value?.active),
+  );
+  // True while the run cannot be read. The poll keeps trying, more slowly, and
+  // the banner says that the progress it shows is the last known.
+  const autoStackRunUnreachable = ref(false);
+  // The request on the wire for the run ("start", "cancel" or "revert"), so
+  // the control that sent it can show it pending; null when there is none.
+  const autoStackAction = ref(null);
+  const autoStackDismissedKey = ref(storedDismissedAutoStackRun());
+  const autoStackRunDismissed = computed(() => {
+    const run = autoStackRun.value;
+    return Boolean(
+      run &&
+      !run.active &&
+      autoStackRunKey(run) === autoStackDismissedKey.value,
+    );
+  });
   /**
-   * Run the bulk auto-stack for real.
+   * The apply run that Undo run would revert, or null when there is none to
+   * offer. A finished apply run is its own target while it has something left
+   * to undo. A revert that stopped short (stopped, interrupted, blocked by a
+   * later edit, or failed) points back at its apply run, so the undo can be
+   * sent again once whatever stopped it is dealt with; the server undoes only
+   * what is still stacked.
+   */
+  const autoStackRevertTargetId = computed(() => {
+    const run = autoStackRun.value;
+    if (!run || run.active) return null;
+    if (run.kind === "apply") return run.can_revert ? run.id : null;
+    return run.status === "complete" ? null : (run.target_run_id ?? null);
+  });
+  const autoStackCanRevert = computed(
+    () => autoStackRevertTargetId.value != null,
+  );
+  let autoStackPollTimer = null;
+  let autoStackPollFailures = 0;
+  // Bumped when the store forgets the run (a session reset): an answer still
+  // on the wire from before then writes nothing.
+  let autoStackEpoch = 0;
+  // Every read or write of the run takes a ticket as it leaves, and an answer
+  // older than the newest one applied is dropped: a poll sent before a Stop
+  // must not land after it and show the run as never asked to stop.
+  let autoStackTicket = 0;
+  let autoStackAppliedTicket = 0;
+  let autoStackResumeAttempted = false;
+  let autoStackResumeInFlight = null;
+  // Every History step a followed run has recorded. Kept after the run ends,
+  // because the operation log can be re-read after the last poll.
+  const autoStackSegmentBatches = new Set();
+  let narrationFilterInstalled = false;
+
+  /** A refusal decided here, without a request, shaped like a served one. */
+  function localAutoStackRefusal(kind, code = null) {
+    return {
+      ok: false,
+      error: { kind, status: null, detail: "", code, run: null },
+    };
+  }
+
+  /**
+   * The receipt filter: true for an operation a run recorded.
    *
-   * The whole run coalesces into one operation batch, so the receipt it raises
-   * reverses every stack it created with a single undo.
+   * A run records its stacks as History steps under the origin of the tab that
+   * started it, so without this that tab narrates each step as its own gesture:
+   * a pill every few seconds for the length of the run, each offering to undo
+   * one arbitrary slice of it. The banner is the run's receipt instead. A step
+   * the poll has named is known by its batch id. One it has not named yet is
+   * any stack, while an apply run is active, that no gesture of this tab sent.
    *
-   * The batch id is minted here, before the request leaves. A large run can
-   * outlast the client's timeout while the server keeps committing groups, and
-   * a request with no answer is then an outcome nobody knows yet rather than a
-   * failure: the queue is reloaded as after a finished run, and the result
-   * names the batch id the run was sent with, under which History shows and
-   * undoes whatever of the run reached the server.
+   * @param {Object} operation - an operation-log row.
+   * @returns {boolean}
+   */
+  function isAutoStackOperation(operation) {
+    const batchId = operation?.batch_id;
+    if (batchId && autoStackSegmentBatches.has(batchId)) return true;
+    const run = autoStackRun.value;
+    return Boolean(
+      run?.active &&
+      run.kind === "apply" &&
+      operation?.op_type === OP_TYPE_STACK &&
+      !ownStackGestures.has(batchId),
+    );
+  }
+
+  /**
+   * Hand the receipt filter to the operation store, once, when this store
+   * first follows a run. Lazily, so a session that never runs auto-stack
+   * leaves the operation store exactly as it was.
+   */
+  function installNarrationFilter() {
+    if (narrationFilterInstalled) return;
+    useOperationStore().setNarrationFilter(isAutoStackOperation);
+    narrationFilterInstalled = true;
+  }
+
+  function stopAutoStackPoll() {
+    if (autoStackPollTimer) {
+      clearTimeout(autoStackPollTimer);
+      autoStackPollTimer = null;
+    }
+  }
+
+  /**
+   * Read the run again after `delayMs`, held to the poll bounds. One timer at
+   * most: scheduling replaces any read already waiting.
+   *
+   * @param {number|null} delayMs - the server's hint, or null for the default.
+   */
+  function scheduleAutoStackPoll(delayMs) {
+    stopAutoStackPoll();
+    const hinted = Number.isFinite(delayMs) ? delayMs : AUTO_STACK_POLL_MS;
+    const delay = Math.min(
+      AUTO_STACK_POLL_MAX_MS,
+      Math.max(AUTO_STACK_POLL_MIN_MS, hinted),
+    );
+    const epoch = autoStackEpoch;
+    autoStackPollTimer = setTimeout(() => {
+      autoStackPollTimer = null;
+      if (epoch === autoStackEpoch) pollAutoStackRun();
+    }, delay);
+  }
+
+  async function pollAutoStackRun() {
+    const run = autoStackRun.value;
+    if (!run?.active) return;
+    const epoch = autoStackEpoch;
+    const ticket = ++autoStackTicket;
+    try {
+      const reply = await getAutoStackRun(run.id);
+      adoptAutoStackRun(reply.run, reply.retryAfterMs, { epoch, ticket });
+    } catch (err) {
+      if (epoch !== autoStackEpoch || ticket < autoStackAppliedTicket) return;
+      if (autoStackRun.value?.id !== run.id) return;
+      if (Number(err?.response?.status) === 404) {
+        // The run is gone: another library is open, or its row was removed.
+        // There is nothing left to follow, so its banner goes with it.
+        console.warn(
+          `[dedup] auto-stack run ${run.id} no longer exists; no longer following it`,
+          err,
+        );
+        autoStackAppliedTicket = ticket;
+        stopAutoStackPoll();
+        autoStackRun.value = null;
+        autoStackRunUnreachable.value = false;
+        autoStackPollFailures = 0;
+        return;
+      }
+      autoStackPollFailures += 1;
+      autoStackRunUnreachable.value = true;
+      const backoff = Math.min(
+        AUTO_STACK_POLL_MAX_MS,
+        AUTO_STACK_POLL_MS * 2 ** autoStackPollFailures,
+      );
+      console.warn(
+        `[dedup] could not read auto-stack run ${run.id} ` +
+          `(${autoStackPollFailures} in a row); trying again in ${backoff} ms`,
+        err,
+      );
+      scheduleAutoStackPoll(backoff);
+    }
+  }
+
+  /**
+   * Take a run the server answered with as the one this store follows.
+   *
+   * The single way a run enters the store, so every answer meets the same
+   * guards: one from before a session reset, or older than an answer already
+   * applied, is dropped. While the run goes, the badge follows it without help
+   * from here: every slice announces its pictures, and that refreshes the
+   * counts through the sidebar. A run that ended re-reads the queue, since it
+   * changed the queue under the user: on the poll's word, or on a gesture's
+   * answer when the run had already ended by the time it arrived. A run found
+   * by {@link resumeAutoStackRun} already ended is shown, not re-read.
+   *
+   * @param {Object} run
+   * @param {number|null} retryAfter - the server's poll hint, in ms.
+   * @param {Object} claim - taken when the request left.
+   * @param {number} claim.epoch
+   * @param {number} claim.ticket
+   * @param {boolean} [claim.fromGesture=false] - the answer to the user's own
+   *   start, stop or undo.
+   * @returns {boolean} whether the run was taken.
+   */
+  function adoptAutoStackRun(
+    run,
+    retryAfter,
+    { epoch, ticket, fromGesture = false },
+  ) {
+    if (!run || epoch !== autoStackEpoch || ticket < autoStackAppliedTicket) {
+      return false;
+    }
+    autoStackAppliedTicket = ticket;
+    installNarrationFilter();
+    for (const batchId of run.segment_batch_ids ?? []) {
+      autoStackSegmentBatches.add(batchId);
+    }
+    const previous = autoStackRun.value;
+    const sameRun = previous?.id === run.id;
+    autoStackRun.value = run;
+    autoStackRunUnreachable.value = false;
+    autoStackPollFailures = 0;
+    if (run.active) scheduleAutoStackPoll(retryAfter);
+    else stopAutoStackPoll();
+    const ended = !run.active && (sameRun ? previous.active : fromGesture);
+    if (ended) {
+      reloadAfterAutoStackRun().catch((err) => {
+        // Both reads log and swallow their own failures; this only catches a
+        // programming error, which must not become an unhandled rejection.
+        console.warn(
+          `[dedup] could not re-read the queue after auto-stack run ${run.id}`,
+          err,
+        );
+      });
+    }
+    return true;
+  }
+
+  /**
+   * The run changed the queue under the user: read the counts again, and the
+   * list from the top if one is showing. The queue reads its own first page
+   * when it opens, so a list that was never loaded is left alone.
+   */
+  async function reloadAfterAutoStackRun() {
+    invalidateScopeCounts();
+    if (groups.value.length) await loadFirstPage();
+    await refreshCounts();
+  }
+
+  /**
+   * Send a start, a stop or an undo, retrying only when no answer came.
+   *
+   * `send` carries a fixed request id where the route takes one, so a retry
+   * is the same request: the server answers it with the run the first attempt
+   * started, if it did. A refusal is an answer and is not retried. A refusal
+   * that names a run (another run already active, nothing left to undo) has
+   * that run followed, so the banner shows what the refusal was about.
+   *
+   * @param {string} action - `start`, `cancel` or `revert`.
+   * @param {Function} send - `() => Promise<{run, retryAfterMs}>`.
+   * @returns {Promise<{ok: true, run: Object}|{ok: false, error: Object}>}
+   *   `error` as {@link autoStackFailure} words it, plus `busy` when another
+   *   run request is already on the wire.
+   */
+  async function submitAutoStackRequest(action, send) {
+    if (autoStackAction.value) return localAutoStackRefusal("busy");
+    autoStackAction.value = action;
+    const epoch = autoStackEpoch;
+    try {
+      for (let attempt = 0; ; attempt += 1) {
+        const ticket = ++autoStackTicket;
+        try {
+          const reply = await send();
+          if (epoch !== autoStackEpoch) {
+            return localAutoStackRefusal("cancelled");
+          }
+          adoptAutoStackRun(reply.run, reply.retryAfterMs, {
+            epoch,
+            ticket,
+            fromGesture: true,
+          });
+          return { ok: true, run: reply.run };
+        } catch (err) {
+          const failure = autoStackFailure(err);
+          if (epoch !== autoStackEpoch) return { ok: false, error: failure };
+          const unanswered =
+            failure.kind === "timeout" || failure.kind === "network";
+          if (unanswered && attempt < AUTO_STACK_SUBMIT_RETRY_MS.length) {
+            console.warn(
+              `[dedup] no answer to the auto-stack ${action}; sending the same ` +
+                `request again (attempt ${attempt + 2})`,
+              err,
+            );
+            await wait(AUTO_STACK_SUBMIT_RETRY_MS[attempt]);
+            if (epoch !== autoStackEpoch) return { ok: false, error: failure };
+            continue;
+          }
+          if (failure.run) {
+            adoptAutoStackRun(failure.run, null, { epoch, ticket });
+          }
+          console.warn(
+            `[dedup] the auto-stack ${action} did not go through ` +
+              `(${failure.kind}${failure.status ? ` ${failure.status}` : ""}` +
+              `${failure.code ? `, ${failure.code}` : ""})`,
+            err,
+          );
+          return { ok: false, error: failure };
+        }
+      }
+    } finally {
+      if (epoch === autoStackEpoch) autoStackAction.value = null;
+    }
+  }
+
+  /**
+   * Start a background run that stacks the exact tier, and follow it.
    *
    * @param {Object} [options]
    * @param {{scopeType: string, scopeId: (string|number|null)}} [options.scope]
    *   the scope to stack: the one the user previewed, so a scope change while
    *   the dialog was open cannot redirect the run. The queue's current scope
    *   when omitted.
-   * @returns {Promise<Object|null>} the run report, carrying `batch_id` and any
-   *   `failures`; `{outcome: "unknown", batch_id}` when no answer arrived (a
-   *   timeout or a lost connection); `null` when the server answered with an
-   *   error, which is left in `error`.
+   * @param {string} [options.requestId] - the gesture's id. The dialog mints
+   *   one when it opens and sends it again if the user confirms again after an
+   *   unanswered attempt, so a start that did reach the server is found rather
+   *   than repeated. Minted here when omitted.
+   * @returns {Promise<{ok: true, run: Object}|{ok: false, error: Object}>}
+   *   `error.code` is `auto_stack_run_active` when another run is going (that
+   *   run is now followed) and `request_id_reused` when the id started a
+   *   different run.
    */
-  async function runAutoStack({ scope = currentScope() } = {}) {
-    busy.value = true;
-    const batchId = newOperationBatchId();
-    try {
-      const result = await autoStackExact({
-        dryRun: false,
+  function startAutoStack({ scope = currentScope(), requestId } = {}) {
+    const id = requestId || newOperationBatchId();
+    return submitAutoStackRequest("start", () =>
+      startAutoStackRun({
         scopeType: scope.scopeType,
         scopeId: scope.scopeId,
-        batchId,
-      });
-      invalidateScopeCounts();
-      // The whole run is one operation batch; the same response-driven
-      // narration as a single verdict raises its one receipt.
-      if (result?.batch_id) narrateVerdictOperation();
-      await loadFirstPage();
-      await refreshCounts();
-      return result;
-    } catch (err) {
-      if (!err?.response) {
-        // No answer is not a refusal: the server may still be stacking under
-        // this batch, so nothing here retries or claims the run failed.
+        requestId: id,
+      }),
+    );
+  }
+
+  /**
+   * Ask the followed run to stop. It stops at its next slice; what it already
+   * stacked stays stacked, and Undo run reverses it.
+   *
+   * @returns {Promise<{ok: true, run: Object}|{ok: false, error: Object}>}
+   */
+  function cancelAutoStack() {
+    const run = autoStackRun.value;
+    if (!run?.active) return Promise.resolve({ ok: true, run });
+    return submitAutoStackRequest("cancel", () => cancelAutoStackRun(run.id));
+  }
+
+  /**
+   * Undo every stack an apply run made, as a run of its own: the followed
+   * apply run, or the one a stopped-short revert was undoing (see
+   * `autoStackRevertTargetId`).
+   *
+   * @param {Object} [options]
+   * @param {string} [options.requestId] - the gesture's id; minted here when
+   *   omitted, and kept across the automatic retries either way.
+   * @returns {Promise<{ok: true, run: Object}|{ok: false, error: Object}>}
+   *   the revert run, which the store now follows in place of the apply run.
+   */
+  function revertAutoStack({ requestId } = {}) {
+    const targetId = autoStackRevertTargetId.value;
+    if (targetId == null) {
+      return Promise.resolve(
+        localAutoStackRefusal("conflict", "nothing_to_revert"),
+      );
+    }
+    const id = requestId || newOperationBatchId();
+    return submitAutoStackRequest("revert", () =>
+      revertAutoStackRun(targetId, { requestId: id }),
+    );
+  }
+
+  /**
+   * Find the newest run and follow it, so a run started before a reload, in
+   * another tab or on an earlier visit shows its progress and its result here,
+   * and its History steps stay off this tab's receipt pill.
+   *
+   * Once per session unless forced. The app asks on every sidebar refresh,
+   * which is how a reload picks a run up wherever it lands; the queue forces a
+   * fresh read when it opens, since another tab may have started one since.
+   * A run already being followed while active is left to its poll.
+   *
+   * @param {Object} [options]
+   * @param {boolean} [options.force=false]
+   * @returns {Promise<Object|null>} the run now followed, or null.
+   */
+  function resumeAutoStackRun({ force = false } = {}) {
+    if (autoStackResumeInFlight) return autoStackResumeInFlight;
+    if (autoStackRunActive.value || (!force && autoStackResumeAttempted)) {
+      return Promise.resolve(autoStackRun.value);
+    }
+    autoStackResumeAttempted = true;
+    const epoch = autoStackEpoch;
+    const ticket = ++autoStackTicket;
+    const pending = (async () => {
+      try {
+        const run = await getLatestAutoStackRun();
+        if (run) adoptAutoStackRun(run, null, { epoch, ticket });
+      } catch (err) {
         console.warn(
-          `[dedup] no answer from the auto-stack run under batch ${batchId}; ` +
-            "its outcome is unknown",
+          "[dedup] could not look for an auto-stack run to follow",
           err,
         );
-        invalidateScopeCounts();
-        await loadFirstPage();
-        await refreshCounts();
-        return { outcome: "unknown", batch_id: batchId };
       }
-      error.value = err;
-      console.warn("[dedup] failed to run the auto-stack", err);
-      return null;
-    } finally {
-      busy.value = false;
+      return autoStackRun.value;
+    })().finally(() => {
+      if (autoStackResumeInFlight === pending) autoStackResumeInFlight = null;
+    });
+    autoStackResumeInFlight = pending;
+    return pending;
+  }
+
+  /**
+   * Hide the followed run's banner once it has ended, and remember that in
+   * this browser so the next visit does not show it again. An active run
+   * cannot be dismissed: its banner is the only place its progress shows.
+   */
+  function dismissAutoStackRun() {
+    const run = autoStackRun.value;
+    if (!run || run.active) return;
+    const key = autoStackRunKey(run);
+    autoStackDismissedKey.value = key;
+    try {
+      window.localStorage?.setItem(AUTO_STACK_DISMISSED_KEY, key);
+    } catch (err) {
+      // Hidden for this session; only the memory of it is lost.
+      console.warn(
+        "[dedup] could not remember the dismissed auto-stack run for next time",
+        err,
+      );
     }
   }
+
+  /**
+   * Stop following any run and drop everything learned about it, so nothing
+   * read under one session reaches the next. The run itself carries on, on
+   * the server.
+   */
+  function forgetAutoStackRun() {
+    autoStackEpoch += 1;
+    stopAutoStackPoll();
+    autoStackAppliedTicket = autoStackTicket;
+    autoStackRun.value = null;
+    autoStackRunUnreachable.value = false;
+    autoStackAction.value = null;
+    autoStackPollFailures = 0;
+    autoStackResumeAttempted = false;
+    autoStackResumeInFlight = null;
+    autoStackSegmentBatches.clear();
+    ownStackGestures.clear();
+  }
+
+  onScopeDispose(stopAutoStackPoll);
 
   // ── Mixed stacks (design D5) ─────────────────────────────────────────────
   // The third page of the Duplicates destination: live stacks whose members do
@@ -3394,10 +3886,13 @@ export const useDedupStore = defineStore("dedup", () => {
    *
    * Three things have to go together, in this order:
    *
-   *   1. The scan poll and the end-chase, so no TIMER re-enters the store and
-   *      repopulates it a second after the clear. `stopScanPoll` already owns
-   *      the interval and the deferred request, so it is reused rather than
-   *      re-implemented.
+   *   1. The scan poll, the auto-stack run poll and the end-chase, so no
+   *      TIMER re-enters the store and repopulates it a second after the
+   *      clear. `stopScanPoll` already owns the interval and the deferred
+   *      request, and `forgetAutoStackRun` the run's timer, its in-flight
+   *      answers and its remembered History steps, so both are reused rather
+   *      than re-implemented. The receipt filter stays installed: it reads
+   *      the emptied state, so it holds back nothing until a run is tracked.
    *   2. The in-flight bookkeeping, so a caller cannot JOIN a request that
    *      belongs to the previous session.
    *   3. The state itself.
@@ -3413,6 +3908,7 @@ export const useDedupStore = defineStore("dedup", () => {
    */
   function reset() {
     stopScanPoll();
+    forgetAutoStackRun();
     cancelEndChase();
     windowEpoch += 1;
     pageInFlight = null;
@@ -3590,7 +4086,18 @@ export const useDedupStore = defineStore("dedup", () => {
     stopScanPoll,
     currentScope,
     previewAutoStack,
-    runAutoStack,
+    // auto-stack runs
+    autoStackRun,
+    autoStackRunActive,
+    autoStackRunUnreachable,
+    autoStackRunDismissed,
+    autoStackAction,
+    autoStackCanRevert,
+    startAutoStack,
+    cancelAutoStack,
+    revertAutoStack,
+    resumeAutoStackRun,
+    dismissAutoStackRun,
     // mixed stacks (the third page)
     showingMixed,
     mixedStacks,

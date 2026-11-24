@@ -71,6 +71,12 @@ export function useSidebarRefresh({ sidebarRef }) {
     if (!isReadOnly.value) {
       dedupStore.invalidateScopeCounts();
       dedupStore.refreshCounts();
+      // A background Auto-stack run outlives the tab that started it. The
+      // first refresh of a session is where a reloaded tab finds it again, on
+      // whatever screen it lands: followed from here, its History steps stay
+      // off this tab's receipt pill, as they did before the reload. Once per
+      // session; the store makes every later call a no-op.
+      dedupStore.resumeAutoStackRun();
     }
   }
 

@@ -120,9 +120,14 @@ describe("DedupAutoStackDialog: the dry run", () => {
     ]);
   });
 
-  it("spells the undo out in keycaps", () => {
-    const kbds = mountDialog().findAll(".as-reversible kbd");
-    expect(kbds.map((k) => k.text())).toEqual(["Ctrl", "Z"]);
+  // The run goes on in the background and is undone from its banner, as a
+  // run of its own: one Ctrl+Z would reverse only the newest of its History
+  // steps, so the consent must not promise that.
+  it("says the run goes on in the background and is undone as a whole", () => {
+    const note = mountDialog().find(".as-reversible");
+    expect(note.text()).toContain("Runs in the background");
+    expect(note.text()).toContain("Undo run reverses every stack it made");
+    expect(note.find("kbd").exists()).toBe(false);
   });
 });
 
@@ -270,5 +275,102 @@ describe("DedupAutoStackDialog: the confirmation", () => {
 
     button.find("button").trigger("click");
     expect(wrapper.emitted("confirm")).toHaveLength(1);
+  });
+});
+
+describe("DedupAutoStackDialog: starting the run", () => {
+  // Pending, not refused: the button holds still with a spinner while the
+  // start is on the wire, so a second click cannot send a second start.
+  it("holds the confirm button while the start is on the wire", () => {
+    const button = footerButtons(mountDialog({ busy: true }))[1];
+    expect(button.props("loading")).toBe(true);
+    expect(button.find("button").attributes("disabled")).toBeDefined();
+    expect(button.find("button").attributes("aria-busy")).toBe("true");
+  });
+
+  it("stays quiet about the start until one fails", () => {
+    expect(mountDialog().find(".as-start-failed").exists()).toBe(false);
+  });
+
+  // The incident this guards: a start with no answer said only that the
+  // outcome was unknown. It now says what confirming again does, because the
+  // second confirm sends the same request and cannot start a second run.
+  it.each([
+    [
+      "no answer",
+      { kind: "timeout", status: null, detail: "", code: null },
+      "No answer came from the server, so it is not known whether the run started. Confirm again to retry: it sends the same request, which cannot start a second run.",
+    ],
+    [
+      "an unreachable server",
+      { kind: "network", status: null, detail: "", code: null },
+      "No answer came from the server, so it is not known whether the run started. Confirm again to retry: it sends the same request, which cannot start a second run.",
+    ],
+    [
+      "a server fault",
+      { kind: "server", status: 500, detail: "", code: null },
+      "The run could not start on the server. Confirm again to retry: it sends the same request, which cannot start a second run.",
+    ],
+    [
+      "another run already going",
+      {
+        kind: "conflict",
+        status: 409,
+        detail: "An auto-stack run is already active.",
+        code: "auto_stack_run_active",
+      },
+      "Another Auto-stack run is already going, and its progress shows above the queue. Start this one once it has finished.",
+    ],
+    [
+      "a refused request",
+      {
+        kind: "validation",
+        status: 422,
+        detail: "That request id already started a different run",
+        code: "request_id_reused",
+      },
+      "The server refused to start the run: That request id already started a different run.",
+    ],
+    [
+      "a missing permission",
+      { kind: "forbidden", status: 403, detail: "", code: null },
+      "You don't have permission to stack duplicates here.",
+    ],
+  ])("words %s as what it was", (_label, startError, sentence) => {
+    const wrapper = mountDialog({ startError });
+    expect(wrapper.find(".as-start-failed").text()).toBe(sentence);
+  });
+
+  it.each([["cancelled"], ["busy"]])(
+    "says nothing about a %s start",
+    (kind) => {
+      const wrapper = mountDialog({
+        startError: { kind, status: null, detail: "", code: null },
+      });
+      expect(wrapper.find(".as-start-failed").exists()).toBe(false);
+    },
+  );
+
+  // Confirming again is the advice after no answer, so the button must allow
+  // it; against a run already going it would only be refused again.
+  it("allows a second confirm after no answer, but not against a running run", () => {
+    const retry = footerButtons(
+      mountDialog({
+        startError: { kind: "timeout", status: null, detail: "", code: null },
+      }),
+    )[1];
+    expect(retry.find("button").attributes("disabled")).toBeUndefined();
+
+    const blocked = footerButtons(
+      mountDialog({
+        startError: {
+          kind: "conflict",
+          status: 409,
+          detail: "",
+          code: "auto_stack_run_active",
+        },
+      }),
+    )[1];
+    expect(blocked.find("button").attributes("disabled")).toBeDefined();
   });
 });

@@ -281,14 +281,18 @@
         <!-- Compresses with the bar rather than folding: a bulk action with
              an accent fill must stay a visible target. Full label → short
              "Auto-stack N" (≤1040) → icon + count (≤820), the sentence
-             surviving as tooltip and accessible name throughout. -->
+             surviving as tooltip and accessible name throughout.
+             While a run is going it is held with `aria-disabled`, never the
+             `disabled` attribute: it stays focusable, and its tooltip says
+             why it is held and where the run's progress is. -->
         <AppButton
           v-if="store.exactCount > 0 && !readOnly && !store.showingMixed"
           variant="primary"
           icon-left="flash-outline"
           class="dq-bar-action"
-          :tooltip="autoStackLabel"
+          :tooltip="autoStackBlockedReason || autoStackLabel"
           :aria-label="autoStackLabel"
+          :aria-disabled="autoStackBlockedReason ? 'true' : undefined"
           data-testid="auto-stack-trigger"
           @click="openAutoStack"
         >
@@ -318,6 +322,22 @@
     </div>
 
     <DedupScanBanner :scan="store.scan" />
+
+    <!-- The background Auto-stack run, followed until it ends and then kept
+         until dismissed: once the start has answered, this is the only place
+         its progress and its outcome show. On every page of the destination,
+         since the run changes the queue whichever page is up. -->
+    <DedupAutoStackBanner
+      v-if="!readOnly && store.autoStackRun && !store.autoStackRunDismissed"
+      class="dq-run-banner"
+      :run="store.autoStackRun"
+      :unreachable="store.autoStackRunUnreachable"
+      :action="store.autoStackAction"
+      :can-revert="store.autoStackCanRevert"
+      @stop="onStopAutoStack"
+      @revert="onRevertAutoStack"
+      @dismiss="onDismissAutoStack"
+    />
 
     <!-- One live region for the whole destination, and deliberately OUTSIDE the
          branches below: a region that unmounts with the last row takes the
@@ -738,7 +758,8 @@
       :preview="autoStackPreview"
       :loading="autoStackLoading"
       :preview-error="autoStackError"
-      :busy="store.busy"
+      :busy="store.autoStackAction === 'start'"
+      :start-error="autoStackStartError"
       :queue-remaining="store.queueOnlyCount"
       @close="closeAutoStack"
       @confirm="confirmAutoStack"
@@ -785,7 +806,7 @@ import { useRoute, useRouter } from "vue-router";
 import { useDedupStore } from "../../stores/useDedupStore";
 import { useOperationStore } from "../../stores/useOperationStore";
 import { useNoticeStore } from "../../stores/useNoticeStore";
-import { isReadOnly } from "../../utils/apiClient";
+import { isReadOnly, newOperationBatchId } from "../../utils/apiClient";
 import {
   candidateId,
   groupUnits,
@@ -818,6 +839,7 @@ import DedupScanBanner from "../widgets/DedupScanBanner.vue";
 import DedupScopePill from "../widgets/DedupScopePill.vue";
 import DedupCompareDialog from "../widgets/DedupCompareDialog.vue";
 import DedupAutoStackDialog from "../widgets/DedupAutoStackDialog.vue";
+import DedupAutoStackBanner from "../widgets/DedupAutoStackBanner.vue";
 import ActionReceipt from "../widgets/ActionReceipt.vue";
 import AppButton from "../widgets/AppButton.vue";
 import AppBarButton from "../widgets/AppBarButton.vue";
@@ -1092,11 +1114,21 @@ const autoStackError = ref(null);
 // The scope the open dialog previewed, frozen when it opened, so confirming
 // stacks exactly what the user was shown even if the queue moved meanwhile.
 const autoStackScope = ref(null);
-// Each opening's dry run has a token and its own abort controller. A reply
-// that lands after a newer opening, or after the dialog closed, belongs to no
-// dialog on screen and is dropped.
+// Why the run the open dialog asked for did not start, or null.
+const autoStackStartError = ref(null);
+// Each opening of the dialog has a token, and its dry run its own abort
+// controller. A dry run's reply, or a start's, that lands after a newer
+// opening or after the dialog closed belongs to no dialog on screen: the dry
+// run's is dropped, and the start's is said elsewhere.
 let autoStackRunToken = 0;
 let autoStackAbort = null;
+// The start's request id, minted per opening. Confirming again in the same
+// dialog sends it again, so a start that reached the server unanswered is
+// answered with the run it began instead of beginning a second.
+let autoStackRequestId = null;
+// The same for Undo run, as `{ runId, id }`: kept only after a press that
+// went unanswered, and sent again only on a press on the same run.
+let autoStackRevertRequest = null;
 const announcement = ref("");
 
 // Which thumbnails are currently flashing their lock chip, and on which row.
@@ -1204,6 +1236,21 @@ const autoStackLabel = computed(
       store.exactCount === 1 ? "match" : "matches"
     }`,
 );
+
+/**
+ * Why the auto-stack button is held, or "" when it is not. One run at a time:
+ * the server refuses a second start while one is going, so the button says so
+ * beforehand instead of opening a dialog that cannot confirm.
+ */
+const autoStackBlockedReason = computed(() => {
+  if (store.autoStackRunActive) {
+    return "An Auto-stack run is already going. Its progress shows above the queue.";
+  }
+  if (store.autoStackAction) {
+    return "Waiting for the server to answer the last Auto-stack request.";
+  }
+  return "";
+});
 
 /** What the toolbar calls the queue: the count, and which side of it is shown. */
 const headline = computed(() => {
@@ -2597,12 +2644,16 @@ function abandonAutoStackPreview() {
  * reply must not land over the second opening's figures.
  */
 async function openAutoStack() {
+  // Held, not disabled (see the button): the click still arrives.
+  if (autoStackBlockedReason.value) return;
   abandonAutoStackPreview();
   const token = autoStackRunToken;
   const controller = new AbortController();
   autoStackAbort = controller;
   const scope = store.currentScope();
   autoStackScope.value = scope;
+  autoStackRequestId = newOperationBatchId();
+  autoStackStartError.value = null;
   autoStackOpen.value = true;
   autoStackLoading.value = true;
   autoStackPreview.value = null;
@@ -2631,37 +2682,215 @@ function closeAutoStack() {
   autoStackPreview.value = null;
   autoStackError.value = null;
   autoStackScope.value = null;
+  autoStackStartError.value = null;
+  autoStackRequestId = null;
 }
 
+/**
+ * Start the run the dialog consented to, and hand it to the banner.
+ *
+ * The server answers once the run is queued, not when it is done, so the
+ * dialog closes on that answer and the banner above the queue follows the run
+ * from there. A start that went unanswered or was refused keeps the dialog
+ * open on the reason; confirming again sends the same request id, which the
+ * server answers with the run the first attempt began, if it began one.
+ */
 async function confirmAutoStack() {
-  const result = await store.runAutoStack({ scope: autoStackScope.value });
-  closeAutoStack();
-  if (result?.outcome === "unknown") {
-    // No answer arrived: the server may still be stacking, may never have
-    // received the request, or may have finished and lost the reply. Only
-    // "not confirmed" is true for all three, so the run is neither reported
-    // as failed nor as running. The announcement is screen-reader only, so the
-    // same sentence is also shown.
-    const sentence =
-      "Auto-stack did not answer, so its outcome is not confirmed: it may still be running, or it may never have reached the server. Check History before running it again.";
-    announcement.value = sentence;
-    noticeStore.info(sentence);
-  } else if (result?.batch_id) {
-    const made = Number(result.groups ?? 0).toLocaleString();
-    announcement.value = `Created ${made} stacks. Undo reverses the whole run in one step.`;
-    // One unstackable group never aborts the run, so a partial result has to be
-    // reported rather than hidden behind a success message.
-    const skipped = result.failures?.length ?? 0;
-    if (skipped) {
-      noticeStore.warning(
-        `Created ${made} stacks. ${skipped} ${skipped === 1 ? "group was" : "groups were"} skipped and stayed in the queue.`,
-      );
-    }
-  } else {
-    reportVerdictFailure("create those stacks", store.error);
+  const token = autoStackRunToken;
+  autoStackStartError.value = null;
+  const result = await store.startAutoStack({
+    scope: autoStackScope.value,
+    requestId: autoStackRequestId,
+  });
+  const sameDialog = autoStackOpen.value && token === autoStackRunToken;
+  if (result.ok) {
+    if (sameDialog) closeAutoStack();
+    announcement.value = result.run?.active
+      ? "Auto-stack started in the background. Its progress shows above the queue."
+      : "That Auto-stack run has already ended. Its result shows above the queue.";
+    rootEl.value?.focus?.();
+    return;
   }
+  const { error } = result;
+  // A session that ended took the request with it; another request on the
+  // wire is the one whose answer will be said.
+  if (error.kind === "cancelled" || error.kind === "busy") return;
+  if (sameDialog) {
+    autoStackStartError.value = error;
+    return;
+  }
+  // The dialog was closed while the start was out, so the reason has nowhere
+  // to show but a notice. An unanswered start may still have begun: the
+  // newest run is looked for, and the banner shows it if it did.
+  if (error.kind === "timeout" || error.kind === "network") {
+    store.resumeAutoStackRun({ force: true });
+  }
+  reportAutoStackFailure(autoStackFailureSentence("start", error));
+}
+
+/**
+ * Ask the run on the banner to stop after its current step. What it already
+ * did stays done, and the banner then offers to undo it.
+ */
+async function onStopAutoStack() {
+  const reverting = store.autoStackRun?.kind === "revert";
+  const result = await store.cancelAutoStack();
+  if (result.ok) {
+    announcement.value = !result.run?.active
+      ? `${reverting ? "The undo" : "Auto-stack"} had already ended. Its result shows above the queue.`
+      : reverting
+        ? "The undo stops after the current step. The groups it put back stay in the queue."
+        : "Auto-stack stops after the current step. The stacks it made so far stay.";
+    // Stop leaves the banner with the press, so the queue takes the keyboard
+    // back rather than letting focus fall to the page.
+    rootEl.value?.focus?.();
+    return;
+  }
+  if (result.error.kind === "cancelled" || result.error.kind === "busy") return;
+  reportAutoStackFailure(autoStackFailureSentence("stop", result.error));
+}
+
+/**
+ * Undo every stack the banner's run made, as a run of its own that the banner
+ * then follows. A press that went unanswered is sent again with the same id
+ * on the next press, so an undo that did start is found, not started twice.
+ */
+async function onRevertAutoStack() {
+  const pressedOn = store.autoStackRun?.id ?? null;
+  if (autoStackRevertRequest?.runId !== pressedOn) {
+    autoStackRevertRequest = { runId: pressedOn, id: newOperationBatchId() };
+  }
+  const result = await store.revertAutoStack({
+    requestId: autoStackRevertRequest.id,
+  });
+  const unanswered =
+    !result.ok &&
+    (result.error.kind === "timeout" || result.error.kind === "network");
+  if (!unanswered) autoStackRevertRequest = null;
+  if (result.ok) {
+    announcement.value = result.run?.active
+      ? "Undoing Auto-stack in the background. Its progress shows above the queue."
+      : "That undo has already ended. Its result shows above the queue.";
+    rootEl.value?.focus?.();
+    return;
+  }
+  if (result.error.kind === "cancelled" || result.error.kind === "busy") return;
+  reportAutoStackFailure(autoStackFailureSentence("undo", result.error));
+}
+
+/** Put away an ended run's banner, and give the keyboard back to the queue. */
+function onDismissAutoStack() {
+  store.dismissAutoStackRun();
   rootEl.value?.focus?.();
 }
+
+/**
+ * Why a start, stop or undo of a run did not go through, as one sentence.
+ *
+ * A refusal that named a run has already put that run on the banner (the
+ * store follows it), so these sentences point there rather than repeat it.
+ * The server's own message is quoted only where no code says more: its
+ * messages name runs by number, which the banner does not.
+ *
+ * @param {"start"|"stop"|"undo"} action
+ * @param {{kind: string, code: (string|null), detail: string}} error
+ * @returns {string}
+ */
+function autoStackFailureSentence(action, error) {
+  const doing = {
+    start: "the run started",
+    stop: "the run is stopping",
+    undo: "the undo started",
+  }[action];
+  const again = {
+    start: "Its progress shows above the queue if it did.",
+    stop: "Press Stop again to retry; a repeated stop is harmless.",
+    undo: "Press it again to retry: it sends the same request, which cannot start a second undo.",
+  }[action];
+  if (error.kind === "timeout" || error.kind === "network") {
+    return `No answer came from the server, so it is not known whether ${doing}. ${again}`;
+  }
+  if (error.kind === "forbidden") {
+    return "You don't have permission to stack duplicates here.";
+  }
+  if (error.code === "auto_stack_run_active") {
+    return action === "undo"
+      ? "The undo can start once the Auto-stack run above the queue has ended."
+      : "Another Auto-stack run is already going, and its progress shows above the queue.";
+  }
+  if (error.code === "nothing_to_revert") {
+    return "Nothing is left to undo from that Auto-stack run.";
+  }
+  const verb = {
+    start: "start Auto-stack",
+    stop: "stop the run",
+    undo: "start the undo",
+  }[action];
+  const reason = String(error.detail || "").trim();
+  return reason
+    ? `Could not ${verb}: ${reason}${/[.!?]$/.test(reason) ? "" : "."}`
+    : `Could not ${verb} on the server.`;
+}
+
+/** Say a run request's failure aloud and on screen, as the queue's others are. */
+function reportAutoStackFailure(sentence) {
+  announcement.value = sentence;
+  noticeStore.error(sentence);
+}
+
+/**
+ * How a run ended, in one short sentence for the live region. The banner
+ * carries the full account; this is the moment a screen reader hears that
+ * there is one.
+ *
+ * @param {Object} run - a run that has just stopped being active.
+ * @returns {string}
+ */
+function autoStackOutcomeSentence(run) {
+  const groups = (value) => {
+    const n = Number(value) || 0;
+    return `${n.toLocaleString()} ${n === 1 ? "group" : "groups"}`;
+  };
+  if (run.kind === "revert") {
+    const back = `${groups(run.applied)} ${Number(run.applied) === 1 ? "is" : "are"} back in the queue.`;
+    switch (run.status) {
+      case "complete":
+        return `Auto-stack undone. ${back}`;
+      case "cancelled":
+        return `The undo stopped. ${back}`;
+      case "blocked":
+        return `The undo stopped at a step that later work was done on top of. ${back}`;
+      case "interrupted":
+        return `The undo was interrupted when the server restarted. ${back}`;
+      default:
+        return `The undo stopped on an error. ${back}`;
+    }
+  }
+  const stacked = `${groups(run.applied)} stacked.`;
+  switch (run.status) {
+    case "complete":
+      return `Auto-stack finished. ${stacked}`;
+    case "cancelled":
+      return `Auto-stack stopped. ${stacked}`;
+    case "interrupted":
+      return `Auto-stack was interrupted when the server restarted. ${stacked}`;
+    default:
+      return `Auto-stack stopped on an error. ${stacked}`;
+  }
+}
+
+// The banner is not a live region (its figures move on every poll), so the
+// end of a followed run is said here: when the run the store has been
+// following stops being active. A run found already ended is not news.
+watch(
+  () => store.autoStackRun,
+  (run, previous) => {
+    if (!run || run.active || !previous?.active || run.id !== previous.id) {
+      return;
+    }
+    announcement.value = autoStackOutcomeSentence(run);
+  },
+);
 
 const compareRef = ref(null);
 
@@ -3040,6 +3269,9 @@ onMounted(() => {
   // asks for none of them: the whole body is the explanatory state, and the
   // fetches would only be a row of 403s behind it.
   if (!readOnly.value) syncQueueToRoute();
+  // Another tab, or this one before a reload, may have started a run since
+  // the session's first look; arriving here is when its banner must show.
+  if (!readOnly.value) store.resumeAutoStackRun({ force: true });
   // The queue is a keyboard surface. Taking focus on mount is what makes the
   // first Enter work without the user hunting for a click target first.
   rootEl.value?.focus?.();
@@ -3338,6 +3570,12 @@ defineExpose({ windowedGroups, tierLabel });
 
 .qspacer {
   flex: 0 0 auto;
+}
+
+/* Clear of the toolbar, or of the scan banner when both show. The list below
+   opens on its own row gap, so the banner sits in the queue's rhythm. */
+.dq-run-banner {
+  margin-top: var(--space-3);
 }
 
 /* Pinned to the foot of the scrollport, not to the end of the content. */

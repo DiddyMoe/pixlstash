@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 
+import pytest
 from sqlmodel import text
 
 
@@ -1820,6 +1821,72 @@ def test_0149_adds_the_description_and_prediction_time_indexes():
         run("upgrade", "head")
         with contextlib.closing(sqlite3.connect(db_path)) as conn:
             assert index_sql(conn) == model, "a re-run leaves them as they were"
+
+
+def _auto_stack_run_shape(conn):
+    """Columns (name, type, NOT NULL, primary key) and named indexes (unique)."""
+    columns = {
+        (name, col_type, notnull, pk)
+        for _cid, name, col_type, notnull, _default, pk in conn.execute(
+            "PRAGMA table_info(dedupautostackrun)"
+        )
+    }
+    indexes = {
+        (row[1], row[2])
+        for row in conn.execute("PRAGMA index_list(dedupautostackrun)")
+        if row[1].startswith("ix_")
+    }
+    return columns, indexes
+
+
+def test_0150_creates_the_auto_stack_run_table_on_a_fresh_and_an_existing_vault():
+    """The migration builds the same table the model does, and a re-run is a no-op.
+
+    A fresh vault takes ``dedupautostackrun`` from the baseline's
+    ``create_all()``; one upgraded from 0149 takes it from the migration. Those
+    are two definitions of one table, so the columns each produces are compared
+    against the other rather than against a hand-kept list. The indexes are
+    created by name on both paths (the migration fills in whichever the
+    baseline did not), so they are pinned by name. The unique ``request_id``
+    index is what makes a replayed start find its run instead of creating a
+    second one, so it is checked by behaviour as well as by name.
+    """
+    previous = "0149_add_description_and_prediction_time_indexes"
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "vault.db")
+        db_url = f"sqlite:///{db_path}"
+        up = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert up.returncode == 0, up.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            from_model = _auto_stack_run_shape(conn)
+        assert from_model[1] == {
+            ("ix_dedupautostackrun_request_id", 1),
+            ("ix_dedupautostackrun_status", 0),
+        }, "a fresh vault at head"
+
+        down = _run_alembic(["downgrade", previous], db_url, _MIGRATIONS_DIR)
+        assert down.returncode == 0, down.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert not _has_table(conn, "dedupautostackrun")
+
+        up = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert up.returncode == 0, up.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert _auto_stack_run_shape(conn) == from_model, "migration 0150"
+            _insert_minimal_row(conn, "dedupautostackrun", request_id="example-1")
+            conn.commit()
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_minimal_row(conn, "dedupautostackrun", request_id="example-1")
+            conn.rollback()
+            conn.execute("UPDATE alembic_version SET version_num = ?", (previous,))
+            conn.commit()
+
+        again = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert again.returncode == 0, again.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert conn.execute(
+                "SELECT request_id FROM dedupautostackrun"
+            ).fetchall() == [("example-1",)]
 
 
 def test_0128_adds_prompt_match_once_on_a_fresh_and_a_populated_vault():

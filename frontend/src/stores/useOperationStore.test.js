@@ -340,6 +340,48 @@ describe("useOperationStore - receipts narrate this client only", () => {
     expect(store.past.map((o) => o.id)).toEqual([10, 9]);
   });
 
+  // A background run records many History steps under this tab's origin; its
+  // owner keeps them off the pill. Only narration is silenced: the steps stay
+  // on the stack, and the high-water mark still moves past them.
+  it("stays silent for an own operation a narration filter holds back", async () => {
+    const store = await primed([op({ id: 9 })]);
+    store.setNarrationFilter((operation) => operation.batch_id === "seg-1");
+    serve([op({ id: 10, batch_id: "seg-1" }), op({ id: 9 })]);
+    await store.refresh();
+    expect(store.receipt).toBeNull();
+    expect(store.past.map((o) => o.id)).toEqual([10, 9]);
+
+    // Lifting the rule does not narrate a step already seen...
+    store.setNarrationFilter(null);
+    await store.refresh();
+    expect(store.receipt).toBeNull();
+
+    // ...and the next own operation narrates as usual, even from that batch.
+    serve([
+      op({ id: 11, batch_id: "seg-1" }),
+      op({ id: 10, batch_id: "seg-1" }),
+      op({ id: 9 }),
+    ]);
+    await store.refresh();
+    expect(store.receipt).toMatchObject({ mode: "did", operationId: 11 });
+  });
+
+  it("narrates an own operation the narration filter lets through", async () => {
+    const store = await primed([op({ id: 9 })]);
+    store.setNarrationFilter((operation) => operation.batch_id === "seg-1");
+    serve([op({ id: 10, batch_id: "own-gesture" }), op({ id: 9 })]);
+    await store.refresh();
+    expect(store.receipt).toMatchObject({ mode: "did", operationId: 10 });
+  });
+
+  it("treats a filter that is not a function as no filter", async () => {
+    const store = await primed([op({ id: 9 })]);
+    store.setNarrationFilter(true);
+    serve([op({ id: 10 }), op({ id: 9 })]);
+    await store.refresh();
+    expect(store.receipt).toMatchObject({ mode: "did", operationId: 10 });
+  });
+
   it("marks an operation recorded for audit as not undoable", async () => {
     const store = await primed([op({ id: 9 })]);
     serve([op({ id: 10, undoable: false }), op({ id: 9 })]);
