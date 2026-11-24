@@ -2436,9 +2436,16 @@ def get_operation(vault: "Vault", operation_id: int) -> Optional[dict]:
     return vault.db.run_task(_fetch)
 
 
-def _finish(
+def announce_restore(
     vault: "Vault", members, touched, facets, lifecycle, origin_client_id
 ) -> dict:
+    """Announce a committed undo/redo and shape the response body.
+
+    Runs after the restore's commit, off the DB writer: emits the change events
+    for the touched pictures and facets and clears the stats cache when a
+    non-picture operation moved. Shared by Ctrl+Z, Ctrl+Shift+Z, a named batch
+    undo and the auto-stack run revert, which restores one segment per slice.
+    """
     _emit(vault, touched, set(facets), origin_client_id, lifecycle)
     # A restore of a non-picture operation (a tag-group move) announces no
     # picture, so no event clears the stats cache, yet a stats query narrowed
@@ -2469,7 +2476,9 @@ def undo(
         origin_client_id,
         vault.image_root,
     )
-    return _finish(vault, members, touched, facets, lifecycle, origin_client_id)
+    return announce_restore(
+        vault, members, touched, facets, lifecycle, origin_client_id
+    )
 
 
 def undo_batch(
@@ -2483,7 +2492,9 @@ def undo_batch(
         origin_client_id,
         vault.image_root,
     )
-    return _finish(vault, members, touched, facets, lifecycle, origin_client_id)
+    return announce_restore(
+        vault, members, touched, facets, lifecycle, origin_client_id
+    )
 
 
 def redo(vault: "Vault", origin_client_id: Optional[str] = None) -> dict:
@@ -2494,4 +2505,6 @@ def redo(vault: "Vault", origin_client_id: Optional[str] = None) -> dict:
         origin_client_id,
         vault.image_root,
     )
-    return _finish(vault, members, touched, facets, lifecycle, origin_client_id)
+    return announce_restore(
+        vault, members, touched, facets, lifecycle, origin_client_id
+    )

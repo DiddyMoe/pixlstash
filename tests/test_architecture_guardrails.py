@@ -150,6 +150,7 @@ def test_services_no_direct_db_calls():
         # scan-status poll cannot share a session with the later write), so no
         # single caller-supplied session would fit every stage.
         "pixlstash/services/folder_structure_commit_service.py",
+        "pixlstash/services/dedup_auto_stack_service.py",  # vault-injection pattern; thin wrappers around the *_in_session auto-stack run start, read and cancel
         "pixlstash/services/dedup_sweep_service.py",  # vault-injection pattern; read-only wrapper around plan_sweep_in_session
         "pixlstash/services/dedup_tier_service.py",  # vault-injection pattern; thin wrappers around the *_in_session queue reads and the scan request
         "pixlstash/services/dedup_verdict_service.py",  # vault-injection pattern; thin wrappers around the *_in_session verdict writers

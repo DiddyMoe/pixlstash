@@ -45,9 +45,10 @@
 //      every other scope type. `ScopeRequestModel` forbids extra fields, so a
 //      caller must not send a scope label or glyph here; those are the client's
 //      own presentation state and live in the URL.
-//   6. **`autoStackExact` defaults to `dry_run: true`.** The dry run returns the
-//      counts the consent dialog shows and writes nothing; the real run returns
-//      the single `batch_id` that makes N stacks reverse with one undo.
+//   6. **Auto-stack is a preview plus a background run.** The preview returns
+//      the counts the consent dialog shows and writes nothing; the run is
+//      started, polled, stopped and undone through `/dedup/auto-stack/runs`
+//      (see "Auto-stack runs" below), never applied in one request.
 //   7. **A group's stack truth is eager, its members are lazy.** Each group
 //      carries a `stacks` block (real member count + leader per existing stack
 //      it touches), which is everything the queue needs to draw a deck;
@@ -461,55 +462,175 @@ export async function reopenGroup(signature, { batchId } = {}) {
 }
 
 /**
- * Auto-stack the exact tier, as a preview or for real.
+ * Preview auto-stacking the exact tier: the counts the consent dialog shows.
  *
  * Byte-identical files are the one tier with no human judgment left in them, so
- * they get a single consent dialog instead of per-group adjudication. The dry
- * run and the real run are the same endpoint precisely so the preview cannot
- * disagree with what the confirmation then does.
+ * they get a single consent dialog instead of per-group adjudication. This is
+ * the dialog's read; it writes nothing. The run itself is
+ * {@link startAutoStackRun}, a background run, because acting on a whole
+ * library's exact tier takes far longer than one request may wait.
  *
  * @param {Object} [options]
- * @param {boolean} [options.dryRun=true] - preview only. Defaults to the safe
- *   direction, so a caller that forgets the flag counts rather than writes.
  * @param {string} [options.scopeType=GLOBAL_SCOPE]
  * @param {number|string} [options.scopeId]
- * @param {string} [options.batchId] - omit to have the server mint one. A
- *   client-minted id is the run's undo handle if the run reached the server,
- *   even when no answer arrives. An id that already has applied operations is
- *   refused with 409 `batch_id_not_at_top` unless that batch is still the
- *   newest in History.
- * @param {number} [options.limit] - cap the number of groups acted on.
+ * @param {number} [options.limit] - cap the number of groups counted.
  * @param {AbortSignal} [options.signal] - cancels the request, so a preview the
  *   dialog has moved past (closed, or reopened on another scope) stops waiting.
- * @returns {Promise<Object>} the response body:
- *   `{ batch_id, dry_run, groups, pictures, scope, dry_run_summary, results,
- *   failures, blocked, failed, superseded }`. `dry_run_summary` is present on a dry run only and carries
- *   `{ groups, groups_by_tier, pictures, covers_gaining_tags,
- *   covers_gaining_score, covers_gaining_metadata }`, every figure derived from
- *   the same read of the same groups so the consent dialog's rows cannot
- *   disagree with each other. `groups_by_tier` counts only what **this run**
- *   would act on (exact-only today, zero-filled for the rest), so it is not the
- *   queue's remainder; that comes from {@link getCounts}. `results` is empty for
- *   a dry run. `failures` names groups the run skipped and why: one unstackable
- *   group never aborts the run, so a partial result is reported rather than
- *   hidden; `blocked` and `failed` count them by outcome. `superseded` counts
- *   planned groups an earlier group in the same run already took out of the
- *   queue; they are in neither `results` nor `failures`.
+ * @returns {Promise<Object>} the response body: `{ dry_run, groups, pictures,
+ *   scope, dry_run_summary }`. `dry_run_summary` carries `{ groups,
+ *   groups_by_tier, pictures, covers_gaining_tags, covers_gaining_score,
+ *   covers_gaining_metadata }`, every figure derived from the same read of the
+ *   same groups so the consent dialog's rows cannot disagree with each other.
+ *   `groups_by_tier` counts only what a run would act on (exact-only today,
+ *   zero-filled for the rest), so it is not the queue's remainder; that comes
+ *   from {@link getCounts}.
  */
-export async function autoStackExact({
-  dryRun = true,
+export async function previewAutoStackExact({
   scopeType = GLOBAL_SCOPE,
   scopeId = null,
-  batchId,
   limit,
   signal,
 } = {}) {
-  const body = { scope: scopeBody(scopeType, scopeId), dry_run: dryRun };
-  if (batchId) body.batch_id = batchId;
+  const body = { scope: scopeBody(scopeType, scopeId), dry_run: true };
   if (Number.isFinite(limit)) body.limit = limit;
   const url = dedupUrl("/auto-stack");
   return unwrap(
     signal ? apiClient.post(url, body, { signal }) : apiClient.post(url, body),
+  );
+}
+
+// ── Auto-stack runs ─────────────────────────────────────────────────────────
+//
+// Applying the exact tier is an asynchronous request-reply: `POST .../runs`
+// answers 202 at once with the run, and the client polls the run until it is no
+// longer `active`. Three facts shape the callers.
+//
+//   1. **A request id makes the start safe to retry.** The caller mints one per
+//      gesture and sends it again on a retry; the server answers a replay with
+//      the run it already started (200) instead of starting a second one. A
+//      start whose answer was lost is therefore retried, never guessed at.
+//   2. **The server sets the poll interval.** An active run's answer carries
+//      `Retry-After`; each function below returns it as `retryAfterMs`, null
+//      when absent (an ended run has nothing left to poll).
+//   3. **A run is many History steps.** It records its stacks in segments of a
+//      bounded size, each one Ctrl+Z; {@link revertAutoStackRun} undoes them
+//      all, and `segment_batch_ids` names them for the operation store.
+
+const RETRY_AFTER_HEADER = "retry-after";
+
+/**
+ * Read a `Retry-After` header as milliseconds.
+ *
+ * Only RFC 9110's `delay-seconds` form is read, because it is the only form
+ * the run routes send. The HTTP-date form is deliberately not: `Date.parse` is
+ * lenient enough to read "-2" or "1.5" as a date in 2001, which would turn a
+ * malformed hint into a zero wait. Anything else is not a hint, and null
+ * leaves the interval to the caller.
+ *
+ * @param {Object} [headers] - the axios response headers.
+ * @returns {number|null}
+ */
+export function retryAfterMs(headers) {
+  const raw =
+    typeof headers?.get === "function"
+      ? headers.get(RETRY_AFTER_HEADER)
+      : headers?.[RETRY_AFTER_HEADER];
+  if (raw == null) return null;
+  const text = String(raw).trim();
+  return /^\d+$/.test(text) ? Number(text) * 1000 : null;
+}
+
+/** A run route's answer: the run, plus the server's poll hint. */
+function runReply(response) {
+  return { run: response.data, retryAfterMs: retryAfterMs(response.headers) };
+}
+
+/**
+ * Start a background run that stacks the exact tier.
+ *
+ * @param {Object} [options]
+ * @param {string} [options.scopeType=GLOBAL_SCOPE]
+ * @param {number|string} [options.scopeId]
+ * @param {number} [options.limit] - cap the number of groups the run stacks.
+ * @param {string} [options.requestId] - the gesture's idempotency key. Send the
+ *   same one when retrying a start whose answer never arrived.
+ * @returns {Promise<{run: Object, retryAfterMs: number|null}>} 202 for a new
+ *   run, 200 for a replayed request id. Refusals carry `detail.code`: 409
+ *   `auto_stack_run_active` (another run is active; `detail.run` names it) and
+ *   422 `request_id_reused` (the id started a run with other parameters).
+ */
+export async function startAutoStackRun({
+  scopeType = GLOBAL_SCOPE,
+  scopeId = null,
+  limit,
+  requestId,
+} = {}) {
+  const body = { scope: scopeBody(scopeType, scopeId) };
+  if (Number.isFinite(limit)) body.limit = limit;
+  if (requestId) body.request_id = requestId;
+  return runReply(await apiClient.post(dedupUrl("/auto-stack/runs"), body));
+}
+
+/**
+ * Read one run's status and progress. A read: it never waits on the writer.
+ *
+ * @param {number} runId
+ * @returns {Promise<{run: Object, retryAfterMs: number|null}>} 404
+ *   `auto_stack_run_not_found` for an unknown id.
+ */
+export async function getAutoStackRun(runId) {
+  return runReply(
+    await apiClient.get(
+      dedupUrl(`/auto-stack/runs/${encodeURIComponent(runId)}`),
+    ),
+  );
+}
+
+/**
+ * The newest run of either kind, so a run started before a reload or in
+ * another tab is picked up again.
+ *
+ * @returns {Promise<Object|null>} the run, or null before the first.
+ */
+export async function getLatestAutoStackRun() {
+  const body = await unwrap(apiClient.get(dedupUrl("/auto-stack/runs/latest")));
+  return body?.run ?? null;
+}
+
+/**
+ * Ask a run to stop. A queued run is cancelled at once; a running one stops at
+ * its next slice. Nothing is rolled back, and an ended run comes back as is.
+ *
+ * @param {number} runId
+ * @returns {Promise<{run: Object, retryAfterMs: number|null}>}
+ */
+export async function cancelAutoStackRun(runId) {
+  return runReply(
+    await apiClient.post(
+      dedupUrl(`/auto-stack/runs/${encodeURIComponent(runId)}/cancel`),
+    ),
+  );
+}
+
+/**
+ * Start a background run that undoes an apply run's History segments.
+ *
+ * @param {number} runId - the apply run to undo.
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - the gesture's idempotency key.
+ * @returns {Promise<{run: Object, retryAfterMs: number|null}>} the revert run.
+ *   409 `not_an_apply_run`, `nothing_to_revert` or `auto_stack_run_active`
+ *   when there is nothing it may do. A revert that meets an unrelated edit
+ *   above a segment in History ends `blocked`.
+ */
+export async function revertAutoStackRun(runId, { requestId } = {}) {
+  const body = {};
+  if (requestId) body.request_id = requestId;
+  return runReply(
+    await apiClient.post(
+      dedupUrl(`/auto-stack/runs/${encodeURIComponent(runId)}/revert`),
+      body,
+    ),
   );
 }
 

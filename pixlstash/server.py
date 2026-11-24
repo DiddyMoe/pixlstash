@@ -956,6 +956,11 @@ class Server(
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
+            # Retry-After is not a CORS-safelisted response header, so without
+            # this a client on another origin (the Vite dev server) is denied
+            # the poll interval of a background run and the 429 backoff alike.
+            # It widens nothing: a refused origin still gets no Allow-Origin.
+            expose_headers=["Retry-After"],
         )
         # Captures the originating tab's ``X-Client-Id`` header into
         # ``request.state.origin_client_id`` / ``origin_client_id_var`` so

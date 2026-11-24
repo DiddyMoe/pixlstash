@@ -8,20 +8,21 @@
  *     :preview="dryRun"
  *     :loading="dryRunLoading"
  *     :preview-error="dryRunError"
- *     :busy="autoStackRunning"
+ *     :busy="autoStackStarting"
+ *     :start-error="autoStackStartError"
  *     @close="closeAutoStack"
- *     @confirm="runAutoStack"
+ *     @confirm="confirmAutoStack"
  *   />
  *
  * Byte-identical files need no judgment, so this dialog replaces per-group
- * adjudication for the exact tier: one dry run, one confirmation, one undo
- * step. The component is presentational: the parent owns the dry run, the real
- * run and the API.
+ * adjudication for the exact tier: one dry run, one confirmation, then a run in
+ * the background that the queue's banner follows, can stop, and can undo whole.
+ * The component is presentational: the parent owns the dry run, the start and
+ * the API.
  */
 import { computed } from "vue";
 import AppDialog from "./AppDialog.vue";
 import AppButton from "./AppButton.vue";
-import KeyCap from "./KeyCap.vue";
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -62,8 +63,18 @@ const props = defineProps({
    * are.
    */
   previewError: { type: Object, default: null },
-  /** True while the real run is in flight. */
+  /**
+   * True while the request that starts the run is on the wire. Only the start:
+   * the run itself goes on in the background once the server has answered.
+   */
   busy: { type: Boolean, default: false },
+  /**
+   * Why the run did not start, or null: the store's `{ kind, status, detail,
+   * code }` (`useDedupStore.startAutoStack`). The dialog stays open on it, so
+   * the user reads what happened where they asked, and can confirm again when
+   * that helps.
+   */
+  startError: { type: Object, default: null },
 });
 
 const emit = defineEmits(["close", "confirm"]);
@@ -149,6 +160,48 @@ const failureSentence = computed(() => {
 });
 
 /**
+ * The sentence for a start that did not go through, or "" when there is none.
+ *
+ * Confirming again sends the same request, which the server answers with the
+ * run the first attempt started if it did start one, so it is safe to offer
+ * whenever the outcome is unknown or the fault was the server's. An answer
+ * that came back as no is worded as that answer instead. A cancelled start
+ * (the session ended) and a start still on the wire say nothing.
+ */
+const startSentence = computed(() => {
+  const error = props.startError;
+  if (!error) return "";
+  const again =
+    "Confirm again to retry: it sends the same request, which cannot start a second run.";
+  switch (error.kind) {
+    case "cancelled":
+    case "busy":
+      return "";
+    case "timeout":
+    case "network":
+      return `No answer came from the server, so it is not known whether the run started. ${again}`;
+    case "conflict":
+      if (error.code === "auto_stack_run_active") {
+        return "Another Auto-stack run is already going, and its progress shows above the queue. Start this one once it has finished.";
+      }
+      return refusedSentence(error.detail);
+    case "validation":
+      return refusedSentence(error.detail);
+    case "forbidden":
+      return "You don't have permission to stack duplicates here.";
+    default:
+      return `The run could not start on the server. ${again}`;
+  }
+});
+
+/** "The server refused …", ending on the server's own reason when it gave one. */
+function refusedSentence(detail) {
+  const reason = String(detail || "").trim();
+  if (!reason) return "The server refused to start the run.";
+  return `The server refused to start the run: ${reason}${/[.!?]$/.test(reason) ? "" : "."}`;
+}
+
+/**
  * Groups this run would stack.
  *
  * Read from the summary's per-tier split, which is the same number the
@@ -183,8 +236,16 @@ const coversGainingMetadata = computed(
   () => Number(summary.value?.covers_gaining_metadata) || 0,
 );
 
+/**
+ * Whether the confirm button may fire. Not while the start is pending: that is
+ * the button's `loading` state, which holds it without fading it. Not against
+ * a run already going either, since the server would refuse it again.
+ */
 const canConfirm = computed(
-  () => !figuresUnknown.value && !props.busy && stacksToCreate.value > 0,
+  () =>
+    !figuresUnknown.value &&
+    stacksToCreate.value > 0 &&
+    props.startError?.code !== "auto_stack_run_active",
 );
 
 /**
@@ -254,9 +315,13 @@ function rowValue(key) {
 
     <p class="as-reversible">
       <v-icon size="16" class="as-icon">mdi-information-outline</v-icon>
-      Reversible as one step with
-      <!-- One flex item, so the paragraph's gap does not split the chord. -->
-      <span><KeyCap k="Ctrl" /><kbd>Z</kbd></span>.
+      Runs in the background while you keep working. You can stop it at any
+      time, and Undo run reverses every stack it made.
+    </p>
+
+    <p v-if="startSentence" class="as-failed as-start-failed" role="status">
+      <v-icon size="16" class="as-icon">mdi-alert-outline</v-icon>
+      {{ startSentence }}
     </p>
 
     <template #footer>
@@ -265,6 +330,7 @@ function rowValue(key) {
         variant="primary"
         icon-left="layers-plus"
         :disabled="!canConfirm"
+        :loading="busy"
         @click="emit('confirm')"
       >
         {{ confirmLabel }}
@@ -340,19 +406,11 @@ function rowValue(key) {
 
 .as-reversible {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--space-2);
   margin: 0;
   font-size: var(--text-xs);
+  line-height: var(--leading-body);
   color: rgba(var(--v-theme-on-surface), 0.6);
-}
-
-.as-reversible kbd {
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
-  padding: var(--kbd-pad);
-  border: 1px solid rgba(var(--v-theme-on-surface), 0.3);
-  border-radius: var(--radius-sm);
-  background: rgba(var(--v-theme-on-surface), 0.08);
 }
 </style>

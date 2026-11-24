@@ -4498,7 +4498,7 @@ For `<img :src="...">` bindings and similar direct browser requests that bypass 
 | `api/pictureImport.js` | the streaming-staging import session (`/pictures/import/staging/*`) |
 | `api/operations.js` | `/operations`: the append-only change log, `undo-state`, and undo / redo / per-operation undo / batch undo (all OWNER_ONLY — callers guard on `isReadOnly`) |
 | `api/stacks.js` | `/stacks`: grouping, ordering, dissolving, and the Keep-cover-only dry run + collapse (`/stacks/keep-cover-only{,/preview}`) |
-| `api/dedup.js` | `/dedup`: the triage queue, the live counts, the scoped scan, the three verdicts, the bulk auto-stack, a deck's lazy members (`/dedup/stacks/{id}/members`), and the Mixed stacks page (`/dedup/mixed-stacks` + its `split` / `unstack` / `keep` sub-resources) |
+| `api/dedup.js` | `/dedup`: the triage queue, the live counts, the scoped scan, the three verdicts, the auto-stack preview and its background runs (`/dedup/auto-stack/runs`: start, poll, cancel, revert), a deck's lazy members (`/dedup/stacks/{id}/members`), and the Mixed stacks page (`/dedup/mixed-stacks` + its `split` / `unstack` / `keep` sub-resources) |
 | `api/pictures.js` | `/pictures`, the largest resource: reads, count, stream, the searches, stats |
 
 Modules are seeded as their first call site migrates, so a module can legitimately expose one function today and a dozen once the components that use the rest of its resource move over.
@@ -8549,6 +8549,41 @@ Decided screen removes the group from Decided (it is back in the queue) and a
 redo returns it there, counts reconciling on the same pass; a group whose
 lens no longer matches after the reopen simply reloads to an honest empty
 state.
+
+**Auto-stack runs in the background, and the queue follows it** (2026-11-23).
+Applying the exact tier is a server run (integration §11.4, §19), so the queue
+never waits on the stacking. `DedupAutoStackDialog` previews, and its confirm
+calls `useDedupStore.startAutoStack` with the scope it previewed and a request
+id minted when the dialog opened; an unanswered start is resent under that id
+(after 1 s, then 3 s), so it can never start a second run. A start that gets
+an answer closes the dialog. One that gets none leaves it open with the
+failure shown, and confirming again sends the same request. While a start,
+stop or undo is on the wire, or while a run is active, the trigger is
+`aria-disabled` (not `disabled`, so its tooltip still says why) and opening it
+does nothing.
+
+`DedupAutoStackBanner` sits above the queue for the run the store follows:
+progress, Stop, Undo once the run has ended with something left to undo, and
+dismiss. The store reads `GET …/runs/latest` when the queue opens (not in a
+read-only session), so a run started before a reload or in another tab is
+picked up, and polls at the server's `Retry-After` while it is active. The
+banner is not a live region, because its figures move on every poll; the
+queue's own announcement says the run started, stopped and ended. Each
+refusal is worded by its code (`auto_stack_run_active`, `nothing_to_revert`,
+forbidden, or the server's message). Stop, Undo and dismiss hand focus back
+to the queue.
+
+The run's stacks reach History as segments, under this tab's origin, so the
+operation store would narrate each as this tab's own gesture: a receipt pill
+every few seconds, each offering to undo one arbitrary slice. The dedup store
+installs a narration filter (`useOperationStore.setNarrationFilter`) the first
+time it follows a run. The filter holds back an operation in a known segment,
+and any stack this tab's own gestures did not send while an apply run is
+active. The steps stay in History and Ctrl+Z still reaches them; the banner is
+their receipt. When the followed run ends, the store re-reads the counts, and
+the first page if one is showing. **Known limitation:** rows the run stacked
+stay on screen until then, and that reload returns the triage to the top.
+
 **The URL filter mirror is gated on `useDedupStore.filtersRestored`**: on a
 full reload the policy landing flipped `policyLoaded` one microtask before
 `openQueue` adopted the URL's filters, the mirror read the still-default gate

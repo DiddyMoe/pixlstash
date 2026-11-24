@@ -45,10 +45,12 @@ Operation log (§21)
 -------------------
 Every verdict raises an action receipt and lands in the operation log. Each
 verdict - stack **and** keep-separate - records **exactly one**
-:class:`~pixlstash.db_models.operation.Operation` row, and a bulk action shares a
-single ``batch_id`` across every group in the run, so
-``POST /operations/batches/{batch_id}/undo`` reverses a thousand verdicts in one
-step. Keep-separate changes no picture facet, so its row carries empty
+:class:`~pixlstash.db_models.operation.Operation` row, and the verdicts of one gesture share a
+single ``batch_id``, so ``POST /operations/batches/{batch_id}/undo`` reverses
+them in one step. A background auto-stack run is the exception in size, not in
+kind: it records into bounded batches (segments) so no single undo is an
+unbounded transaction, and reverses as a whole through its own revert
+(:mod:`pixlstash.services.dedup_auto_stack_service`). Keep-separate changes no picture facet, so its row carries empty
 before/after payloads and the whole restore is done by its post-restore hook
 (undo reopens the verdict and returns the group to the queue; redo re-resolves
 it). Keep-separate was originally *not* op-logged (CSO ruling around #644: no
@@ -111,7 +113,6 @@ from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK as ID_CHUNK
 from pixlstash.services.dedup_tier_service import (
     DedupScope,
     DedupTier,
-    prune_stale_groups_in_session,
 )
 from pixlstash.services.dedup_tier_service import (
     # The queue list, the badge and the tier split all filter on this; since D1
@@ -140,8 +141,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = get_logger(__name__)
 
 # The op_types this module records. Stable - part of the API contract the
-# frontend keys its undo affordances off. A bulk action shares one batch_id
-# across every row it writes, so the whole run reverses in a single step.
+# frontend keys its undo affordances off. A gesture shares one batch_id across
+# every row it writes, so it reverses in a single step.
 #
 # Keep-separate had no op_type until 2026-07-30 (it changes no reversible
 # picture facet, so the original CSO ruling around #644 recorded nothing rather
@@ -158,9 +159,9 @@ OP_TYPE_STACK = "dedup.stack"
 OP_TYPE_KEEP_SEPARATE = "dedup.keep_separate"
 OP_TYPE_REOPEN = "dedup.reopen"
 
-# Per-group outcome vocabulary for a bulk auto-stack. Closed set; the response
-# reports every group under exactly one of these, so a partial run is legible
-# rather than inferred from a count mismatch.
+# Per-group outcome vocabulary for an auto-stack slice. Closed set; a slice
+# reports every group it stacked or refused under exactly one of these, so a
+# partial run is legible rather than inferred from a count mismatch.
 BULK_REASON_APPLIED = "applied"
 BULK_REASON_BLOCKED = "blocked"
 """The group was refused by a guard that returns an HTTP status - in practice a
@@ -171,6 +172,25 @@ BULK_REASON_FAILED = "failed"
 
 class DedupVerdictError(Exception):
     """A verdict could not be applied (unknown signature, bad cover, ...)."""
+
+
+class AutoStackSliceError(Exception):
+    """An auto-stack slice stopped on an error no per-group rule covers.
+
+    The groups before the failing one have committed, one commit each, so the
+    run must still count them before it is marked failed.
+
+    Attributes:
+        report: The slice's report up to the failing group, in the shape
+            :func:`auto_stack_groups_in_session` returns.
+        signature: The group the slice stopped at: its signature, or
+            ``id <group id>`` when the re-check that reads the signature failed.
+    """
+
+    def __init__(self, report: dict[str, Any], signature: str) -> None:
+        super().__init__(f"auto-stack stopped at group {signature!r}")
+        self.report = report
+        self.signature = signature
 
 
 @dataclass(frozen=True)
@@ -781,8 +801,8 @@ def apply_stack_verdict_in_session(
         excluded_picture_ids: Members the user left out (the design's X key).
             They keep their current stack and are recorded on the verdict so a
             rescan does not treat the exclusion as an unfinished decision.
-        batch_id: Operation-log batch. Bulk auto-stack passes one id for every
-            group so the whole run reverses with a single undo.
+        batch_id: Operation-log batch. An auto-stack run passes its current
+            segment's id, so the segment reverses with a single undo.
         actor: Who performed the change, from ``request_context`` in the handler.
         source: WS-envelope source, likewise read from the request (§21 origin
             discipline: never from a contextvar, which is dead on this thread).
@@ -1547,174 +1567,29 @@ def restore_reopens_in_session(
     )
 
 
-def _still_poses_a_decision(
-    session: Session, group_id: int, touched_picture_ids: set[int]
-) -> bool:
-    """Whether a group planned at the start of a bulk run is still in the queue.
+def _auto_stack_candidates(scope: DedupScope, *columns):
+    """Select the groups auto-stack acts on, in the order it acts on them.
 
-    The run is planned once and applied group by group, and an earlier group can
-    fold the stacks a later one spans, leaving the later group's members in one
-    stack unit. The queue stops showing such a group, so the run must stop too:
-    applying it would force its own cover to the front of the stack the earlier
-    group just built.
+    Only unresolved **exact** groups: tier 1 is the tier with no human judgment
+    left in it. A near or embedding group always goes through the queue, however
+    confident it looks.
 
-    The queue's own filter is the test, restricted to this group's member rows,
-    so one check costs the same however large the library is. It still runs
-    only for a group with a member an earlier group in this run touched, which
-    saves one query per untouched group. Nothing else writes during the run (it
-    is one writer task), the filter reads only its members' stack, deleted and
-    set-lock state and the group's own row, and every picture a stack verdict
-    changes is in its ``event_picture_ids``, the set its undo restores. A group
-    sharing no picture with that set is as eligible as it was when planned.
+    The filter is THE SAME one the queue list, the badge and the tier counts
+    apply (:func:`~pixlstash.services.dedup_tier_service.live_groups_filter`).
+    Auto-stack once ran on a weaker, now-deleted filter that said nothing about
+    stack units, so a group whose live members already sat in one stack was
+    still planned: on a real library it planned 62 groups where the badge and
+    the button said 3, and 21 of those would have had a curated cover replaced.
+    One filter, so the count, the button and the run cannot disagree.
 
     Args:
-        session: The run's session.
-        group_id: The planned group.
-        touched_picture_ids: Every picture an applied group in this run changed.
+        scope: The scope the user picked; a group is in it when one of its live
+            members is.
+        *columns: What to select (the row for the preview, the id for a plan).
     """
-    if not touched_picture_ids:
-        return True
-    member_ids = session.exec(
-        select(DedupGroupMember.picture_id).where(DedupGroupMember.group_id == group_id)
-    ).all()
-    if touched_picture_ids.isdisjoint(int(pid) for pid in member_ids):
-        return True
-    still = session.exec(
-        select(DedupGroup.id).where(
-            DedupGroup.id == group_id,
-            DedupGroup.resolved.is_(False),
-            DedupGroup.tier == TIER_EXACT,
-            live_groups_filter(group_id),
-        )
-    ).first()
-    return still is not None
-
-
-def _refuse_a_buried_batch(session: Session, batch_id: str) -> None:
-    """Refuse to extend a supplied batch that is no longer on top of History.
-
-    Undo takes a batch only while it is the newest applied unit and contiguous at
-    the top of History (see ``operation_log_service.undo_batch_in_session``). A
-    run appends every group to the batch it is given, so appending to a batch
-    that another undoable operation has since landed on would split the batch
-    around that operation. History could then undo neither: the batch is stale
-    behind the newer operation, and the newer operation sits inside the batch.
-    A batch with no applied rows yet, or one still on top, is extended as before.
-
-    Args:
-        session: The run's session.
-        batch_id: The batch id the caller supplied.
-
-    Raises:
-        HTTPException: 409 ``batch_id_not_at_top``, before anything is written.
-    """
-    applied = select(Operation.batch_id).where(
-        Operation.status == STATUS_APPLIED, Operation.undoable.is_(True)
-    )
-    own_row = session.exec(applied.where(Operation.batch_id == batch_id).limit(1))
-    if own_row.first() is None:
-        return
-    newest = session.exec(applied.order_by(Operation.id.desc()).limit(1))
-    latest_batch_id = newest.first()
-    if latest_batch_id == batch_id:
-        return
-    logger.info(
-        "[dedup-verdict] auto-stack refused batch %s: the newest applied operation "
-        "belongs to batch %s, so appending would split the batch's undo",
-        batch_id,
-        latest_batch_id,
-    )
-    raise HTTPException(
-        status_code=409,
-        detail={
-            "code": "batch_id_not_at_top",
-            "message": (
-                f"Batch {batch_id} is no longer the newest entry in History, so "
-                "this run cannot join it. Send a new batch id."
-            ),
-            "batch_id": batch_id,
-        },
-    )
-
-
-def bulk_auto_stack_in_session(
-    session: Session,
-    scope: Optional[DedupScope] = None,
-    batch_id: Optional[str] = None,
-    dry_run: bool = False,
-    limit: Optional[int] = None,
-    actor: Optional[str] = None,
-    source: str = "external",
-    origin_client_id: Optional[str] = None,
-) -> dict[str, Any]:
-    """Stack every unresolved **exact** group under one batch id.
-
-    Tier 1 is the tier with no human judgment left in it, so the design gives it
-    a single consent dialog instead of per-group adjudication: the dialog shows
-    the dry-run counts, and accepting stacks them all under one operation-log
-    batch id so N stacks reverse with one Ctrl+Z.
-
-    Only exact groups are eligible. A near or embedding group always goes through
-    the queue, no matter how confident it looks.
-
-    **The candidate query uses the queue's own filter**
-    (:func:`~pixlstash.services.dedup_tier_service.live_groups_filter`), so the
-    run acts on exactly the groups the list shows and the badge counts. See the
-    comment on the query for the already-collapsed groups the old, weaker filter
-    let through.
-
-    Args:
-        session: Pre-opened session.
-        scope: Restrict to a scope; defaults to the whole vault.
-        batch_id: The shared batch id. Minted when omitted and returned. A
-            supplied one that already has applied operations must still be the
-            newest batch in History (see :func:`_refuse_a_buried_batch`).
-        dry_run: Count what would happen and write nothing. This is what the
-            consent dialog reads.
-        limit: Cap the number of groups acted on.
-        actor: Who performed the change, from ``request_context`` in the handler.
-        source: WS-envelope source, likewise read from the request.
-        origin_client_id: WS-envelope per-tab origin, likewise.
-
-    Returns:
-        The batch id, the counts, and a per-group outcome for **every** group the
-        run considered: ``results`` for the applied ones and ``failures`` for the
-        rest, each carrying an ``outcome`` of :data:`BULK_REASON_APPLIED`,
-        :data:`BULK_REASON_BLOCKED` or :data:`BULK_REASON_FAILED`, plus
-        ``superseded``, the count of planned groups an earlier group in the same
-        run left with no decision to make (see :func:`_still_poses_a_decision`);
-        nothing is written for those. A returned run always carries its batch
-        id, so a partially applied run hands back its undo handle.
-
-    Raises:
-        HTTPException: 409 from :func:`_refuse_a_buried_batch`, before any
-            write.
-        Exception: Anything the per-group handling does not expect. The groups
-            before it stay committed under the batch, and the error log line
-            names the batch.
-    """
-    scope = scope or DedupScope()
-    if batch_id and not dry_run:
-        _refuse_a_buried_batch(session, batch_id)
-    # The dry run aggregates over the group rows. The run itself reads only
-    # (id, signature) scalars: it commits once per group, every commit expires
-    # the whole identity map, and holding G loaded rows across G commits made
-    # each later group pay to reload all of them.
-    columns = (DedupGroup,) if dry_run else (DedupGroup.id, DedupGroup.signature)
     query = select(*columns).where(
         DedupGroup.resolved.is_(False),
         DedupGroup.tier == TIER_EXACT,
-        # THE SAME filter the queue list, the badge and the tier counts apply.
-        # This used to run on a weaker, now-deleted filter that only required
-        # two unfrozen live members and said nothing about stack
-        # units, so a group whose live members already sit in one and the same
-        # stack was still planned: on a real library the run planned 62 groups
-        # where the badge and the button said 3. The 59 extra posed no decision
-        # (`_stack_members` reuses their existing stack, so nothing is created),
-        # and 21 of them would have had their curated cover replaced, because
-        # this path passes no cover and the group's preselection is forced to
-        # stack_position 0. One filter, so the count, the button and the run
-        # cannot disagree.
         live_groups_filter(),
     )
     predicate = scope.picture_predicate()
@@ -1726,44 +1601,198 @@ def bulk_auto_stack_in_session(
                 .where(Picture.deleted.is_(False), predicate)
             )
         )
-    query = query.order_by(DedupGroup.confidence.desc(), DedupGroup.id.asc())
+    return query.order_by(DedupGroup.confidence.desc(), DedupGroup.id.asc())
+
+
+def plan_auto_stack_in_session(
+    session: Session,
+    scope: Optional[DedupScope] = None,
+    limit: Optional[int] = None,
+) -> list[int]:
+    """Return the ids of the groups an auto-stack run will work through.
+
+    Read once when a run starts. The run then takes the ids in slices and
+    re-checks each group just before stacking it
+    (:func:`auto_stack_groups_in_session`), because other writes land between
+    slices. Ids rather than rows: a run spans thousands of commits, and every
+    commit expires the identity map, so held rows would be reloaded over and
+    over.
+
+    Args:
+        session: A read session.
+        scope: Restrict to a scope; defaults to the whole vault.
+        limit: Cap the number of groups planned.
+    """
+    query = _auto_stack_candidates(scope or DedupScope(), DedupGroup.id)
+    if limit is not None:
+        query = query.limit(max(1, int(limit)))
+    return [int(group_id) for group_id in session.exec(query).all()]
+
+
+def preview_auto_stack_in_session(
+    session: Session,
+    scope: Optional[DedupScope] = None,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Count what an auto-stack run would do, writing nothing.
+
+    This is what the consent dialog reads. The summary comes from the same group
+    list the counts do, in the same read, so the dialog's figures cannot
+    disagree with each other.
+
+    Args:
+        session: A read session.
+        scope: Restrict to a scope; defaults to the whole vault.
+        limit: Cap the number of groups counted, as the run would cap them.
+
+    Returns:
+        ``dry_run_summary`` (see :func:`_dry_run_summary_in_session`),
+        ``dry_run`` (always ``True``), ``groups``, ``pictures`` and ``scope``.
+    """
+    scope = scope or DedupScope()
+    query = _auto_stack_candidates(scope, DedupGroup)
     if limit is not None:
         query = query.limit(max(1, int(limit)))
     groups = session.exec(query).all()
+    summary = _dry_run_summary_in_session(session, groups)
+    return {
+        "dry_run_summary": summary,
+        "dry_run": True,
+        "groups": len(groups),
+        # `member_count` is the group's stored total and counts frozen members
+        # the run will skip. The summary already excludes them, so the figure is
+        # taken from there rather than recomputed and disagreeing.
+        "pictures": int(summary["pictures"]),
+        "scope": scope.as_dict(),
+    }
 
-    if dry_run:
-        summary = _dry_run_summary_in_session(session, groups)
-        # `member_count` is the group's stored total and counts frozen members the
-        # run will skip. The summary already excludes them, so the top-level
-        # figure is taken from there rather than recomputed and disagreeing.
-        picture_total = int(summary["pictures"])
-        return {
-            "dry_run_summary": summary,
-            "batch_id": batch_id,
-            "dry_run": True,
-            "groups": len(groups),
-            "pictures": picture_total,
-            "scope": scope.as_dict(),
-            "results": [],
-        }
 
+def _recheck_planned_group(
+    session: Session, group_id: int, scope: DedupScope
+) -> Optional[str]:
+    """Return a planned group's signature if it still poses a decision in scope.
+
+    A run is planned once and applied slice by slice, and anything may write
+    between two slices: the user deciding a group by hand, a scan retiring it, a
+    stack edit, a picture leaving the scope. An earlier group of the same run
+    can also fold the stacks a later one spans, leaving the later group's
+    members in one stack unit; applying it would force its own cover to the
+    front of the stack the earlier group just built. So every group is asked the
+    queue's own question again, just before it is stacked, in the same writer
+    callback that stacks it.
+
+    The filter is restricted to this group's member rows, so one check costs the
+    same however large the library is (well under a millisecond, against tens
+    of milliseconds to stack the group).
+
+    Args:
+        session: The slice's session.
+        group_id: The planned group.
+        scope: The run's scope.
+
+    Returns:
+        The group's signature, or ``None`` when the group no longer poses an
+        exact decision in the scope.
+    """
+    query = select(DedupGroup.signature).where(
+        DedupGroup.id == group_id,
+        DedupGroup.resolved.is_(False),
+        DedupGroup.tier == TIER_EXACT,
+        live_groups_filter(group_id),
+    )
+    predicate = scope.picture_predicate()
+    if predicate is not None:
+        query = query.where(
+            select(DedupGroupMember.picture_id)
+            .join(Picture, Picture.id == DedupGroupMember.picture_id)
+            .where(
+                DedupGroupMember.group_id == group_id,
+                Picture.deleted.is_(False),
+                predicate,
+            )
+            .exists()
+        )
+    return session.exec(query).first()
+
+
+def _auto_stack_report(
+    batch_id: str,
+    scope: DedupScope,
+    results: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    superseded: int,
+    event_picture_ids: set[int],
+) -> dict[str, Any]:
+    """Shape one slice's outcome; see :func:`auto_stack_groups_in_session`."""
+    return {
+        "batch_id": batch_id,
+        "groups": len(results),
+        "pictures": sum(len(item["picture_ids"]) for item in results),
+        "scope": scope.as_dict(),
+        "results": results,
+        "failures": failures,
+        "blocked": sum(1 for f in failures if f["outcome"] == BULK_REASON_BLOCKED),
+        "failed": sum(1 for f in failures if f["outcome"] == BULK_REASON_FAILED),
+        "superseded": superseded,
+        # Broadcast plumbing for the caller's post-commit announcement.
+        "event_picture_ids": sorted(event_picture_ids),
+    }
+
+
+def auto_stack_groups_in_session(
+    session: Session,
+    group_ids: Iterable[int],
+    scope: Optional[DedupScope] = None,
+    batch_id: Optional[str] = None,
+    actor: Optional[str] = None,
+    source: str = "external",
+    origin_client_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Stack one slice of a planned auto-stack run.
+
+    Each group is re-checked (:func:`_recheck_planned_group`), then stacked with
+    its stored preselection as the cover and committed on its own, so a slice
+    that stops part-way keeps every group before the stop. Every stacked group
+    is recorded under ``batch_id``, one History segment of the run.
+
+    Args:
+        session: The slice's session, on the DB writer.
+        group_ids: Planned group ids, in plan order.
+        scope: The run's scope; defaults to the whole vault.
+        batch_id: The History segment the slice records into. Minted when
+            omitted.
+        actor: Who started the run.
+        source: WS-envelope source of the request that started the run.
+        origin_client_id: WS-envelope per-tab origin, likewise.
+
+    Returns:
+        ``batch_id``, ``groups`` and ``pictures`` stacked, ``results`` (one per
+        stacked group, ``outcome`` :data:`BULK_REASON_APPLIED`), ``failures``
+        (``outcome`` :data:`BULK_REASON_BLOCKED` or :data:`BULK_REASON_FAILED`),
+        their counts ``blocked`` and ``failed``, ``superseded`` (planned groups
+        that no longer posed a decision when their turn came; nothing is
+        written for those) and ``event_picture_ids``, the stack-expanded set of
+        pictures the slice changed.
+
+    Raises:
+        AutoStackSliceError: On anything the per-group handling does not
+            expect. The failing group's writes are rolled back; the groups
+            before it stay committed, and the error carries their report.
+    """
+    scope = scope or DedupScope()
     batch_id = batch_id or new_batch_id()
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     event_picture_ids: set[int] = set()
     superseded = 0
-    for group_id, signature in groups:
+    for group_id in group_ids:
+        signature: Optional[str] = None
         try:
-            if not _still_poses_a_decision(session, group_id, event_picture_ids):
-                # Not a failure: an earlier group in this run already collapsed
-                # it, so it left the queue too. Nothing is written for it.
+            # Inside the boundary: the re-check is a query of its own and can
+            # fail like one, after earlier groups have committed.
+            signature = _recheck_planned_group(session, int(group_id), scope)
+            if signature is None:
                 superseded += 1
-                logger.info(
-                    "[dedup-verdict] auto-stack superseded group %s (batch=%s): an "
-                    "earlier group in this run left it no decision to make",
-                    signature,
-                    batch_id,
-                )
                 continue
             result = apply_stack_verdict_in_session(
                 session,
@@ -1774,16 +1803,10 @@ def bulk_auto_stack_in_session(
                 origin_client_id=origin_client_id,
             )
         except (DedupVerdictError, HTTPException) as exc:
-            # One unstackable group must never abort the run: every earlier group
-            # has already committed, so aborting here would leave a partially
-            # applied bulk mutation whose batch id the caller never receives -
-            # i.e. no undo handle for work that did happen.
-            #
-            # HTTPException is caught alongside DedupVerdictError because the
-            # locked-set guards raise 423, and a locked member is the *most
-            # likely* reason a group cannot be stacked. Catching only the former
-            # made this function's own API description ("a single unstackable
-            # group never aborts the run") false for the common case.
+            # One unstackable group never aborts the run. HTTPException is
+            # caught alongside DedupVerdictError because the locked-set guards
+            # raise 423, and a locked member is the most likely reason a group
+            # cannot be stacked.
             session.rollback()
             if isinstance(exc, HTTPException):
                 reason, detail, status_code = (
@@ -1809,58 +1832,41 @@ def bulk_auto_stack_in_session(
                 }
             )
             continue
-        except Exception:
+        except Exception as exc:
             # Anything else is a defect, not a refusal, so the run stops rather
-            # than guess. Every earlier group has already committed under the
-            # batch, and the caller gets this exception instead of the batch id,
-            # so this line is where the undo handle and the progress survive.
+            # than guess. Rolled back here so no later commit on this session
+            # can persist the failing group's half-written stack.
+            session.rollback()
+            # The signature is unknown when the re-check itself failed.
+            stopped_at = signature or f"id {int(group_id)}"
             logger.exception(
                 "[dedup-verdict] auto-stack stopped at group %s (batch=%s) after "
-                "%d applied group(s); those stay committed under the batch and "
-                "undo with it",
-                signature,
+                "%d applied group(s) in this slice; those stay committed under "
+                "the batch and undo with it",
+                stopped_at,
                 batch_id,
                 len(results),
             )
-            raise
+            raise AutoStackSliceError(
+                _auto_stack_report(
+                    batch_id, scope, results, failures, superseded, event_picture_ids
+                ),
+                stopped_at,
+            ) from exc
         results.append({**result.as_dict(), "outcome": BULK_REASON_APPLIED})
         # A group can name one member of an already-existing stack. Folding that
         # stack reparents and renumbers every sibling, so aggregate the verdict's
         # complete affected set rather than reconstructing it from picture_ids.
         event_picture_ids.update(result.event_picture_ids)
-    prune_stale_groups_in_session(session)
-    logger.info(
-        "[dedup-verdict] auto-stacked %d exact group(s) under batch %s "
-        "(%d blocked, %d failed, %d superseded)",
-        len(results),
-        batch_id,
-        sum(1 for f in failures if f["outcome"] == BULK_REASON_BLOCKED),
-        sum(1 for f in failures if f["outcome"] == BULK_REASON_FAILED),
-        superseded,
+    return _auto_stack_report(
+        batch_id, scope, results, failures, superseded, event_picture_ids
     )
-    return {
-        # Always present once anything could have committed, so the caller always
-        # holds the POST /operations/batches/{batch_id}/undo handle.
-        "batch_id": batch_id,
-        "dry_run": False,
-        "groups": len(results),
-        "pictures": sum(len(item["picture_ids"]) for item in results),
-        "scope": scope.as_dict(),
-        "results": results,
-        "failures": failures,
-        "blocked": sum(1 for f in failures if f["outcome"] == BULK_REASON_BLOCKED),
-        "failed": sum(1 for f in failures if f["outcome"] == BULK_REASON_FAILED),
-        # Planned groups an earlier group in the run took out of the queue.
-        "superseded": superseded,
-        # Wrapper-only broadcast plumbing; removed before the API response.
-        "event_picture_ids": sorted(event_picture_ids),
-    }
 
 
 # --- Vault wrappers ---------------------------------------------------------
 
 
-def _notify_pictures_changed(
+def notify_pictures_changed(
     vault: "Vault",
     picture_ids: list[int],
     origin_client_id: Optional[str],
@@ -1914,7 +1920,7 @@ def apply_stack_verdict(
         source,
         origin_client_id,
     )
-    _notify_pictures_changed(vault, result.event_picture_ids, origin_client_id, source)
+    notify_pictures_changed(vault, result.event_picture_ids, origin_client_id, source)
     return result
 
 
@@ -1940,7 +1946,7 @@ def apply_keep_separate(
         source,
         origin_client_id,
     )
-    _notify_pictures_changed(vault, result.event_picture_ids, origin_client_id, source)
+    notify_pictures_changed(vault, result.event_picture_ids, origin_client_id, source)
     return result
 
 
@@ -2024,7 +2030,7 @@ def apply_verdict_batch(
         origin_client_id,
     )
     event_picture_ids = report.pop("event_picture_ids", [])
-    _notify_pictures_changed(vault, event_picture_ids, origin_client_id, source)
+    notify_pictures_changed(vault, event_picture_ids, origin_client_id, source)
     return report
 
 
@@ -2054,51 +2060,23 @@ def reopen_verdict(
         origin_client_id,
     )
     event_picture_ids = result.pop("event_picture_ids", [])
-    _notify_pictures_changed(vault, event_picture_ids, origin_client_id, source)
+    notify_pictures_changed(vault, event_picture_ids, origin_client_id, source)
     return result
 
 
-def bulk_auto_stack(
+def preview_auto_stack(
     vault: "Vault",
     scope: Optional[DedupScope] = None,
-    batch_id: Optional[str] = None,
-    dry_run: bool = False,
     limit: Optional[int] = None,
-    actor: Optional[str] = None,
-    source: str = "external",
-    origin_client_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Write-path vault wrapper around :func:`bulk_auto_stack_in_session`.
+    """Read-path vault wrapper around :func:`preview_auto_stack_in_session`.
 
-    A dry run returns before minting a batch id and writes nothing, so it goes to
-    ``run_immediate_read_task`` instead of the serialised writer queue. On the
-    queue it held the single writer thread for as long as the aggregate took, and
-    every stack verdict behind it (also a write task) waited: the consent dialog
-    timed out and the queue then refused each group with "Could not stack that
-    group" until the preview finished (#751). The preview is read-only, so
-    it has no business blocking writes even when it is slow.
+    On ``run_immediate_read_task``, never the writer queue: on the queue the
+    preview held the single writer for as long as the aggregate took, every
+    stack verdict behind it waited, and the queue refused each group with
+    "Could not stack that group" until it finished (#751).
     """
-    runner = vault.db.run_immediate_read_task if dry_run else vault.db.run_task
-    report = runner(
-        bulk_auto_stack_in_session,
-        scope,
-        batch_id,
-        dry_run,
-        limit,
-        actor,
-        source,
-        origin_client_id,
-    )
-    if not report.get("dry_run"):
-        event_picture_ids = report.pop("event_picture_ids", [])
-        # One post-commit announcement over the full stack-expanded affected set.
-        _notify_pictures_changed(
-            vault,
-            event_picture_ids,
-            origin_client_id,
-            source,
-        )
-    return report
+    return vault.db.run_immediate_read_task(preview_auto_stack_in_session, scope, limit)
 
 
 # Registered at import time, and this module is imported by
@@ -2131,6 +2109,7 @@ __all__ = [
     "OP_TYPE_KEEP_SEPARATE",
     "OP_TYPE_REOPEN",
     "OP_TYPE_STACK",
+    "AutoStackSliceError",
     "DedupVerdictError",
     "VerdictResult",
     "apply_keep_separate",
@@ -2140,9 +2119,12 @@ __all__ = [
     "apply_stack_verdict_in_session",
     "apply_verdict_batch",
     "apply_verdict_batch_in_session",
-    "bulk_auto_stack",
-    "bulk_auto_stack_in_session",
+    "auto_stack_groups_in_session",
     "new_batch_id",
+    "notify_pictures_changed",
+    "plan_auto_stack_in_session",
+    "preview_auto_stack",
+    "preview_auto_stack_in_session",
     "reopen_verdict",
     "reopen_verdict_in_session",
     "restore_reopens_in_session",

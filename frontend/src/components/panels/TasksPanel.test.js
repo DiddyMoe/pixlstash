@@ -1409,6 +1409,27 @@ describe("the GPU queue in the task manager", () => {
     expect(working.find("canvas.tm-sparkline").exists()).toBe(true);
   });
 
+  it("names a background Auto-stack run by the action the user started", () => {
+    // The worker's counter is `duplicate_auto_stack`; spelled out word by word
+    // it would read "Duplicate Auto Stack", which is nothing the user clicked.
+    const tasksStore = setGpu(gpuAnswer({ leases: [] }));
+    tasksStore.workerSnapshots = {
+      DedupAutoStackTask: {
+        label: "duplicate_auto_stack",
+        current: 37036,
+        total: 123456,
+        running: true,
+        active: true,
+      },
+    };
+    localStorage.setItem("pixlstash:tasks:pixlstash-fold", "1");
+    const wrapper = mount(TasksPanel, globalOpts);
+    const rows = wrapper.findAll('[data-testid="tm-pixl-child"]');
+    expect(rows.map((row) => row.find(".tm-child-name").text())).toEqual([
+      "Auto-stack 37036 / 123456",
+    ]);
+  });
+
   it("marks a task the backend stopped as stopped, not as lost", async () => {
     setGpu(
       gpuAnswer({

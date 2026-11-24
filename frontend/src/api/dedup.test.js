@@ -15,7 +15,13 @@ import {
   keepGroupSeparate,
   applyVerdictBatch,
   reopenGroup,
-  autoStackExact,
+  previewAutoStackExact,
+  startAutoStackRun,
+  getAutoStackRun,
+  getLatestAutoStackRun,
+  cancelAutoStackRun,
+  revertAutoStackRun,
+  retryAfterMs,
   scopeBody,
   policyBody,
   listStackMembers,
@@ -341,12 +347,15 @@ describe("api/dedup - verdicts", () => {
   });
 });
 
-describe("api/dedup - bulk auto-stack", () => {
-  // The safe direction is the default: a caller that forgets the flag counts
-  // rather than writes.
-  it("autoStackExact defaults to a dry run", async () => {
+describe("api/dedup - the auto-stack preview", () => {
+  // The preview is a read: the server refuses `dry_run: false` on this route,
+  // so the client has no way left to apply through it.
+  it("previewAutoStackExact always asks for a dry run", async () => {
     apiClient.post.mockResolvedValue({ data: { groups: 1204 } });
-    const result = await autoStackExact();
+    const result = await previewAutoStackExact({
+      dryRun: false,
+      batchId: "b-1",
+    });
     expect(apiClient.post).toHaveBeenCalledWith("/dedup/auto-stack", {
       scope: { scope_type: GLOBAL_SCOPE },
       dry_run: true,
@@ -354,42 +363,146 @@ describe("api/dedup - bulk auto-stack", () => {
     expect(result.groups).toBe(1204);
   });
 
-  it("autoStackExact commits with dry_run false and returns the batch id", async () => {
-    apiClient.post.mockResolvedValue({ data: { batch_id: "b-1" } });
-    const result = await autoStackExact({ dryRun: false });
-    expect(apiClient.post).toHaveBeenCalledWith("/dedup/auto-stack", {
-      scope: { scope_type: GLOBAL_SCOPE },
-      dry_run: false,
-    });
-    expect(result.batch_id).toBe("b-1");
-  });
-
-  it("autoStackExact scopes and caps a paged run", async () => {
+  it("previewAutoStackExact scopes and caps the count", async () => {
     apiClient.post.mockResolvedValue({ data: {} });
-    await autoStackExact({
-      dryRun: false,
+    await previewAutoStackExact({
       scopeType: "character",
       scopeId: 2,
       limit: 500,
     });
     expect(apiClient.post).toHaveBeenCalledWith("/dedup/auto-stack", {
       scope: { scope_type: "character", scope_id: "2" },
-      dry_run: false,
+      dry_run: true,
       limit: 500,
     });
   });
 
   // The dialog aborts a preview it has moved past; the signal has to reach the
   // request or the abort cancels nothing.
-  it("autoStackExact hands an abort signal to the request", async () => {
+  it("previewAutoStackExact hands an abort signal to the request", async () => {
     apiClient.post.mockResolvedValue({ data: {} });
     const controller = new AbortController();
-    await autoStackExact({ signal: controller.signal });
+    await previewAutoStackExact({ signal: controller.signal });
     expect(apiClient.post).toHaveBeenCalledWith(
       "/dedup/auto-stack",
       { scope: { scope_type: GLOBAL_SCOPE }, dry_run: true },
       { signal: controller.signal },
     );
+  });
+});
+
+describe("api/dedup - auto-stack runs", () => {
+  const run = { id: 7, kind: "apply", status: "pending", active: true };
+
+  it("starts a run with the gesture's request id and returns the poll hint", async () => {
+    apiClient.post.mockResolvedValue({
+      data: run,
+      headers: { "retry-after": "2" },
+    });
+    const result = await startAutoStackRun({
+      scopeType: "character",
+      scopeId: 2,
+      limit: 500,
+      requestId: "example-request",
+    });
+    expect(apiClient.post).toHaveBeenCalledWith("/dedup/auto-stack/runs", {
+      scope: { scope_type: "character", scope_id: "2" },
+      limit: 500,
+      request_id: "example-request",
+    });
+    expect(result).toEqual({ run, retryAfterMs: 2000 });
+  });
+
+  it("starts a run without a request id or cap when given none", async () => {
+    apiClient.post.mockResolvedValue({ data: run, headers: {} });
+    const result = await startAutoStackRun();
+    expect(apiClient.post).toHaveBeenCalledWith("/dedup/auto-stack/runs", {
+      scope: { scope_type: GLOBAL_SCOPE },
+    });
+    // An answer without the header leaves the interval to the caller.
+    expect(result.retryAfterMs).toBeNull();
+  });
+
+  it("reads one run by its id", async () => {
+    apiClient.get.mockResolvedValue({
+      data: run,
+      headers: { "retry-after": "5" },
+    });
+    const result = await getAutoStackRun(7);
+    expect(apiClient.get).toHaveBeenCalledWith("/dedup/auto-stack/runs/7");
+    expect(result).toEqual({ run, retryAfterMs: 5000 });
+  });
+
+  it("reads the newest run, and null before the first", async () => {
+    apiClient.get.mockResolvedValueOnce({ data: { run } });
+    expect(await getLatestAutoStackRun()).toEqual(run);
+    expect(apiClient.get).toHaveBeenCalledWith("/dedup/auto-stack/runs/latest");
+    apiClient.get.mockResolvedValueOnce({ data: { run: null } });
+    expect(await getLatestAutoStackRun()).toBeNull();
+  });
+
+  it("asks a run to stop", async () => {
+    const stopping = { ...run, status: "running", cancel_requested: true };
+    apiClient.post.mockResolvedValue({
+      data: stopping,
+      headers: { "retry-after": "2" },
+    });
+    const result = await cancelAutoStackRun(7);
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/dedup/auto-stack/runs/7/cancel",
+    );
+    expect(result).toEqual({ run: stopping, retryAfterMs: 2000 });
+  });
+
+  it("starts an undo of an apply run with its own request id", async () => {
+    const revert = { id: 8, kind: "revert", target_run_id: 7, active: true };
+    apiClient.post.mockResolvedValue({
+      data: revert,
+      headers: { "retry-after": "2" },
+    });
+    const result = await revertAutoStackRun(7, { requestId: "example-undo" });
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/dedup/auto-stack/runs/7/revert",
+      {
+        request_id: "example-undo",
+      },
+    );
+    expect(result.run).toEqual(revert);
+
+    apiClient.post.mockClear();
+    await revertAutoStackRun(7);
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/dedup/auto-stack/runs/7/revert",
+      {},
+    );
+  });
+});
+
+describe("api/dedup - retryAfterMs", () => {
+  it("reads a count of seconds", () => {
+    expect(retryAfterMs({ "retry-after": "2" })).toBe(2000);
+    expect(retryAfterMs({ "retry-after": " 0 " })).toBe(0);
+  });
+
+  it("reads axios's header object through its getter", () => {
+    const headers = {
+      get: (name) => (name === "retry-after" ? "4" : undefined),
+    };
+    expect(retryAfterMs(headers)).toBe(4000);
+  });
+
+  it("treats a missing or unreadable value as no hint", () => {
+    expect(retryAfterMs(undefined)).toBeNull();
+    expect(retryAfterMs({})).toBeNull();
+    expect(retryAfterMs({ "retry-after": "soon" })).toBeNull();
+    // `Date.parse` reads both of these as dates in 2001; taken as a date, a
+    // malformed hint would become a zero wait and a tight poll.
+    expect(retryAfterMs({ "retry-after": "-2" })).toBeNull();
+    expect(retryAfterMs({ "retry-after": "1.5" })).toBeNull();
+    // The run routes send seconds only, so a date is not read as a hint.
+    expect(
+      retryAfterMs({ "retry-after": "Mon, 23 Nov 2026 10:00:03 GMT" }),
+    ).toBeNull();
   });
 });
 

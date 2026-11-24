@@ -41,7 +41,14 @@ vi.mock("../../api/dedup", () => ({
   keepGroupSeparate: vi.fn(),
   applyVerdictBatch: vi.fn(),
   reopenGroup: vi.fn(),
-  autoStackExact: vi.fn(),
+  // Auto-stack: a dry run that only counts, and the background run it starts,
+  // which the queue follows by polling until it ends.
+  previewAutoStackExact: vi.fn(),
+  startAutoStackRun: vi.fn(),
+  getAutoStackRun: vi.fn(),
+  getLatestAutoStackRun: vi.fn(),
+  cancelAutoStackRun: vi.fn(),
+  revertAutoStackRun: vi.fn(),
   // The lazy half of the stack contract: a row's expansion reads its members
   // only when the user opens one.
   listStackMembers: vi.fn(),
@@ -104,6 +111,8 @@ vi.mock("../../stores/useOperationStore", () => {
     nextRedo: null,
     past: [],
     operations: [],
+    // The dedup store keeps a followed run's History steps off the pill.
+    setNarrationFilter: vi.fn(),
     $onAction: (cb) => {
       actionListeners.push(cb);
       return () => {};
@@ -136,7 +145,12 @@ import {
   keepGroupSeparate,
   applyVerdictBatch,
   reopenGroup,
-  autoStackExact,
+  previewAutoStackExact,
+  startAutoStackRun,
+  getAutoStackRun,
+  getLatestAutoStackRun,
+  cancelAutoStackRun,
+  revertAutoStackRun,
   listStackMembers,
   listMixedStacks,
   splitMixedStack,
@@ -209,6 +223,64 @@ function mixedPage(stacks, over = {}) {
     ...over,
   };
 }
+
+/** An auto-stack run in the backend's shape: apply run 7, a third of the way. */
+function runFixture(over = {}) {
+  return {
+    id: 7,
+    request_id: "cli-fake-request",
+    kind: "apply",
+    status: "running",
+    active: true,
+    target_run_id: null,
+    total: 120,
+    processed: 40,
+    applied: 40,
+    superseded: 0,
+    blocked: 0,
+    failed: 0,
+    pictures: 80,
+    failures: [],
+    segment_batch_ids: [],
+    cancel_requested: false,
+    can_revert: false,
+    error_code: null,
+    error: null,
+    created_at: "2026-05-12T14:22:00Z",
+    ...over,
+  };
+}
+
+/** Run 8, undoing apply run 7, a third of the way. */
+function revertRun(over = {}) {
+  return runFixture({ id: 8, kind: "revert", target_run_id: 7, ...over });
+}
+
+/** An axios rejection carrying a served status and `detail`. */
+function refusal(status, detail) {
+  return Object.assign(new Error(`Request failed with status code ${status}`), {
+    response: { status, data: detail == null ? {} : { detail } },
+  });
+}
+
+/** A promise the test settles by hand, to order replies at will. */
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+const autoStackDialog = (wrapper) =>
+  wrapper.findComponent({ name: "DedupAutoStackDialog" });
+const autoStackTrigger = (wrapper) =>
+  wrapper.find('[data-testid="auto-stack-trigger"]');
+/** What the queue's one live region last said. */
+const announced = (wrapper) =>
+  wrapper.find('[data-testid="dedup-announcement"]').text();
 
 /** The bounds `GET /dedup/policy` publishes. */
 const BOUNDS = {
@@ -312,6 +384,12 @@ beforeEach(() => {
     keepGroupSeparate,
     applyVerdictBatch,
     reopenGroup,
+    previewAutoStackExact,
+    startAutoStackRun,
+    getAutoStackRun,
+    getLatestAutoStackRun,
+    cancelAutoStackRun,
+    revertAutoStackRun,
     listStackMembers,
     listMixedStacks,
     splitMixedStack,
@@ -327,6 +405,9 @@ beforeEach(() => {
   // Most libraries have no mixed stack at all, so an empty list is the default
   // answer here too. Cases that need rows override it.
   listMixedStacks.mockResolvedValue(mixedPage([]));
+  // The queue looks for the newest Auto-stack run when it opens; most cases
+  // run in a library that never had one.
+  getLatestAutoStackRun.mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -2512,102 +2593,94 @@ describe("DuplicateQueue - the Auto-stack dry run", () => {
   // be closed, reopened or left behind before it lands. Its figures are the
   // user's consent, so they must belong to the dialog on screen, and the run
   // that consent starts must act on the scope those figures described.
-  const dialog = (wrapper) =>
-    wrapper.findComponent({ name: "DedupAutoStackDialog" });
-  const trigger = (wrapper) =>
-    wrapper.find('[data-testid="auto-stack-trigger"]');
-
-  /** A promise the test settles by hand, to order two replies at will. */
-  function deferred() {
-    let resolve;
-    let reject;
-    const promise = new Promise((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
-    return { promise, resolve, reject };
-  }
-
   const mountWithExactGroups = () =>
     mountQueue([group("g1")], { byTier: { exact: 3 } });
 
   beforeEach(() => {
-    autoStackExact.mockReset();
+    // A started run is followed by a timed poll; fake timers keep it from
+    // outliving the case.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("keeps the newer opening's figures when the older reply lands last", async () => {
     const first = deferred();
     const second = deferred();
-    autoStackExact
+    previewAutoStackExact
       .mockReturnValueOnce(first.promise)
       .mockReturnValueOnce(second.promise);
     const { wrapper } = await mountWithExactGroups();
 
-    await trigger(wrapper).trigger("click");
-    await trigger(wrapper).trigger("click");
+    await autoStackTrigger(wrapper).trigger("click");
+    await autoStackTrigger(wrapper).trigger("click");
     // The newer opening cancels the request it replaced.
-    expect(autoStackExact.mock.calls[0][0].signal.aborted).toBe(true);
-    expect(autoStackExact.mock.calls[1][0].signal.aborted).toBe(false);
+    expect(previewAutoStackExact.mock.calls[0][0].signal.aborted).toBe(true);
+    expect(previewAutoStackExact.mock.calls[1][0].signal.aborted).toBe(false);
 
     second.resolve({ dry_run: true, groups: 2, pictures: 4 });
     await flushPromises();
     first.resolve({ dry_run: true, groups: 99, pictures: 999 });
     await flushPromises();
 
-    expect(dialog(wrapper).props("preview")).toEqual({
+    expect(autoStackDialog(wrapper).props("preview")).toEqual({
       dry_run: true,
       groups: 2,
       pictures: 4,
     });
-    expect(dialog(wrapper).props("loading")).toBe(false);
+    expect(autoStackDialog(wrapper).props("loading")).toBe(false);
     wrapper.unmount();
   });
 
   it("cancels the dry run when the dialog closes and ignores what lands after", async () => {
     const pending = deferred();
-    autoStackExact.mockReturnValueOnce(pending.promise);
+    previewAutoStackExact.mockReturnValueOnce(pending.promise);
     const { wrapper } = await mountWithExactGroups();
 
-    await trigger(wrapper).trigger("click");
-    const { signal } = autoStackExact.mock.calls[0][0];
+    await autoStackTrigger(wrapper).trigger("click");
+    const { signal } = previewAutoStackExact.mock.calls[0][0];
     expect(signal.aborted).toBe(false);
 
-    dialog(wrapper).vm.$emit("close");
+    autoStackDialog(wrapper).vm.$emit("close");
     await flushPromises();
     expect(signal.aborted).toBe(true);
 
     pending.resolve({ dry_run: true, groups: 5, pictures: 10 });
     await flushPromises();
-    expect(dialog(wrapper).props("open")).toBe(false);
-    expect(dialog(wrapper).props("preview")).toBe(null);
-    expect(dialog(wrapper).props("loading")).toBe(false);
+    expect(autoStackDialog(wrapper).props("open")).toBe(false);
+    expect(autoStackDialog(wrapper).props("preview")).toBe(null);
+    expect(autoStackDialog(wrapper).props("loading")).toBe(false);
     wrapper.unmount();
   });
 
   it("cancels the dry run when the queue is left", async () => {
-    autoStackExact.mockReturnValueOnce(deferred().promise);
+    previewAutoStackExact.mockReturnValueOnce(deferred().promise);
     const { wrapper } = await mountWithExactGroups();
 
-    await trigger(wrapper).trigger("click");
-    const { signal } = autoStackExact.mock.calls[0][0];
+    await autoStackTrigger(wrapper).trigger("click");
+    const { signal } = previewAutoStackExact.mock.calls[0][0];
     wrapper.unmount();
     expect(signal.aborted).toBe(true);
   });
 
-  it("stacks the scope it previewed after the queue moved to another", async () => {
-    autoStackExact
-      .mockResolvedValueOnce({ dry_run: true, groups: 3, pictures: 6 })
-      .mockResolvedValueOnce({ batch_id: "srv-1", groups: 3 });
+  it("starts the run on the scope it previewed after the queue moved to another", async () => {
+    previewAutoStackExact.mockResolvedValueOnce({
+      dry_run: true,
+      groups: 3,
+      pictures: 6,
+    });
+    startAutoStackRun.mockResolvedValueOnce({
+      run: runFixture(),
+      retryAfterMs: 2000,
+    });
     const { wrapper, store } = await mountWithExactGroups();
 
-    await trigger(wrapper).trigger("click");
+    await autoStackTrigger(wrapper).trigger("click");
     await flushPromises();
-    expect(autoStackExact).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        dryRun: true,
-        scopeType: "global",
-        scopeId: null,
-      }),
+    expect(previewAutoStackExact).toHaveBeenLastCalledWith(
+      expect.objectContaining({ scopeType: "global", scopeId: null }),
     );
 
     // The sidebar's "Find duplicates in..." moves the queue while the dialog
@@ -2616,22 +2689,30 @@ describe("DuplicateQueue - the Auto-stack dry run", () => {
     await flushPromises();
     expect([store.scopeType, store.scopeId]).toEqual(["project", "7"]);
 
-    dialog(wrapper).vm.$emit("confirm");
+    autoStackDialog(wrapper).vm.$emit("confirm");
     await flushPromises();
-    expect(autoStackExact).toHaveBeenCalledTimes(2);
-    expect(autoStackExact).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        dryRun: false,
-        scopeType: "global",
-        scopeId: null,
-      }),
+    // The dry run never writes: only the run's own route does.
+    expect(previewAutoStackExact).toHaveBeenCalledTimes(1);
+    expect(startAutoStackRun).toHaveBeenCalledTimes(1);
+    expect(startAutoStackRun).toHaveBeenCalledWith({
+      scopeType: "global",
+      scopeId: null,
+      requestId: expect.stringMatching(/^cli-test-\d+$/),
+    });
+    // The start answers once the run is queued, so the dialog goes and the
+    // banner takes over.
+    expect(autoStackDialog(wrapper).props("open")).toBe(false);
+    expect(wrapper.find('[data-testid="auto-stack-banner"]').exists()).toBe(
+      true,
     );
-    expect(dialog(wrapper).props("open")).toBe(false);
+    expect(announced(wrapper)).toBe(
+      "Auto-stack started in the background. Its progress shows above the queue.",
+    );
     wrapper.unmount();
   });
 
   it("hands a failed dry run to the dialog as the reason it failed", async () => {
-    autoStackExact.mockRejectedValueOnce(
+    previewAutoStackExact.mockRejectedValueOnce(
       Object.assign(new Error("Request failed with status code 422"), {
         response: {
           status: 422,
@@ -2643,51 +2724,663 @@ describe("DuplicateQueue - the Auto-stack dry run", () => {
     );
     const { wrapper } = await mountWithExactGroups();
 
-    await trigger(wrapper).trigger("click");
+    await autoStackTrigger(wrapper).trigger("click");
     await flushPromises();
 
-    expect(dialog(wrapper).props("previewError")).toEqual({
+    expect(autoStackDialog(wrapper).props("previewError")).toEqual({
       kind: "validation",
       status: 422,
       detail: "fake-reason",
+      code: null,
+      run: null,
     });
-    expect(dialog(wrapper).props("preview")).toBe(null);
-    expect(dialog(wrapper).props("loading")).toBe(false);
+    expect(autoStackDialog(wrapper).props("preview")).toBe(null);
+    expect(autoStackDialog(wrapper).props("loading")).toBe(false);
     wrapper.unmount();
   });
+});
 
-  // With no answer the client cannot tell a run the server is still working
-  // through from one that never reached it or one whose reply was lost, so
-  // "Could not ... nothing was lost" and "still running" would both be
-  // guesses. The run is reported as unconfirmed, and History is where to look.
+describe("DuplicateQueue - starting the Auto-stack run", () => {
+  // The reported failure: the whole tier ran inside one request, the client
+  // gave up on it after 60 s, and the queue could only say the outcome was not
+  // confirmed. The start now answers as soon as the run is queued; an
+  // unanswered start is sent again under the same request id, which the server
+  // answers with the run the first attempt began, never a second run.
+  const OLD_NOTICE = /did not answer, so its outcome is not confirmed/;
+
+  async function openAndPreview() {
+    previewAutoStackExact.mockResolvedValue({
+      dry_run: true,
+      groups: 3,
+      pictures: 6,
+    });
+    const mounted = await mountQueue([group("g1")], { byTier: { exact: 3 } });
+    await autoStackTrigger(mounted.wrapper).trigger("click");
+    await flushPromises();
+    return mounted;
+  }
+
+  /** Confirm the open dialog, and run out the store's two resend waits. */
+  async function confirmAndWaitOutResends(wrapper) {
+    autoStackDialog(wrapper).vm.$emit("confirm");
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(3000);
+    await flushPromises();
+  }
+
+  const requestIds = () =>
+    startAutoStackRun.mock.calls.map(([args]) => args.requestId);
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it.each([
     ["the client's timeout", "timeout of 60000ms exceeded", "ECONNABORTED"],
     ["a refused or lost connection", "Network Error", "ERR_NETWORK"],
   ])(
-    "reports a run with no answer as unconfirmed, not failed: %s",
+    "keeps the dialog open on an unanswered start, and confirming again resends it: %s",
     async (_label, message, code) => {
-      autoStackExact
-        .mockResolvedValueOnce({ dry_run: true, groups: 3, pictures: 6 })
-        .mockRejectedValueOnce(Object.assign(new Error(message), { code }));
-      const { wrapper } = await mountWithExactGroups();
+      const kind = code === "ECONNABORTED" ? "timeout" : "network";
+      startAutoStackRun.mockRejectedValue(
+        Object.assign(new Error(message), { code }),
+      );
+      const { wrapper } = await openAndPreview();
       const notices = useNoticeStore();
 
-      await trigger(wrapper).trigger("click");
-      await flushPromises();
-      dialog(wrapper).vm.$emit("confirm");
-      await flushPromises();
+      await confirmAndWaitOutResends(wrapper);
 
-      const unconfirmed =
-        "Auto-stack did not answer, so its outcome is not confirmed: it may still be running, or it may never have reached the server. Check History before running it again.";
-      const said = wrapper.find('[data-testid="dedup-announcement"]').text();
-      expect(said).not.toMatch(/still running/i);
-      expect(said).toBe(unconfirmed);
-      expect(notices.info).toHaveBeenCalledWith(unconfirmed);
+      // Sent three times as one request.
+      expect(startAutoStackRun).toHaveBeenCalledTimes(3);
+      expect(new Set(requestIds()).size).toBe(1);
+      expect(autoStackDialog(wrapper).props("open")).toBe(true);
+      expect(autoStackDialog(wrapper).props("startError")).toMatchObject({
+        kind,
+      });
+      expect(announced(wrapper)).not.toMatch(OLD_NOTICE);
+      expect(notices.info).not.toHaveBeenCalled();
       expect(notices.error).not.toHaveBeenCalled();
-      expect(dialog(wrapper).props("open")).toBe(false);
+
+      // The fourth try is the same request too, and its answer is the run.
+      const [sent] = requestIds();
+      startAutoStackRun.mockReset();
+      startAutoStackRun.mockResolvedValueOnce({
+        run: runFixture(),
+        retryAfterMs: 2000,
+      });
+      autoStackDialog(wrapper).vm.$emit("confirm");
+      await flushPromises();
+      expect(requestIds()).toEqual([sent]);
+      expect(autoStackDialog(wrapper).props("open")).toBe(false);
+      expect(wrapper.find('[data-testid="auto-stack-banner"]').exists()).toBe(
+        true,
+      );
       wrapper.unmount();
     },
   );
+
+  it("mints a new request id for each opening of the dialog", async () => {
+    startAutoStackRun.mockResolvedValue({
+      run: runFixture({ status: "complete", active: false, processed: 120 }),
+      retryAfterMs: null,
+    });
+    const { wrapper } = await openAndPreview();
+    autoStackDialog(wrapper).vm.$emit("confirm");
+    await flushPromises();
+    // The id named a run that had already ended by the time it was answered.
+    expect(announced(wrapper)).toBe(
+      "That Auto-stack run has already ended. Its result shows above the queue.",
+    );
+
+    await autoStackTrigger(wrapper).trigger("click");
+    await flushPromises();
+    autoStackDialog(wrapper).vm.$emit("confirm");
+    await flushPromises();
+    const [first, second] = requestIds();
+    expect(first).toMatch(/^cli-test-\d+$/);
+    expect(second).toMatch(/^cli-test-\d+$/);
+    expect(second).not.toBe(first);
+    wrapper.unmount();
+  });
+
+  it("says an unanswered start a closed dialog no longer shows, and looks for its run", async () => {
+    startAutoStackRun.mockRejectedValue(
+      Object.assign(new Error("timeout of 60000ms exceeded"), {
+        code: "ECONNABORTED",
+      }),
+    );
+    const { wrapper } = await openAndPreview();
+    const notices = useNoticeStore();
+    expect(getLatestAutoStackRun).toHaveBeenCalledTimes(1);
+
+    autoStackDialog(wrapper).vm.$emit("confirm");
+    await flushPromises();
+    autoStackDialog(wrapper).vm.$emit("close");
+    await flushPromises();
+    // The first attempt did start a run; only its answer was lost.
+    getLatestAutoStackRun.mockResolvedValueOnce(runFixture());
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(3000);
+    await flushPromises();
+
+    const sentence =
+      "No answer came from the server, so it is not known whether the run started. Its progress shows above the queue if it did.";
+    expect(notices.error).toHaveBeenCalledWith(sentence);
+    expect(announced(wrapper)).toBe(sentence);
+    expect(announced(wrapper)).not.toMatch(OLD_NOTICE);
+    expect(getLatestAutoStackRun).toHaveBeenCalledTimes(2);
+    expect(wrapper.find('[data-testid="auto-stack-banner"]').exists()).toBe(
+      true,
+    );
+    wrapper.unmount();
+  });
+
+  it("does not resend a refusal, and shows the run it names", async () => {
+    startAutoStackRun.mockRejectedValueOnce(
+      refusal(409, {
+        code: "auto_stack_run_active",
+        message: "Run 3 is already active.",
+        run: runFixture({ id: 3 }),
+      }),
+    );
+    const { wrapper, store } = await openAndPreview();
+    await confirmAndWaitOutResends(wrapper);
+
+    expect(startAutoStackRun).toHaveBeenCalledTimes(1);
+    expect(autoStackDialog(wrapper).props("startError")).toMatchObject({
+      kind: "conflict",
+      code: "auto_stack_run_active",
+    });
+    expect(store.autoStackRun.id).toBe(3);
+    expect(wrapper.find('[data-testid="auto-stack-banner"]').exists()).toBe(
+      true,
+    );
+    wrapper.unmount();
+  });
+
+  it("tells the dialog a start is on the wire, and holds the trigger meanwhile", async () => {
+    const pending = deferred();
+    startAutoStackRun.mockReturnValueOnce(pending.promise);
+    const { wrapper } = await openAndPreview();
+    expect(autoStackDialog(wrapper).props("busy")).toBe(false);
+
+    autoStackDialog(wrapper).vm.$emit("confirm");
+    await flushPromises();
+    expect(autoStackDialog(wrapper).props("busy")).toBe(true);
+    expect(autoStackTrigger(wrapper).attributes("aria-disabled")).toBe("true");
+    expect(tipText(autoStackTrigger(wrapper))).toBe(
+      "Waiting for the server to answer the last Auto-stack request.",
+    );
+
+    pending.resolve({ run: runFixture(), retryAfterMs: 2000 });
+    await flushPromises();
+    expect(autoStackDialog(wrapper).props("busy")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("holds the trigger while a run is going, without opening the dialog", async () => {
+    getLatestAutoStackRun.mockResolvedValueOnce(runFixture());
+    const { wrapper } = await mountQueue([group("g1")], {
+      byTier: { exact: 3 },
+    });
+    await flushPromises();
+
+    const trigger = autoStackTrigger(wrapper);
+    // Held, not disabled: it keeps focus and its tooltip says why.
+    expect(trigger.attributes("aria-disabled")).toBe("true");
+    expect(trigger.attributes("disabled")).toBeUndefined();
+    expect(tipText(trigger)).toBe(
+      "An Auto-stack run is already going. Its progress shows above the queue.",
+    );
+    await trigger.trigger("click");
+    await flushPromises();
+    expect(previewAutoStackExact).not.toHaveBeenCalled();
+    expect(autoStackDialog(wrapper).props("open")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("offers the trigger when no run is going", async () => {
+    const { wrapper } = await mountQueue([group("g1")], {
+      byTier: { exact: 3 },
+    });
+    await flushPromises();
+    const trigger = autoStackTrigger(wrapper);
+    expect(trigger.attributes("aria-disabled")).toBeUndefined();
+    expect(tipText(trigger)).toBe(trigger.attributes("aria-label"));
+    wrapper.unmount();
+  });
+});
+
+describe("DuplicateQueue - the Auto-stack run banner", () => {
+  // The banner is the run's only surface once the start has answered: it
+  // follows the run, stops it, undoes it, and is put away once it has ended.
+  const banner = (wrapper) => wrapper.find('[data-testid="auto-stack-banner"]');
+
+  /** Mount over a run the session finds when the queue opens. */
+  async function mountWithRun(run) {
+    getLatestAutoStackRun.mockResolvedValueOnce(run);
+    const mounted = await mountQueue([group("g1")], { byTier: { exact: 3 } });
+    await flushPromises();
+    return mounted;
+  }
+
+  /** Press a banner control the way the keyboard would leave focus on it. */
+  async function press(wrapper, testId) {
+    const button = wrapper.find(`[data-testid="${testId}"]`);
+    expect(button.exists()).toBe(true);
+    button.element.focus();
+    await button.trigger("click");
+    await flushPromises();
+  }
+
+  const queueHasFocus = (wrapper) =>
+    document.activeElement === wrapper.find(".dq").element;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("looks for the newest run on arriving, and shows it", async () => {
+    const { wrapper } = await mountWithRun(runFixture());
+    expect(getLatestAutoStackRun).toHaveBeenCalledTimes(1);
+    expect(banner(wrapper).exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("shows no banner when there is no run", async () => {
+    const { wrapper } = await mountWithRun(null);
+    expect(banner(wrapper).exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("neither looks for a run nor shows one in a read-only session", async () => {
+    readOnlyRef.value = true;
+    const { wrapper, store } = await mountQueue([group("g1")]);
+    await flushPromises();
+    expect(getLatestAutoStackRun).not.toHaveBeenCalled();
+    store.autoStackRun = runFixture();
+    await flushPromises();
+    expect(banner(wrapper).exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it.each([
+    [
+      "an apply run",
+      runFixture(),
+      runFixture({ cancel_requested: true }),
+      "Auto-stack stops after the current step. The stacks it made so far stay.",
+    ],
+    [
+      "an undo",
+      runFixture({ id: 8, kind: "revert", target_run_id: 7 }),
+      runFixture({
+        id: 8,
+        kind: "revert",
+        target_run_id: 7,
+        cancel_requested: true,
+      }),
+      "The undo stops after the current step. The groups it put back stay in the queue.",
+    ],
+    [
+      "an apply run that had already ended",
+      runFixture(),
+      runFixture({ status: "complete", active: false, processed: 120 }),
+      "Auto-stack had already ended. Its result shows above the queue.",
+    ],
+    [
+      "an undo that had already ended",
+      runFixture({ id: 8, kind: "revert", target_run_id: 7 }),
+      runFixture({
+        id: 8,
+        kind: "revert",
+        target_run_id: 7,
+        status: "complete",
+        active: false,
+      }),
+      "The undo had already ended. Its result shows above the queue.",
+    ],
+  ])(
+    "stops %s and gives the queue the keyboard back",
+    async (_label, run, answer, said) => {
+      cancelAutoStackRun.mockResolvedValueOnce({
+        run: answer,
+        retryAfterMs: 2000,
+      });
+      const { wrapper } = await mountWithRun(run);
+
+      await press(wrapper, "auto-stack-stop");
+
+      expect(cancelAutoStackRun).toHaveBeenCalledWith(run.id);
+      expect(announced(wrapper)).toBe(said);
+      expect(queueHasFocus(wrapper)).toBe(true);
+      wrapper.unmount();
+    },
+  );
+
+  it("hands the banner the request on the wire, and whether the run can be read", async () => {
+    const pending = deferred();
+    cancelAutoStackRun.mockReturnValueOnce(pending.promise);
+    getAutoStackRun.mockRejectedValue(
+      Object.assign(new Error("Network Error"), { code: "ERR_NETWORK" }),
+    );
+    const { wrapper } = await mountWithRun(runFixture());
+    const props = () =>
+      wrapper.findComponent({ name: "DedupAutoStackBanner" }).props();
+    expect(props()).toMatchObject({ action: null, unreachable: false });
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(props().unreachable).toBe(true);
+
+    await press(wrapper, "auto-stack-stop");
+    expect(props().action).toBe("cancel");
+    pending.resolve({
+      run: runFixture({ cancel_requested: true }),
+      retryAfterMs: 2000,
+    });
+    await flushPromises();
+    expect(props()).toMatchObject({ action: null, unreachable: false });
+    wrapper.unmount();
+  });
+
+  it("undoes an ended run as a run of its own, which the banner follows", async () => {
+    revertAutoStackRun.mockResolvedValueOnce({
+      run: runFixture({ id: 8, kind: "revert", target_run_id: 7 }),
+      retryAfterMs: 2000,
+    });
+    const { wrapper, store } = await mountWithRun(
+      runFixture({ status: "complete", active: false, can_revert: true }),
+    );
+
+    await press(wrapper, "auto-stack-revert");
+
+    expect(revertAutoStackRun).toHaveBeenCalledWith(7, {
+      requestId: expect.stringMatching(/^cli-test-\d+$/),
+    });
+    expect(store.autoStackRun).toMatchObject({ id: 8, kind: "revert" });
+    expect(announced(wrapper)).toBe(
+      "Undoing Auto-stack in the background. Its progress shows above the queue.",
+    );
+    expect(queueHasFocus(wrapper)).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("says when the undo it asked for had already ended", async () => {
+    revertAutoStackRun.mockResolvedValueOnce({
+      run: runFixture({
+        id: 8,
+        kind: "revert",
+        target_run_id: 7,
+        status: "complete",
+        active: false,
+      }),
+      retryAfterMs: null,
+    });
+    const { wrapper } = await mountWithRun(
+      runFixture({ status: "complete", active: false, can_revert: true }),
+    );
+    await press(wrapper, "auto-stack-revert");
+    expect(announced(wrapper)).toBe(
+      "That undo has already ended. Its result shows above the queue.",
+    );
+    wrapper.unmount();
+  });
+
+  it("sends an unanswered undo again under the same id, and an answered one never", async () => {
+    revertAutoStackRun.mockRejectedValue(
+      Object.assign(new Error("Network Error"), { code: "ERR_NETWORK" }),
+    );
+    const { wrapper } = await mountWithRun(
+      runFixture({ status: "complete", active: false, can_revert: true }),
+    );
+    const notices = useNoticeStore();
+    const ids = () => revertAutoStackRun.mock.calls.map(([, o]) => o.requestId);
+
+    await press(wrapper, "auto-stack-revert");
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(3000);
+    await flushPromises();
+    expect(notices.error).toHaveBeenCalledWith(
+      "No answer came from the server, so it is not known whether the undo started. Press it again to retry: it sends the same request, which cannot start a second undo.",
+    );
+    const [unanswered] = ids();
+    expect(new Set(ids())).toEqual(new Set([unanswered]));
+
+    // The next press repeats that request; a refusal is an answer.
+    revertAutoStackRun.mockReset();
+    revertAutoStackRun.mockRejectedValueOnce(
+      refusal(500, { code: null, message: "Fake reason." }),
+    );
+    await press(wrapper, "auto-stack-revert");
+    expect(ids()).toEqual([unanswered]);
+    expect(notices.error).toHaveBeenLastCalledWith(
+      "Could not start the undo: Fake reason.",
+    );
+
+    // So the press after that is a new request.
+    revertAutoStackRun.mockReset();
+    revertAutoStackRun.mockRejectedValueOnce(
+      refusal(500, { code: null, message: "Fake reason." }),
+    );
+    await press(wrapper, "auto-stack-revert");
+    expect(ids()).toHaveLength(1);
+    expect(ids()[0]).not.toBe(unanswered);
+    wrapper.unmount();
+  });
+
+  it("puts an ended run's banner away and gives the queue the keyboard back", async () => {
+    const { wrapper, store } = await mountWithRun(
+      runFixture({ status: "complete", active: false, can_revert: true }),
+    );
+    await press(wrapper, "auto-stack-dismiss");
+    expect(store.autoStackRunDismissed).toBe(true);
+    expect(banner(wrapper).exists()).toBe(false);
+    expect(queueHasFocus(wrapper)).toBe(true);
+    wrapper.unmount();
+  });
+
+  it.each([
+    [
+      "stop",
+      "auto-stack-stop",
+      runFixture(),
+      refusal(403, "Forbidden"),
+      "You don't have permission to stack duplicates here.",
+    ],
+    [
+      "stop",
+      "auto-stack-stop",
+      runFixture(),
+      refusal(500, { code: null, message: "fake-reason" }),
+      "Could not stop the run: fake-reason.",
+    ],
+    [
+      "stop",
+      "auto-stack-stop",
+      runFixture(),
+      refusal(500, { code: null, message: "Fake reason?" }),
+      "Could not stop the run: Fake reason?",
+    ],
+    [
+      "stop",
+      "auto-stack-stop",
+      runFixture(),
+      refusal(500, null),
+      "Could not stop the run on the server.",
+    ],
+    [
+      "undo",
+      "auto-stack-revert",
+      runFixture({ status: "complete", active: false, can_revert: true }),
+      refusal(409, {
+        code: "auto_stack_run_active",
+        message: "Run 9 is already active.",
+        run: null,
+      }),
+      "The undo can start once the Auto-stack run above the queue has ended.",
+    ],
+    [
+      "undo",
+      "auto-stack-revert",
+      runFixture({ status: "complete", active: false, can_revert: true }),
+      refusal(409, {
+        code: "nothing_to_revert",
+        message: "Run 7 has nothing left to revert.",
+        run: null,
+      }),
+      "Nothing is left to undo from that Auto-stack run.",
+    ],
+  ])(
+    "words a refused %s for the person, not the server (%#)",
+    async (_action, testId, run, err, sentence) => {
+      cancelAutoStackRun.mockRejectedValueOnce(err);
+      revertAutoStackRun.mockRejectedValueOnce(err);
+      const { wrapper } = await mountWithRun(run);
+      const notices = useNoticeStore();
+
+      await press(wrapper, testId);
+
+      expect(notices.error).toHaveBeenCalledWith(sentence);
+      expect(announced(wrapper)).toBe(sentence);
+      wrapper.unmount();
+    },
+  );
+
+  it("words a closed dialog's refused start by the run it names", async () => {
+    previewAutoStackExact.mockResolvedValue({
+      dry_run: true,
+      groups: 3,
+      pictures: 6,
+    });
+    const pending = deferred();
+    startAutoStackRun.mockReturnValueOnce(pending.promise);
+    const { wrapper } = await mountQueue([group("g1")], {
+      byTier: { exact: 3 },
+    });
+    const notices = useNoticeStore();
+    await autoStackTrigger(wrapper).trigger("click");
+    await flushPromises();
+    autoStackDialog(wrapper).vm.$emit("confirm");
+    await flushPromises();
+    autoStackDialog(wrapper).vm.$emit("close");
+    await flushPromises();
+
+    pending.reject(
+      refusal(409, {
+        code: "auto_stack_run_active",
+        message: "Run 3 is already active.",
+        run: null,
+      }),
+    );
+    await flushPromises();
+    expect(notices.error).toHaveBeenCalledWith(
+      "Another Auto-stack run is already going, and its progress shows above the queue.",
+    );
+    // A refusal is an answer: nothing is looked for again.
+    expect(getLatestAutoStackRun).toHaveBeenCalledTimes(1);
+    wrapper.unmount();
+  });
+
+  // The banner is not a live region, since its figures move on every poll, so
+  // the end of the run it follows is said in the queue's own.
+  it.each([
+    [
+      runFixture(),
+      { status: "complete", applied: 120 },
+      "Auto-stack finished. 120 groups stacked.",
+    ],
+    [
+      runFixture(),
+      { status: "complete", applied: 123456 },
+      "Auto-stack finished. 123,456 groups stacked.",
+    ],
+    [
+      runFixture(),
+      { status: "cancelled", applied: 1 },
+      "Auto-stack stopped. 1 group stacked.",
+    ],
+    [
+      runFixture(),
+      { status: "interrupted" },
+      "Auto-stack was interrupted when the server restarted. 40 groups stacked.",
+    ],
+    [
+      runFixture(),
+      { status: "failed" },
+      "Auto-stack stopped on an error. 40 groups stacked.",
+    ],
+    [
+      revertRun(),
+      { status: "complete" },
+      "Auto-stack undone. 40 groups are back in the queue.",
+    ],
+    [
+      revertRun(),
+      { status: "cancelled", applied: 1 },
+      "The undo stopped. 1 group is back in the queue.",
+    ],
+    [
+      revertRun(),
+      { status: "blocked" },
+      "The undo stopped at a step that later work was done on top of. 40 groups are back in the queue.",
+    ],
+    [
+      revertRun(),
+      { status: "interrupted" },
+      "The undo was interrupted when the server restarted. 40 groups are back in the queue.",
+    ],
+    [
+      revertRun(),
+      { status: "failed" },
+      "The undo stopped on an error. 40 groups are back in the queue.",
+    ],
+  ])("says how the followed run ended (%#)", async (run, ended, said) => {
+    getAutoStackRun.mockResolvedValueOnce({
+      run: { ...run, ...ended, active: false },
+      retryAfterMs: null,
+    });
+    const { wrapper } = await mountWithRun(run);
+    expect(announced(wrapper)).toBe("");
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+
+    expect(getAutoStackRun).toHaveBeenCalledWith(run.id);
+    expect(announced(wrapper)).toBe(said);
+    wrapper.unmount();
+  });
+
+  it("says nothing while the run is still going", async () => {
+    getAutoStackRun.mockResolvedValueOnce({
+      run: runFixture({ processed: 80, applied: 80 }),
+      retryAfterMs: 2000,
+    });
+    const { wrapper } = await mountWithRun(runFixture());
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(getAutoStackRun).toHaveBeenCalledTimes(1);
+    expect(announced(wrapper)).toBe("");
+    wrapper.unmount();
+  });
+
+  it("says nothing for a run found already ended", async () => {
+    const { wrapper } = await mountWithRun(
+      runFixture({ status: "complete", active: false, applied: 120 }),
+    );
+    expect(banner(wrapper).exists()).toBe(true);
+    expect(announced(wrapper)).toBe("");
+    wrapper.unmount();
+  });
 });
 
 describe("DuplicateQueue: a picture scrapheaped elsewhere", () => {

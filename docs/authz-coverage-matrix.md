@@ -325,7 +325,26 @@ tags, project/set membership and scores, so there is no coherent scoped form of 
 | POST | `/api/v1/dedup/verdicts/keep-separate` | owner_only |  | Writes a permanent verdict about an arbitrary set of vault pictures. POST also blocked for READ tokens |
 | POST | `/api/v1/dedup/verdicts/reopen` | owner_only |  | Reverses a stored verdict about an arbitrary set of vault pictures. POST also blocked for READ tokens |
 | POST | `/api/v1/dedup/verdicts/batch` | owner_only |  | Atomically applies several stack or keep-separate verdicts over arbitrary vault pictures; same owner-only boundary as the single verdict routes above. POST also blocked for READ tokens |
-| POST | `/api/v1/dedup/auto-stack` | owner_only |  | Bulk stacking across the whole vault under one undo batch; the most far-reaching mutation on this surface. POST also blocked for READ tokens |
+| POST | `/api/v1/dedup/auto-stack` | owner_only |  | Counts the exact tier across the whole vault for the auto-stack consent dialog (writes nothing since 2026-11-23; applying moved to the run routes below). A vault-wide aggregate cannot be narrowed to a token's scope without leaking counts. POST also blocked for READ tokens |
+
+The five routes below were added on 2026-11-23 when applying auto-stack moved from
+one long request to a background run (async request-reply: 202 plus a status
+resource). None carries inline authz code (the gate is the sole enforcement,
+§16.1), and all five are covered **in both directions** by
+`tests/test_dedup_tiers_api.py`: negative through the same
+`test_scoped_read_token_is_denied_on_every_route` sweep as the nine above
+(Bearer and `?token=`), positive via the owner cookie session in the run tests.
+A run is vault-wide by construction (its counters and History batches span the
+whole library), so the read routes are owner-only for the same reason as
+`POST /dedup/counts`, and the write routes for the same reason as the verdicts.
+
+| Method | Effective path | Policy | id_param / body_ids | Rationale (current enforcement) |
+|---|---|---|---|---|
+| POST | `/api/v1/dedup/auto-stack/runs` | owner_only |  | Starts bulk stacking across the whole vault in the background; the most far-reaching mutation on this surface. POST also blocked for READ tokens |
+| GET | `/api/v1/dedup/auto-stack/runs/latest` | owner_only |  | A vault-wide run's progress: group and picture counts over the whole vault and the History batches it wrote |
+| GET | `/api/v1/dedup/auto-stack/runs/{run_id}` | owner_only |  | The same run payload addressed by id; same reasoning as `runs/latest` |
+| POST | `/api/v1/dedup/auto-stack/runs/{run_id}/cancel` | owner_only |  | Stops a vault-wide stacking run. POST also blocked for READ tokens |
+| POST | `/api/v1/dedup/auto-stack/runs/{run_id}/revert` | owner_only |  | Unstacks everything a vault-wide run stacked, in the background. POST also blocked for READ tokens |
 
 The five routes below were added on 2026-08-01 with **Mixed stacks** (design D5/B5).
 All are new, none carries inline authz code (the gate is the sole enforcement,

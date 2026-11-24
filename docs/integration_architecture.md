@@ -18,7 +18,7 @@
 8. [Real-Time Event Contract](#8-real-time-event-contract)
 9. [Image & Thumbnail Serving](#9-image--thumbnail-serving)
 10. [File Uploads (Import)](#10-file-uploads-import)
-11. [Long-Running Operations](#11-long-running-operations) — incl. [11.3 Work waiting for the GPU](#113-work-waiting-for-the-gpu)
+11. [Long-Running Operations](#11-long-running-operations) — incl. [11.3 Work waiting for the GPU](#113-work-waiting-for-the-gpu), [11.4 Background runs: async request-reply](#114-background-runs-async-request-reply)
 12. [Configuration Sync](#12-configuration-sync)
 13. [Error Handling Contract](#13-error-handling-contract)
 14. [Build & Deployment Coupling](#14-build--deployment-coupling)
@@ -81,7 +81,12 @@ copy, reconciled against `routes/dedup.py` as shipped (2026-07-29).
 | `POST /dedup/verdicts/stack` | the "same picture" verdict | `VerdictResponse` |
 | `POST /dedup/verdicts/keep-separate` | the "different pictures" verdict | `VerdictResponse` |
 | `POST /dedup/verdicts/reopen` | un-resolve a group (clearing a stacked verdict also dissolves its stack) | `{ signature, previous_verdict, reopened_at, group_returned_to_queue, batch_id, unstacked_picture_ids }` |
-| `POST /dedup/auto-stack` | bulk-stack the exact tier, `dry_run` first | `{ batch_id, dry_run, groups, pictures, scope, dry_run_summary, results, failures, blocked, failed, superseded }` |
+| `POST /dedup/auto-stack` | count what auto-stacking the exact tier would do; writes nothing | `{ dry_run, groups, pictures, scope, dry_run_summary }` |
+| `POST /dedup/auto-stack/runs` | start applying it as a background run (202, `Location`, `Retry-After`; §11.4) | `AutoStackRunModel` |
+| `GET /dedup/auto-stack/runs/latest` | the newest run of either kind, so a reopened screen picks it up | `{ run }` |
+| `GET /dedup/auto-stack/runs/{run_id}` | one run's status and progress | `AutoStackRunModel` |
+| `POST /dedup/auto-stack/runs/{run_id}/cancel` | stop a run after its current step (idempotent) | `AutoStackRunModel` |
+| `POST /dedup/auto-stack/runs/{run_id}/revert` | undo an apply run in the background (202) | `AutoStackRunModel` |
 | `GET /dedup/mixed-stacks` | live stacks that do not hold together at the given threshold (§19) | `{ threshold, total, kept_total, live_stack_count, offset, limit, next_offset, stacks }` |
 | `POST /dedup/mixed-stacks/{stack_id}/split` | move the stranded members out of a mixed stack (§19) | `{ stack_id, split_picture_ids, remaining_picture_ids, stack_dissolved, batch_id }` |
 | `POST /dedup/mixed-stacks/{stack_id}/unstack` | dissolve a mixed stack (§19) | as split |
@@ -153,7 +158,7 @@ Shapes and rules the frontend depends on:
 - **A group with fewer than two stackable members is withheld entirely** (owner
   call, 2026-07-30). It poses no stackable decision, so it is not served, not
   counted in `total`, not counted by `POST /dedup/counts` (`unresolved_groups`
-  and `by_tier`), and not planned into `POST /dedup/auto-stack` or its dry run.
+  and `by_tier`), and not planned into an auto-stack run or its preview.
   One rule, every surface, so the badge can never disagree with the list. The
   filter is **SQL inside the group predicate**, not a post-filter on the page:
   dropping rows after the `LIMIT` would shrink pages and desynchronise the
@@ -162,8 +167,8 @@ Shapes and rules the frontend depends on:
   and unlocking the set brings it straight back with no rescan.
 - **A fully collapsed group is withheld the same way** (design D1): a group
   whose live members already sit in one and the same stack poses no decision, so
-  it is not served, not counted, and, since 2026-08-01, **not planned into
-  `POST /dedup/auto-stack` or its dry run either**. Auto-stack used a weaker
+  it is not served, not counted, and, since 2026-08-01, **not planned into an
+  auto-stack run or its preview either**. Auto-stack used a weaker
   filter that ignored stack units, so it reported far more "stacks to create"
   than the badge showed and would have re-covered stacks the user had already
   curated. The button's count and the run are now the same population.
@@ -196,10 +201,12 @@ Shapes and rules the frontend depends on:
   context menu labelling three entries refreshes the sidebar in the same
   request and the two can never disagree. `by_tier` deliberately includes tiers
   that are switched off, so the tier menu can show what enabling one would add.
-- **`batch_id`** is what makes a bulk auto-stack reverse with one `Ctrl+Z`, so
-  it has to reach the client on the real run. `failures` names groups the run
-  skipped: one unstackable group never aborts it, so a partial result is
-  reported rather than hidden.
+- **An auto-stack run is undone by its own revert, not by one `Ctrl+Z`.** It
+  records History in segments of at most a few hundred groups, each its own
+  batch and its own `Ctrl+Z`, and lists them in `segment_batch_ids`;
+  `POST /dedup/auto-stack/runs/{run_id}/revert` undoes them all. `failures`
+  samples groups the run could not stack: one unstackable group never aborts
+  it, so a partial result is reported rather than hidden.
 
 **Keep-separate records one operation, exactly like stack (owner override,
 2026-07-30).** Until then it deliberately recorded nothing (the #644-era CSO
@@ -2216,6 +2223,12 @@ Configured in [server.py](../pixlstash/server.py) (`CORSMiddleware`):
 - Additional explicit origins can be added through the server config `cors_origins` list.
 - `allow_credentials=True` — required because the SPA uses cookie auth.
 - `allow_methods=["*"]`, `allow_headers=["*"]`.
+- `expose_headers=["Retry-After"]`. `Retry-After` is not a CORS-safelisted
+  response header, so without this a client on another origin (the Vite dev
+  server) reads it as absent: the poll interval of a background run (§11.4)
+  and the backoff on a 429 alike. It grants nothing to an origin the regex
+  refuses, which still gets no `Access-Control-Allow-Origin`. `Location` needs
+  no entry: the client builds a run's status URL from its id.
 
 **Rule**: any new dev environment must satisfy the regex above or be added to `cors_origins`, otherwise cookies will be dropped.
 
@@ -2668,6 +2681,57 @@ PixlStash's own tasks appear as `light` leases (one per running GPU task, `worke
 **Workflow cards** carry `vram: {need_mb, measured_runs, exclusive, exclusive_source, exclusive_at, trend, peaks}` (peaks on the detail read only, each with the `pixels` it was measured at); `PATCH /workflows/{id}` takes `exclusive`, and `forget_vram_peaks: true`, the GPU memory section's Reset. The owner's `auto_exclusive_after_oom` rides `GET`/`PATCH /users/me/config`.
 
 **PixlStash's GPU.** `GET /compute/gpus` (local owner) lists each GPU with `used_by`, the one `selected` (`auto` or a UUID), the one `resolved` (in use now) and `auto_reason`; `PATCH /compute/gpu {gpu}` stores the choice and answers `restart_required: true`. The desktop restarts through the runtime-switch path; a headless install is restarted by its operator.
+
+### 11.4 Background runs: async request-reply
+
+**A request that does an unbounded amount of work does not run in the request.**
+Auto-stack once stacked a whole library's exact tier (~169k groups at 14-24 ms
+each, about an hour) inside one `POST`; the client's 60 s timeout fired while
+the server kept going, and the client could only say the outcome was unknown.
+Such work is now a **run**: a row that is both the request and its progress,
+worked by a background task in short writer slices. Auto-stack (§19) is the only
+run today; a second one copies this shape rather than inventing another.
+
+The pattern is the async request-reply / long-running-operation one
+([Azure Async Request-Reply](https://learn.microsoft.com/azure/architecture/patterns/async-request-reply),
+[AIP-151](https://google.aip.dev/151),
+[`google.longrunning`](https://developers.google.com/optimization/service/reference/rpc/google.longrunning)):
+
+- **Start** is a `POST` that records the run and answers **202** at once with
+  the run itself, a `Location` naming its status resource, and `Retry-After`
+  (delay-seconds, RFC 9110 §10.2.3; the server never sends an HTTP-date) while
+  it is active. The client polls at that interval, clamped to 0.5-30 s, 2 s
+  when absent.
+- **Idempotency is a client-minted `request_id`** per gesture
+  ([AIP-155](https://google.aip.dev/155); the same idea as the IETF
+  Idempotency-Key draft, which expired without becoming an RFC). The same id
+  again returns the run it started, **200**, in whatever state it has reached,
+  so a retry after a lost response cannot start a second run. The same id with
+  different parameters is **422** `request_id_reused`. The client resends an
+  unanswered start (timeout or no response) under the same id, after 1 s then
+  3 s, and never resends an answered refusal.
+- **Status** is `GET …/runs/{id}`, and `GET …/runs/latest` lets a reopened
+  screen or another tab pick a run back up. `active` is true while `pending` or
+  `running`; the end states are `complete`, `cancelled`, `interrupted` (the
+  server stopped; a run is never resumed), `failed` and `blocked`. Whatever
+  committed before a run stopped stays committed.
+- **Cancel** is `POST …/runs/{id}/cancel`: durable (`cancel_requested` on the
+  row), idempotent, and honoured at the next slice. Cancelling an ended run
+  answers 200 with the run unchanged.
+- **One active run at a time.** A start while one is active is **409**
+  `auto_stack_run_active`, and the body names that run so the client can follow
+  it instead.
+- **Every refusal is `{ "detail": { "code", "message", "run" } }`**, where `run`
+  is the run the refusal is about, or null.
+- **Events stay secondary.** A run still emits the ordinary events for what it
+  changes (§8), coalesced; the run resource is what the client trusts for
+  progress and outcome.
+
+The task's slices are LOW-priority writer callbacks of about a second each, so
+interactive writes get the single SQLite writer
+([WAL: one writer at a time](https://www.sqlite.org/wal.html)) between them. A
+run left `pending` or `running` by a server that stopped is closed
+`interrupted` at start-up.
 
 ## 12. Configuration Sync
 
@@ -3209,17 +3273,16 @@ the highest score; nothing is overwritten and nothing is deleted.
 > same), but auto-stack applies it in bulk — worth saying out loud in the consent
 > copy. See backend §22.9 accepted risk A1.
 
-### `POST /dedup/auto-stack`
+### `POST /dedup/auto-stack`: the preview
 
-Body: `{ "scope": {…}, "dry_run": true, "batch_id": null, "limit": null }`.
-**Defaults to `dry_run: true`**, which returns the counts the consent dialog shows
-and writes nothing. Send `dry_run: false` to apply.
-
-Dry run:
+Body: `{ "scope": {…}, "dry_run": true, "limit": null }`. **It only counts**:
+the figures the consent dialog shows, and nothing is written. Applying is a
+background run (next subsection); `dry_run: false` is refused with **400**
+`apply_runs_in_background` rather than quietly previewing, so a stale client
+that meant to apply learns it did not. A read: it never takes the writer.
 
 ```jsonc
-{ "batch_id": null, "dry_run": true, "groups": 1204, "pictures": 2611,
-  "scope": { … }, "results": [],
+{ "dry_run": true, "groups": 1204, "pictures": 2611, "scope": { … },
   "dry_run_summary": {
     "groups": 1204,
     "groups_by_tier": { "exact": 1204, "near": 0, "embedding": 0 },
@@ -3242,63 +3305,84 @@ same stack. It can therefore exceed the sum of the groups' `member_count`s.
 The `covers_gaining_*` rows stay on the groups' own members, because the tag and
 score union runs over exactly those.
 
-Applied (including a partially applied run):
+Only the **exact** tier is eligible; near and embedding groups always go through
+the queue no matter how confident they look. **The queue's badge counts every
+enabled tier, so it can stay high after a complete run**: what remains is near
+and embedding groups waiting for a decision, plus anything blocked.
+
+### `POST /dedup/auto-stack/runs`: applying, in the background
+
+Applying follows the async request-reply contract in §11.4. Body:
+`{ "scope": {…}, "limit": null, "request_id": "cli-…" }`, all optional. The
+client mints a fresh `request_id` each time the consent dialog opens and sends
+that one with every confirm from it, so a resent start returns the run the
+first one created.
 
 ```jsonc
-{ "batch_id": "a1b2…", "dry_run": false, "groups": 1203, "pictures": 2609,
-  "scope": { … },
-  "results":  [ { …verdict…, "outcome": "applied" } ],
-  "failures": [ { "signature": "…", "outcome": "blocked", "status_code": 423,
-                  "error": { "code": "set_locked", … } } ],
-  "blocked": 1, "failed": 0, "superseded": 0 }
+// 202 Accepted   Location: /api/v1/dedup/auto-stack/runs/7   Retry-After: 2
+{ "id": 7, "request_id": "cli-…", "kind": "apply", "status": "pending",
+  "active": true, "target_run_id": null, "scope": { … }, "limit": null,
+  "total": 0, "processed": 0, "applied": 0, "superseded": 0, "blocked": 0,
+  "failed": 0, "pictures": 0, "failures": [], "segment_batch_ids": [],
+  "cancel_requested": false, "can_revert": false,
+  "error_code": null, "error": null,
+  "created_at": "…", "started_at": "…", "updated_at": "…", "finished_at": null }
 ```
 
-Only the **exact** tier is eligible; near and embedding groups always go through
-the queue no matter how confident they look. Every group in the run shares one
-`batch_id`, so N stacks reverse with a single `POST
-/operations/batches/{batch_id}/undo`.
+The run plans the scope's exact groups once (a read), sets `total`, then stacks
+them 40 to a writer slice. The counters split `processed` by outcome:
 
-**Every group is accounted for under exactly one `outcome`** — `applied`,
-`blocked` (a guard refused it, in practice a locked picture set at 423) or
-`failed` (it could not be resolved at all). One bad group never aborts the run,
-and **the `batch_id` is returned even on a partially applied run**, so work that
-did happen always comes back with its undo handle. Show `blocked` groups to the
-user: they are still in the queue awaiting an individual decision.
+- **`applied`**: groups stacked. `pictures`: pictures across them.
+- **`superseded`**: planned groups with no decision left when reached. Stacking
+  one group folds every stack it spans, so a later group in the same plan can
+  stop posing one; so can a group decided by hand meanwhile. Nothing is written
+  for them.
+- **`blocked`**: a guard refused the group, in practice a locked picture set.
+  It stays in the queue for an individual decision.
+- **`failed`**: the group could not be stacked at all.
 
-**`superseded` counts planned groups the run itself took out of the queue.**
-Stacking one group folds every stack it spans, so a later group in the same
-plan can stop posing a decision (its members already share a stack). The run
-re-checks each group before applying it and skips such a group: nothing is
-written for it, and it is in neither `results` nor `failures`. That is why
-`groups` can be smaller than the dry run's figure with nothing blocked.
+`failures` holds the first 50 `{signature, outcome, status_code, error}`
+entries; the counters are exact and the list is a sample. One bad group never
+aborts the run. An unexpected error ends it `failed` with `error_code:
+"unexpected_error"`, keeping every slice committed before it.
 
-**Each group commits on its own**, under the run's `batch_id`. An unexpected
-error while a group is checked or applied (anything other than a guard's
-refusal) ends the run with a 500 after the earlier groups have committed; the
-server logs the batch id and how many groups it applied, and those groups are in
-History under that id.
+**History is written in segments.** Each segment is its own operation-log batch
+of at most 250 groups, its own `Ctrl+Z`, and an entry in `segment_batch_ids`
+(oldest first). A segment also ends early when anything else records an undoable
+operation above it, because appending past that would split its undo. So one
+undo is always a bounded transaction, never the whole run.
 
-**The client mints the batch id** (`cli-…`, the same format as
-`newOperationBatchId()`), so it holds the run's undo handle before the request
-leaves, for whatever of the run reaches the server. A large run can outlast the
-client's 60 s timeout while the server keeps stacking. With no answer (a timeout
-or a refused or lost connection), `runAutoStack` reloads the queue and counts as
-after a finished run and returns `{ outcome: "unknown", batch_id }`. The client
-cannot tell a run still going from one that never arrived or one whose reply
-was lost, so the Duplicates view says "Auto-stack did not answer, so its outcome
-is not confirmed: it may still be running, or it may never have reached the
-server. Check History before running it again." It never reports such a run as
-failed and never retries it.
+The run's stacks reach other tabs as `pictures_changed`, coalesced to one event
+every 2 s, and as ordinary operation-log events. The tab that started the run
+holds back the receipt pill for those History steps: the run banner is their
+receipt (frontend §13.3, "Auto-stack runs in the background").
 
-**A supplied `batch_id` must still be on top of History.** An applied run under
-an id that already has applied undoable operations is refused with **409**
-`{ "detail": { "code": "batch_id_not_at_top", "message": "…", "batch_id": "…" } }`
-when the newest applied undoable operation belongs to another batch, because
-appending would split the batch around that operation and neither could then be
-undone. The refusal comes before any write, for an id in the body or in
-`X-Operation-Batch-Id`. A repeat under an id that is still the newest batch
-extends it, and the whole batch is still one undo. `limit` caps the number of
-groups acted on.
+### Run status, cancel and revert
+
+- **`GET /dedup/auto-stack/runs/{run_id}`**: the run, with `Retry-After` while
+  active; **404** `auto_stack_run_not_found` for an unknown id.
+- **`GET /dedup/auto-stack/runs/latest`**: `{ "run": … }`, the newest run of
+  either kind, or `null` before the first. The Duplicates screen reads it on
+  arrival so a run started before a reload, or in another tab, is followed.
+- **`POST /dedup/auto-stack/runs/{run_id}/cancel`**: a pending run is
+  cancelled at once; a running one stops at its next slice, within about a
+  second, keeping what it committed. An ended run is returned unchanged.
+- **`POST /dedup/auto-stack/runs/{run_id}/revert`**, body `{ "request_id" }`:
+  a second run, `kind: "revert"`, `target_run_id` naming the first, answered
+  **202** like a start. It undoes the target's segments newest first, one per
+  slice, exactly as `Ctrl+Z` on each would. For a revert, `total` /
+  `processed` count segments, `applied` counts the stacked groups put back in
+  the queue, `superseded` the segments with nothing left to undo, and
+  `pictures` the pictures restored. If an unrelated edit has since landed above
+  a segment in History, the revert ends **`blocked`** with `error_code:
+  "history_moved_on"`: undo that edit, then revert again. Refused with **409**
+  `not_an_apply_run`, `nothing_to_revert` or `auto_stack_run_active`.
+
+`can_revert` is true for an ended apply run with a segment that still has
+something to undo. A server that stops mid-run closes the run `interrupted` with
+`error_code: "server_restarted"` (at the slice boundary, or at the next
+start-up if even that could not run); it is never resumed, and whatever it
+committed stays stacked and revertable.
 
 ### Not in this API
 

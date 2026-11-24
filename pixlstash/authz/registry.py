@@ -1417,9 +1417,46 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
     ("POST", "/api/v1/dedup/auto-stack"): RoutePolicy(
         _OWNER,
         justification=(
-            "Bulk stacking across the whole vault under one undo batch; the "
-            "most far-reaching mutation on this surface. POST is also blocked "
-            "for READ tokens"
+            "Counts the exact tier across the whole vault for the auto-stack "
+            "consent dialog; a vault-wide aggregate cannot be narrowed to a "
+            "token's scope without leaking counts. POST is also blocked for "
+            "READ tokens"
+        ),
+    ),
+    ("POST", "/api/v1/dedup/auto-stack/runs"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "Starts bulk stacking across the whole vault in the background; "
+            "the most far-reaching mutation on this surface. POST is also "
+            "blocked for READ tokens"
+        ),
+    ),
+    ("GET", "/api/v1/dedup/auto-stack/runs/latest"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "A vault-wide run's progress: group and picture counts over the "
+            "whole vault and the History batches it wrote. Same reasoning as "
+            "the counts route"
+        ),
+    ),
+    ("GET", "/api/v1/dedup/auto-stack/runs/{run_id}"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "A vault-wide run's progress, addressed by run id; same payload "
+            "and reasoning as GET /dedup/auto-stack/runs/latest"
+        ),
+    ),
+    ("POST", "/api/v1/dedup/auto-stack/runs/{run_id}/cancel"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "Stops a vault-wide stacking run. POST is also blocked for READ tokens"
+        ),
+    ),
+    ("POST", "/api/v1/dedup/auto-stack/runs/{run_id}/revert"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "Unstacks everything a vault-wide run stacked, in the background. "
+            "POST is also blocked for READ tokens"
         ),
     ),
     # ── dedup.py (v1.9 Mixed stacks, design D5/B5) ──────────────────────────

@@ -270,6 +270,18 @@ export const useOperationStore = defineStore("operation", () => {
    */
   let pendingReceiptNote = null;
 
+  /**
+   * A caller's rule for operations this tab must not narrate, or null.
+   *
+   * A background run records its work as many History steps under the origin
+   * of the tab that started it, so that tab would narrate each step as its
+   * own: a pill per segment, each offering Undo for an arbitrary slice of the
+   * run. The run's progress has a surface of its own, so its owner keeps those
+   * steps off the pill. Only narration is silenced: the steps stay in History
+   * and on the undo stack, and the high-water mark still moves past them.
+   */
+  let narrationFilter = null;
+
   // Highest operation id seen by a completed refresh. Used to tell a genuinely
   // new operation from a re-read of the same history - an id we have already
   // seen must never raise a second receipt. `null` means never loaded; `0`
@@ -850,7 +862,19 @@ export const useOperationStore = defineStore("operation", () => {
     const mine =
       newest.origin_client_id && newest.origin_client_id === myClientId();
     if (!mine) return;
+    if (narrationFilter?.(newest)) return;
     showReceipt(buildReceipt(newest, newest.undoable ? "did" : "blocked"));
+  }
+
+  /**
+   * Keep some of this tab's own operations off the receipt pill.
+   *
+   * @param {Function|null} filter - `(operation) => boolean`, true to stay
+   *   silent; null removes the rule. One owner at a time: a second call
+   *   replaces the first.
+   */
+  function setNarrationFilter(filter) {
+    narrationFilter = typeof filter === "function" ? filter : null;
   }
 
   /**
@@ -1241,6 +1265,7 @@ export const useOperationStore = defineStore("operation", () => {
     setLocalReceiptHost,
     buildReceipt,
     noteNextReceipt,
+    setNarrationFilter,
     dismissReceipt,
     pauseReceipt,
     resumeReceipt,

@@ -24,8 +24,12 @@ Two surfaces live here, and every route is owner-only.
 * ``POST /dedup/verdicts/batch``       - apply one multi-group UI gesture in one
   transaction and one contiguous undo unit.
 * ``POST /dedup/verdicts/reopen``   - return a decided group to the queue.
-* ``POST /dedup/auto-stack``        - the exact tier's bulk action, one
-  operation-log batch id so N stacks reverse with one undo.
+* ``POST /dedup/auto-stack``        - count what auto-stacking the exact tier
+  would do, for its consent dialog. Writes nothing.
+* ``POST /dedup/auto-stack/runs``   - apply it as a background run: 202 with a
+  ``Location`` to poll, never a request that waits on the stacking.
+* ``GET  /dedup/auto-stack/runs/latest`` and ``GET .../runs/{run_id}``: a run's
+  progress; ``POST .../runs/{run_id}/cancel`` and ``.../revert`` stop or undo it.
 
 **The vault-wide sweep dry run** (:mod:`pixlstash.services.dedup_sweep_service`),
 unchanged and still non-destructive:
@@ -49,14 +53,24 @@ owner-only, and the verdict routes mutate stacks across arbitrary pictures.
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import dedup_sweep_service, dedup_tier_service
 from pixlstash.services import dedup_verdict_service, mixed_stack_service
-from pixlstash.services import operation_log_service
+from pixlstash.services import dedup_auto_stack_service, operation_log_service
+from pixlstash.services.dedup_auto_stack_service import (
+    ERROR_ACTIVE,
+    ERROR_NOT_AN_APPLY_RUN,
+    ERROR_NOT_FOUND,
+    ERROR_NOTHING_TO_REVERT,
+    ERROR_REQUEST_ID_REUSED,
+    REQUEST_ID_MAX_LENGTH,
+    SEGMENT_GROUP_CAP,
+    AutoStackRunError,
+)
 from pixlstash.services.mixed_stack_service import (
     DEFAULT_PAGE_SIZE as MIXED_STACK_PAGE_SIZE,
     MAX_PAGE_SIZE as MAX_MIXED_STACK_PAGE_SIZE,
@@ -121,6 +135,25 @@ Each scope is a separate correlated ``COUNT`` subquery, so an uncapped list turn
 one request into thousands of queries against the owner's own server. 200 is far
 more than any real context menu needs (the sidebar asks for a handful) and keeps
 the worst case bounded."""
+
+AUTO_STACK_POLL_AFTER_S = 2
+"""``Retry-After`` on an active auto-stack run: how often a client should poll.
+
+A run commits a slice about every second and its change events are coalesced
+every two, so polling faster than this reads the same counters twice."""
+
+AUTO_STACK_RUN_ERROR_STATUS = {
+    ERROR_ACTIVE: 409,
+    ERROR_NOT_AN_APPLY_RUN: 409,
+    ERROR_NOTHING_TO_REVERT: 409,
+    ERROR_NOT_FOUND: 404,
+    ERROR_REQUEST_ID_REUSED: 422,
+}
+"""HTTP status per refused run request; the body carries the code itself.
+
+422 for a reused ``request_id`` follows the idempotency-key convention (AIP-155,
+the IETF Idempotency-Key draft): the key names a different request than the one
+sent. 409 is a refusal the current state causes and a later state may lift."""
 
 
 class SweepPolicyModel(BaseModel):
@@ -1341,7 +1374,7 @@ class ReopenResponse(BaseModel):
 
 
 class AutoStackRequestModel(BaseModel):
-    """The exact tier's bulk action, behind one consent."""
+    """Count what auto-stacking the exact tier would do, for its consent dialog."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1351,27 +1384,16 @@ class AutoStackRequestModel(BaseModel):
     dry_run: bool = Field(
         default=True,
         description=(
-            "True (the default) counts what would happen and writes nothing - "
-            "this is what the consent dialog reads. Send `false` to apply."
-        ),
-    )
-    batch_id: Optional[str] = Field(
-        default=None,
-        description=(
-            "Operation-log batch id. Omit to have the server mint one (`srv-…`); "
-            "every stack in the run shares it, so N stacks reverse with one "
-            "undo. A supplied id must be client-namespaced `cli-…`. A client "
-            "that mints its own id holds the run's undo handle even when it "
-            "never sees the response. An applied run under an id that already "
-            "has applied operations is refused with 409 `batch_id_not_at_top` "
-            "unless that batch is still the newest in History, because "
-            "appending to it would split its undo."
+            "Must be true: this route only counts. Applying is a background run "
+            "started with `POST /dedup/auto-stack/runs`; `false` is refused with "
+            "400 `apply_runs_in_background` rather than quietly previewing, so a "
+            "caller that meant to apply learns it did not."
         ),
     )
     limit: Optional[int] = Field(
         default=None,
         ge=1,
-        description="Cap the number of groups acted on.",
+        description="Cap the number of groups counted.",
     )
 
 
@@ -1408,67 +1430,143 @@ class AutoStackDryRunSummaryModel(BaseModel):
 
 
 class AutoStackResponse(BaseModel):
-    """What the bulk auto-stack did, or would do."""
+    """What auto-stacking the exact tier would do. Nothing is written."""
 
     model_config = ConfigDict(extra="allow")
 
-    batch_id: Optional[str] = Field(
+    dry_run: bool = Field(description="Always true: nothing was written.")
+    groups: int = Field(description="Exact groups a run would stack.")
+    pictures: int = Field(description="Pictures across those groups.")
+    scope: dict[str, Any] = Field(description="The scope counted.")
+    dry_run_summary: AutoStackDryRunSummaryModel = Field(
+        description="Consent-dialog aggregates."
+    )
+
+
+class AutoStackRunRequestModel(BaseModel):
+    """Start a background run that stacks the exact tier."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Optional[ScopeRequestModel] = Field(
+        default=None, description="Restrict to a scope; the whole vault when omitted."
+    )
+    limit: Optional[int] = Field(
         default=None,
-        description=(
-            "The shared batch id, and the `POST /operations/batches/{batch_id}/"
-            "undo` handle for the whole run. Always present on an applied run - "
-            "including a partially applied one - so work that did happen is "
-            "never left without a way to reverse it. Null only for a dry run "
-            "with none supplied. An unexpected error ends the run with a 500 "
-            "after the groups before it have committed under the batch; those "
-            "are in History under this id, which is why a client supplying its "
-            "own `cli-…` id can still undo them."
-        ),
+        ge=1,
+        description="Cap the number of groups the run stacks.",
     )
-    dry_run: bool = Field(description="Whether anything was written.")
-    groups: int = Field(
-        description="Exact groups actually stacked (or, on a dry run, that would be)."
-    )
-    pictures: int = Field(description="Pictures across the stacked groups.")
-    scope: dict[str, Any] = Field(description="The scope the run covered.")
-    dry_run_summary: Optional[AutoStackDryRunSummaryModel] = Field(
+    request_id: Optional[str] = Field(
         default=None,
-        description="Consent-dialog aggregates. Present on a dry run only.",
-    )
-    results: list[VerdictResponse] = Field(
-        default_factory=list,
+        min_length=1,
+        max_length=REQUEST_ID_MAX_LENGTH,
+        pattern=r"^[A-Za-z0-9._:-]+$",
         description=(
-            'One entry per applied group, each with `outcome: "applied"`. Empty '
-            "for a dry run."
+            "Idempotency key the client mints per gesture (a UUID). Sending the "
+            "same id again returns the run it already started (200) instead of "
+            "starting another, so a retry after a lost response is safe; the "
+            "same id with different parameters is refused with 422 "
+            "`request_id_reused`. Omit and the server mints one."
         ),
     )
-    failures: list[dict[str, Any]] = Field(
-        default_factory=list,
+
+
+class AutoStackRevertRequestModel(BaseModel):
+    """Start a background run that undoes an auto-stack run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=REQUEST_ID_MAX_LENGTH,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Idempotency key, as on `POST /dedup/auto-stack/runs`.",
+    )
+
+
+class AutoStackRunModel(BaseModel):
+    """One background auto-stack run, or the revert of one: request and progress."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: int = Field(description="The run id; its status is `GET .../runs/{id}`.")
+    request_id: str = Field(description="The idempotency key it was started with.")
+    kind: str = Field(description="`apply` stacks groups; `revert` undoes a run.")
+    status: str = Field(
         description=(
-            "One entry per group that was not applied: `{signature, outcome, "
-            "status_code, error}`, where `outcome` is `blocked` (a guard refused "
-            "it - in practice a locked picture set, 423) or `failed` (it could "
-            "not be resolved at all). A single unstackable group never aborts "
-            "the run, so a partial result is reported honestly rather than "
-            "hidden, and the run still returns its `batch_id`."
-        ),
+            "`pending` (queued), `running`, then one of `complete`, `cancelled` "
+            "(stopped on request), `interrupted` (the server stopped; never "
+            "resumed), `failed` (an unexpected error; see `error`) or `blocked` "
+            "(a revert that met an unrelated edit above the run in History; "
+            "undo that edit, then revert again). Whatever committed before a "
+            "run stopped stays committed and revertable."
+        )
     )
-    blocked: int = Field(
-        default=0, description="Groups refused by a guard, typically a locked set."
+    active: bool = Field(description="True while `pending` or `running`.")
+    target_run_id: Optional[int] = Field(
+        default=None, description="For a revert, the run it undoes."
     )
-    failed: int = Field(default=0, description="Groups that could not be resolved.")
+    scope: dict[str, Any] = Field(description="The scope an apply run covers.")
+    limit: Optional[int] = Field(default=None, description="The group cap, if any.")
+    total: int = Field(
+        description=(
+            "Apply: groups planned. Revert: History segments to undo. Zero until "
+            "an apply run has planned."
+        )
+    )
+    processed: int = Field(description="Groups (apply) or segments (revert) done.")
+    applied: int = Field(
+        description="Groups stacked (apply) or unstacked (revert) so far."
+    )
     superseded: int = Field(
-        default=0,
         description=(
-            "Planned groups an earlier group in the same run took out of the "
-            "queue: stacking that group folded every stack the later one "
-            "spanned. Nothing is written for them, and they are neither in "
-            "`results` nor in `failures`."
+            "Apply: planned groups with no decision left when reached (stacked "
+            "by an earlier group, decided by hand, or emptied). Revert: segments "
+            "with nothing left to undo."
+        )
+    )
+    blocked: int = Field(description="Groups a guard refused, typically a locked set.")
+    failed: int = Field(description="Groups that could not be stacked.")
+    pictures: int = Field(description="Pictures stacked, or restored, so far.")
+    failures: list[dict[str, Any]] = Field(
+        description=(
+            "The first per-group failures, `{signature, outcome, status_code, "
+            "error}`; the counters are exact, this list is a sample."
+        )
+    )
+    segment_batch_ids: list[str] = Field(
+        description=(
+            "The operation-log batches the run recorded into, oldest first. "
+            "Each is one Ctrl+Z; revert undoes them all."
+        )
+    )
+    cancel_requested: bool = Field(description="A cancel is waiting for the slice.")
+    can_revert: bool = Field(
+        description="An ended apply run with something left to undo."
+    )
+    error_code: Optional[str] = Field(
+        default=None,
+        description=(
+            "Why it ended early: `server_restarted`, `unexpected_error` or "
+            "`history_moved_on`."
         ),
     )
+    error: Optional[str] = Field(default=None, description="The detail, if any.")
+    created_at: Optional[str] = Field(default=None)
+    started_at: Optional[str] = Field(default=None)
+    updated_at: Optional[str] = Field(default=None)
+    finished_at: Optional[str] = Field(default=None)
 
 
-# ── Mixed stacks (design D5 / B5) ────────────────────────────────────────────
+class AutoStackLatestRunResponse(BaseModel):
+    """The newest run, so a reopened screen can pick one up again."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run: Optional[AutoStackRunModel] = Field(
+        description="The newest run of either kind; null before the first."
+    )
 
 
 class MemberEdgeModel(BaseModel):
@@ -2398,42 +2496,200 @@ def create_router(server) -> APIRouter:
 
     @router.post(
         "/dedup/auto-stack",
-        summary="Bulk auto-stack the exact tier",
+        summary="Count what auto-stacking the exact tier would do",
         description=(
-            "Stacks every unresolved **exact** group under one operation-log "
-            "batch id, so a thousand stacks reverse with a single undo. Exact "
+            "Returns the counts the consent dialog shows and writes nothing: "
+            "how many unresolved **exact** groups a run would stack, the "
+            "pictures across them and the metadata-union aggregates. Exact "
             "matches are the tier with no human judgment left in them, which is "
             "why they get one consent dialog instead of per-group adjudication; "
             "near and embedding groups always go through the queue no matter how "
-            "confident they look. Defaults to `dry_run=true`, which returns the "
-            "counts the dialog shows and writes nothing. An applied run under a "
-            "supplied batch id that already has applied operations but is no "
-            "longer the newest batch in History is refused with 409 "
-            "`batch_id_not_at_top` before anything is written."
+            "confident they look. Applying is a background run, "
+            "`POST /dedup/auto-stack/runs`; `dry_run=false` here is refused with "
+            "400 `apply_runs_in_background`. A read: it never takes the writer."
         ),
         response_model=AutoStackResponse,
     )
-    def post_auto_stack(
-        request: Request,
-        payload: Optional[AutoStackRequestModel] = Body(default=None),
-    ):
+    def post_auto_stack(payload: Optional[AutoStackRequestModel] = Body(default=None)):
         request_model = payload or AutoStackRequestModel()
+        if not request_model.dry_run:
+            # Applying in this request is what outlived the client's timeout by
+            # an hour on a large library; refuse loudly rather than preview, so
+            # a stale client that meant to apply is told it did not.
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "apply_runs_in_background",
+                    "message": (
+                        "Auto-stack applies as a background run: "
+                        "POST /dedup/auto-stack/runs."
+                    ),
+                },
+            )
+        scope = _scope(request_model.scope)
+        return dedup_verdict_service.preview_auto_stack(
+            server.vault, scope, request_model.limit
+        )
+
+    def _run_refused(exc: AutoStackRunError) -> HTTPException:
+        """Map a refused run request to its status; the body names the code."""
+        status_code = AUTO_STACK_RUN_ERROR_STATUS[exc.code]
+        logger.info("[dedup] auto-stack run refused (%s): %s", exc.code, exc)
+        return HTTPException(
+            status_code=status_code,
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                "run": jsonable_encoder(exc.run),
+            },
+        )
+
+    def _accepted(
+        request: Request, response: Response, run: dict[str, Any], created: bool
+    ) -> dict[str, Any]:
+        """Set the async request-reply headers on a run a POST started.
+
+        202 for a new run, 200 for a replayed ``request_id`` (the run it
+        already started, in whatever state it has reached). ``Location`` is the
+        status resource either way; ``Retry-After`` only while it is active.
+        """
+        response.status_code = 202 if created else 200
+        response.headers["Location"] = request.url_for(
+            "get_auto_stack_run", run_id=run["id"]
+        ).path
+        if run["active"]:
+            response.headers["Retry-After"] = str(AUTO_STACK_POLL_AFTER_S)
+        return run
+
+    @router.post(
+        "/dedup/auto-stack/runs",
+        summary="Start auto-stacking the exact tier in the background",
+        description=(
+            "Records a run and returns 202 at once with the run, a `Location` "
+            "naming its status resource and a `Retry-After` poll hint; a "
+            "background task then stacks the exact groups a slice at a time, "
+            "so the request never waits on the stacking and other writes keep "
+            "getting the database between slices. History records the run in "
+            "segments of at most "
+            f"{SEGMENT_GROUP_CAP} groups, each one Ctrl+Z; "
+            "`POST .../runs/{run_id}/revert` undoes them all. Send a fresh "
+            "`request_id` per gesture: the same id again returns the run it "
+            "started (200) rather than starting another, and with different "
+            "parameters is 422 `request_id_reused`. One run at a time: while "
+            "one is active this is 409 `auto_stack_run_active`, naming it."
+        ),
+        status_code=202,
+        response_model=AutoStackRunModel,
+    )
+    def post_auto_stack_run(
+        request: Request,
+        response: Response,
+        payload: Optional[AutoStackRunRequestModel] = Body(default=None),
+    ):
+        request_model = payload or AutoStackRunRequestModel()
         scope = _scope(request_model.scope)
         # §21 origin discipline, read in the handler - see post_stack_verdict.
-        # This is the most far-reaching mutation on the surface, so it is the one
-        # that most needs an attributed audit row.
+        # The run mints its own History batches (one per segment), so the
+        # ambient gesture batch is not used.
         context = operation_log_service.request_context(request)
-        # Body batch_id wins over the ambient gesture header (see
-        # post_stack_verdict); the service mints srv- when both are absent.
-        header_batch_id = context.pop("batch_id", None)
-        return dedup_verdict_service.bulk_auto_stack(
-            server.vault,
-            scope,
-            _batch_id(request_model.batch_id) or header_batch_id,
-            request_model.dry_run,
-            request_model.limit,
-            **context,
-        )
+        context.pop("batch_id", None)
+        try:
+            run, created = dedup_auto_stack_service.start_apply_run(
+                server.vault,
+                scope,
+                request_model.limit,
+                request_model.request_id,
+                **context,
+            )
+        except AutoStackRunError as exc:
+            raise _run_refused(exc) from exc
+        return _accepted(request, response, run, created)
+
+    # Declared before ``/runs/{run_id}`` so ``latest`` is never read as an id.
+    @router.get(
+        "/dedup/auto-stack/runs/latest",
+        summary="The newest auto-stack run",
+        description=(
+            "The newest run of either kind, or `run: null` before the first. "
+            "A client reads it when the Duplicates screen opens so a run "
+            "started before a reload, or in another tab, is picked up again. "
+            "A read: it never takes the writer."
+        ),
+        response_model=AutoStackLatestRunResponse,
+    )
+    def get_latest_auto_stack_run():
+        return {"run": dedup_auto_stack_service.latest_run(server.vault)}
+
+    @router.get(
+        "/dedup/auto-stack/runs/{run_id}",
+        summary="An auto-stack run's status and progress",
+        description=(
+            "The run's status, counters and History segments. While it is "
+            "active the response carries `Retry-After`, the interval to poll "
+            "at. A read: it never takes the writer."
+        ),
+        response_model=AutoStackRunModel,
+    )
+    def get_auto_stack_run(run_id: int, response: Response):
+        try:
+            run = dedup_auto_stack_service.get_run(server.vault, run_id)
+        except AutoStackRunError as exc:
+            raise _run_refused(exc) from exc
+        if run["active"]:
+            response.headers["Retry-After"] = str(AUTO_STACK_POLL_AFTER_S)
+        return run
+
+    @router.post(
+        "/dedup/auto-stack/runs/{run_id}/cancel",
+        summary="Stop an auto-stack run",
+        description=(
+            "A queued run is cancelled at once. A running one stops at its next "
+            "slice, within about a second; poll the run for `cancelled`. Nothing "
+            "is rolled back: what committed stays stacked and revertable. An "
+            "ended run is returned unchanged, so a repeated cancel is harmless."
+        ),
+        response_model=AutoStackRunModel,
+    )
+    def post_cancel_auto_stack_run(run_id: int, response: Response):
+        try:
+            run = dedup_auto_stack_service.cancel_run(server.vault, run_id)
+        except AutoStackRunError as exc:
+            raise _run_refused(exc) from exc
+        if run["active"]:
+            response.headers["Retry-After"] = str(AUTO_STACK_POLL_AFTER_S)
+        return run
+
+    @router.post(
+        "/dedup/auto-stack/runs/{run_id}/revert",
+        summary="Undo an auto-stack run in the background",
+        description=(
+            "Records a revert run and returns 202, as starting a run does. It "
+            "undoes the run's History segments newest first, one per slice, "
+            "exactly as Ctrl+Z on each would. If an unrelated edit has since "
+            "landed above a segment in History, that segment is not undone and "
+            "the revert ends `blocked`; undo that edit, then revert again. 409 "
+            "`not_an_apply_run`, `nothing_to_revert` or `auto_stack_run_active` "
+            "when there is nothing it may do."
+        ),
+        status_code=202,
+        response_model=AutoStackRunModel,
+    )
+    def post_revert_auto_stack_run(
+        run_id: int,
+        request: Request,
+        response: Response,
+        payload: Optional[AutoStackRevertRequestModel] = Body(default=None),
+    ):
+        request_model = payload or AutoStackRevertRequestModel()
+        context = operation_log_service.request_context(request)
+        context.pop("batch_id", None)
+        try:
+            run, created = dedup_auto_stack_service.start_revert_run(
+                server.vault, run_id, request_model.request_id, **context
+            )
+        except AutoStackRunError as exc:
+            raise _run_refused(exc) from exc
+        return _accepted(request, response, run, created)
 
     @router.get(
         "/dedup/sweep/policy",

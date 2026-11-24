@@ -33,6 +33,7 @@ class TaskType(str, Enum):
     PIXEL_SHA = "PixelShaTask"
     ORIENTATION = "OrientationTask"
     DEDUP_SCAN = "DedupScanTask"
+    DEDUP_AUTO_STACK = "DedupAutoStackTask"
     STACK_COHESION = "StackCohesionTask"
     SNAPSHOT_IDENTITY_SCRUB = "SnapshotIdentityScrubTask"
     CHECKPOINT_HASH = "CheckpointHashTask"

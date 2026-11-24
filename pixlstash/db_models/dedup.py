@@ -1,6 +1,6 @@
 """Persistent state for the tiered duplicate detection queue (v1.9).
 
-Three concerns, three tables:
+Four concerns, four tables:
 
 * :class:`DedupGroup` / :class:`DedupGroupMember` - the **found groups cache**.
   Detection writes groups here as it finds them, so the queue is paged from the
@@ -14,6 +14,8 @@ Three concerns, three tables:
   until the user reopens it.
 * :class:`DedupScan` - the **scan progress** behind the "scanned N of M" banner
   and the scoped-scan entry points, one row per scope key.
+* :class:`DedupAutoStackRun` - one **background auto-stack run** (or a revert of
+  one): the request, its progress and the History segments it wrote.
 
 Nothing here stores pixels, and no row in this module ever causes a delete: a
 verdict is either a stack (additive) or a "keep separate" note.
@@ -42,6 +44,22 @@ SCAN_RUNNING = "running"
 SCAN_COMPLETE = "complete"
 SCAN_PARTIAL = "partial"
 SCAN_FAILED = "failed"
+
+# ``DedupAutoStackRun.kind`` values: a run that stacks the exact tier, or one
+# that undoes such a run's History segments.
+AUTO_STACK_KIND_APPLY = "apply"
+AUTO_STACK_KIND_REVERT = "revert"
+
+# ``DedupAutoStackRun.status`` values. ``pending`` and ``running`` are the
+# active states; at most one run of either kind is active at a time.
+AUTO_STACK_PENDING = "pending"
+AUTO_STACK_RUNNING = "running"
+AUTO_STACK_COMPLETE = "complete"
+AUTO_STACK_CANCELLED = "cancelled"
+AUTO_STACK_INTERRUPTED = "interrupted"
+AUTO_STACK_FAILED = "failed"
+AUTO_STACK_BLOCKED = "blocked"
+AUTO_STACK_ACTIVE_STATUSES = (AUTO_STACK_PENDING, AUTO_STACK_RUNNING)
 
 
 class DedupGroup(SQLModel, table=True):
@@ -249,7 +267,126 @@ class DedupScan(SQLModel, table=True):
     )
 
 
+class DedupAutoStackRun(SQLModel, table=True):
+    """One auto-stack run, or one revert of a run: the request and its progress.
+
+    Stacking a whole library's exact tier takes minutes to an hour, so it is not
+    a request the client waits on. ``POST /dedup/auto-stack/runs`` writes this
+    row and returns it (202); a background task applies the planned groups in
+    short writer slices and keeps the counters here current, so any tab can read
+    progress, cancel, or pick the run back up after a reload.
+
+    History is written in **segments**, each its own operation-log batch of at
+    most a few hundred groups, so one Ctrl+Z (or one undo after a stop) is a
+    bounded transaction rather than the whole run. A revert run undoes its
+    target's segments newest first.
+
+    Attributes:
+        request_id: The client's idempotency key (AIP-155 ``request_id``).
+            Unique: a retried create with the same key and the same parameters
+            returns this row instead of starting a second run.
+        kind: :data:`AUTO_STACK_KIND_APPLY` or :data:`AUTO_STACK_KIND_REVERT`.
+        status: One of the ``AUTO_STACK_*`` statuses.
+        target_run_id: For a revert, the apply run being reverted.
+        scope_type / scope_id: The scope an apply run covers.
+        group_limit: The optional cap on groups an apply run acts on.
+        total / processed: Progress. Planned groups for an apply run; History
+            segments for a revert, the unit one revert slice undoes.
+        applied: Groups stacked (apply), or stacked groups put back in the
+            queue (revert): one per stack operation undone, not per segment.
+        superseded: Planned groups that had left the queue by their turn
+            (apply), or segments with nothing left to undo (revert).
+        blocked / failed: Groups refused by a lock or a verdict error.
+        pictures: Pictures across the stacked groups, or restored by a revert.
+        failures: JSON list of the first refusals, for the summary.
+        segment_batch_ids: JSON list of the History batch ids the run wrote,
+            oldest first. A revert copies its target's list.
+        segment_groups: Groups in the newest segment, for the segment cap.
+        cancel_requested: Set by a cancel; the task stops at its next slice.
+        actor / source / origin_client_id: Who asked, for the operation log and
+            the WS envelope.
+        error_code / error: Why a run ended failed or blocked.
+    """
+
+    __tablename__ = "dedupautostackrun"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    request_id: str = Field(
+        sa_column=Column("request_id", String, nullable=False, unique=True, index=True)
+    )
+    kind: str = Field(
+        default=AUTO_STACK_KIND_APPLY, sa_column=Column("kind", String, nullable=False)
+    )
+    status: str = Field(
+        default=AUTO_STACK_PENDING,
+        sa_column=Column("status", String, nullable=False, index=True),
+    )
+    target_run_id: Optional[int] = Field(default=None)
+    scope_type: str = Field(
+        default="global", sa_column=Column("scope_type", String, nullable=False)
+    )
+    scope_id: Optional[str] = Field(
+        default=None, sa_column=Column("scope_id", String, nullable=True)
+    )
+    group_limit: Optional[int] = Field(default=None)
+    total: int = Field(default=0)
+    processed: int = Field(default=0)
+    applied: int = Field(default=0)
+    superseded: int = Field(default=0)
+    blocked: int = Field(default=0)
+    failed: int = Field(default=0)
+    pictures: int = Field(default=0)
+    failures: str = Field(
+        default="[]", sa_column=Column("failures", String, nullable=False)
+    )
+    segment_batch_ids: str = Field(
+        default="[]", sa_column=Column("segment_batch_ids", String, nullable=False)
+    )
+    segment_groups: int = Field(default=0)
+    cancel_requested: bool = Field(default=False)
+    actor: Optional[str] = Field(
+        default=None, sa_column=Column("actor", String, nullable=True)
+    )
+    source: Optional[str] = Field(
+        default=None, sa_column=Column("source", String, nullable=True)
+    )
+    origin_client_id: Optional[str] = Field(
+        default=None, sa_column=Column("origin_client_id", String, nullable=True)
+    )
+    error_code: Optional[str] = Field(
+        default=None, sa_column=Column("error_code", String, nullable=True)
+    )
+    error: Optional[str] = Field(
+        default=None, sa_column=Column("error", String, nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column("created_at", UTCDateTime(), nullable=False),
+    )
+    started_at: Optional[datetime] = Field(
+        default=None, sa_column=Column("started_at", UTCDateTime(), nullable=True)
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column("updated_at", UTCDateTime(), nullable=False),
+    )
+    finished_at: Optional[datetime] = Field(
+        default=None, sa_column=Column("finished_at", UTCDateTime(), nullable=True)
+    )
+
+
 __all__ = [
+    "AUTO_STACK_ACTIVE_STATUSES",
+    "AUTO_STACK_BLOCKED",
+    "AUTO_STACK_CANCELLED",
+    "AUTO_STACK_COMPLETE",
+    "AUTO_STACK_FAILED",
+    "AUTO_STACK_INTERRUPTED",
+    "AUTO_STACK_KIND_APPLY",
+    "AUTO_STACK_KIND_REVERT",
+    "AUTO_STACK_PENDING",
+    "AUTO_STACK_RUNNING",
+    "DedupAutoStackRun",
     "DedupGroup",
     "DedupGroupMember",
     "DedupScan",

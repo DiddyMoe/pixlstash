@@ -33,14 +33,19 @@ from sqlmodel import select
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture, PictureSet, PictureSetMember, PictureStack
-from pixlstash.db_models.dedup import DedupGroup, DedupScan, DedupVerdict
-from pixlstash.db_models.operation import Operation
+from pixlstash.db_models.dedup import (
+    DedupAutoStackRun,
+    DedupGroup,
+    DedupScan,
+    DedupVerdict,
+)
 from pixlstash.db_models.tag import Tag
 from pixlstash.server import Server
 from pixlstash.services import dedup_tier_service as tiers
 from pixlstash.services import dedup_verdict_service as verdicts
 from pixlstash.services.dedup_tier_service import TierPolicy
 from pixlstash.routes.dedup import MAX_COUNT_SCOPES
+from pixlstash.tasks.dedup_auto_stack_finder import DedupAutoStackFinder
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from tests.authz_guard import no_spa_fallback  # noqa: F401
 
@@ -54,10 +59,17 @@ KEEP_SEPARATE_URL = f"{API}/dedup/verdicts/keep-separate"
 BATCH_VERDICTS_URL = f"{API}/dedup/verdicts/batch"
 REOPEN_URL = f"{API}/dedup/verdicts/reopen"
 AUTO_STACK_URL = f"{API}/dedup/auto-stack"
+AUTO_STACK_RUNS_URL = f"{API}/dedup/auto-stack/runs"
+AUTO_STACK_LATEST_URL = f"{AUTO_STACK_RUNS_URL}/latest"
 
 
 def _stack_members_url(stack_id) -> str:
     return f"{API}/dedup/stacks/{stack_id}/members"
+
+
+def _auto_stack_run_url(run_id, action=None) -> str:
+    url = f"{AUTO_STACK_RUNS_URL}/{run_id}"
+    return f"{url}/{action}" if action else url
 
 
 # The SPA catch-all answers unmatched GETs with 200, so a wrong URL could make a
@@ -156,6 +168,37 @@ def _signature(client) -> str:
     return body["groups"][0]["signature"]
 
 
+def _work_auto_stack_runs(server):
+    """Work every pending auto-stack run as the planner would: finder, then task.
+
+    These servers run without background workers, so a run stays ``pending``
+    until a test works it here, through the same finder and task the planner
+    uses.
+    """
+    finder = DedupAutoStackFinder(server.vault)
+    while (task := finder.find_task()) is not None:
+        task.run()
+
+
+def _auto_stack_run(client, server, body=None, url=AUTO_STACK_RUNS_URL):
+    """Start a run (or a revert, given its *url*), work it, and return it ended."""
+    started = client.post(url, json=body or {})
+    assert started.status_code == 202, started.text
+    _work_auto_stack_runs(server)
+    ended = client.get(_auto_stack_run_url(started.json()["id"]))
+    assert ended.status_code == 200, ended.text
+    return ended.json()
+
+
+def _auto_stack_run_ids(server) -> list[int]:
+    return _run(
+        server,
+        lambda session: [
+            int(run_id) for run_id in session.exec(select(DedupAutoStackRun.id)).all()
+        ],
+    )
+
+
 # ── authorization, both directions ────────────────────────────────────────────
 
 
@@ -163,6 +206,19 @@ def test_scoped_read_token_is_denied_on_every_route():
     temp_dir, client, server, _ids, token, _set_id = _env()
     try:
         signature = _signature(client)
+        # A real run for the run routes to name. Workers are off, so it stays
+        # pending: a scoped request reaching the handler would get 200 / 409,
+        # not the gate's 403.
+        started = client.post(AUTO_STACK_RUNS_URL, json={})
+        assert started.status_code == 202, started.text
+        run_id = started.json()["id"]
+        run_routes = [
+            ("post", AUTO_STACK_RUNS_URL, {}),
+            ("get", AUTO_STACK_LATEST_URL, None),
+            ("get", _auto_stack_run_url(run_id), None),
+            ("post", _auto_stack_run_url(run_id, "cancel"), {}),
+            ("post", _auto_stack_run_url(run_id, "revert"), {}),
+        ]
         scoped = TestClient(server.api)
         headers = {"Authorization": f"Bearer {token}"}
         assert scoped.get(POLICY_URL, headers=headers).status_code == 403
@@ -198,6 +254,9 @@ def test_scoped_read_token_is_denied_on_every_route():
             == 403
         )
         assert scoped.post(AUTO_STACK_URL, json={}, headers=headers).status_code == 403
+        for method, url, body in run_routes:
+            response = scoped.request(method, url, json=body, headers=headers)
+            assert response.status_code == 403, (method, url, response.text)
         # The deck expansion is deny-by-default too, and the gate answers
         # before the handler, so a scoped token is refused whether or not
         # the stack exists - it never learns which.
@@ -250,6 +309,33 @@ def test_scoped_read_token_is_denied_on_every_route():
             scoped.get(_stack_members_url(1), params={"token": token}).status_code
             == 403
         )
+        for method, url, body in run_routes:
+            response = scoped.request(method, url, json=body, params={"token": token})
+            assert response.status_code == 403, (method, url, response.text)
+
+        # Fail-closed: the denied cancel and revert changed nothing, and the
+        # denied start created no run.
+        assert _auto_stack_run_ids(server) == [run_id]
+        # The positive control: the owner reaches all five, so the 403s above
+        # were the gate refusing a real route, not a path nothing answers.
+        owner = [
+            client.get(AUTO_STACK_LATEST_URL),
+            client.get(_auto_stack_run_url(run_id)),
+        ]
+        assert [response.status_code for response in owner] == [200, 200]
+        assert owner[0].json()["run"]["id"] == run_id
+        assert owner[1].json()["status"] == "pending"
+        busy = client.post(AUTO_STACK_RUNS_URL, json={})
+        assert busy.status_code == 409, busy.text
+        assert busy.json()["detail"]["run"]["id"] == run_id
+        # Nothing stacked yet, so there is nothing to revert; and only an
+        # ended run can be reverted at all.
+        early = client.post(_auto_stack_run_url(run_id, "revert"), json={})
+        assert early.status_code == 409, early.text
+        assert early.json()["detail"]["code"] == "auto_stack_run_active"
+        cancelled = client.post(_auto_stack_run_url(run_id, "cancel"), json={})
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelled"
     finally:
         _teardown(temp_dir, server)
 
@@ -287,6 +373,14 @@ def test_unauthenticated_is_denied():
         assert anonymous.post(SCAN_URL, json={}).status_code in (401, 403)
         assert anonymous.post(BATCH_VERDICTS_URL, json={}).status_code in (401, 403)
         assert anonymous.post(AUTO_STACK_URL, json={}).status_code in (401, 403)
+        assert anonymous.post(AUTO_STACK_RUNS_URL, json={}).status_code in (401, 403)
+        assert anonymous.get(AUTO_STACK_LATEST_URL).status_code in (401, 403)
+        assert anonymous.get(_auto_stack_run_url(1)).status_code in (401, 403)
+        for action in ("cancel", "revert"):
+            assert anonymous.post(
+                _auto_stack_run_url(1, action), json={}
+            ).status_code in (401, 403)
+        assert _auto_stack_run_ids(server) == []
     finally:
         _teardown(temp_dir, server)
 
@@ -1070,7 +1164,7 @@ def test_auto_stack_defaults_to_a_dry_run():
         assert body["dry_run"] is True
         assert body["groups"] == 1
         assert body["pictures"] == 2
-        assert body["results"] == []
+        assert "batch_id" not in body
         stacked = _run(
             server,
             lambda session: [session.get(Picture, pid).stack_id for pid in ids],
@@ -1080,23 +1174,75 @@ def test_auto_stack_defaults_to_a_dry_run():
         _teardown(temp_dir, server)
 
 
-def test_auto_stack_applies_under_one_batch_id():
+def test_auto_stack_refuses_to_apply_inside_the_request():
+    """Applying in the request is what outlived the client's timeout by an hour.
+
+    A caller that still sends ``dry_run: false`` is told where applying went,
+    and nothing is stacked or queued: a silent preview would read as success.
+    """
     temp_dir, client, server, ids, _token, _set_id = _env()
     try:
-        # The exact body the duplicate queue sends to apply (``api/dedup.js``
-        # ``autoStackExact``), so a request-model change that refuses the real
-        # client fails here rather than in the user's dialog.
-        response = client.post(
-            AUTO_STACK_URL,
-            json={"scope": {"scope_type": "global"}, "dry_run": False},
+        response = client.post(AUTO_STACK_URL, json={"dry_run": False})
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"]["code"] == "apply_runs_in_background"
+        stacked = _run(
+            server,
+            lambda session: [session.get(Picture, pid).stack_id for pid in ids],
         )
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["dry_run"] is False
-        assert body["groups"] == 1
-        assert body["batch_id"]
-        assert body["failures"] == []
-        assert {item["batch_id"] for item in body["results"]} == {body["batch_id"]}
+        assert stacked == [None, None, None]
+        assert _auto_stack_run_ids(server) == []
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_an_auto_stack_run_applies_in_the_background_under_one_segment():
+    temp_dir, client, server, ids, _token, _set_id = _env()
+    try:
+        # The exact body the Auto-stack dialog sends to apply (``api/dedup.js``
+        # ``startAutoStackRun``), so a request-model change that refuses the
+        # real client fails here rather than in the user's dialog.
+        response = client.post(
+            AUTO_STACK_RUNS_URL,
+            json={
+                "scope": {"scope_type": "global"},
+                "request_id": "8a6e0b7c-2f1d-4e5a-9c3b-1d2e3f4a5b6c",
+            },
+        )
+        assert response.status_code == 202, response.text
+        run_id = response.json()["id"]
+        # The asynchronous request-reply contract: where to poll, and how often.
+        assert response.headers["Location"] == _auto_stack_run_url(run_id)
+        assert response.headers["Retry-After"] == "2"
+        assert response.json()["status"] == "pending"
+        assert response.json()["active"] is True
+        # Answered before any stacking: the run has not started.
+        stacked = _run(
+            server,
+            lambda session: [session.get(Picture, pid).stack_id for pid in ids],
+        )
+        assert stacked == [None, None, None]
+        polled = client.get(response.headers["Location"])
+        assert polled.status_code == 200, polled.text
+        assert polled.headers["Retry-After"] == "2"
+
+        _work_auto_stack_runs(server)
+        ended = client.get(_auto_stack_run_url(run_id))
+        assert ended.status_code == 200, ended.text
+        assert "Retry-After" not in ended.headers
+        run = ended.json()
+        assert run["status"] == "complete"
+        assert run["active"] is False
+        assert (run["total"], run["processed"], run["applied"]) == (1, 1, 1)
+        assert (run["superseded"], run["blocked"], run["failed"]) == (0, 0, 0)
+        assert run["pictures"] == 2
+        assert run["failures"] == []
+        assert run["can_revert"] is True
+        assert len(run["segment_batch_ids"]) == 1
+        segment = run["segment_batch_ids"][0]
+        assert segment.startswith("srv-")
+        rows = client.get(f"{API}/operations", params={"batch_id": segment}).json()
+        assert rows, "the stack is recorded in the run's segment"
+        assert {row["batch_id"] for row in rows} == {segment}
         stacked = _run(
             server,
             lambda session: [session.get(Picture, pid).stack_id for pid in ids],
@@ -1104,6 +1250,7 @@ def test_auto_stack_applies_under_one_batch_id():
         assert stacked[0] is not None and stacked[0] == stacked[1]
         assert stacked[2] is None
         assert client.post(COUNTS_URL, json={}).json()["unresolved_groups"] == 0
+        assert client.get(AUTO_STACK_LATEST_URL).json()["run"]["id"] == run_id
     finally:
         _teardown(temp_dir, server)
 
@@ -1130,9 +1277,14 @@ def test_a_non_numeric_scope_id_is_a_400_on_every_route():
             assert client.post(COUNTS_URL, json={"scopes": [body]}).status_code == 400
             assert client.post(SCAN_URL, json={"scope": body}).status_code == 400
             assert client.post(AUTO_STACK_URL, json={"scope": body}).status_code == 400
-        # And nothing was persisted by the rejected scan requests.
+            assert (
+                client.post(AUTO_STACK_RUNS_URL, json={"scope": body}).status_code
+                == 400
+            )
+        # And nothing was persisted by the rejected scan or run requests.
         scans = _run(server, lambda session: session.exec(select(DedupScan)).all())
         assert scans == []
+        assert _auto_stack_run_ids(server) == []
     finally:
         _teardown(temp_dir, server)
 
@@ -1267,7 +1419,7 @@ def test_a_refused_auto_stack_request_is_logged_without_its_input(caplog):
         _teardown(temp_dir, server)
 
 
-def test_a_partially_blocked_auto_stack_returns_its_batch_id():
+def test_an_auto_stack_run_beside_a_locked_group_records_its_segment():
     """R2 at the HTTP boundary, restated for the withholding filter.
 
     The original fixture reached the run with a locked group in it and asserted
@@ -1275,7 +1427,7 @@ def test_a_partially_blocked_auto_stack_returns_its_batch_id():
     stackable members is withheld from the queue, the counts AND the auto-stack
     plan (owner call, 2026-07-30), that group no longer enters the run: the right
     HTTP-boundary assertion is now that the run applies the decidable group,
-    reports no failure, and still hands back its undo handle. The
+    reports no failure, and still records the History segment that undoes it. The
     "an HTTPException mid-run does not abort" invariant itself is pinned at the
     service level by
     ``test_dedup_verdict_service.test_an_http_exception_mid_run_does_not_abort_the_bulk_run``,
@@ -1311,13 +1463,12 @@ def test_a_partially_blocked_auto_stack_returns_its_batch_id():
         locked_ids = _run(server, add_second_group_and_lock_it)
         _run(server, tiers.run_scan_now_in_session, TierPolicy(), None)
 
-        response = client.post(AUTO_STACK_URL, json={"dry_run": False})
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["batch_id"]
-        assert body["groups"] == 1
-        assert body["blocked"] == 0, "the locked group was filtered out, not refused"
-        assert body["failures"] == []
+        run = _auto_stack_run(client, server)
+        assert run["status"] == "complete"
+        assert len(run["segment_batch_ids"]) == 1
+        assert run["total"] == run["applied"] == 1
+        assert run["blocked"] == 0, "the locked group was filtered out, not refused"
+        assert run["failures"] == []
         # The unlocked group was applied, the locked one was not.
         assert (
             _run(server, lambda session: session.get(Picture, ids[0]).stack_id)
@@ -1439,10 +1590,10 @@ def test_batch_undo_after_auto_stack_returns_every_group():
         assert len(before) == 4
         assert client.post(COUNTS_URL, json={}).json()["unresolved_groups"] == 4
 
-        applied = client.post(AUTO_STACK_URL, json={"dry_run": False})
-        assert applied.status_code == 200, applied.text
-        batch_id = applied.json()["batch_id"]
-        assert applied.json()["groups"] == 4
+        run = _auto_stack_run(client, server)
+        assert run["applied"] == 4
+        # Four groups is well under one segment, so the run is one History unit.
+        [batch_id] = run["segment_batch_ids"]
         assert client.post(COUNTS_URL, json={}).json()["unresolved_groups"] == 0
 
         undone = client.post(f"{API}/operations/batches/{batch_id}/undo", json={})
@@ -2044,14 +2195,15 @@ def test_a_server_shaped_batch_id_from_a_client_is_rejected():
                 ).status_code
                 == 400
             ), bad
+            # An auto-stack run mints its own History segments and takes no
+            # batch id at all, so the field is refused as unknown.
             assert (
-                client.post(
-                    AUTO_STACK_URL, json={"dry_run": False, "batch_id": bad}
-                ).status_code
-                == 400
+                client.post(AUTO_STACK_RUNS_URL, json={"batch_id": bad}).status_code
+                == 422
             ), bad
-        # Nothing was decided by any of the rejected calls.
+        # Nothing was decided or queued by any of the rejected calls.
         assert client.post(COUNTS_URL, json={}).json()["unresolved_groups"] == 1
+        assert _auto_stack_run_ids(server) == []
 
         # A client-namespaced id is accepted and used verbatim.
         response = client.post(
@@ -2089,8 +2241,13 @@ def test_a_folder_scope_that_normalises_to_nothing_is_rejected():
             assert client.post(COUNTS_URL, json={"scopes": [body]}).status_code == 400
             assert client.post(SCAN_URL, json={"scope": body}).status_code == 400
             assert client.post(AUTO_STACK_URL, json={"scope": body}).status_code == 400
-        # No poison scan row was persisted by the rejected requests.
+            assert (
+                client.post(AUTO_STACK_RUNS_URL, json={"scope": body}).status_code
+                == 400
+            )
+        # No poison scan or run row was persisted by the rejected requests.
         assert _run(server, lambda session: session.exec(select(DedupScan)).all()) == []
+        assert _auto_stack_run_ids(server) == []
 
         # A real folder still works, with or without a trailing separator, and
         # both spellings are the same scope.
@@ -2307,101 +2464,49 @@ def test_a_locked_sibling_outside_the_group_makes_the_whole_deck_unstackable():
         _teardown(temp_dir, server)
 
 
-# ── auto-stack: the supplied batch id and the run's own cascade ───────────────
+# ── auto-stack: the run's own History segments and cascade ───────────────────
 
 
-def _apply_auto_stack(client, batch_id=None, headers=None, limit=1):
-    body = {"dry_run": False, "limit": limit}
-    if batch_id is not None:
-        body["batch_id"] = batch_id
-    return client.post(AUTO_STACK_URL, json=body, headers=headers)
+def test_an_auto_stack_run_never_records_into_a_batch_the_client_names():
+    """A run records into segments it mints, never the ambient gesture batch.
 
-
-def _row_counts(server) -> tuple[int, int]:
-    """Operation and verdict rows, to show a refusal wrote neither."""
-    return _run(
-        server,
-        lambda session: (
-            len(session.exec(select(Operation.id)).all()),
-            len(session.exec(select(DedupVerdict.id)).all()),
-        ),
-    )
-
-
-def test_a_supplied_batch_id_buried_under_another_operation_is_refused():
-    """A run cannot append to a batch that is no longer on top of History.
-
-    Appending would split the batch around the newer operation, and History
-    could then undo neither part: the batch is stale behind the newer
-    operation, and the newer operation sits inside the batch. The refusal comes
-    before any write, whether the id arrives in the body or in the header.
+    The old in-request apply took a body or ``X-Operation-Batch-Id`` batch and
+    had to refuse one buried under another operation, because appending would
+    split the batch around it and leave both un-undoable. A run spans many
+    writer slices with other writes landing between them, so it owns its
+    batches outright and starts a new one whenever something lands on top
+    (pinned in ``tests/test_dedup_auto_stack_runs.py``).
     """
-    temp_dir, client, server, _ids, _token, _set_id = _env()
-    try:
-        _add_exact_groups(server, count=2)
-        _rescan(server)
-        run = "cli-example-buried-run"
-        first = _apply_auto_stack(client, batch_id=run)
-        assert first.status_code == 200, first.text
-        assert first.json()["batch_id"] == run
-        assert first.json()["groups"] == 1
-
-        # An unrelated operation lands on top of the run's batch.
-        unrelated = sorted(_signatures(client))[0]
-        stacked = client.post(STACK_URL, json={"signature": unrelated})
-        assert stacked.status_code == 200, stacked.text
-        queued = _signatures(client)
-        assert len(queued) == 1
-        before = _row_counts(server)
-
-        for supplied in (
-            {"batch_id": run},
-            {"headers": {"X-Operation-Batch-Id": run}},
-        ):
-            refused = _apply_auto_stack(client, **supplied)
-            assert refused.status_code == 409, refused.text
-            detail = refused.json()["detail"]
-            assert detail["code"] == "batch_id_not_at_top"
-            assert detail["batch_id"] == run
-            assert _row_counts(server) == before
-            assert _signatures(client) == queued
-
-        # History is still two clean undos: the newer operation, then the run.
-        assert client.post(f"{API}/operations/undo", json={}).status_code == 200
-        undone = client.post(f"{API}/operations/batches/{run}/undo", json={})
-        assert undone.status_code == 200, undone.text
-    finally:
-        _teardown(temp_dir, server)
-
-
-def test_a_supplied_batch_id_still_on_top_takes_another_run():
-    """Only a buried batch is refused: a repeat that is still on top extends
-    the batch, and the whole batch is still one undo."""
     temp_dir, client, server, _ids, _token, _set_id = _env()
     try:
         _add_exact_groups(server, count=1)
         _rescan(server)
-        queued = _signatures(client)
-        assert len(queued) == 2
-        run = "cli-example-repeat-run"
-        for _ in range(2):
-            response = _apply_auto_stack(client, batch_id=run)
-            assert response.status_code == 200, response.text
-            assert response.json()["batch_id"] == run
-            assert response.json()["groups"] == 1
-        rows = client.get(f"{API}/operations", params={"batch_id": run}).json()
-        assert len(rows) == 2
-
-        undone = client.post(f"{API}/operations/batches/{run}/undo", json={})
+        gesture = "cli-example-gesture"
+        started = client.post(
+            AUTO_STACK_RUNS_URL,
+            json={},
+            headers={"X-Operation-Batch-Id": gesture},
+        )
+        assert started.status_code == 202, started.text
+        _work_auto_stack_runs(server)
+        run = client.get(_auto_stack_run_url(started.json()["id"])).json()
+        assert run["applied"] == 2
+        assert gesture not in run["segment_batch_ids"]
+        assert (
+            client.get(f"{API}/operations", params={"batch_id": gesture}).json() == []
+        )
+        # And the segment is still one clean undo of everything the run did.
+        [segment] = run["segment_batch_ids"]
+        undone = client.post(f"{API}/operations/batches/{segment}/undo", json={})
         assert undone.status_code == 200, undone.text
-        assert _signatures(client) == queued
+        assert client.post(COUNTS_URL, json={}).json()["unresolved_groups"] == 2
     finally:
         _teardown(temp_dir, server)
 
 
-def test_an_auto_stack_response_counts_a_group_an_earlier_group_collapsed():
-    """The response says how many planned groups the run itself took out of the
-    queue, so a run that stacks fewer groups than it planned explains why.
+def test_an_auto_stack_run_counts_a_group_an_earlier_group_collapsed():
+    """The run says how many planned groups it took out of the queue itself, so
+    a run that stacks fewer groups than it planned explains why.
 
     Two exact pairs are spread across two mixed stacks. Stacking either pair
     folds both stacks together, which leaves the other pair in one stack.
@@ -2419,10 +2524,10 @@ def test_an_auto_stack_response_counts_a_group_an_earlier_group_collapsed():
         _stack_over_http(server, [ids[1], b2])
         _rescan(server)
 
-        response = _apply_auto_stack(client, limit=None)
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["groups"] == 1
-        assert body["superseded"] == 1
+        run = _auto_stack_run(client, server)
+        assert run["total"] == 2
+        assert run["applied"] == 1
+        assert run["superseded"] == 1
+        assert run["processed"] == 2
     finally:
         _teardown(temp_dir, server)
