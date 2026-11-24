@@ -2176,7 +2176,9 @@ On app mount, the SPA calls:
   `ai_toolkit_repo_path` / `ai_toolkit_python` are host paths: they are `null`
   unless the request passes the §16.3 local rule, and `ai_toolkit_configured`
   says whether an install is saved. The Train dialog's setup state reads the
-  flag, never the paths (#2295).
+  flag, never the paths (#2295). `vram_total_gb` is the installed card, in GB
+  (`null` without one): the bound of the `max_vram_gb` slider, sent with the
+  value it bounds (see §11.3).
 
 ### Logout
 
@@ -2663,7 +2665,7 @@ PixlStash admits the GPU work it starts against the card's measured free memory 
 
 PixlStash's own tasks appear as `light` leases (one per running GPU task, `worker_type` set; `on_cpu: true` for one that spilled to the CPU) and never wait. `preempted` lists work paused to make room until the lease that caused it is granted.
 
-`resources` sits beside the response's older `process` block, which it does not replace. `process` is this process's usage (`vram_used_gb`, `vram_total_gb`, `vram_percent`, null without a GPU), and the VRAM limit slider in Settings › GPU & compute reads its upper bound from `process.vram_total_gb`.
+`resources` sits beside the response's older `process` block, which it does not replace. `process` is this process's usage (`vram_used_gb`, `vram_total_gb`, `vram_percent`, null without a GPU). The VRAM limit slider in Settings › GPU & compute does **not** read its upper bound here: it takes `vram_total_gb` from `GET /users/me/config`, in the same response as the `max_vram_gb` it bounds. Waiting on this poll, the heaviest the server answers, held the slider at its 2 GB floor for as long as the poll took on a large library under load. The card total behind the config field is read once per process (`vram_utils.query_total_vram_mb`).
 
 **Workflow cards** carry `vram: {need_mb, measured_runs, exclusive, exclusive_source, exclusive_at, trend, peaks}` (peaks on the detail read only, each with the `pixels` it was measured at); `PATCH /workflows/{id}` takes `exclusive`, and `forget_vram_peaks: true`, the GPU memory section's Reset. The owner's `auto_exclusive_after_oom` rides `GET`/`PATCH /users/me/config`.
 

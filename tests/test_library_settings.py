@@ -18,8 +18,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
-from pixlstash.db_models import User
+from pixlstash.db_models import Picture, User
 from pixlstash.db_models.library_settings import LibrarySettings
+from pixlstash.routes import config as config_routes
 from pixlstash.server import Server
 from pixlstash.services import library_settings_service
 from tests.utils import reset_owner_auth
@@ -414,3 +415,22 @@ class TestTagChipSize:
         assert response.status_code == 400, response.text
         body = client.get(f"{API}/users/me/config").json()
         assert body["tag_chip_size"] == "comfortable"
+
+
+class TestVramSliderBound:
+    """The card bounding ``max_vram_gb`` arrives in the same response as it.
+
+    The slider took its bound from ``GET /workers/progress``, and sat at its
+    2 GB floor until that heaviest of polls answered.
+    """
+
+    def test_the_card_comes_with_the_budget_it_bounds(self, server, monkeypatch):
+        monkeypatch.setattr(config_routes, "query_total_vram_mb", lambda: 16384)
+        body = _owner(server).get(f"{API}/users/me/config").json()
+        assert body["vram_total_gb"] == 16.0
+        assert body["max_vram_gb"] is not None
+
+    def test_no_card_sends_no_total(self, server, monkeypatch):
+        monkeypatch.setattr(config_routes, "query_total_vram_mb", lambda: 0)
+        body = _owner(server).get(f"{API}/users/me/config").json()
+        assert body["vram_total_gb"] is None

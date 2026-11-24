@@ -2141,6 +2141,7 @@ This rule is enforced by **`tests/test_architecture_guardrails.py::test_services
 | [utils/request_origin.py](../pixlstash/utils/request_origin.py) | `OriginClientMiddleware` — captures the per-tab `X-Client-Id` for the real-time event envelope (see §15) |
 | [utils/comfyui_utilities.py](../pixlstash/utils/comfyui_utilities.py) | ComfyUI workflow parsing |
 | [utils/insightface_batched.py](../pixlstash/utils/insightface_batched.py) | Batched InsightFace wrapper |
+| [utils/vram_utils.py](../pixlstash/utils/vram_utils.py) | Accelerator cache flushes and `query_total_vram_mb()`, the installed card total behind both the `max_vram_gb` validator ceiling (`system_utils.max_vram_budget_gb`) and the slider bound `GET /users/me/config` sends as `vram_total_gb`. The card's answer is kept once positive, because `nvidia-smi` costs tens of milliseconds and the config read asks on every request. A `0` is not kept, since the driver may not be up yet. `nvidia-smi` gets `NVIDIA_SMI_TIMEOUT_S` (10 s) to answer: a wedged driver is logged at warning and counts as no card for that call. The Apple Silicon answer is not kept either: it is cheap, and it sharpens once torch loads. |
 | utils/image_processing/ | `image_utils`, `face_utils`, `video_utils` |
 | utils/likeness/ | `likeness_utils`, `likeness_parameter_utils` |
 | utils/quality/ | `quality_utils`, `smart_score_utils` |

@@ -29,6 +29,7 @@ from pixlstash.routes._helpers import require_hub
 from pixlstash.routes.model_folders import register_comfyui_model_folders
 from pixlstash.utils.path_utils import LibraryRootsUnavailable
 from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.vram_utils import query_total_vram_mb
 from pixlstash.services import (
     comfyui_connections,
     comfyui_link_service,
@@ -89,6 +90,11 @@ def create_router(server) -> APIRouter:
         The ai-toolkit checkout and its Python are host paths, which only the
         §16.3 tier that ``GET /training/ai-toolkit/status`` carries may read;
         everyone else gets ``ai_toolkit_configured`` and nulls (#2295).
+
+        ``vram_total_gb`` is the card the ``max_vram_gb`` slider is bounded by,
+        sent with the value it bounds. The slider used to wait for it on
+        ``GET /workers/progress``, the heaviest poll there is, and sat at its
+        2 GB floor until that answered. ``None`` without a card.
         """
         payload = serialize_user_config(user)
         payload["ai_toolkit_configured"] = bool(
@@ -107,6 +113,10 @@ def create_router(server) -> APIRouter:
         # A table of its own in the hub too.
         payload["tag_chip_size"] = tag_preferences.read(
             server.hub, getattr(user, "id", None)
+        )
+        total_vram_mb = query_total_vram_mb()
+        payload["vram_total_gb"] = (
+            round(total_vram_mb / 1024.0, 2) if total_vram_mb > 0 else None
         )
         return payload
 

@@ -24,6 +24,15 @@ from pixlstash.utils.accelerator import (
 
 logger = get_logger(__name__)
 
+#: Installed VRAM in MiB once ``nvidia-smi`` has reported a card; 0 until then.
+#: See :func:`query_total_vram_mb`.
+_card_total_mb: int = 0
+
+#: How long ``nvidia-smi`` may take to report the card's memory. A healthy
+#: driver answers in well under a second, even cold. A wedged one can block
+#: indefinitely, and this read now sits on the settings request path.
+NVIDIA_SMI_TIMEOUT_S = 10
+
 
 def query_total_vram_mb() -> int:
     """Return the GPU memory this host can offer, in MiB.
@@ -42,11 +51,27 @@ def query_total_vram_mb() -> int:
     fallback and ``max_vram_budget_gb`` to 12 GB, figures that were invisible
     only while no Apple GPU was ever selected.
 
+    The card's answer is kept once it is positive. ``nvidia-smi`` is a
+    subprocess that brings the driver up on every run (54 ms measured on a WSL2
+    development box), and ``GET /users/me/config`` asks on every request for
+    the VRAM slider's bound; installed VRAM does not change under a running
+    process. A 0 is not kept, because it can mean the driver was not up yet,
+    and keeping it would hold the slider at its floor until a restart. The
+    Apple answer is not kept either: it is a cheap read, and it sharpens from a
+    share of RAM to Metal's own figure once torch is loaded.
+
+    ``nvidia-smi`` gets :data:`NVIDIA_SMI_TIMEOUT_S` to answer. A driver that
+    does not answer in that time counts as no card for this call and is asked
+    again on the next one.
+
     Returns:
         Total GPU-usable memory in MiB, or 0 when there is no GPU to ask.
     """
+    global _card_total_mb
     if is_apple_silicon():
         return accelerator_total_memory_mb(MPS)
+    if _card_total_mb > 0:
+        return _card_total_mb
     try:
         output = subprocess.check_output(
             [
@@ -56,6 +81,7 @@ def query_total_vram_mb() -> int:
             ],
             stderr=subprocess.DEVNULL,
             text=True,
+            timeout=NVIDIA_SMI_TIMEOUT_S,
         )
         totals = []
         for line in output.splitlines():
@@ -63,7 +89,17 @@ def query_total_vram_mb() -> int:
             if not value:
                 continue
             totals.append(int(float(value)))
-        return sum(totals)
+        _card_total_mb = sum(totals)
+        return _card_total_mb
+    except subprocess.TimeoutExpired:
+        # Not the routine "no card" case below: a card whose driver is not
+        # answering is worth a line in the log.
+        logger.warning(
+            "nvidia-smi did not report the card's memory within %d s; treating "
+            "this host as having no card for now, and asking again next time.",
+            NVIDIA_SMI_TIMEOUT_S,
+        )
+        return 0
     except Exception:
         # nvidia-smi absent/failing is normal on CPU-only hosts; 0 (no VRAM) IS
         # the documented answer, so logging it would be routine noise.
