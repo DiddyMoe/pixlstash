@@ -219,6 +219,7 @@ def _active_run(session: Session) -> Optional[DedupAutoStackRun]:
         select(DedupAutoStackRun)
         .where(DedupAutoStackRun.status.in_(AUTO_STACK_ACTIVE_STATUSES))
         .order_by(DedupAutoStackRun.id.asc())
+        .limit(1)
     ).first()
 
 
