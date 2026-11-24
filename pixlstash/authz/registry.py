@@ -154,6 +154,27 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
         justification="Owner config; READ_BLOCKED_GET_PATHS blocks READ tokens; only owner reaches",
     ),
     ("GET", "/api/v1/users/me/penalised-tags"): RoutePolicy(_ANY),
+    ("GET", "/api/v1/users/me/penalised-tags/cleanup"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "Owner's removed tags and the cleanup of this library; on "
+            "READ_BLOCKED_GET_PATHS, only the owner reaches it"
+        ),
+    ),
+    ("POST", "/api/v1/users/me/penalised-tags/cleanup"): RoutePolicy(
+        _OWNER,
+        justification="Owner removes removed tags from every picture; owner only",
+    ),
+    ("PUT", "/api/v1/users/me/penalised-tags/{tag:path}"): RoutePolicy(
+        _OWNER, justification="Owner config write (penalised tag weight)"
+    ),
+    ("DELETE", "/api/v1/users/me/penalised-tags/{tag:path}"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "Owner config write that removes the tag from every picture in the "
+            "library; owner only"
+        ),
+    ),
     # ── telemetry.py (anonymous install ID) ─────────────────────────────────
     # Owner-only, not any_token: the install ID is a stable identifier for the
     # installation, so handing it to a share-link holder would let them

@@ -178,3 +178,60 @@ export async function deleteWatermark() {
 export async function getPenalisedTags() {
   return unwrap(apiClient.get(`${ME_URL}/penalised-tags`));
 }
+
+/**
+ * Penalise one tag with a weight, or change its weight.
+ *
+ * A tag that was removed (X) is let back into tagging by this; the tags
+ * removed earlier are not restored. Ordinary weight edits go through the
+ * config PATCH instead.
+ *
+ * @param {string} tag
+ * @param {number} weight - 1 to 5.
+ * @returns {Promise<Object>} the response body: `smart_score_penalised_tags`
+ *   (tag→weight), `excluded` (the tags removed from tagging) and `cleanup`
+ *   (a job finishing the other removed tags here, or null).
+ */
+export async function putPenalisedTag(tag, weight) {
+  return unwrap(
+    apiClient.put(`${ME_URL}/penalised-tags/${encodeURIComponent(tag)}`, {
+      weight,
+    }),
+  );
+}
+
+/**
+ * Remove one penalised tag: drop it from the list, stop the tagger producing
+ * it in every library, and start taking it off this library's pictures.
+ *
+ * @param {string} tag
+ * @returns {Promise<Object>} the response body: `smart_score_penalised_tags`,
+ *   `excluded` and `cleanup` (the job removing it from pictures, or null when
+ *   it was removed already).
+ */
+export async function deletePenalisedTag(tag) {
+  return unwrap(
+    apiClient.delete(`${ME_URL}/penalised-tags/${encodeURIComponent(tag)}`),
+  );
+}
+
+/**
+ * Read how removing tags from this library's pictures is going.
+ *
+ * @returns {Promise<Object>} the response body: `excluded`, `remaining`
+ *   (unlocked pictures still carrying a removed tag), `locked`, `state`
+ *   (`running`, `interrupted` or `idle`) and `jobs`, newest first.
+ */
+export async function getPenalisedTagCleanup() {
+  return unwrap(apiClient.get(`${ME_URL}/penalised-tags/cleanup`));
+}
+
+/**
+ * Start removing every removed tag from this library's pictures again, after
+ * a job stopped before it finished. Refused with 409 while one is running.
+ *
+ * @returns {Promise<Object>} the response body, whose `cleanup` is the job.
+ */
+export async function startPenalisedTagCleanup() {
+  return unwrap(apiClient.post(`${ME_URL}/penalised-tags/cleanup`, {}));
+}

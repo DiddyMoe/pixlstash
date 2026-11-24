@@ -33,6 +33,11 @@ from pixlstash.utils.service.smart_score_invalidation import (
     invalidate_on_anomaly_change,
 )
 from pixlstash.utils.service.tag_prediction_utils import PENALISED_TAG_SET
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_scores,
+    filter_tag_names,
+    session_tag_exclusions,
+)
 from pixlstash.inference.workflows.tagging import TaggingWorkflow
 from pixlstash.inference.engine import InferenceEngine
 from pixlstash.tagger_plugins.pixlstash_tagger import (
@@ -775,6 +780,7 @@ class TagTask(BaseTask):
         # only re-queues pictures that still carry a retag sentinel.
         pics_to_update: list[tuple[int, set]] = []
         preserved_by_pic: dict[int, int] = {}
+        exclusions = session_tag_exclusions(session)
         for update in updates:
             pic_id = update.get("pic_id")
             if pic_id is None:
@@ -787,6 +793,9 @@ class TagTask(BaseTask):
             effective_tags = set(update.get("tags") or [])
             effective_tags -= human_neg_by_pic.get(pic_id, set())
             effective_tags |= human_pos_by_pic.get(pic_id, set())
+            # A tag the user removed from tagging is never written, whoever
+            # produced it. A picture left with nothing still loses its sentinel.
+            effective_tags = set(filter_tag_names(effective_tags, exclusions))
 
             tags_to_add = effective_tags - existing
             if not tags_to_add and not any(is_tag_sentinel(t) for t in existing):
@@ -1108,13 +1117,25 @@ class TagTask(BaseTask):
                 crop_inference_s = 0.0
                 crop_fetch_s = 0.0
                 crop_build_s = 0.0
+                # With every tag a crop can own removed from tagging, all it
+                # finds would be dropped at the write: skip the face lookup and
+                # the crop model. One permitted crop tag keeps the whole pass.
+                excluded = self._db.tag_exclusions
+                crop_wanted = any(
+                    set(tags) - excluded for tags in CROP_TAGS_BY_KIND.values()
+                )
+                crop_batch = batch if crop_wanted else []
                 try:
                     crop_fetch_start = time.perf_counter()
-                    pic_ids = [p.id for p in batch]
-                    faces_by_pic = self._db.run_immediate_read_task(
-                        lambda session: self._fetch_faces_for_pictures(
-                            session, pic_ids
-                        ),
+                    pic_ids = [p.id for p in crop_batch]
+                    faces_by_pic = (
+                        self._db.run_immediate_read_task(
+                            lambda session: self._fetch_faces_for_pictures(
+                                session, pic_ids
+                            ),
+                        )
+                        if pic_ids
+                        else {}
                     )
                     crop_fetch_s = time.perf_counter() - crop_fetch_start
                     target = active_workflow.pixlstash_tagger_image_size_quality_crop()
@@ -1129,7 +1150,7 @@ class TagTask(BaseTask):
                     # crops and resizes, plus a decode for any picture the
                     # preload missed.
                     crop_build_start = time.perf_counter()
-                    for pic in batch:
+                    for pic in crop_batch:
                         faces = faces_by_pic.get(pic.id, [])
                         entry = preloaded_crops.get(pic.id)
                         # The preload read faces when the task was queued; a
@@ -1422,8 +1443,15 @@ class TagTask(BaseTask):
             for pid, scores in label_scores_by_pic_id.items()
             if pid in existing_picture_ids
         }
+        # A tag the user removed from tagging gets no prediction row, neither
+        # from its score nor from the applied-tag fallback below.
+        exclusions = session_tag_exclusions(session)
+        label_scores_by_pic_id = {
+            pid: filter_scores(scores, exclusions)
+            for pid, scores in label_scores_by_pic_id.items()
+        }
         tags_by_pic_id = {
-            pid: tags
+            pid: set(filter_tag_names(tags, exclusions))
             for pid, tags in tags_by_pic_id.items()
             if pid in existing_picture_ids
         }

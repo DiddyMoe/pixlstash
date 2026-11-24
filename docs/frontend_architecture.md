@@ -91,7 +91,7 @@ frontend/src/
 ├── api/                         # Backend resource modules: the only place URL strings live (see §8)
 │   ├── config.js                # Per-user config blob: GET/PATCH /users/me/config
 │   ├── serverConfig.js          # Server-wide config topics under /server-config/
-│   ├── users.js                 # /users/me/* — account, tokens/share links, watermark
+│   ├── users.js                 # /users/me/* — account, tokens/share links, watermark, penalised tags
 │   ├── session.js               # /session/context — the current credential's scope
 │   ├── workers.js               # /workers/progress — background-worker poll
 │   ├── snapshots.js             # /snapshots + restore/preview sub-resources
@@ -1197,11 +1197,20 @@ The Snapshots section of the Recovery pane. Props: `open: Boolean`, `active: Boo
 #### `ComputeSection.vue` (795 lines)
 Compute-runtime manager, behind both the GPU & compute pane (`view="compute"`) and the Server pane (`view="backend"`). Talks to the Electron preload bridge (`window.pixlstashDesktop`) to switch between the built-in CPU/Metal runtime and an on-demand GPU overlay; the same choice appears on the first-run welcome screen. Switching the runtime restarts the local server (which reloads the page). Props: `open: Boolean`, `active: Boolean`, `view`. Each view reads its settings the first time its tab is shown in an open, and not again on a return to the tab; a VRAM change still inside its 500 ms debounce is saved when the pane unmounts. The runtime list no-ops outside the desktop shell; two blocks above it work on every install, which is why the Compute tab now shows on headless too: **Which GPU PixlStash uses** (`GET /compute/gpus`: Auto first with `auto_reason`, a row per GPU, integrated ones not pickable; choosing stages, *Apply & restart* commits with `PATCH /compute/gpu` and, on the desktop, restarts through `useAccelerator(<the active runtime>)`, on headless says to restart) and **Sharing the GPU** (the VRAM limit, now "PixlStash's VRAM limit", which caps PixlStash's own work only, and *Run a workflow alone after it runs out of memory*, `auto_exclusive_after_oom`). The limit's slider is bounded by `vram_total_gb` from the same `GET /users/me/config` that carries `max_vram_gb` (the card less 2 GB, in 2 GB steps; never below a stored larger value), not by the `/workers/progress` poll; until that read lands the row shows `—` and *Loading…*, never the 2 GB floor its refs start at.
 
-#### `SmartScoreSection.vue` (429 lines)
-Penalised-tags configuration. Props: `open: Boolean`. Owns all penalised-tag CRUD state internally, except the edit queue, which is in `useUserPrefsStore`.
-- **Read:** an immediate watcher on `open` reads `GET /users/me/config` (the dialog's lazy content remounts with `open` already true), passing an `AbortController` signal that `onWatcherCleanup` aborts when the dialog closes or the section unmounts; an aborted read changes nothing. Each read takes a number from a list epoch, and its list is applied only if no newer read or accepted save has moved the epoch since, so a slow read cannot put back a tag the owner just removed.
-- **Edits** (add, remove, weight) are queued and run one at a time. The queue is `useUserPrefsStore.queuePenalisedEdit`, not the pane's, because closing Settings unmounts the pane: it spans a close and reopen, so an edit made in the reopened pane still waits for one the closed pane left saving, and the reopened pane's read waits for `penalisedEditsSettled()`, so it shows the list that edit left. Each is applied to the list the server last accepted, not the list on screen when it was clicked, and sent as the whole map via `PATCH /users/me/config`; only the server's acceptance replaces the list. An edit made before the first read lands reads the list first. A failed edit leaves the list as it was, shows the server's reason inline and as an error notice, and does not stop the edits queued behind it.
-- **Busy chip:** while a removal is being saved its chip is pending (`SettingsChip` `busy`) and its weight select is disabled; other chips stay usable.
+#### `SmartScoreSection.vue` (701 lines)
+Penalised-tags configuration, plus the hidden-tag filter. Props: `open: Boolean`. Emits `update:hidden-tags` and `update:apply-tag-filter`. Owns all penalised-tag state internally, except the edit queue, which is in `useUserPrefsStore`. The contract is in integration §2.12.
+- **Read:** an immediate watcher on `open` reads `GET /users/me/config` (the dialog's lazy content remounts with `open` already true), passing an `AbortController` signal that `onWatcherCleanup` aborts when the dialog closes or the section unmounts; an aborted read changes nothing. Each read takes a number from a list epoch, and its list is applied only if no newer read or accepted save has moved the epoch since, so a slow read cannot put back a tag the owner just removed. The read then fetches `GET /users/me/penalised-tags/cleanup` for the removed names (`excluded`) and the job state.
+- **Edits** (add, weight, remove, add back) are queued and run one at a time. The queue is `useUserPrefsStore.queuePenalisedEdit`, not the pane's, because closing Settings unmounts the pane: it spans a close and reopen, so an edit made in the reopened pane still waits for one the closed pane left saving, and the reopened pane's read waits for `penalisedEditsSettled()`, so it shows the list that edit left. Adding a tag and changing a weight are applied to the list the server last accepted, not the list on screen when it was clicked, and sent as the whole map via `PATCH /users/me/config`. X and add-back use the per-tag routes when their turn comes and take the list from the server's answer. Only the server's acceptance replaces the list. An edit made before the first read lands reads the list first. A failed edit leaves the list as it was, shows the server's reason inline and as an error notice, and does not stop the edits queued behind it.
+- **X removes the tag everywhere.** A danger confirm says the tag is removed from every picture in this library and that the tagger stops adding it in all the owner's libraries; one question is open at a time. Then `DELETE /users/me/penalised-tags/{tag}` is queued; the chip goes only on the server's answer. While it waits or is in flight, that chip is busy (`SettingsChip` `busy`, meta "Removing…") and its weight select is disabled; other chips stay usable, and an edit made meanwhile applies to the list the removal leaves.
+- **Adding a removed name back** (it is in the status's `excluded`) asks first, then goes through `PUT /users/me/penalised-tags/{tag}` at weight 3. Nothing removed earlier comes back.
+- **The cleanup job is followed by polling.** Both answers can carry a `cleanup` job. The section polls the status route every second and shows a sticky info notice keyed per job (`penalised-cleanup:<id>`). It ends in one of:
+  - a success notice;
+  - a warning that counts the locked pictures skipped;
+  - "stopped before it finished" with *Retry* (`POST .../cleanup`);
+  - following the newer job that took over the names.
+
+  A failed status read leaves "Could not check" with *Check again*. Polling is not tied to the component: the notices are global, so a job is followed to its end after the dialog closes. A job running before a reload is not picked up again.
+- **On open, an `interrupted` status** (removed tags still on unlocked pictures, no job running) raises "Removed tags are still on N pictures in this library." with *Remove from this library*. A 409 from that retry means a job is already running, and the section follows it instead.
 
 #### `AccountSection.vue` (1255 lines)
 The Account & tokens pane. Props: `open: Boolean`.
@@ -4521,7 +4530,7 @@ For `<img :src="...">` bindings and similar direct browser requests that bypass 
 |---|---|
 | `api/config.js` | `GET`/`PATCH /users/me/config`, the per-user config blob |
 | `api/serverConfig.js` | `/server-config/*`, the server-wide topics (scrapheap retention, snapshots) |
-| `api/users.js` | `/users/me/*`: the owner account, its tokens and share links, the watermark |
+| `api/users.js` | `/users/me/*`: the owner account, its tokens and share links, the watermark, the penalised tags (remove, add back, the cleanup status and retry) |
 | `api/session.js` | `/session/context` and `/sort_mechanisms` |
 | `api/workers.js` | `/workers/progress`, the background-worker poll |
 | `api/snapshots.js` | `/snapshots` and its restore/preview sub-resources |

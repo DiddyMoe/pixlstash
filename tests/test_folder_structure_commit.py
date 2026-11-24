@@ -821,6 +821,111 @@ def test_a_picture_frozen_by_a_locked_set_is_skipped_not_filed(owner_env):
     assert frozen_id not in tagged, "a picture frozen by a locked set must be skipped"
 
 
+def test_a_folder_named_for_a_removed_tag_files_no_tag(owner_env):
+    """A folder accepted as a tag, named for a tag the owner removed from
+    tagging, gives its pictures no Tag row and no human label the tagger
+    would apply again. The other folders are filed as usual."""
+    from pixlstash.db_models.picture import Picture
+    from pixlstash.db_models.tag import Tag
+    from pixlstash.db_models.tag_prediction import TagPrediction
+    from pixlstash.services.folder_structure_commit_service import (
+        Assignment,
+        CommitResult,
+        _link_pictures,
+    )
+    from sqlmodel import select
+
+    server = owner_env["server"]
+    image_root = server.vault.image_root
+
+    def scenario(session):
+        removed = Picture(file_path="removed-folder-tag/Flux Chin/a.jpg")
+        kept = Picture(file_path="removed-folder-tag/kept/b.jpg")
+        session.add(removed)
+        session.add(kept)
+        session.flush()
+        _link_pictures(
+            session,
+            [removed, kept],
+            [
+                Assignment(relative_path="Flux Chin", kind="tag"),
+                Assignment(relative_path="kept", kind="tag"),
+            ],
+            os.path.join(image_root, "removed-folder-tag"),
+            image_root,
+            CommitResult(),
+        )
+        session.commit()
+        ids = [removed.id, kept.id]
+        tags = session.exec(
+            select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(ids))
+        ).all()
+        labels = session.exec(
+            select(TagPrediction.picture_id, TagPrediction.tag).where(
+                TagPrediction.picture_id.in_(ids)
+            )
+        ).all()
+        return kept.id, sorted(map(tuple, tags)), sorted(map(tuple, labels))
+
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+    try:
+        kept_id, tags, labels = server.vault.db.run_task(scenario)
+    finally:
+        server.vault.db.set_tag_exclusions(frozenset())
+    assert tags == [(kept_id, "kept")]
+    assert labels == [(kept_id, "kept")]
+
+
+def test_local_import_leaves_out_a_tag_removed_from_tagging(owner_env):
+    """A confirmed tags file brings in its permitted tags. One naming only
+    tags the owner removed from tagging leaves the picture untagged and not
+    waiting for the tagger: the owner did tag it."""
+    from sqlmodel import select
+
+    from pixlstash.db_models import Picture, Tag
+
+    server = owner_env["server"]
+    owner = owner_env["owner"]
+    root = os.path.join(server.vault.image_root, "removed-tag-captions")
+    _make_tree(root, {"": ["a.jpg", "a.txt", "b.jpg", "b.txt"]})
+    with open(os.path.join(root, "a.txt"), "w") as fh:
+        fh.write("flux_chin, portrait\n")
+    with open(os.path.join(root, "b.txt"), "w") as fh:
+        fh.write("Flux Chin\n")
+
+    def read_tags(session):
+        pics = session.exec(
+            select(Picture).where(Picture.file_path.startswith("removed-tag-captions/"))
+        ).all()
+        return {
+            os.path.basename(pic.file_path): sorted(
+                session.exec(select(Tag.tag).where(Tag.picture_id == pic.id)).all()
+            )
+            for pic in pics
+        }
+
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+    try:
+        read_task_id = owner.post(_READ, json={"path": root}).json()["task_id"]
+        _drain_read(owner, read_task_id)
+        commit_started = owner.post(
+            _COMMIT,
+            json={
+                "task_id": read_task_id,
+                "mode": "local_import",
+                "assignments": [],
+                "captions": [{"suffix": ".txt", "kind": "tags"}],
+            },
+        )
+        assert commit_started.status_code == 200, commit_started.text
+        body = _drain_commit(owner, commit_started.json()["task_id"], timeout_s=60.0)
+        assert body["status"] == "completed", body
+        tags = server.vault.db.run_task(read_tags)
+    finally:
+        server.vault.db.set_tag_exclusions(frozenset())
+    assert tags == {"a.jpg": ["portrait"], "b.jpg": []}
+
+
 def test_a_folder_tag_survives_the_tagger_reaching_the_picture(owner_env):
     """The commit runs while the tagger is still draining the import.
 

@@ -8,7 +8,7 @@ from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, Session, create_engine, select
 
 from pixlstash.db_models.picture import Picture
-from pixlstash.db_models.tag import Tag
+from pixlstash.db_models.tag import TAG_PENDING_SENTINEL, Tag
 from pixlstash.db_models.tag_prediction import TagPrediction
 from pixlstash.inference.workflows.tagging import TaggingWorkflow
 from pixlstash.resources.arbiter import ResourceArbiter
@@ -134,6 +134,74 @@ def test_add_tags_bulk_honours_human_labels(tmp_path):
         )
         # 'watermark' is kept (human POS), 'blurry' is dropped (human NEG).
         assert saved_tags == {"woman", "watermark"}
+
+
+def test_add_tags_bulk_never_writes_a_tag_removed_from_tagging(tmp_path):
+    """A tag the user removed from tagging is not written, even when the model
+    emits it or a human once confirmed it; a picture left with nothing still
+    loses its retag sentinel, so it is not tagged again forever."""
+    engine = _make_engine(tmp_path)
+
+    with Session(engine) as session:
+        mixed = Picture(file_path="mixed.jpg")
+        only_removed = Picture(file_path="only-removed.jpg")
+        session.add_all([mixed, only_removed])
+        session.commit()
+        session.add_all(
+            [
+                Tag(picture_id=mixed.id, tag=TAG_PENDING_SENTINEL),
+                Tag(picture_id=only_removed.id, tag=TAG_PENDING_SENTINEL),
+                TagPrediction(
+                    picture_id=mixed.id,
+                    tag="malformed teeth",
+                    confidence=1.0,
+                    model_version="manual",
+                    status="CONFIRMED",
+                    label_state="POS",
+                    label_source="human",
+                ),
+            ]
+        )
+        session.commit()
+        session.info["tag_exclusions"] = frozenset({"flux chin", "malformed teeth"})
+
+        updated_ids = TagTask._add_tags_bulk(
+            session,
+            [
+                {"pic_id": mixed.id, "tags": ["Flux Chin", "portrait"]},
+                {"pic_id": only_removed.id, "tags": ["flux chin"]},
+            ],
+        )
+
+        assert set(updated_ids) == {mixed.id, only_removed.id}
+        rows = session.exec(select(Tag.picture_id, Tag.tag)).all()
+        assert set(rows) == {(mixed.id, "portrait")}
+
+
+def test_predictions_never_record_a_tag_removed_from_tagging(tmp_path):
+    """Neither a scored tag nor the applied-tag fallback row is recorded for a
+    removed tag, and it does not count towards the picture's uncertainty."""
+    engine = _make_engine(tmp_path)
+
+    with Session(engine) as session:
+        picture = Picture(file_path="p.jpg")
+        session.add(picture)
+        session.commit()
+        session.info["tag_exclusions"] = frozenset({"flux chin", "malformed teeth"})
+
+        TagTask._write_predictions_from_tags(
+            session,
+            {picture.id: {"flux chin": 0.55, "portrait": 0.9}},
+            {picture.id: {"flux chin", "portrait", "malformed teeth"}},
+            "test-v1",
+        )
+
+        rows = session.exec(
+            select(TagPrediction.tag).where(TagPrediction.picture_id == picture.id)
+        ).all()
+        assert set(rows) == {"portrait"}
+        session.refresh(picture)
+        assert picture.tag_uncertainty == pytest.approx(0.1)
 
 
 # --- Unprocessable-registry gating (PR #750 review blockers) -----------------
@@ -270,10 +338,13 @@ class _PredictionDb:
         self.prediction_calls = []
         self.tag_payloads = []
         self.cleared_sentinels = []
+        self.tag_exclusions = frozenset()
+        self.face_fetches = 0
 
     def run_immediate_read_task(self, fn, *args, **kwargs):
         # Only `_fetch_faces_for_pictures` comes through here: no faces, so
         # every picture takes the centre-crop fallback.
+        self.face_fetches += 1
         return {}
 
     def run_task(self, fn, *args, priority=None):
@@ -421,6 +492,37 @@ def test_a_crop_never_deletes_another_models_tags(tmp_path):
         "the crop pass deleted a tag the plugin emitted, leaving the plugin's "
         "own prediction row with nothing to confirm it"
     )
+
+
+def test_the_crop_pass_is_skipped_when_every_crop_tag_is_removed(tmp_path):
+    """With every tag a quality crop can own removed from tagging, the crop
+    pass would produce nothing that is kept: no face lookup, no crop model."""
+    path = _png(tmp_path, "no-crop.png")
+    db = _PredictionDb(str(tmp_path), [1])
+    db.tag_exclusions = frozenset(QUALITY_CROP_TAG_WHITELIST)
+    workflow = _PluginWorkflow()
+
+    _prediction_task(
+        db, workflow, [Picture(id=1, file_path=str(path))]
+    )._tag_pictures_batch()
+
+    assert workflow.crop_scores_requested is None
+    assert db.face_fetches == 0
+
+
+def test_removing_one_crop_tag_keeps_the_crop_pass(tmp_path):
+    """The other crop tags are still wanted, so the crop pass still runs."""
+    path = _png(tmp_path, "crop.png")
+    db = _PredictionDb(str(tmp_path), [1])
+    db.tag_exclusions = frozenset({"blocky"})
+    workflow = _PluginWorkflow()
+
+    _prediction_task(
+        db, workflow, [Picture(id=1, file_path=str(path))]
+    )._tag_pictures_batch()
+
+    assert workflow.crop_scores_requested is not None
+    assert db.face_fetches == 1
 
 
 class _FakeFace:

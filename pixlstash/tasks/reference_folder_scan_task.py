@@ -57,6 +57,11 @@ from pixlstash.services.move_reconciliation_service import record_pending_review
 from pixlstash.utils.library_layout import DEFAULT_LAYOUT, parse_layout
 from pixlstash.utils.reference_folder_watcher import ROOT_INTERNAL_DIRS
 from pixlstash.utils.path_utils import path_is_within
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    is_excluded,
+    session_tag_exclusions,
+)
 from pixlstash.utils.service.smart_score_invalidation import (
     invalidate_on_anomaly_change,
 )
@@ -976,6 +981,8 @@ class ReferenceFolderScanTask(BaseTask):
                     for u in updates
                     if "new_tags" in u and u["pic_id"] not in locked
                 ]
+                exclusions = session_tag_exclusions(session)
+                left_out = 0
                 with invalidate_on_anomaly_change(
                     session, retagged, context="sidecar tag sync"
                 ):
@@ -1002,18 +1009,28 @@ class ReferenceFolderScanTask(BaseTask):
                             session.exec(
                                 delete(Tag).where(Tag.picture_id == u["pic_id"])
                             )
-                            tags = u["new_tags"]
+                            # A tag the owner removed from tagging is left
+                            # out; a sidecar naming only such tags still
+                            # tagged the picture, so it gets no sentinel.
+                            tags = filter_tag_names(u["new_tags"], exclusions)
+                            left_out += len(u["new_tags"]) - len(tags)
                             if tags:
                                 session.add_all(
                                     [Tag(picture_id=u["pic_id"], tag=t) for t in tags]
                                 )
-                            else:
+                            elif not u["new_tags"]:
                                 session.add(
                                     Tag(
                                         picture_id=u["pic_id"], tag=TAG_PENDING_SENTINEL
                                     )
                                 )
                     session.flush()
+                if left_out:
+                    logger.debug(
+                        "Reference-folder sync: left out %d sidecar tag(s) "
+                        "removed from tagging.",
+                        left_out,
+                    )
                 session.commit()
                 self._db.tag_resets.mark_reset(retagged)
 
@@ -1092,9 +1109,16 @@ class ReferenceFolderScanTask(BaseTask):
                 .join(Picture, Tag.picture_id == Picture.id)
                 .where(owner)
             ).all()
+            # A tag the owner removed from tagging is not exported, though a
+            # picture may still carry it (a locked picture keeps it).
+            exclusions = session_tag_exclusions(session)
             out: dict[int, list[str]] = {}
             for pic_id, tag in rows:
-                if tag and not is_tag_sentinel(tag):
+                if (
+                    tag
+                    and not is_tag_sentinel(tag)
+                    and not is_excluded(tag, exclusions)
+                ):
                     out.setdefault(pic_id, []).append(tag)
             return out
 
@@ -1446,15 +1470,18 @@ class ReferenceFolderScanTask(BaseTask):
             for pic in pictures_batch:
                 session.refresh(pic)
 
+            exclusions = session_tag_exclusions(session)
             sidecar_tags_to_add = []
             sentinel_tags_to_add = []
             imported_ids: list[int] = []
             for pic in pictures_batch:
                 if pic.id is not None:
                     imported_ids.append(int(pic.id))
+                # A sidecar naming only tags the owner removed from tagging
+                # still tagged the picture, so it gets no sentinel either.
                 sidecar_tags = getattr(pic, "_sidecar_tags", None)
                 if sidecar_tags and pic.id is not None:
-                    for tag_str in sidecar_tags:
+                    for tag_str in filter_tag_names(sidecar_tags, exclusions):
                         sidecar_tags_to_add.append(Tag(picture_id=pic.id, tag=tag_str))
                 elif pic.id is not None:
                     sentinel_tags_to_add.append(

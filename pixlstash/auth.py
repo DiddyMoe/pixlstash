@@ -353,6 +353,8 @@ READ_BLOCKED_GET_PATHS: frozenset[str] = frozenset(
         "/api/v1/tag_predictions/labels",
         "/api/v1/telemetry/install-id",
         "/api/v1/users/me/auth",
+        # The owner's removed tags and the cleanup of this library.
+        "/api/v1/users/me/penalised-tags/cleanup",
         "/api/v1/users/me/shared-resource-ids",
         "/api/v1/users/me/token",
         "/api/v1/workflows",

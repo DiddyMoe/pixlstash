@@ -2,7 +2,13 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 vi.mock("../utils/apiClient", () => ({
   API_BASE_URL: "/api/v1",
-  apiClient: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
+  apiClient: {
+    get: vi.fn(),
+    post: vi.fn(),
+    put: vi.fn(),
+    patch: vi.fn(),
+    delete: vi.fn(),
+  },
 }));
 
 import { apiClient } from "../utils/apiClient";
@@ -15,11 +21,16 @@ import {
   deleteToken,
   uploadWatermark,
   deleteWatermark,
+  putPenalisedTag,
+  deletePenalisedTag,
+  getPenalisedTagCleanup,
+  startPenalisedTagCleanup,
 } from "./users";
 
 beforeEach(() => {
   apiClient.get.mockReset();
   apiClient.post.mockReset();
+  apiClient.put.mockReset();
   apiClient.patch.mockReset();
   apiClient.delete.mockReset();
 });
@@ -101,5 +112,58 @@ describe("api/users", () => {
     apiClient.delete.mockResolvedValue({ data: {} });
     await deleteWatermark();
     expect(apiClient.delete).toHaveBeenCalledWith("/users/me/watermark");
+  });
+
+  // A tag name is a path segment here, so a space or a slash in it must be
+  // escaped or the request names a different tag.
+  it("putPenalisedTag sends the weight for one escaped tag", async () => {
+    const body = {
+      smart_score_penalised_tags: { "flux chin": 3 },
+      excluded: [],
+      cleanup: null,
+    };
+    apiClient.put.mockResolvedValue({ data: body });
+    const result = await putPenalisedTag("flux chin", 3);
+    expect(apiClient.put).toHaveBeenCalledWith(
+      "/users/me/penalised-tags/flux%20chin",
+      { weight: 3 },
+    );
+    expect(result).toEqual(body);
+  });
+
+  it("deletePenalisedTag removes one escaped tag", async () => {
+    const body = {
+      smart_score_penalised_tags: {},
+      excluded: ["flux chin"],
+      cleanup: { id: "test-job", names: ["flux chin"], state: "queued" },
+    };
+    apiClient.delete.mockResolvedValue({ data: body });
+    const result = await deletePenalisedTag("flux/chin");
+    expect(apiClient.delete).toHaveBeenCalledWith(
+      "/users/me/penalised-tags/flux%2Fchin",
+    );
+    expect(result).toEqual(body);
+  });
+
+  it("getPenalisedTagCleanup reads the cleanup status", async () => {
+    const body = { excluded: ["flux chin"], state: "idle", jobs: [] };
+    apiClient.get.mockResolvedValue({ data: body });
+    const result = await getPenalisedTagCleanup();
+    expect(apiClient.get).toHaveBeenCalledWith(
+      "/users/me/penalised-tags/cleanup",
+    );
+    expect(result).toEqual(body);
+  });
+
+  // No names means every removed tag, which is what a retry wants.
+  it("startPenalisedTagCleanup asks for every removed tag", async () => {
+    const body = { cleanup: { id: "test-job", state: "queued" } };
+    apiClient.post.mockResolvedValue({ data: body });
+    const result = await startPenalisedTagCleanup();
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/users/me/penalised-tags/cleanup",
+      {},
+    );
+    expect(result).toEqual(body);
   });
 });

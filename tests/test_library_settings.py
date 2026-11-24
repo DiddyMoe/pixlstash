@@ -10,6 +10,8 @@ The API surface is unchanged, so the tests assert the seam is invisible from
 outside: one flat config object, two databases behind it.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -322,6 +324,33 @@ class TestTheSettingsFingerprint:
             compute_settings_fingerprint(salt, {"a": 1.5})
         )
 
+    def test_removing_a_tag_from_tagging_changes_the_hash(self, server):
+        """A removed tag stops counting, so the cached scores are stale too."""
+        from pixlstash.services.library_settings_service import (
+            compute_settings_fingerprint,
+        )
+
+        salt = "a-salt"
+        weights = {"flux chin": 1.0, "waxy skin": 0.5}
+        assert compute_settings_fingerprint(salt, weights) != (
+            compute_settings_fingerprint(salt, weights, frozenset({"flux chin"}))
+        )
+
+    def test_nothing_removed_keeps_the_hash_libraries_already_store(self, server):
+        """Otherwise every library would re-score in full on its next open."""
+        from pixlstash.services.library_settings_service import (
+            compute_settings_fingerprint,
+        )
+
+        salt = "a-salt"
+        stored_before = hmac.new(
+            salt.encode("utf-8"), b'{"a":1.0,"b":0.5}', hashlib.sha256
+        ).hexdigest()
+        assert (
+            compute_settings_fingerprint(salt, {"b": 0.5, "a": 1.0}, frozenset())
+            == stored_before
+        )
+
 
 class TestCatchingUpADormantLibrary:
     def test_a_weights_change_while_closed_invalidates_on_open(self, server):
@@ -417,6 +446,29 @@ class TestCatchingUpADormantLibrary:
             lambda session: session.get(Picture, picture_id).smart_score
         )
         assert score is None, "an emptied table must not hash like the defaults"
+
+    def test_a_tag_removed_while_closed_invalidates_on_open(self, server):
+        """Opening a library reconciles against the tags removed from tagging too."""
+        server.reconcile_library_settings(server.vault)
+
+        def _add(session: Session):
+            picture = Picture(file_path="/tmp/removed-tag.png", smart_score=2.2)
+            session.add(picture)
+            session.commit()
+            session.refresh(picture)
+            return picture.id
+
+        picture_id = server.vault.db.run_task(_add)
+        try:
+            server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+            server.reconcile_library_settings(server.vault)
+            score = server.vault.db.run_immediate_read_task(
+                lambda session: session.get(Picture, picture_id).smart_score
+            )
+            assert score is None, "removing a tag should have cleared the score"
+        finally:
+            server.vault.db.set_tag_exclusions(frozenset())
+            server.reconcile_library_settings(server.vault)
 
     def test_the_first_ever_reconcile_invalidates_nothing(self, server):
         """A library that has never recorded one has nothing to repair."""

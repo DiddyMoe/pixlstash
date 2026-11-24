@@ -32,6 +32,7 @@ Covers the three things the design rests on:
 """
 
 import asyncio
+import contextlib
 import gc
 import io
 import json
@@ -1470,6 +1471,60 @@ def test_undo_refuses_to_write_a_picture_frozen_by_a_locked_set(client, server):
     assert _operations(server)[0]["status"] == "applied"
 
 
+@contextlib.contextmanager
+def _removed_from_tagging(server, *names):
+    """Run the block with *names* removed from tagging, as the X in Smart Score does."""
+    server.vault.db.set_tag_exclusions(frozenset(names))
+    try:
+        yield
+    finally:
+        server.vault.db.set_tag_exclusions(frozenset())
+
+
+def test_undo_and_redo_never_put_back_a_tag_removed_from_tagging(client, server):
+    """A history step that would re-add a removed tag is refused whole.
+
+    The log stores the exact prior state, so applying part of it would leave a
+    step marked undone that was not. The refusal names the tag and leaves the
+    pictures and the step's status as they were; an unrelated step still undoes.
+    """
+    removed = _upload(client)
+    redone = _upload(client)
+    unrelated = _upload(client)
+    client.post(f"{API}/pictures/{removed}/tags", json={"tag": "Test Gone"})
+    client.post(f"{API}/pictures/{removed}/tags/remove_all", json={"tag": "Test Gone"})
+    removal = _operations(server)[0]
+    client.post(f"{API}/pictures/{redone}/tags", json={"tag": "test gone"})
+    assert client.post(f"{API}/operations/undo").status_code == 200
+    addition = _operations(server, status="undone")[0]
+    assert _tags(server, removed) == [] and _tags(server, redone) == []
+
+    with _removed_from_tagging(server, "test gone"):
+        redo = client.post(f"{API}/operations/redo")
+        assert redo.status_code == 409, redo.text
+        assert "test gone" in redo.json()["detail"]
+        assert "removed from tagging" in redo.json()["detail"]
+        assert _tags(server, redone) == []
+        assert client.get(f"{API}/operations/{addition['id']}").json()["status"] == (
+            "undone"
+        )
+
+        undo = client.post(f"{API}/operations/undo")
+        assert undo.status_code == 409, undo.text
+        assert "removed from tagging" in undo.json()["detail"]
+        assert _tags(server, removed) == []
+        assert client.get(f"{API}/operations/{removal['id']}").json()["status"] == (
+            "applied"
+        )
+
+        client.post(f"{API}/pictures/{unrelated}/tags", json={"tag": "sunset"})
+        client.post(
+            f"{API}/pictures/{unrelated}/tags/remove_all", json={"tag": "sunset"}
+        )
+        assert client.post(f"{API}/operations/undo").status_code == 200
+        assert _tags(server, unrelated) == ["sunset"]
+
+
 # ---------------------------------------------------------------------------
 # Scrapheap lifecycle (soft delete / restore)
 # ---------------------------------------------------------------------------
@@ -1946,6 +2001,27 @@ def test_reject_of_a_hand_added_tag_round_trips_the_synthetic_manual_row(
     assert rebuilt["model_version"] == "manual"
     assert rebuilt["status"] == "REJECTED"
     assert rebuilt["label_state"] == "NEG"
+
+
+def test_redo_never_rebuilds_a_label_row_for_a_tag_removed_from_tagging(client, server):
+    """A label on a removed tag is data about it, and is not written back either."""
+    picture_id = _upload(client)
+    client.post(f"{API}/pictures/{picture_id}/tags", json={"tag": "test-gone label"})
+    resp = client.post(
+        f"{API}/pictures/{picture_id}/tag_predictions/test-gone label/reject"
+    )
+    assert resp.status_code == 200, resp.text
+    assert client.post(f"{API}/operations/undo").status_code == 200
+    assert _prediction(server, picture_id, "test-gone label") is None
+
+    with _removed_from_tagging(server, "test-gone label"):
+        redo = client.post(f"{API}/operations/redo")
+        assert redo.status_code == 409, redo.text
+        assert "removed from tagging" in redo.json()["detail"]
+        assert _prediction(server, picture_id, "test-gone label") is None
+        assert _operations(server, status="undone")[0]["op_type"] == (
+            "pictures.tags.reject"
+        )
 
 
 def test_confirm_is_recorded_and_undo_removes_the_tag_row_it_created(client, server):

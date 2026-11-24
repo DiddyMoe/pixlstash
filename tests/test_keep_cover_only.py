@@ -282,6 +282,34 @@ def test_hand_made_stack_is_unioned_onto_the_cover_before_anything_is_deleted():
         _teardown(temp_dir, server)
 
 
+def test_a_tag_removed_from_tagging_is_not_carried_onto_the_cover():
+    """The preview and the union agree: a removed tag on a copy is no gain."""
+    temp_dir, client, server = _env()
+    try:
+        removed, removed_pics = _make_stack(
+            server, [{"tags": ["cover_only"]}, {"tags": ["Flux Chin"]}]
+        )
+        kept, kept_pics = _make_stack(
+            server, [{"tags": ["cover_only"]}, {"tags": ["copy_only"]}]
+        )
+        server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+        selection = {"stack_ids": [removed, kept]}
+
+        preview = client.post(PREVIEW_URL, json=selection)
+        assert preview.status_code == 200, preview.text
+        rows = _rows_by_stack(preview.json())
+        assert (rows[removed]["cover_gains_tags"], rows[kept]["cover_gains_tags"]) == (
+            False,
+            True,
+        )
+        applied = client.post(COLLAPSE_URL, json=selection)
+        assert applied.status_code == 200, applied.text
+        assert _tags_of(server, removed_pics[0]) == {"cover_only"}
+        assert _tags_of(server, kept_pics[0]) == {"cover_only", "copy_only"}
+    finally:
+        _teardown(temp_dir, server)
+
+
 def test_survivor_keeps_its_stack_and_one_undo_restores_the_stack():
     """Acceptance criterion 6: nothing is dissolved and undo is a flag flip.
 

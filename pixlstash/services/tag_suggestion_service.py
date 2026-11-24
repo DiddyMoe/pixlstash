@@ -33,6 +33,13 @@ from pixlstash.services.set_lock_service import (
     locked_picture_id_subquery,
     locked_picture_ids,
 )
+from pixlstash.utils.quality.tag_exclusion import (
+    TagExcludedError,
+    excluded_spellings,
+    is_excluded,
+    normalise_tag,
+    session_tag_exclusions,
+)
 from pixlstash.utils.service.filter_helpers import (
     fetch_tag_review_scope_picture_ids,
 )
@@ -125,6 +132,8 @@ def list_suggestions(
         source: Optional exact ``source`` filter (e.g. ``"near_neighbor"`` or
             ``"impossible_tag"``), so the two review tabs stay isolated.
 
+    Suggestions for a tag the owner removed from tagging are never listed.
+
     Returns:
         List of TagSuggestion instances ordered by score descending, then twin_sim.
     """
@@ -152,6 +161,9 @@ def list_suggestions(
             q = q.where(TagSuggestion.source == source)
         if picture_ids is not None:
             q = q.where(TagSuggestion.picture_id.in_(picture_ids))
+        removed = excluded_spellings(session, TagSuggestion.tag)
+        if removed:
+            q = q.where(TagSuggestion.tag.notin_(removed))
         q = (
             q.order_by(
                 TagSuggestion.score.desc(),
@@ -431,8 +443,16 @@ def _reverse_review(session: Session, suggestion: TagSuggestion) -> None:
     left standing until that re-exposed row is itself reversed. (A row decided
     anew in the new review reverses that decision first and re-pends, leaving
     ``prior_*`` intact for a second reopen to peel.)
+
+    A decision about a tag the owner removed from tagging is not reversed:
+    reversing would put the tag back on a picture or re-queue it for review.
+
+    Raises:
+        TagExcludedError: ``suggestion.tag`` was removed from tagging.
     """
     tag_value = suggestion.tag
+    if is_excluded(tag_value, session_tag_exclusions(session)):
+        raise TagExcludedError(normalise_tag(tag_value))
     if suggestion.control_state is not None:
         # A control's verdict wrote no label (see accept/dismiss), so there is
         # nothing to reverse - and clearing the ledger here would destroy the
@@ -505,6 +525,7 @@ def reopen_suggestion(vault: "Vault", suggestion_id: int) -> dict:
 
     Raises:
         KeyError: If no suggestion with that id exists.
+        TagExcludedError: The suggestion's tag was removed from tagging.
     """
 
     def _reopen(session: Session) -> dict:
@@ -610,7 +631,13 @@ def _set_tag(
     default for a forward human decision), also writes the human POS/NEG to the label
     ledger - ``present`` ⇒ POS, absent ⇒ NEG - so accepting/resolving a suggestion is
     durable supervision. Undo paths pass ``record=False`` and clear the ledger instead.
+
+    Raises:
+        TagExcludedError: ``present`` asks for a tag the owner removed from
+            tagging. Removing such a tag is allowed.
     """
+    if present and is_excluded(tag_value, session_tag_exclusions(session)):
+        raise TagExcludedError(normalise_tag(tag_value))
     existing = session.exec(
         select(Tag).where(Tag.picture_id == picture_id, Tag.tag == tag_value)
     ).first()
@@ -674,7 +701,8 @@ def bulk_accept(
     *because* the model is noisy, so a confident tagger alone is never enough to auto-edit
     a label. ``dry_run`` applies nothing and instead returns a ``sample`` of the *least
     tagger-confident* would-be resolutions (the riskiest of the agreed set, to
-    spot-check). Returns ``{"count", "sample", "accepted_ids", "picture_ids"}``.
+    spot-check). Returns ``{"count", "sample", "accepted_ids", "picture_ids",
+    "skipped_locked", "skipped_excluded"}``.
 
     ``picture_ids`` optionally restricts the set of suspects considered (by
     ``TagSuggestion.picture_id``, never the twin): when not ``None`` only suspects
@@ -685,6 +713,10 @@ def bulk_accept(
     ``review_id`` optionally restricts to one review session's rows
     (``TagSuggestion.review_id``), so a review's "N obvious pairs -
     auto-resolve?" receipt and its apply act on exactly that review's queue.
+
+    A pair that would be resolved by tagging a picture with a tag the owner
+    removed from tagging is left alone and its suspect listed in
+    ``skipped_excluded`` (dry run and apply alike, so their counts agree).
     """
 
     def _bulk(session: Session) -> dict:
@@ -711,6 +743,8 @@ def bulk_accept(
         # counts agree.
         locked = locked_picture_ids(session, sorted(ids))
         skipped_locked: set[int] = set()
+        tag_removed = is_excluded(tag, session_tag_exclusions(session))
+        skipped_excluded: set[int] = set()
 
         chosen: list[tuple[TagSuggestion, str, float]] = []
         for r in rows:
@@ -740,6 +774,9 @@ def bulk_accept(
                 continue
             if r.score is None or r.score < min_combined:
                 continue
+            if tag_removed and corner == "both":
+                skipped_excluded.add(r.picture_id)
+                continue
             chosen.append((r, corner, confidence))
 
         if dry_run:
@@ -764,6 +801,7 @@ def bulk_accept(
                 "accepted_ids": [],
                 "picture_ids": [],
                 "skipped_locked": sorted(skipped_locked),
+                "skipped_excluded": sorted(skipped_excluded),
             }
 
         accepted_ids: list[int] = []
@@ -781,6 +819,7 @@ def bulk_accept(
             "accepted_ids": accepted_ids,
             "picture_ids": sorted(pic_ids),
             "skipped_locked": sorted(skipped_locked),
+            "skipped_excluded": sorted(skipped_excluded),
         }
 
     # dry_run performs no writes (it returns before any session.commit above), so
@@ -802,6 +841,9 @@ def bulk_reopen(vault: "Vault", ids: list[int], review_id: int | None = None) ->
     With ``review_id`` set and ``ids`` empty, ALL of that review's decided rows
     are reopened (the "Undo N changes" abort flow). SKIPPED rows are always
     left as-is in review-scoped mode - they made no changes to undo.
+
+    A row for a tag the owner removed from tagging is left as it is and its
+    suspect listed in ``skipped_excluded`` (see :func:`_reverse_review`).
     """
 
     def _bulk(session: Session) -> dict:
@@ -817,6 +859,8 @@ def bulk_reopen(vault: "Vault", ids: list[int], review_id: int | None = None) ->
             )
         pic_ids: set[int] = set()
         skipped_locked: set[int] = set()
+        exclusions = session_tag_exclusions(session)
+        skipped_excluded: set[int] = set()
         count = 0
         for sid in target_ids:
             suggestion = session.get(TagSuggestion, sid)
@@ -825,6 +869,9 @@ def bulk_reopen(vault: "Vault", ids: list[int], review_id: int | None = None) ->
             if review_id is not None and suggestion.review_id != review_id:
                 continue
             if review_id is not None and suggestion.status == "SKIPPED":
+                continue
+            if is_excluded(suggestion.tag, exclusions):
+                skipped_excluded.add(suggestion.picture_id)
                 continue
             # A batch undo skips rows whose suspect or twin is frozen by a locked
             # set (reversing would re-add/delete Tag rows on frozen data), rather
@@ -845,6 +892,7 @@ def bulk_reopen(vault: "Vault", ids: list[int], review_id: int | None = None) ->
             "count": count,
             "picture_ids": sorted(pic_ids),
             "skipped_locked": sorted(skipped_locked),
+            "skipped_excluded": sorted(skipped_excluded),
         }
 
     return vault.db.run_task(_bulk)

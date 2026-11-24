@@ -43,6 +43,9 @@ TARGET_PICTURE = "picture"
 # targets no picture: its before/after payload is the tag -> group map it moved,
 # and a post-restore hook writes that map back. ``target_ids`` is empty.
 TARGET_TAG_GROUP = "tag_group"
+# The cleanup after the owner removes a tag from tagging. Its after payload is the
+# names and the counts; it is a receipt, never undoable. ``target_ids`` is empty.
+TARGET_TAG_EXCLUSION = "tag_exclusion"
 
 
 class Operation(SQLModel, table=True):

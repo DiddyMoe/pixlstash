@@ -111,6 +111,10 @@ Rationale column is empty where it equals the policy-meaning table above (e.g. `
 | GET | `/api/v1/users/me/config` | owner_only |  | Owner config; READ_BLOCKED_GET_PATHS blocks READ tokens; only owner reaches |
 | PATCH | `/api/v1/users/me/config` | owner_only |  | require_unscoped_owner; owner config write. Refuses `ai_toolkit_repo_path`, `ai_toolkit_python` and `ai_toolkit_commit` with 422 naming the PUT below |
 | GET | `/api/v1/users/me/penalised-tags` | any_token |  |  |
+| GET | `/api/v1/users/me/penalised-tags/cleanup` | owner_only |  | The owner's removed tags and how many of this library's pictures still carry one; on READ_BLOCKED_GET_PATHS, only the owner reaches it |
+| POST | `/api/v1/users/me/penalised-tags/cleanup` | owner_only |  | Starts a job removing removed tags from this library's pictures; POST blocked for READ tokens; owner only |
+| PUT | `/api/v1/users/me/penalised-tags/{tag:path}` | owner_only |  | Owner config write (one penalised tag's weight); lets a removed tag back into tagging |
+| DELETE | `/api/v1/users/me/penalised-tags/{tag:path}` | owner_only |  | Owner config write that removes the tag from tagging in every library and starts the cleanup of this library's pictures; owner only |
 | POST | `/api/v1/users/me/shared-picture-ids/batch` | owner_only |  | POST not in READ_SAFE; READ tokens blocked; owner only |
 | GET | `/api/v1/users/me/shared-resource-ids` | owner_only | auth.py:1314 | get_shared_resource_ids rejects token_scope is not None; scoped/READ 403'd; owner only |
 | GET | `/api/v1/users/me/token` | owner_only | auth.py:1178 | list_tokens rejects token_scope is not None; scoped/READ 403'd; owner only |

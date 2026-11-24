@@ -29,6 +29,8 @@ module calls it and adds the three the design requires on top:
   Sentinel tags (``__tag``, ``__tag:<engine>``) are pipeline markers, not user
   metadata, so they are deliberately excluded: copying a "needs retagging"
   marker onto a picture that was already tagged would re-queue it for no reason.
+  A tag the owner removed from tagging is not copied either: it stays on the
+  member that carries it, and no other member gains it.
 * **score** - every member is lifted to ``max(score)``. Only lifted: a union
   never lowers a rating the user set.
 * **characters** - a real face-to-character union is not expressible without
@@ -107,6 +109,7 @@ from pixlstash.db_models.tag import Tag, is_tag_sentinel
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import operation_log_service
+from pixlstash.utils.quality.tag_exclusion import is_excluded, session_tag_exclusions
 from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK as ID_CHUNK
 from pixlstash.services.dedup_tier_service import (
     DedupScope,
@@ -400,10 +403,12 @@ def apply_metadata_union_in_session(
     tag_rows = session.exec(
         select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(picture_ids))
     ).all()
+    # A tag removed from tagging stays where it is but is never copied.
+    exclusions = session_tag_exclusions(session)
     tags_by_picture: dict[int, set[str]] = {pid: set() for pid in picture_ids}
     union: set[str] = set()
     for picture_id, tag in tag_rows:
-        if is_tag_sentinel(tag):
+        if is_tag_sentinel(tag) or is_excluded(tag, exclusions):
             continue
         tags_by_picture.setdefault(int(picture_id), set()).add(str(tag))
         union.add(str(tag))
@@ -725,11 +730,14 @@ def _dry_run_summary_in_session(
             if not deleted:
                 members_by_stack[int(stack_id)].append(int(picture_id))
 
+    # Mirrors the union: a tag removed from tagging is never copied, so a cover
+    # does not "gain" it.
+    exclusions = session_tag_exclusions(session)
     tags_by_picture: dict[int, set[str]] = defaultdict(set)
     for picture_id, tag in session.exec(
         select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(picture_scope))
     ).all():
-        if not is_tag_sentinel(tag):
+        if not is_tag_sentinel(tag) and not is_excluded(tag, exclusions):
             tags_by_picture[int(picture_id)].add(str(tag))
 
     # Accumulated DISTINCT, not summed per group: two groups can each name a

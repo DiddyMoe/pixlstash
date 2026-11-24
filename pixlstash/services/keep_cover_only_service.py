@@ -108,6 +108,7 @@ from pixlstash.services.workflow_ghost_service import (
     GHOST_RETENTION_ON,
 )
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.quality.tag_exclusion import is_excluded, session_tag_exclusions
 from pixlstash.utils.sql_chunking import chunked
 from pixlstash.stacking import normalize_stack_positions
 
@@ -507,18 +508,19 @@ def _live_members_by_stack(
 def _tags_by_picture(session: Session, picture_ids: list[int]) -> dict[int, set[str]]:
     """Real (non-sentinel) tags per picture, in one query.
 
-    Sentinels are dropped for the same reason
+    Sentinels and tags removed from tagging are dropped for the same reason
     :func:`~pixlstash.services.dedup_verdict_service.apply_metadata_union_in_session`
-    drops them: they are bookkeeping rows, not metadata, so a cover "gaining"
-    one would be a figure the union never produces.
+    drops them: the union never copies either, so a cover "gaining" one would
+    be a figure the union never produces.
     """
     tags: dict[int, set[str]] = {pid: set() for pid in picture_ids}
     if not picture_ids:
         return tags
+    exclusions = session_tag_exclusions(session)
     for picture_id, tag in session.exec(
         select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(picture_ids))
     ).all():
-        if is_tag_sentinel(tag):
+        if is_tag_sentinel(tag) or is_excluded(tag, exclusions):
             continue
         tags.setdefault(int(picture_id), set()).add(str(tag))
     return tags

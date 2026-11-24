@@ -128,6 +128,8 @@ class BulkResultResponse(BaseModel):
     # Picture ids skipped because a locked set freezes their labels (bulk
     # accept/reopen skip locked suspects/twins rather than 423-ing the batch).
     skipped_locked: list[int] = []
+    # Suspect picture ids left alone because the tag was removed from tagging.
+    skipped_excluded: list[int] = []
 
 
 def _notify_changed(server, picture_ids, origin_client_id: str | None = None) -> None:
@@ -296,7 +298,8 @@ def create_router(server) -> APIRouter:
             "(``add`` / ``remove``), and ``status`` (default ``PENDING``). Optionally "
             "narrow the queue to a ``project_id``, ``set_id``, and/or ``character_id`` "
             "(numeric id, or the literal ``UNASSIGNED``); these AND together and match "
-            "the suspect picture only."
+            "the suspect picture only. Suggestions for a tag removed from tagging "
+            "are left out."
         ),
         response_model=list[TagSuggestionItemResponse],
     )
@@ -359,7 +362,8 @@ def create_router(server) -> APIRouter:
         summary="Accept a tag-fix suggestion",
         description=(
             "Applies the fix to the Tag table (remove → deletes the tag, add → creates "
-            "it), marks the suggestion ACCEPTED, and emits a CHANGED_TAGS event."
+            "it), marks the suggestion ACCEPTED, and emits a CHANGED_TAGS event. 409 "
+            "when it would add a tag removed from tagging."
         ),
         response_model=ReviewSuggestionResponse,
     )
@@ -393,7 +397,8 @@ def create_router(server) -> APIRouter:
         summary="Reopen (undo) a reviewed suggestion",
         description=(
             "Sets the suggestion back to PENDING and reverses any label change it made "
-            "(re-adds a removed tag / removes an added tag). Emits a CHANGED_TAGS event."
+            "(re-adds a removed tag / removes an added tag). Emits a CHANGED_TAGS event. "
+            "409 when the tag was removed from tagging."
         ),
         response_model=ReviewSuggestionResponse,
     )
@@ -420,7 +425,8 @@ def create_router(server) -> APIRouter:
             "Keeps the suspect's label and flips the near-twin to match it: for a "
             "'remove' suggestion the untagged twin gets the tag (it has the anomaly "
             "too); for an 'add' suggestion the tagged twin loses it. Marks the "
-            "suggestion TWIN_FIXED (undoable via reopen)."
+            "suggestion TWIN_FIXED (undoable via reopen). 409 when it would add a tag "
+            "removed from tagging."
         ),
         response_model=ReviewSuggestionResponse,
     )
@@ -443,7 +449,7 @@ def create_router(server) -> APIRouter:
         description=(
             "The tagged image is actually clean and the untagged twin actually has the "
             "tag - untag the former and tag the latter. Marks the suggestion SWAPPED "
-            "(undoable via reopen)."
+            "(undoable via reopen). 409 when the tag was removed from tagging."
         ),
         response_model=ReviewSuggestionResponse,
     )
@@ -467,7 +473,8 @@ def create_router(server) -> APIRouter:
         summary="Scan a tag for near-neighbour label disagreements",
         description=(
             "Runs the near-neighbour scan for the tag and rebuilds its PENDING "
-            "suggestions (reviewed rows are kept). Synchronous - fast on a typical vault."
+            "suggestions (reviewed rows are kept). Synchronous - fast on a typical vault. "
+            "409 for a tag removed from tagging."
         ),
         response_model=ScanResultResponse,
     )
@@ -489,7 +496,9 @@ def create_router(server) -> APIRouter:
             "what would be resolved. Optionally narrow to a ``project_id``, ``set_id``, "
             "and/or ``character_id`` (numeric id, or the literal ``UNASSIGNED``); these "
             "AND together, match the suspect picture only, and bind both the dry-run "
-            "count and the apply so out-of-scope suggestions are never bulk-resolved."
+            "count and the apply so out-of-scope suggestions are never bulk-resolved. "
+            "A pair that would add a tag removed from tagging is left alone and its "
+            "suspect listed in ``skipped_excluded``."
         ),
         response_model=BulkResultResponse,
     )
@@ -539,7 +548,11 @@ def create_router(server) -> APIRouter:
     @router.post(
         "/tag_suggestions/bulk-reopen",
         summary="Batch-undo a bulk accept",
-        description="Reopens the given suggestion ids and reverses their label changes.",
+        description=(
+            "Reopens the given suggestion ids and reverses their label changes. Rows "
+            "for a tag removed from tagging are left as they are and their suspects "
+            "listed in ``skipped_excluded``."
+        ),
         response_model=BulkResultResponse,
     )
     def bulk_reopen_tag_suggestions(payload: BulkReopenRequest, request: Request):

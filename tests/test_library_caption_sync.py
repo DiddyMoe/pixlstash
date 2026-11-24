@@ -188,6 +188,40 @@ def test_the_root_scan_reads_and_exports_sidecars_once_sync_is_on(env):
     )
 
 
+def test_a_scan_never_reads_in_a_tag_removed_from_tagging(env):
+    """A sidecar naming a tag the owner removed from tagging brings in the
+    rest, on first indexing and on a later edit. A sidecar naming only removed
+    tags leaves the picture untagged and not waiting for the tagger: the owner
+    did tag it."""
+    server = env["server"]
+    root = server.vault.image_root
+    _make_image(os.path.join(root, "removed", "mixed.png"), (90, 20, 30))
+    _make_image(os.path.join(root, "removed", "only.png"), (90, 50, 60))
+    _write(os.path.join(root, "removed", "mixed.txt"), "flux chin, cat")
+    _write(os.path.join(root, "removed", "only.txt"), "Flux_Chin, waxy skin")
+    _set_sync(server, sync_tags=False, sync_descriptions=False, tags_suffix=None)
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin", "waxy skin"}))
+    try:
+        _run_root_scan(server)
+        assert _picture(server, "removed/mixed.png")[3] == ["cat"]
+        assert _picture(server, "removed/only.png")[3] == []
+
+        _set_sync(server, sync_tags=True, tags_suffix=".txt")
+        _write(
+            os.path.join(root, "removed", "mixed.txt"),
+            "flux chin, cat, calm",
+            when=time.time() + 5,
+        )
+        _write(
+            os.path.join(root, "removed", "only.txt"), "flux chin", when=time.time() + 5
+        )
+        _run_root_scan(server)
+        assert _picture(server, "removed/mixed.png")[3] == ["calm", "cat"]
+        assert _picture(server, "removed/only.png")[3] == []
+    finally:
+        server.vault.db.set_tag_exclusions(frozenset())
+
+
 def test_an_edit_in_pixlstash_is_written_beside_the_managed_picture(env):
     """The write-back returned early for any picture without a reference
     folder. A managed picture follows the library's settings, a pending
@@ -229,6 +263,46 @@ def test_an_edit_in_pixlstash_is_written_beside_the_managed_picture(env):
     assert not os.path.exists(os.path.join(root, "writeback", "c_caption.txt")), (
         "a pending sentinel is not a description"
     )
+
+
+def test_a_tag_removed_from_tagging_is_never_written_out(env):
+    """A picture can still carry a tag the owner removed from tagging (a
+    locked picture keeps it). Neither the write-back after an edit nor the
+    scan's export puts it in a sidecar, and a picture carrying only such a tag
+    gets no sidecar. The picture's own tag list still shows it."""
+    server = env["server"]
+    root = server.vault.image_root
+    for name, color in (
+        ("edited", (3, 4, 5)),
+        ("only", (3, 4, 6)),
+        ("scan", (3, 4, 7)),
+    ):
+        _make_image(os.path.join(root, "removed-out", f"{name}.png"), color)
+    _set_sync(server, sync_tags=False, sync_descriptions=False, tags_suffix=None)
+    _run_root_scan(server)
+    edited_id = _picture(server, "removed-out/edited.png")[0]
+    only_id = _picture(server, "removed-out/only.png")[0]
+    scan_id = _picture(server, "removed-out/scan.png")[0]
+    _give(server, edited_id, "Flux Chin", "square")
+    _give(server, only_id, "flux chin")
+    _give(server, scan_id, "flux chin", "beach")
+
+    _set_sync(server, sync_tags=True, tags_suffix=".txt")
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+    try:
+        shown = sorted(t["tag"] for t in sync_picture_sidecar(server, edited_id))
+        sync_picture_sidecar(server, only_id)
+        _run_root_scan(server)
+    finally:
+        server.vault.db.set_tag_exclusions(frozenset())
+
+    assert shown == ["Flux Chin", "square"]
+    folder = os.path.join(root, "removed-out")
+    with open(os.path.join(folder, "edited.txt"), encoding="utf-8") as fh:
+        assert fh.read().strip() == "square"
+    assert not os.path.exists(os.path.join(folder, "only.txt"))
+    with open(os.path.join(folder, "scan.txt"), encoding="utf-8") as fh:
+        assert fh.read().strip() == "beach"
 
 
 def test_the_settings_route_reads_patches_and_refuses_bad_suffixes(env, monkeypatch):

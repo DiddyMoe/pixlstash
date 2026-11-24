@@ -189,7 +189,8 @@ def create_router(server) -> APIRouter:
             "exists in the Tag table.  Emits a CHANGED_PICTURES event and records "
             "an undoable ``pictures.tags.confirm`` operation, so undo reverses "
             "both the Tag row and the human-label ledger entry.  423 when a "
-            "locked picture set freezes the picture (nothing is recorded)."
+            "locked picture set freezes the picture, 409 when the tag was "
+            "removed from tagging (nothing is recorded in either case)."
         ),
         response_model=ConfirmTagPredictionResponse,
     )

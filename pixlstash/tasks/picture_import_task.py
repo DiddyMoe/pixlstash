@@ -25,6 +25,10 @@ from pixlstash.services.project_membership_service import (
 )
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    session_tag_exclusions,
+)
 
 
 logger = get_logger(__name__)
@@ -516,11 +520,15 @@ class PictureImportTask(BaseTask):
                 ):
                     session.add_all([pic for pic, _entry in pictures])
                     session.flush()
+                    exclusions = session_tag_exclusions(session)
+                    left_out = 0
                     for pic, entry in pictures:
                         # Apply sidecar caption tags when a caption in the
                         # picture's own folder has its basename stem; otherwise
                         # seed the pending sentinel so the tagger picks it up
-                        # (mirrors WatchFolderImportTask).
+                        # (mirrors WatchFolderImportTask). A sidecar naming
+                        # only tags the owner removed from tagging still
+                        # tagged the picture, so it gets no sentinel either.
                         tags = sidecar_tags_by_key.get(
                             (
                                 entry.get("sidecar_folder", ""),
@@ -528,12 +536,21 @@ class PictureImportTask(BaseTask):
                             )
                         )
                         if tags:
-                            for tag_str in tags:
+                            permitted = filter_tag_names(tags, exclusions)
+                            left_out += len(tags) - len(permitted)
+                            for tag_str in permitted:
                                 session.add(Tag(picture_id=pic.id, tag=tag_str))
                         else:
                             session.add(
                                 Tag(picture_id=pic.id, tag=TAG_PENDING_SENTINEL)
                             )
+                    if left_out:
+                        logger.debug(
+                            "PictureImportTask: left out %d sidecar tag(s) "
+                            "removed from tagging (staging_id=%s).",
+                            left_out,
+                            self._staging_id,
+                        )
                     # The flush assigned the ids. Read them before the commit
                     # so nothing after it can fail an insert that is already
                     # in the library.

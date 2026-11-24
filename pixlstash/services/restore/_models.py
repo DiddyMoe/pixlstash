@@ -98,6 +98,8 @@ class RestoreReport:
             their file/content was recorded in ``deleted_file_log`` (a
             permanent deletion that restore must never resurrect).
         upserted_count: Number of rows upserted (per-resource restores only).
+        skipped_excluded: Number of Tag rows left out because the owner removed
+            the tag from tagging (per-resource restores only).
         errors: Non-fatal error messages accumulated during the restore.
     """
 
@@ -107,6 +109,7 @@ class RestoreReport:
     missing_files_count: int = 0
     permanently_deleted_count: int = 0
     upserted_count: int = 0
+    skipped_excluded: int = 0
     errors: list[str] = field(default_factory=list)
 
 

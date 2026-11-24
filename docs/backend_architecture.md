@@ -446,6 +446,9 @@ The same module also serves the **v1.9 tiered Duplicates queue** — `GET /dedup
 | GET | `/config/logout` | Logout |
 | GET | `/config/progress` | Worker progress snapshot |
 | GET | `/config/sort-mechanisms` | Available sort modes |
+| DELETE | `/users/me/penalised-tags/{tag:path}` | Remove a penalised tag from Smart Score, from tagging in every library and from this library's pictures (§9 *Tags removed from tagging*) |
+| PUT | `/users/me/penalised-tags/{tag:path}` | Penalise a tag with a weight, lifting its removal from tagging |
+| GET / POST | `/users/me/penalised-tags/cleanup` | How taking removed tags off this library's pictures is going; POST retries it |
 | GET | `/server-config/scrapheap-retention` | Scrapheap auto-purge window (`scrapheap_retention_days`, `scrapheap_retention_reduced_at`, `scrapheap_retention_choices`, `scrapheap_retention_grace_days`). `null` days = Never, and that is the **shipped default** |
 | PATCH | `/server-config/scrapheap-retention` | Set the window (30/60/90/120 or `null` = Never). The ONLY writer of `scrapheap_retention_days`, which is why an absent key reliably means "never chosen". Persists to `server-config.json`; stamps `scrapheap_retention_reduced_at` only on a *reduction* (turning auto-purge on counts as one). Purges nothing synchronously. |
 | GET | `/server-config/scrapheap-retention/impact` | Preview a retention reduction: `would_purge_count` (excludes protected + locked; evaluated at the grace floor so it never understates) + `first_purge_at`. Pure read — applies nothing, stamps nothing, purges nothing. `0` when `days` is not lower than the current window |
@@ -2022,7 +2025,7 @@ User plugin preferences are stored in a single `User.tagger_settings` JSON colum
 - **Tag plugins** carry an `enabled` flag; outputs union across all enabled plugins (max confidence wins).
 - **Description plugins** are selected via the single `active_description_plugin` value (radio-select). Florence-2 is the fallback if the configured plugin is unavailable.
 - Missing entries are filled with per-plugin defaults on every serialise; unknown plugin names are preserved on read for downgrade safety.
-- Written exclusively through `PATCH /users/me/config` (`tagger_settings` key); `user_settings_utils._apply_tagger_settings_patch` validates all plugin names and parameter names against the live registry.
+- Plugin preferences are written through `PATCH /users/me/config` (`tagger_settings` key); `user_settings_utils._apply_tagger_settings_patch` validates all plugin names and parameter names against the live registry. The tags removed from tagging (`excluded_tags`, `excluded_tags_generation`) are kept in the same column but written only by the penalised-tag routes; see [Tags removed from tagging](#tags-removed-from-tagging).
 
 Models are lazily loaded on first `init()` call and can be unloaded after idle to free device memory unless `keep_models_in_memory` is set.
 
@@ -2178,6 +2181,140 @@ The `InferenceEngine` also exposes workflow accessor properties that wrap the ta
 | `text_embedding_workflow` | `inference/workflows/text_embedding.py` | SentenceTransformer + CLIP text |
 | `face_embedding_workflow` | `inference/workflows/face_embedding.py` | InsightFace 512-d embeddings |
 | `clip_embedding_workflow` | `inference/workflows/clip_embedding.py` | CLIP image embeddings |
+
+### Tags removed from tagging
+
+Removing a penalised tag with its X (Settings › Smart score & filters) does more
+than drop its weight: the tag stops counting towards Smart Score, nothing may
+add it to a picture again in any library, and the open library's pictures lose
+it. Penalising it again lifts the rule; nothing removed earlier comes back. The
+rule lives in one module, `pixlstash/utils/quality/tag_exclusion.py`, and every
+writer asks it.
+
+**Where the choice lives.** In the hub, in `User.tagger_settings`, under
+`excluded_tags` (sorted normalised names) and `excluded_tags_generation` (a
+counter bumped on every change). No migration: the column is JSON, and
+`_apply_tagger_settings_patch` keeps unknown top-level keys and ignores unknown
+patch keys, so `PATCH /users/me/config` can neither set nor clear them; only
+the penalised-tag routes below write them. `Vault.set_tagger_settings` hands
+the names and the generation to `VaultDatabase.set_tag_exclusions`, which
+replaces both as one value under a lock and ignores (with an info log) a
+generation lower than the one in force: two changes that publish in the
+opposite order to their hub writes leave the newer one in force. An equal
+generation is accepted. Every vault session (the writer's and
+`run_immediate_read_task`'s) carries that snapshot in
+`session.info["tag_exclusions"]`. A producer reads it from the
+session that persists the row (`session_tag_exclusions`), so a task whose tags
+were computed before the removal still drops the tag when it writes. The vault
+opened beside the active one for a move between libraries
+(`library_switch_service.open_other_library`) is given the same snapshot.
+
+**What a name covers.** The normalised name (stripped, lowercase) and, when it
+is a canonical parent, its `DEFAULT_TAG_MERGES` children (`expand_aliases`): a
+picture tagged with a child is scored as the parent, so removing the parent
+removes the child too. Removing a child covers only the child, and anomaly
+families are never expanded. A name from a request is 1-128 characters and
+never the pending marker (`validate_tag_name`, 422). A stored tag matches when
+its own normalised form does, whatever its case or surrounding whitespace.
+SQL cannot reproduce that form (SQLite's `lower` and `trim` know only ASCII
+letters and spaces), so every query that selects or leaves out rows by a
+removed name first reads the distinct stored spellings that match, in Python
+(`excluded_spellings`, over the indexed tag column), and compares the column
+with `IN` on those: the cleanup's rows and its remaining count, the prediction
+backfill finder and its count, and the suggestion listing.
+
+**What each producer does with a removed tag:**
+
+- **A single interactive write refuses** with `TagExcludedError` (409):
+  `POST /pictures/{id}/tags`, `GET /pictures/{id}/anomaly_region`, confirming a
+  prediction, accepting or reopening a suggestion that would add the tag,
+  creating a review or scanning for the tag, and an undo or redo that would put
+  a `Tag` or `TagPrediction` row back (`OperationLogError`, the same 409).
+  Removing such a tag, or rejecting it, stays allowed.
+- **A bulk or import path drops the name and carries on**: the tagger (tags,
+  predictions, and the face-crop pass when every crop tag is removed), the
+  prediction backfill and its finder, `PATCH /pictures/{id}`, uploads, watch
+  folders, the staging import, the library and reference-folder scans, the
+  folder-structure commit, the reference-folder metadata import, the stack
+  union, a move to another library, a per-resource snapshot restore, the
+  impossible-tags undo, and bulk suggestion accept and reopen. The picture
+  PATCH, the restore, the impossible-tags undo and the bulk suggestion routes
+  say what they left out (`skipped_excluded`); the import paths log it. A
+  sidecar that names only removed tags leaves a new picture with no tags and
+  no pending marker: it was tagged, so the tagger is not asked to.
+- **What leaves the library leaves it out**: tag sidecars written back, export
+  and training captions (`CaptionUtils.build_tag_caption(..., exclusions=)` is
+  a required keyword), and the tag catalogue (`GET /tags`). A picture's own
+  tag list still shows a removed tag it carries (a locked picture keeps it).
+- **Human labels**: `record_human_label` adds no new `manual` prediction row
+  for a removed tag; an existing row is still marked.
+
+**Scoring.** `smart_score.fetch_anomaly_confidences` skips a removed tag,
+whoever's row carries it, so a locked picture still holding one is not
+charged for it; `recompute_anomaly_tag_uncertainty` skips it too.
+`library_settings_service.compute_settings_fingerprint` folds the removed names
+in when there are any, so a library opened after a removal made elsewhere is
+re-scored; with none removed the fingerprint is what it always was.
+
+**The guardrail.**
+`tests/test_architecture_guardrails.py::test_tag_rows_respect_the_tags_removed_from_tagging`
+finds every `Tag(...)`, `TagPrediction(...)` and `TagSuggestion(...)`
+construction under `pixlstash/` and fails unless the building function (or the
+one it is nested in) uses `tag_exclusions`, `session_tag_exclusions`,
+`is_excluded`, `filter_tag_names` or `filter_scores`, or the site has a
+justified `_TAG_ROW_EXEMPT` entry. A stale exemption fails too.
+
+**Taking the tag off pictures.** `services/tag_exclusion_service.py` does the
+routes' work and `TagExclusionCleanupTask`
+(`tasks/tag_exclusion_cleanup_task.py`, CPU queue, LOW priority, no finder)
+removes the rows:
+
+- Three phases, `Tag` rows, then `TagPrediction` rows, then pending
+  `TagSuggestion` rows (decided ones are review history and stay), in
+  id-ordered batches of 200, one writer turn each, deleted through the ORM so
+  each picture's metadata hash follows. Locked pictures are filtered in the
+  query, before the batch limit, and counted; the Scrapheap is included and
+  counted.
+- Each batch checks again, inside its writer turn, that its names are still
+  removed, that the exclusion generation is the one it was planned on and that
+  the library is the same; otherwise the job stops as `superseded`. Penalising
+  one removed tag again moves the generation, so the service starts a new job
+  for the other names a stopping job was carrying.
+- Each batch NULLs the changed pictures' `smart_score`, recomputes their
+  anomaly uncertainty and emits `CHANGED_TAGS`. The `text_embedding` is left
+  as it is.
+- A `Tag` batch rewrites the tag sidecars of its pictures in its own writer
+  turn, before the rows go, from the tags each picture keeps (as
+  `sync_picture_sidecar` does), wherever the picture's owner has `sync_tags`
+  on. A sidecar edited on disk since it was read in is left for the folder
+  scan. A picture whose sidecar cannot be written keeps its rows and is counted
+  in the job's `sidecar_failed`; the job then ends `failed`, never
+  `completed`. The cost is at most 200 small files per LOW-priority writer
+  turn.
+- At the end: a tag-health rebuild and an activity-log receipt
+  (`tags.exclusion_cleanup`, target `tag_exclusion`, the names and counts),
+  not undoable, because nothing is kept to undo it with.
+- Jobs are kept in memory, the last 20 per library. Rows and sidecar change in
+  the same writer turn, so whatever a job leaves (a restart, a cancel, a
+  sidecar that could not be written) is in the status's live count of the
+  unlocked pictures still carrying a removed tag: it reads `interrupted`, and a
+  retry finishes the work.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| DELETE | `/users/me/penalised-tags/{tag:path}` | Remove a tag: its weight goes, it and its merge children join `excluded_tags`, and a cleanup job starts here. 404 when the tag is neither penalised nor removed |
+| PUT | `/users/me/penalised-tags/{tag:path}` | `{weight: 1-5}`: penalise the tag, lifting its exclusion. Nothing removed is restored |
+| GET | `/users/me/penalised-tags/cleanup` | What is removed, `remaining` and `locked` picture counts, `state` (`running` / `interrupted` / `idle`), the jobs |
+| POST | `/users/me/penalised-tags/cleanup` | Retry: start a job for `names` (default: every removed tag). 409 while a job is running, 422 for a name not removed |
+
+All four are owner-only (`OWNER_ONLY` in `ROUTE_POLICIES`), and the GET is on
+the READ-token belt as well. The PUT and DELETE take the rest of the path as
+the tag (`{tag:path}`), because the server decodes `%2F` before routing: a tag
+with a slash in it, URL-encoded as the frontend sends it, reaches them like any
+other. The JSON shapes are in
+`docs/integration_architecture.md` §2.12. A weight change made here records
+its smart-score invalidation before the hub write, as `PATCH /users/me/config`
+does.
 
 ---
 

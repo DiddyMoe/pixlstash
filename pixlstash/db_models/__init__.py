@@ -30,6 +30,7 @@ from .operation import (  # noqa: F401
     STATUS_SUPERSEDED,
     STATUS_UNDONE,
     TARGET_PICTURE,
+    TARGET_TAG_EXCLUSION,
     TARGET_TAG_GROUP,
     VALID_STATUSES,
 )

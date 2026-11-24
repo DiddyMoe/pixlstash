@@ -326,6 +326,50 @@ def test_anomaly_region_cache_hit_is_scope_gated():
         gc.collect()
 
 
+def test_anomaly_region_for_a_tag_removed_from_tagging_is_409():
+    """A tag the owner removed from tagging is refused, even from the cache.
+
+    The owner first warms the cache for the label (the positive control), then
+    removes it from tagging. Any spelling of it must now be 409 and must not
+    reach the model.
+    """
+    temp_dir, server, client, picture_ids = _setup_server_with_pictures()
+    try:
+        target = picture_ids[0]
+        r = client.get(
+            f"{API}/pictures/{target}/anomaly_region",
+            params={"tag": "malformed hand"},
+        )
+        assert r.status_code == 200, r.text
+        assert (target, "malformed hand", 1) in anomaly_module._anomaly_region_cache
+
+        server.vault.db.set_tag_exclusions(frozenset({"malformed hand"}))
+        service = server.vault._engine.pixlstash_tagger_service
+        service.threads.clear()
+
+        # The warm entry is still there: the cache-hit path is refused.
+        r = client.get(
+            f"{API}/pictures/{target}/anomaly_region",
+            params={"tag": "malformed hand"},
+        )
+        assert r.status_code == 409, r.text
+        assert "'malformed hand' was removed from tagging" in r.json()["detail"]
+
+        # Cold, and spelled the way a tagger label arrives: refused before
+        # the model runs.
+        anomaly_module._anomaly_region_cache.clear()
+        r = client.get(
+            f"{API}/pictures/{target}/anomaly_region",
+            params={"tag": " Malformed_Hand "},
+        )
+        assert r.status_code == 409, r.text
+        assert "localize" not in service.threads
+    finally:
+        server.__exit__(None, None, None)
+        temp_dir.cleanup()
+        gc.collect()
+
+
 def test_anomaly_region_character_scope_both_directions():
     """A character-scoped READ token reads its picture but is 403 elsewhere."""
     temp_dir, server, client, picture_ids = _setup_server_with_pictures()

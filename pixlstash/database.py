@@ -36,6 +36,9 @@ import numpy as np
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.tag_reset_registry import TagResetRegistry
+from pixlstash.utils.quality.tag_exclusion import (
+    SESSION_INFO_KEY as TAG_EXCLUSIONS_INFO_KEY,
+)
 from pixlstash.utils.sqlite_uri import sqlite_url
 from pixlstash.utils.unprocessable_image_registry import UnprocessableImageRegistry
 
@@ -1277,6 +1280,15 @@ class VaultDatabase:
         # When each picture's tags were last reset, so a tag task that read the
         # picture before a retag does not write over it (#1361).
         self.tag_resets = TagResetRegistry()
+        # The tags the owner removed from tagging. Every session this database
+        # opens carries the snapshot current at that moment in
+        # ``session.info``, so a producer filters against the rule in force
+        # when its row is written, not when its work was planned. Held with
+        # its generation, bumped on every change to the names, as one value,
+        # so work planned under one decision can tell that the owner has
+        # decided again since.
+        self._tag_exclusion_state: tuple[frozenset[str], int] = (frozenset(), 0)
+        self._tag_exclusion_lock = threading.Lock()
         db_exists = os.path.exists(self._db_path)
         logger.debug(f"Vault init, db_path={self._db_path}, db_exists={db_exists}")
 
@@ -1359,6 +1371,43 @@ class VaultDatabase:
     def is_open(self) -> bool:
         """True while the database serves reads (OPEN, or FAILED with reads only)."""
         return self._state in _READABLE_STATES and self._engine is not None
+
+    @property
+    def tag_exclusions(self) -> frozenset[str]:
+        """The excluded tag names stamped on every new session."""
+        return self._tag_exclusion_state[0]
+
+    @property
+    def tag_exclusion_generation(self) -> int:
+        """The counter of the excluded names now in force."""
+        return self._tag_exclusion_state[1]
+
+    def set_tag_exclusions(self, names, generation: int = 0) -> None:
+        """Replace the excluded tag names that new sessions carry.
+
+        Sessions already open keep the snapshot they started with; a caller
+        that needs every later write to see the new set runs one writer task
+        after this returns.
+
+        A generation lower than the one in force is an older decision that
+        lost the race to publish, and is ignored; an equal one is accepted.
+
+        Args:
+            names: The normalised excluded names, merge children included.
+            generation: The counter stored with the names in the owner's
+                settings.
+        """
+        with self._tag_exclusion_lock:
+            current = self._tag_exclusion_state[1]
+            if generation < current:
+                logger.info(
+                    "Ignoring excluded tags of generation %s: generation %s is "
+                    "already in force.",
+                    generation,
+                    current,
+                )
+                return
+            self._tag_exclusion_state = (frozenset(names), generation)
 
     def add_session_hook(self, hook) -> None:
         """Run *hook(session)* on every writer session, after the built-in hooks.
@@ -1531,6 +1580,7 @@ class VaultDatabase:
         """
         with self.engine_read_access():
             with Session(self._engine) as session:
+                session.info[TAG_EXCLUSIONS_INFO_KEY] = self.tag_exclusions
                 return func(session, *args, **kwargs)
 
     @contextmanager
@@ -1748,6 +1798,7 @@ class VaultDatabase:
         try:
             session = Session(self._engine)
             _attach_session_hooks(session)
+            session.info[TAG_EXCLUSIONS_INFO_KEY] = self.tag_exclusions
             # Part of opening the session: a failing hook discards it and
             # fails this task's future instead of killing the writer thread.
             for hook in self._session_hooks:

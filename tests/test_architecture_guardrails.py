@@ -167,6 +167,11 @@ def test_services_no_direct_db_calls():
         "pixlstash/services/face_clusters.py",  # vault-injection pattern; thin wrappers around read_person_in_session and the reference-cluster write, the clustering run outside the reader
         "pixlstash/services/tag_prediction_service.py",  # vault-injection pattern
         "pixlstash/services/tag_suggestion_service.py",  # vault-injection pattern; review-queue writeback
+        # vault-injection pattern; the owner's penalised-tag write is a hub write
+        # with the vault's smart-score invalidation recorded before it and applied
+        # after it (no session spans both databases), and the status read is a
+        # thin wrapper around pictures_carrying(session).
+        "pixlstash/services/tag_exclusion_service.py",
         "pixlstash/services/tagger_run_service.py",  # vault-injection pattern; tagger run history upsert
         "pixlstash/services/workflow_library_service.py",  # vault-injection pattern; read-only wrappers around the session-level workflow counts
         "pixlstash/services/workflow_set_verdicts.py",  # vault-injection pattern; fetch_set_checks is a read-only wrapper around recipe_evidence(session), the vault half of a hub/vault join no session can span
@@ -481,6 +486,11 @@ _LABEL_SINK_EXEMPT = {
         "async staging import of NEW pictures (#459) - sentinel Tag on freshly "
         "created rows that cannot yet be in a locked set"
     ),
+    ("pixlstash/services/folder_structure_commit_service.py", "insert"): (
+        "local import of NEW pictures - sidecar tags or the sentinel on rows "
+        "added in this same transaction; a row the root scan already indexed "
+        "is reused and gets no tags here"
+    ),
     ("pixlstash/vault.py", "import_default_data"): (
         "logo / default-data import (new pictures)"
     ),
@@ -675,6 +685,155 @@ def test_lock_chokepoint_callers_are_guarded():
         "(enforce_pictures_not_locked / locked_picture_ids skip):\n"
         f"  {rel}: " + ", ".join(sorted(violations))
     )
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: tag rows respect the tags the owner removed from tagging
+#
+# Removing a tag from tagging (the X on a penalised tag) must hold everywhere a
+# Tag, TagPrediction or TagSuggestion row is built: an import, scan, undo or
+# review that writes the name back undoes the owner's decision without a word.
+# A list of the paths someone remembered cannot catch the one they forgot, so
+# this finds every construction and asks the function that builds it - or the
+# function it is nested in - to show the check.
+# ---------------------------------------------------------------------------
+
+_TAG_ROW_MODELS = frozenset({"Tag", "TagPrediction", "TagSuggestion"})
+
+# A use of any of these names in the building function shows it reads the
+# removed set (a name, not text: a comment or docstring does not count).
+_TAG_EXCLUSION_NAMES = frozenset(
+    {
+        "tag_exclusions",
+        "session_tag_exclusions",
+        "is_excluded",
+        "filter_tag_names",
+        "filter_scores",
+    }
+)
+
+# A route factory holds every handler of its module, so a check in one handler
+# never vouches for another.
+_ROUTE_FACTORIES = frozenset({"create_router", "register_routes"})
+
+# {(relative_path, function): why the rows it builds cannot carry a removed tag}.
+_TAG_ROW_EXEMPT = {
+    ("pixlstash/utils/service/label_ledger.py", "_manual_prediction"): (
+        "builds the ledger's synthetic row; both callers, record_human_label and "
+        "record_human_labels, return before it for a removed tag"
+    ),
+    ("pixlstash/services/review_service.py", "_fill_from_list"): (
+        "suggestions for the review's own tag; its one caller, create_review's "
+        "_create, refuses a review for a removed tag first"
+    ),
+}
+
+
+def _builds_the_pending_marker(call: ast.Call) -> bool:
+    """True when the row's ``tag`` is a sentinel name, not a real tag."""
+    for keyword in call.keywords:
+        if keyword.arg == "tag":
+            value = keyword.value
+            return isinstance(value, ast.Name) and "sentinel" in value.id.lower()
+    return False
+
+
+def _reads_the_removed_set(function: ast.AST) -> bool:
+    for node in ast.walk(function):
+        if isinstance(node, ast.Name) and node.id in _TAG_EXCLUSION_NAMES:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in _TAG_EXCLUSION_NAMES:
+            return True
+    return False
+
+
+def _unchecked_tag_rows(source: str) -> list[tuple[int, str, str]]:
+    """``(line, model, function)`` for each tag row *source* builds unchecked."""
+    tree = ast.parse(source)
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        model = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if model not in _TAG_ROW_MODELS or _builds_the_pending_marker(node):
+            continue
+        chain = sorted(
+            (f for f in functions if f.lineno <= node.lineno <= f.end_lineno),
+            key=lambda f: f.lineno,
+        )
+        name = chain[-1].name if chain else "<module>"
+        vouching = [f for f in chain[-2:] if f.name not in _ROUTE_FACTORIES]
+        if not any(_reads_the_removed_set(f) for f in vouching):
+            found.append((node.lineno, model, name))
+    return found
+
+
+def test_tag_rows_respect_the_tags_removed_from_tagging():
+    unchecked = []
+    used_exemptions = set()
+    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel.startswith("pixlstash/migrations/"):
+            continue
+        for lineno, model, name in _unchecked_tag_rows(
+            path.read_text(encoding="utf-8")
+        ):
+            if (rel, name) in _TAG_ROW_EXEMPT:
+                used_exemptions.add((rel, name))
+                continue
+            unchecked.append(f"{rel}:{lineno} {model}(...) in '{name}'")
+
+    assert not unchecked, (
+        "A Tag/TagPrediction/TagSuggestion row is built with no check against "
+        "the tags the owner removed from tagging, so it can write one back.\n"
+        "Filter with filter_tag_names / is_excluded(tag, "
+        "session_tag_exclusions(session)) in the building function, or add a "
+        "justified entry to _TAG_ROW_EXEMPT:\n" + "\n".join(unchecked)
+    )
+    stale = sorted(set(_TAG_ROW_EXEMPT) - used_exemptions)
+    assert not stale, (
+        "Stale _TAG_ROW_EXEMPT entries no longer match an unchecked row "
+        "(prune them):\n" + "\n".join(f"{r} :: {n}" for r, n in stale)
+    )
+
+
+def test_tag_row_guardrail_flags_a_dropped_check():
+    """The scan reports a checked producer once its check is taken out."""
+    rel = "pixlstash/services/dedup_verdict_service.py"
+    source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+    assert _unchecked_tag_rows(source) == []
+    stripped = source
+    for name in sorted(_TAG_EXCLUSION_NAMES, key=len, reverse=True):
+        stripped = stripped.replace(name, "unchecked")
+    assert [(m, n) for _line, m, n in _unchecked_tag_rows(stripped)] == [
+        ("Tag", "apply_metadata_union_in_session")
+    ]
+    # A check named only in a comment does not count, a real tag is not taken
+    # for the pending marker, and a route factory does not vouch for its
+    # handlers; an ordinary enclosing function does.
+    handler = (
+        "def create_router(server):\n"
+        "    exclusions = session_tag_exclusions(None)\n"
+        "    def add(session, name):\n"
+        "        # is_excluded(name, exclusions) was checked by the caller\n"
+        "        session.add(Tag(tag=name, picture_id=1))\n"
+        "        session.add(Tag(tag=TAG_PENDING_SENTINEL, picture_id=1))\n"
+    )
+    assert _unchecked_tag_rows(handler) == [(5, "Tag", "add")]
+    nested = (
+        "def add_all(session, names):\n"
+        "    names = filter_tag_names(names, session_tag_exclusions(session))\n"
+        "    def _write(inner):\n"
+        "        for name in names:\n"
+        "            inner.add(Tag(tag=name, picture_id=1))\n"
+    )
+    assert _unchecked_tag_rows(nested) == []
 
 
 def test_workers_not_started_at_vault_init():

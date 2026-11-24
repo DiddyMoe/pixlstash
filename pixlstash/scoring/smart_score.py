@@ -30,6 +30,7 @@ from pixlstash.db_models import (
 from pixlstash.db_models.tag_prediction import feeds_anomaly_score
 from pixlstash.services.tagger_run_service import get_latest_tag_precisions
 from pixlstash.utils.quality.anomaly_penalty import ANOMALY_PENALTY_TAGS
+from pixlstash.utils.quality.tag_exclusion import session_tag_exclusions
 from pixlstash.utils.quality.smart_score_utils import (
     SmartScoreUtils,
     resolve_owner_penalised_tags,
@@ -303,6 +304,11 @@ def fetch_anomaly_confidences(
     with no ``Tag`` row (a human said the defect is there), and a human NEG suppresses
     even while the tag is still applied.
 
+    A tag the owner removed from tagging (``session.info``, see
+    :mod:`pixlstash.utils.quality.tag_exclusion`) is no input at all, whoever's
+    row carries it, so a locked picture still holding one is not charged for it
+    and does not inherit a family weight through it.
+
     Note the tag check is applied *unconditionally*, independent of *apply_thresholds*.
     :func:`~pixlstash.utils.service.smart_score_invalidation.anomaly_state_signature`
     calls this function with ``apply_thresholds=None`` to build its change signature, so
@@ -331,6 +337,7 @@ def fetch_anomaly_confidences(
         return probs_map, human_map
 
     applied_tags = fetch_applied_anomaly_tags(session, picture_ids)
+    exclusions = session_tag_exclusions(session)
 
     rows = session.exec(
         select(
@@ -353,6 +360,8 @@ def fetch_anomaly_confidences(
         if not tag:
             continue
         key = tag.strip().lower()
+        if key in exclusions:
+            continue
         if label_source == HUMAN and label_state == POS:
             probs_map[picture_id][key] = 1.0
             human_map[picture_id].add(key)

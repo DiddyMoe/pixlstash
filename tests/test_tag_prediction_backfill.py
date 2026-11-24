@@ -137,6 +137,37 @@ def test_backfill_marks_unscored_pictures_so_they_drop_out(tmp_path):
         assert Vault._count_missing_tag_predictions(session) == 0
 
 
+def test_a_removed_tag_is_never_back_filled(tmp_path):
+    """An unscored picture's zero-confidence rows skip a tag removed from
+    tagging, as the scored path does."""
+    engine = _make_engine(tmp_path)
+    with Session(engine) as session:
+        pic_id = _add_picture(session, "a.jpg", tags=["dog", "flux chin"])
+        session.info["tag_exclusions"] = frozenset({"flux chin"})
+
+        TagPredictionBackfillTask._backfill_predictions(session, {}, [pic_id], "v7")
+
+        preds = session.exec(
+            select(TagPrediction.tag).where(TagPrediction.picture_id == pic_id)
+        ).all()
+        assert set(preds) == {"dog"}
+
+
+def test_a_picture_with_only_removed_tags_is_not_selected_again(tmp_path):
+    """Nothing can be back-filled for a picture whose only real tags were
+    removed from tagging, so the finder must not pick it on every sweep."""
+    engine = _make_engine(tmp_path)
+    with Session(engine) as session:
+        only_removed = _add_picture(session, "a.jpg", tags=["Flux Chin"])
+        permitted = _add_picture(session, "b.jpg", tags=["flux chin", "dog"])
+        session.info["tag_exclusions"] = frozenset({"flux chin"})
+
+        for _sweep in range(2):
+            found = MissingTagPredictionFinder._fetch_missing_predictions(session, 100)
+            assert [p.id for p in found] == [permitted], only_removed
+        assert Vault._count_missing_tag_predictions(session) == 1
+
+
 class _RecordingWorkflow:
     """Minimal TaggingWorkflow stand-in that records the engine overrides it got.
 

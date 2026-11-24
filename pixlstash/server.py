@@ -1367,7 +1367,7 @@ class Server(
                 getattr(self._user, "smart_score_penalised_tags", None)
             )
             library_settings_service.reconcile_settings_fingerprint(
-                vault.db, library.settings_salt, penalised
+                vault.db, library.settings_salt, penalised, vault.db.tag_exclusions
             )
         except Exception:
             # A failed reconcile leaves scores as they were, which is the state

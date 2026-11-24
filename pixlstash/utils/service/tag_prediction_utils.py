@@ -11,6 +11,7 @@ from pixlstash.db_models.tag_prediction import (
     PLUGIN_VERSION_SEPARATOR,
     TagPrediction,
 )
+from pixlstash.utils.quality.tag_exclusion import is_excluded, session_tag_exclusions
 
 PENALISED_TAG_SET = {t.strip().lower() for t in DEFAULT_SMART_SCORE_PENALIZED_TAGS}
 
@@ -32,6 +33,9 @@ def recompute_anomaly_tag_uncertainty(session: Session, picture_id: int) -> None
 
     A higher value means a stronger disagreement between the model score and the
     current human label on at least one anomaly tag.
+
+    A tag the owner removed from tagging is left out, so rows still held on a
+    locked picture do not keep it in the review queue.
 
     Call this **after** any ``session.flush()`` that modifies ``Tag`` rows, and
     **before** ``session.commit()``, so the read sees the latest state.
@@ -61,9 +65,12 @@ def recompute_anomaly_tag_uncertainty(session: Session, picture_id: int) -> None
         if row is not None
     }
 
+    exclusions = session_tag_exclusions(session)
     scores: list[float] = []
     for tag, confidence in predictions:
         if tag is None or tag.strip().lower() not in PENALISED_TAG_SET:
+            continue
+        if is_excluded(tag, exclusions):
             continue
         if tag in applied_tags:
             scores.append(1.0 - float(confidence))

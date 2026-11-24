@@ -68,6 +68,12 @@ from pixlstash.services.tag_health_service import (
     EST_MISSING_MIN_CONF,
     latest_model_version,
 )
+from pixlstash.utils.quality.tag_exclusion import (
+    TagExcludedError,
+    is_excluded,
+    normalise_tag,
+    session_tag_exclusions,
+)
 from pixlstash.utils.service.anomaly_thresholds import load_label_thresholds
 from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.utils.near_neighbor import (
@@ -285,7 +291,12 @@ def scan_tag(
         *detected*, ``new`` is how many rows this call actually added to the
         queue/review (inserted + adopted + re-included), and ``prev_reviewed``
         is how many detected suspects were already decided in earlier reviews.
+
+    Raises:
+        TagExcludedError: The owner removed ``tag`` from tagging.
     """
+    if is_excluded(tag, vault.db.tag_exclusions):
+        raise TagExcludedError(normalise_tag(tag))
     # Child tags that PixlTagger merges into this one count as "has the tag" for voting
     # and the "missing" direction (but not for "remove" - see has_literal vs has_concept).
     equiv = {tag} | {
@@ -662,7 +673,18 @@ def _write_suspects(
     Shared by :func:`scan_tag` and :func:`scan_boundary` so both sources adopt,
     skip and re-parent existing rows by the same rules. Returns
     ``{"new", "prev_reviewed"}``.
+
+    A tag the owner removed from tagging while the scan ran writes nothing:
+    neither a new row nor a refresh of an existing one.
     """
+    if is_excluded(tag, session_tag_exclusions(session)):
+        logger.debug(
+            "Scan for %r finished after it was removed from tagging; "
+            "dropping %d suspects",
+            tag,
+            len(suspects),
+        )
+        return {"new": 0, "prev_reviewed": 0}
     # Diff-insert against every existing (tag, source) row of an incoming
     # picture: the unique constraint is on (picture_id, tag, source), so a
     # suspect with any prior row is updated-or-skipped, never re-inserted.
@@ -827,7 +849,12 @@ def scan_boundary(
     Returns:
         The same shape as :func:`scan_tag`. ``scanned`` is how many unreviewed
         predictions were ranked, ``count`` how many were selected.
+
+    Raises:
+        TagExcludedError: The owner removed ``tag`` from tagging.
     """
+    if is_excluded(tag, vault.db.tag_exclusions):
+        raise TagExcludedError(normalise_tag(tag))
     threshold = effective_threshold(vault, tag)
 
     def _load(session: Session) -> tuple[str | None, int, list]:

@@ -366,6 +366,30 @@ def test_the_tag_union_skips_pipeline_sentinels(server):
     assert _tags(server, ids[1]) == {"__tag:wd14", "portrait"}
 
 
+def test_the_tag_union_never_copies_a_tag_removed_from_tagging(server):
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100, "tags": ["portrait", "Flux Chin"]},
+            {"pixel_sha": "aaa", "size_bytes": 100, "tags": ["sunset"]},
+        ],
+    )
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+    _scan(server)
+    result = _run(
+        server,
+        verdicts.apply_stack_verdict_in_session,
+        _one_signature(server),
+        None,
+        [],
+        None,
+    )
+    # The removed tag stays where it is; it is never copied to a sibling.
+    assert _tags(server, ids[0]) == {"Flux Chin", "portrait", "sunset"}
+    assert _tags(server, ids[1]) == {"portrait", "sunset"}
+    assert result.metadata_union["tags_added"] == 2
+
+
 def test_stacking_lifts_every_member_to_the_highest_score(server):
     ids = _seed(
         server,
@@ -1353,6 +1377,24 @@ def test_the_dry_run_summary_counts_covers_that_gain_metadata(server):
     # Still a dry run: nothing written, nothing tagged.
     assert all(_picture(server, pid).stack_id is None for pid in ids)
     assert _tags(server, ids[0]) == set()
+
+
+def test_the_dry_run_summary_counts_no_gain_from_a_removed_tag(server):
+    _seed(
+        server,
+        [
+            # Group 1: the twin carries only a tag removed from tagging.
+            {"pixel_sha": "aaa", "size_bytes": 100, "score": 5},
+            {"pixel_sha": "aaa", "size_bytes": 100, "tags": ["Flux Chin"]},
+            # Group 2: the twin carries a real tag the cover lacks.
+            {"pixel_sha": "bbb", "size_bytes": 200, "score": 5},
+            {"pixel_sha": "bbb", "size_bytes": 200, "tags": ["portrait"]},
+        ],
+    )
+    server.vault.db.set_tag_exclusions(frozenset({"flux chin"}))
+    _scan(server)
+    report = _run(server, verdicts.bulk_auto_stack_in_session, None, None, True, None)
+    assert report["dry_run_summary"]["covers_gaining_tags"] == 1
 
 
 def test_the_dry_run_summary_counts_a_score_lift(server):

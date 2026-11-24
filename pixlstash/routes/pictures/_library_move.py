@@ -18,7 +18,8 @@ reported: its tags and score there may differ from the ones here, and choosing
 between them is the owner's call, not a side effect of a move.
 
 **What travels:** the file, its tags, score, description and creation date.
-**What does not:** people, sets, projects and stacks, whose ids name different
+**What does not:** tags the owner removed from tagging; people, sets, projects
+and stacks, whose ids name different
 things in the other library; reviews, guest scores and the link to the workflow
 run that made the picture; and everything derived, which is computed again.
 """
@@ -38,6 +39,10 @@ from pixlstash.hub.registry import LibraryError, LibraryNotFoundError
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    session_tag_exclusions,
+)
 
 from ._crud import BULK_DELETE_MAX_IDS, scrapheap_pictures
 from ._helpers import _create_picture_imports
@@ -166,9 +171,11 @@ def _copy_into(target, source_root: str, row) -> str:
     def persist(session: Session):
         session.add(picture)
         session.flush()
-        # No tags of its own: leave the marker the tagger looks for, as every
-        # other import does.
-        for tag in row.tags or [TAG_PENDING_SENTINEL]:
+        # A tag removed from tagging stays behind. No tags of its own: leave
+        # the marker the tagger looks for, as every other import does. One whose
+        # only tags were removed was tagged here, so it gets no marker either.
+        permitted = filter_tag_names(row.tags, session_tag_exclusions(session))
+        for tag in permitted or ([] if row.tags else [TAG_PENDING_SENTINEL]):
             session.add(Tag(tag=tag, picture_id=picture.id))
         session.commit()
 
@@ -208,7 +215,8 @@ def register_routes(router, server):
             "library, then moves them to this library's Scrapheap - one "
             "`pictures.scrapheap.move` operation, so one undo brings them back "
             "here. Tags, score, description and creation date travel with the "
-            "file; people, sets, projects and stacks do not. A file the other "
+            "file, except tags removed from tagging; people, sets, projects and "
+            "stacks do not. A file the other "
             "library already holds, live or in its Scrapheap, is left where it "
             "is in both and reported."
         ),

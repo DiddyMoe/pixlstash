@@ -56,6 +56,10 @@ from pixlstash.db_models.picture_set import PictureSet
 from pixlstash.db_models.project import Project
 from pixlstash.services.set_lock_service import locked_set_ids
 from pixlstash.utils.media_files import SUPPORTED_MEDIA_EXTS
+from pixlstash.utils.quality.tag_exclusion import (
+    filter_tag_names,
+    session_tag_exclusions,
+)
 
 from ._helpers import (
     _create_picture_imports,
@@ -1273,10 +1277,16 @@ def register_routes(router, server):
                         ).all()
                         changed_ids = []
                         replaced_ids = []
+                        exclusions = session_tag_exclusions(session)
+                        left_out = 0
                         for pic in pics:
                             tag_values = mapping.get(pic.id) or set()
                             if not tag_values:
                                 continue
+                            # Tags the owner removed from tagging never come
+                            # back through a sidecar.
+                            permitted = set(filter_tag_names(tag_values, exclusions))
+                            left_out += len(tag_values) - len(permitted)
                             existing_values = {
                                 (row[0] if isinstance(row, tuple) else row or "")
                                 .strip()
@@ -1289,32 +1299,48 @@ def register_routes(router, server):
                             if pic.id in replace_ids:
                                 # For duplicate imports with sidecar captions,
                                 # replace old tags with sidecar-provided tags.
+                                # A sidecar left with nothing permitted keeps
+                                # the tags the picture has.
+                                if not permitted:
+                                    continue
                                 session.exec(
                                     delete(Tag).where(Tag.picture_id == pic.id)
                                 )
-                                for tag_value in sorted(tag_values):
+                                for tag_value in sorted(permitted):
                                     session.add(Tag(tag=tag_value, picture_id=pic.id))
                                 replaced_ids.append(pic.id)
                                 changed = True
                             else:
+                                # The sidecar tagged the picture even when it
+                                # named only removed tags, so the pending
+                                # sentinel goes either way. Deleted through the
+                                # session so the metadata hash is recomputed
+                                # when no tag is added in its place.
                                 if any(is_tag_sentinel(v) for v in existing_values):
-                                    session.exec(
-                                        delete(Tag).where(
+                                    for sentinel_row in session.exec(
+                                        select(Tag).where(
                                             Tag.picture_id == pic.id,
                                             Tag.tag.like(
                                                 TAG_SENTINEL_LIKE_PATTERN,
                                                 escape=TAG_SENTINEL_ESCAPE_CHAR,
                                             ),
                                         )
-                                    )
+                                    ).all():
+                                        session.delete(sentinel_row)
                                     changed = True
-                                for tag_value in sorted(tag_values):
+                                for tag_value in sorted(permitted):
                                     if tag_value in existing_values:
                                         continue
                                     session.add(Tag(tag=tag_value, picture_id=pic.id))
                                     changed = True
                             if changed:
                                 changed_ids.append(pic.id)
+                        if left_out:
+                            logger.debug(
+                                "Import: left out %d sidecar tag(s) removed from "
+                                "tagging.",
+                                left_out,
+                            )
                         session.commit()
                         vault.db.tag_resets.mark_reset(replaced_ids)
                         return changed_ids

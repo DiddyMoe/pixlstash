@@ -293,6 +293,8 @@ class LibrarySwitchService:
         builds its candidate (revalidated folder, guarded connection, pending
         migrations applied) but with no background workers, and it is closed on
         the way out. It is never published: the active library stays active.
+        Its writer carries the active vault's tag exclusions, which are the
+        owner's and apply to every library.
 
         Holds the switch lock for as long as the vault is open, so a switch
         cannot open the same database a second time, and neither can a second
@@ -330,6 +332,13 @@ class LibrarySwitchService:
                     f'Could not open "{target.name}": {exc}. Nothing was moved.'
                 ) from exc
             try:
+                # The owner's tag exclusions are hub-wide, so the library opened
+                # beside the active one enforces the same set in its writer.
+                active = self._server.vault.db
+                vault.db.set_tag_exclusions(
+                    active.tag_exclusions,
+                    generation=active.tag_exclusion_generation,
+                )
                 yield target, vault
             finally:
                 vault.close()

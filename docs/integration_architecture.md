@@ -2150,6 +2150,65 @@ made by the refresh arrive as `CHANGED_PICTURES` with `source: "smart_set"` and
 no `origin_client_id`, which refreshes the sidebar like another tab's edit.
 Backend: the *Smart sets* paragraph in §5 of the backend document.
 
+### 2.12 Removing a penalised tag
+
+The X on a penalised tag (Settings › Smart score & filters) removes the tag from
+Smart Score, from tagging in every library and from the open library's pictures.
+It has its own routes rather than the config PATCH, which can neither set nor
+clear a removal. All four are owner-only; the client is
+`frontend/src/api/users.js` (`deletePenalisedTag`, `putPenalisedTag`,
+`getPenalisedTagCleanup`, `startPenalisedTagCleanup`, each URL-encoding the
+tag).
+
+`DELETE /users/me/penalised-tags/{tag:path}` and `PUT /users/me/penalised-tags/{tag:path}`
+with `{weight}` (1-5; the PUT lifts a removal) both answer:
+
+```json
+{
+  "smart_score_penalised_tags": {"bad anatomy": 3},
+  "excluded": ["extra digit", "malformed hand", "missing digit"],
+  "cleanup": {"id": "…", "names": ["extra digit", "malformed hand", "missing digit"],
+              "state": "queued",
+              "pictures": 0, "scrapheap": 0, "locked": 0,
+              "removed": {"tags": 0, "predictions": 0, "suggestions": 0},
+              "sidecar_failed": 0}
+}
+```
+
+- `excluded` is the whole removed set after the change, merge children
+  included; `smart_score_penalised_tags` is the whole weight map.
+- `cleanup` is the job started in this library, or `null` when there was
+  nothing to start (a DELETE of a tag already removed, a PUT with no other
+  removal to carry on).
+  A PUT that lifts one removal while a job is still taking others off restarts
+  that work under a new job and returns it.
+- A tag name is trimmed and lowercased; an empty one, one over 128
+  characters, or the internal pending marker is a 422. A DELETE of a tag that
+  is neither penalised nor removed is a 404.
+
+`GET /users/me/penalised-tags/cleanup` answers `{library_uuid, excluded,
+remaining, locked, state, jobs}`. `remaining` counts the unlocked pictures,
+Scrapheap included, still carrying a removed tag and `locked` the locked ones;
+both are read live. `state` is `running` while a job is queued or running,
+`interrupted` when none is and `remaining` is not 0, otherwise `idle`. `jobs`
+holds this library's last jobs since the server started, newest first, in the
+shape above; a job's `state` ends as `completed`, `superseded` (penalising a
+removed tag again stopped it; a newer job carries its other names),
+`cancelled`, `failed` or `not_started`. A job's `locked` is filled in when it
+ends, and the activity log gets a receipt (not undoable).
+
+`POST /users/me/penalised-tags/cleanup` with an optional `{names}` (default:
+every removed tag; at most 500) starts a job and answers `{cleanup}`. It is a
+409 while a job is queued or running here, and a 422 for a name that is not
+removed.
+
+No WebSocket event announces a job's progress: the client polls the GET while
+a job it follows is `queued` or `running`. Each batch the job removes does fire
+`CHANGED_TAGS` for its pictures, so an open grid refreshes as usual. Other
+writers that meet a removed tag answer 409 (`TagExcludedError`) for a single
+write or list it in `skipped_excluded` for a bulk one. Backend: *Tags removed
+from tagging* in §9 of the backend document.
+
 ---
 
 

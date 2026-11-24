@@ -81,7 +81,9 @@ def set_similarity_character(vault_db, character_id: Optional[int]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def compute_settings_fingerprint(salt: str, penalised_tags: dict) -> str:
+def compute_settings_fingerprint(
+    salt: str, penalised_tags: dict, exclusions: frozenset = frozenset()
+) -> str:
     """Return an opaque, keyed hash of the score-affecting settings.
 
     **Deliberately one-way and keyed, because the inputs are personal.** The
@@ -97,21 +99,28 @@ def compute_settings_fingerprint(salt: str, penalised_tags: dict) -> str:
     Args:
         salt: The library's ``settings_salt`` from the hub.
         penalised_tags: The resolved ``{tag: weight}`` table.
+        exclusions: Tags the owner removed from tagging. They change scores
+            too, so they are folded in, but only when there are some: a
+            library whose owner never removed a tag keeps the fingerprint it
+            already stored.
 
     Returns:
         A hex digest. Equality is the only thing callers may infer from it.
     """
-    canonical = json.dumps(
-        {str(tag): float(weight) for tag, weight in sorted(penalised_tags.items())},
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    payload: dict = {
+        str(tag): float(weight) for tag, weight in sorted(penalised_tags.items())
+    }
+    if exclusions:
+        payload = {"weights": payload, "excluded": sorted(exclusions)}
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     return hmac.new(
         salt.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256
     ).hexdigest()
 
 
-def reconcile_settings_fingerprint(vault_db, salt: str, penalised_tags: dict) -> bool:
+def reconcile_settings_fingerprint(
+    vault_db, salt: str, penalised_tags: dict, exclusions: frozenset = frozenset()
+) -> bool:
     """Invalidate this library's cached scores if the weights changed while it slept.
 
     A penalised-tag weight change invalidates cached smart scores in the library
@@ -132,6 +141,7 @@ def reconcile_settings_fingerprint(vault_db, salt: str, penalised_tags: dict) ->
         vault_db: The library's database.
         salt: The library's ``settings_salt`` from the hub.
         penalised_tags: The owner's current resolved ``{tag: weight}`` table.
+        exclusions: The owner's tags removed from tagging.
 
     Returns:
         True when the fingerprint had changed and an invalidation was recorded.
@@ -145,7 +155,7 @@ def reconcile_settings_fingerprint(vault_db, salt: str, penalised_tags: dict) ->
         )
         return False
 
-    expected = compute_settings_fingerprint(salt, penalised_tags or {})
+    expected = compute_settings_fingerprint(salt, penalised_tags or {}, exclusions)
 
     def _reconcile(session: Session) -> bool:
         settings = _row(session)

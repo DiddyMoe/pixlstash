@@ -169,7 +169,8 @@ def create_router(server) -> APIRouter:
             "one of the targets; 410 when undoing a move to the Scrapheap whose "
             "picture has since been permanently purged (retention sweep or Empty "
             "Scrapheap) - the whole request is refused, the operation stays "
-            "applied, and nothing is written."
+            "applied, and nothing is written. Also 409, refused the same way, "
+            "when the undo would add back a tag removed from tagging."
         ),
         response_model=UndoResultResponse,
     )
@@ -192,7 +193,8 @@ def create_router(server) -> APIRouter:
             "The single-call revert behind a bulk action's report ('Collapsed "
             "2,700 groups - Undo'). Reverts every still-applied, reversible "
             "operation carrying this ``batch_id``, newest first. 409 when the "
-            "batch has nothing left to undo."
+            "batch has nothing left to undo, or when it would add back a tag "
+            "removed from tagging (nothing is written)."
         ),
         response_model=UndoResultResponse,
     )
@@ -233,7 +235,9 @@ def create_router(server) -> APIRouter:
             "Restores the recorded *after* state of the most recently undone "
             "operation (and its whole batch). Recording any new operation "
             "invalidates the redo stack, so redo only ever replays onto the "
-            "history it was undone from. 409 when there is nothing to redo."
+            "history it was undone from. 409 when there is nothing to redo, or "
+            "when the redo would add back a tag removed from tagging (nothing is "
+            "written and the operation stays undone)."
         ),
         response_model=UndoResultResponse,
     )
