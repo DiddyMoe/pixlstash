@@ -40,7 +40,6 @@ import os
 import re
 import tempfile
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -3089,19 +3088,28 @@ def test_a_picture_edit_waiting_on_the_writer_does_not_stall_other_requests(
     )
 
 
-def test_score_edits_a_moment_apart_end_at_the_later_one(client, server):
-    """Two score edits of one picture a moment apart, both waiting on a busy
-    writer, leave the later score stored: an edit compares and writes in the
-    order it was sent, even while it waits on a worker thread."""
+def test_score_edits_a_moment_apart_end_at_the_later_one(monkeypatch, client, server):
+    """Two score edits of one picture, both waiting on a busy writer, leave the
+    later score stored: an edit that is waiting its turn compares and writes
+    before one sent after it, even while it waits on a worker thread."""
     picture_id = _upload(client)
     start = client.patch(f"{API}/pictures/{picture_id}", json={"score": 3})
     assert start.status_code == 200, start.text
 
-    started = threading.Event()
+    started, release, entered = threading.Event(), threading.Event(), threading.Event()
+
+    real_run_task = server.vault.db.run_task
+
+    def spy_run_task(func, *args, **kwargs):
+        if getattr(func, "__module__", "") == "pixlstash.routes.pictures._crud":
+            entered.set()
+        return real_run_task(func, *args, **kwargs)
+
+    monkeypatch.setattr(server.vault.db, "run_task", spy_run_task)
 
     def _keep_the_writer_busy(session):
         started.set()
-        time.sleep(0.1)
+        release.wait(10)
 
     async def edit_twice():
         async with httpx.AsyncClient(
@@ -3112,19 +3120,31 @@ def test_score_edits_a_moment_apart_end_at_the_later_one(client, server):
             first = asyncio.ensure_future(
                 loop_client.patch(f"{API}/pictures/{picture_id}", json={"score": 5})
             )
-            await asyncio.sleep(0.01)
-            second = await loop_client.patch(
-                f"{API}/pictures/{picture_id}", json={"score": 3}
+            # The later edit is sent once the first is waiting on the writer,
+            # not after a fixed head start: a request reaches its turn through
+            # worker-thread hops, which a loaded machine can stretch past any
+            # fixed delay. Bounded, in case the first never gets that far.
+            for _ in range(500):
+                if entered.is_set() or first.done():
+                    break
+                await asyncio.sleep(0.01)
+            second = asyncio.ensure_future(
+                loop_client.patch(f"{API}/pictures/{picture_id}", json={"score": 3})
             )
-            return await first, second
+            # Time for the later edit to reach the first's turn and wait on it.
+            await asyncio.sleep(0.1)
+            release.set()
+            return await first, await second
 
     busy = server.vault.db.submit_task(_keep_the_writer_busy, priority=DBPriority.LOW)
     try:
         assert started.wait(5), "the writer never picked up the busy task"
         first, second = asyncio.run(edit_twice())
     finally:
+        release.set()
         busy.result(10)
 
+    assert entered.is_set(), "the first edit never reached the writer"
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
     stored = server.vault.db.run_immediate_read_task(
