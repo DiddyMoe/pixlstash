@@ -301,7 +301,7 @@ function acceptPerTagResult(result) {
 async function askThen(options, run) {
   if (confirming) return;
   confirming = true;
-  let confirmed = false;
+  let confirmed;
   try {
     confirmed = await confirm(options);
   } finally {
