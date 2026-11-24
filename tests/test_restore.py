@@ -11,11 +11,13 @@ import shutil
 import tempfile
 from contextlib import closing
 
+import numpy as np
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, create_engine, delete, select
 
+from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Character,
     CharacterProjectMember,
@@ -234,6 +236,48 @@ def test_full_restore_reverts_mutation(server):
     assert restored_pic.description == "before", (
         f"Expected description 'before' after restore, got '{restored_pic.description}'"
     )
+
+
+def test_full_restore_does_not_read_the_restored_library_as_an_anchor_change(server):
+    """The anchor watch's baseline describes the swapped-out file; the swap drops it.
+
+    Kept, the next anchor check would compare the restored library's anchors with
+    the replaced file's and clear every smart score the snapshot brought back,
+    although each was computed from exactly the anchors it was restored with.
+    """
+    _create_file(server, "anchor.jpg")
+    pic = _add_picture(server, filename="anchor.jpg")
+
+    def write(session, **values):
+        row = session.get(Picture, pic.id)
+        for name, value in values.items():
+            setattr(row, name, value)
+        session.commit()
+
+    def drain():
+        server.vault.db.run_task(lambda session: None, priority=DBPriority.LOW)
+
+    server.vault.db.run_task(
+        write,
+        image_embedding=np.random.rand(128).astype(np.float32).tobytes(),
+        score=5,
+    )
+    drain()  # the anchor entering clears every score; settle that first
+    server.vault.db.run_task(write, smart_score=0.5)
+    cp = server.vault.snapshot_service.create_snapshot("MANUAL")
+
+    # The live library then loses its only anchor: the baseline now holds none.
+    server.vault.db.run_task(write, score=3)
+    drain()
+
+    report = server.vault.restore_service.restore_full(cp.id)
+    assert not report.errors, f"Restore errors: {report.errors}"
+
+    server.vault.smart_score_anchor_watch.request_check()
+    drain()
+    restored = _get_picture(server, pic.id)
+    assert restored.score == 5
+    assert restored.smart_score == 0.5
 
 
 def test_the_location_guard_is_released_before_the_restore_swap(server, monkeypatch):

@@ -60,7 +60,10 @@ from .utils.vram_utils import empty_device_cache
 from . import worker_config
 
 from pixlstash.event_types import EventType
-from pixlstash.utils.service.smart_score_invalidation import InteractiveRescoreRegistry
+from pixlstash.utils.service.smart_score_invalidation import (
+    InteractiveRescoreRegistry,
+    SmartScoreAnchorWatch,
+)
 from pixlstash.tagger_plugins.registry import (
     get_tagger_plugin_manager,
     unload_loaded_tagger_plugins,
@@ -331,6 +334,11 @@ class Vault:
         # disable_background_workers early-return because the mutation handlers that
         # record into it run in both modes.
         self.interactive_rescore_registry = InteractiveRescoreRegistry()
+        # Clears every cached smart score when a rating, undo, soft delete or dedup
+        # score lift actually changes the scorer's anchor set, and only then. Hooked
+        # into every writer session; before the early-return for the same reason.
+        self.smart_score_anchor_watch = SmartScoreAnchorWatch(self.db)
+        self.db.add_session_hook(self.smart_score_anchor_watch.attach)
 
         if disable_background_workers:
             logger.info(
@@ -952,6 +960,8 @@ class Vault:
         # Cancel it first so it removes its files and ends before the workers
         # are joined and the database is closed under it.
         self.snapshot_service.cancel_inflight()
+        # Its quiet-period timer would queue a check on the database closed below.
+        self.smart_score_anchor_watch.close()
         if self._started:
             # Stop the training poll thread first.  This does NOT kill a running
             # external trainer (by policy): it survives the restart and is
@@ -2467,13 +2477,17 @@ class Vault:
 
     def _build_worker_progress_snapshot(self) -> dict:
         progress = {}
+        # Counted once per snapshot. It used to be re-counted for every worker
+        # type (39 full counts per poll), although only the picture-scoped
+        # branches below read it.
+        library_total = int(
+            self.db.run_immediate_read_task(self._count_total_pictures) or 0
+        )
         for worker_type in TaskType.all():
             # When set by a branch below, this overrides the finder-based
             # activity check (used by user-triggered tasks that have no finder).
             worker_active_override = None
-            total = int(
-                self.db.run_immediate_read_task(self._count_total_pictures) or 0
-            )
+            total = library_total
             if worker_type == TaskType.DESCRIPTION:
                 missing = int(
                     self.db.run_immediate_read_task(self._count_missing_descriptions)
@@ -2735,6 +2749,15 @@ class Vault:
                     or 0
                 )
                 label = "orientations_read"
+            elif worker_type == TaskType.SMART_SCORE:
+                # Counted over the pictures the scorer can work on. Left in
+                # `planner_managed` below it read "N / N" from the first second
+                # of a full re-score to the last, so the row said the library
+                # was done while every picture in it was being scored again.
+                total, missing = self.db.run_immediate_read_task(
+                    SmartScoreTask.count_progress
+                ) or (0, 0)
+                label = "smart_scored"
             elif worker_type == TaskType.THUMBNAIL_GENERATION:
                 # Whole-frame bitmap regeneration (MissingThumbnailFinder). After
                 # the v1.8.0 upgrade this counted the entire library; a fresh
@@ -2744,6 +2767,12 @@ class Vault:
                 )
                 label = "thumbnails_generated"
             else:
+                # A worker with no count of its own reports none. Borrowing the
+                # library's picture total with nothing remaining rendered every
+                # such row as "N / N", finished, while it ran: the trap the
+                # Orientation, Checkpoint Hash, Workflow cards and Smart score
+                # rows each fell into before getting a count of their own.
+                total = 0
                 missing = 0
                 label = "planner_managed"
             worker_active = (

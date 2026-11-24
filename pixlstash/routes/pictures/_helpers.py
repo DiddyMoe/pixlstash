@@ -29,26 +29,6 @@ from pixlstash.utils.service.scope_table import scope_id_subquery
 logger = get_logger(__name__)
 
 
-def _score_is_good_anchor(score_value: int | None) -> bool:
-    """Return True if score belongs to the good-anchor class used by smart-score seeding."""
-    return score_value is not None and score_value >= 4
-
-
-def _score_is_bad_anchor(score_value: int | None) -> bool:
-    """Return True if score belongs to the bad-anchor class used by smart-score seeding."""
-    return score_value is not None and 0 < score_value <= 1
-
-
-def _score_anchor_membership_changed(
-    old_score: int | None,
-    new_score: int | None,
-) -> bool:
-    """Return True when a score change crosses either smart-score anchor boundary."""
-    return _score_is_good_anchor(old_score) != _score_is_good_anchor(
-        new_score
-    ) or _score_is_bad_anchor(old_score) != _score_is_bad_anchor(new_score)
-
-
 _SIDECAR_TAG_PATTERN = re.compile(
     r"^[a-z0-9]+(?:[ _-][a-z0-9]+){0,2}$",
     re.IGNORECASE,

@@ -26,6 +26,7 @@ from pixlstash.scoring.smart_score import (
     get_smart_score_penalised_tags_from_request,
     resolve_penalised_tag_weights,
 )
+from pixlstash.routes import config as config_routes
 from pixlstash.server import Server
 from pixlstash.services import library_settings_service
 from pixlstash.utils.quality.smart_score_utils import resolve_owner_penalised_tags
@@ -452,6 +453,143 @@ class TestCatchingUpADormantLibrary:
         )
 
 
+def _stored_fingerprint(server):
+    return server.vault.db.run_immediate_read_task(
+        lambda session: (
+            session.exec(select(LibrarySettings)).first().settings_fingerprint
+        )
+    )
+
+
+def _scored_picture(server, path: str, score: float) -> int:
+    def _add(session: Session):
+        picture = Picture(file_path=path, smart_score=score)
+        session.add(picture)
+        session.commit()
+        session.refresh(picture)
+        return picture.id
+
+    return server.vault.db.run_task(_add)
+
+
+def _score_of(server, picture_id: int):
+    return server.vault.db.run_immediate_read_task(
+        lambda session: session.get(Picture, picture_id).smart_score
+    )
+
+
+class TestAChangeMadeWhileOpen:
+    """The open library repairs a weights change at once; the next open must not again.
+
+    Without this, every penalised-tag edit re-scored the whole library at the
+    following start, which is the "Smart score N / N" nobody asked for.
+    """
+
+    def test_the_next_open_does_not_invalidate_after_a_patch(self, server):
+        """End to end: the setting is saved, then the library is opened again."""
+        client = _owner(server)
+        # Bring the fingerprint in line with the owner's current weights first,
+        # so the only change the reopen can see is the one this PATCH makes.
+        server.reconcile_library_settings(server.vault)
+        before = _stored_fingerprint(server)
+        current = client.get(f"{API}/users/me/config").json()[
+            "smart_score_penalised_tags"
+        ]
+        weight = 0.25 if (current or {}).get("blurry") != 0.25 else 0.75
+        untouched = _scored_picture(server, "/tmp/while-open.png", 2.7)
+
+        response = client.patch(
+            f"{API}/users/me/config",
+            json={"smart_score_penalised_tags": {"blurry": weight}},
+        )
+        assert response.status_code == 200, response.text
+        assert _stored_fingerprint(server) != before, "the PATCH changed nothing"
+
+        server.reconcile_library_settings(server.vault)
+
+        assert _score_of(server, untouched) == pytest.approx(2.7)
+
+    def test_it_moves_from_the_previous_weights_to_the_new(self, server):
+        library = server.library_registry.active_library()
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.5}
+        )
+
+        advanced = library_settings_service.advance_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.5}, {"blurry": 0.9}
+        )
+
+        assert advanced is True
+        assert _stored_fingerprint(server) == (
+            library_settings_service.compute_settings_fingerprint(
+                library.settings_salt, {"blurry": 0.9}
+            )
+        )
+
+    def test_a_repair_already_owed_is_not_erased(self, server):
+        """A stale fingerprint is a debt; advancing past it would forgive it."""
+        library = server.library_registry.active_library()
+        # The library last saw 0.1, so it missed the move to 0.5 as well.
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.1}
+        )
+        owed = _stored_fingerprint(server)
+
+        advanced = library_settings_service.advance_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.5}, {"blurry": 0.9}
+        )
+
+        assert advanced is False
+        assert _stored_fingerprint(server) == owed
+        stale = _scored_picture(server, "/tmp/owed.png", 1.9)
+        assert library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.9}
+        )
+        assert _score_of(server, stale) is None
+
+    def test_reaching_the_same_weights_again_writes_nothing(self, server, caplog):
+        """Already at the new weights: no write, and no report of a debt.
+
+        The stored value matches neither the old weights nor nothing, so the
+        compare-and-set alone would read it as a repair owed and say so.
+        """
+        library = server.library_registry.active_library()
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.9}
+        )
+        recorded = _stored_fingerprint(server)
+        caplog.clear()
+
+        assert (
+            library_settings_service.advance_settings_fingerprint(
+                server.vault.db,
+                library.settings_salt,
+                {"blurry": 0.5},
+                {"blurry": 0.9},
+            )
+            is False
+        )
+        assert _stored_fingerprint(server) == recorded
+        assert not [
+            record for record in caplog.records if "owed a repair" in record.message
+        ]
+
+    def test_a_missing_salt_writes_nothing(self, server):
+        library = server.library_registry.active_library()
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.5}
+        )
+        recorded = _stored_fingerprint(server)
+
+        assert (
+            library_settings_service.advance_settings_fingerprint(
+                server.vault.db, None, {"blurry": 0.5}, {"blurry": 0.9}
+            )
+            is False
+        )
+        assert _stored_fingerprint(server) == recorded
+
+
 class TestTagChipSize:
     """The tag chip size is the owner's, kept in its own hub table."""
 
@@ -486,3 +624,22 @@ class TestTagChipSize:
         assert response.status_code == 400, response.text
         body = client.get(f"{API}/users/me/config").json()
         assert body["tag_chip_size"] == "comfortable"
+
+
+class TestVramSliderBound:
+    """The card bounding ``max_vram_gb`` arrives in the same response as it.
+
+    The slider took its bound from ``GET /workers/progress``, and sat at its
+    2 GB floor until that heaviest of polls answered.
+    """
+
+    def test_the_card_comes_with_the_budget_it_bounds(self, server, monkeypatch):
+        monkeypatch.setattr(config_routes, "query_total_vram_mb", lambda: 16384)
+        body = _owner(server).get(f"{API}/users/me/config").json()
+        assert body["vram_total_gb"] == 16.0
+        assert body["max_vram_gb"] is not None
+
+    def test_no_card_sends_no_total(self, server, monkeypatch):
+        monkeypatch.setattr(config_routes, "query_total_vram_mb", lambda: 0)
+        body = _owner(server).get(f"{API}/users/me/config").json()
+        assert body["vram_total_gb"] is None

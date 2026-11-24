@@ -1349,6 +1349,9 @@ class VaultDatabase:
         # exclusive_engine_access / run_immediate_read_task) and against the
         # engine release in close().
         self._engine_rwlock = _EngineRWLock()
+        # Extra per-session listeners from layers above the database (see
+        # add_session_hook). Must exist before the worker starts reading it.
+        self._session_hooks: tuple = ()
         self._task_worker = threading.Thread(target=self._task_worker_loop, daemon=True)
         self._task_worker.start()
 
@@ -1356,6 +1359,23 @@ class VaultDatabase:
     def is_open(self) -> bool:
         """True while the database serves reads (OPEN, or FAILED with reads only)."""
         return self._state in _READABLE_STATES and self._engine is not None
+
+    def add_session_hook(self, hook) -> None:
+        """Run *hook(session)* on every writer session, after the built-in hooks.
+
+        The writer thread opens a fresh ``Session`` per task, so a listener that
+        must see every write (``before_flush``, ``after_commit``) cannot be
+        registered once on a session; it has to be attached to each. This is how
+        a layer above the database does that without the database importing it.
+        Read sessions (:meth:`run_immediate_read_task`) and control tasks get no
+        hooks: they do not write.
+
+        Args:
+            hook: Called with each new writer ``Session`` before the task runs.
+        """
+        # Replace the tuple rather than mutate it: the writer thread iterates
+        # whatever tuple it read, so it never sees a half-updated sequence.
+        self._session_hooks = (*self._session_hooks, hook)
 
     def close(self):
         """Stop the writer, refuse queued work and release the engine.
@@ -1728,6 +1748,10 @@ class VaultDatabase:
         try:
             session = Session(self._engine)
             _attach_session_hooks(session)
+            # Part of opening the session: a failing hook discards it and
+            # fails this task's future instead of killing the writer thread.
+            for hook in self._session_hooks:
+                hook(session)
         except BaseException as exc:
             self._discard_session(session, label, "open", exc)
             return None, exc

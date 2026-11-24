@@ -26,6 +26,7 @@ from pixlstash.routes._helpers import require_hub
 from pixlstash.routes.model_folders import register_comfyui_model_folders
 from pixlstash.utils.path_utils import LibraryRootsUnavailable
 from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.vram_utils import query_total_vram_mb
 from pixlstash.services import (
     comfyui_connections,
     comfyui_link_service,
@@ -73,6 +74,11 @@ def create_router(server) -> APIRouter:
         The ai-toolkit checkout and its Python are host paths, which only the
         §16.3 tier that ``GET /training/ai-toolkit/status`` carries may read;
         everyone else gets ``ai_toolkit_configured`` and nulls (#2295).
+
+        ``vram_total_gb`` is the card the ``max_vram_gb`` slider is bounded by,
+        sent with the value it bounds. The slider used to wait for it on
+        ``GET /workers/progress``, the heaviest poll there is, and sat at its
+        2 GB floor until that answered. ``None`` without a card.
         """
         payload = serialize_user_config(user)
         payload["ai_toolkit_configured"] = bool(
@@ -91,6 +97,10 @@ def create_router(server) -> APIRouter:
         # A table of its own in the hub too.
         payload["tag_chip_size"] = tag_preferences.read(
             server.hub, getattr(user, "id", None)
+        )
+        total_vram_mb = query_total_vram_mb()
+        payload["vram_total_gb"] = (
+            round(total_vram_mb / 1024.0, 2) if total_vram_mb > 0 else None
         )
         return payload
 
@@ -736,6 +746,11 @@ def create_router(server) -> APIRouter:
             known *before* anything is written. That ordering is what lets the
             invalidation be recorded durably first; see the comment on the write
             below.
+
+            Returns:
+                ``(changed_tags, old_table, new_table)``: the tags whose
+                effective weight moves, and the resolved tables either side.
+                The tables are ``None`` when nothing moves.
             """
             user = session.get(User, user_id)
             if user is None:
@@ -752,15 +767,18 @@ def create_router(server) -> APIRouter:
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             if not would_update:
-                return set()
+                return set(), None, None
             # Diff the *resolved* weight tables, not the raw JSON strings: a
             # reordered or reformatted payload with identical weights must not
             # trigger a re-score. The resolver is the one the scorer uses, so the
             # diff is over the weights that actually reach the penalty.
-            return changed_penalised_tags(
-                old_penalised_tags,
-                resolve_owner_penalised_tags(probe.smart_score_penalised_tags),
+            new_penalised_tags = resolve_owner_penalised_tags(
+                probe.smart_score_penalised_tags
             )
+            changed = changed_penalised_tags(old_penalised_tags, new_penalised_tags)
+            if not changed:
+                return set(), None, None
+            return changed, old_penalised_tags, new_penalised_tags
 
         def update_user(session: Session, user_id: int):
             user = session.get(User, user_id)
@@ -812,7 +830,9 @@ def create_router(server) -> APIRouter:
             )
             return user, updated, install_id_turned_on
 
-        changed_tags = server.hub_engine.run_immediate_read_task(preview_patch, user_id)
+        changed_tags, old_penalised_table, new_penalised_table = (
+            server.hub_engine.run_immediate_read_task(preview_patch, user_id)
+        )
 
         # ``similarity_character`` belongs to the active library, not to the
         # user: it is a row id in that vault's character table, so the same
@@ -869,6 +889,30 @@ def create_router(server) -> APIRouter:
         server._user = user
 
         if changed_tags:
+            # The open library is repaired below, so its fingerprint moves with
+            # the change. Left behind, the next start reads the stale fingerprint
+            # as "changed while closed" and re-scores every picture in it.
+            # Failing here costs that full re-score at the next open and nothing
+            # else, so it is logged rather than raised.
+            library = None
+            try:
+                library = server.library_registry.active_library()
+                if library is not None:
+                    library_settings_service.advance_settings_fingerprint(
+                        server.vault.db,
+                        library.settings_salt,
+                        old_penalised_table,
+                        new_penalised_table,
+                    )
+            except Exception:
+                logger.exception(
+                    "Penalised tags changed (%s) but the settings fingerprint of "
+                    "library %s could not be advanced. Its next open will "
+                    "invalidate every cached smart score in it.",
+                    ", ".join(sorted(changed_tags)),
+                    getattr(library, "name", None),
+                )
+
             # Apply the recorded invalidation now, so the user sees the effect
             # immediately. Consuming the record and NULLing the scores share one
             # vault transaction, so that half cannot tear.

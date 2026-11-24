@@ -49,7 +49,7 @@ from pixlstash.utils.service.smart_score_invalidation import (
     invalidate_all_anomaly_scores,
     invalidate_for_penalised_tag_change,
 )
-from tests.utils import upload_pictures_and_wait
+from tests.utils import stop_planner_and_settle, upload_pictures_and_wait
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
 
@@ -192,9 +192,10 @@ def _set_smart_score(server, pic_id, value=0.5, with_embedding=True):
     """Give the picture a stored smart score (and an embedding so the finder sees it)."""
 
     # Uploads require live workers, but every caller below is about to inspect
-    # deliberately controlled intermediate score state. Stop the finder before
-    # making that state visible so it cannot claim the row between assertions.
-    server.vault._work_planner.stop()
+    # deliberately controlled intermediate score state. Stop the finders, and
+    # wait out the tasks they already handed off, before making that state
+    # visible so nothing claims or rewrites the row between assertions.
+    stop_planner_and_settle(server)
 
     def _apply(session):
         pic = session.get(Picture, pic_id)
@@ -344,7 +345,7 @@ def test_confirm_registers_origin_stamped_rescore_refresh():
     try:
         edited = _upload_picture(client, "Bad1.png")
         pending = _upload_picture(client, "Bad2.png")  # keeps the backfill in flight
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         _prepare_for_scoring(server, pending)  # embedding + NULL score
 
         _seed_prediction(server, edited, PENALISED_TAG, confidence=0.8)
@@ -835,25 +836,28 @@ def test_changed_penalised_tags_includes_family_aliases():
     assert "blocky" not in unchanged and "jpeg artifacts" not in unchanged
 
 
-def test_penalised_tag_config_change_invalidates_only_matching_pictures():
-    """Assert both sets: the carriers are cleared and the bystanders keep their score."""
+def test_penalised_tag_config_change_invalidates_only_charged_pictures():
+    """Clear exactly the pictures the re-weight can move; every other score stays.
+
+    The penalty charges a tag on an applied ``Tag`` row or a human POS, nothing else
+    (``fetch_anomaly_confidences``). A model prediction with no applied tag never
+    reaches it, and the tagger writes such a prediction for every anomaly label on
+    every picture it tags, so counting one would clear the whole library.
+    """
     temp_dir, client, server = _setup()
     try:
         carrier_tag = _upload_picture(client, "Bad1.png")
-        carrier_pred = _upload_picture(client, "Bad2.png")
+        carrier_human = _upload_picture(client, "Bad2.png")
+        predicted_only = _upload_picture(client, "Changed2.png")
         bystander = _upload_picture(client, "Changed1.png")
-        for pic_id in (carrier_tag, carrier_pred, bystander):
+        for pic_id in (carrier_tag, carrier_human, predicted_only, bystander):
             _set_smart_score(server, pic_id, 0.5)
 
-        # One carries an applied Tag, one only an anomaly TagPrediction - the penalty
-        # reads both, so invalidation must cover both.
-        server.vault.db.run_task(
-            lambda s: (
-                s.add(Tag(picture_id=carrier_tag, tag=PENALISED_TAG)),
-                s.commit(),
-            )
-        )
-        _seed_prediction(server, carrier_pred, PENALISED_TAG, confidence=0.9)
+        _seed_tag(server, carrier_tag, PENALISED_TAG)
+        # A person confirmed the defect: charged with no Tag row behind it.
+        _seed_human_prediction(server, carrier_human, PENALISED_TAG, POS)
+        # The model's guess alone: never charged, so its score cannot have moved.
+        _seed_prediction(server, predicted_only, PENALISED_TAG, confidence=0.9)
         # The bystander carries an *unrelated* penalised tag, so it is not just "untagged".
         _seed_prediction(server, bystander, "bad anatomy", confidence=0.9)
 
@@ -865,12 +869,13 @@ def test_penalised_tag_config_change_invalidates_only_matching_pictures():
         )
         assert cleared == 2
         assert _get_smart_score(server, carrier_tag) is None
-        assert _get_smart_score(server, carrier_pred) is None
+        assert _get_smart_score(server, carrier_human) is None
+        assert _get_smart_score(server, predicted_only) == 0.5
         assert _get_smart_score(server, bystander) == 0.5
 
         missing = _find_missing_ids(server)
-        assert carrier_tag in missing and carrier_pred in missing
-        assert bystander not in missing
+        assert carrier_tag in missing and carrier_human in missing
+        assert predicted_only not in missing and bystander not in missing
     finally:
         server.close()
         temp_dir.cleanup()
@@ -899,10 +904,13 @@ def test_patch_config_invalidates_only_pictures_with_the_changed_tag():
     temp_dir, client, server = _setup()
     try:
         carrier = _upload_picture(client, "Bad1.png")
+        predicted_only = _upload_picture(client, "Bad2.png")
         bystander = _upload_picture(client, "Changed1.png")
-        _set_smart_score(server, carrier, 0.5)
-        _set_smart_score(server, bystander, 0.5)
+        for pic_id in (carrier, predicted_only, bystander):
+            _set_smart_score(server, pic_id, 0.5)
+        _seed_tag(server, carrier, PENALISED_TAG)
         _seed_prediction(server, carrier, PENALISED_TAG, confidence=0.9)
+        _seed_prediction(server, predicted_only, PENALISED_TAG, confidence=0.9)
         _seed_prediction(server, bystander, "bad anatomy", confidence=0.9)
 
         # Re-weight only PENALISED_TAG; leave every other tag where it was.
@@ -915,6 +923,7 @@ def test_patch_config_invalidates_only_pictures_with_the_changed_tag():
 
         _wait_for(lambda: _get_smart_score(server, carrier) is None)
         assert _get_smart_score(server, carrier) is None
+        assert _get_smart_score(server, predicted_only) == 0.5
         assert _get_smart_score(server, bystander) == 0.5
     finally:
         server.close()
@@ -926,8 +935,9 @@ def test_patch_config_invalidates_only_pictures_with_the_changed_tag():
 # The tagger's ``threshold_offset`` moves both the anomaly apply gate and the penalty's
 # ``u = (p - t)/(1 - t)`` normalisation, so every cached score with an anomaly component
 # goes stale when it changes. Unlike a penalised-tag re-weight it is not scoped by tag -
-# but it is still bounded to pictures that actually carry an anomaly ``TagPrediction``,
-# because a picture with no anomaly term cannot have moved.
+# but it is still bounded to pictures with an applied anomaly ``Tag``: a model prediction
+# without one is never charged, and a human verdict folds to 1.0 or 0.0, which the
+# normalisation maps to the same value at any threshold.
 
 
 def _patch_threshold_offset(client, offset):
@@ -944,19 +954,23 @@ def _patch_threshold_offset(client, offset):
 
 
 def test_invalidate_all_anomaly_scores_clears_only_anomaly_bearing_pictures():
-    """The helper clears anomaly-bearing scores and leaves content-only / clean ones."""
+    """The helper clears charged anomaly scores and leaves every other one."""
     temp_dir, client, server = _setup()
     try:
         anomaly = _upload_picture(client, "Bad1.png")
         content_only = _upload_picture(client, "Bad2.png")
+        predicted_only = _upload_picture(client, "Changed2.png")
         clean = _upload_picture(client, "Changed1.png")
-        for pic_id in (anomaly, content_only, clean):
+        for pic_id in (anomaly, content_only, predicted_only, clean):
             _set_smart_score(server, pic_id, 0.5)
 
-        # Only the first carries an anomaly-vocabulary prediction; the second carries a
-        # pure content prediction; the third carries none.
+        # Only the first carries an applied anomaly tag behind its prediction. The
+        # second carries a pure content prediction, the third an anomaly prediction
+        # the scorer never charges (no applied tag), the fourth nothing.
+        _seed_tag(server, anomaly, PENALISED_TAG)
         _seed_prediction(server, anomaly, PENALISED_TAG, confidence=0.9)
         _seed_prediction(server, content_only, CONTENT_TAG, confidence=0.9)
+        _seed_prediction(server, predicted_only, PENALISED_TAG, confidence=0.9)
 
         cleared = server.vault.db.run_task(
             lambda s: (
@@ -967,11 +981,13 @@ def test_invalidate_all_anomaly_scores_clears_only_anomaly_bearing_pictures():
         assert cleared == 1
         assert _get_smart_score(server, anomaly) is None
         assert _get_smart_score(server, content_only) == 0.5
+        assert _get_smart_score(server, predicted_only) == 0.5
         assert _get_smart_score(server, clean) == 0.5
 
         missing = _find_missing_ids(server)
         assert anomaly in missing
         assert content_only not in missing and clean not in missing
+        assert predicted_only not in missing
     finally:
         server.close()
         temp_dir.cleanup()
@@ -987,9 +1003,10 @@ def test_threshold_offset_change_invalidates_anomaly_scores_via_patch():
         # NULLs the anomaly score, the live MissingSmartScoreFinder would otherwise
         # re-score it and make the `is None` assertion racy. The offset-change
         # invalidation runs on the DB queue, so it is unaffected by stopping the planner.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         for pic_id in (anomaly, content_only):
             _set_smart_score(server, pic_id, 0.5)
+        _seed_tag(server, anomaly, PENALISED_TAG)
         _seed_prediction(server, anomaly, PENALISED_TAG, confidence=0.9)
         _seed_prediction(server, content_only, CONTENT_TAG, confidence=0.9)
 
@@ -1010,6 +1027,9 @@ def test_identical_threshold_offset_save_is_a_noop():
     temp_dir, client, server = _setup()
     try:
         pic_id = _upload_picture(client)
+        # Applied as well as predicted, so a real offset move *would* clear it and the
+        # surviving score below proves the guard rather than the picture's exemption.
+        _seed_tag(server, pic_id, PENALISED_TAG)
         _seed_prediction(server, pic_id, PENALISED_TAG, confidence=0.9)
 
         # Establish a non-default offset first, then score the picture.
@@ -1064,7 +1084,7 @@ def test_background_task_scores_and_honours_the_users_penalised_tags():
 
         # Drive the finder by hand: the live WorkPlanner would otherwise claim and score
         # the same picture concurrently, making the assertions below racy.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
 
         finder = server.vault._planner_work_finders[TaskType.SMART_SCORE]
         assert hasattr(finder, "_vault"), "finder must carry the vault for thresholds"
@@ -1273,7 +1293,7 @@ def test_interactive_edit_refreshes_card_without_waiting_for_backfill_drain():
         # A second unscored picture keeps the backfill in flight: count_remaining() > 0.
         pending = _upload_picture(client, "Bad2.png")
         # Stop the planner so no background task races us to score/consume.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         _prepare_for_scoring(server, pending)  # embedding + NULL score
 
         # The edited card is scored, then a user edit (tab "tab-a") NULLs and registers it.
@@ -1324,7 +1344,7 @@ def test_full_backfill_emits_once_at_drain_not_per_batch():
             _upload_picture(client, n)
             for n in ("Bad1.png", "Bad2.png", "Reference1.png")
         ]
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         for p in pics:
             _prepare_for_scoring(server, p)  # embedding + NULL score
 
@@ -1371,7 +1391,7 @@ def test_own_origin_edit_does_not_also_pill_on_drain():
     try:
         edited = _upload_picture(client, "Bad1.png")
         # Stop the planner so no background task races us; this edit is the only work.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
 
         # Score, then a real add-penalised-tag from tab "tab-a" NULLs and registers it.
         _set_smart_score(server, edited, 0.5)
@@ -1425,7 +1445,7 @@ def test_drain_still_fires_for_unregistered_ids_alongside_own_origin():
     try:
         edited = _upload_picture(client, "Bad1.png")  # registered under tab-a
         background = _upload_picture(client, "Bad2.png")  # never registered
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
 
         _set_smart_score(server, edited, 0.5)
         assert (
@@ -1474,7 +1494,7 @@ def test_cas_skipped_id_is_not_announced_and_stays_registered():
     try:
         persisted_pic = _upload_picture(client, "Bad1.png")
         skipped_pic = _upload_picture(client, "Bad2.png")
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         # Both registered interactive from the same tab.
         server.vault.interactive_rescore_registry.record(
             [persisted_pic, skipped_pic], "tab-x"
@@ -1531,7 +1551,7 @@ def test_over_cap_demoted_id_falls_back_to_bulk_drain_emit():
     try:
         recorded = _upload_picture(client, "Bad1.png")
         demoted = _upload_picture(client, "Bad2.png")
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
 
         # Shrink the cap so the second interactive id overflows and is demoted.
         server.vault.interactive_rescore_registry = InteractiveRescoreRegistry(
@@ -1589,7 +1609,7 @@ def test_persist_writes_batch_as_single_bulk_statement():
         # Stop the planner after upload (import needs its workers) but before scoring, so
         # no background SmartScoreTask races our manual persist and overwrites the
         # hand-set scores with a real recompute.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         for pid in pic_ids:
             _prepare_for_scoring(server, pid)
 
@@ -1639,8 +1659,10 @@ def test_persist_preserves_metadata_hash():
     try:
         pic_id = _upload_picture(client)
         # Stop the planner after upload (import needs its workers) but before scoring, so
-        # no background SmartScoreTask races our manual persist.
-        server.vault._work_planner.stop()
+        # no background SmartScoreTask races our manual persist. The settle matters here
+        # too: a ComfyUI extraction the upload queued rewrites ``metadata_hash`` itself,
+        # and landing between the two reads it failed this test on a slow run.
+        stop_planner_and_settle(server)
         _prepare_for_scoring(server, pic_id)
 
         h0 = server.vault.db.run_task(lambda s: s.get(Picture, pic_id).metadata_hash)
@@ -1671,7 +1693,7 @@ def test_persist_excludes_picture_deleted_mid_flight():
         pic_id = _upload_picture(client)
         # Stop the planner after upload (import needs its workers) but before scoring, so
         # no background SmartScoreTask races our manual persist.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         _prepare_for_scoring(server, pic_id)
         gone_id = 9_999_999  # never existed → stands in for a hard-deleted row
 
@@ -1708,6 +1730,7 @@ def test_penalised_tag_change_invalidates_atomically_no_second_task():
         bystander = _upload_picture(client, "Changed1.png")
         _set_smart_score(server, carrier, 0.5)
         _set_smart_score(server, bystander, 0.5)
+        _seed_tag(server, carrier, PENALISED_TAG)
         _seed_prediction(server, carrier, PENALISED_TAG, confidence=0.9)
         _seed_prediction(server, bystander, "bad anatomy", confidence=0.9)
 

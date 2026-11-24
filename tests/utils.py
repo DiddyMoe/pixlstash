@@ -367,6 +367,68 @@ def quiesce_background_work(server, timeout_s=60.0):
     )
 
 
+def stop_planner_and_settle(server, timeout_s: float = 120.0) -> None:
+    """Stop *server*'s planner and wait out the work it already handed off.
+
+    ``WorkPlanner.stop()`` stops the loop that FINDS work. It does not touch
+    the ``TaskRunner``, which owns its own queues and worker threads, so a task
+    the planner submitted seconds earlier is still queued or already executing
+    when ``stop()`` returns - measured on a fresh two-picture import: one task
+    on the GPU queue and a ``FaceExtractionTask`` running.
+
+    A test that stops the planner to hold its rows still cannot survive that.
+    ``TagTask`` deletes a picture's tags before writing its own, so a tagger
+    still in flight lands inside a test body, wipes a tag row the test just
+    posted, and leaves the tagger's own vocabulary in its place
+    (``tests/test_read_token_security.py``). A ComfyUI extraction still in
+    flight rewrites ``metadata_hash`` and the workflow hash columns between
+    two reads the test expects to agree
+    (``tests/test_smart_score_invalidation.py``). Both passed on a machine fast
+    enough to finish the pipeline during setup and failed on one that was not.
+
+    Same shape as ``tests/test_picture_mutation_scope.py``'s pipeline settle:
+    drain what is queued, then wait for what is running. Looped, because a
+    finishing task's completion callback can submit its own follow-up. Queued
+    tasks are cancelled, not run: the cancellation fires their completion
+    callbacks, so the finders release the pictures they had claimed and a test
+    can still drive a finder by hand afterwards.
+
+    **The planner thread has to be dead before the queues mean anything.**
+    ``stop()`` joins it for ``STOP_JOIN_TIMEOUT_S`` and then returns whether or
+    not it exited; a pass slow enough on a loaded runner outlives that, and the
+    loop then submits the ``TagTask`` its pass had found *after* this helper
+    saw empty queues and returned, seen with a pass that took eleven seconds.
+    So the queues are only read once ``is_running()`` is false.
+
+    Args:
+        server: The ``Server`` whose background work should stop.
+        timeout_s: How long to wait for the planner to exit and running tasks
+            to finish.
+
+    Raises:
+        AssertionError: If the work does not settle within ``timeout_s``.
+    """
+    planner = server.vault._work_planner
+    planner.stop()
+    runner = server.vault._task_runner
+    deadline = time.monotonic() + timeout_s
+    active = []
+    while time.monotonic() < deadline:
+        if planner.is_running():
+            time.sleep(0.05)
+            continue
+        runner.cancel_pending_tasks()
+        with runner._active_task_lock:
+            active = list(runner._active_tasks.values())
+        if not active and runner._queue.empty() and runner._gpu_queue.empty():
+            return
+        time.sleep(0.05)
+    raise AssertionError(
+        f"background work did not settle within {timeout_s}s; planner running: "
+        f"{planner.is_running()}, still running: {active}"
+    )
+
+
 def mint_read_token(owner_client, description: str, **restriction) -> str:
     """Mint a READ token as the owner and return its secret value.
 

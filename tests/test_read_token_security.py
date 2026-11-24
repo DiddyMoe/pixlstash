@@ -87,7 +87,11 @@ from pixlstash.server import Server
 from pixlstash.services.workflow_hash import asset_reference, normalized_filename
 from pixlstash.utils.rate_limiter import RateLimitMiddleware
 from tests.test_workflow_identity import _graph as _workflow_graph
-from tests.utils import mint_read_token, upload_pictures_and_wait
+from tests.utils import (
+    mint_read_token,
+    stop_planner_and_settle,
+    upload_pictures_and_wait,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -309,55 +313,6 @@ def _setup_two_picture_sets(tmp: str):
 # ---------------------------------------------------------------------------
 
 
-def _stop_planner_and_settle(server, timeout_s: float = 120.0) -> None:
-    """Stop *server*'s planner and wait out the work it already handed off.
-
-    ``WorkPlanner.stop()`` stops the loop that FINDS work. It does not touch
-    the ``TaskRunner``, which owns its own queues and worker threads, so a task
-    the planner submitted seconds earlier is still queued or already executing
-    when ``stop()`` returns - measured on this very fixture: one task on the
-    GPU queue and a ``FaceExtractionTask`` running.
-
-    That is what a shared module environment cannot survive. ``TagTask``
-    deletes a picture's tags before writing its own, so a tagger still in
-    flight lands inside a test body, wipes the ``tag-a-only`` row the test just
-    posted, and leaves the tagger's own vocabulary in its place - which is
-    exactly how ``test_list_all_tags_cannot_leak_out_of_scope_vocab`` failed on
-    a CI runner slow enough to keep the pipeline alive that long, while passing
-    on every machine fast enough to finish it during setup.
-
-    Same shape as ``tests/test_picture_mutation_scope.py``'s pipeline settle:
-    drain what is queued, then wait for what is running. Looped, because a
-    finishing task's completion callback can submit its own follow-up.
-
-    **The planner thread has to be dead before the queues mean anything.**
-    ``stop()`` joins it for ``STOP_JOIN_TIMEOUT_S`` and then returns whether or
-    not it exited; a pass slow enough on a loaded runner outlives that, and the
-    loop then submits the ``TagTask`` its pass had found *after* this helper
-    saw empty queues and returned. Exactly the failure described above, seen
-    again with a pass that took eleven seconds. So the queues are only read
-    once ``is_running()`` is false.
-    """
-    planner = server.vault._work_planner
-    planner.stop()
-    runner = server.vault._task_runner
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if planner.is_running():
-            time.sleep(0.05)
-            continue
-        runner.cancel_pending_tasks()
-        with runner._active_task_lock:
-            active = list(runner._active_tasks.values())
-        if not active and runner._queue.empty() and runner._gpu_queue.empty():
-            return
-        time.sleep(0.05)
-    raise AssertionError(
-        f"the import pipeline did not settle within {timeout_s}s; still "
-        f"running: {active}"
-    )
-
-
 def _clear_rate_limit_window(server) -> None:
     """Empty the global rate limiter's sliding window on *server*.
 
@@ -504,8 +459,8 @@ def _two_set_env():
 
     The planner is stopped once the two imports are done, and the work it has
     ALREADY handed to the runner is waited out - see
-    {@link _stop_planner_and_settle}, which is the half this fixture used to
-    skip. Nothing after setup imports a picture, so there is no legitimate work
+    ``tests.utils.stop_planner_and_settle``, which is the half this fixture
+    used to skip. Nothing after setup imports a picture, so there is no legitimate work
     left here - but several of these tests hand-write ``Tag``, ``Character``
     and ``PictureStack`` rows, and a ``TagTask`` still in flight (it deletes a
     picture's tags before rewriting them) or a stack-cohesion sweep would
@@ -517,7 +472,7 @@ def _two_set_env():
     with tempfile.TemporaryDirectory() as tmp:
         env = _setup_two_picture_sets(tmp)
         try:
-            _stop_planner_and_settle(env.server)
+            stop_planner_and_settle(env.server)
             yield env
         finally:
             env.server.__exit__(None, None, None)
@@ -706,7 +661,7 @@ def _comfyui_stack_env():
 
             ids = _seed_stack_pictures(server)
             _form_stacks(server, ids)
-            _stop_planner_and_settle(server)
+            stop_planner_and_settle(server)
 
             yield SimpleNamespace(server=server, owner_client=owner_client, ids=ids)
         finally:

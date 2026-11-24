@@ -31,12 +31,14 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterable
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import event, func, inspect as sa_inspect, or_, update
 from sqlmodel import select
 
+from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture, Tag, TagPrediction
 from pixlstash.db_models.tag import DEFAULT_TAG_MERGES
 from pixlstash.scoring import fetch_anomaly_confidences
+from pixlstash.scoring.smart_score import anchor_signature, is_anchor_score
 from pixlstash.utils.quality.anomaly_penalty import (
     ANOMALY_FAMILIES,
     ANOMALY_PENALTY_TAGS,
@@ -44,6 +46,7 @@ from pixlstash.utils.quality.anomaly_penalty import (
     normalise_tag_weights,
 )
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.service.label_ledger import HUMAN, POS
 from pixlstash.utils.sql_chunking import chunked
 
 if TYPE_CHECKING:
@@ -336,23 +339,31 @@ def changed_penalised_tags(before: dict | None, after: dict | None) -> set[str]:
 def invalidate_for_penalised_tag_change(
     session: "Session", changed_tags: Iterable[str]
 ) -> int:
-    """NULL the cached score of every picture carrying one of *changed_tags*.
+    """NULL the cached score of every picture the changed weights are charged against.
 
-    Re-weighting a penalised tag only moves the score of pictures that actually carry
-    that tag, so invalidating the whole library (the previous behaviour) forced a full
-    re-score of every picture on any settings edit - tens of thousands of GPU-backed
-    recomputes to fix a few hundred rows.
+    Re-weighting a penalised tag only moves the score of pictures the penalty actually
+    charges for that tag, so invalidating the whole library forced a full re-score of
+    every picture on any settings edit.
 
-    "Carrying" spans both label sources the penalty reads: an applied :class:`Tag` row,
-    or an anomaly :class:`TagPrediction` row (which is what
-    :func:`~pixlstash.scoring.smart_score.fetch_anomaly_confidences` actually feeds the
-    scorer, including human POS/NEG decisions). Predictions are matched without a
-    confidence gate on purpose: a weight change must invalidate a picture whose
-    prediction sits either side of the apply threshold, and over-invalidating a handful
-    of rows is far cheaper than missing a stale score.
+    "Charged" is exactly what
+    :func:`~pixlstash.scoring.smart_score.fetch_anomaly_confidences` feeds the penalty,
+    and nothing wider:
+
+    * an applied :class:`Tag` row (a model prediction counts only with one), or
+    * a **human POS** :class:`TagPrediction`, which counts with no ``Tag`` row.
+
+    A model prediction with no applied tag is dropped by the scorer under any weight,
+    and a human NEG folds to 0, so neither can move. Matching *any* prediction row, as
+    this once did, matched nearly the whole library: the tagger stores a score for
+    every anomaly label on every picture it tags, so removing one penalised tag
+    re-scored every tagged picture and ran a library-wide UPDATE inside the settings
+    request. Weights shared across a family are already covered, because
+    :func:`changed_penalised_tags` expands a moved family to all its members.
 
     Issued as one bulk UPDATE per tag chunk with an ``IN (subquery)``, so no picture ids
-    are round-tripped into Python. Does **not** commit - the caller owns the transaction.
+    are round-tripped into Python. The prediction side is a lookup on the
+    ``label_source`` index rather than a scan. Does **not** commit - the caller owns the
+    transaction.
 
     Args:
         session: Active DB session.
@@ -371,14 +382,16 @@ def invalidate_for_penalised_tag_change(
     cleared = 0
     for chunk in chunked(tags):
         tagged = select(Tag.picture_id).where(func.lower(Tag.tag).in_(chunk))
-        predicted = select(TagPrediction.picture_id).where(
-            func.lower(TagPrediction.tag).in_(chunk)
+        confirmed = select(TagPrediction.picture_id).where(
+            TagPrediction.label_source == HUMAN,
+            TagPrediction.label_state == POS,
+            func.lower(TagPrediction.tag).in_(chunk),
         )
         result = session.exec(
             update(Picture)
             .where(
                 Picture.smart_score.is_not(None),
-                or_(Picture.id.in_(tagged), Picture.id.in_(predicted)),
+                or_(Picture.id.in_(tagged), Picture.id.in_(confirmed)),
             )
             .values(smart_score=None)
         )
@@ -394,7 +407,7 @@ def invalidate_for_penalised_tag_change(
 
 
 def invalidate_all_anomaly_scores(session: "Session", *, context: str) -> int:
-    """NULL the cached score of every picture that carries an anomaly prediction.
+    """NULL the cached score of every picture carrying an applied anomaly tag.
 
     The tagger's ``threshold_offset`` moves *two* things at once for every anomaly
     detection: the apply gate in
@@ -405,14 +418,17 @@ def invalidate_all_anomaly_scores(session: "Session", *, context: str) -> int:
     regardless of which specific tag is involved - so this is deliberately not scoped by
     tag the way :func:`invalidate_for_penalised_tag_change` is.
 
-    The set is still bounded to *anomaly-bearing* pictures rather than the whole vault:
-    the scorer's anomaly inputs come solely from :class:`TagPrediction` rows in the anomaly
-    vocabulary (:data:`~pixlstash.utils.quality.anomaly_penalty.ANOMALY_PENALTY_TAGS` -
-    exactly what ``fetch_anomaly_confidences`` reads). A picture with no such prediction has
-    no anomaly term, so the offset cannot have moved its score, and re-scoring it would be a
-    needless GPU-backed recompute. Predictions are matched without a confidence gate on
-    purpose: the offset shifts the gate itself, so a prediction sitting either side of the
-    old threshold can cross it and must be re-evaluated.
+    The set is bounded to the pictures the offset can actually move: those with an
+    applied :class:`Tag` in the anomaly vocabulary
+    (:data:`~pixlstash.utils.quality.anomaly_penalty.ANOMALY_PENALTY_TAGS`). The offset
+    acts only on *model* predictions, and ``fetch_anomaly_confidences`` charges a model
+    prediction only when its tag is applied, at any threshold. A human POS is 1.0, which
+    normalises to 1 against any threshold, and a human NEG is 0, so neither moves either.
+    Matching every anomaly :class:`TagPrediction` instead, as this once did, matched
+    nearly the whole library, because the tagger stores a score for every anomaly label
+    on every picture it tags. No confidence gate is applied to the tag rows: the offset
+    shifts the gate itself, so a prediction either side of the old threshold must be
+    re-evaluated.
 
     Issued as one bulk UPDATE per tag chunk with an ``IN (subquery)``, so no picture ids are
     round-tripped into Python. Does **not** commit - the caller owns the transaction.
@@ -434,21 +450,19 @@ def invalidate_all_anomaly_scores(session: "Session", *, context: str) -> int:
         return 0
     cleared = 0
     for chunk in chunked(tags):
-        predicted = select(TagPrediction.picture_id).where(
-            func.lower(TagPrediction.tag).in_(chunk)
-        )
+        tagged = select(Tag.picture_id).where(func.lower(Tag.tag).in_(chunk))
         result = session.exec(
             update(Picture)
             .where(
                 Picture.smart_score.is_not(None),
-                Picture.id.in_(predicted),
+                Picture.id.in_(tagged),
             )
             .values(smart_score=None)
         )
         cleared += result.rowcount or 0
     logger.info(
         "Smart-score invalidation (%s): tagger threshold offset changed, cleared %d "
-        "cached anomaly-bearing score(s) for recompute.",
+        "cached score(s) of pictures carrying an anomaly tag for recompute.",
         context,
         cleared,
     )
@@ -510,13 +524,16 @@ def invalidate_on_anomaly_change(
 def invalidate_all_smart_scores(session: "Session") -> int:
     """NULL every cached smart score in this library. Does not commit.
 
-    The blunt instrument, for the one case where a narrow diff is not available:
-    the owner's penalty weights changed while this library was closed, and the
-    library stores only a keyed hash of those weights, never the weights
-    themselves (see
-    :func:`pixlstash.services.library_settings_service.reconcile_settings_fingerprint`).
-    Knowing *that* something changed without knowing *what* leaves no way to
-    scope it.
+    The blunt instrument, for the two cases where no narrower set is correct:
+
+    * the owner's penalty weights changed while this library was closed, and the
+      library stores only a keyed hash of those weights, never the weights
+      themselves (see
+      :func:`pixlstash.services.library_settings_service.reconcile_settings_fingerprint`).
+      Knowing *that* something changed without knowing *what* leaves no way to
+      scope it;
+    * the anchor set moved (:class:`SmartScoreAnchorWatch`): every score is a
+      distance from the anchors, so every score depends on them.
 
     Cheaper than it sounds: recomputing a smart score reads tags and quality
     metrics and runs no AI models, and it happens in background batches.
@@ -623,3 +640,398 @@ def apply_pending_invalidations(session: "Session") -> int:
             cleared,
         )
     return cleared
+
+
+# ---------------------------------------------------------------------------
+# Anchor watch: clear every score only when the scorer's anchors really move
+# ---------------------------------------------------------------------------
+
+#: ``Session.info`` key under which a writer session carries the vault's watch.
+ANCHOR_WATCH_SESSION_KEY = "smart_score_anchor_watch"
+# Set once a session has captured the baseline and armed its after_commit check;
+# popped when that commit lands.
+_ANCHOR_NOTED_KEY = "_smart_score_anchor_noted"
+# The same for an embedding write, whose check waits for the quiet period.
+_EMBEDDING_NOTED_KEY = "_smart_score_embedding_noted"
+# Marks an attribute the object has not loaded. Unknown means "could be an
+# anchor": an extra check costs two LIMIT 200 queries, a missed one leaves every
+# score in the library stale.
+_UNLOADED = object()
+
+#: Seconds without an embedding write on a rated picture before the watch checks
+#: the anchors. Embeddings land in batches; checking after each one would clear
+#: the library once per batch while a folder of rated pictures is embedded.
+#: Read at call time, so a test can shorten it.
+EMBEDDING_QUIET_S = 60.0
+
+
+class SmartScoreAnchorWatch:
+    """Clears every cached smart score when, and only when, the anchor set changes.
+
+    Every smart score is a distance from the user's top-rated (good) and
+    bottom-rated (bad) pictures, capped at
+    :data:`~pixlstash.scoring.smart_score.ANCHOR_LIMIT` per side. When that set
+    moves, every cached score is stale. Before this watch the rating routes
+    cleared the whole library whenever *one* rating crossed an anchor boundary,
+    even when the picture never made the capped set, and the other writers of
+    ``score`` and ``deleted`` (undo, the scrapheap, dedup's score lift) cleared
+    nothing.
+
+    The watch is a writer-session hook (see
+    :meth:`pixlstash.database.VaultDatabase.add_session_hook`), so it sees every
+    ORM write without each call site having to remember it:
+
+    1. ``before_flush``: a ``Picture`` whose ``score`` or ``deleted`` changes in
+       a way that can touch anchor eligibility makes the watch capture the
+       current :func:`~pixlstash.scoring.smart_score.anchor_signature` as its
+       baseline (unless it holds one), before the change is written.
+    2. ``after_commit``: one LOW-priority check is queued; checks already queued
+       absorb later commits.
+    3. The check compares the signature now with the baseline and clears every
+       score only if they differ, logging what moved.
+
+    Writers that bypass the ORM (a Core ``UPDATE`` of ``score``) call
+    :func:`note_anchor_inputs_changing` before writing.
+
+    An embedding landing on a picture rated into an anchor class moves the set
+    too: a picture is an anchor only once it has an embedding. Embeddings
+    arrive in batches, so that commit does not queue the check at once. It
+    (re)starts a :data:`EMBEDDING_QUIET_S` timer, and the check runs when the
+    timer expires without another such commit. Because the baseline is captured
+    before the first write, a folder of rated pictures being embedded costs one
+    comparison and at most one clear, at the end.
+
+    An embedding *removed* from an anchor captures the baseline and arms
+    nothing. The only writer that removes one in normal use is a turn, which
+    re-queues the embedding; the arrival that follows arms the check, and it
+    compares against a baseline that still holds the anchor. Checking at the
+    removal would clear the library when the anchor left and again when it
+    came back. An embedding that never returns is counted at the next check
+    that runs.
+
+    Not watched: an anchor whose embedding is replaced while its rating stays
+    (a turn re-embeds the picture). The signature holds ids and ratings, so
+    once the new embedding lands the set reads as unchanged, and scores keep
+    the distance to the pre-turn embedding until something else clears them.
+
+    Thread safety: the hooks and the check run on the writer thread, the quiet
+    timer on its own thread; :attr:`epoch` is read from task threads and
+    :meth:`forget_baseline` from the restore thread, hence the lock.
+
+    Args:
+        db: The vault's :class:`~pixlstash.database.VaultDatabase`, used to queue
+            the check.
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+        self._lock = threading.Lock()
+        self._baseline: tuple[frozenset, frozenset] | None = None
+        self._check_pending = False
+        self._epoch = 0
+        self._closed = False
+        self._quiet_timer: threading.Timer | None = None
+        # Bumped whenever the timer is replaced or cancelled. Timer.cancel()
+        # cannot stop a callback that has already started, so the callback
+        # compares the generation it was armed with before it queues a check.
+        self._quiet_generation = 0
+
+    @property
+    def epoch(self) -> int:
+        """Counts library-wide clears. A scorer reads it before it reads anchors.
+
+        A batch scored from anchors read before a clear must not be written
+        after it, or it resurrects scores the clear just invalidated; comparing
+        the epoch at write time catches that (see
+        :meth:`pixlstash.tasks.smart_score_task.SmartScoreTask._persist_scores`).
+        """
+        with self._lock:
+            return self._epoch
+
+    def attach(self, session: "Session") -> None:
+        """Watch *session*. Registered through ``VaultDatabase.add_session_hook``."""
+        session.info[ANCHOR_WATCH_SESSION_KEY] = self
+        event.listen(session, "before_flush", self._before_flush)
+
+    def note_changing(self, session: "Session") -> None:
+        """Record that *session* is about to write something that may move the anchors.
+
+        Captures the baseline from the session's current state if the watch has
+        none, so it must run before the write. Arms one check for the session's
+        next commit.
+        """
+        if session.info.get(_ANCHOR_NOTED_KEY):
+            return
+        self._capture_baseline(session)
+        session.info[_ANCHOR_NOTED_KEY] = True
+        event.listen(session, "after_commit", self._after_commit, once=True)
+
+    def request_check(self) -> None:
+        """Queue one anchor check unless one is already queued."""
+        with self._lock:
+            if self._check_pending:
+                return
+            self._check_pending = True
+        future = self._db.submit_task(self._check, priority=DBPriority.LOW)
+        future.add_done_callback(self._on_check_done)
+
+    def forget_baseline(self) -> None:
+        """Drop the baseline; call after the database underneath was replaced.
+
+        The baseline describes the old file. Kept, the next check would compare
+        a different library's anchors with it and clear for no reason. A
+        pending quiet-period check belongs to the old file too, so it is
+        cancelled.
+        """
+        with self._lock:
+            self._baseline = None
+            self._cancel_quiet_check_locked()
+
+    def close(self) -> None:
+        """Cancel a pending quiet-period check and arm no more. Idempotent.
+
+        Called by :meth:`pixlstash.vault.Vault.stop`, which closes the database
+        the check would be queued on.
+        """
+        with self._lock:
+            self._closed = True
+            self._cancel_quiet_check_locked()
+
+    def _capture_baseline(self, session: "Session") -> None:
+        """Read the anchors as the baseline unless one is held. Run before the write."""
+        with self._lock:
+            need_baseline = self._baseline is None
+        if not need_baseline:
+            return
+        with session.no_autoflush:
+            baseline = anchor_signature(session)
+        with self._lock:
+            if self._baseline is None:
+                self._baseline = baseline
+
+    def _before_flush(self, session: "Session", flush_context, instances) -> None:
+        if session.info.get(_ANCHOR_NOTED_KEY):
+            return
+        # A rating, delete or new anchor queues the check at commit. It compares
+        # the whole set, so it also covers an embedding written in this flush.
+        if _flush_may_move_anchors(session):
+            self.note_changing(session)
+            return
+        if session.info.get(_EMBEDDING_NOTED_KEY):
+            return
+        for obj in session.dirty:
+            if not (
+                isinstance(obj, Picture) and _embedding_change_may_move_anchors(obj)
+            ):
+                continue
+            self._capture_baseline(session)
+            if _loaded(obj, "image_embedding") is None:
+                # Removed: a turn clears the embedding and re-queues it. The
+                # check the re-embed arms compares against this baseline, which
+                # still holds the anchor, so a turn alone clears nothing.
+                continue
+            session.info[_EMBEDDING_NOTED_KEY] = True
+            event.listen(
+                session, "after_commit", self._after_embedding_commit, once=True
+            )
+            return
+
+    def _after_commit(self, session: "Session") -> None:
+        session.info.pop(_ANCHOR_NOTED_KEY, None)
+        self.request_check()
+
+    def _after_embedding_commit(self, session: "Session") -> None:
+        session.info.pop(_EMBEDDING_NOTED_KEY, None)
+        self._schedule_quiet_check()
+
+    def _schedule_quiet_check(self) -> None:
+        """(Re)start the quiet-period timer, so the check follows the last write."""
+        with self._lock:
+            if self._closed:
+                return
+            self._cancel_quiet_check_locked()
+            timer = threading.Timer(
+                EMBEDDING_QUIET_S, self._on_quiet, args=(self._quiet_generation,)
+            )
+            timer.name = "smart-score-anchor-quiet"
+            timer.daemon = True
+            self._quiet_timer = timer
+            timer.start()
+
+    def _cancel_quiet_check_locked(self) -> None:
+        """Cancel the pending quiet-period check. The caller holds ``_lock``."""
+        self._quiet_generation += 1
+        if self._quiet_timer is not None:
+            self._quiet_timer.cancel()
+            self._quiet_timer = None
+
+    def _on_quiet(self, generation: int) -> None:
+        with self._lock:
+            if self._closed or generation != self._quiet_generation:
+                return
+            self._quiet_timer = None
+        self.request_check()
+
+    def _check(self, session: "Session") -> int:
+        with self._lock:
+            self._check_pending = False
+            baseline = self._baseline
+        current = anchor_signature(session)
+        if baseline is None or baseline == current:
+            with self._lock:
+                self._baseline = current
+            return 0
+        cleared = invalidate_all_smart_scores(session)
+        session.commit()
+        # Bumped only after the commit: a scorer that reads the epoch and then
+        # the anchors must never pair the new epoch with the old anchors.
+        with self._lock:
+            self._baseline = current
+            self._epoch += 1
+        logger.info(
+            "Smart-score anchors changed (good: %s; bad: %s); cleared %d cached "
+            "smart score(s) for rescoring.",
+            _describe_anchor_change(baseline[0], current[0]),
+            _describe_anchor_change(baseline[1], current[1]),
+            cleared,
+        )
+        return cleared
+
+    def _on_check_done(self, future) -> None:
+        exc = future.exception()
+        if exc is None:
+            return
+        with self._lock:
+            self._check_pending = False
+        logger.error(
+            "Smart-score anchor check failed: %s. Cached smart scores stay as they "
+            "are; the next rating change retries the check.",
+            exc,
+            exc_info=exc,
+        )
+
+
+def note_anchor_inputs_changing(session: "Session") -> None:
+    """Tell the anchor watch a write that bypasses the ORM may move the anchors.
+
+    Call it before the write, in the writer session that makes it. The ORM path
+    needs no call: the watch's ``before_flush`` hook sees those writes.
+    """
+    watch = session.info.get(ANCHOR_WATCH_SESSION_KEY)
+    if watch is None:
+        logger.warning(
+            "No smart-score anchor watch on this session; a rating change that may "
+            "move the anchors goes unchecked and cached smart scores can go stale. "
+            "Only writer sessions of a Vault carry the watch."
+        )
+        return
+    watch.note_changing(session)
+
+
+def anchors_cleared_since(session: "Session", epoch: int) -> bool:
+    """Whether the anchor watch cleared every score after *epoch* was read.
+
+    Args:
+        session: A writer session (it carries the watch).
+        epoch: :attr:`SmartScoreAnchorWatch.epoch` as read before the anchors were.
+    """
+    watch = session.info.get(ANCHOR_WATCH_SESSION_KEY)
+    if watch is None:
+        logger.warning(
+            "No smart-score anchor watch on this session; cannot tell whether the "
+            "anchors moved since epoch %d, so the scores are written as computed.",
+            epoch,
+        )
+        return False
+    return watch.epoch != epoch
+
+
+def _loaded(obj, name: str):
+    """The value of *name* on *obj* without loading it, or ``_UNLOADED``."""
+    return sa_inspect(obj).dict.get(name, _UNLOADED)
+
+
+def _could_be_anchor(score, deleted, embedding) -> bool:
+    """Whether a picture with these values could sit in the anchor set.
+
+    An unloaded value (``_UNLOADED``) counts as "could": the watch errs towards
+    a check.
+    """
+    if embedding is None:
+        return False
+    if deleted is not _UNLOADED and deleted:
+        return False
+    if score is _UNLOADED:
+        return True
+    return is_anchor_score(score)
+
+
+def _old_and_new(obj, name: str) -> tuple:
+    """``(old, new, changed)`` for *name* in the flush about to run.
+
+    ``old`` is ``_UNLOADED`` when the attribute was assigned without its
+    committed value ever being loaded.
+    """
+    history = sa_inspect(obj).attrs[name].history
+    if not history.has_changes():
+        current = _loaded(obj, name)
+        return current, current, False
+    new = history.added[0] if history.added else None
+    old = history.deleted[0] if history.deleted else _UNLOADED
+    return old, new, True
+
+
+def _change_may_move_anchors(obj) -> bool:
+    old_score, new_score, score_changed = _old_and_new(obj, "score")
+    old_deleted, new_deleted, deleted_changed = _old_and_new(obj, "deleted")
+    if not (score_changed or deleted_changed):
+        return False
+    # Each side is judged with its own embedding: a flush that clears an
+    # anchor's rating and its embedding together still takes it out of the set.
+    old_embedding, new_embedding, _ = _old_and_new(obj, "image_embedding")
+    return _could_be_anchor(old_score, old_deleted, old_embedding) or (
+        _could_be_anchor(new_score, new_deleted, new_embedding)
+    )
+
+
+def _flush_may_move_anchors(session: "Session") -> bool:
+    """Whether a new, deleted or re-rated picture in this flush can move the anchors."""
+    for obj in (*session.new, *session.deleted):
+        if isinstance(obj, Picture) and _could_be_anchor(
+            _loaded(obj, "score"),
+            _loaded(obj, "deleted"),
+            _loaded(obj, "image_embedding"),
+        ):
+            return True
+    return any(
+        isinstance(obj, Picture) and _change_may_move_anchors(obj)
+        for obj in session.dirty
+    )
+
+
+def _embedding_change_may_move_anchors(obj) -> bool:
+    """Whether this flush writes or removes the embedding of a possible anchor.
+
+    The caller tells the two apart: only a write arms a check.
+
+    Only the embedding moves here: a flush that also changes the score or
+    ``deleted`` was judged, both sides, by :func:`_flush_may_move_anchors`.
+    """
+    _, _, changed = _old_and_new(obj, "image_embedding")
+    if not changed:
+        return False
+    deleted = _loaded(obj, "deleted")
+    if deleted is not _UNLOADED and deleted:
+        return False
+    score = _loaded(obj, "score")
+    return score is _UNLOADED or is_anchor_score(score)
+
+
+def _describe_anchor_change(before: frozenset, after: frozenset) -> str:
+    """``"+entered -left ~rescored"`` between two anchor-side signatures."""
+    old = dict(before)
+    new = dict(after)
+    entered = len(new.keys() - old.keys())
+    left = len(old.keys() - new.keys())
+    rescored = sum(1 for pid in new.keys() & old.keys() if new[pid] != old[pid])
+    return f"+{entered} -{left} ~{rescored}"

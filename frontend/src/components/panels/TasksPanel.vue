@@ -1781,6 +1781,7 @@ const tmLabelMap = {
   workflows_carded: "Workflow cards",
   training_previews_scored: "Training preview faces",
   text_score: "Text score",
+  smart_scored: "Smart score",
   text_read: "Text in pictures",
   object_detection: "Object detection",
 };

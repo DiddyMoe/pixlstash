@@ -661,6 +661,7 @@ jobs:
           tests/test_share_copies.py
           tests/test_share_link_library_pin.py
           tests/test_sidebar_counts_query_cost.py
+          tests/test_smart_score_anchor_watch.py
           tests/test_smart_score_consistency.py
           tests/test_smart_score_face_resolution.py
           tests/test_snapshots.py

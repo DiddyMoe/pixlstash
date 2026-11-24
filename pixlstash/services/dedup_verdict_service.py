@@ -133,6 +133,9 @@ from pixlstash.services.stack_membership import (
 )
 from pixlstash.stacking import normalize_stack_positions
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.service.smart_score_invalidation import (
+    invalidate_on_anomaly_change,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pixlstash.vault import Vault
@@ -405,10 +408,17 @@ def apply_metadata_union_in_session(
         tags_by_picture.setdefault(int(picture_id), set()).add(str(tag))
         union.add(str(tag))
     tags_added = 0
-    for picture_id in picture_ids:
-        for tag in sorted(union - tags_by_picture.get(picture_id, set())):
-            session.add(Tag(picture_id=picture_id, tag=tag))
-            tags_added += 1
+    # A unioned tag can be an anomaly tag ("malformed eyes" on one member reaches
+    # all of them), and a Tag row is a human-verified label the scorer penalises.
+    # The guard clears the cached smart score of exactly the members whose anomaly
+    # inputs moved, so the stack does not keep scores computed without the penalty.
+    with invalidate_on_anomaly_change(
+        session, picture_ids, context="dedup metadata union"
+    ):
+        for picture_id in picture_ids:
+            for tag in sorted(union - tags_by_picture.get(picture_id, set())):
+                session.add(Tag(picture_id=picture_id, tag=tag))
+                tags_added += 1
 
     # --- Score: lift every member to the highest rating in the group ---
     pictures = session.exec(select(Picture).where(Picture.id.in_(picture_ids))).all()

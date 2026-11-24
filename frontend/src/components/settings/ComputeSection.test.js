@@ -592,3 +592,49 @@ describe("a hidden pane reads nothing and a tab switch keeps its edits", () => {
     }
   });
 });
+
+describe("PixlStash's VRAM limit", () => {
+  beforeEach(() => {
+    compute.getComputeGpus.mockReset().mockResolvedValue(gpuAnswer());
+    compute.patchUserConfig.mockReset().mockResolvedValue({});
+    delete window.pixlstashDesktop;
+  });
+
+  const vramRow = (wrapper) => wrapper.find(".vram-row");
+
+  it("is bounded by the card that comes with the config, not by a later poll", async () => {
+    compute.getUserConfig.mockReset().mockResolvedValue({ max_vram_gb: 8, vram_total_gb: 16.0 });
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
+    await flushPromises();
+    // A 16 GB card keeps 2 GB back: 14, as the progress-poll bound gave.
+    expect(wrapper.findComponent({ name: "v-slider" }).attributes("max")).toBe("14");
+    expect(vramRow(wrapper).find(".vram-value").text()).toBe("8 GB");
+    expect(vramRow(wrapper).find(".vram-meta").text()).toBe("max 14 GB");
+  });
+
+  it("stays at its floor without a card, and still shows a larger stored limit", async () => {
+    compute.getUserConfig.mockReset().mockResolvedValue({ max_vram_gb: 6, vram_total_gb: null });
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
+    await flushPromises();
+    expect(vramRow(wrapper).find(".vram-meta").text()).toBe("max 6 GB");
+  });
+
+  it("shows no limit while the stored one is still being read", async () => {
+    compute.getUserConfig.mockReset().mockReturnValue(new Promise(() => {}));
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
+    await flushPromises();
+    // The 2 GB floor the slider starts at is nobody's setting.
+    expect(vramRow(wrapper).find(".vram-value").text()).toBe("—");
+    expect(vramRow(wrapper).find(".vram-meta").text()).toBe("Loading…");
+    expect(vramRow(wrapper).text()).not.toContain("2 GB");
+    expect(wrapper.findComponent({ name: "v-slider" }).attributes("disabled")).toBe("true");
+  });
+
+  it("says nothing is loading once the read has failed", async () => {
+    compute.getUserConfig.mockReset().mockRejectedValue(new Error("offline"));
+    const wrapper = mount(ComputeSection, { props: { view: "compute", ...SHOWN } });
+    await flushPromises();
+    expect(vramRow(wrapper).find(".vram-meta").text()).toBe("");
+    expect(wrapper.text()).toContain("Failed to load the sharing settings.");
+  });
+});

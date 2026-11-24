@@ -2,7 +2,7 @@ import logging
 import time
 from typing import Collection
 
-from sqlalchemy import bindparam, desc, func, update
+from sqlalchemy import bindparam, case, func, update
 from sqlalchemy.orm import load_only
 from sqlmodel import Session, select
 
@@ -12,17 +12,18 @@ from pixlstash.db_models import (
     Quality,
 )
 from pixlstash.scoring.smart_score import (
-    _load_builtin_anchors,
-    _BUILTIN_MIN_GOOD,
-    _BUILTIN_MIN_BAD,
     attach_anomaly_inputs,
     fetch_main_face_mpx,
     prepare_smart_score_inputs,
+    read_scoring_anchors,
     resolve_penalised_tag_weights,
 )
 from pixlstash.utils.quality.smart_score_utils import SmartScoreUtils
 from pixlstash.utils.service.anomaly_thresholds import resolve_anomaly_apply_thresholds
-from pixlstash.utils.service.smart_score_invalidation import anomaly_state_signature
+from pixlstash.utils.service.smart_score_invalidation import (
+    anchors_cleared_since,
+    anomaly_state_signature,
+)
 from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask
@@ -80,6 +81,9 @@ class SmartScoreTask(BaseTask):
         owner_penalised_tags = resolve_penalised_tag_weights(
             getattr(self._vault, "auth_service", None)
         )
+        # Read before the anchors are: if the anchor watch clears every score after
+        # this point, _persist_scores sees the epoch moved and drops the batch.
+        anchor_epoch = self._vault.smart_score_anchor_watch.epoch
         fetch_start = time.perf_counter()
         good_anchors, bad_anchors, candidates, scorer_config, before_signature = (
             self._db.run_immediate_read_task(
@@ -115,6 +119,7 @@ class SmartScoreTask(BaseTask):
             self._persist_scores,
             id_to_score,
             before_signature,
+            anchor_epoch=anchor_epoch,
             priority=DBPriority.LOW,
         )
         db_s = time.perf_counter() - db_start
@@ -170,25 +175,6 @@ class SmartScoreTask(BaseTask):
             owner_penalised_tags: The owner's ``{tag: weight}`` table, resolved from the
                 hub by the caller - ``session`` is a vault one and holds no identity.
         """
-        good = session.exec(
-            select(Picture.image_embedding, Picture.score)
-            .where(Picture.score >= 4)
-            .where(Picture.image_embedding.is_not(None))
-            .where(Picture.deleted.is_(False))
-            .order_by(desc(Picture.score), desc(Picture.created_at))
-            .limit(200)
-        ).all()
-
-        bad = session.exec(
-            select(Picture.image_embedding, Picture.score)
-            .where(Picture.score <= 1)
-            .where(Picture.score > 0)
-            .where(Picture.image_embedding.is_not(None))
-            .where(Picture.deleted.is_(False))
-            .order_by(Picture.score, desc(Picture.created_at))
-            .limit(200)
-        ).all()
-
         query = (
             select(Picture, Quality)
             .outerjoin(
@@ -240,12 +226,7 @@ class SmartScoreTask(BaseTask):
             penalised_tag_weights=owner_penalised_tags,
         )
 
-        builtin_good, builtin_bad = _load_builtin_anchors()
-        if len(good) < _BUILTIN_MIN_GOOD:
-            good = list(good) + builtin_good
-        if len(bad) < _BUILTIN_MIN_BAD:
-            bad = list(bad) + builtin_bad
-
+        good, bad = read_scoring_anchors(session)
         before_signature = SmartScoreTask._input_signature(session, candidate_ids)
 
         return good, bad, candidates, scorer_config, before_signature
@@ -262,7 +243,12 @@ class SmartScoreTask(BaseTask):
         return {pid: (anomaly.get(pid), faces.get(pid)) for pid in picture_ids}
 
     @staticmethod
-    def _persist_scores(session: Session, id_to_score: dict, before: dict) -> list[int]:
+    def _persist_scores(
+        session: Session,
+        id_to_score: dict,
+        before: dict,
+        anchor_epoch: int | None = None,
+    ) -> list[int]:
         """Write each computed ``smart_score`` - but only if its inputs did not move.
 
         Scores are computed outside this write transaction. If a concurrent tag edit
@@ -278,11 +264,18 @@ class SmartScoreTask(BaseTask):
         and it rescores from fresh inputs. Writing the old value here would recreate the
         bug.
 
+        The anchors are compared the same way, for the whole batch at once: if the
+        anchor watch cleared every score after *anchor_epoch* was read, these scores
+        came from the old anchors, and writing them would undo the clear for this batch.
+        Nothing is written; the finder re-picks the batch.
+
         Args:
             session: Active DB session.
             id_to_score: ``{picture_id: score}`` computed from the *before* inputs.
             before: Anomaly signature map captured in the read transaction that loaded
                 the scorer inputs.
+            anchor_epoch: :attr:`SmartScoreAnchorWatch.epoch` read before the anchors
+                were; ``None`` skips the anchor comparison.
 
         Returns:
             The picture ids whose score was actually written this transaction, in input
@@ -290,6 +283,14 @@ class SmartScoreTask(BaseTask):
             excluded - the interactive-refresh path keys off this list, so a skipped,
             still-NULL id is never announced as a finished rescore.
         """
+        if anchor_epoch is not None and anchors_cleared_since(session, anchor_epoch):
+            logger.info(
+                "SmartScoreTask: dropped %d score(s) computed from anchors that changed "
+                "during scoring; they are rescored from the new anchors.",
+                len(id_to_score),
+            )
+            return []
+
         after = SmartScoreTask._input_signature(session, list(id_to_score.keys()))
 
         # Compare-and-swap (B1): keep only pictures whose anomaly inputs did not move
@@ -367,6 +368,26 @@ class SmartScoreTask(BaseTask):
         if isinstance(result, (tuple, list)):
             return result[0]
         return result or 0
+
+    @classmethod
+    def count_progress(cls, session: Session) -> tuple[int, int]:
+        """Return ``(scorable, remaining)`` for the Tasks panel, in one pass.
+
+        *scorable* is every picture the scorer can work on (it has an embedding
+        and is not deleted), and *remaining* the share of those still without a
+        score, the same population :meth:`count_remaining` counts. Against the
+        whole library's picture count the row could only ever read "N / N".
+        """
+        scorable, remaining = session.exec(
+            select(
+                func.count(),
+                func.count(case((Picture.smart_score.is_(None), 1))),
+            )
+            .select_from(Picture)
+            .where(Picture.image_embedding.is_not(None))
+            .where(Picture.deleted.is_(False))
+        ).one()
+        return int(scorable or 0), int(remaining or 0)
 
     @staticmethod
     def find_pictures_missing_smart_score(

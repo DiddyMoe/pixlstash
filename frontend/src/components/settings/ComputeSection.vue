@@ -9,7 +9,6 @@ import { login } from "../../utils/apiClient";
 import { getAuthState } from "../../api/users";
 import { getComputeGpus, setComputeGpu } from "../../api/compute";
 import { getUserConfig, patchUserConfig } from "../../api/config";
-import { getWorkerProgress } from "../../api/workers";
 import { formatGb } from "../../utils/gpuMemory";
 import AppButton from "../widgets/AppButton.vue";
 import AppStepper from "../widgets/AppStepper.vue";
@@ -451,22 +450,14 @@ function clampAndSnapVramBudget(value, upperBound = maxVramGbMax.value) {
   return Math.min(maxValue, Math.max(VRAM_BUDGET_MIN_GB, stepped));
 }
 
-async function fetchVramSliderBounds() {
-  try {
-    const progress = await getWorkerProgress();
-    const processData = progress?.process || progress?.system || {};
-    const totalVramGb =
-      processData.vram_total_gb ??
-      processData.vramTotalGb ??
-      processData.total_vram_gb;
-    const derived = deriveMaxVramSliderMax(totalVramGb);
-    // Only ever increase the bound - a transient low reading must not shrink the
-    // slider and cause Vuetify to auto-clamp (and overwrite) the saved budget.
-    if (derived > maxVramGbMax.value) maxVramGbMax.value = derived;
-  } catch (err) {
-    // Leave maxVramGbMax unchanged on failure.
-    console.warn("Could not read the total VRAM for the budget slider's bound.", err);
-  }
+// The card comes with the config, beside the budget it bounds. It used to come
+// from GET /workers/progress, the heaviest poll there is: on a large library
+// under load the slider sat at its 2 GB floor for as long as that took.
+function applyVramSliderBound(totalVramGb) {
+  const derived = deriveMaxVramSliderMax(totalVramGb);
+  // Only ever increase the bound - a transient low reading must not shrink the
+  // slider and cause Vuetify to auto-clamp (and overwrite) the saved budget.
+  if (derived > maxVramGbMax.value) maxVramGbMax.value = derived;
 }
 
 function scheduleMaxVramGbSave() {
@@ -535,8 +526,8 @@ async function loadSharing() {
     autoExclusive.value =
       typeof cfg?.auto_exclusive_after_oom === "boolean" ? cfg.auto_exclusive_after_oom : true;
     autoExclusiveLoaded.value = true;
-    await fetchVramSliderBounds();
     maxVramGbHydrating.value = true;
+    applyVramSliderBound(cfg?.vram_total_gb);
     const parsedMaxVram = Number(cfg?.max_vram_gb);
     const initialValue =
       Number.isFinite(parsedMaxVram) && parsedMaxVram > 0 ? parsedMaxVram : VRAM_BUDGET_MIN_GB;
@@ -894,7 +885,9 @@ onUnmounted(() => {
           sub="Caps PixlStash's own tagging and search. ComfyUI and training are not limited."
         >
           <div class="vram-row">
-            <span class="vram-value">{{ maxVramGbValue }} GB</span>
+            <!-- Nothing is shown as the limit until it is the stored one: the
+                 floor the refs start at is not anybody's setting. -->
+            <span class="vram-value">{{ maxVramGbAutoSaveReady ? `${maxVramGbValue} GB` : "—" }}</span>
             <div class="vram-track">
               <v-slider
                 v-model="maxVramGbValue"
@@ -910,7 +903,8 @@ onUnmounted(() => {
               />
             </div>
             <span class="vram-meta">
-              max {{ maxVramGbMax }} GB
+              <template v-if="maxVramGbAutoSaveReady">max {{ maxVramGbMax }} GB</template>
+              <template v-else-if="!sharingError">Loading…</template>
               <template v-if="maxVramGbError">
                 · <span class="vram-err">{{ maxVramGbError }}</span>
               </template>

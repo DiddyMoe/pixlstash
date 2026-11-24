@@ -21,6 +21,9 @@ def a_card_host(monkeypatch):
     """
     monkeypatch.setattr(vram_utils, "is_apple_silicon", lambda: False)
     monkeypatch.setattr(system_utils, "is_apple_silicon", lambda: False)
+    # The card total is kept once read: each test's simulated card starts
+    # unread, and monkeypatch puts back whatever the process had read before.
+    monkeypatch.setattr(vram_utils, "_card_total_mb", 0)
 
 
 @pytest.mark.parametrize(
@@ -66,3 +69,59 @@ def test_the_settable_ceiling_falls_back_without_a_card(monkeypatch):
 
     monkeypatch.setattr(subprocess, "check_output", missing)
     assert system_utils.max_vram_budget_gb() == system_utils.MAX_VRAM_BUDGET_GB
+
+
+def test_the_card_is_asked_once(monkeypatch):
+    """``GET /users/me/config`` reads the card on every request; one subprocess."""
+    calls = []
+
+    def nvidia_smi(*args, **kwargs):
+        calls.append(args)
+        return "16384\n"
+
+    monkeypatch.setattr(subprocess, "check_output", nvidia_smi)
+    assert vram_utils.query_total_vram_mb() == 16384
+    assert vram_utils.query_total_vram_mb() == 16384
+    assert len(calls) == 1
+
+
+def test_a_card_that_has_not_answered_is_asked_again(monkeypatch):
+    """A 0 can be a driver still starting; keeping it would pin the slider."""
+    answers = iter([FileNotFoundError("nvidia-smi"), "16384\n"])
+
+    def nvidia_smi(*args, **kwargs):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(subprocess, "check_output", nvidia_smi)
+    assert vram_utils.query_total_vram_mb() == 0
+    assert vram_utils.query_total_vram_mb() == 16384
+
+
+def test_a_card_that_does_not_answer_in_time_is_logged_and_asked_again(
+    monkeypatch, caplog
+):
+    """A wedged driver must not hold the settings request open."""
+    timeouts = []
+    answers = iter(
+        [
+            subprocess.TimeoutExpired("nvidia-smi", vram_utils.NVIDIA_SMI_TIMEOUT_S),
+            "16384\n",
+        ]
+    )
+
+    def nvidia_smi(*args, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(subprocess, "check_output", nvidia_smi)
+    with caplog.at_level("WARNING"):
+        assert vram_utils.query_total_vram_mb() == 0
+    assert "nvidia-smi did not report" in caplog.text
+    assert vram_utils.query_total_vram_mb() == 16384
+    assert timeouts == [vram_utils.NVIDIA_SMI_TIMEOUT_S] * 2

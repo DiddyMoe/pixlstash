@@ -47,6 +47,7 @@ from pixlstash.db_models.dedup import (
 )
 from pixlstash.db_models.operation import Operation
 from pixlstash.db_models.tag import Tag
+from pixlstash.db_models.tag_prediction import TagPrediction
 from pixlstash.server import Server
 from pixlstash.services import dedup_tier_service as tiers
 from pixlstash.services import dedup_verdict_service as verdicts
@@ -293,6 +294,53 @@ def test_stacking_unions_tags_onto_every_member(server):
     expected = {"portrait", "outdoor", "sunset"}
     assert _tags(server, ids[0]) == expected
     assert _tags(server, ids[1]) == expected
+
+
+def test_the_tag_union_clears_the_score_of_a_member_it_newly_penalises(server):
+    # The tagger predicted the defect on both members but only the first carries
+    # the tag, so only the first is charged for it. The union applies the tag to
+    # the second, which charges its prediction: its cached smart score was
+    # computed without the penalty and is stale. The first's is not.
+    ids = _seed(
+        server,
+        [
+            {
+                "pixel_sha": "aaa",
+                "size_bytes": 100,
+                "tags": ["watermark"],
+                "smart_score": 0.5,
+            },
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 0.5},
+        ],
+    )
+
+    def predict(session):
+        for picture_id in ids:
+            session.add(
+                TagPrediction(
+                    picture_id=picture_id,
+                    tag="watermark",
+                    confidence=0.9,
+                    model_version="test-v1",
+                    status="PENDING",
+                    predicted_at=datetime.now(timezone.utc),
+                )
+            )
+        session.commit()
+
+    _run(server, predict)
+    _scan(server)
+    _run(
+        server,
+        verdicts.apply_stack_verdict_in_session,
+        _one_signature(server),
+        None,
+        [],
+        None,
+    )
+    assert _tags(server, ids[1]) == {"watermark"}
+    assert _picture(server, ids[1]).smart_score is None
+    assert _picture(server, ids[0]).smart_score == 0.5
 
 
 def test_the_tag_union_skips_pipeline_sentinels(server):
