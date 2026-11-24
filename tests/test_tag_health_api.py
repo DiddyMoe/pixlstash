@@ -54,7 +54,7 @@ def _disable_background_tagger(server):
       then ``TagTask._add_tags_bulk`` clears the sentinel and adds its own tags
       beside the seeded ones, plus writes
       ``TagPrediction`` rows on the tagger's own ``model_version`` - moving
-      ``_current_model_version`` off the seeded ``"v1"`` and dropping the seeded
+      ``latest_model_version`` off the seeded ``"v1"`` and dropping the seeded
       predictions out of the version-pinned ``est_wrong``/``est_missing`` signals.
     * ``MissingTagPredictionFinder`` back-fills predictions for any picture that
       has a real tag but no prediction (e.g. the deliberately prediction-less

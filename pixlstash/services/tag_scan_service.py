@@ -64,7 +64,10 @@ from pixlstash.db_models.tag_prediction import TagPrediction
 from pixlstash.db_models.tag_suggestion import TagSuggestion
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.set_lock_service import locked_picture_id_subquery
-from pixlstash.services.tag_health_service import EST_MISSING_MIN_CONF
+from pixlstash.services.tag_health_service import (
+    EST_MISSING_MIN_CONF,
+    latest_model_version,
+)
 from pixlstash.utils.service.anomaly_thresholds import load_label_thresholds
 from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.utils.near_neighbor import (
@@ -352,12 +355,7 @@ def scan_tag(
             pid = session.exec(
                 select(Project.id).where(Project.name == project)
             ).first()
-        current_version = session.exec(
-            select(TagPrediction.model_version)
-            .where(TagPrediction.model_version != "manual")
-            .order_by(TagPrediction.predicted_at.desc())
-            .limit(1)
-        ).first()
+        current_version = latest_model_version(session)
         if current_version is None:
             return []
         q = (
@@ -833,12 +831,7 @@ def scan_boundary(
     threshold = effective_threshold(vault, tag)
 
     def _load(session: Session) -> tuple[str | None, int, list]:
-        current_version = session.exec(
-            select(TagPrediction.model_version)
-            .where(TagPrediction.model_version != "manual")
-            .order_by(TagPrediction.predicted_at.desc())
-            .limit(1)
-        ).first()
+        current_version = latest_model_version(session)
         if current_version is None:
             return None, 0, []
         where = [

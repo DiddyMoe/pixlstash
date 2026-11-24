@@ -688,6 +688,22 @@ class Picture(SQLModel, table=True):
             # partial index whose WHERE matches the query's term.
             sqlite_where=text("favourite IS 1"),
         ),
+        # MissingDescriptionFinder: description IS NULL OR description is a
+        # pending sentinel (DESCRIPTION_SENTINEL_LIKE_PATTERN, ESCAPE
+        # DESCRIPTION_SENTINEL_ESCAPE_CHAR). No ``deleted`` term because that
+        # probe does not filter on it. SQLite uses a partial index only when the
+        # query's WHERE carries the same terms, and a LIKE term only matches
+        # when its pattern is the same literal: a bound ``?`` never does. The
+        # finder therefore renders the pattern inline (``literal_execute``);
+        # bind it again and this index is built, maintained, and never read.
+        Index(
+            "ix_picture_description_pending",
+            "id",
+            sqlite_where=text(
+                "description IS NULL OR description LIKE '\\_\\_description::%' "
+                "ESCAPE '\\'"
+            ),
+        ),
     )
 
     class Config:

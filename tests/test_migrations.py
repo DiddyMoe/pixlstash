@@ -1740,6 +1740,88 @@ def test_0147_adds_building_to_a_populated_vault_as_finished_sets():
         assert again.returncode == 0, again.stderr
 
 
+def _model_index_sql(table: str, name: str) -> str:
+    """The ``CREATE INDEX`` the model metadata emits for one index."""
+    from sqlalchemy.dialects import sqlite
+    from sqlalchemy.schema import CreateIndex
+    from sqlmodel import SQLModel
+
+    import pixlstash.db_models  # noqa: F401  (registers every table)
+
+    (index,) = [ix for ix in SQLModel.metadata.tables[table].indexes if ix.name == name]
+    return str(CreateIndex(index).compile(dialect=sqlite.dialect())).strip()
+
+
+def test_0149_adds_the_description_and_prediction_time_indexes():
+    """Both indexes arrive on a populated vault exactly as the model declares
+    them, a fresh vault (whose baseline already built them) upgrades cleanly,
+    and both directions are safe to run twice."""
+    previous = "0148_add_picture_set_smart"
+    this = "0149_add_description_and_prediction_time_indexes"
+    wanted = {
+        "ix_picture_description_pending": "picture",
+        "ix_tag_prediction_predicted_at": "tag_prediction",
+    }
+
+    def index_sql(conn):
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            f"AND name IN ({', '.join('?' for _ in wanted)})",
+            list(wanted),
+        )
+        return {name: " ".join(sql.split()) for name, sql in rows}
+
+    def run(*args):
+        result = _run_alembic(list(args), db_url, _MIGRATIONS_DIR)
+        assert result.returncode == 0, (args, result.stdout, result.stderr)
+
+    def restamp(revision):
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("UPDATE alembic_version SET version_num = ?", (revision,))
+            conn.commit()
+
+    model = {
+        name: " ".join(_model_index_sql(table, name).split())
+        for name, table in wanted.items()
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "vault.db")
+        db_url = f"sqlite:///{db_path}"
+
+        # Fresh: the baseline's create_all already built both indexes.
+        run("upgrade", "head")
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert index_sql(conn) == model, "a fresh vault"
+
+        run("downgrade", previous)
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert index_sql(conn) == {}, "downgrade removes both"
+            _insert_minimal_row(conn, "picture", id=1, file_path="a.png")
+            _insert_minimal_row(
+                conn,
+                "tag_prediction",
+                picture_id=1,
+                tag="stand-in tag",
+                model_version="v1",
+                predicted_at="2026-01-01 00:00:00.000000",
+            )
+            conn.commit()
+        restamp(this)
+        run("downgrade", previous)
+
+        run("upgrade", "head")
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert index_sql(conn) == model, "the migration builds the model's indexes"
+            assert conn.execute("SELECT count(*) FROM tag_prediction").fetchone() == (
+                1,
+            )
+        restamp(previous)
+        run("upgrade", "head")
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert index_sql(conn) == model, "a re-run leaves them as they were"
+
+
 def test_0128_adds_prompt_match_once_on_a_fresh_and_a_populated_vault():
     """Column and probe index arrive either way, existing pictures read NULL
     (not scored), and a second upgrade over a vault that has both is a no-op."""

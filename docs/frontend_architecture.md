@@ -1222,6 +1222,8 @@ Create/edit a character (person). Props: `open`, `character`, `backendUrl`, `pro
 #### `PictureSetEditor.vue` (696 lines)
 Create/edit picture sets. Props: `open`, `set`, `thumbnailUrl`, `backendUrl`, `projects`. Uses `SET_COLORS`, `SET_ICON_CATEGORIES`, `ICON_CARDS` from `setAppearance.js`. Emits: `close`, `refresh-sidebar`, `saved` (the created set, on create only). Hosted by `SideBar`. Embeds `AdapterTray` below the appearance row, outside the lock wash — the tray is read-only, so a locked set still shows what it uses. **Two-column at 720**: name/description left, projects/lock right, with the appearance row and the tray spanning both. See "Two-column editors" below.
 
+**Smart sets (#2148).** The filter strip's **Save as smart set…** (`FilterStrip`'s `onSaveSmartSet`, passed by `ImageGrid` except during a search, in the Scrapheap and for a share link) opens this editor through `handleCreateSetFromMenu` with a draft carrying `smart_filter` (the grid's `buildPictureIdsQueryParams()`, captured at the click) and `smart_summary` (`utils/smartSets.smartSetSummary`: the view's name, then each chip). The editor titles it "New smart set", sends both on create only, and shows a read-only *Smart set* line above Locked for a draft and for an existing smart set (`smartSetDescription`: what fills it, then Automatic, Custom or locked). In the sidebar a smart set's row carries an `mdi-filter-variant` mark with the same line as its tooltip, and its row menu offers **Reset to automatic** (`PATCH smart_reset`) when `smart.custom`, greyed while locked. Contract: `integration_architecture.md` §2.11.
+
 #### Two-column editors (`CharacterEditor`, `PictureSetEditor`)
 
 Both editors had outgrown the viewport and were scrolling `AppDialog`'s body. Measured by driving the e2e fixture library in Chromium at 1280x800, comparing `.app-dialog__body` `scrollHeight` against `clientHeight`: the person editor held 768px of content in a 641px body — 127px of scroll — and the set editor 676 in 641. **`e2e/specs/editor-layout.spec.js` keeps that measurement honest**: it asserts `scrollHeight === clientHeight` for both editors and that the columns are side by side, which is the guarantee this section is about and the one a jsdom unit test cannot see. Two columns, not tabs: these are short-lived forms with one required field and one commit, and a field behind a tab is one you cannot check before you save — which in the person editor is a Ctrl+Enter away (the set editor has no such binding; that inconsistency is its own item). At 720 the same measurement gave 487 and 540 with `scrollHeight === clientHeight`, measured with the old 24px body padding; the 16px gutter (#1298) only shortens it.
@@ -1987,6 +1989,18 @@ up).
   does; Undo takes the pictures out, the set stays. The ids are taken when the
   name is asked for; the reference is untouched. A failed create stays open
   with the reason under the field; a failed add says the set is empty.
+- **Centring on a face**: *Centre on this face (C)* under the picked face, or
+  `C` on the field (a click still only selects), asks `getFaceClusters` again
+  with `centre` and shows `centred`, every face of the person ranked against
+  that face, in place of the cluster: *Centred on face* and its thumbnail, *k
+  of {name}'s n faces count*, *Make these {name}'s reference* and *Back to
+  Cluster N's centre*; no *Against the reference*, and every likeness
+  reads "to the chosen face". The pane header wraps, its count on a line of its
+  own under the title and buttons, so the labels never squeeze it into a
+  column. The slider starts at the strictness threshold,
+  not at every face. Back, any rail row, a strictness change or a save leave
+  it; the cluster's own slider value is kept. Nothing about the centre is
+  stored.
 
 #### `CharacterSheetsDialog.vue` (`io/`)
 

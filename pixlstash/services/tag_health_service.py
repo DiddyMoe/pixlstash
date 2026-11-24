@@ -12,7 +12,7 @@ Signal definitions (thresholds are module constants, deliberately fixed for now
 * ``est_wrong``    – tagged, *un-reviewed* pictures (no human POS/NEG on the
   ``(tag, picture)`` ledger row - ``label_state == "UNKNOWN"``) whose prediction
   confidence ≤ 0.1, on the current model version only (older generations are
-  excluded - see ``_current_model_version``). A tag a human already CONFIRMED is
+  excluded - see ``latest_model_version``). A tag a human already CONFIRMED is
   excluded even when the model doubts it: that human-vs-model contradiction is
   surfaced via ``model_disputes`` instead, never re-counted here as an estimated
   fix.
@@ -132,16 +132,25 @@ def get_status(vault: "Vault") -> dict:
         return {"building": state["building"], "progress": state["progress"]}
 
 
-def _current_model_version(session: Session) -> str | None:
+def latest_model_version(session: Session) -> str | None:
     """The model version of the most recently written real prediction row.
 
+    The one place "the current tagger version" is decided: tag health and the
+    tag scans (``tag_scan_service``) pin their prediction queries to it.
     ``manual`` is the synthetic version ``reject_tag_prediction`` writes for
     pure-human decisions, not a tagger - excluded.
+
+    Rows with equal ``predicted_at`` resolve to the lowest id, and NULL times
+    sort last. ``ix_tag_prediction_predicted_at`` is ``(predicted_at DESC,
+    id)``, so this order is read straight off the index, with no sort.
+
+    Returns:
+        The version string, or ``None`` when no tagger prediction exists.
     """
     return session.exec(
         select(TagPrediction.model_version)
         .where(TagPrediction.model_version != "manual")
-        .order_by(TagPrediction.predicted_at.desc())
+        .order_by(TagPrediction.predicted_at.desc(), TagPrediction.id)
         .limit(1)
     ).first()
 
@@ -289,7 +298,7 @@ def compute_tag_health_rows(
     pictures get rows. An empty set yields no rows. ``None`` = whole vault
     (the cached path).
     """
-    current_version = _current_model_version(session)
+    current_version = latest_model_version(session)
     tag_precisions = get_latest_tag_precisions(session)
 
     # Materialise the scope once into a per-connection temp table and filter

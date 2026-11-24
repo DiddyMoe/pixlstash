@@ -145,6 +145,12 @@ class TagPrediction(SQLModel, table=True):
         sa.Index(
             "ix_tag_prediction_model_version_picture_id", "model_version", "picture_id"
         ),
+        # tag_health_service.latest_model_version: newest non-manual row, ties to
+        # the lowest id. ``(predicted_at DESC, id)`` hands rows over in exactly
+        # that order, so the lookup stops at the first non-manual row instead of
+        # sorting the table. A plain ``(predicted_at)`` index would be walked
+        # backwards and give ties to the highest id, changing the answer.
+        sa.Index("ix_tag_prediction_predicted_at", sa.desc("predicted_at"), "id"),
     )
 
     picture: Optional["Picture"] = Relationship(

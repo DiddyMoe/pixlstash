@@ -2,7 +2,7 @@ from collections import Counter
 from typing import Callable, Collection
 
 from sqlmodel import Session, select
-from sqlalchemy import or_
+from sqlalchemy import literal, or_
 
 from pixlstash.db_models import (
     Picture,
@@ -288,8 +288,13 @@ class MissingDescriptionFinder(BaseTaskFinder):
         stmt = select(Picture).where(
             or_(
                 Picture.description.is_(None),
+                # Rendered inline, not bound: ``ix_picture_description_pending``
+                # is a partial index on exactly this OR, and SQLite only
+                # matches a LIKE term to it when the pattern is the same
+                # literal. Bound as ``?``, every planner sweep scans the
+                # whole picture table, even with nothing pending.
                 Picture.description.like(
-                    DESCRIPTION_SENTINEL_LIKE_PATTERN,
+                    literal(DESCRIPTION_SENTINEL_LIKE_PATTERN, literal_execute=True),
                     escape=DESCRIPTION_SENTINEL_ESCAPE_CHAR,
                 ),
             ),

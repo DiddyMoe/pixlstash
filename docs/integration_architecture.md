@@ -2103,7 +2103,11 @@ score, format, width, height, thumbnail_width, thumbnail_height, orientation}],
 size, cohesion, reference_share, is_reference,
 similarity_to_reference, from_sheets}`, members most typical first, the
 reference cluster first and then largest first. `unclustered` is
-`[{picture_id, score, similarity_to_reference, format}]`.
+`[{picture_id, score, similarity_to_reference, format}]`. With
+`centre=<picture_id>` it also answers `centred`: every face of the person as a
+member row, `centrality` being the likeness to that picture's face, most alike
+first (null without `centre`); a picture that is not one of the person's faces
+is a 422.
 
 `PUT /characters/{id}/reference-cluster` with `{picture_ids}` stores the
 reference cluster and answers `{picture_ids}`; `[]` clears it, and an id
@@ -2129,6 +2133,22 @@ names the reason refuses the whole request, filing nothing, when a sheet's
 boxes are not six, not inside the sheet, inverted, under 32 px a side on the
 sheet, or keyed by a picture not among `picture_ids`. Both routes are
 owner-only. Backend: §25.29 of the backend document.
+
+### 2.11 Smart picture sets (#2148)
+
+`POST /picture_sets` with `smart_filter` (the query string the grid sends to
+`GET /pictures`, as `useGridFetch.buildPictureIdsQueryParams` builds it) and an
+optional `smart_summary` (the chips in words, at most 500 characters) creates a
+smart set; a filter with nothing that narrows the library is a 400. The server
+keeps only the filter keys that say which pictures and never `project_id`: the
+set's own `project_ids` scope the rule. Set reads carry `smart: {filter,
+summary, removed}` (null for an ordinary set and for a scoped token), and the
+set list adds `smart.custom`. `PATCH /picture_sets/{id}` with
+`{"smart_reset": true}` is *Reset to automatic* (423 while locked). Members are
+ordinary members, so every other set route is unchanged; membership changes
+made by the refresh arrive as `CHANGED_PICTURES` with `source: "smart_set"` and
+no `origin_client_id`, which refreshes the sidebar like another tab's edit.
+Backend: the *Smart sets* paragraph in §5 of the backend document.
 
 ---
 

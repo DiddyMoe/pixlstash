@@ -1573,6 +1573,7 @@ def test_vault_reconciles_a_surviving_trainer_before_the_worker_starts():
     GPU workers start, so none of them loads a model under it.
     """
     order: list[str] = []
+    suspenders: list = []
 
     def noop(*_args, **_kwargs):
         return None
@@ -1582,9 +1583,12 @@ def test_vault_reconciles_a_surviving_trainer_before_the_worker_starts():
         _started=False,
         _task_runner=SimpleNamespace(start=lambda: order.append("tasks")),
         _work_planner=SimpleNamespace(start=noop),
-        _arbiter=SimpleNamespace(add_yielder=noop, add_listener=noop),
+        _arbiter=SimpleNamespace(
+            add_yielder=noop, add_listener=noop, set_suspender=suspenders.append
+        ),
         _yield_gpu=noop,
         _on_resource_lease=noop,
+        _queue_cuda_suspend=noop,
         _ref_folder_watcher=SimpleNamespace(start=noop),
         _model_folder_watcher=SimpleNamespace(start=noop),
         _start_existing_folder_watches=noop,
@@ -1598,6 +1602,8 @@ def test_vault_reconciles_a_surviving_trainer_before_the_worker_starts():
     Vault.start(stand_in)
 
     assert order == ["adopt", "tasks", "reconcile", "start"]
+    # The arbiter can then suspend PixlStash's CUDA context for that run (#2557).
+    assert suspenders == [stand_in._queue_cuda_suspend]
 
 
 def test_a_poll_does_not_undo_a_cancel_the_trainer_has_not_seen_yet(hub, repo_dir):
