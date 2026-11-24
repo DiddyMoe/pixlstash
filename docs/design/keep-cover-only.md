@@ -8,7 +8,9 @@ Where it lives: `pixlstash/services/keep_cover_only_service.py` +
 `pixlstash/routes/stacks.py` on the backend; on the frontend
 `frontend/src/api/stacks.js` (the two URLs),
 `frontend/src/utils/keepCoverOnly.js` (the copy and the two selection
-computations, both pure), `frontend/src/components/widgets/KeepCoverOnlyDialog.vue`
+computations, both pure), `frontend/src/utils/keepCoverOnlyRequests.js` (a
+selection larger than one request, see "Selections larger than one request"),
+`frontend/src/components/widgets/KeepCoverOnlyDialog.vue`
 (the consent), the menu item in `ImageGridContextMenu.vue` /
 `SelectionMenu.vue`, and the preview / run / ghosting in `ImageGrid.vue`. The
 wire contract is `docs/integration_architecture.md` §2.2.
@@ -136,6 +138,26 @@ Order:
    reason.
 5. **Undo**, matching the sibling verbatim.
 
+**A failed preview says why, and offers Try again when asking again can help.**
+The figures are unknown either way, so the en dash stands and the confirm stays
+disabled; the failure's kind picks the sentence. A timeout, an unreachable
+server and a server fault are worth asking again, so those offer **Try again**
+in place, over the same frozen selection: "close this and try again" made the
+user rebuild a `Ctrl+A` over the grid to ask the same question twice. A refused
+request names the server's reason and a missing permission says so; neither
+offers a retry, because both would fail the same way again. After Try again the
+keyboard goes back to Cancel, never to the confirm, for the reason it starts
+there.
+
+**One status region, mounted with the dialog.** The failure's sentence, the
+progress line of a long collapse and the `N stacks won't change` summary all
+arrive after the dialog has opened, and a live region inserted together with its
+text is often not read. So none of them is a live region of its own: a single
+visually hidden `role="status"` paragraph is in the dialog from the start and
+carries whichever applies (the failure first, then the progress, then the
+skips). The visible copies stay where they are; the skip reasons are read from
+the list.
+
 **The retention sentence must read the live setting.** `DEFAULT_RETENTION_DAYS`
 is `None`: on a default install **the Scrapheap never empties on its own**.
 Hardcoding "30 days" would be the same class of error the whole dialog exists to
@@ -207,6 +229,71 @@ Text names the consequence in the user's unit: *"414 pictures moved to the
 Scrapheap"*, with Undo. Skips get a second sentence rather than a separate toast.
 **No space figure in the receipt**: it was a potential in the preview; in a
 receipt it would be false at the moment it is displayed.
+
+## Selections larger than one request
+
+The gesture this action invites, "filter to stacked, `Ctrl+A`, Keep cover
+only", names every stack in the library, and that number grows with the
+library. One request carries at most 2000 ids (`MAX_SELECTION_IDS`), and a
+collapse holds the library's single database writer for the whole call. A
+selection past the cap used to be refused on the preview, and the dialog told
+the user to close it and try again, which nothing they could do would ever fix.
+
+So the grid splits the selection into requests of at most 500 stacks
+(`KEEP_COVER_ONLY_STACKS_PER_REQUEST` in
+`frontend/src/utils/keepCoverOnlyRequests.js`) and sends them one at a time:
+the server answers them from one database, so sending them together would only
+queue them there. Four rules keep the split out of the user's way:
+
+1. **The preview and the collapse use the same partition.** Collapse request N
+   sends preview N's `picture_ids_moving` as its `expected_picture_ids`, so each
+   request acts on exactly what one preview described, and a request whose plan
+   grew after the user read the figure is refused (409, nothing written).
+   Acceptance criterion 1 survives the split request by request.
+2. **One batch id for the whole gesture.** The grid mints one `cli-` batch id
+   and sends it with every request, so however many requests it took, the
+   gesture is one entry in the history and one `Ctrl+Z`. The receipt names the
+   newest operation of the batch, and its second sentence leads with the
+   gesture's own totals ("In all, 1,402 pictures from 1,201 stacks moved to the
+   Scrapheap."), because the newest operation's figures are one request's.
+3. **Nothing is silently dropped.** The reports merge field by field into one
+   report of the same shape: counts are summed, lists concatenated, and the
+   fields that describe the library or the request (the retention window, the
+   mode) are taken from the last report, because summing a 30-day window over
+   three requests makes 90. Every field the server returns is classified
+   exactly once, and `tests/test_keep_cover_only.py` fails the build when a
+   response model gains a field nobody classified, or when the request size
+   passes the server's cap.
+4. **The wait is narrated.** A collapse of more than one request shows "500 of
+   1,201 stacks done…" beside the spinning confirm, and announces it through
+   the dialog's one status region, which is mounted before its first text (see
+   "One status region, mounted with the dialog"). A single request shows no line:
+   one that flashes "0 of 40" says nothing.
+
+**The preview can be abandoned; the collapse cannot.** Closing the dialog aborts
+the preview requests still on the wire, whose answers would be thrown away. A
+collapse request that has been sent may commit whether or not anybody waits for
+its answer, so the collapse always runs to its end or to its first failure, and
+its receipt still arrives after the dialog has closed.
+
+**A collapse that stops partway says what happened, why, and what to do next**,
+because each way of stopping leaves the library in a different state:
+
+| What happened | What the grid does | What the notice says |
+| --- | --- | --- |
+| Nothing done, and the server said why | Leaves the dialog open on the same preview; after a 409 it reads the preview again, and the new figure is what a second confirm acts on | "Couldn't collapse those stacks." and the reason |
+| Some requests done, then a refusal | Ghosts the moved copies, drops their stacks from the selection, leaves the rest selected | "Collapsed 500 of 1,201 stacks, then stopped." The reason, then "The other 701 are still selected: run Keep cover only again to finish, or press Ctrl+Z to take back what was done." |
+| The answer was lost (a timeout, a dropped connection) | Reloads the grid, because the request may have committed | "…then lost the server's answer, so more of them may have collapsed too." The reason, then that running it again is safe |
+
+Running it again is always safe: a collapsed stack has one live member left,
+and the server skips a stack of one (`single_member`) without writing anything.
+
+**Measured at the request size** (500 two-member stacks, one request): the
+preview answers in 0.04 s, the collapse in 4.3 s and the `Ctrl+Z` of the whole
+gesture in 0.5 s. The collapse's cost is the per-stack metadata union, about
+9 ms a stack, which the union's contract (every stack, before any copy leaves)
+does not let it skip; it stays far inside the client's 60 s request timeout,
+and the progress line covers the wait between requests.
 
 ## Interactions during the Scrapheap stay: verified
 
@@ -344,3 +431,6 @@ routes (`keep_recipes: true`), same keyboard, same one undo.
 8. No path from the queue-clear screen reaches a destructive confirm in fewer
    than two deliberate steps.
 9. Neither the receipt nor the announcement claims any space was freed.
+10. No selection the grid can make is refused for its size. However many
+    requests it takes, the gesture is one `Ctrl+Z`, and a collapse that stops
+    partway says how many stacks it collapsed and what happens to the rest.

@@ -339,6 +339,30 @@ exceed 2000 (400 either way). Both halves of that used to be looser: the cap was
 applied to the de-duplicated set, so a body of repeats passed, and it was applied
 per list, so one request carried 4000.
 
+**A selection larger than one request is one gesture of several.** A client
+whose selection names more stacks than a request may carry (a `Ctrl+A` over a
+stacked library does) splits it, and the SPA does so at 500 stacks
+(`KEEP_COVER_ONLY_STACKS_PER_REQUEST`, `frontend/src/utils/keepCoverOnlyRequests.js`).
+Three rules keep the split inside this contract:
+
+- **One partition for both routes.** Collapse request N carries preview N's
+  stacks and sends preview N's `picture_ids_moving` as its
+  `expected_picture_ids`, so the 409 below still guards each request.
+- **One `cli-` `batch_id` on every collapse request.** The server records one
+  operation per request, all in that batch, and undoing any of them (Ctrl+Z
+  included) reverts the batch. Without it each request mints its own `srv-…`
+  batch and the gesture becomes several undo steps.
+- **The client merges the reports field by field**: counts summed, lists
+  concatenated, and `scrapheap_retention_days`, `keep_recipes`,
+  `ghost_retention`, `status` and `batch_id` taken from the last report.
+  `tests/test_keep_cover_only.py` checks those lists against
+  `KeepCoverOnlyPreviewResponse` and `KeepCoverOnlyResponse`, so **adding a
+  field to either model fails the build until the SPA classifies it**.
+
+A request that fails partway leaves the earlier ones committed and in the batch.
+Rerunning the same selection is safe: a collapsed stack has one live member, and
+the server skips it as `single_member` without writing.
+
 **`batch_id` must be client-namespaced** (`cli-` plus 4-76 of `A-Z a-z 0-9 _ -`)
 or the request is a 400, the same rule the `/dedup/*` routes and the
 `X-Operation-Batch-Id` header enforce, from the same helper
@@ -351,7 +375,10 @@ Shapes and rules the frontend depends on:
 - **Every figure in the dialog comes from the preview, and only from it.** The
   headline and the button label must render from the *same computed value*, not
   merely the same endpoint. While the preview is in flight or has failed, show
-  an en dash and disable the confirm: never a zero, never a stale number.
+  an en dash and disable the confirm: never a zero, never a stale number. A
+  failure is classified by `requestFailure` (`frontend/src/utils/apiError.js`):
+  a timeout, a network failure or a 5xx is offered a retry in place, a 400/422
+  shows the server's `detail`, and a 403 says the permission is missing.
 - **The stack buckets are disjoint and sum to `stacks_selected`:**
   `stacks_eligible + stacks_skipped_locked + stacks_skipped_character_on_copy +
   stacks_skipped_single_member`. Do not derive one by subtracting the others;

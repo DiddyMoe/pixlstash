@@ -6690,7 +6690,7 @@ Instead of teaching each mutating endpoint how to invert itself, the log snapsho
 
 **`undoable=True` iff the log stores the whole prior state.** That is the rule; "file-mutating operations are not undoable" is the consequence of it that holds for almost every file mutation, not the rule itself. A crop, a re-encode or a scale destroys information that exists nowhere but the prior file, so no snapshot short of the file itself can reverse them — they are *recorded* with `undoable=False` for audit and stay irreversible until copy-on-write versions land (v2.1). An in-place rotate is the one file mutation that does not: it replaces a single enumerated value 1–8 and copies the entropy-coded stream through byte for byte, so `{"orientation": n}` **is** the whole prior state and the ordinary facet machinery reverses it exactly (§21.5).
 
-**Derived values are re-derived, never snapshotted.** `Picture.anomaly_tag_uncertainty` is a function of the label state and `Picture.smart_score` is a cache of a function of it, so `apply_state_in_session` recomputes the first and drops the second — through the very same `recompute_anomaly_tag_uncertainty` / `invalidate_on_anomaly_change` guards the forward write paths use — instead of restoring a recorded copy. Snapshotting a derived value creates a second source of truth, and the moment its inputs are restored by one path and its cached value by another they drift.
+**Derived values are re-derived, never snapshotted.** `Picture.anomaly_tag_uncertainty` is a function of the label state and `Picture.smart_score` is a cache of a function of it, so `apply_state_in_session` recomputes the first and drops the second — through the very same `recompute_anomaly_tag_uncertainty` / `invalidate_on_anomaly_change` guards the forward write paths use (the restore calls the batched `recompute_anomaly_tag_uncertainties`, of which the single form is a thin wrapper, so the two cannot compute different values) — instead of restoring a recorded copy. Snapshotting a derived value creates a second source of truth, and the moment its inputs are restored by one path and its cached value by another they drift.
 
 ### Recording a change
 
@@ -6713,6 +6713,12 @@ Recorded content (`op_type` / `target_ids` / `before_state` / `after_state` / `a
 ### Locked sets are not bypassed
 
 A locked picture set is a hard freeze on its members' label data. `apply_state_in_session` — the single sink every restore goes through — calls `enforce_pictures_not_locked` over the whole recorded state before dispatching, so undo/redo cannot become the one write path around the freeze; a frozen target yields `423` and the operation stays `applied`.
+
+### Restoring a batch reads first, then writes
+
+One undo restores a whole batch, and a batch is one gesture that may have been sent as several requests (Keep cover only over a library, §22.12), so a restore can name thousands of pictures. `apply_state_in_session` therefore reads everything its appliers compare against **before the first write**, by id chunk (`utils/sql_chunking.chunked`): the `Picture` rows, and each facet's rows (`Tag`, `TagPrediction`, `PictureSetMember`, `PictureProjectMember`, `Face`) through `_rows_by_picture`, which the appliers receive instead of querying per picture. Stack rows the undone operation dissolved are recreated together, under their original ids, by `_recreate_dissolved_stacks`, ahead of the first pointer that names them; `_delete_emptied_stacks` reads every vacated stack and its survivors in chunks before its first delete. The anomaly recompute is `recompute_anomaly_tag_uncertainties`, batched the same way.
+
+The reason is the session's autoflush, not the query count. A read inside the per-picture loop flushes the previous picture's writes, and every flush recomputes the flushed pictures' metadata hashes, so reading per picture cost about one flush per picture, and undoing a library-sized gesture outlasted the client's request timeout. Each applier reads and writes only its own picture's rows of its own table, so no earlier picture's write can make a prefetched row stale. Measured on the undo of 500 collapsed stacks: three flushes, 0.5 s.
 
 ### Endpoints and authorization
 
@@ -8203,7 +8209,12 @@ soft-deleted to the Scrapheap.
   stated out loud as `0`.
 - **One call, one operation, one `Ctrl+Z`.** However many stacks a request
   names, the whole thing is a single `stack.keep_cover_only` row under one
-  `batch_id` (§21). The undo snapshot is stack-expanded with
+  `batch_id` (§21). A selection larger than one request is several calls, and
+  the client sends them all under its own `cli-` `batch_id`, so the gesture is
+  several rows in one batch, and the undo of any of them (`POST
+  /operations/undo` included) reverts the batch (`_batch_members_in_session`).
+  `tests/test_keep_cover_only.py::test_one_ctrl_z_undoes_every_request_of_a_split_gesture`
+  pins that. The undo snapshot is stack-expanded with
   `include_deleted=True`, because `normalize_stack_positions` renumbers every
   member including the already-scrapheaped ones. The op type is
   `stack.keep_cover_only`; `squash` is kept out of identifiers because in git it
@@ -8250,6 +8261,25 @@ soft-deleted to the Scrapheap.
   request is not a cap. (What no check here can un-do is Pydantic having already
   materialised the list while binding the request model; that is inherent to any
   modelled body and belongs to the transport, not to this route.)
+
+  The cap is per request, not per gesture: "select every stacked picture and
+  collapse it" grows with the library, so the SPA splits it into requests of
+  `KEEP_COVER_ONLY_STACKS_PER_REQUEST` (500) stacks under one batch id, each
+  sending its own preview's `expected_picture_ids` (design file, "Selections
+  larger than one request"). `tests/test_keep_cover_only.py` reads that constant
+  and the SPA's per-field merge lists out of
+  `frontend/src/utils/keepCoverOnlyRequests.js` and fails the build when the
+  size passes this cap or a response field is left unclassified.
+
+  **Every `IN (...)` is read by id chunk** (`utils/sql_chunking.chunked`,
+  `SQLITE_ID_CHUNK`): the selection resolve, the planner's member, tag, face
+  and character reads, the soft delete, and the metadata union's reads. A
+  request at the cap names thousands of pictures, past the 999 bound variables
+  an older SQLite allows per statement. Measured at the SPA's request size
+  (500 two-member stacks): preview 0.04 s, collapse 4.3 s, and the undo of the
+  gesture 0.5 s. The collapse costs about 9 ms a stack, almost all of it the
+  per-stack metadata union, which is mandatory (above) and shared with the
+  dedup verdict, so it is left per stack.
 - **`batch_id` is validated, never stored verbatim.**
   `utils/request_origin.require_client_batch_id` is the single implementation of
   the `cli-<4-76 safe chars>` contract, shared with the `/dedup/*` routes and
