@@ -118,7 +118,9 @@ def reconcile_settings_fingerprint(vault_db, salt: str, penalised_tags: dict) ->
     that is *open at the time*. A library that was closed then never learns, and
     nothing revisits its scores, because NULL is the only signal that a recompute
     is owed. This closes that gap at the one moment the answer is knowable: when
-    the library is opened.
+    the library is opened. The library that *was* open moved its fingerprint
+    with the change (:func:`advance_settings_fingerprint`), so a mismatch here
+    means this library genuinely missed one.
 
     On a mismatch it invalidates **every** cached score in the library rather
     than the pictures carrying the changed tags. That is the price of storing no
@@ -171,6 +173,67 @@ def reconcile_settings_fingerprint(vault_db, salt: str, penalised_tags: dict) ->
             "recomputed in the background."
         )
     return changed
+
+
+def advance_settings_fingerprint(
+    vault_db, salt: str, before: dict, after: dict
+) -> bool:
+    """Record that the open library has already absorbed a penalised-tag change.
+
+    A weights change made while a library is open is repaired in that library at
+    once, by the targeted invalidation in ``PATCH /users/me/config``. Unless the
+    fingerprint moves with it, the next open finds a mismatch and
+    :func:`reconcile_settings_fingerprint` invalidates *every* cached score in the
+    library, re-scoring hundreds of thousands of pictures for a change that was
+    already handled. The open-time check exists for libraries that were closed
+    during the change, not for the one that was open.
+
+    This is a compare-and-set: the fingerprint only advances from the value that
+    *before* produces. If the stored one differs, this library already owed a
+    repair for an earlier change (a failed reconcile, a restored backup), and
+    moving it forward would erase that debt; it is left alone so the next open
+    still repays it in full.
+
+    Args:
+        vault_db: The open library's database.
+        salt: The library's ``settings_salt`` from the hub.
+        before: The resolved ``{tag: weight}`` table before the change.
+        after: The resolved table the hub now holds.
+
+    Returns:
+        True when the fingerprint was advanced to *after*.
+    """
+    if not salt:
+        logger.warning(
+            "No settings salt for this library; not recording the penalised-tag "
+            "change in its fingerprint. Its next open skips the check as well."
+        )
+        return False
+
+    expected = compute_settings_fingerprint(salt, before or {})
+    target = compute_settings_fingerprint(salt, after or {})
+
+    def _advance(session: Session) -> bool | None:
+        settings = _row(session)
+        current = settings.settings_fingerprint
+        if current == target:
+            return False
+        if current is not None and current != expected:
+            return None
+        settings.settings_fingerprint = target
+        session.add(settings)
+        session.commit()
+        return True
+
+    advanced = vault_db.run_task(_advance, priority=DBPriority.IMMEDIATE)
+    if advanced is None:
+        logger.warning(
+            "This library's settings fingerprint did not match the penalised-tag "
+            "weights in force before this change, so it already owed a repair. "
+            "The fingerprint is left as it is; the next open of this library "
+            "invalidates its cached smart scores in full."
+        )
+    return bool(advanced)
 
 
 # ---------------------------------------------------------------------------

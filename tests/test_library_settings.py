@@ -381,6 +381,143 @@ class TestCatchingUpADormantLibrary:
         )
 
 
+def _stored_fingerprint(server):
+    return server.vault.db.run_immediate_read_task(
+        lambda session: (
+            session.exec(select(LibrarySettings)).first().settings_fingerprint
+        )
+    )
+
+
+def _scored_picture(server, path: str, score: float) -> int:
+    def _add(session: Session):
+        picture = Picture(file_path=path, smart_score=score)
+        session.add(picture)
+        session.commit()
+        session.refresh(picture)
+        return picture.id
+
+    return server.vault.db.run_task(_add)
+
+
+def _score_of(server, picture_id: int):
+    return server.vault.db.run_immediate_read_task(
+        lambda session: session.get(Picture, picture_id).smart_score
+    )
+
+
+class TestAChangeMadeWhileOpen:
+    """The open library repairs a weights change at once; the next open must not again.
+
+    Without this, every penalised-tag edit re-scored the whole library at the
+    following start, which is the "Smart score N / N" nobody asked for.
+    """
+
+    def test_the_next_open_does_not_invalidate_after_a_patch(self, server):
+        """End to end: the setting is saved, then the library is opened again."""
+        client = _owner(server)
+        # Bring the fingerprint in line with the owner's current weights first,
+        # so the only change the reopen can see is the one this PATCH makes.
+        server.reconcile_library_settings(server.vault)
+        before = _stored_fingerprint(server)
+        current = client.get(f"{API}/users/me/config").json()[
+            "smart_score_penalised_tags"
+        ]
+        weight = 0.25 if (current or {}).get("blurry") != 0.25 else 0.75
+        untouched = _scored_picture(server, "/tmp/while-open.png", 2.7)
+
+        response = client.patch(
+            f"{API}/users/me/config",
+            json={"smart_score_penalised_tags": {"blurry": weight}},
+        )
+        assert response.status_code == 200, response.text
+        assert _stored_fingerprint(server) != before, "the PATCH changed nothing"
+
+        server.reconcile_library_settings(server.vault)
+
+        assert _score_of(server, untouched) == pytest.approx(2.7)
+
+    def test_it_moves_from_the_previous_weights_to_the_new(self, server):
+        library = server.library_registry.active_library()
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.5}
+        )
+
+        advanced = library_settings_service.advance_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.5}, {"blurry": 0.9}
+        )
+
+        assert advanced is True
+        assert _stored_fingerprint(server) == (
+            library_settings_service.compute_settings_fingerprint(
+                library.settings_salt, {"blurry": 0.9}
+            )
+        )
+
+    def test_a_repair_already_owed_is_not_erased(self, server):
+        """A stale fingerprint is a debt; advancing past it would forgive it."""
+        library = server.library_registry.active_library()
+        # The library last saw 0.1, so it missed the move to 0.5 as well.
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.1}
+        )
+        owed = _stored_fingerprint(server)
+
+        advanced = library_settings_service.advance_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.5}, {"blurry": 0.9}
+        )
+
+        assert advanced is False
+        assert _stored_fingerprint(server) == owed
+        stale = _scored_picture(server, "/tmp/owed.png", 1.9)
+        assert library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.9}
+        )
+        assert _score_of(server, stale) is None
+
+    def test_reaching_the_same_weights_again_writes_nothing(self, server, caplog):
+        """Already at the new weights: no write, and no report of a debt.
+
+        The stored value matches neither the old weights nor nothing, so the
+        compare-and-set alone would read it as a repair owed and say so.
+        """
+        library = server.library_registry.active_library()
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.9}
+        )
+        recorded = _stored_fingerprint(server)
+        caplog.clear()
+
+        assert (
+            library_settings_service.advance_settings_fingerprint(
+                server.vault.db,
+                library.settings_salt,
+                {"blurry": 0.5},
+                {"blurry": 0.9},
+            )
+            is False
+        )
+        assert _stored_fingerprint(server) == recorded
+        assert not [
+            record for record in caplog.records if "owed a repair" in record.message
+        ]
+
+    def test_a_missing_salt_writes_nothing(self, server):
+        library = server.library_registry.active_library()
+        library_settings_service.reconcile_settings_fingerprint(
+            server.vault.db, library.settings_salt, {"blurry": 0.5}
+        )
+        recorded = _stored_fingerprint(server)
+
+        assert (
+            library_settings_service.advance_settings_fingerprint(
+                server.vault.db, None, {"blurry": 0.5}, {"blurry": 0.9}
+            )
+            is False
+        )
+        assert _stored_fingerprint(server) == recorded
+
+
 class TestTagChipSize:
     """The tag chip size is the owner's, kept in its own hub table."""
 
