@@ -6869,6 +6869,9 @@ def relocatable_downloads(shelf_env, tmp_path, monkeypatch):
     model_moves._job = None
     data_dir = tmp_path / "userdata"
     monkeypatch.setattr(builtin_models, "_pixlstash_data_dir", lambda: str(data_dir))
+    # A shell that exports the override (a development one does) would keep the
+    # folder where it is, whatever the data dir says.
+    monkeypatch.delenv(builtin_models.BUILTIN_MODEL_DIR_ENV, raising=False)
     downloads = data_dir / builtin_models.BUILTIN_DIRNAME
     downloads.mkdir(parents=True)
     assert builtin_models.builtin_model_dir() == str(downloads)
@@ -10064,6 +10067,7 @@ def test_delete_takes_a_leftover_out_of_the_folder_we_download_into(
     downloads.mkdir(parents=True)
     write_adapter(downloads / "best.pt")
     monkeypatch.setattr(builtin_models, "_pixlstash_data_dir", lambda: str(root))
+    monkeypatch.delenv(builtin_models.BUILTIN_MODEL_DIR_ENV, raising=False)
 
     with shelf_env.server.hub.transaction() as conn:
         conn.execute(
@@ -10106,6 +10110,7 @@ def test_delete_still_refuses_an_engine_in_that_same_folder(
     downloads.mkdir(parents=True)
     write_adapter(downloads / "tagger.safetensors")
     monkeypatch.setattr(builtin_models, "_pixlstash_data_dir", lambda: str(root))
+    monkeypatch.delenv(builtin_models.BUILTIN_MODEL_DIR_ENV, raising=False)
 
     engine = _declare_engine(shelf_env)
     with shelf_env.server.hub.transaction() as conn:

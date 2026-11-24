@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from pixlstash import cli, plugin_install, tagger_plugins
+from pixlstash import cli, plugin_check, plugin_install, tagger_plugins
 from pixlstash.plugin_install import CAPTIONING, IMAGE, PluginError
 from pixlstash.utils.accelerator import VALID_DEVICE_SETTINGS
 
@@ -1244,7 +1244,6 @@ def test_a_torch_that_will_not_answer_does_not_take_the_command_down(monkeypatch
     narrower catch let it escape and end the command before the plugin could
     report its own missing dependency.
     """
-    from pixlstash import plugin_check
 
     class Unloadable:
         @property
@@ -1283,6 +1282,9 @@ _IMPORTS = "from pixlstash.tagger_plugins.base import TaggerPlugin\n"
 _SPAWN = (
     '__import__("subpro" + "cess").run([__import__("sys").executable, "-c", "pass"])'
 )
+#: How the report names `_SPAWN`. It cuts a command line to fit, so in a venv
+#: with a long path the interpreter arrives cut short.
+_SPAWN_STARTED = f"started {plugin_check._clip(f'{sys.executable} -c pass')}"
 
 
 def _reaching(tmp_path: Path, *lines: str, name: str = "mine.py") -> Path:
@@ -1320,7 +1322,7 @@ def test_a_spawned_process_is_reported(tmp_path, capsys):
     assert _check(source) == cli.EXIT_OK
 
     out = capsys.readouterr().out
-    assert f"started {sys.executable} -c pass" in out
+    assert _SPAWN_STARTED in out
     assert "This is what was seen, not what the plugin can do" in out
 
 
@@ -1453,7 +1455,7 @@ def test_a_move_is_reported_where_the_file_landed(tmp_path, capsys):
 def _times_started(out: str) -> int:
     """Return how often the `_SPAWN` program was reported started."""
     match = re.search(
-        re.escape(f"started {sys.executable} -c pass") + r"(?:  \((\d+) times\))?",
+        re.escape(_SPAWN_STARTED) + r"(?:  \((\d+) times\))?",
         out,
     )
     assert match, out
@@ -1495,7 +1497,7 @@ def test_what_it_reached_for_is_reported_even_when_it_fails_to_import(tmp_path, 
 
     captured = capsys.readouterr()
     assert "boom" in captured.err
-    assert f"started {sys.executable} -c pass" in captured.out
+    assert _SPAWN_STARTED in captured.out
 
 
 def test_image_run_is_observed_but_picking_a_device_is_not(
@@ -1506,8 +1508,6 @@ def test_image_run_is_observed_but_picking_a_device_is_not(
     So a write made while choosing it must not be reported as the plugin's,
     and the spawn inside the plugin's own `init()` must be.
     """
-    from pixlstash import plugin_check
-
     sentinel = tmp_path / "device" / "picked.txt"
     sentinel.parent.mkdir()
 
@@ -1528,7 +1528,7 @@ def test_image_run_is_observed_but_picking_a_device_is_not(
 
     out = capsys.readouterr().out
     assert sentinel.exists()
-    assert f"started {sys.executable} -c pass" in out
+    assert _SPAWN_STARTED in out
     assert "wrote " not in out
 
 
@@ -1545,7 +1545,7 @@ def test_interrupting_a_hung_import_prints_what_was_seen(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert "had not returned from load" in out
-    assert f"started {sys.executable} -c pass" in out
+    assert _SPAWN_STARTED in out
 
 
 def test_schema_types_match_the_component_that_renders_them():

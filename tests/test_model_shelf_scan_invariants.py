@@ -445,6 +445,10 @@ class TestScanCostAndIdentity:
         stale = only_model(hub)["sha256"]
 
         write_adapter(folder / "a.safetensors", filler="B")
+        # Two writes inside one kernel timestamp tick share an mtime_ns, and an
+        # edit worth catching comes later than the scan that recorded the first.
+        stat = os.stat(path)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
         # The size is unchanged, so nothing but the mtime can tell these apart.
         assert (
             os.path.getsize(path)

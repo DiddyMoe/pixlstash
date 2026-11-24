@@ -2596,12 +2596,24 @@ def test_the_vault_queues_one_unload_and_suspend_on_the_gpu_worker():
     assert len(submitted) == 2, "asked again once the last one ran"
 
 
-_REAL_SUSPEND = """
+#: What a driver that exports the checkpoint API but cannot do it (WSL's
+#: libcuda) answers the lock with: CUDA_ERROR_NOT_SUPPORTED.
+_CHECKPOINT_NOT_SUPPORTED = 801
+
+_REAL_SUSPEND = f"""
+import ctypes, os
 import torch
 from pixlstash.resources import cuda_checkpoint
 x = torch.randn(256, 256, device="cuda")
 y = (x @ x).sum().item()
 assert cuda_checkpoint.available()
+driver, pid = cuda_checkpoint._cuda(), os.getpid()
+code = driver.cuCheckpointProcessLock(pid, ctypes.byref(cuda_checkpoint._LockArgs(1000)))
+if code == {_CHECKPOINT_NOT_SUPPORTED}:
+    print("not supported")
+    raise SystemExit
+assert code == 0, f"lock: CUresult {{code}}"
+assert driver.cuCheckpointProcessUnlock(pid, None) == 0, "unlock"
 cuda_checkpoint.begin()
 assert cuda_checkpoint.suspend(), "suspend"
 assert cuda_checkpoint.suspended()
@@ -2625,4 +2637,6 @@ def test_the_driver_suspends_and_restores_a_real_context():
         text=True,
         timeout=120,
     )
+    if done.returncode == 0 and done.stdout.strip() == "not supported":
+        pytest.skip("this driver exports the CUDA checkpoint API but refuses it")
     assert done.returncode == 0 and done.stdout.strip() == "ok", done.stderr[-2000:]

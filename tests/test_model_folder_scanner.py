@@ -779,6 +779,10 @@ class TestScanCost:
         stale = digest_at(hub, "a.safetensors")
 
         write_adapter(path, name="BBBB")
+        # Two writes inside one kernel timestamp tick share an mtime_ns, and an
+        # edit worth catching comes later than the scan that recorded the first.
+        stat = os.stat(path)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
         assert os.path.getsize(path) == next(iter(models(hub).values()))["file_size"]
         scanner.scan_folder(folder_id, str(folder), "user")
 
