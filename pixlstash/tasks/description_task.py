@@ -39,8 +39,13 @@ def describable_picture_clauses() -> tuple:
     A picture restored from the Scrapheap keeps its NULL or sentinel
     description and is picked up again on the next sweep, so nothing is lost by
     holding it out while it is deleted.
+
+    The Scrapheap term is ``deleted IS NOT 1``, which no index serves, so the
+    finder's probe still reads ``ix_picture_description_pending``: beside
+    ``deleted IS 0`` SQLite takes ``ix_picture_deleted`` instead. ``deleted`` is
+    never NULL, so the two select the same rows.
     """
-    return (Picture.deleted.is_(False), Picture.file_path.is_not(None))
+    return (Picture.deleted.is_not(True), Picture.file_path.is_not(None))
 
 
 class DescriptionTask(BaseTask):

@@ -1357,7 +1357,9 @@ def _description_queue_with_bound_pattern(session: Session, limit: int) -> list[
 
     This is the query as it was before the pattern was rendered inline, kept
     here as the reference for "same rows, same order". ``ORDER BY`` ends in the
-    primary key, so its answer does not depend on which plan SQLite picks.
+    primary key, so its answer does not depend on which plan SQLite picks. It
+    carries the finder's Scrapheap and file terms, which are not what is being
+    compared.
     """
     from sqlalchemy import or_
     from sqlmodel import select
@@ -1367,6 +1369,7 @@ def _description_queue_with_bound_pattern(session: Session, limit: int) -> list[
         DESCRIPTION_SENTINEL_LIKE_PATTERN,
     )
     from pixlstash.services.set_lock_service import locked_picture_id_subquery
+    from pixlstash.tasks.description_task import describable_picture_clauses
 
     return list(
         session.exec(
@@ -1380,6 +1383,7 @@ def _description_queue_with_bound_pattern(session: Session, limit: int) -> list[
                     ),
                 ),
                 ~Picture.id.in_(locked_picture_id_subquery()),
+                *describable_picture_clauses(),
             )
             .order_by(Picture.description.is_(None), Picture.id)
             .limit(limit)
@@ -1478,9 +1482,8 @@ def test_description_probe_returns_the_same_rows_in_the_same_order(tmp_path):
     """Inlining the pattern changes the plan only: same ids, same order.
 
     Sentinels (a user's reset) come before NULLs (never described), each group
-    by id; empty strings, captions and look-alikes are not pending; deleted
-    pictures are not filtered here; a locked-set member and its stack sibling
-    are excluded.
+    by id; empty strings, captions and look-alikes are not pending; Scrapheap
+    pictures, a locked-set member and its stack sibling are excluded.
     """
     with Vault(image_root=str(tmp_path)) as vault:
         ids = _seed_descriptions(vault)
@@ -1490,10 +1493,8 @@ def test_description_probe_returns_the_same_rows_in_the_same_order(tmp_path):
                 "sentinel",
                 "sentinel_engine",
                 "sentinel_upper",
-                "deleted_sentinel",
                 "null_a",
                 "null_b",
-                "deleted_null",
                 "null_c",
             )
         ]
