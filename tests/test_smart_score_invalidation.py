@@ -836,25 +836,28 @@ def test_changed_penalised_tags_includes_family_aliases():
     assert "blocky" not in unchanged and "jpeg artifacts" not in unchanged
 
 
-def test_penalised_tag_config_change_invalidates_only_matching_pictures():
-    """Assert both sets: the carriers are cleared and the bystanders keep their score."""
+def test_penalised_tag_config_change_invalidates_only_charged_pictures():
+    """Clear exactly the pictures the re-weight can move; every other score stays.
+
+    The penalty charges a tag on an applied ``Tag`` row or a human POS, nothing else
+    (``fetch_anomaly_confidences``). A model prediction with no applied tag never
+    reaches it, and the tagger writes such a prediction for every anomaly label on
+    every picture it tags, so counting one would clear the whole library.
+    """
     temp_dir, client, server = _setup()
     try:
         carrier_tag = _upload_picture(client, "Bad1.png")
-        carrier_pred = _upload_picture(client, "Bad2.png")
+        carrier_human = _upload_picture(client, "Bad2.png")
+        predicted_only = _upload_picture(client, "Changed2.png")
         bystander = _upload_picture(client, "Changed1.png")
-        for pic_id in (carrier_tag, carrier_pred, bystander):
+        for pic_id in (carrier_tag, carrier_human, predicted_only, bystander):
             _set_smart_score(server, pic_id, 0.5)
 
-        # One carries an applied Tag, one only an anomaly TagPrediction - the penalty
-        # reads both, so invalidation must cover both.
-        server.vault.db.run_task(
-            lambda s: (
-                s.add(Tag(picture_id=carrier_tag, tag=PENALISED_TAG)),
-                s.commit(),
-            )
-        )
-        _seed_prediction(server, carrier_pred, PENALISED_TAG, confidence=0.9)
+        _seed_tag(server, carrier_tag, PENALISED_TAG)
+        # A person confirmed the defect: charged with no Tag row behind it.
+        _seed_human_prediction(server, carrier_human, PENALISED_TAG, POS)
+        # The model's guess alone: never charged, so its score cannot have moved.
+        _seed_prediction(server, predicted_only, PENALISED_TAG, confidence=0.9)
         # The bystander carries an *unrelated* penalised tag, so it is not just "untagged".
         _seed_prediction(server, bystander, "bad anatomy", confidence=0.9)
 
@@ -866,12 +869,13 @@ def test_penalised_tag_config_change_invalidates_only_matching_pictures():
         )
         assert cleared == 2
         assert _get_smart_score(server, carrier_tag) is None
-        assert _get_smart_score(server, carrier_pred) is None
+        assert _get_smart_score(server, carrier_human) is None
+        assert _get_smart_score(server, predicted_only) == 0.5
         assert _get_smart_score(server, bystander) == 0.5
 
         missing = _find_missing_ids(server)
-        assert carrier_tag in missing and carrier_pred in missing
-        assert bystander not in missing
+        assert carrier_tag in missing and carrier_human in missing
+        assert predicted_only not in missing and bystander not in missing
     finally:
         server.close()
         temp_dir.cleanup()
@@ -900,10 +904,13 @@ def test_patch_config_invalidates_only_pictures_with_the_changed_tag():
     temp_dir, client, server = _setup()
     try:
         carrier = _upload_picture(client, "Bad1.png")
+        predicted_only = _upload_picture(client, "Bad2.png")
         bystander = _upload_picture(client, "Changed1.png")
-        _set_smart_score(server, carrier, 0.5)
-        _set_smart_score(server, bystander, 0.5)
+        for pic_id in (carrier, predicted_only, bystander):
+            _set_smart_score(server, pic_id, 0.5)
+        _seed_tag(server, carrier, PENALISED_TAG)
         _seed_prediction(server, carrier, PENALISED_TAG, confidence=0.9)
+        _seed_prediction(server, predicted_only, PENALISED_TAG, confidence=0.9)
         _seed_prediction(server, bystander, "bad anatomy", confidence=0.9)
 
         # Re-weight only PENALISED_TAG; leave every other tag where it was.
@@ -916,6 +923,7 @@ def test_patch_config_invalidates_only_pictures_with_the_changed_tag():
 
         _wait_for(lambda: _get_smart_score(server, carrier) is None)
         assert _get_smart_score(server, carrier) is None
+        assert _get_smart_score(server, predicted_only) == 0.5
         assert _get_smart_score(server, bystander) == 0.5
     finally:
         server.close()
@@ -927,8 +935,9 @@ def test_patch_config_invalidates_only_pictures_with_the_changed_tag():
 # The tagger's ``threshold_offset`` moves both the anomaly apply gate and the penalty's
 # ``u = (p - t)/(1 - t)`` normalisation, so every cached score with an anomaly component
 # goes stale when it changes. Unlike a penalised-tag re-weight it is not scoped by tag -
-# but it is still bounded to pictures that actually carry an anomaly ``TagPrediction``,
-# because a picture with no anomaly term cannot have moved.
+# but it is still bounded to pictures with an applied anomaly ``Tag``: a model prediction
+# without one is never charged, and a human verdict folds to 1.0 or 0.0, which the
+# normalisation maps to the same value at any threshold.
 
 
 def _patch_threshold_offset(client, offset):
@@ -945,19 +954,23 @@ def _patch_threshold_offset(client, offset):
 
 
 def test_invalidate_all_anomaly_scores_clears_only_anomaly_bearing_pictures():
-    """The helper clears anomaly-bearing scores and leaves content-only / clean ones."""
+    """The helper clears charged anomaly scores and leaves every other one."""
     temp_dir, client, server = _setup()
     try:
         anomaly = _upload_picture(client, "Bad1.png")
         content_only = _upload_picture(client, "Bad2.png")
+        predicted_only = _upload_picture(client, "Changed2.png")
         clean = _upload_picture(client, "Changed1.png")
-        for pic_id in (anomaly, content_only, clean):
+        for pic_id in (anomaly, content_only, predicted_only, clean):
             _set_smart_score(server, pic_id, 0.5)
 
-        # Only the first carries an anomaly-vocabulary prediction; the second carries a
-        # pure content prediction; the third carries none.
+        # Only the first carries an applied anomaly tag behind its prediction. The
+        # second carries a pure content prediction, the third an anomaly prediction
+        # the scorer never charges (no applied tag), the fourth nothing.
+        _seed_tag(server, anomaly, PENALISED_TAG)
         _seed_prediction(server, anomaly, PENALISED_TAG, confidence=0.9)
         _seed_prediction(server, content_only, CONTENT_TAG, confidence=0.9)
+        _seed_prediction(server, predicted_only, PENALISED_TAG, confidence=0.9)
 
         cleared = server.vault.db.run_task(
             lambda s: (
@@ -968,11 +981,13 @@ def test_invalidate_all_anomaly_scores_clears_only_anomaly_bearing_pictures():
         assert cleared == 1
         assert _get_smart_score(server, anomaly) is None
         assert _get_smart_score(server, content_only) == 0.5
+        assert _get_smart_score(server, predicted_only) == 0.5
         assert _get_smart_score(server, clean) == 0.5
 
         missing = _find_missing_ids(server)
         assert anomaly in missing
         assert content_only not in missing and clean not in missing
+        assert predicted_only not in missing
     finally:
         server.close()
         temp_dir.cleanup()
@@ -988,9 +1003,10 @@ def test_threshold_offset_change_invalidates_anomaly_scores_via_patch():
         # NULLs the anomaly score, the live MissingSmartScoreFinder would otherwise
         # re-score it and make the `is None` assertion racy. The offset-change
         # invalidation runs on the DB queue, so it is unaffected by stopping the planner.
-        server.vault._work_planner.stop()
+        stop_planner_and_settle(server)
         for pic_id in (anomaly, content_only):
             _set_smart_score(server, pic_id, 0.5)
+        _seed_tag(server, anomaly, PENALISED_TAG)
         _seed_prediction(server, anomaly, PENALISED_TAG, confidence=0.9)
         _seed_prediction(server, content_only, CONTENT_TAG, confidence=0.9)
 
@@ -1011,6 +1027,9 @@ def test_identical_threshold_offset_save_is_a_noop():
     temp_dir, client, server = _setup()
     try:
         pic_id = _upload_picture(client)
+        # Applied as well as predicted, so a real offset move *would* clear it and the
+        # surviving score below proves the guard rather than the picture's exemption.
+        _seed_tag(server, pic_id, PENALISED_TAG)
         _seed_prediction(server, pic_id, PENALISED_TAG, confidence=0.9)
 
         # Establish a non-default offset first, then score the picture.
@@ -1711,6 +1730,7 @@ def test_penalised_tag_change_invalidates_atomically_no_second_task():
         bystander = _upload_picture(client, "Changed1.png")
         _set_smart_score(server, carrier, 0.5)
         _set_smart_score(server, bystander, 0.5)
+        _seed_tag(server, carrier, PENALISED_TAG)
         _seed_prediction(server, carrier, PENALISED_TAG, confidence=0.9)
         _seed_prediction(server, bystander, "bad anatomy", confidence=0.9)
 

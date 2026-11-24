@@ -44,6 +44,7 @@ from pixlstash.utils.quality.anomaly_penalty import (
     normalise_tag_weights,
 )
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.service.label_ledger import HUMAN, POS
 from pixlstash.utils.sql_chunking import chunked
 
 if TYPE_CHECKING:
@@ -336,23 +337,31 @@ def changed_penalised_tags(before: dict | None, after: dict | None) -> set[str]:
 def invalidate_for_penalised_tag_change(
     session: "Session", changed_tags: Iterable[str]
 ) -> int:
-    """NULL the cached score of every picture carrying one of *changed_tags*.
+    """NULL the cached score of every picture the changed weights are charged against.
 
-    Re-weighting a penalised tag only moves the score of pictures that actually carry
-    that tag, so invalidating the whole library (the previous behaviour) forced a full
-    re-score of every picture on any settings edit - tens of thousands of GPU-backed
-    recomputes to fix a few hundred rows.
+    Re-weighting a penalised tag only moves the score of pictures the penalty actually
+    charges for that tag, so invalidating the whole library forced a full re-score of
+    every picture on any settings edit.
 
-    "Carrying" spans both label sources the penalty reads: an applied :class:`Tag` row,
-    or an anomaly :class:`TagPrediction` row (which is what
-    :func:`~pixlstash.scoring.smart_score.fetch_anomaly_confidences` actually feeds the
-    scorer, including human POS/NEG decisions). Predictions are matched without a
-    confidence gate on purpose: a weight change must invalidate a picture whose
-    prediction sits either side of the apply threshold, and over-invalidating a handful
-    of rows is far cheaper than missing a stale score.
+    "Charged" is exactly what
+    :func:`~pixlstash.scoring.smart_score.fetch_anomaly_confidences` feeds the penalty,
+    and nothing wider:
+
+    * an applied :class:`Tag` row (a model prediction counts only with one), or
+    * a **human POS** :class:`TagPrediction`, which counts with no ``Tag`` row.
+
+    A model prediction with no applied tag is dropped by the scorer under any weight,
+    and a human NEG folds to 0, so neither can move. Matching *any* prediction row, as
+    this once did, matched nearly the whole library: the tagger stores a score for
+    every anomaly label on every picture it tags, so removing one penalised tag
+    re-scored every tagged picture and ran a library-wide UPDATE inside the settings
+    request. Weights shared across a family are already covered, because
+    :func:`changed_penalised_tags` expands a moved family to all its members.
 
     Issued as one bulk UPDATE per tag chunk with an ``IN (subquery)``, so no picture ids
-    are round-tripped into Python. Does **not** commit - the caller owns the transaction.
+    are round-tripped into Python. The prediction side is a lookup on the
+    ``label_source`` index rather than a scan. Does **not** commit - the caller owns the
+    transaction.
 
     Args:
         session: Active DB session.
@@ -371,14 +380,16 @@ def invalidate_for_penalised_tag_change(
     cleared = 0
     for chunk in chunked(tags):
         tagged = select(Tag.picture_id).where(func.lower(Tag.tag).in_(chunk))
-        predicted = select(TagPrediction.picture_id).where(
-            func.lower(TagPrediction.tag).in_(chunk)
+        confirmed = select(TagPrediction.picture_id).where(
+            TagPrediction.label_source == HUMAN,
+            TagPrediction.label_state == POS,
+            func.lower(TagPrediction.tag).in_(chunk),
         )
         result = session.exec(
             update(Picture)
             .where(
                 Picture.smart_score.is_not(None),
-                or_(Picture.id.in_(tagged), Picture.id.in_(predicted)),
+                or_(Picture.id.in_(tagged), Picture.id.in_(confirmed)),
             )
             .values(smart_score=None)
         )
@@ -394,7 +405,7 @@ def invalidate_for_penalised_tag_change(
 
 
 def invalidate_all_anomaly_scores(session: "Session", *, context: str) -> int:
-    """NULL the cached score of every picture that carries an anomaly prediction.
+    """NULL the cached score of every picture carrying an applied anomaly tag.
 
     The tagger's ``threshold_offset`` moves *two* things at once for every anomaly
     detection: the apply gate in
@@ -405,14 +416,17 @@ def invalidate_all_anomaly_scores(session: "Session", *, context: str) -> int:
     regardless of which specific tag is involved - so this is deliberately not scoped by
     tag the way :func:`invalidate_for_penalised_tag_change` is.
 
-    The set is still bounded to *anomaly-bearing* pictures rather than the whole vault:
-    the scorer's anomaly inputs come solely from :class:`TagPrediction` rows in the anomaly
-    vocabulary (:data:`~pixlstash.utils.quality.anomaly_penalty.ANOMALY_PENALTY_TAGS` -
-    exactly what ``fetch_anomaly_confidences`` reads). A picture with no such prediction has
-    no anomaly term, so the offset cannot have moved its score, and re-scoring it would be a
-    needless GPU-backed recompute. Predictions are matched without a confidence gate on
-    purpose: the offset shifts the gate itself, so a prediction sitting either side of the
-    old threshold can cross it and must be re-evaluated.
+    The set is bounded to the pictures the offset can actually move: those with an
+    applied :class:`Tag` in the anomaly vocabulary
+    (:data:`~pixlstash.utils.quality.anomaly_penalty.ANOMALY_PENALTY_TAGS`). The offset
+    acts only on *model* predictions, and ``fetch_anomaly_confidences`` charges a model
+    prediction only when its tag is applied, at any threshold. A human POS is 1.0, which
+    normalises to 1 against any threshold, and a human NEG is 0, so neither moves either.
+    Matching every anomaly :class:`TagPrediction` instead, as this once did, matched
+    nearly the whole library, because the tagger stores a score for every anomaly label
+    on every picture it tags. No confidence gate is applied to the tag rows: the offset
+    shifts the gate itself, so a prediction either side of the old threshold must be
+    re-evaluated.
 
     Issued as one bulk UPDATE per tag chunk with an ``IN (subquery)``, so no picture ids are
     round-tripped into Python. Does **not** commit - the caller owns the transaction.
@@ -434,21 +448,19 @@ def invalidate_all_anomaly_scores(session: "Session", *, context: str) -> int:
         return 0
     cleared = 0
     for chunk in chunked(tags):
-        predicted = select(TagPrediction.picture_id).where(
-            func.lower(TagPrediction.tag).in_(chunk)
-        )
+        tagged = select(Tag.picture_id).where(func.lower(Tag.tag).in_(chunk))
         result = session.exec(
             update(Picture)
             .where(
                 Picture.smart_score.is_not(None),
-                Picture.id.in_(predicted),
+                Picture.id.in_(tagged),
             )
             .values(smart_score=None)
         )
         cleared += result.rowcount or 0
     logger.info(
         "Smart-score invalidation (%s): tagger threshold offset changed, cleared %d "
-        "cached anomaly-bearing score(s) for recompute.",
+        "cached score(s) of pictures carrying an anomaly tag for recompute.",
         context,
         cleared,
     )
