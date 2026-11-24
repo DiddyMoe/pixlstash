@@ -316,6 +316,8 @@ READ_BLOCKED_GET_PATHS: frozenset[str] = frozenset(
         # sensitive?", and the question is now "is this route owner-only?".
         "/api/v1/adapters",
         "/api/v1/checkpoints",
+        # A vault-wide auto-stack run's progress and failures.
+        "/api/v1/dedup/auto-stack/runs/latest",
         "/api/v1/dedup/groups",
         "/api/v1/dedup/mixed-stacks",
         "/api/v1/dedup/policy",
