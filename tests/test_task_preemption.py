@@ -563,6 +563,10 @@ def test_stop_leaves_the_models_to_a_worker_that_outlived_the_wait(monkeypatch):
             _disable_background_workers=False,
             _engine=SimpleNamespace(close=lambda: released.append("engine")),
             db=None,
+            # Stopped ahead of the workers; none is running here.
+            snapshot_service=SimpleNamespace(cancel_inflight=lambda: None),
+            smart_score_anchor_watch=SimpleNamespace(close=lambda: None),
+            _wait_for_face_followups=lambda: None,
         )
         Vault.stop(vault)
         assert vault._engine is None
