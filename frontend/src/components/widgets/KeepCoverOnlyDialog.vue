@@ -264,7 +264,7 @@ function retry() {
         <AppButton
           v-if="failure.retryable"
           data-testid="keep-cover-retry"
-          variant="outline"
+          variant="secondary"
           size="sm"
           icon-left="refresh"
           @click="retry"
