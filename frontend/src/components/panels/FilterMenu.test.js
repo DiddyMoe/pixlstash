@@ -11,6 +11,7 @@ import { setActivePinia, createPinia } from "pinia";
 
 import FilterMenu from "./FilterMenu.vue";
 import { useFilterStore } from "../../stores/useFilterStore.js";
+import { useGridStore } from "../../stores/useGridStore.js";
 import { useSelectionStore } from "../../stores/useSelectionStore.js";
 import { getFaceClusters } from "../../api/characters";
 import { filterChips } from "../../utils/filterChips";
@@ -92,6 +93,25 @@ beforeEach(() => {
 });
 
 describe("FilterMenu", () => {
+  // The header's "N of M": M is the view's own count (3 here), N is what the
+  // grid has counted, and until it has the header says so instead of "0".
+  it("heads the menu with the grid's match count only once it is counted", async () => {
+    const wrapper = await mountMenu();
+    const header = () => wrapper.find(".fm-of").text();
+    expect(header()).toBe("– of 3");
+
+    const grid = useGridStore();
+    grid.matchCount = 0;
+    await flushPromises();
+    expect(header()).toBe("0 of 3");
+
+    grid.matchCount = 2;
+    await flushPromises();
+    expect(header()).toBe("2 of 3");
+    // Left mounted, its header keeps counting the view into later tests.
+    wrapper.unmount();
+  });
+
   it("ticks any number of workflows, one chip each, and drops a lone LoRA beside a second (#1797)", async () => {
     const store = useFilterStore();
     // The Workflow tab's LoRA pile: one workflow narrowed to one LoRA.

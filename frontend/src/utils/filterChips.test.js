@@ -5,6 +5,7 @@ import { useFilterStore } from "../stores/useFilterStore";
 import { useTagGroupsStore } from "../stores/useTagGroupsStore";
 import {
   filterChips,
+  matchCountLabel,
   scoreChipValue,
   tagTermLabel,
   workflowFilterChips,
@@ -153,6 +154,29 @@ describe("scoreChipValue", () => {
     [null, null, false, ""],
   ])("min %s max %s unscored %s → %s", (min, max, unscored, want) => {
     expect(scoreChipValue(min, max, unscored)).toBe(want);
+  });
+});
+
+describe("matchCountLabel", () => {
+  const big = (207680).toLocaleString();
+
+  // The reported fault: the strip read "0 of 207,680" while the grid was
+  // still loading the filtered view.
+  it("reads a view the grid has not counted as unknown, never as 0", () => {
+    expect(matchCountLabel(null, 207680)).toBe(`– of ${big}`);
+    expect(matchCountLabel(null, undefined)).toBe("–");
+  });
+
+  it("states a counted view, and one that matched nothing, as figures", () => {
+    expect(matchCountLabel(0, 207680)).toBe(`0 of ${big}`);
+    expect(matchCountLabel(1234, 207680)).toBe(
+      `${(1234).toLocaleString()} of ${big}`,
+    );
+  });
+
+  it("leaves off the of-total until it is known", () => {
+    expect(matchCountLabel(12, undefined)).toBe("12");
+    expect(matchCountLabel(12, null)).toBe("12");
   });
 });
 

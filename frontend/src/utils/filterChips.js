@@ -12,6 +12,7 @@ import {
   isGroupToken,
   useTagGroupsStore,
 } from "../stores/useTagGroupsStore";
+import { UNKNOWN_FIGURE } from "./keepCoverOnly";
 
 // Pick-one Picture kinds. "Any" is deliberately not a choice: removing the chip
 // is how you get back to any.
@@ -124,6 +125,20 @@ export function tagTermLabel(term) {
 /** A filter row's count, localised; blank while it is still unknown. */
 export function formatCount(n) {
   return n == null ? "" : Number(n).toLocaleString();
+}
+
+/**
+ * The "N of M" beside the active filters (the strip's tail and the Filter menu
+ * header): how many pictures the view matches, of the view unfiltered.
+ *
+ * `matches` is null until the grid has counted them, and then it reads as the
+ * en dash every unknown figure uses, never as 0: "0 of 207,680" says the
+ * filters matched nothing when nobody has looked yet. `total` is null until
+ * its own count lands, and the "of M" waits for it.
+ */
+export function matchCountLabel(matches, total) {
+  const n = matches == null ? UNKNOWN_FIGURE : Number(matches).toLocaleString();
+  return total == null ? n : `${n} of ${Number(total).toLocaleString()}`;
 }
 
 export function percent(threshold) {

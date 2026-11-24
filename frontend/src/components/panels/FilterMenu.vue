@@ -453,6 +453,7 @@ import {
   confidenceEntry,
   filterChips,
   formatCount,
+  matchCountLabel,
   modelLabel,
   parseConfidenceEntry,
   scoreChipValue,
@@ -615,10 +616,9 @@ const chips = computed(() =>
 );
 
 const total = computed(() => count(""));
-const ofLabel = computed(() => {
-  const n = Number(gridStore.matchCount || 0).toLocaleString();
-  return total.value == null ? n : `${n} of ${total.value.toLocaleString()}`;
-});
+const ofLabel = computed(() =>
+  matchCountLabel(gridStore.matchCount, total.value),
+);
 
 // ── Root rows ────────────────────────────────────────────────────────────────
 const KIND_OF_CHIP = {

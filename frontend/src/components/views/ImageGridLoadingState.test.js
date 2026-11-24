@@ -11,6 +11,7 @@ import { useSelectionStore } from "../../stores/useSelectionStore.js";
 import { useProjectStore } from "../../stores/useProjectStore.js";
 import { useSortStore } from "../../stores/useSortStore.js";
 import { useFilterStore } from "../../stores/useFilterStore.js";
+import { useSearchStore } from "../../stores/useSearchStore.js";
 import {
   isSupportedImageFile,
   isSupportedVideoFile,
@@ -556,6 +557,86 @@ describe("stack counts while a view streams in", () => {
       expect(lastStackStats(wrapper)).toEqual({ expanded: 0, total: 1 });
     } finally {
       wrapper.unmount();
+    }
+  });
+});
+
+describe("the match count beside the filters", () => {
+  // The filter strip and the Filter menu header print it as "N of M". A count
+  // the grid has not made reaches them as null (unknown), never as the 0 that
+  // an emptied grid holds while its read is out: "0 of 207,680" over a view
+  // that is still loading says the filters matched nothing.
+  const counts = (wrapper) =>
+    (wrapper.emitted("update:match-count") ?? []).map(([n]) => n);
+
+  it("is unknown, not 0, while the view's read is out", async () => {
+    answer({ count: never, stream: never });
+    const wrapper = await settle();
+
+    expect(counts(wrapper).at(-1)).toBeNull();
+    expect(counts(wrapper)).not.toContain(0);
+  });
+
+  it("stays unknown when the read failed", async () => {
+    answer({ count: DOWN, stream: never });
+    const wrapper = await settle();
+
+    expect(cardText(wrapper)).toContain("Couldn't load pictures");
+    expect(counts(wrapper).at(-1)).toBeNull();
+    expect(counts(wrapper)).not.toContain(0);
+  });
+
+  it("is 0 once the view has answered with nothing", async () => {
+    answer({ count: COUNT_ZERO, stream: never });
+    const wrapper = await settle();
+
+    expect(counts(wrapper).at(-1)).toBe(0);
+  });
+
+  it("is a stream's count as soon as the count answers, before any batch", async () => {
+    answer({ count: COUNT_FIVE, stream: never });
+    const wrapper = await settle();
+
+    expect(wrapper.vm.imagesLoading).toBe(true);
+    expect(counts(wrapper).at(-1)).toBe(5);
+  });
+
+  // The reported view: a text search fills the grid only when its read
+  // returns, so until then the grid is empty however much it will match.
+  it("waits for a text search to answer, then counts what it found", async () => {
+    const search = held();
+    apiGet.mockImplementation((url) => {
+      const u = String(url);
+      if (u.includes("/summary")) {
+        return Promise.resolve({ data: { image_count: 5 } });
+      }
+      if (u.includes("/pictures/search")) return search.promise;
+      return Promise.resolve({ data: [] });
+    });
+    useSearchStore().searchQuery = "stacked";
+    const wrapper = mountGrid();
+    try {
+      await vi.waitFor(() =>
+        expect(
+          apiGet.mock.calls.some(([u]) => String(u).includes("/pictures/search")),
+        ).toBe(true),
+      );
+      await nextTick();
+      expect(counts(wrapper).at(-1)).toBeNull();
+      expect(counts(wrapper)).not.toContain(0);
+
+      search.resolve({
+        data: [
+          { id: 1, name: "test-1.png" },
+          { id: 2, name: "test-2.png" },
+        ],
+      });
+      await vi.waitFor(() => expect(wrapper.vm.imagesLoading).toBe(false));
+      await nextTick();
+      expect(counts(wrapper).at(-1)).toBe(2);
+    } finally {
+      wrapper.unmount();
+      search.resolve({ data: [] });
     }
   });
 });

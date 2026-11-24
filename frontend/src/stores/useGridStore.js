@@ -37,9 +37,11 @@ export const useGridStore = defineStore("grid", () => {
   const totalStackCount = ref(0);
   const visibleRangeLabel = ref(null);
   // Total number of pictures matching the active filter/sort (the full fetched
-  // set, not the virtualised window). Published by ImageGrid; read by the Filter
-  // menu header to show a live "N matches" count.
-  const matchCount = ref(0);
+  // set, not the virtualised window). Published by ImageGrid; read by the
+  // filter strip and the Filter menu header for their "N of M". Null while the
+  // grid has not counted the view (its read is out, or failed), which is not
+  // the same as a view that matched nothing.
+  const matchCount = ref(null);
   const gridVersion = ref(0);
   const wsUpdateKey = ref(0);
   const minColumns = ref(6);

@@ -3464,16 +3464,6 @@ watch(
   { immediate: true },
 );
 
-// Publish the total number of pictures matching the active filter/sort so the
-// Filter menu header can show a live "N matches" count. allGridImages holds the
-// full fetched set, so its length is the match total.
-watch(
-  () => allGridImages.value.length,
-  (count) => {
-    emit("update:match-count", count);
-  },
-  { immediate: true },
-);
 // ────────────────────────────────────────────────────────────────
 
 function prefetchFullImage(img) {
@@ -7885,6 +7875,26 @@ const gridFetchPending = computed(
 );
 const emptyStateLoading = computed(
   () => gridFetchPending.value || !!imagesError.value,
+);
+
+// Publish how many pictures match the active filter/sort, for the "N of M"
+// beside the filters. allGridImages holds the full fetched set, so once a read
+// has answered its length is the match total; a stream lays down a
+// placeholder per match as soon as its count answers, before any batch.
+// Before then it is not a count: every view change empties the grid, and a
+// text search fills it only when its read returns, so the length reads 0 for
+// a view that may match thousands. While the grid is empty and the card says
+// "Loading…" or "Couldn't load pictures" the count is null (unknown), the
+// same test the card uses. An answered empty view is a real 0.
+watch(
+  () =>
+    allGridImages.value.length === 0 && emptyStateLoading.value
+      ? null
+      : allGridImages.value.length,
+  (count) => {
+    emit("update:match-count", count);
+  },
+  { immediate: true },
 );
 
 function retryGridFetch() {

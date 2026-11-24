@@ -72,7 +72,7 @@ import { computed } from "vue";
 import { useFilterCounts } from "../../composables/useFilterCounts";
 import { useFilterStore } from "../../stores/useFilterStore";
 import { useGridStore } from "../../stores/useGridStore";
-import { filterChips } from "../../utils/filterChips";
+import { filterChips, matchCountLabel } from "../../utils/filterChips";
 import Tooltip from "../widgets/Tooltip.vue";
 
 const props = defineProps({
@@ -111,11 +111,11 @@ const chips = computed(
 const { count } = useFilterCounts(() => props.countBaseQuery);
 const total = computed(() => (chips.value.length ? count("") : undefined));
 
-const ofLabel = computed(() => {
-  if (props.ofLabel != null) return props.ofLabel;
-  const n = Number(gridStore.matchCount || 0).toLocaleString();
-  return total.value == null ? n : `${n} of ${total.value.toLocaleString()}`;
-});
+const ofLabel = computed(() =>
+  props.ofLabel != null
+    ? props.ofLabel
+    : matchCountLabel(gridStore.matchCount, total.value),
+);
 
 function clearAll() {
   if (props.onClearAll) {
