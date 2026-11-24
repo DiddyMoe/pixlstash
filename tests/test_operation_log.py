@@ -953,6 +953,41 @@ def test_undo_restores_before_state_and_redo_restores_after(client, server):
     assert _tags(server, picture_id) == ["sunset"]
 
 
+def test_redo_after_two_undos_replays_the_older_operation_first(client, server):
+    """Redo is the mirror of undo: the last one undone is the first one redone.
+
+    Undo walks history newest-first, so after two undos the most recently
+    undone operation is the OLDER one. Replaying the newer one first would lay
+    its after-state over a history that has not reached it yet, and the older
+    redo that follows would then roll the picture back to the middle state
+    while both rows read "applied".
+    """
+    picture_id = _upload(client)
+    client.post(f"{API}/pictures/{picture_id}/tags", json={"tag": "one"})
+    client.post(f"{API}/pictures/{picture_id}/tags", json={"tag": "two"})
+    first, second = sorted(
+        (row for row in _operations(server) if row["op_type"] == "pictures.tags.add"),
+        key=lambda row: row["id"],
+    )[-2:]
+
+    assert client.post(f"{API}/operations/undo").status_code == 200
+    assert client.post(f"{API}/operations/undo").status_code == 200
+    assert _tags(server, picture_id) == []
+
+    state = client.get(f"{API}/operations/undo-state").json()
+    assert state["next_redo"]["id"] == first["id"]
+
+    redo = client.post(f"{API}/operations/redo")
+    assert redo.status_code == 200, redo.text
+    assert [op["id"] for op in redo.json()["operations"]] == [first["id"]]
+    assert _tags(server, picture_id) == ["one"]
+
+    state = client.get(f"{API}/operations/undo-state").json()
+    assert state["next_redo"]["id"] == second["id"]
+    assert client.post(f"{API}/operations/redo").status_code == 200
+    assert sorted(_tags(server, picture_id)) == ["one", "two"]
+
+
 def test_undo_of_bulk_rating_reverts_every_target(client, server):
     ids = [_upload(client) for _ in range(3)]
     client.post(

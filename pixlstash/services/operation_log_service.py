@@ -2318,6 +2318,23 @@ def undo_batch_in_session(
     return [serialize(member) for member in members], touched, sorted(facets), lifecycle
 
 
+def _next_redo_in_session(session: Session) -> Optional[Operation]:
+    """The operation Redo replays next: the one undone most recently.
+
+    Undo walks history newest-first and recording anything new supersedes every
+    undone row (:func:`_append_operation_row`), so the undone rows are always one
+    contiguous suffix of history and the most recently undone is the OLDEST of
+    them. Replaying a newer one first would lay its after-state over a history
+    that has not reached it, and the older redo after it would roll that back
+    while both rows read applied.
+    """
+    return session.exec(
+        select(Operation)
+        .where(Operation.status == STATUS_UNDONE)
+        .order_by(Operation.id.asc())
+    ).first()
+
+
 def redo_in_session(
     session: Session,
     registry: Optional[InteractiveRescoreRegistry] = None,
@@ -2325,11 +2342,7 @@ def redo_in_session(
     image_root: Optional[str] = None,
 ) -> tuple[list[dict], list[int], list[str], dict[str, list[int]]]:
     """Re-apply the most recently undone operation (and its whole batch)."""
-    operation = session.exec(
-        select(Operation)
-        .where(Operation.status == STATUS_UNDONE)
-        .order_by(Operation.id.desc())
-    ).first()
+    operation = _next_redo_in_session(session)
     if operation is None:
         raise OperationLogError("Nothing to redo")
     members = _batch_members_in_session(session, operation, STATUS_UNDONE)
@@ -2387,11 +2400,7 @@ def undo_state_in_session(session: Session) -> dict:
         .where(Operation.undoable.is_(True))
         .order_by(Operation.id.desc())
     ).first()
-    next_redo = session.exec(
-        select(Operation)
-        .where(Operation.status == STATUS_UNDONE)
-        .order_by(Operation.id.desc())
-    ).first()
+    next_redo = _next_redo_in_session(session)
     return {
         "can_undo": next_undo is not None,
         "can_redo": next_redo is not None,
