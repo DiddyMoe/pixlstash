@@ -466,6 +466,11 @@ class FullRestoreMixin:
             # soon-to-be-disposed engine. _swap_database holds
             # exclusive_engine_access internally to fence out readers.
             self._swap_database(live_db_path, upgraded_snapshot)
+            # The smart-score anchor baseline describes the file just swapped
+            # out. Dropped here, on the writer thread, so an anchor check
+            # already queued behind this task re-baselines on the restored
+            # library instead of reading the whole file as an anchor change.
+            self._vault.smart_score_anchor_watch.forget_baseline()
 
         def _post_restore_cleanup(session):
             # Identify resurrected scrapheap ghosts: snapshot ``deleted=True``

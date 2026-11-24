@@ -18,7 +18,6 @@ from sqlalchemy import (
 from sqlmodel import Session, select
 from typing import Optional
 
-from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Detection,
     Picture,
@@ -29,6 +28,7 @@ from pixlstash.db_models import (
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.scoring.prompt_match import looks_like_prompt
+from pixlstash.scoring.smart_score import is_anchor_score
 from pixlstash.services import operation_log_service, scrapheap_service
 from pixlstash.services.set_lock_service import (
     enforce_pictures_not_locked,
@@ -62,11 +62,10 @@ from pixlstash.utils.service.filter_helpers import (
     narrow_picture_project_ids,
 )
 from pixlstash.utils.service.scope_table import scope_id_subquery
-from pixlstash.utils.serialization_utils import safe_model_dict
-
-from ._helpers import (
-    _score_anchor_membership_changed,
+from pixlstash.utils.service.smart_score_invalidation import (
+    note_anchor_inputs_changing,
 )
+from pixlstash.utils.serialization_utils import safe_model_dict
 
 
 logger = get_logger(__name__)
@@ -120,7 +119,14 @@ class ApplyScoresResponse(BaseModel):
     skipped_count: int
     missing_ids: list[int] = []
     missing_count: int
-    reset_triggered: bool
+    reset_triggered: bool = Field(
+        description=(
+            "True when a changed rating could move the smart-score anchors (an "
+            "embedded picture entering, leaving or re-rated within the good or bad "
+            "anchor range). A background check then compares the anchor set and "
+            "clears every cached smart score only if the set actually changed."
+        )
+    )
 
 
 class SetFavouriteResponse(BaseModel):
@@ -758,8 +764,13 @@ def register_routes(router, server):
         ):
             # Read only id+score to avoid loading heavy blob columns on Picture.
             # Loading full ORM rows here can be very expensive for large batches.
+            # Whether a picture has an embedding decides if it can be an anchor.
             score_rows = session.exec(
-                select(Picture.id, Picture.score)
+                select(
+                    Picture.id,
+                    Picture.score,
+                    Picture.image_embedding.is_not(None),
+                )
                 .where(Picture.id.in_(picture_ids))
                 .where(Picture.deleted.is_(False))
             ).all()
@@ -767,11 +778,11 @@ def register_routes(router, server):
             found_ids: set[int] = set()
             updated_ids: list[int] = []
             skipped_ids: list[int] = []
-            reset_triggered = False
+            anchor_check = False
             score_updates: dict[int, int] = {}
 
             for row in score_rows:
-                pic_id_raw, old_score = row
+                pic_id_raw, old_score, has_embedding = row
                 if pic_id_raw is None:
                     continue
                 pic_id = int(pic_id_raw)
@@ -785,13 +796,20 @@ def register_routes(router, server):
                 if old_score == new_score:
                     continue
 
-                if _score_anchor_membership_changed(old_score, new_score):
-                    reset_triggered = True
+                if has_embedding and (
+                    is_anchor_score(old_score) or is_anchor_score(new_score)
+                ):
+                    anchor_check = True
 
                 score_updates[pic_id] = new_score
                 updated_ids.append(pic_id)
 
             missing_ids = [pid for pid in picture_ids if pid not in found_ids]
+
+            if anchor_check:
+                # A Core UPDATE never reaches the anchor watch's flush hook, so
+                # say so before writing: the watch snapshots the anchors first.
+                note_anchor_inputs_changing(session)
 
             if score_updates:
                 session.exec(
@@ -806,27 +824,20 @@ def register_routes(router, server):
                     )
                 )
 
-            if reset_triggered:
-                session.exec(
-                    update(Picture)
-                    .where(Picture.smart_score.is_not(None))
-                    .values(smart_score=None)
-                )
-
-            if updated_ids or reset_triggered:
+            if updated_ids:
                 session.flush()
 
             return (
                 sorted(updated_ids),
                 sorted(skipped_ids),
                 sorted(missing_ids),
-                reset_triggered,
+                anchor_check,
             )
 
         # Recorded as ONE operation so Ctrl+Z reverts the whole batch of ratings
         # rather than one picture at a time.
         (
-            (updated_ids, skipped_ids, missing_ids, reset_triggered),
+            (updated_ids, skipped_ids, missing_ids, anchor_check),
             _operation,
         ) = operation_log_service.run_recorded_metadata_task(
             server.vault,
@@ -840,7 +851,7 @@ def register_routes(router, server):
             **operation_log_service.request_context(request),
         )
 
-        if updated_ids or reset_triggered:
+        if updated_ids:
             server.vault.notify(
                 EventType.CHANGED_PICTURES,
                 {
@@ -859,7 +870,7 @@ def register_routes(router, server):
             "skipped_count": len(skipped_ids),
             "missing_ids": missing_ids,
             "missing_count": len(missing_ids),
-            "reset_triggered": bool(reset_triggered),
+            "reset_triggered": anchor_check,
         }
 
     @router.post(
@@ -1339,7 +1350,6 @@ def register_routes(router, server):
                 updated = True
 
         if updated:
-            old_score = pic.score if "score" in updated_fields else None
 
             def apply_picture_updates(session: Session, picture_id: int, fields: dict):
                 pic_db = session.get(Picture, picture_id)
@@ -1375,18 +1385,8 @@ def register_routes(router, server):
                 )
             except KeyError:
                 raise HTTPException(status_code=404, detail="Picture not found")
-            if "score" in updated_fields:
-                new_score = updated_fields["score"]
-
-                if _score_anchor_membership_changed(old_score, new_score):
-
-                    def _reset_smart_scores(session: Session) -> None:
-                        session.exec(update(Picture).values(smart_score=None))
-                        session.commit()
-
-                    server.vault.db.run_task(
-                        _reset_smart_scores, priority=DBPriority.LOW
-                    )
+            # A score change needs no smart-score handling here: the anchor watch
+            # sees the flush and clears every score if the anchor set moved.
             server.vault.notify(
                 EventType.CHANGED_PICTURES,
                 {

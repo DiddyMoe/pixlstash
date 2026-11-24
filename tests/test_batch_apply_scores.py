@@ -7,6 +7,7 @@ from PIL import Image
 from io import BytesIO
 from sqlmodel import select
 
+from pixlstash.database import DBPriority
 from pixlstash.db_models.picture import Picture
 from pixlstash.server import Server
 from tests.utils import upload_pictures_and_wait
@@ -80,7 +81,11 @@ def test_batch_apply_scores_updates_only_unscored_pictures():
 
 
 def test_batch_apply_scores_resets_smart_scores_for_anchor_transitions():
-    """A batch crossing anchor boundaries should trigger one smart-score reset pass."""
+    """A batch that changes the anchor set clears every cached smart score.
+
+    The clear is the anchor watch's, queued behind the batch at LOW priority and
+    run only if the anchor set really moved; draining that priority settles it.
+    """
 
     with tempfile.TemporaryDirectory() as temp_dir:
         server_config_path = os.path.join(temp_dir, "server_config.json")
@@ -103,11 +108,16 @@ def test_batch_apply_scores_resets_smart_scores_for_anchor_transitions():
 
             pic_a = first_import["results"][0]["picture_id"]
             pic_b = second_import["results"][0]["picture_id"]
+            # Nothing may re-score the pictures between the clear and the read.
+            server.vault._work_planner.stop()
 
             def seed_smart_scores(session, ids: list[int]) -> None:
+                # Only an embedded picture can be an anchor.
+                embedding = np.random.rand(128).astype(np.float32).tobytes()
                 for pid in ids:
                     pic = session.get(Picture, pid)
                     assert pic is not None
+                    pic.image_embedding = embedding
                     pic.smart_score = 4.0
                     session.add(pic)
                 session.commit()
@@ -139,6 +149,8 @@ def test_batch_apply_scores_resets_smart_scores_for_anchor_transitions():
                     if row.id is not None
                 }
 
+            # The anchor check runs behind everything queued before it.
+            server.vault.db.run_task(lambda session: None, priority=DBPriority.LOW)
             snapshot = server.vault.db.run_task(fetch_score_snapshot, [pic_a, pic_b])
             assert snapshot[pic_a][0] == 5
             assert snapshot[pic_b][0] == 4

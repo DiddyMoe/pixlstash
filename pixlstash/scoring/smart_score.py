@@ -47,6 +47,95 @@ logger = get_logger(__name__)
 _BUILTIN_MIN_GOOD = 10
 _BUILTIN_MIN_BAD = 10
 
+#: A rating at or above this makes an embedded, live picture a *good* anchor.
+GOOD_ANCHOR_MIN_SCORE = 4
+#: A rating in ``(0, BAD_ANCHOR_MAX_SCORE]`` makes it a *bad* anchor (0 = unrated).
+BAD_ANCHOR_MAX_SCORE = 1
+#: How many user-rated pictures each anchor side reads. Read at call time rather
+#: than bound as a default, so the anchor queries and the anchor watch can never
+#: disagree on it.
+ANCHOR_LIMIT = 200
+
+# The order each anchor side is cut in. Shared by the query builders and by the
+# keyed read in :func:`read_scoring_anchors`, which has to re-apply it after
+# fetching the embeddings so the scorer sees the anchors in the same order.
+_GOOD_ANCHOR_ORDER = (desc(Picture.score), desc(Picture.created_at), desc(Picture.id))
+_BAD_ANCHOR_ORDER = (Picture.score, desc(Picture.created_at), desc(Picture.id))
+
+
+def is_good_anchor_score(score: int | None) -> bool:
+    """Whether a rating places a picture in the good-anchor class."""
+    return score is not None and score >= GOOD_ANCHOR_MIN_SCORE
+
+
+def is_bad_anchor_score(score: int | None) -> bool:
+    """Whether a rating places a picture in the bad-anchor class."""
+    return score is not None and 0 < score <= BAD_ANCHOR_MAX_SCORE
+
+
+def is_anchor_score(score: int | None) -> bool:
+    """Whether a rating places a picture in either anchor class."""
+    return is_good_anchor_score(score) or is_bad_anchor_score(score)
+
+
+def good_anchor_query(*columns):
+    """The good-anchor read: best-rated live, embedded pictures, newest first.
+
+    Every reader of the anchors builds its query here, so the scorer and the
+    anchor watch (:class:`~pixlstash.utils.service.smart_score_invalidation.SmartScoreAnchorWatch`)
+    always see the same set. ``id`` breaks ties after ``created_at`` so the
+    ``ANCHOR_LIMIT`` cut is deterministic: without it, two equally old pictures
+    on the boundary could swap between reads and look like an anchor change.
+
+    Args:
+        *columns: The columns to select, e.g. ``Picture.image_embedding, Picture.score``.
+    """
+    return (
+        select(*columns)
+        .where(Picture.score >= GOOD_ANCHOR_MIN_SCORE)
+        .where(Picture.image_embedding.is_not(None))
+        .where(Picture.deleted.is_(False))
+        .order_by(*_GOOD_ANCHOR_ORDER)
+        .limit(ANCHOR_LIMIT)
+    )
+
+
+def bad_anchor_query(*columns):
+    """The bad-anchor read: worst-rated live, embedded pictures, newest first.
+
+    See :func:`good_anchor_query` for why every anchor reader goes through here.
+
+    Args:
+        *columns: The columns to select.
+    """
+    return (
+        select(*columns)
+        .where(Picture.score > 0)
+        .where(Picture.score <= BAD_ANCHOR_MAX_SCORE)
+        .where(Picture.image_embedding.is_not(None))
+        .where(Picture.deleted.is_(False))
+        .order_by(*_BAD_ANCHOR_ORDER)
+        .limit(ANCHOR_LIMIT)
+    )
+
+
+def anchor_signature(session: Session) -> tuple[frozenset, frozenset]:
+    """Identify the anchors the scorer would read now: ``(good, bad)``.
+
+    Each side is a frozenset of ``(picture_id, score)``. The score is part of the
+    identity because an anchor's weight depends on it, so a 4 -> 5 change on an
+    anchor moves every smart score even though membership did not change.
+    """
+    good = frozenset(
+        (pid, score)
+        for pid, score in session.exec(good_anchor_query(Picture.id, Picture.score))
+    )
+    bad = frozenset(
+        (pid, score)
+        for pid, score in session.exec(bad_anchor_query(Picture.id, Picture.score))
+    )
+    return good, bad
+
 
 @dataclass
 class _BuiltinAnchor:
@@ -100,6 +189,52 @@ def _load_builtin_anchors() -> tuple[list["_BuiltinAnchor"], list["_BuiltinAncho
         len(good),
         len(bad),
     )
+    return good, bad
+
+
+def read_scoring_anchors(session: Session) -> tuple[list, list]:
+    """The anchors the scorer compares candidates against: ``(good, bad)``.
+
+    Each side holds the user's anchor rows (``image_embedding``, ``score``), in
+    the order and with the cut of :func:`good_anchor_query` and
+    :func:`bad_anchor_query`. A side is topped up with the built-in anchors when
+    the user has rated fewer than ``_BUILTIN_MIN_GOOD`` / ``_BUILTIN_MIN_BAD``
+    pictures into it. Both scorers read through here: the background
+    :class:`~pixlstash.tasks.smart_score_task.SmartScoreTask` and the
+    on-demand sort in :func:`fetch_smart_score_data`.
+
+    The read is keyed. The anchor query chooses the ids, and the embeddings are
+    fetched for those ids only. Selecting the embedding inside the ordered,
+    limited query makes SQLite read every qualifying picture's embedding to
+    build its sort record, though ``LIMIT`` keeps only ``ANCHOR_LIMIT`` of them
+    (SQLite's sorter-reference optimisation is off unless compiled in and
+    configured). On a synthetic library with 37,000 pictures rated 4 or 5 the
+    keyed read took about half as long (95 ms against 193 ms; 133 against 267
+    on a busier run) for the same rows. The background scorer pays it once per
+    64-picture batch.
+
+    Args:
+        session: An open vault session.
+    """
+    good = list(
+        session.exec(
+            select(Picture.image_embedding, Picture.score)
+            .where(Picture.id.in_(good_anchor_query(Picture.id)))
+            .order_by(*_GOOD_ANCHOR_ORDER)
+        ).all()
+    )
+    bad = list(
+        session.exec(
+            select(Picture.image_embedding, Picture.score)
+            .where(Picture.id.in_(bad_anchor_query(Picture.id)))
+            .order_by(*_BAD_ANCHOR_ORDER)
+        ).all()
+    )
+    builtin_good, builtin_bad = _load_builtin_anchors()
+    if len(good) < _BUILTIN_MIN_GOOD:
+        good += builtin_good
+    if len(bad) < _BUILTIN_MIN_BAD:
+        bad += builtin_bad
     return good, bad
 
 
@@ -462,26 +597,6 @@ def fetch_smart_score_data(
         penalised_tags = resolve_penalised_tag_weights(getattr(server, "auth", None))
 
     def fetch_data(session: Session):
-        # Anchors
-        good = session.exec(
-            select(Picture.image_embedding, Picture.score)
-            .where(Picture.score >= 4)
-            .where(Picture.image_embedding.is_not(None))
-            .where(Picture.deleted.is_(False))
-            .order_by(desc(Picture.score), desc(Picture.created_at))
-            .limit(200)
-        ).all()
-
-        bad = session.exec(
-            select(Picture.image_embedding, Picture.score)
-            .where(Picture.score <= 1)
-            .where(Picture.score > 0)
-            .where(Picture.image_embedding.is_not(None))
-            .where(Picture.deleted.is_(False))
-            .order_by(Picture.score, desc(Picture.created_at))
-            .limit(200)
-        ).all()
-
         # Candidates - join to picture-level quality rows.
         query = select(Picture, Quality).outerjoin(
             Quality,
@@ -494,7 +609,9 @@ def fetch_smart_score_data(
 
         if candidate_ids is not None:
             if not candidate_ids:
-                return good, bad, [], {}
+                # Nothing to score, so the anchors are not read; every caller
+                # scores only when ``candidates`` is non-empty.
+                return [], [], [], {}
             query = query.where(Picture.id.in_(candidate_ids))
 
         if format:
@@ -550,13 +667,7 @@ def fetch_smart_score_data(
             penalised_tag_weights=penalised_tags,
         )
 
-        # Supplement with built-in anchors when the user has few rated images.
-        builtin_good, builtin_bad = _load_builtin_anchors()
-        if len(good) < _BUILTIN_MIN_GOOD:
-            good = list(good) + builtin_good
-        if len(bad) < _BUILTIN_MIN_BAD:
-            bad = list(bad) + builtin_bad
-
+        good, bad = read_scoring_anchors(session)
         return good, bad, candidates, scorer_config
 
     return server.vault.db.run_immediate_read_task(fetch_data)

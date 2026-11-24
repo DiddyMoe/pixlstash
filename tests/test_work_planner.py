@@ -1038,7 +1038,11 @@ def test_smart_score_timing_line_carries_every_field(caplog, monkeypatch):
     monkeypatch.setattr(
         smart_score_task, "resolve_penalised_tag_weights", lambda auth: {}
     )
-    vault = SimpleNamespace(db=_SmartScoreDb(), auth_service=None)
+    vault = SimpleNamespace(
+        db=_SmartScoreDb(),
+        auth_service=None,
+        smart_score_anchor_watch=SimpleNamespace(epoch=0),
+    )
     task = SmartScoreTask(vault, [SimpleNamespace(id=1)])
 
     with caplog.at_level(logging.DEBUG):

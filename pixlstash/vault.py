@@ -59,7 +59,10 @@ from .utils.vram_utils import empty_device_cache
 from . import worker_config
 
 from pixlstash.event_types import EventType
-from pixlstash.utils.service.smart_score_invalidation import InteractiveRescoreRegistry
+from pixlstash.utils.service.smart_score_invalidation import (
+    InteractiveRescoreRegistry,
+    SmartScoreAnchorWatch,
+)
 from pixlstash.tagger_plugins.registry import (
     get_tagger_plugin_manager,
     unload_loaded_tagger_plugins,
@@ -318,6 +321,11 @@ class Vault:
         # disable_background_workers early-return because the mutation handlers that
         # record into it run in both modes.
         self.interactive_rescore_registry = InteractiveRescoreRegistry()
+        # Clears every cached smart score when a rating, undo, soft delete or dedup
+        # score lift actually changes the scorer's anchor set, and only then. Hooked
+        # into every writer session; before the early-return for the same reason.
+        self.smart_score_anchor_watch = SmartScoreAnchorWatch(self.db)
+        self.db.add_session_hook(self.smart_score_anchor_watch.attach)
 
         if disable_background_workers:
             logger.info(
@@ -928,6 +936,8 @@ class Vault:
             self._changed_tags_pending_ids.clear()
         if timer is not None:
             timer.cancel()
+        # Its quiet-period timer would queue a check on the database closed below.
+        self.smart_score_anchor_watch.close()
         if self._started:
             # Stop the training poll thread first.  This does NOT kill a running
             # external trainer (by policy): it survives the restart and is

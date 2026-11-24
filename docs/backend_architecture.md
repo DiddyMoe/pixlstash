@@ -2284,6 +2284,7 @@ The fix is an additive column, `public_id`: 128 bits of randomness as lowercase 
 
 - File-based **SQLite** at `{image_root}/vault.db`
 - All writes are serialised through `VaultDatabase`'s task queue (single writer); reads run in parallel.
+- **Session hooks.** The writer opens a fresh `Session` per task, so a listener that must see every write (`before_flush`, `after_commit`) cannot be registered once. `VaultDatabase.add_session_hook(hook)` runs `hook(session)` on each writer session after the built-in hooks. The hooks run inside the task's `try`, so a failing hook fails that task's future rather than killing the writer thread. Read sessions and control tasks get no hooks. This is how a layer above the database watches writes without the database importing it; the smart-score anchor watch (§7 *Smart-score invalidation*) is the first user.
 - **No model inference runs inside a database task.** An encode on the writer thread blocks every write for the length of the model call. Encode on the calling thread and pass the result in as a value: text search (`GET /pictures/search`) and export by query encode before `db.run_task`, and `Picture.semantic_search` takes `query_embedding` / `clip_query_embedding`. `tests/test_server.py` asserts both routes encode off the writer thread.
 
 ### Stored path containment (#776)
