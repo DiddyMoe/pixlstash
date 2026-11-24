@@ -128,8 +128,9 @@ OP_TYPE_SPLIT = "dedup.split_stack"
 OP_TYPE_UNSTACK = "dedup.unstack"
 """Operation-log verbs for the two actions. Both mutate stack pointers only, so
 the recorded before/after snapshot is the whole inverse and a plain undo
-restores the stack (``_apply_stack`` recreates a ``PictureStack`` row the
-forward path dissolved, so no post-restore hook is needed)."""
+restores the stack (the restore recreates a ``PictureStack`` row the forward
+path dissolved, ``_recreate_dissolved_stacks``, so no post-restore hook is
+needed)."""
 
 
 class MixedStackError(Exception):

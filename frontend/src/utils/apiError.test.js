@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { errorDetail, errorMessage } from "./apiError";
+import { errorDetail, errorMessage, requestFailure } from "./apiError";
 
 const err = (detail, status) => ({ response: { data: { detail }, status } });
 
@@ -35,5 +35,56 @@ describe("errorMessage", () => {
       "Network Error",
     );
     expect(errorMessage({}, "Could not save.")).toBe("Could not save.");
+  });
+});
+
+describe("requestFailure", () => {
+  // The kind decides the next step, so every branch is pinned: a retry helps
+  // the first three and not the rest.
+  it("tells the failures a retry can fix from those it cannot", () => {
+    const kinds = [
+      [{ code: "ECONNABORTED", message: "timeout of 60000ms exceeded" }, "timeout"],
+      [new Error("Network Error"), "network"],
+      [err("boom", 500), "server"],
+      [err("too many ids", 400), "validation"],
+      [err([{ msg: "field required" }], 422), "validation"],
+      [err("no", 403), "forbidden"],
+      [err("preview again", 409), "conflict"],
+    ];
+    for (const [failure, kind] of kinds) {
+      expect(requestFailure(failure).kind).toBe(kind);
+    }
+  });
+
+  // An abort arrives without a response, and must not read as "unreachable".
+  it("reads a cancelled request as cancelled, not as a network failure", () => {
+    expect(requestFailure({ code: "ERR_CANCELED" }).kind).toBe("cancelled");
+    expect(requestFailure(new DOMException("x", "AbortError")).kind).toBe(
+      "cancelled",
+    );
+  });
+
+  // A 422's `input` echoes what was submitted; only the message is shown.
+  it("takes a field error's message and never its echoed input", () => {
+    const failure = requestFailure(
+      err([{ msg: "Too many ids", input: [1, 2, 3] }], 422),
+    );
+    expect(failure).toEqual({
+      kind: "validation",
+      status: 422,
+      detail: "Too many ids",
+      code: null,
+    });
+  });
+
+  it("keeps a structured refusal's code and message", () => {
+    expect(
+      requestFailure(err({ code: "plan_grew", message: "Preview again." }, 409)),
+    ).toEqual({
+      kind: "conflict",
+      status: 409,
+      detail: "Preview again.",
+      code: "plan_grew",
+    });
   });
 });

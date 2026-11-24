@@ -83,6 +83,18 @@ def _locked_sets_by_picture(
     ids = [int(pid) for pid in picture_ids if pid is not None]
     if not ids:
         return {}
+    # No picture can be frozen while no set is locked, and most libraries lock
+    # none. This one read answers that before the stack expansion and its three
+    # temp tables, which a restore pays once per operation it replays: they were
+    # most of what undoing a stack-every-group gesture cost. It is an ordinary
+    # autoflushing read, so a lock flipped earlier in the same session counts.
+    if (
+        session.exec(
+            select(PictureSet.id).where(PictureSet.locked.is_(True)).limit(1)
+        ).first()
+        is None
+    ):
+        return {}
     expanded = expand_picture_ids_to_stacks(session, ids)
     if not expanded:
         return {}

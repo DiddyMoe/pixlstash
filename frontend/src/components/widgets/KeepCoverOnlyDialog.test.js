@@ -65,9 +65,18 @@ function mountDialog(props = {}) {
   });
 }
 
-/** The footer buttons, in render order: Cancel, Move N to the Scrapheap. */
+/**
+ * A preview that could not be read: `requestFailure`'s shape for a server
+ * fault, the screen the owner reported.
+ */
+const SERVER_FAULT = { kind: "server", status: 500, detail: "", code: null };
+
+/**
+ * The footer buttons, in render order: Cancel, Move N to the Scrapheap.
+ * Scoped to the footer, because the body can carry a Try again of its own.
+ */
 function footerButtons(wrapper) {
-  return wrapper.findAllComponents(AppButton);
+  return wrapper.get(".dlg-footer").findAllComponents(AppButton);
 }
 
 /** Every digit run in a string, so two renderings can be compared numerically. */
@@ -112,7 +121,7 @@ describe("KeepCoverOnlyDialog: one figure, two places", () => {
 describe("KeepCoverOnlyDialog: before the numbers land", () => {
   for (const [name, props] of [
     ["while the preview is in flight", { preview: null, loading: true }],
-    ["when the preview could not be read", { preview: null, previewFailed: true }],
+    ["when the preview could not be read", { preview: null, previewError: SERVER_FAULT }],
   ]) {
     it(`shows no number and refuses to confirm ${name}`, () => {
       const wrapper = mountDialog(props);
@@ -137,7 +146,7 @@ describe("KeepCoverOnlyDialog: before the numbers land", () => {
 
   // A failed preview and a genuinely empty one must not be the same screen.
   it("says so when the preview could not be read", () => {
-    expect(mountDialog({ preview: null, previewFailed: true }).find(".kco-failed").exists()).toBe(true);
+    expect(mountDialog({ preview: null, previewError: SERVER_FAULT }).find(".kco-failed").exists()).toBe(true);
     expect(mountDialog().find(".kco-failed").exists()).toBe(false);
   });
 
@@ -253,6 +262,18 @@ describe("KeepCoverOnlyDialog: the skips", () => {
       "1 stack won't change",
     );
   });
+
+  // The skips arrive with the preview, after the dialog opened. A section that
+  // is its own live region would be inserted along with its text, which is
+  // often not announced, so the summary goes through the region already there.
+  it("announces the skips through the dialog's status region", async () => {
+    const wrapper = mountDialog({ preview: null, loading: true });
+    const announcer = wrapper.get('[data-testid="keep-cover-announcer"]');
+    expect(announcer.text()).toBe("");
+    await wrapper.setProps({ preview: PREVIEW, loading: false });
+    expect(announcer.text()).toBe("3 stacks won't change.");
+    expect(wrapper.findAll("[role='status']")).toHaveLength(1);
+  });
 });
 
 describe("KeepCoverOnlyDialog: the keyboard, deliberately inverted", () => {
@@ -327,5 +348,98 @@ describe("KeepCoverOnlyDialog: the confirmation", () => {
     const lede = mountDialog().find(".kco-lede").text();
     expect(lede).toContain("collapses whole");
     expect(lede).toContain("loose pictures are left alone");
+  });
+});
+
+// The reported screen ended "Close this and try again": the only way to ask
+// again was to rebuild a Ctrl+A selection over the grid.
+describe("KeepCoverOnlyDialog: a preview that failed", () => {
+  it("offers Try again in place, and it asks again", async () => {
+    const wrapper = mountDialog({ preview: null, previewError: SERVER_FAULT });
+    expect(wrapper.get(".kco-failed").text()).not.toMatch(/close this/i);
+    await wrapper.get('button[data-testid="keep-cover-retry"]').trigger("click");
+    expect(wrapper.emitted("retry")).toHaveLength(1);
+    expect(wrapper.emitted("confirm")).toBeUndefined();
+  });
+
+  // The button vanishes with the failure, so focus must land somewhere
+  // deliberate rather than on the page behind the scrim.
+  it("hands the keyboard back to Cancel after Try again", async () => {
+    const wrapper = mount(KeepCoverOnlyDialog, {
+      ...globalOpts,
+      attachTo: document.body,
+      props: { open: true, preview: null, previewError: SERVER_FAULT },
+    });
+    const cancel = footerButtons(wrapper)[0].find("button").element;
+    const retry = wrapper.get('button[data-testid="keep-cover-retry"]');
+    retry.element.focus();
+    await retry.trigger("click");
+    await vi.waitFor(() => expect(document.activeElement).toBe(cancel));
+    wrapper.unmount();
+  });
+
+  // The same request would be refused the same way: say why, offer nothing.
+  it("gives the server's reason and no retry when the request was refused", () => {
+    const wrapper = mountDialog({
+      preview: null,
+      previewError: {
+        kind: "validation",
+        status: 400,
+        detail: "At most 2000 ids per request",
+        code: null,
+      },
+    });
+    expect(wrapper.get(".kco-failed").text()).toContain(
+      "At most 2000 ids per request.",
+    );
+    expect(wrapper.find('[data-testid="keep-cover-retry"]').exists()).toBe(false);
+  });
+
+  // The failure lands while the dialog is already open on "–", so its sentence
+  // has to go through a region that was listening before it arrived.
+  it("is heard through the status region that was there before it failed", async () => {
+    const wrapper = mountDialog({ preview: null, loading: true });
+    const announcer = wrapper.get('[data-testid="keep-cover-announcer"]');
+    expect(announcer.text()).toBe("");
+    await wrapper.setProps({ loading: false, previewError: SERVER_FAULT });
+    expect(announcer.text()).toBe(wrapper.get(".kco-failed-text").text());
+    expect(announcer.text()).not.toBe("");
+    expect(wrapper.findAll("[role='status']")).toHaveLength(1);
+  });
+});
+
+describe("KeepCoverOnlyDialog: a long collapse", () => {
+  it("says how far a collapse of several requests has got", () => {
+    const wrapper = mountDialog({
+      busy: true,
+      progress: { stacksDone: 500, stacksTotal: 1201 },
+    });
+    expect(wrapper.get('[data-testid="keep-cover-progress"]').text()).toBe(
+      "500 of 1,201 stacks done…",
+    );
+    // And a screen reader hears it, through a region that was already there.
+    expect(wrapper.get(".visually-hidden[role='status']").text()).toBe(
+      "500 of 1,201 stacks done…",
+    );
+  });
+
+  // The region must exist before its first figure: one inserted along with its
+  // text is often not announced at all.
+  it("keeps the announcer mounted before any progress exists", () => {
+    const wrapper = mountDialog();
+    expect(wrapper.find(".visually-hidden[role='status']").exists()).toBe(true);
+    expect(wrapper.find('[data-testid="keep-cover-progress"]').exists()).toBe(
+      false,
+    );
+  });
+
+  it("drops a stale figure once the run is over", () => {
+    const wrapper = mountDialog({
+      busy: false,
+      progress: { stacksDone: 1201, stacksTotal: 1201 },
+    });
+    expect(wrapper.find('[data-testid="keep-cover-progress"]').exists()).toBe(
+      false,
+    );
   });
 });

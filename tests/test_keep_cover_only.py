@@ -27,28 +27,41 @@ worker can rewrite metadata underneath the assertions.
 import gc
 import json
 import os
+import re
+import sqlite3
 import tempfile
+import typing
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import select
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session as SASession
+from sqlmodel import delete, select, update
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Character,
     Face,
     Picture,
+    PictureProjectMember,
     PictureSet,
     PictureSetMember,
     PictureStack,
+    Project,
     Tag,
+    TagPrediction,
 )
+from pixlstash.routes.stacks import KeepCoverOnlyPreviewResponse, KeepCoverOnlyResponse
 from pixlstash.server import Server
 from pixlstash.utils import sql_chunking
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.services import (
     keep_cover_only_service,
     operation_log_service,
+    set_lock_service,
     workflow_ghost_service,
 )
 from tests.authz_guard import no_spa_fallback  # noqa: F401
@@ -58,6 +71,16 @@ PREVIEW_URL = f"{API}/stacks/keep-cover-only/preview"
 COLLAPSE_URL = f"{API}/stacks/keep-cover-only"
 UNDO_URL = f"{API}/operations/undo"
 RESTORE_URL = f"{API}/pictures/scrapheap/restore"
+
+# The SPA module that splits a large selection into requests and merges their
+# reports back into one (see the drift guard below).
+KCO_REQUESTS_JS = (
+    Path(__file__).resolve().parents[1]
+    / "frontend"
+    / "src"
+    / "utils"
+    / "keepCoverOnlyRequests.js"
+)
 
 # The SPA catch-all answers unmatched GETs with 200, so a wrong URL could make a
 # positive assertion vacuous. See tests/authz_guard.py.
@@ -152,18 +175,25 @@ def _lock_set_over(client, server, name: str, picture_id: int) -> int:
 
 
 def _picture_rows(server, picture_ids: list[int]) -> dict[int, tuple]:
-    """``{picture_id: (deleted, stack_id, stack_position, score)}``."""
+    """``{picture_id: (deleted, stack_id, stack_position, score)}``.
+
+    Read in chunks, so it can check a fixture past :func:`_sqlite_variable_ceiling`.
+    """
 
     def read(session):
-        rows = session.exec(
-            select(
-                Picture.id,
-                Picture.deleted,
-                Picture.stack_id,
-                Picture.stack_position,
-                Picture.score,
-            ).where(Picture.id.in_(picture_ids))
-        ).all()
+        rows = [
+            row
+            for chunk in sql_chunking.chunked(list(picture_ids))
+            for row in session.exec(
+                select(
+                    Picture.id,
+                    Picture.deleted,
+                    Picture.stack_id,
+                    Picture.stack_position,
+                    Picture.score,
+                ).where(Picture.id.in_(chunk))
+            ).all()
+        ]
         return {
             int(pid): (bool(deleted), sid, pos, score)
             for pid, deleted, sid, pos, score in rows
@@ -234,6 +264,134 @@ def _teardown(temp_dir, server):
 
 def _rows_by_stack(body) -> dict:
     return {row["stack_id"]: row for row in body["stacks"]}
+
+
+def _make_many_stacks(
+    server,
+    count: int,
+    members: int,
+    *,
+    character_per_copy: bool = False,
+    character_on_cover: bool = False,
+) -> list[tuple[int, list[int]]]:
+    """Insert *count* stacks of *members* pictures in ONE transaction.
+
+    :func:`_make_stack` costs a DB task per stack and the variable-ceiling tests
+    need over a thousand. Every copy (never the cover) carries the tag
+    ``copy_only``, so every cover gains a tag. With *character_per_copy* each copy
+    also gets a face bound to its own character, so the stack references
+    ``members - 1`` characters, all of them only on copies. With
+    *character_on_cover* each cover gets a face bound to a character of its own
+    stack, the one-character case the metadata union passes on to the copies.
+    """
+
+    def insert(session):
+        # One flush per phase, not per row: a flush per picture made this
+        # fixture most of the test's run time.
+        stacks = [PictureStack(name=None) for _ in range(count)]
+        session.add_all(stacks)
+        session.flush()
+        pictures = [
+            [
+                Picture(
+                    file_path=f"/vault/kco_{int(stack.id)}_{position}.png",
+                    format="png",
+                    width=1000,
+                    height=1000,
+                    size_bytes=1000,
+                    stack_id=int(stack.id),
+                    stack_position=position,
+                )
+                for position in range(members)
+            ]
+            for stack in stacks
+        ]
+        session.add_all(pic for members_of in pictures for pic in members_of)
+        session.flush()
+        copies = [int(pic.id) for members_of in pictures for pic in members_of[1:]]
+        covers = [int(members_of[0].id) for members_of in pictures]
+        session.add_all(Tag(picture_id=pid, tag="copy_only") for pid in copies)
+        faces_on = (copies if character_per_copy else []) + (
+            covers if character_on_cover else []
+        )
+        characters = [Character(name=f"KCO {pid}") for pid in faces_on]
+        session.add_all(characters)
+        session.flush()
+        session.add_all(
+            Face(
+                picture_id=pid,
+                frame_index=0,
+                face_index=0,
+                character_id=int(character.id),
+                x=0,
+                y=0,
+                width=10,
+                height=10,
+            )
+            for pid, character in zip(faces_on, characters)
+        )
+        session.commit()
+        return [
+            (int(stack.id), [int(pic.id) for pic in members_of])
+            for stack, members_of in zip(stacks, pictures)
+        ]
+
+    return _run(server, insert)
+
+
+@contextmanager
+def _counting_vault_flushes(server):
+    """Collect one entry per flush of a vault session while the block runs.
+
+    A flush is where the vault pays for the metadata-hash, layout and score hooks,
+    so a write path that flushes per picture costs those per picture however the
+    rest of it is batched. Only sessions on the vault engine count, so a hub-side
+    write during a request is not mistaken for the restore's.
+    """
+    engine = server.vault.db._engine
+    flushes: list[int] = []
+
+    def count(session, _flush_context):
+        if session.get_bind() is engine:
+            flushes.append(1)
+
+    event.listen(SASession, "after_flush", count)
+    try:
+        yield flushes
+    finally:
+        event.remove(SASession, "after_flush", count)
+
+
+@contextmanager
+def _sqlite_variable_ceiling(server, limit: int = 999):
+    """Pin every new vault connection to SQLite's pre-3.32 bound-parameter cap.
+
+    Current builds allow 32766 parameters per statement, so a test library big
+    enough to cross that would take minutes to build. At the historical 999 the
+    same unbatched ``IN`` list fails with a fixture of a thousand rows, and the
+    failure is the identical ``too many SQL variables``. The pin is proved to
+    have taken effect before the block runs (a 1,000-id ``IN`` must fail), so a
+    build that ignored ``setlimit`` could not pass these tests vacuously, and it
+    is removed on the way out.
+    """
+    engine = server.vault.db._engine
+
+    def pin(dbapi_conn, _record):
+        dbapi_conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+
+    event.listen(engine, "connect", pin)
+    engine.dispose()
+    try:
+
+        def over_the_ceiling(session):
+            session.exec(select(Picture.id).where(Picture.id.in_(range(limit + 1))))
+
+        with pytest.raises(OperationalError, match="too many SQL variables"):
+            _run(server, over_the_ceiling)
+        yield
+    finally:
+        event.remove(engine, "connect", pin)
+        engine.dispose()
 
 
 # ── the metadata union, the sharpest point ───────────────────────────────────
@@ -1076,6 +1234,561 @@ def test_the_selection_cap_bounds_the_request_not_the_deduplicated_set():
         assert response.json()["stacks_collapsed"] == 1
     finally:
         _teardown(temp_dir, server)
+
+
+# ── the SPA's split of a large selection stays inside the contract ───────────
+
+
+def _js_string_array(name: str) -> list[str]:
+    """Return the strings of ``export const <name> = Object.freeze([...])``.
+
+    A source parse rather than running node, as in
+    ``tests/test_install_type_buckets.py``: the backend gate has no frontend
+    toolchain, and the point is to catch a hand edit of either side.
+    """
+    source = KCO_REQUESTS_JS.read_text(encoding="utf-8")
+    declaration = f"export const {name} = Object.freeze(["
+    assert source.count(declaration) == 1, f"{name} not found once in {KCO_REQUESTS_JS}"
+    opening = source.index(declaration) + len(declaration)
+    closing = source.index("]", opening)
+    return re.findall(r'"([^"]+)"', source[opening:closing])
+
+
+@pytest.mark.parametrize(
+    ("model", "prefix"),
+    [
+        (KeepCoverOnlyPreviewResponse, "KEEP_COVER_ONLY_PREVIEW"),
+        (KeepCoverOnlyResponse, "KEEP_COVER_ONLY_RESULT"),
+    ],
+)
+def test_the_spa_merges_every_field_of_a_split_report(model, prefix):
+    """The SPA classifies every response field, and classifies it by its type.
+
+    A selection larger than one request is previewed and collapsed as several
+    requests whose reports the SPA merges back into one: counts are summed,
+    lists concatenated, settings taken from the last report. A field the
+    response gains without being classified there would vanish from the merged
+    report, and the dialog would show a figure for the first 500 stacks of a
+    1,200-stack selection without a sound. A count classified as a setting is
+    the same loss; a setting summed turns a 30-day retention into 90.
+    """
+    counts = _js_string_array(f"{prefix}_COUNTS")
+    lists = _js_string_array(f"{prefix}_LISTS")
+    settings = _js_string_array(f"{prefix}_SETTINGS")
+    classified = counts + lists + settings
+
+    assert len(classified) == len(set(classified)), "a field is classified twice"
+    assert set(classified) == set(model.model_fields), (
+        "unclassified: "
+        f"{sorted(set(model.model_fields) - set(classified))}; "
+        f"not in the model: {sorted(set(classified) - set(model.model_fields))}"
+    )
+    for name in counts:
+        assert model.model_fields[name].annotation is int, (name, "summed")
+    for name in lists:
+        assert typing.get_origin(model.model_fields[name].annotation) is list, (
+            name,
+            "concatenated",
+        )
+    for name in settings:
+        annotation = model.model_fields[name].annotation
+        assert annotation is not int and typing.get_origin(annotation) is not list, (
+            name,
+            "taken from the last report",
+        )
+
+
+def test_the_spa_never_sends_more_stacks_than_one_request_may_carry():
+    """The SPA's request size is under the server's per-request id cap.
+
+    Raising it past the cap brings the original failure back: every request of
+    a large selection is refused with 400 and the dialog has no figures.
+    """
+    source = KCO_REQUESTS_JS.read_text(encoding="utf-8")
+    found = re.findall(
+        r"^export const KEEP_COVER_ONLY_STACKS_PER_REQUEST = (\d+);$",
+        source,
+        flags=re.MULTILINE,
+    )
+    assert len(found) == 1, found
+    assert 0 < int(found[0]) <= keep_cover_only_service.MAX_SELECTION_IDS
+
+
+# ── a whole-library selection crosses SQLite's bound-parameter ceiling ───────
+
+
+@pytest.fixture(scope="module")
+def past_the_ceiling():
+    """One library with every id list past :func:`_sqlite_variable_ceiling`.
+
+    Built once for the module because the build is most of what these tests
+    cost. 1,500 stacks and 3,500 members, so the planner's stack and member lists
+    cross the ceiling; 500 of those stacks strand two characters each on their
+    copies, so it also has 1,000 characters to name; and one stack of 1,001
+    members, its cover naming a character, so a single stack's own reads cross
+    it too, the metadata union's one-character pass included. Every test that
+    collapses something undoes it, so the library is the same for each of them.
+    The restore-cost tests below add pictures of their own beside these and read
+    only those, so they share this server rather than paying for another.
+    """
+    temp_dir, client, server = _env()
+    try:
+        eligible = _make_many_stacks(server, 1000, 2)
+        stranding = _make_many_stacks(server, 500, 3, character_per_copy=True)
+        ((big_stack, big_pics),) = _make_many_stacks(
+            server, 1, 1001, character_on_cover=True
+        )
+        yield {
+            "client": client,
+            "server": server,
+            "eligible": eligible,
+            "stranding": stranding,
+            "big_stack": big_stack,
+            "big_pics": big_pics,
+        }
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_a_selection_over_the_variable_ceiling_previews_whole(past_the_ceiling):
+    """``Ctrl+A`` over a stacked library is more ids than one statement may bind.
+
+    The planner bound one parameter per stack, per member and per character it
+    had to name, so selecting every stack in a big library failed with ``too
+    many SQL variables`` and the dialog could only say the preview could not be
+    read. Both ways a selection arrives are covered: the grid sends stacks and a
+    multi-select sends pictures.
+    """
+    client, server = past_the_ceiling["client"], past_the_ceiling["server"]
+    everything = past_the_ceiling["eligible"] + past_the_ceiling["stranding"]
+    last_stack, last_pics = past_the_ceiling["stranding"][-1]
+
+    with _sqlite_variable_ceiling(server):
+        for selection in (
+            {"stack_ids": [stack_id for stack_id, _pics in everything]},
+            {"picture_ids": [pics[0] for _stack_id, pics in everything]},
+        ):
+            response = client.post(PREVIEW_URL, json=selection)
+            assert response.status_code == 200, response.text[:300]
+            preview = response.json()
+            assert preview["stacks_selected"] == 1500
+            assert preview["stacks_eligible"] == 1000
+            assert preview["stacks_skipped_character_on_copy"] == 500
+            assert preview["pictures_moving"] == 1000
+            assert preview["covers_gaining_tags"] == 1000
+            # The last stack's characters are in the last chunk, and they are
+            # still named rather than dropped.
+            lost = _rows_by_stack(preview)[last_stack]["lost_characters"]
+            assert {item["name"]: item["picture_ids"] for item in lost} == {
+                f"KCO {pid}": [pid] for pid in last_pics[1:]
+            }
+
+
+def test_one_gesture_over_the_variable_ceiling_collapses_and_undoes_whole(
+    past_the_ceiling,
+):
+    """The grid's shape for a big selection: several requests, one batch, one undo.
+
+    The SPA sends a large selection as several requests sharing one client batch
+    id, so a single ``Ctrl+Z`` reverses all of them, and that undo restores every
+    copy every request moved. The 1,001-member stack makes the metadata union,
+    the soft delete and the undo each read more pictures than the ceiling.
+    """
+    client, server = past_the_ceiling["client"], past_the_ceiling["server"]
+    big_stack, big_pics = past_the_ceiling["big_stack"], past_the_ceiling["big_pics"]
+    small = past_the_ceiling["eligible"][:2]
+    moved = big_pics[1:] + [pics[1] for _stack_id, pics in small]
+    covers = [big_pics[0]] + [pics[0] for _stack_id, pics in small]
+    batch_id = "cli-variable-ceiling-gesture"
+
+    with _sqlite_variable_ceiling(server):
+        for selection, expected in (
+            ([big_stack], 1000),
+            ([stack_id for stack_id, _pics in small], 2),
+        ):
+            response = client.post(
+                COLLAPSE_URL, json={"stack_ids": selection, "batch_id": batch_id}
+            )
+            assert response.status_code == 200, response.text[:300]
+            assert response.json()["pictures_moved"] == expected
+            assert response.json()["batch_id"] == batch_id
+        assert all(row[0] for row in _picture_rows(server, moved).values())
+        assert all(_tags_of(server, cover) == {"copy_only"} for cover in covers)
+
+        with _counting_vault_flushes(server) as flushes:
+            response = client.post(f"{API}/operations/batches/{batch_id}/undo")
+        assert response.status_code == 200, response.text[:300]
+
+    # The restore reads every row it compares against before its first write, so
+    # its writes reach the database together. Reading per picture autoflushed per
+    # picture, about three flushes for each of these 1,005, each recomputing the
+    # flushed pictures' metadata hashes: a whole-library undo outlasted the
+    # client's timeout.
+    assert len(flushes) <= 6, f"{len(flushes)} flushes to restore 1,005 pictures"
+    rows = _picture_rows(server, moved + covers)
+    assert len(rows) == 1005
+    assert not any(row[0] for row in rows.values())
+    # The union is reversed with the move: the covers lost the copies' tag.
+    assert all(_tags_of(server, cover) == set() for cover in covers)
+
+
+def test_one_ctrl_z_undoes_every_request_of_a_split_gesture(past_the_ceiling):
+    """``Ctrl+Z`` reverses the whole gesture, not its last request.
+
+    The SPA collapses a large selection as several requests under one client
+    batch id, each confirming the moving ids of its own preview. The plain undo
+    (``POST /operations/undo`` with no body, which is what ``Ctrl+Z`` sends)
+    must take back every request of that gesture in one step, or the user sees
+    1,200 stacks collapse and one ``Ctrl+Z`` bring back 200 of them.
+    """
+    client, server = past_the_ceiling["client"], past_the_ceiling["server"]
+    first, second = past_the_ceiling["eligible"][2], past_the_ceiling["eligible"][3]
+    batch_id = "cli-split-gesture-ctrl-z"
+
+    for stack_id, _pics in (first, second):
+        preview = client.post(PREVIEW_URL, json={"stack_ids": [stack_id]}).json()
+        response = client.post(
+            COLLAPSE_URL,
+            json={
+                "stack_ids": [stack_id],
+                "batch_id": batch_id,
+                "expected_picture_ids": preview["picture_ids_moving"],
+            },
+        )
+        assert response.status_code == 200, response.text[:300]
+        assert response.json()["stacks_collapsed"] == 1
+    copies = [first[1][1], second[1][1]]
+    covers = [first[1][0], second[1][0]]
+    assert all(row[0] for row in _picture_rows(server, copies).values())
+
+    response = client.post(UNDO_URL)
+    assert response.status_code == 200, response.text[:300]
+    undone = response.json()["operations"]
+    assert len(undone) == 2
+    assert {operation["batch_id"] for operation in undone} == {batch_id}
+    assert not any(row[0] for row in _picture_rows(server, copies).values())
+    assert all(_tags_of(server, cover) == set() for cover in covers)
+
+
+def test_an_undo_over_the_variable_ceiling_still_names_the_covers_it_changes(
+    past_the_ceiling,
+):
+    """The undo's last read names more stacks than one statement may bind.
+
+    An undo announces every live member of each stack it changed, so the covers'
+    badges redraw (``_stack_siblings_in_session``). Undoing a whole-library
+    gesture names a stack per collapsed stack. Read directly, because reaching
+    it end to end would mean collapsing a thousand stacks, about ten seconds.
+    """
+    server = past_the_ceiling["server"]
+    eligible = past_the_ceiling["eligible"]
+    copies = {pics[1] for _stack_id, pics in eligible}
+
+    with _sqlite_variable_ceiling(server):
+        siblings = _run(
+            server,
+            lambda session: operation_log_service._stack_siblings_in_session(
+                session, copies
+            ),
+        )
+    assert siblings == sorted(pics[0] for _stack_id, pics in eligible)
+
+
+# ── undoing a library-sized gesture costs the same at any size ───────────────
+
+# The facets the restore engine reads rows for before it writes, plus a column on
+# the picture row itself.
+_PRELOADED_FACETS = (
+    operation_log_service.FACET_SCORE,
+    operation_log_service.FACET_TAGS,
+    operation_log_service.FACET_TAG_PREDICTIONS,
+    operation_log_service.FACET_SETS,
+    operation_log_service.FACET_PROJECTS,
+    operation_log_service.FACET_CHARACTERS,
+)
+
+
+def _seed_every_preloaded_facet(server, count: int) -> list[int]:
+    """Insert *count* unstacked pictures, each holding a row of every facet above.
+
+    One set, one project and one character are shared by all of them, so the
+    only thing that varies between two calls is the number of pictures.
+    """
+
+    def insert(session):
+        label = f"Restore cost {count}"
+        picture_set = PictureSet(name=label)
+        project = Project(name=label)
+        character = Character(name=label)
+        pictures = [
+            Picture(
+                file_path=f"/vault/restore_cost_{count}_{n}.png",
+                format="png",
+                width=10,
+                height=10,
+                size_bytes=1000,
+                score=3,
+            )
+            for n in range(count)
+        ]
+        session.add_all([picture_set, project, character, *pictures])
+        session.flush()
+        for picture in pictures:
+            picture_id = int(picture.id)
+            session.add_all(
+                [
+                    Tag(picture_id=picture_id, tag="restore_cost"),
+                    TagPrediction(
+                        picture_id=picture_id,
+                        tag="restore_cost",
+                        confidence=0.9,
+                        model_version="restore-cost-model",
+                        status="CONFIRMED",
+                        label_state="POS",
+                        label_source="human",
+                    ),
+                    PictureSetMember(set_id=int(picture_set.id), picture_id=picture_id),
+                    PictureProjectMember(
+                        picture_id=picture_id, project_id=int(project.id)
+                    ),
+                    Face(
+                        picture_id=picture_id,
+                        frame_index=0,
+                        face_index=0,
+                        character_id=int(character.id),
+                        x=0,
+                        y=0,
+                        width=10,
+                        height=10,
+                    ),
+                ]
+            )
+        session.commit()
+        return [int(picture.id) for picture in pictures]
+
+    return _run(server, insert)
+
+
+def _preloaded_state(server, picture_ids: list[int]) -> dict:
+    """The recorded state of *picture_ids*, narrowed to :data:`_PRELOADED_FACETS`."""
+
+    def capture(session):
+        state = operation_log_service.capture_state_in_session(session, picture_ids)
+        return {
+            picture_id: {facet: facets[facet] for facet in _PRELOADED_FACETS}
+            for picture_id, facets in state.items()
+        }
+
+    return _run(server, capture)
+
+
+def _scramble_every_preloaded_facet(server, picture_ids: list[int]) -> None:
+    """Change every facet of :data:`_PRELOADED_FACETS` on every picture."""
+
+    def scramble(session):
+        for model in (Tag, PictureSetMember, PictureProjectMember):
+            session.exec(delete(model).where(model.picture_id.in_(picture_ids)))
+        session.exec(
+            update(Face)
+            .where(Face.picture_id.in_(picture_ids))
+            .values(character_id=None)
+        )
+        session.exec(
+            update(TagPrediction)
+            .where(TagPrediction.picture_id.in_(picture_ids))
+            .values(status="PENDING", label_state="UNKNOWN", label_source=None)
+        )
+        session.exec(update(Picture).where(Picture.id.in_(picture_ids)).values(score=1))
+        session.commit()
+
+    _run(server, scramble)
+
+
+def _restore_round_trips(server, state: dict) -> tuple[int, int]:
+    """Apply *state* in one session and commit; ``(flushes, reads)`` it took.
+
+    Reads, not every statement: the ORM inserts an autoincrement row such as a
+    ``Tag`` one statement per row inside a single flush, which is the cost of
+    the row itself, not of how the restore is organised.
+    """
+
+    def restore(session):
+        flushes: list[int] = []
+        reads: list[str] = []
+        connection = session.connection()
+
+        def on_flush(_session, _flush_context):
+            flushes.append(1)
+
+        def on_statement(conn, _cursor, statement, *_rest):
+            if conn is connection and statement.lstrip().upper().startswith("SELECT"):
+                reads.append(statement)
+
+        event.listen(session, "after_flush", on_flush)
+        event.listen(connection.engine, "before_cursor_execute", on_statement)
+        try:
+            operation_log_service.apply_state_in_session(session, state)
+            session.commit()
+        finally:
+            event.remove(connection.engine, "before_cursor_execute", on_statement)
+            event.remove(session, "after_flush", on_flush)
+        return len(flushes), len(reads)
+
+    return _run(server, restore)
+
+
+def test_a_restore_reads_and_writes_in_a_constant_number_of_round_trips(
+    past_the_ceiling,
+):
+    """Restoring four times the pictures costs exactly the same flushes and reads.
+
+    Each applier read its own picture's rows with a query of its own, and a
+    query in a session with pending writes flushes them first, so a restore
+    paid a read per picture per facet and a flush per picture, each flush
+    recomputing the flushed pictures' metadata hashes. Undoing a whole-library
+    gesture outlasted the client's timeout. The engine now reads every row it
+    compares against before its first write. A facet read per picture again
+    adds a read per picture here, which the equality catches; the state check
+    proves the restore still restores.
+    """
+    server = past_the_ceiling["server"]
+    cost = {}
+    for count in (15, 60):
+        picture_ids = _seed_every_preloaded_facet(server, count)
+        recorded = _preloaded_state(server, picture_ids)
+        _scramble_every_preloaded_facet(server, picture_ids)
+        scrambled = _preloaded_state(server, picture_ids)
+        # Every facet of every picture moved, so the restore has to write each.
+        assert all(
+            scrambled[picture_id][facet] != recorded[picture_id][facet]
+            for picture_id in recorded
+            for facet in _PRELOADED_FACETS
+        )
+
+        cost[count] = _restore_round_trips(server, recorded)
+
+        assert _preloaded_state(server, picture_ids) == recorded
+    assert cost[60] == cost[15], f"(flushes, reads) by size: {cost}"
+
+
+def test_undo_and_redo_of_stacking_every_group_flush_once_per_stack_at_most(
+    past_the_ceiling,
+):
+    """The other gesture a deduplication pass undoes at library size.
+
+    Stacking every duplicate group sends one ``stacks.create`` per group under
+    one batch, so one ``Ctrl+Z`` replays hundreds of operations. A replay
+    flushes once per operation by design: each operation's lock check must see
+    the operations replayed before it. Everything else used to flush per stack
+    as well: the undo deleted each emptied stack row after reading it, and the
+    redo looked each stack row up and recreated it one at a time. Those are now
+    one read and one write for the whole restore, so the undo flushes once per
+    stack and the redo, which also recreates each row as its operation replays,
+    at most twice. Both still put back exactly the rows the gesture made.
+    """
+    client, server = past_the_ceiling["client"], past_the_ceiling["server"]
+    groups = 12
+
+    def insert(session):
+        pictures = [
+            Picture(
+                file_path=f"/vault/stack_every_group_{n}.png",
+                format="png",
+                width=10,
+                height=10,
+                size_bytes=1000,
+            )
+            for n in range(2 * groups)
+        ]
+        session.add_all(pictures)
+        session.commit()
+        return [int(picture.id) for picture in pictures]
+
+    picture_ids = _run(server, insert)
+    batch_id = "cli-stack-every-group"
+    stacks = []
+    for group in range(groups):
+        response = client.post(
+            f"{API}/stacks",
+            json={"picture_ids": picture_ids[2 * group : 2 * group + 2]},
+            headers={"X-Operation-Batch-Id": batch_id},
+        )
+        assert response.status_code == 200, response.text[:300]
+        stacks.append(int(response.json()["id"]))
+
+    def stack_rows(session):
+        return {
+            int(stack_id)
+            for stack_id in session.exec(
+                select(PictureStack.id).where(PictureStack.id.in_(stacks))
+            )
+        }
+
+    stacked = _picture_rows(server, picture_ids)
+    assert _run(server, stack_rows) == set(stacks)
+
+    with _counting_vault_flushes(server) as undo_flushes:
+        response = client.post(f"{API}/operations/batches/{batch_id}/undo")
+    assert response.status_code == 200, response.text[:300]
+    assert all(row[1] is None for row in _picture_rows(server, picture_ids).values())
+    assert _run(server, stack_rows) == set(), "undo left emptied stack rows behind"
+
+    with _counting_vault_flushes(server) as redo_flushes:
+        response = client.post(f"{API}/operations/redo")
+    assert response.status_code == 200, response.text[:300]
+    # The same rows under the same ids, the pictures back on them in order.
+    assert _run(server, stack_rows) == set(stacks)
+    assert _picture_rows(server, picture_ids) == stacked
+
+    assert len(undo_flushes) <= groups + 2, f"{len(undo_flushes)} flushes to undo"
+    assert len(redo_flushes) <= 2 * groups + 2, f"{len(redo_flushes)} flushes to redo"
+
+
+def test_a_library_with_no_locked_set_answers_the_lock_check_in_one_read(
+    past_the_ceiling,
+):
+    """The lock check a restore runs per replayed operation, when nothing is locked.
+
+    Expanding the pictures to their stacks and joining them to the locked sets
+    took three temp tables per call, the largest share of undoing a
+    stack-every-group gesture, in a library with nothing locked to find. One
+    read now answers that. The same read is an ordinary autoflushing query, so
+    a set locked earlier in the same, uncommitted session still freezes its
+    picture: the positive control, without which a check that always answered
+    "nothing" would pass.
+    """
+    server = past_the_ceiling["server"]
+    eligible = past_the_ceiling["eligible"]
+    cover, copy = eligible[0][1]
+    selection = [pics[0] for _stack_id, pics in eligible]
+
+    def check(session):
+        statements: list[str] = []
+        connection = session.connection()
+
+        def on_statement(conn, _cursor, statement, *_rest):
+            if conn is connection:
+                statements.append(statement)
+
+        event.listen(connection.engine, "before_cursor_execute", on_statement)
+        try:
+            unlocked = set_lock_service.locked_picture_ids(session, selection)
+        finally:
+            event.remove(connection.engine, "before_cursor_execute", on_statement)
+
+        picture_set = PictureSet(name="Locked in this session", locked=True)
+        session.add(picture_set)
+        session.flush()
+        session.add(PictureSetMember(set_id=int(picture_set.id), picture_id=copy))
+        locked = set_lock_service.locked_picture_ids(session, selection)
+        session.rollback()
+        return unlocked, statements, locked
+
+    unlocked, statements, locked = _run(server, check)
+    assert unlocked == set()
+    assert len(statements) == 1, statements
+    # Stack-expanded: the copy is the member, and its cover is frozen with it.
+    assert locked == {cover}
 
 
 # ── Keep recipes only (#1315) ────────────────────────────────────────────────

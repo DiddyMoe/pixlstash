@@ -113,6 +113,7 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.services import operation_log_service
 from pixlstash.utils.quality.tag_exclusion import is_excluded, session_tag_exclusions
 from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK as ID_CHUNK
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.services.dedup_tier_service import (
     DedupScope,
     DedupTier,
@@ -419,10 +420,19 @@ def apply_metadata_union_in_session(
 
     membership_changed = reconcile_stack_membership(session, stack_id)
 
+    # Every read below goes by id chunk: a stack is not bounded in size, and one
+    # bound parameter per member overruns SQLite's per-statement cap. One chunk
+    # for any ordinary stack, so the common case pays nothing for it.
+    batches = list(chunked(sorted({int(pid) for pid in picture_ids})))
+
     # --- Tags: every member gains every real tag any member carries ---
-    tag_rows = session.exec(
-        select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(picture_ids))
-    ).all()
+    tag_rows = [
+        row
+        for batch in batches
+        for row in session.exec(
+            select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(batch))
+        ).all()
+    ]
     # A tag removed from tagging stays where it is but is never copied.
     exclusions = session_tag_exclusions(session)
     tags_by_picture: dict[int, set[str]] = {pid: set() for pid in picture_ids}
@@ -446,7 +456,11 @@ def apply_metadata_union_in_session(
                 tags_added += 1
 
     # --- Score: lift every member to the highest rating in the group ---
-    pictures = session.exec(select(Picture).where(Picture.id.in_(picture_ids))).all()
+    pictures = [
+        pic
+        for batch in batches
+        for pic in session.exec(select(Picture).where(Picture.id.in_(batch))).all()
+    ]
     best_score = max((int(pic.score or 0) for pic in pictures), default=0)
     scores_lifted = 0
     if best_score > 0:
@@ -459,9 +473,10 @@ def apply_metadata_union_in_session(
     # --- Characters: only the unambiguous single-character case ---
     character_ids = {
         int(row)
+        for batch in batches
         for row in session.exec(
             select(Face.character_id).where(
-                Face.picture_id.in_(picture_ids), Face.character_id.is_not(None)
+                Face.picture_id.in_(batch), Face.character_id.is_not(None)
             )
         ).all()
         if row is not None
@@ -471,9 +486,10 @@ def apply_metadata_union_in_session(
         character_id = next(iter(character_ids))
         assigned = {
             int(row)
+            for batch in batches
             for row in session.exec(
                 select(Face.picture_id).where(
-                    Face.picture_id.in_(picture_ids),
+                    Face.picture_id.in_(batch),
                     Face.character_id == character_id,
                 )
             ).all()

@@ -132,12 +132,18 @@ function keepCoverOnlyBody({ stackIds, pictureIds } = {}) {
  * fill in a row, and do not derive a bucket by subtracting one figure from
  * another.
  *
+ * One call takes at most 2000 ids across `stackIds` and `pictureIds` (a `400`
+ * past that). A selection larger than one call goes through
+ * `utils/keepCoverOnlyRequests.js`, which reads one preview per request of the
+ * very partition the collapse will send.
+ *
  * Writes nothing and deletes nothing.
  *
  * @param {Object} [selection]
  * @param {Array<number|string>} [selection.stackIds] - stacks named directly.
  * @param {Array<number|string>} [selection.pictureIds] - the grid selection;
  *   each resolves to its stack.
+ * @param {AbortSignal} [selection.signal] - cancels the read when aborted.
  * @returns {Promise<Object>} `{ stacks_selected, stacks_eligible,
  *   stacks_skipped_locked, stacks_skipped_character_on_copy,
  *   stacks_skipped_single_member, pictures_moving, picture_ids_moving,
@@ -145,11 +151,16 @@ function keepCoverOnlyBody({ stackIds, pictureIds } = {}) {
  *   bytes_held_by_copies, originals_deleted_from_disk,
  *   scrapheap_retention_days, unknown_stack_ids, stacks }`.
  */
-export async function previewKeepCoverOnly({ stackIds, pictureIds } = {}) {
-  return unwrap(apiClient.post(
-    stacksUrl("/keep-cover-only/preview"),
-    keepCoverOnlyBody({ stackIds, pictureIds }),
-  ));
+export async function previewKeepCoverOnly({
+  stackIds,
+  pictureIds,
+  signal,
+} = {}) {
+  const url = stacksUrl("/keep-cover-only/preview");
+  const body = keepCoverOnlyBody({ stackIds, pictureIds });
+  return unwrap(
+    signal ? apiClient.post(url, body, { signal }) : apiClient.post(url, body),
+  );
 }
 
 /**
@@ -158,16 +169,22 @@ export async function previewKeepCoverOnly({ stackIds, pictureIds } = {}) {
  * Each stack keeps its **current** cover and every other live member is
  * soft-deleted to the Scrapheap, where it can be restored: the same soft delete
  * the grid's Delete performs, never a second permanent path. Nothing leaves
- * disk. The whole call is one operation under one `batch_id`, so a single
- * `Ctrl+Z` puts every stack back.
+ * disk. The whole call is one operation, and every call carrying the same
+ * `batchId` joins one history step, so a single `Ctrl+Z` puts every stack back.
  *
  * Call {@link previewKeepCoverOnly} first and show the user what it reports.
+ * The same 2000-id cap applies; `utils/keepCoverOnlyRequests.js` splits a
+ * larger selection under one batch id.
  *
  * @param {Object} [selection]
  * @param {Array<number|string>} [selection.stackIds]
  * @param {Array<number|string>} [selection.pictureIds]
  * @param {string} [selection.batchId] - client-namespaced `cli-…` batch id, so
  *   one gesture stays a single undo. Omit and the server mints one.
+ * @param {Array<number|string>} [selection.expectedPictureIds] - the
+ *   `picture_ids_moving` of the preview the user confirmed. The server refuses
+ *   with a `409`, writing nothing, if its plan has since grown past them, so
+ *   the figure on the button is the figure acted on. Omit to skip the check.
  * @returns {Promise<Object>} `{ status, stacks_collapsed, stack_ids_collapsed,
  *   pictures_moved, picture_ids_moved, cover_picture_ids,
  *   covers_gaining_metadata, tags_added, scores_lifted,
@@ -175,8 +192,20 @@ export async function previewKeepCoverOnly({ stackIds, pictureIds } = {}) {
  *   stacks_skipped_locked, stacks_skipped_character_on_copy,
  *   stacks_skipped_single_member, unknown_stack_ids }`.
  */
-export async function keepCoverOnly({ stackIds, pictureIds, batchId } = {}) {
+export async function keepCoverOnly({
+  stackIds,
+  pictureIds,
+  batchId,
+  expectedPictureIds,
+} = {}) {
   const body = keepCoverOnlyBody({ stackIds, pictureIds });
   if (batchId) body.batch_id = batchId;
+  if (Array.isArray(expectedPictureIds)) {
+    // Sent even when empty: "the preview said nothing moves" is a promise the
+    // server can hold the call to, and dropping it would skip the check.
+    body.expected_picture_ids = expectedPictureIds
+      .map(Number)
+      .filter((id) => Number.isFinite(id));
+  }
   return unwrap(apiClient.post(stacksUrl("/keep-cover-only"), body));
 }

@@ -58,7 +58,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Union
 
 from fastapi import HTTPException
 from sqlalchemy import event as sa_event
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import defer
 from sqlmodel import Session, select
 
@@ -107,8 +107,9 @@ from pixlstash.utils.service.smart_score_invalidation import (
 )
 from pixlstash.utils.service.picture_stats import clear_stats_cache
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.service.tag_prediction_utils import (
-    recompute_anomaly_tag_uncertainty,
+    recompute_anomaly_tag_uncertainties,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -989,17 +990,20 @@ def _refuse_a_removed_tag(tag: str, exclusions: frozenset[str]) -> None:
         )
 
 
-def _apply_tags(session: Session, picture_id: int, tags) -> None:
+def _apply_tags(session: Session, picture_id: int, tags, rows: list[Tag]) -> None:
     """Make the picture's Tag rows exactly the recorded set.
 
     A tag the owner has removed from tagging is never added back; one the
     picture still carries is left alone, as are its removals.
+
+    Args:
+        session: Pre-opened DB session; the caller commits.
+        picture_id: Picture whose tags are being restored.
+        tags: The recorded tag list.
+        rows: The picture's Tag rows as they are now (:func:`_rows_by_picture`).
     """
     wanted = {str(tag) for tag in tags or []}
-    existing = {
-        row.tag: row
-        for row in session.exec(select(Tag).where(Tag.picture_id == picture_id)).all()
-    }
+    existing = {row.tag: row for row in rows}
     for tag, row in existing.items():
         if tag not in wanted:
             session.delete(row)
@@ -1009,7 +1013,9 @@ def _apply_tags(session: Session, picture_id: int, tags) -> None:
         session.add(Tag(picture_id=picture_id, tag=tag))
 
 
-def _apply_tag_predictions(session: Session, picture_id: int, predictions) -> None:
+def _apply_tag_predictions(
+    session: Session, picture_id: int, predictions, rows: list[TagPrediction]
+) -> None:
     """Restore the picture's prediction rows and their human-label ledger.
 
     Two rules keep this from rolling back work the operation never did:
@@ -1033,18 +1039,15 @@ def _apply_tag_predictions(session: Session, picture_id: int, predictions) -> No
         session: Pre-opened DB session; the caller commits.
         picture_id: Picture whose prediction rows are being restored.
         predictions: The recorded ``{tag: {field: value}}`` map for this picture.
+        rows: The picture's prediction rows as they are now
+            (:func:`_rows_by_picture`).
 
     Raises:
         OperationLogError: The state would rebuild a row for a removed tag.
     """
     if not isinstance(predictions, dict):
         return
-    existing = {
-        row.tag: row
-        for row in session.exec(
-            select(TagPrediction).where(TagPrediction.picture_id == picture_id)
-        ).all()
-    }
+    existing = {row.tag: row for row in rows}
     exclusions = session_tag_exclusions(session)
     for tag, fields in predictions.items():
         if not isinstance(fields, dict):
@@ -1097,14 +1100,11 @@ def _apply_tag_predictions(session: Session, picture_id: int, predictions) -> No
         )
 
 
-def _apply_sets(session: Session, picture_id: int, set_ids) -> None:
+def _apply_sets(
+    session: Session, picture_id: int, set_ids, rows: list[PictureSetMember]
+) -> None:
     wanted = {int(sid) for sid in set_ids or []}
-    existing = {
-        int(row.set_id): row
-        for row in session.exec(
-            select(PictureSetMember).where(PictureSetMember.picture_id == picture_id)
-        ).all()
-    }
+    existing = {int(row.set_id): row for row in rows}
     for set_id, row in existing.items():
         if set_id not in wanted:
             session.delete(row)
@@ -1112,16 +1112,11 @@ def _apply_sets(session: Session, picture_id: int, set_ids) -> None:
         session.add(PictureSetMember(set_id=set_id, picture_id=picture_id))
 
 
-def _apply_projects(session: Session, picture_id: int, project_ids) -> None:
+def _apply_projects(
+    session: Session, picture_id: int, project_ids, rows: list[PictureProjectMember]
+) -> None:
     wanted = {int(pid) for pid in project_ids or []}
-    existing = {
-        int(row.project_id): row
-        for row in session.exec(
-            select(PictureProjectMember).where(
-                PictureProjectMember.picture_id == picture_id
-            )
-        ).all()
-    }
+    existing = {int(row.project_id): row for row in rows}
     for project_id, row in existing.items():
         if project_id not in wanted:
             session.delete(row)
@@ -1129,15 +1124,12 @@ def _apply_projects(session: Session, picture_id: int, project_ids) -> None:
         session.add(PictureProjectMember(picture_id=picture_id, project_id=project_id))
 
 
-def _apply_characters(session: Session, picture_id: int, assignments) -> None:
+def _apply_characters(
+    session: Session, picture_id: int, assignments, rows: list[Face]
+) -> None:
     if not isinstance(assignments, dict):
         return
-    faces = {
-        int(face.id): face
-        for face in session.exec(
-            select(Face).where(Face.picture_id == picture_id)
-        ).all()
-    }
+    faces = {int(face.id): face for face in rows}
     for face_id_raw, character_id in assignments.items():
         try:
             face_id = int(face_id_raw)
@@ -1171,7 +1163,11 @@ def _apply_stack(
     stack,
     vacated_stack_ids: Optional[set[int]] = None,
 ) -> None:
-    """Restore one picture's stack pointer, recreating the stack row if needed.
+    """Restore one picture's stack pointer.
+
+    The stack row exists by the time this runs: a stack the operation being
+    undone dissolved was recreated before the first pointer was written
+    (:func:`_recreate_dissolved_stacks`).
 
     Args:
         session: Pre-opened DB session; the caller commits.
@@ -1189,11 +1185,6 @@ def _apply_stack(
     stack_id = stack.get("id")
     if stack_id is not None:
         stack_id = int(stack_id)
-        if session.get(PictureStack, stack_id) is None:
-            # The stack was dissolved by the operation being undone; recreate the
-            # row under its original id so the restored pointer stays valid.
-            session.add(PictureStack(id=stack_id, name=stack.get("name")))
-            session.flush()
     if (
         vacated_stack_ids is not None
         and picture.stack_id is not None
@@ -1209,7 +1200,7 @@ def _apply_stack(
 def delete_emptied_stacks(session: Session, stack_ids: set[int]) -> None:
     """Delete ``PictureStack`` rows a restore has just left with no members.
 
-    The symmetric counterpart of the recreate branch in :func:`_apply_stack`:
+    The symmetric counterpart of :func:`_recreate_dissolved_stacks`:
     undoing a dissolve recreates the stack row, so undoing a stack *creation*
     (members restored to ``stack_id=None`` or to another stack) must delete the
     row it empties - otherwise every undone stacking leaves an orphaned empty
@@ -1222,6 +1213,11 @@ def delete_emptied_stacks(session: Session, stack_ids: set[int]) -> None:
     over-deletion would break a pointer the restore never touched, which is a
     worse bug than the row leak this cleanup exists to fix.
 
+    Every vacated stack's row and its remaining members are read by id chunk
+    before the first delete. Reading per stack would autoflush the previous
+    stack's delete, once for each stack an undo of a stack-every-group gesture
+    empties.
+
     Args:
         session: The restore's session; the caller commits.
         stack_ids: Ids of stacks some picture was moved off of by the restore.
@@ -1230,8 +1226,25 @@ def delete_emptied_stacks(session: Session, stack_ids: set[int]) -> None:
         return
     # Make the in-session stack_id writes visible to the membership query below.
     session.flush()
-    for stack_id in sorted(stack_ids):
-        stack = session.get(PictureStack, stack_id)
+    ids = sorted(int(stack_id) for stack_id in stack_ids)
+    stacks = {
+        int(stack.id): stack
+        for batch in chunked(ids)
+        for stack in session.exec(
+            select(PictureStack).where(PictureStack.id.in_(batch))
+        )
+    }
+    survivors = {
+        int(stack_id): int(picture_id)
+        for batch in chunked(ids)
+        for stack_id, picture_id in session.exec(
+            select(Picture.stack_id, func.min(Picture.id))
+            .where(Picture.stack_id.in_(batch))
+            .group_by(Picture.stack_id)
+        )
+    }
+    for stack_id in ids:
+        stack = stacks.get(stack_id)
         if stack is None:
             # Already gone - e.g. the restore replayed a dissolve, whose forward
             # path deleted the row itself. Nothing to clean up; logged so the
@@ -1242,9 +1255,7 @@ def delete_emptied_stacks(session: Session, stack_ids: set[int]) -> None:
                 stack_id,
             )
             continue
-        survivor = session.exec(
-            select(Picture.id).where(Picture.stack_id == stack_id).limit(1)
-        ).first()
+        survivor = survivors.get(stack_id)
         if survivor is not None:
             logger.debug(
                 "operation_log: stack %d still has members (e.g. picture %d) "
@@ -1582,10 +1593,14 @@ def _enforce_scrapheap_targets_exist(
     )
     if not wanted:
         return
+    # By id chunk: one undo restores a whole batch, and a batch is one gesture
+    # that may have been sent as several requests (Keep cover only over a
+    # library), so it can name more pictures than one statement may bind.
     alive = {
         int(picture_id)
+        for batch in chunked(wanted)
         for picture_id in session.exec(
-            select(Picture.id).where(Picture.id.in_(wanted))
+            select(Picture.id).where(Picture.id.in_(batch))
         ).all()
         if picture_id is not None
     }
@@ -1627,6 +1642,77 @@ def _label_bearing_ids(state: dict[str, dict]) -> list[int]:
         for picture_id, facets in (state or {}).items()
         if FACET_TAGS in (facets or {}) or FACET_TAG_PREDICTIONS in (facets or {})
     )
+
+
+def _ids_restoring(state: dict[str, dict], facet: str) -> list[int]:
+    """Picture ids in *state* that carry a value to restore for *facet*."""
+    return sorted(
+        int(picture_id)
+        for picture_id, facets in (state or {}).items()
+        if (facets or {}).get(facet) is not None
+    )
+
+
+def _rows_by_picture(session: Session, model, picture_ids: list[int]) -> dict:
+    """Every *model* row of each picture in *picture_ids*, read by id chunk.
+
+    Args:
+        session: Pre-opened DB session.
+        model: A table keyed by ``picture_id`` (``Tag``, ``Face``, ...).
+        picture_ids: The pictures to read rows for.
+
+    Returns:
+        ``{picture_id: [row, ...]}``; a picture with no rows has no entry.
+    """
+    rows: dict[int, list] = {}
+    for batch in chunked(picture_ids):
+        for row in session.exec(select(model).where(model.picture_id.in_(batch))):
+            rows.setdefault(int(row.picture_id), []).append(row)
+    return rows
+
+
+def _recreate_dissolved_stacks(
+    session: Session, state: dict[str, dict], pictures: dict[int, Picture]
+) -> None:
+    """Recreate, under its original id, every stack row *state* points back at.
+
+    The operation being undone may have dissolved a stack, deleting its row; the
+    restored pointers need it back. One existence read and one flush cover every
+    stack the state names, ahead of the first pointer write: done per picture,
+    each lookup autoflushed the previous picture and each recreate flushed
+    again, twice for every stack a redo of a stack-every-group gesture rebuilt.
+
+    Args:
+        session: Pre-opened DB session; the caller commits.
+        state: The recorded state being applied.
+        pictures: The state's pictures that still exist. A picture that is gone
+            is skipped by the restore, so it must not bring back a stack row
+            that nothing would point at.
+    """
+    names: dict[int, Optional[str]] = {}
+    for picture_id_raw, facets in (state or {}).items():
+        stack = (facets or {}).get(FACET_STACK)
+        if int(picture_id_raw) not in pictures or not isinstance(stack, dict):
+            continue
+        if stack.get("id") is not None:
+            names.setdefault(int(stack["id"]), stack.get("name"))
+    if not names:
+        return
+    present = {
+        int(stack_id)
+        for batch in chunked(sorted(names))
+        for stack_id in session.exec(
+            select(PictureStack.id).where(PictureStack.id.in_(batch))
+        )
+    }
+    missing = [stack_id for stack_id in sorted(names) if stack_id not in present]
+    if missing:
+        session.add_all(
+            PictureStack(id=stack_id, name=names[stack_id]) for stack_id in missing
+        )
+        # Written before any pointer to them, so no restored pointer is ever
+        # flushed ahead of the row it names.
+        session.flush()
 
 
 def apply_state_in_session(
@@ -1690,6 +1776,29 @@ def apply_state_in_session(
     _enforce_scrapheap_targets_exist(session, state, action)
     label_ids = _label_bearing_ids(state)
     touched: list[int] = []
+    # Everything the appliers compare against is read here, by id chunk, before
+    # the first write. A read inside the loop autoflushes the previous picture's
+    # writes, and every flush recomputes the flushed pictures' metadata hashes, so
+    # reading per picture cost a flush per picture: undoing a library-sized
+    # gesture outlasted the client's timeout. Each applier reads and writes only
+    # its own picture's rows of its own table, so none of these reads can be made
+    # stale by an earlier picture's writes.
+    pictures = {
+        int(picture.id): picture
+        for batch in chunked(sorted(int(pid) for pid in (state or {})))
+        for picture in session.exec(select(Picture).where(Picture.id.in_(batch)))
+    }
+    rows_of = {
+        facet: _rows_by_picture(session, model, _ids_restoring(state, facet))
+        for facet, model in (
+            (FACET_TAGS, Tag),
+            (FACET_TAG_PREDICTIONS, TagPrediction),
+            (FACET_SETS, PictureSetMember),
+            (FACET_PROJECTS, PictureProjectMember),
+            (FACET_CHARACTERS, Face),
+        )
+    }
+    _recreate_dissolved_stacks(session, state, pictures)
     # The dispatch loop stays inside this function on purpose: the lock guard
     # above is what makes every sink below safe, and extracting the loop would
     # move those sinks into a helper the locked-set guardrail can no longer see
@@ -1703,7 +1812,7 @@ def apply_state_in_session(
     ):
         for picture_id_raw, facets in (state or {}).items():
             picture_id = int(picture_id_raw)
-            picture = session.get(Picture, picture_id)
+            picture = pictures.get(picture_id)
             if picture is None:
                 logger.warning(
                     "operation_log: picture %d no longer exists; skipping its part "
@@ -1731,19 +1840,44 @@ def apply_state_in_session(
                     session.add(picture)
                 elif facet == FACET_TAGS:
                     if value is not None:
-                        _apply_tags(session, picture_id, value)
+                        _apply_tags(
+                            session,
+                            picture_id,
+                            value,
+                            rows_of[FACET_TAGS].get(picture_id, []),
+                        )
                 elif facet == FACET_TAG_PREDICTIONS:
                     if value is not None:
-                        _apply_tag_predictions(session, picture_id, value)
+                        _apply_tag_predictions(
+                            session,
+                            picture_id,
+                            value,
+                            rows_of[FACET_TAG_PREDICTIONS].get(picture_id, []),
+                        )
                 elif facet == FACET_SETS:
                     if value is not None:
-                        _apply_sets(session, picture_id, value)
+                        _apply_sets(
+                            session,
+                            picture_id,
+                            value,
+                            rows_of[FACET_SETS].get(picture_id, []),
+                        )
                 elif facet == FACET_PROJECTS:
                     if value is not None:
-                        _apply_projects(session, picture_id, value)
+                        _apply_projects(
+                            session,
+                            picture_id,
+                            value,
+                            rows_of[FACET_PROJECTS].get(picture_id, []),
+                        )
                 elif facet == FACET_CHARACTERS:
                     if value is not None:
-                        _apply_characters(session, picture_id, value)
+                        _apply_characters(
+                            session,
+                            picture_id,
+                            value,
+                            rows_of[FACET_CHARACTERS].get(picture_id, []),
+                        )
                 elif facet == FACET_STACK:
                     if value is not None:
                         _apply_stack(
@@ -1837,8 +1971,7 @@ def apply_state_in_session(
             # from a snapshot). Must run before the context manager exits, so the
             # score invalidation observes the final label state.
             session.flush()
-            for picture_id in label_ids:
-                recompute_anomaly_tag_uncertainty(session, picture_id)
+            recompute_anomaly_tag_uncertainties(session, label_ids)
     return touched
 
 
@@ -1993,11 +2126,13 @@ def _stack_siblings_in_session(session: Session, moved: set[int]) -> list[int]:
     """
     if not moved:
         return []
+    # By id chunk, for the reason :func:`_enforce_scrapheap_targets_exist` gives.
     stack_ids = {
         int(stack_id)
+        for batch in chunked(sorted(moved))
         for stack_id in session.exec(
             select(Picture.stack_id).where(
-                Picture.id.in_(moved),
+                Picture.id.in_(batch),
                 Picture.stack_id.is_not(None),
             )
         ).all()
@@ -2012,8 +2147,9 @@ def _stack_siblings_in_session(session: Session, moved: set[int]) -> list[int]:
     # ``ix_picture_stack_id`` (backend_architecture.md, "Probe cost").
     live = {
         int(picture_id)
+        for batch in chunked(sorted(stack_ids))
         for picture_id, deleted in session.exec(
-            select(Picture.id, Picture.deleted).where(Picture.stack_id.in_(stack_ids))
+            select(Picture.id, Picture.deleted).where(Picture.stack_id.in_(batch))
         ).all()
         if not deleted
     }
@@ -2038,7 +2174,7 @@ def _restore(
     the same transaction. A hook that raises aborts the restore.
 
     Stacks the restore empties are then deleted (:func:`delete_emptied_stacks`),
-    the mirror of :func:`_apply_stack` recreating a dissolved stack's row. The
+    the mirror of :func:`_recreate_dissolved_stacks`. The
     decision is deliberately made HERE, after every operation's state (and every
     hook) has been applied: emptiness is a property of the whole restore, not of
     any single picture's pointer write.

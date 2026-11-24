@@ -384,11 +384,176 @@ export function keepCoverOnlySkipNote(result) {
   const noun = total === 1 ? "stack" : "stacks";
   let note;
   if (locked && character) {
-    note = `${total} ${noun} skipped: ${locked} locked, ${character} holding a person's only link.`;
+    note = `${total.toLocaleString()} ${noun} skipped: ${locked.toLocaleString()} locked, ${character.toLocaleString()} holding a person's only link.`;
   } else if (locked) {
-    note = `${locked} ${noun} skipped: held by a locked picture set.`;
+    note = `${locked.toLocaleString()} ${noun} skipped: held by a locked picture set.`;
   } else {
-    note = `${character} ${noun} skipped: a person's only link sits on a copy.`;
+    note = `${character.toLocaleString()} ${noun} skipped: a person's only link sits on a copy.`;
   }
   return [note, nothingNote, stayingNote].filter(Boolean).join(" ");
+}
+
+/**
+ * The receipt's second sentence for a whole gesture.
+ *
+ * A selection larger than one request is collapsed as several operations under
+ * one batch id, and the receipt names the newest of them with a `+N` for the
+ * rest. Its figures are that one request's, so when there was more than one,
+ * the gesture's own totals lead the note: "Kept the cover of 201 stacks" must
+ * not be the last word on a Ctrl+A that collapsed 1,201.
+ *
+ * @param {Object|null} result - the merged collapse result.
+ * @param {number} [steps=1] - operations the gesture recorded: requests that
+ *   collapsed at least one stack.
+ * @returns {string} `""` when there is nothing to add.
+ */
+export function keepCoverOnlyReceiptNote(result, steps = 1) {
+  const skipNote = keepCoverOnlySkipNote(result);
+  if (!result || !(Number(steps) > 1)) return skipNote;
+  const stacks = Number(result.stacks_collapsed) || 0;
+  const pictures = Number(result.pictures_moved) || 0;
+  const totals = `In all, ${pictures.toLocaleString()} ${pictures === 1 ? "picture" : "pictures"} from ${stacks.toLocaleString()} ${stacks === 1 ? "stack" : "stacks"} moved to the Scrapheap.`;
+  return [totals, skipNote].filter(Boolean).join(" ");
+}
+
+/**
+ * Where a collapse of several requests has got to, for the dialog's status line.
+ *
+ * Shown only when the selection takes more than one request: one request is
+ * answered within the button's own spinner, and a line that flashes "0 of 40"
+ * for a moment says nothing.
+ *
+ * @param {{stacksDone: number, stacksTotal: number}|null} progress
+ * @returns {string} `""` with no progress to report.
+ */
+export function keepCoverOnlyProgressSentence(progress) {
+  if (!progress) return "";
+  const total = Number(progress.stacksTotal) || 0;
+  if (total <= 0) return "";
+  const done = Math.min(Number(progress.stacksDone) || 0, total);
+  return `${done.toLocaleString()} of ${total.toLocaleString()} stacks done…`;
+}
+
+/** A sentence the server or the transport gave, ending in a full stop. */
+function asSentence(text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return "";
+  const capital = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+  return /[.!?…]$/.test(capital) ? capital : `${capital}.`;
+}
+
+/**
+ * The notice for a collapse that did not finish.
+ *
+ * Says what happened, why, and what to do next, in that order, because the
+ * three cases need different next steps:
+ *
+ *   * nothing done and the server said why: the selection and the dialog are
+ *     untouched, so the reason is the whole story;
+ *   * some requests done, then a refusal: the done part is real and one Ctrl+Z
+ *     away, and the rest is still selected to run again;
+ *   * the answer was lost (a timeout, a dropped connection): the request may
+ *     have committed, so the grid is re-read and the message cannot claim
+ *     either way. Rerunning is still safe: a collapsed stack has one live
+ *     member left, and the server skips a stack of one without writing.
+ *
+ * @param {Object} details
+ * @param {number} details.stacksDone - stacks in the requests that answered.
+ * @param {number} details.stacksTotal - stacks in the whole selection.
+ * @param {string} [details.detail] - the server's or the transport's reason.
+ * @param {boolean} [details.outcomeUnknown] - the failed request got no answer.
+ * @returns {string}
+ */
+export function keepCoverOnlyIncompleteMessage({
+  stacksDone,
+  stacksTotal,
+  detail,
+  outcomeUnknown = false,
+}) {
+  const done = Number(stacksDone) || 0;
+  const total = Number(stacksTotal) || 0;
+  const reason = asSentence(detail);
+  if (outcomeUnknown) {
+    const lead =
+      done > 0
+        ? `Collapsed ${done.toLocaleString()} of ${total.toLocaleString()} stacks, then lost the server's answer, so more of them may have collapsed too.`
+        : "Lost the server's answer while collapsing those stacks, so some of them may have collapsed.";
+    return [
+      lead,
+      reason,
+      "The grid has been reloaded to show where things stand. Running Keep cover only again is safe: a stack already collapsed is skipped.",
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+  if (done <= 0) {
+    return ["Couldn't collapse those stacks.", reason].filter(Boolean).join(" ");
+  }
+  const left = Math.max(total - done, 0);
+  return [
+    `Collapsed ${done.toLocaleString()} of ${total.toLocaleString()} stacks, then stopped.`,
+    reason,
+    `The other ${left.toLocaleString()} ${left === 1 ? "is" : "are"} still selected: run Keep cover only again to finish, or press Ctrl+Z to take back what was done.`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+/**
+ * What the dialog says when its preview could not be read, and whether a retry
+ * can help.
+ *
+ * The counts are unknown either way, so the dialog shows no figure; the kind
+ * decides the rest. A timeout, an unreachable server and a server fault are
+ * worth a retry, so those offer one in place: "close this and try again" made
+ * the user rebuild a Ctrl+A selection to ask the same question twice. A refused
+ * request and a missing permission would fail the same way again, so those say
+ * why instead. A cancelled preview says nothing: it was cancelled because the
+ * dialog moved on.
+ *
+ * @param {{kind: string, detail?: string}|null} failure - from
+ *   `requestFailure` in `utils/apiError.js`.
+ * @returns {{sentence: string, retryable: boolean}}
+ */
+export function keepCoverOnlyPreviewFailure(failure) {
+  if (!failure || failure.kind === "cancelled") {
+    return { sentence: "", retryable: false };
+  }
+  const reason = String(failure.detail ?? "").trim();
+  const ended = reason && !/[.!?…]$/.test(reason) ? `${reason}.` : reason;
+  switch (failure.kind) {
+    case "validation":
+      return {
+        sentence: ended
+          ? `The server refused the preview: ${ended}`
+          : "The server refused the preview.",
+        retryable: false,
+      };
+    case "forbidden":
+      return {
+        sentence: "You don't have permission to change stacks here.",
+        retryable: false,
+      };
+    case "timeout":
+      return {
+        sentence:
+          "The preview took too long to answer, so these counts are unknown.",
+        retryable: true,
+      };
+    case "network":
+      return {
+        sentence: "The server could not be reached, so these counts are unknown.",
+        retryable: true,
+      };
+    default:
+      return {
+        sentence: [
+          "The preview failed on the server, so these counts are unknown.",
+          ended,
+        ]
+          .filter(Boolean)
+          .join(" "),
+        retryable: true,
+      };
+  }
 }

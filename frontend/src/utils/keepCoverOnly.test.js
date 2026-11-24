@@ -10,7 +10,11 @@ import {
   keepCoverOnlyLockReason,
   keepCoverOnlyBytesSentence,
   keepCoverOnlyConfirmLabel,
+  keepCoverOnlyIncompleteMessage,
   keepCoverOnlyMenuLabel,
+  keepCoverOnlyPreviewFailure,
+  keepCoverOnlyProgressSentence,
+  keepCoverOnlyReceiptNote,
   keepCoverOnlyRetentionSentence,
   keepCoverOnlySkipNote,
   keepCoverOnlySkipReasons,
@@ -324,5 +328,145 @@ describe("Keep recipes only copy", () => {
     ).toBe(
       "1 stack skipped: held by a locked picture set. 1 picture stays: it could not be made again.",
     );
+  });
+});
+
+// A selection past one request is collapsed in several, under one batch id.
+// The receipt names one operation; these sentences carry the gesture.
+describe("Selections larger than one request", () => {
+  it("leads the receipt with the gesture's totals when it took several steps", () => {
+    expect(
+      keepCoverOnlyReceiptNote(
+        {
+          stacks_collapsed: 1201,
+          pictures_moved: 3300,
+          stacks_skipped_locked: [{}],
+        },
+        3,
+      ),
+    ).toBe(
+      "In all, 3,300 pictures from 1,201 stacks moved to the Scrapheap. 1 stack skipped: held by a locked picture set.",
+    );
+  });
+
+  // One step: the receipt's own figures are already the gesture's.
+  it("adds no totals to a one-step gesture", () => {
+    expect(
+      keepCoverOnlyReceiptNote({ stacks_collapsed: 40, pictures_moved: 90 }, 1),
+    ).toBe("");
+    expect(
+      keepCoverOnlyReceiptNote({ stacks_collapsed: 40, pictures_moved: 90 }),
+    ).toBe("");
+  });
+
+  it("groups a merged skip count the way every other count is grouped", () => {
+    const rows = Array.from({ length: 1200 }, () => ({}));
+    expect(keepCoverOnlySkipNote({ stacks_skipped_locked: rows })).toBe(
+      "1,200 stacks skipped: held by a locked picture set.",
+    );
+  });
+
+  it("states progress as stacks done of the whole", () => {
+    expect(
+      keepCoverOnlyProgressSentence({ stacksDone: 500, stacksTotal: 1201 }),
+    ).toBe("500 of 1,201 stacks done…");
+    expect(keepCoverOnlyProgressSentence(null)).toBe("");
+    expect(
+      keepCoverOnlyProgressSentence({ stacksDone: 0, stacksTotal: 0 }),
+    ).toBe("");
+  });
+
+  // Nothing happened: the reason is the whole story, and nothing claims a
+  // partial collapse that did not occur.
+  it("gives the server's reason alone when nothing was done", () => {
+    expect(
+      keepCoverOnlyIncompleteMessage({
+        stacksDone: 0,
+        stacksTotal: 1201,
+        detail: "the selection changed since the preview; preview again",
+      }),
+    ).toBe(
+      "Couldn't collapse those stacks. The selection changed since the preview; preview again.",
+    );
+  });
+
+  // Some done: what happened, why it stopped, and both ways forward.
+  it("says how far it got and how to finish or take it back", () => {
+    expect(
+      keepCoverOnlyIncompleteMessage({
+        stacksDone: 500,
+        stacksTotal: 1201,
+        detail: "Database is busy.",
+      }),
+    ).toBe(
+      "Collapsed 500 of 1,201 stacks, then stopped. Database is busy. The other 701 are still selected: run Keep cover only again to finish, or press Ctrl+Z to take back what was done.",
+    );
+  });
+
+  // A lost answer may have committed: the message must not claim either way.
+  it("never claims an outcome nobody saw", () => {
+    const lost = keepCoverOnlyIncompleteMessage({
+      stacksDone: 500,
+      stacksTotal: 1201,
+      detail: "",
+      outcomeUnknown: true,
+    });
+    expect(lost).toBe(
+      "Collapsed 500 of 1,201 stacks, then lost the server's answer, so more of them may have collapsed too. The grid has been reloaded to show where things stand. Running Keep cover only again is safe: a stack already collapsed is skipped.",
+    );
+    expect(lost).not.toMatch(/still selected: run/);
+    expect(
+      keepCoverOnlyIncompleteMessage({
+        stacksDone: 0,
+        stacksTotal: 40,
+        detail: "timeout of 60000ms exceeded",
+        outcomeUnknown: true,
+      }),
+    ).toMatch(/^Lost the server's answer while collapsing those stacks/);
+  });
+});
+
+describe("keepCoverOnlyPreviewFailure", () => {
+  // The reported screen: a server fault, and the only way on was to close the
+  // dialog and rebuild the selection.
+  it("offers a retry where one can help", () => {
+    for (const kind of ["timeout", "network", "server", "conflict"]) {
+      const failure = keepCoverOnlyPreviewFailure({ kind, detail: "" });
+      expect(failure.retryable).toBe(true);
+      expect(failure.sentence).toMatch(/so these counts are unknown\.$/);
+    }
+  });
+
+  // The same request would be refused the same way again.
+  it("says why instead when a retry would fail the same way", () => {
+    expect(
+      keepCoverOnlyPreviewFailure({
+        kind: "validation",
+        detail: "At most 2000 ids per request",
+      }),
+    ).toEqual({
+      sentence: "The server refused the preview: At most 2000 ids per request.",
+      retryable: false,
+    });
+    expect(keepCoverOnlyPreviewFailure({ kind: "forbidden" })).toEqual({
+      sentence: "You don't have permission to change stacks here.",
+      retryable: false,
+    });
+  });
+
+  it("never tells the user to close the dialog to try again", () => {
+    for (const kind of ["timeout", "network", "server", "validation"]) {
+      expect(keepCoverOnlyPreviewFailure({ kind }).sentence).not.toMatch(
+        /close/i,
+      );
+    }
+  });
+
+  it("says nothing about a preview the dialog cancelled itself", () => {
+    expect(keepCoverOnlyPreviewFailure({ kind: "cancelled" })).toEqual({
+      sentence: "",
+      retryable: false,
+    });
+    expect(keepCoverOnlyPreviewFailure(null).sentence).toBe("");
   });
 });

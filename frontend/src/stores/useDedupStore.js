@@ -87,6 +87,7 @@ import {
   mixedStackEngineMarks,
 } from "../utils/dedup";
 import { newOperationBatchId, onSessionReset } from "../utils/apiClient";
+import { requestFailure } from "../utils/apiError";
 import { useOperationStore } from "./useOperationStore";
 
 /** How many groups one queue page holds. */
@@ -448,54 +449,21 @@ function wait(ms) {
  * Why an Auto-stack request failed, in the terms the dialog and the banner
  * word it.
  *
- * Checked in this order because the cases overlap: an aborted or timed-out
- * request also arrives without a response, and only the remainder is a server
- * that could not be reached. `detail` is the server's own sentence, or for a
- * refused body (a list of field errors) the first error's message only: never
- * its `input`, which echoes the submitted value. The run routes refuse with a
- * structured detail, `{code, message, run}`: `code` is the machine-readable
- * reason and `run` the run a refusal is about, such as the one already active.
+ * {@link requestFailure}'s classification, plus the run a refusal is about: the
+ * run routes refuse with a structured detail, `{code, message, run}`, and `run`
+ * is the run already active when a second start is refused.
  *
  * @param {*} err - the rejection from a `../api/dedup` auto-stack call.
  * @returns {{kind: string, status: (number|null), detail: string,
  *   code: (string|null), run: (Object|null)}}
  */
 function autoStackFailure(err) {
-  const status = Number(err?.response?.status) || null;
   const served = err?.response?.data?.detail;
-  let detail = "";
-  let code = null;
-  let run = null;
-  if (typeof served === "string") {
-    detail = served.trim();
-  } else if (Array.isArray(served) && typeof served[0]?.msg === "string") {
-    detail = served[0].msg.trim();
-  } else if (served && typeof served === "object") {
-    if (typeof served.message === "string") detail = served.message.trim();
-    if (typeof served.code === "string") code = served.code;
-    if (served.run && typeof served.run === "object") run = served.run;
-  }
-  let kind;
-  if (
-    err?.code === "ERR_CANCELED" ||
-    err?.name === "CanceledError" ||
-    err?.name === "AbortError"
-  ) {
-    kind = "cancelled";
-  } else if (err?.code === "ECONNABORTED" || err?.code === "ETIMEDOUT") {
-    kind = "timeout";
-  } else if (!err?.response) {
-    kind = "network";
-  } else if (status === 400 || status === 422) {
-    kind = "validation";
-  } else if (status === 401 || status === 403) {
-    kind = "forbidden";
-  } else if (status === 409) {
-    kind = "conflict";
-  } else {
-    kind = "server";
-  }
-  return { kind, status, detail, code, run };
+  const run =
+    served && typeof served === "object" && served.run && typeof served.run === "object"
+      ? served.run
+      : null;
+  return { ...requestFailure(err), run };
 }
 
 export const useDedupStore = defineStore("dedup", () => {

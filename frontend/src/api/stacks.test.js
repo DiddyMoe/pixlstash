@@ -133,6 +133,36 @@ describe("api/stacks: keep cover only", () => {
     });
   });
 
+  // The confirmed figure is the one acted on: the server refuses a plan that
+  // grew past what the preview listed. An empty list is still a promise
+  // ("nothing moves") and must be sent, not dropped.
+  it("sends the confirmed preview's ids, even an empty list", async () => {
+    apiClient.post.mockResolvedValue({ data: { status: "success" } });
+    await keepCoverOnly({ stackIds: [12], expectedPictureIds: [101, "102"] });
+    expect(apiClient.post).toHaveBeenCalledWith("/stacks/keep-cover-only", {
+      stack_ids: [12],
+      expected_picture_ids: [101, 102],
+    });
+
+    apiClient.post.mockClear();
+    await keepCoverOnly({ stackIds: [12], expectedPictureIds: [] });
+    expect(apiClient.post).toHaveBeenCalledWith("/stacks/keep-cover-only", {
+      stack_ids: [12],
+      expected_picture_ids: [],
+    });
+  });
+
+  it("lets a preview be cancelled", async () => {
+    apiClient.post.mockResolvedValue({ data: {} });
+    const controller = new AbortController();
+    await previewKeepCoverOnly({ stackIds: [12], signal: controller.signal });
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/stacks/keep-cover-only/preview",
+      { stack_ids: [12] },
+      { signal: controller.signal },
+    );
+  });
+
   it("returns the response body rather than the axios envelope", async () => {
     apiClient.post.mockResolvedValue({
       data: { status: "success", pictures_moved: 414 },

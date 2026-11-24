@@ -7,10 +7,12 @@
  *     :open="keepCoverOpen"
  *     :preview="keepCoverPreview"
  *     :loading="keepCoverLoading"
- *     :preview-failed="keepCoverPreviewFailed"
+ *     :preview-error="keepCoverPreviewError"
  *     :busy="keepCoverBusy"
+ *     :progress="keepCoverProgress"
  *     @close="keepCoverOpen = false"
  *     @confirm="runKeepCoverOnly"
+ *     @retry="loadKeepCoverPreview"
  *   />
  *
  * Presentational: the parent owns the preview, the real run and the API.
@@ -39,6 +41,8 @@ import {
   UNKNOWN_FIGURE,
   keepCoverOnlyBytesSentence,
   keepCoverOnlyConfirmLabel,
+  keepCoverOnlyPreviewFailure,
+  keepCoverOnlyProgressSentence,
   keepCoverOnlyRetentionSentence,
   keepCoverOnlySkipReasons,
   keepCoverOnlySkippedCount,
@@ -62,17 +66,25 @@ const props = defineProps({
   /** True while the dry run is in flight. */
   loading: { type: Boolean, default: false },
   /**
-   * True when the dry run could not be read. Without this a failed preview and
-   * a genuinely empty one are the same screen: a zero over a live confirm
-   * button, which says "there is nothing to collapse" when the truth is
-   * "nobody was able to ask".
+   * Why the dry run could not be read, or null when it was: `requestFailure`'s
+   * `{ kind, status, detail, code }` (`utils/apiError.js`). Without this a
+   * failed preview and a genuinely empty one are the same screen: a zero over a
+   * live confirm button, which says "there is nothing to collapse" when the
+   * truth is "nobody was able to ask". The kind picks the sentence and whether
+   * Try again is offered.
    */
-  previewFailed: { type: Boolean, default: false },
+  previewError: { type: Object, default: null },
   /** True while the real run is in flight. */
   busy: { type: Boolean, default: false },
+  /**
+   * `{ stacksDone, stacksTotal }` while a selection of more than one request
+   * is being collapsed, or null. A large selection takes several seconds per
+   * request, past the point where a spinner alone says enough.
+   */
+  progress: { type: Object, default: null },
 });
 
-const emit = defineEmits(["close", "confirm"]);
+const emit = defineEmits(["close", "confirm", "retry"]);
 
 /**
  * True while no figure from the server may be shown.
@@ -81,7 +93,15 @@ const emit = defineEmits(["close", "confirm"]);
  * selection is exactly as wrong as an invented one.
  */
 const figuresUnknown = computed(
-  () => props.loading || props.previewFailed || !props.preview,
+  () => props.loading || Boolean(props.previewError) || !props.preview,
+);
+
+/** The failed preview's sentence, and whether Try again can help. */
+const failure = computed(() => keepCoverOnlyPreviewFailure(props.previewError));
+
+/** "500 of 1,201 stacks done…" while a long collapse runs, else "". */
+const progressSentence = computed(() =>
+  props.busy ? keepCoverOnlyProgressSentence(props.progress) : "",
 );
 
 /**
@@ -138,6 +158,20 @@ const skippedSummary = computed(() => {
 });
 
 /**
+ * What a screen reader is told, through the one status region that is mounted
+ * with the dialog: why the preview failed, how far a long collapse has got, or
+ * that some stacks won't change. Each of those appears after the dialog opens,
+ * and a live region inserted together with its text is often not announced, so
+ * they share this region rather than each carrying a role of its own.
+ */
+const announcement = computed(
+  () =>
+    failure.value.sentence ||
+    progressSentence.value ||
+    (skipReasons.value.length ? `${skippedSummary.value}.` : ""),
+);
+
+/**
  * The recovery window, read from the response.
  *
  * `scrapheap_retention_days` is `null` on a default install, which means the
@@ -187,16 +221,29 @@ const canConfirm = computed(
 // the confirm button, it reintroduces exactly that hazard. Do not.
 const cancelRef = ref(null);
 
+function focusCancel() {
+  nextTick(() => {
+    cancelRef.value?.focus?.();
+  });
+}
+
 watch(
   () => props.open,
   (isOpen) => {
-    if (!isOpen) return;
     // After the dialog's own enter transition has mounted the footer.
-    nextTick(() => {
-      cancelRef.value?.focus?.();
-    });
+    if (isOpen) focusCancel();
   },
 );
+
+/**
+ * Ask again. Try again disappears with the failure it answers, so the keyboard
+ * goes back to Cancel rather than to the page behind the dialog; Cancel, not
+ * the confirm, for the same reason it starts there.
+ */
+function retry() {
+  emit("retry");
+  focusCancel();
+}
 </script>
 
 <template>
@@ -207,11 +254,25 @@ watch(
       only picked some of its pictures, and loose pictures are left alone.
     </p>
 
-    <p v-if="previewFailed" class="kco-failed" role="status">
+    <div v-if="failure.sentence" class="kco-failed">
       <v-icon size="16" class="kco-icon">mdi-alert-outline</v-icon>
-      The preview could not be read, so these counts are unknown. Close this and
-      try again.
-    </p>
+      <div class="kco-failed-body">
+        <!-- Heard through the dialog's status region, below. -->
+        <p class="kco-failed-text" aria-hidden="true">{{ failure.sentence }}</p>
+        <!-- In place, so the same selection is asked about again: closing
+             the dialog to retry meant rebuilding a Ctrl+A over the grid. -->
+        <AppButton
+          v-if="failure.retryable"
+          data-testid="keep-cover-retry"
+          variant="outline"
+          size="sm"
+          icon-left="refresh"
+          @click="retry"
+        >
+          Try again
+        </AppButton>
+      </div>
+    </div>
 
     <!-- The headline. One instance of the figure, and the confirm button below
          renders the same computed value. The numeral is `on-surface`, never
@@ -233,10 +294,12 @@ watch(
       </span>
     </p>
 
+    <!-- Not a live region itself: it arrives with its text. The summary is
+         announced through the status region below; the reasons stay here to
+         be read. -->
     <section
       v-if="skipReasons.length"
       class="kco-skips"
-      role="status"
       aria-labelledby="keep-cover-skips-title"
     >
       <p id="keep-cover-skips-title" class="kco-skips-title">
@@ -273,6 +336,25 @@ watch(
       Reversible as one step with
       <!-- One flex item, so the paragraph's gap does not split the chord. -->
       <span><KeyCap k="Ctrl" /><kbd>Z</kbd></span>.
+    </p>
+
+    <!-- Seen beside the spinning confirm; heard through the status region. -->
+    <p
+      v-if="progressSentence"
+      class="kco-progress"
+      data-testid="keep-cover-progress"
+      aria-hidden="true"
+    >
+      {{ progressSentence }}
+    </p>
+    <!-- The dialog's only live region. It is mounted with the dialog, so a
+         screen reader is listening before the first sentence arrives. -->
+    <p
+      class="visually-hidden"
+      role="status"
+      data-testid="keep-cover-announcer"
+    >
+      {{ announcement }}
     </p>
 
     <template #footer>
@@ -314,6 +396,18 @@ watch(
   font-size: var(--text-xs);
   line-height: var(--leading-body);
   color: rgb(var(--v-theme-on-surface));
+}
+
+.kco-failed-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.kco-failed-text {
+  margin: 0;
 }
 
 /* The leading status rail carries the consequence's hue so the numeral does
@@ -419,6 +513,16 @@ watch(
   margin: 0;
   font-size: var(--text-xs);
   color: rgba(var(--v-theme-on-surface), 0.6);
+}
+
+/* The same quiet line as the undo hint, at full strength: it is the one
+   thing changing while the run goes on. */
+.kco-progress {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  font-variant-numeric: tabular-nums;
+  color: rgba(var(--v-theme-on-surface), 0.8);
 }
 
 .kco-reversible kbd {

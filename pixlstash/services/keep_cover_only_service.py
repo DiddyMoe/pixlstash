@@ -131,10 +131,16 @@ MAX_SELECTION_IDS = 2000
 
 Each id costs a bounded amount of DB work, but an unbounded list would serialise
 an arbitrary amount of it on the DB queue from one request (the reasoning behind
-``BULK_DELETE_MAX_IDS``). It is set higher than that 1000 because the natural
-gesture here is "select every stacked picture in the library and collapse it":
-the owner's 160 stacks hold 574 pictures, and forcing that into chunks would
-split one user gesture across several undo batches.
+``BULK_DELETE_MAX_IDS``). No single value fits every selection: "select every
+stacked picture and collapse it" grows with the library. A client with more
+stacks than one request may carry splits the selection into several requests
+and sends them all under **one** client-minted ``cli-`` ``batch_id``, so the
+gesture is still one history entry and one ``Ctrl+Z``. Each request also sends
+its own preview's ``expected_picture_ids``, which keeps the split from
+weakening the "act on what the preview showed" check. The grid sends 500
+stacks per request (``KEEP_COVER_ONLY_STACKS_PER_REQUEST`` in
+``frontend/src/utils/keepCoverOnlyRequests.js``), well inside this cap;
+``tests/test_keep_cover_only.py`` fails the build if it ever exceeds it.
 
 **It bounds the request, not the result.** Two ways this cap used to be nothing
 of the kind, both of which a client could reach on purpose:
@@ -428,20 +434,22 @@ def resolve_selection_in_session(
         one live member, and the explicitly named ids that have none.
     """
     named = {int(sid) for sid in (stack_ids or []) if sid is not None}
-    seeds = [int(pid) for pid in (picture_ids or []) if pid is not None]
-    from_pictures: set[int] = set()
-    if seeds:
-        from_pictures = {
-            int(sid)
-            for sid in session.exec(
-                select(Picture.stack_id).where(
-                    Picture.id.in_(seeds),
-                    Picture.stack_id.is_not(None),
-                    Picture.deleted.is_(False),
-                )
-            ).all()
-            if sid is not None
-        }
+    seeds = sorted({int(pid) for pid in (picture_ids or []) if pid is not None})
+    # Every id list in this module is read in chunks: "select every stack" is
+    # the natural gesture, and one bound parameter per id overruns SQLite's
+    # per-statement cap (see :func:`~pixlstash.utils.sql_chunking.chunked`).
+    from_pictures = {
+        int(sid)
+        for batch in chunked(seeds)
+        for sid in session.exec(
+            select(Picture.stack_id).where(
+                Picture.id.in_(batch),
+                Picture.stack_id.is_not(None),
+                Picture.deleted.is_(False),
+            )
+        ).all()
+        if sid is not None
+    }
     candidates = named | from_pictures
     if not candidates:
         return [], sorted(named)
@@ -454,10 +462,9 @@ def resolve_selection_in_session(
     # (backend_architecture.md, "Probe cost").
     live = {
         int(sid)
+        for batch in chunked(sorted(candidates))
         for sid, deleted in session.exec(
-            select(Picture.stack_id, Picture.deleted).where(
-                Picture.stack_id.in_(sorted(candidates))
-            )
+            select(Picture.stack_id, Picture.deleted).where(Picture.stack_id.in_(batch))
         ).all()
         if sid is not None and not deleted
     }
@@ -487,13 +494,14 @@ def _live_members_by_stack(
     # walking every kept picture through ``ix_picture_deleted``. Filtered in
     # SQL so scrapheaped rows are never loaded as entities
     # (backend_architecture.md, "Probe cost").
-    for picture in session.exec(
-        select(Picture).where(
-            Picture.stack_id.in_(stack_ids),
-            Picture.deleted.is_not(True),
-        )
-    ).all():
-        members.setdefault(int(picture.stack_id), []).append(picture)
+    for batch in chunked(stack_ids):
+        for picture in session.exec(
+            select(Picture).where(
+                Picture.stack_id.in_(batch),
+                Picture.deleted.is_not(True),
+            )
+        ).all():
+            members.setdefault(int(picture.stack_id), []).append(picture)
     for stack_id in list(members):
         members[stack_id].sort(
             key=lambda pic: (
@@ -506,7 +514,7 @@ def _live_members_by_stack(
 
 
 def _tags_by_picture(session: Session, picture_ids: list[int]) -> dict[int, set[str]]:
-    """Real (non-sentinel) tags per picture, in one query.
+    """Real (non-sentinel) tags per picture, one query per id chunk.
 
     Sentinels and tags removed from tagging are dropped for the same reason
     :func:`~pixlstash.services.dedup_verdict_service.apply_metadata_union_in_session`
@@ -517,29 +525,29 @@ def _tags_by_picture(session: Session, picture_ids: list[int]) -> dict[int, set[
     if not picture_ids:
         return tags
     exclusions = session_tag_exclusions(session)
-    for picture_id, tag in session.exec(
-        select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(picture_ids))
-    ).all():
-        if is_tag_sentinel(tag) or is_excluded(tag, exclusions):
-            continue
-        tags.setdefault(int(picture_id), set()).add(str(tag))
+    for batch in chunked(picture_ids):
+        for picture_id, tag in session.exec(
+            select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(batch))
+        ).all():
+            if is_tag_sentinel(tag) or is_excluded(tag, exclusions):
+                continue
+            tags.setdefault(int(picture_id), set()).add(str(tag))
     return tags
 
 
 def _faces_by_picture(session: Session, picture_ids: list[int]) -> dict[int, set[int]]:
-    """Assigned character ids per picture, in one query."""
+    """Assigned character ids per picture, one query per id chunk."""
     faces: dict[int, set[int]] = {}
-    if not picture_ids:
-        return faces
-    for picture_id, character_id in session.exec(
-        select(Face.picture_id, Face.character_id).where(
-            Face.picture_id.in_(picture_ids),
-            Face.character_id.is_not(None),
-        )
-    ).all():
-        if character_id is None:
-            continue
-        faces.setdefault(int(picture_id), set()).add(int(character_id))
+    for batch in chunked(picture_ids):
+        for picture_id, character_id in session.exec(
+            select(Face.picture_id, Face.character_id).where(
+                Face.picture_id.in_(batch),
+                Face.character_id.is_not(None),
+            )
+        ).all():
+            if character_id is None:
+                continue
+            faces.setdefault(int(picture_id), set()).add(int(character_id))
     return faces
 
 
@@ -816,15 +824,12 @@ def plan_in_session(
 
 
 def _character_names(session: Session, character_ids: set[int]) -> dict[int, str]:
-    """Names for the characters a skip has to name, in one query."""
-    if not character_ids:
-        return {}
+    """Names for the characters a skip has to name, one query per id chunk."""
     return {
         int(cid): str(name)
+        for batch in chunked(sorted(character_ids))
         for cid, name in session.exec(
-            select(Character.id, Character.name).where(
-                Character.id.in_(sorted(character_ids))
-            )
+            select(Character.id, Character.name).where(Character.id.in_(batch))
         ).all()
     }
 
@@ -1179,17 +1184,18 @@ def keep_cover_only_in_session(
             covers_gaining_metadata += 1
         session.flush()
 
-        for picture in session.exec(
-            select(Picture).where(Picture.id.in_(row.copy_ids))
-        ).all():
-            if picture.deleted:
-                continue
-            picture.deleted = True
-            # Same retention clock the grid's Delete starts, stamped only on the
-            # False -> True transition. stack_id is deliberately left alone: a
-            # restored copy has to rejoin its stack.
-            picture.deleted_at = deleted_at
-            session.add(picture)
+        for batch in chunked(row.copy_ids):
+            for picture in session.exec(
+                select(Picture).where(Picture.id.in_(batch))
+            ).all():
+                if picture.deleted:
+                    continue
+                picture.deleted = True
+                # Same retention clock the grid's Delete starts, stamped only on
+                # the False -> True transition. stack_id is deliberately left
+                # alone: a restored copy has to rejoin its stack.
+                picture.deleted_at = deleted_at
+                session.add(picture)
         session.flush()
         normalize_stack_positions(session, row.stack_id)
 

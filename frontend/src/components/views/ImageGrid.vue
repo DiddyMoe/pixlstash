@@ -314,10 +314,12 @@
       :open="keepCoverOnlyOpen"
       :preview="keepCoverOnlyPreview"
       :loading="keepCoverOnlyLoading"
-      :preview-failed="keepCoverOnlyPreviewFailed"
+      :preview-error="keepCoverOnlyPreviewError"
       :busy="keepCoverOnlyBusy"
+      :progress="keepCoverOnlyProgress"
       @close="closeKeepCoverOnly"
       @confirm="runKeepCoverOnly"
+      @retry="loadKeepCoverOnlyPreview"
     />
     <div
       v-if="isMultiCharacterView || isSetOverlapView"
@@ -1357,7 +1359,7 @@ import {
   squareCropBboxRect,
   coverBboxRect,
 } from "../../utils/squareCrop.js";
-import { errorMessage } from "../../utils/apiError.js";
+import { errorMessage, requestFailure } from "../../utils/apiError.js";
 import {
   isSupportedImageFile,
   isSupportedVideoFile,
@@ -1429,17 +1431,18 @@ import {
   listPicturesByIds,
   rotatePictures,
 } from "../../api/pictures";
+import { getStack, removeStackMembers } from "../../api/stacks";
 import {
-  getStack,
-  keepCoverOnly,
-  previewKeepCoverOnly,
-  removeStackMembers,
-} from "../../api/stacks";
-import {
+  keepCoverOnlyIncompleteMessage,
   keepCoverOnlyLockReason as buildKeepCoverOnlyLockReason,
-  keepCoverOnlySkipNote,
+  keepCoverOnlyReceiptNote,
   selectedKeepCoverOnlyStacks,
 } from "../../utils/keepCoverOnly";
+import {
+  KeepCoverOnlyIncompleteError,
+  keepCoverOnlySelection,
+  previewKeepCoverOnlySelection,
+} from "../../utils/keepCoverOnlyRequests";
 import {
   ROTATE_CCW,
   ROTATE_CW,
@@ -4474,9 +4477,11 @@ async function deleteSelected(
 }
 
 // ── Keep cover only ─────────────────────────────────────────────────────────
-// One preview over one selection, then one call. The dialog is the only consent
-// (no type-to-confirm: this is a recoverable soft delete, not the destruction of
-// an on-disk original). See docs/design/keep-cover-only.md.
+// One preview over one selection, then one gesture. The dialog is the only
+// consent (no type-to-confirm: this is a recoverable soft delete, not the
+// destruction of an on-disk original). A selection larger than one request is
+// previewed and collapsed in several, under one batch id, by
+// `utils/keepCoverOnlyRequests.js`. See docs/design/keep-cover-only.md.
 
 /** The dotted op type the backend records, so the receipt note can match it. */
 const KEEP_COVER_ONLY_OP_TYPE = "stack.keep_cover_only";
@@ -4484,19 +4489,33 @@ const KEEP_COVER_ONLY_OP_TYPE = "stack.keep_cover_only";
 const keepCoverOnlyOpen = ref(false);
 const keepCoverOnlyPreview = ref(null);
 const keepCoverOnlyLoading = ref(false);
-const keepCoverOnlyPreviewFailed = ref(false);
+/** Why the preview could not be read (`requestFailure`), or null. */
+const keepCoverOnlyPreviewError = ref(null);
 const keepCoverOnlyBusy = ref(false);
 /**
- * The stacks the open dialog is describing, frozen when it opened.
+ * `{ stacksDone, stacksTotal }` while a collapse of more than one request is
+ * running, or null. One request is answered inside the button's own spinner.
+ */
+const keepCoverOnlyProgress = ref(null);
+/**
+ * The stacks the open dialog is describing, frozen when it opened, so Try again
+ * asks about the same selection.
+ */
+const keepCoverOnlyTargetStackIds = ref([]);
+/**
+ * The requests the confirm sends, from the preview the user read.
  *
  * The confirm must act on exactly what the preview reported. Reading the live
  * selection again at confirm time would let a background refetch, or a stray
  * click behind the scrim, move the target out from under the figures the user
- * agreed to.
+ * agreed to; and each request carries its own preview's moving ids, so the
+ * server refuses one whose plan grew since.
  */
-const keepCoverOnlyTargetStackIds = ref([]);
+let keepCoverOnlyRequests = [];
 // Guards a preview that lands after its dialog was closed or reopened.
 let keepCoverOnlyRunToken = 0;
+// Cancels the preview requests still on the wire when they stop mattering.
+let keepCoverOnlyPreviewAbort = null;
 
 async function openKeepCoverOnly() {
   if (isReadOnly.value || keepCoverOnlyBusy.value) return;
@@ -4509,15 +4528,29 @@ async function openKeepCoverOnly() {
   await loadKeepCoverOnlyPreview();
 }
 
+/** Abandon the preview in flight, if any: its answer would be discarded. */
+function abortKeepCoverOnlyPreview() {
+  keepCoverOnlyPreviewAbort?.abort();
+  keepCoverOnlyPreviewAbort = null;
+}
+
 async function loadKeepCoverOnlyPreview() {
   const stackIds = keepCoverOnlyTargetStackIds.value;
+  if (!stackIds.length) return;
+  abortKeepCoverOnlyPreview();
+  const controller = new AbortController();
+  keepCoverOnlyPreviewAbort = controller;
   keepCoverOnlyPreview.value = null;
-  keepCoverOnlyPreviewFailed.value = false;
+  keepCoverOnlyPreviewError.value = null;
+  keepCoverOnlyRequests = [];
   keepCoverOnlyLoading.value = true;
   const token = ++keepCoverOnlyRunToken;
   try {
-    const report = await previewKeepCoverOnly({ stackIds });
+    const { report, requests } = await previewKeepCoverOnlySelection(stackIds, {
+      signal: controller.signal,
+    });
     if (token !== keepCoverOnlyRunToken) return;
+    keepCoverOnlyRequests = requests;
     keepCoverOnlyPreview.value = report;
   } catch (err) {
     if (token !== keepCoverOnlyRunToken) return;
@@ -4525,49 +4558,81 @@ async function loadKeepCoverOnlyPreview() {
     // zeroes: "nobody could ask" and "there is nothing to collapse" must not
     // look the same.
     console.error(
-      `Keep cover only: the preview for stacks [${stackIds.join(", ")}] could not be read`,
+      `Keep cover only: the preview for ${stackIds.length} stacks [${stackIds.join(", ")}] could not be read`,
       err,
     );
-    keepCoverOnlyPreviewFailed.value = true;
+    keepCoverOnlyPreviewError.value = requestFailure(err);
   } finally {
-    if (token === keepCoverOnlyRunToken) keepCoverOnlyLoading.value = false;
+    if (token === keepCoverOnlyRunToken) {
+      keepCoverOnlyLoading.value = false;
+      keepCoverOnlyPreviewAbort = null;
+    }
   }
 }
 
 function closeKeepCoverOnly() {
   // Bumping the token orphans any preview still in flight, so it cannot write
-  // figures into a dialog the user has already dismissed.
+  // figures into a dialog the user has already dismissed, and the abort stops
+  // the requests it has yet to send. A collapse already running is not
+  // stopped: a sent collapse may commit whether or not anybody waits for it, so
+  // it runs on and its receipt still arrives.
   keepCoverOnlyRunToken += 1;
+  abortKeepCoverOnlyPreview();
   keepCoverOnlyOpen.value = false;
   keepCoverOnlyPreview.value = null;
   keepCoverOnlyLoading.value = false;
-  keepCoverOnlyPreviewFailed.value = false;
+  keepCoverOnlyPreviewError.value = null;
   keepCoverOnlyTargetStackIds.value = [];
+  keepCoverOnlyRequests = [];
+}
+
+/**
+ * Show the copies a collapse moved as ghosts.
+ *
+ * Same treatment as the grid's own delete: the tiles stay ghosted in place
+ * while undo is one click away, and the receipt's clock decides when the grid
+ * closes the gap. `markGhosted` declines in a read-only session, where there is
+ * no undo window at all.
+ *
+ * @param {Object} result - a (merged) collapse result.
+ * @returns {number[]} the ids that moved.
+ */
+function ghostKeepCoverOnlyCopies(result) {
+  const movedIds = Array.isArray(result?.picture_ids_moved)
+    ? result.picture_ids_moved
+    : [];
+  if (movedIds.length && !operationStore.markGhosted(movedIds)) {
+    removeImagesById(movedIds);
+  }
+  return movedIds;
 }
 
 async function runKeepCoverOnly() {
-  const stackIds = keepCoverOnlyTargetStackIds.value;
-  if (!stackIds.length || keepCoverOnlyBusy.value) return;
+  const requests = keepCoverOnlyRequests;
+  if (!requests.length || keepCoverOnlyBusy.value) return;
   keepCoverOnlyBusy.value = true;
+  // One id for the whole gesture, however many requests it takes, so it is
+  // one history step and one Ctrl+Z.
+  const batchId = newOperationBatchId();
   try {
-    const result = await keepCoverOnly({ stackIds });
-    const movedIds = Array.isArray(result?.picture_ids_moved)
-      ? result.picture_ids_moved
-      : [];
-    // Same treatment as the grid's own delete: the tiles stay ghosted in place
-    // while undo is one click away, and the receipt's clock decides when the
-    // grid closes the gap. `markGhosted` declines in a read-only session, where
-    // there is no undo window at all.
-    if (movedIds.length && !operationStore.markGhosted(movedIds)) {
-      removeImagesById(movedIds);
-    }
+    const { result, operations } = await keepCoverOnlySelection(requests, {
+      batchId,
+      onProgress:
+        requests.length > 1
+          ? (progress) => {
+              keepCoverOnlyProgress.value = progress;
+            }
+          : undefined,
+    });
+    ghostKeepCoverOnlyCopies(result);
     selectedImageIds.value = [];
     lastSelectedImageId.value = null;
-    // What the run deliberately left alone rides the SAME pill as what it did,
-    // as a second sentence, rather than a notice competing with it.
+    // What the gesture did in all, and what it deliberately left alone, ride
+    // the SAME pill as the step it names, as a second sentence, rather than a
+    // notice competing with it.
     operationStore.noteNextReceipt(
       KEEP_COVER_ONLY_OP_TYPE,
-      keepCoverOnlySkipNote(result),
+      keepCoverOnlyReceiptNote(result, operations),
     );
     // Raises "Kept the cover of N stacks · M pictures to the Scrapheap · Undo".
     operationStore.refresh();
@@ -4581,20 +4646,91 @@ async function runKeepCoverOnly() {
     // THIS tab as well as any other and routes to `refreshStackFacets`
     // (useGridRealtimeSync's stack-facet branch). One mechanism, so the undo
     // and a second tab converge through exactly the same path.
-    keepCoverOnlyOpen.value = false;
-    keepCoverOnlyPreview.value = null;
-    keepCoverOnlyTargetStackIds.value = [];
+    closeKeepCoverOnly();
   } catch (err) {
-    console.error(
-      `Keep cover only failed for stacks [${stackIds.join(", ")}]`,
-      err,
-    );
+    reportKeepCoverOnlyFailure(err, requests);
+  } finally {
+    keepCoverOnlyBusy.value = false;
+    keepCoverOnlyProgress.value = null;
+  }
+}
+
+/**
+ * Settle the grid after a collapse that did not finish, and say so.
+ *
+ * Three cases, because each leaves the library in a different state:
+ *
+ *   * nothing done and the server said why: nothing changed, so the dialog
+ *     stays open on the same preview. A 409 is the server's "preview again"
+ *     (the plan grew since the user read it), so the preview is re-read and
+ *     the new figure is what a second confirm acts on;
+ *   * some requests done, then a refusal: those are real, in the history and
+ *     one Ctrl+Z away, so their copies are ghosted, their stacks leave the
+ *     selection and the rest stay selected to run again;
+ *   * the answer was lost: the failed request may have committed, so the grid
+ *     is re-read rather than trusted, at the cost of the ghosts.
+ *
+ * @param {*} err - `KeepCoverOnlyIncompleteError`, or anything the walk threw
+ *   before sending a request.
+ * @param {Array<{stackIds: number[]}>} requests - what was being sent.
+ */
+function reportKeepCoverOnlyFailure(err, requests) {
+  const stackIds = requests.flatMap((request) => request.stackIds);
+  console.error(
+    `Keep cover only failed for ${stackIds.length} stacks [${stackIds.join(", ")}]`,
+    err,
+  );
+  if (!(err instanceof KeepCoverOnlyIncompleteError)) {
     noticeStore.error(`Couldn't collapse those stacks. ${errorDetail(err)}`, {
       key: "keep-cover-only",
     });
-  } finally {
-    keepCoverOnlyBusy.value = false;
+    return;
   }
+  const { result, stacksDone, stacksTotal, operations, outcomeUnknown } = err;
+  const failure = requestFailure(err.cause);
+  const message = keepCoverOnlyIncompleteMessage({
+    stacksDone,
+    stacksTotal,
+    detail: failure.detail,
+    outcomeUnknown,
+  });
+  if (stacksDone === 0 && !outcomeUnknown) {
+    noticeStore.error(message, { key: "keep-cover-only" });
+    if (failure.kind === "conflict" && keepCoverOnlyOpen.value) {
+      loadKeepCoverOnlyPreview();
+    }
+    return;
+  }
+  // Something committed, or may have.
+  const movedIds = ghostKeepCoverOnlyCopies(result);
+  const settled = new Set(
+    [
+      ...movedIds,
+      ...(Array.isArray(result.cover_picture_ids) ? result.cover_picture_ids : []),
+    ].map(String),
+  );
+  selectedImageIds.value = selectedImageIds.value.filter(
+    (id) => !settled.has(String(id)),
+  );
+  if (settled.has(String(lastSelectedImageId.value))) {
+    lastSelectedImageId.value = null;
+  }
+  // The receipt's totals are only claimed when every answer arrived: after a
+  // lost one, the newest step's own figures are the only true ones.
+  if (!outcomeUnknown) {
+    operationStore.noteNextReceipt(
+      KEEP_COVER_ONLY_OP_TYPE,
+      keepCoverOnlyReceiptNote(result, operations),
+    );
+  }
+  operationStore.refresh();
+  emit("refresh-sidebar");
+  if (outcomeUnknown) {
+    preserveScrollOnNextFetch.value = true;
+    debouncedFetchAllGridImages();
+  }
+  closeKeepCoverOnly();
+  noticeStore.error(message, { key: "keep-cover-only" });
 }
 
 // ── Rotate in place ─────────────────────────────────────────────────────────
