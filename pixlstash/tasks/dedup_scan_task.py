@@ -10,18 +10,23 @@ banner. This task is what makes that true.
   and persisted page by page, one short writer slice each (see
   :func:`~pixlstash.services.dedup_tier_service.page_exact_keys`), so imports
   and edits interleave with a large scan and the queue fills while it runs.
+  Every page also publishes how many pictures are settled so far
+  (:meth:`DedupScanTask._exact_progress_read`).
 * **Tier 2** iterates the candidate buckets built by
   :func:`~pixlstash.services.dedup_tier_service.build_near_buckets`, persisting
   and committing after **each bucket**. A bucket's groups are visible in the
   queue the moment that bucket finishes, and the scan's ``scanned_buckets``
-  counter advances with it.
+  counter advances with it. Building the buckets reads the whole scope, so it
+  too runs on a reader.
 * **Tier 3** appends the embedding groups last, because it is the tier whose
   input (the likeness edge table) is the one that may still be filling.
 
 The task is driven by a :class:`~pixlstash.db_models.dedup.DedupScan` row, which
-is both the request (status ``pending``) and the progress readout. Restarting a
-scan is safe: group persistence upserts on the signature, so a re-run refreshes
-rows rather than duplicating them.
+is both the request (status ``pending``) and the progress readout. The row's
+``phase`` names the tier running, since each tier counts on its own scale:
+pictures, buckets, or nothing it can count. Restarting a scan is safe: group
+persistence upserts on the signature, so a re-run refreshes rows rather than
+duplicating them.
 """
 
 import json
@@ -108,7 +113,7 @@ class DedupScanTask(BaseTask):
             }
             exact_found = self._run_exact_tier(
                 scope,
-                total_pictures if not policy.near_enabled else None,
+                total_pictures,
                 signatures_by_tier[DedupTier.EXACT.value],
             )
             found = exact_found
@@ -122,10 +127,19 @@ class DedupScanTask(BaseTask):
             self._set_task_progress(1, total_phases)
 
             if policy.near_enabled:
-                buckets = self._run_low_slice(
-                    DedupScanTask._prepare_near_slice,
+                # The tier is published before its buckets are built: that read
+                # covers the whole scope, and until it returns the banner has
+                # no bucket total to count against.
+                self._run_low_slice(
+                    DedupScanTask._begin_phase_slice,
                     self._scan_id,
-                    scope,
+                    DedupTier.NEAR.value,
+                )
+                buckets = self._run_read_slice(DedupScanTask._near_buckets_read, scope)
+                self._run_low_slice(
+                    DedupScanTask._publish_bucket_total_slice,
+                    self._scan_id,
+                    len(buckets),
                 )
                 # exact setup + near setup + one phase per bucket + optional
                 # embedding + finalisation. With zero buckets this still leaves
@@ -166,9 +180,13 @@ class DedupScanTask(BaseTask):
                     self._set_task_progress(2 + index, total_phases)
 
             if policy.embedding_enabled:
-                in_scope = self._run_low_slice(
-                    DedupScanTask._embedding_scope_slice,
-                    scope,
+                self._run_low_slice(
+                    DedupScanTask._begin_phase_slice,
+                    self._scan_id,
+                    DedupTier.EMBEDDING.value,
+                )
+                in_scope = self._run_read_slice(
+                    DedupScanTask._embedding_scope_read, scope
                 )
                 forest = dedup_tier_service.dedup_sweep_service._LikenessForest()
                 cursor = (-1, -1)
@@ -292,27 +310,33 @@ class DedupScanTask(BaseTask):
     def _run_exact_tier(
         self,
         scope: DedupScope,
-        scanned_when_done: Optional[int],
+        total_pictures: int,
         signatures: set[str],
     ) -> int:
-        """Run tier 1: one key read off the writer, then one slice per page.
+        """Run tier 1: key and progress reads off the writer, a slice per page.
 
         Adds each persisted signature to *signatures* and returns the number of
-        unresolved exact groups. *scanned_when_done*, when given, is published as
-        ``scanned_pictures`` by the last page (an exact-only scan has then seen
-        every picture).
+        unresolved exact groups. Every page publishes the pictures settled so
+        far as ``scanned_pictures``, and the last one *total_pictures*.
         """
         keys = self._run_read_slice(DedupScanTask._exact_keys_read, scope)
         pages = dedup_tier_service.page_exact_keys(keys)
+        scanned_after = (
+            self._run_read_slice(
+                DedupScanTask._exact_progress_read, scope, pages, total_pictures
+            )
+            if pages
+            else []
+        )
         found = 0
-        for index, page in enumerate(pages, start=1):
+        for page, scanned_pictures in zip(pages, scanned_after, strict=True):
             persisted = self._run_low_slice(
                 DedupScanTask._persist_exact_page_slice,
                 self._scan_id,
                 page,
                 scope,
                 found,
-                scanned_when_done if index == len(pages) else None,
+                scanned_pictures,
             )
             found += int(persisted["unresolved"])
             signatures.update(persisted["signatures"])
@@ -356,6 +380,7 @@ class DedupScanTask(BaseTask):
             )
             return
         scan.status = SCAN_FAILED
+        scan.phase = None
         scan.error = error[:2000]
         scan.updated_at = datetime.now(timezone.utc)
         session.add(scan)
@@ -376,6 +401,7 @@ class DedupScanTask(BaseTask):
         if scan.status in (SCAN_COMPLETE, SCAN_PARTIAL):
             return
         scan.status = SCAN_PENDING
+        scan.phase = None
         scan.error = None
         scan.finished_at = None
         scan.updated_at = datetime.now(timezone.utc)
@@ -383,11 +409,24 @@ class DedupScanTask(BaseTask):
         session.commit()
 
     @staticmethod
-    def _count_live_pictures(session: Session, scope: DedupScope) -> int:
-        """Count the live pictures in *scope* without loading their ids."""
+    def _count_live_pictures(
+        session: Session,
+        scope: DedupScope,
+        id_from: Optional[int] = None,
+        id_below: Optional[int] = None,
+    ) -> int:
+        """Count the live pictures in *scope* without loading their ids.
+
+        *id_from* and *id_below*, when given, bound the count to the half-open
+        id range ``[id_from, id_below)``, a range read on the primary key.
+        """
         total_query = (
             select(func.count()).select_from(Picture).where(Picture.deleted.is_(False))
         )
+        if id_from is not None:
+            total_query = total_query.where(Picture.id >= id_from)
+        if id_below is not None:
+            total_query = total_query.where(Picture.id < id_below)
         predicate = scope.picture_predicate()
         if predicate is not None:
             total_query = total_query.where(predicate)
@@ -410,6 +449,7 @@ class DedupScanTask(BaseTask):
         total_pictures = DedupScanTask._count_live_pictures(session, scope)
 
         scan.status = SCAN_RUNNING
+        scan.phase = DedupTier.EXACT.value
         scan.total_pictures = total_pictures
         scan.scanned_pictures = 0
         scan.scanned_buckets = 0
@@ -435,15 +475,51 @@ class DedupScanTask(BaseTask):
         return dedup_tier_service.find_exact_keys_in_session(session, scope)
 
     @staticmethod
+    def _exact_progress_read(
+        session: Session,
+        scope: DedupScope,
+        pages: list[list[dedup_tier_service.ExactKey]],
+        total_pictures: int,
+    ) -> list[int]:
+        """Reader step: the ``scanned_pictures`` each exact page publishes.
+
+        The keys come ordered by their lowest picture id
+        (:attr:`~pixlstash.services.dedup_tier_service.ExactKey.first_id`), so
+        once a page is persisted every live picture below the next page's first
+        key is settled: it carries a key already persisted, or it has no exact
+        duplicate at all. Those pictures are counted as the id range between
+        one frontier and the next, a single pass over the scope for the whole
+        list rather than one per page. The last page publishes the whole scope.
+
+        Capped at *total_pictures*, the count taken when the scan started, so a
+        picture imported since cannot carry the count past the total.
+        """
+        published: list[int] = []
+        settled = 0
+        id_from: Optional[int] = None
+        for page in pages[1:]:
+            id_below = int(page[0].first_id)
+            settled += DedupScanTask._count_live_pictures(
+                session, scope, id_from, id_below
+            )
+            published.append(min(settled, total_pictures))
+            id_from = id_below
+        if pages:
+            published.append(total_pictures)
+        return published
+
+    @staticmethod
     def _persist_exact_page_slice(
         session: Session,
         scan_id: int,
         keys: list[dedup_tier_service.ExactKey],
         scope: DedupScope,
         found_before: int,
-        scanned_pictures: Optional[int],
+        scanned_pictures: int,
     ) -> dict:
-        """Build and persist one page of exact groups and publish the count.
+        """Build and persist one page of exact groups and publish the counts.
+
+        *scanned_pictures* is the page's entry from :meth:`_exact_progress_read`.
 
         The page's members are re-read from the pictures as they are now,
         through ``ix_picture_pixel_sha``. The read returns every row whose
@@ -463,8 +539,7 @@ class DedupScanTask(BaseTask):
         if scan is None:
             raise ValueError(f"DedupScan {scan_id} no longer exists")
         scan.groups_found = found_before + unresolved
-        if scanned_pictures is not None:
-            scan.scanned_pictures = scanned_pictures
+        scan.scanned_pictures = scanned_pictures
         scan.updated_at = datetime.now(timezone.utc)
         session.add(scan)
         session.commit()
@@ -474,19 +549,42 @@ class DedupScanTask(BaseTask):
         }
 
     @staticmethod
-    def _prepare_near_slice(
-        session: Session, scan_id: int, scope: DedupScope
-    ) -> list[dedup_tier_service.NearBucket]:
-        """Build bounded candidate buckets and publish their total."""
-        buckets = dedup_tier_service.build_near_buckets(session, scope)
+    def _begin_phase_slice(session: Session, scan_id: int, phase: str) -> None:
+        """Publish that the scan has moved on to tier *phase*, counters at zero.
+
+        Each tier counts on its own scale, so the counts the previous tier left
+        behind are cleared rather than read as this tier's progress.
+        """
         scan = session.get(DedupScan, scan_id)
         if scan is None:
             raise ValueError(f"DedupScan {scan_id} no longer exists")
-        scan.total_buckets = len(buckets)
+        scan.phase = phase
+        scan.scanned_pictures = 0
+        scan.scanned_buckets = 0
+        scan.total_buckets = 0
         scan.updated_at = datetime.now(timezone.utc)
         session.add(scan)
         session.commit()
-        return buckets
+
+    @staticmethod
+    def _near_buckets_read(
+        session: Session, scope: DedupScope
+    ) -> list[dedup_tier_service.NearBucket]:
+        """Reader step: the scope's bounded tier-2 candidate buckets."""
+        return dedup_tier_service.build_near_buckets(session, scope)
+
+    @staticmethod
+    def _publish_bucket_total_slice(
+        session: Session, scan_id: int, total_buckets: int
+    ) -> None:
+        """Publish how many candidate buckets the near tier will compare."""
+        scan = session.get(DedupScan, scan_id)
+        if scan is None:
+            raise ValueError(f"DedupScan {scan_id} no longer exists")
+        scan.total_buckets = total_buckets
+        scan.updated_at = datetime.now(timezone.utc)
+        session.add(scan)
+        session.commit()
 
     @staticmethod
     def _run_near_bucket_slice(
@@ -578,10 +676,10 @@ class DedupScanTask(BaseTask):
         }
 
     @staticmethod
-    def _embedding_scope_slice(
+    def _embedding_scope_read(
         session: Session, scope: DedupScope
     ) -> Optional[set[int]]:
-        """Return a plain live-id filter for a scoped embedding scan."""
+        """Reader step: a plain live-id filter for a scoped embedding scan."""
         predicate = scope.picture_predicate()
         if predicate is None:
             return None
@@ -690,6 +788,7 @@ class DedupScanTask(BaseTask):
             )
         unique_reasons = list(dict.fromkeys(partial_reasons))
         scan.status = SCAN_PARTIAL if unique_reasons else SCAN_COMPLETE
+        scan.phase = None
         scan.error = "; ".join(unique_reasons)[:2000] if unique_reasons else None
         scan.scanned_pictures = total_pictures
         scan.groups_found = found
@@ -731,22 +830,24 @@ class DedupScanTask(BaseTask):
         # in one session.
         keys = dedup_tier_service.find_exact_keys_in_session(session, scope)
         pages = dedup_tier_service.page_exact_keys(keys)
-        for index, page in enumerate(pages, start=1):
+        scanned_after = DedupScanTask._exact_progress_read(
+            session, scope, pages, total_pictures
+        )
+        for page, scanned_pictures in zip(pages, scanned_after, strict=True):
             persisted = DedupScanTask._persist_exact_page_slice(
                 session,
                 scan_id,
                 page,
                 scope,
                 found,
-                total_pictures
-                if not policy.near_enabled and index == len(pages)
-                else None,
+                scanned_pictures,
             )
             found += int(persisted["unresolved"])
             signatures_by_tier[DedupTier.EXACT.value].update(persisted["signatures"])
 
         # --- Tier 2: bucketed near, one commit per bucket.
         if policy.near_enabled:
+            DedupScanTask._begin_phase_slice(session, scan_id, DedupTier.NEAR.value)
             buckets = dedup_tier_service.build_near_buckets(session, scope)
             if any(bucket.oversized for bucket in buckets):
                 incomplete_tiers.add(DedupTier.NEAR.value)
@@ -754,11 +855,7 @@ class DedupScanTask(BaseTask):
                     "near scan used overlapping shards for oversized buckets; "
                     "cross-shard comparisons are incomplete"
                 )
-            scan = session.get(DedupScan, scan_id)
-            scan.total_buckets = len(buckets)
-            scan.updated_at = datetime.now(timezone.utc)
-            session.add(scan)
-            session.commit()
+            DedupScanTask._publish_bucket_total_slice(session, scan_id, len(buckets))
 
             seen_pictures: set[int] = set()
             # Pairs are kept across buckets so a chain spanning two buckets folds
@@ -856,6 +953,9 @@ class DedupScanTask(BaseTask):
 
         # --- Tier 3: embedding, appended to the same queue.
         if policy.embedding_enabled:
+            DedupScanTask._begin_phase_slice(
+                session, scan_id, DedupTier.EMBEDDING.value
+            )
             embedding_groups = dedup_tier_service.find_embedding_groups_in_session(
                 session, policy, scope
             )

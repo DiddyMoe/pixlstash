@@ -2492,7 +2492,9 @@ Selected milestones:
 
 | 0150 | `dedupautostackrun`: one row per background auto-stack run or revert of one, its counters and the History segments it recorded (§22.13). Additive: a new table, created only when absent, with no `NULL` reset. |
 
-Current head: `0150_add_dedup_auto_stack_run`.
+| 0151 | `dedupscan.phase`: the tier a running duplicate scan is in, so the banner knows which scale its counters are on (§22.8). Additive and nullable, no `NULL` reset: no scan runs across an upgrade, and a resumed one sets it when it starts. |
+
+Current head: `0151_add_dedup_scan_phase`.
 
 ### 12.1 Two revisions numbered 0086, and why the chain was spliced
 
@@ -7272,7 +7274,8 @@ would make the deck an N+1 on the one query the queue page is measured by
 ### 22.6 Persistence: five tables
 
 `pixlstash/db_models/dedup.py`, migration `0088_add_dedup_tier_tables`
-(`dedupautostackrun`: `0150_add_dedup_auto_stack_run`):
+(`dedupautostackrun`: `0150_add_dedup_auto_stack_run`; `dedupscan.phase`:
+`0151_add_dedup_scan_phase`):
 
 - **`dedupgroup` / `dedupgroupmember`** — the found-groups cache. Detection
   *upserts on `signature`*, so a rescan refreshes rows instead of duplicating
@@ -7321,7 +7324,9 @@ would make the deck an N+1 on the one query the queue page is measured by
   rather than on what the user saw. Pinned by
   `test_two_groups_sharing_a_digest_but_not_a_size_stay_distinct`.
 - **`dedupscan`** — one row per scope key, both the scan *request* (status
-  `pending`) and the "scanned N of M" progress readout.
+  `pending`) and the "scanned N of M" progress readout. `phase` names the tier
+  a `running` scan is in and is null otherwise; the counters are that tier's
+  own (§22.8).
 - **`dedupautostackrun`** — one row per auto-stack run or revert of one, the
   same request-and-readout shape as `dedupscan`: the start route writes it
   `pending`, the task keeps its counters current, and it lists the History
@@ -7449,9 +7454,11 @@ thread for the entire scan: the callback did not return between buckets. A
 12,098-picture scan held it for 104 seconds, starving grid reads queued behind it.
 `DedupScanTask` now submits bounded work as separate `DBPriority.LOW` callbacks:
 scan start (prune, a `SELECT count(*)` of the scope, mark running), one tier-1
-page at a time, bucket construction, one capped near bucket at a time,
-keyset-paged embedding edges, bounded embedding-component persistence, and final
-status. Only plain Python ids, keys, cursors, buckets, pairs and policy values
+page at a time, the start of each later tier, the near tier's bucket total, one
+capped near bucket at a time, keyset-paged embedding edges, bounded
+embedding-component persistence, and final status. The whole-scope reads
+(tier 1's key discovery and its progress frontiers, near bucket construction,
+the embedding tier's scope) run on readers instead, below. Only plain Python ids, keys, cursors, buckets, pairs and policy values
 survive between callbacks; no ORM row or `Session` crosses the boundary. An
 interactive callback already in the queue therefore runs before the next LOW
 scan slice. Shutdown uses the same boundary: `DedupScanTask.on_cancel()` records
@@ -7486,6 +7493,35 @@ checkpoint cannot pass its snapshot. Pinned by
 `test_the_exact_tier_holds_the_writer_one_page_at_a_time`,
 `test_each_exact_page_is_built_from_the_pictures_as_they_are_now` and
 `test_a_reader_step_honours_a_cancel_on_either_side`.
+
+**Progress is reported per tier, on each tier's own scale.** `dedupscan.phase`
+names the tier running (`exact`, `near`, `embedding`; null outside `running`),
+and `_begin_phase_slice` zeroes the counters when a later tier starts, so a
+count is never read on the previous tier's scale:
+
+- **`exact` counts pictures, after every page.** `find_exact_keys_in_session`
+  returns each key with `first_id`, the lowest live picture id carrying it,
+  which is the order the keys come back in. Once a page is persisted, every
+  live picture below the next page's first key is settled: it carries a key
+  already persisted, or it has no exact duplicate. `_exact_progress_read` counts
+  those as id ranges between consecutive frontiers, one reader pass over the
+  scope for the whole page list, capped at the start-of-scan total; each page's
+  writer slice publishes its entry, and the last page publishes the total.
+  Before this the count was written only by the last page, so a large
+  exact-only scan read "0 of N" until it finished.
+- **`near` counts candidate buckets, once they exist.** Building them is a full
+  read of the scope (`_near_buckets_read`, on a reader); `total_buckets` stays
+  0 until it returns, and the banner shows an unmeasured meter rather than 0%.
+- **`embedding` has no counter.** Its edges are keyset-paged without a total,
+  so it reports none rather than invent one.
+
+The banner derives the percentage and the "step N of M" label from `phase`
+(`useDedupStore.normalizeScan`, frontend architecture); the server sends no
+percentage and no time estimate. A failed, cancelled or re-requested scan
+clears `phase`, because the row is reused across rescans. Pinned by
+`test_every_tier_publishes_its_own_progress_as_it_runs`,
+`test_the_synchronous_scan_publishes_the_same_progress` and the phase
+assertions in `test_failed_and_cancelled_rescans_preserve_prior_complete_evidence`.
 
 **Retirement is chosen on a reader and applied under a guard.** When a scan
 completes, `_obsolete_groups_read` picks, on a reader, the ids of groups this

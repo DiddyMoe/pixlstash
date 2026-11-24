@@ -231,11 +231,14 @@ const IDLE_SCAN = Object.freeze({
   scanId: null,
   scopeKey: null,
   status: "idle",
+  phase: null,
+  step: null,
   tiers: [],
   threshold: null,
   scanned: 0,
   total: 0,
   percent: 100,
+  measured: true,
   buckets: 0,
   totalBuckets: 0,
   groupsFound: 0,
@@ -262,10 +265,17 @@ export function scopeKey(type, id) {
 /**
  * Normalise a `ScanProgressModel` into what the banner renders.
  *
- * The server reports pictures and buckets but no percentage and no estimate, so
- * the percentage is derived here. Tier 2 streams its groups in per bucket, so a
- * scope whose picture total is not yet known still shows honest progress from
- * the bucket counters rather than sitting at zero.
+ * The server names the tier a running scan is in (`phase`) and reports that
+ * tier's own counters, but no percentage and no estimate, so the percentage is
+ * derived here, per tier: the exact tier counts pictures, the near tier counts
+ * candidate batches once it has built them, and the embedding tier has no
+ * counter at all. Each tier starts its counters again from zero, which is why
+ * `step` travels with them: a bar that restarts needs to say it is on a new
+ * step, or it reads as progress going backwards.
+ *
+ * `measured` says whether `percent` is a measurement. When it is not, the
+ * banner shows an indeterminate meter instead of a 0% it does not know to be
+ * true.
  *
  * @param {Object} [raw] - a `ScanProgressModel`.
  * @returns {Object}
@@ -273,29 +283,47 @@ export function scopeKey(type, id) {
 function normalizeScan(raw) {
   if (!raw) return { ...IDLE_SCAN };
   const status = raw.status || "idle";
+  const phase = typeof raw.phase === "string" && raw.phase ? raw.phase : null;
+  const tiers = Array.isArray(raw.tiers) ? [...raw.tiers] : [];
   const scanned = Number(raw.scanned_pictures) || 0;
   const total = Number(raw.total_pictures) || 0;
   const buckets = Number(raw.scanned_buckets) || 0;
   const totalBuckets = Number(raw.total_buckets) || 0;
-  // Status is the terminal truth. A fresh pending/running scan has no totals
-  // yet, which means "unknown", not "100%". Near scans can finish their
-  // picture enumeration before their candidate batches, so once the backend
-  // publishes bucket counters those are the authoritative progress slice.
-  let percent = RUNNING_STATUSES.has(status) ? 0 : 100;
-  if (totalBuckets > 0)
-    percent = Math.round((buckets / totalBuckets) * 100);
-  else if (total > 0) percent = Math.round((scanned / total) * 100);
+  // Status is the terminal truth: a finished scan is 100% whatever its
+  // counters say, and a pending one has measured nothing yet.
+  let measured = !RUNNING_STATUSES.has(status);
+  let percent = measured ? 100 : 0;
+  if (status === "running") {
+    if (phase === "exact" && total > 0) {
+      measured = true;
+      percent = Math.round((scanned / total) * 100);
+    } else if (phase === "near" && totalBuckets > 0) {
+      measured = true;
+      percent = Math.round((buckets / totalBuckets) * 100);
+    }
+  }
+  const stepIndex = phase ? tiers.indexOf(phase) : -1;
   return {
     scanId: raw.scan_id ?? null,
     scopeKey: raw.scope_key ?? null,
     status,
-    tiers: Array.isArray(raw.tiers) ? [...raw.tiers] : [],
+    phase,
+    step:
+      stepIndex >= 0
+        ? {
+            number: stepIndex + 1,
+            of: tiers.length,
+            label: TIER_LABELS[phase]?.label ?? phase,
+          }
+        : null,
+    tiers,
     threshold: Number.isFinite(Number(raw.threshold))
       ? Number(raw.threshold)
       : null,
     scanned,
     total,
     percent: Math.max(0, Math.min(100, percent)),
+    measured,
     buckets,
     totalBuckets,
     groupsFound: Number(raw.groups_found) || 0,

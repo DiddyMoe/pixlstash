@@ -295,6 +295,8 @@ describe("useDedupStore - loading the queue", () => {
     servePage([group("g1")], {
       scan: {
         status: "running",
+        phase: "exact",
+        tiers: ["exact"],
         scanned_pictures: 6200,
         total_pictures: 12400,
       },
@@ -308,28 +310,131 @@ describe("useDedupStore - loading the queue", () => {
   // The server reports pictures and buckets but never a percentage.
   it("derives the percentage the server does not send", async () => {
     servePage([], {
-      scan: { status: "running", scanned_pictures: 1, total_pictures: 4 },
+      scan: {
+        status: "running",
+        phase: "exact",
+        tiers: ["exact"],
+        scanned_pictures: 1,
+        total_pictures: 4,
+      },
     });
     const store = useDedupStore();
     await store.loadFirstPage();
-    expect(store.scan.percent).toBe(25);
+    expect(store.scan).toMatchObject({ percent: 25, measured: true });
   });
 
-  // Tier 2 streams groups in per candidate bucket, so a scope whose picture
-  // total is not known yet still has honest progress to report.
-  it("falls back to bucket progress when no picture total is known", async () => {
+  // Tier 2 streams groups in per candidate bucket, so its progress is the
+  // bucket counter, whatever the picture counter says.
+  it("counts candidate batches during the near tier", async () => {
     servePage([], {
       scan: {
         status: "running",
+        phase: "near",
+        tiers: ["exact", "near"],
         scanned_pictures: 0,
-        total_pictures: 0,
+        total_pictures: 40,
         scanned_buckets: 3,
         total_buckets: 12,
       },
     });
     const store = useDedupStore();
     await store.loadFirstPage();
-    expect(store.scan.percent).toBe(25);
+    expect(store.scan).toMatchObject({ percent: 25, measured: true });
+  });
+
+  // Each tier owns its counters, so a figure is only a measurement when it is
+  // the running tier's own. The exact tier leaves its finished picture count
+  // behind when the near tier starts, and before the near tier has built its
+  // batches that count would read as a full bar.
+  it.each([
+    [
+      "the near tier before its batches exist",
+      { phase: "near", scanned_pictures: 40, total_buckets: 0 },
+    ],
+    [
+      "the embedding tier, which has no counter",
+      { phase: "embedding", scanned_pictures: 40, scanned_buckets: 9 },
+    ],
+    // A row a server left running before it recorded the tier keeps whatever
+    // counters that tier had reached, on a scale nobody can name.
+    [
+      "a running scan whose tier is not known yet",
+      { phase: null, scanned_pictures: 40, total_buckets: 12 },
+    ],
+  ])("reports %s as unmeasured rather than as a figure", async (_, fields) => {
+    servePage([], {
+      scan: {
+        status: "running",
+        tiers: ["exact", "near", "embedding"],
+        total_pictures: 40,
+        scanned_buckets: 9,
+        total_buckets: 0,
+        ...fields,
+      },
+    });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    expect(store.scan).toMatchObject({ percent: 0, measured: false });
+  });
+
+  // The counters restart at every tier, so the banner needs the step to say
+  // the restarted bar is a new step rather than progress going backwards.
+  it.each([
+    ["exact", { number: 1, of: 3, label: "Exact matches" }],
+    ["near", { number: 2, of: 3, label: "Near-identical" }],
+    ["embedding", { number: 3, of: 3, label: "Same scene" }],
+  ])("names the %s tier as its step of the scan", async (phase, step) => {
+    servePage([], {
+      scan: {
+        status: "running",
+        phase,
+        tiers: ["exact", "near", "embedding"],
+        total_pictures: 40,
+      },
+    });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    expect(store.scan.phase).toBe(phase);
+    expect(store.scan.step).toEqual(step);
+  });
+
+  it("reports a finished scan as a measured whole with no step", async () => {
+    servePage([], {
+      scan: {
+        status: "complete",
+        phase: null,
+        tiers: ["exact", "near"],
+        scanned_pictures: 0,
+        total_pictures: 40,
+      },
+    });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    expect(store.scan).toMatchObject({
+      percent: 100,
+      measured: true,
+      phase: null,
+      step: null,
+    });
+  });
+
+  // Status is the terminal truth: a finished scan's counters are not read,
+  // even on a row that still names the tier it ended in.
+  it("reads a finished scan as whole whatever tier its row names", async () => {
+    servePage([], {
+      scan: {
+        status: "complete",
+        phase: "near",
+        tiers: ["exact", "near"],
+        scanned_pictures: 0,
+        total_pictures: 40,
+        scanned_buckets: 3,
+        total_buckets: 12,
+      },
+    });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    expect(store.scan).toMatchObject({ percent: 100, measured: true });
   });
 
   it("reports an empty queue rather than a stale focus", async () => {
@@ -2666,7 +2771,11 @@ describe("useDedupStore - scans and bulk auto-stack", () => {
       expect(listGroups).toHaveBeenCalledWith(
         expect.objectContaining({ scopeType: "character", scopeId: 7 }),
       );
-      expect(store.scan).toMatchObject({ status: "pending", percent: 0 });
+      expect(store.scan).toMatchObject({
+        status: "pending",
+        percent: 0,
+        measured: false,
+      });
       expect(store.isScanning).toBe(true);
       expect(startScan).not.toHaveBeenCalled();
       store.stopScanPoll();
@@ -2680,7 +2789,8 @@ describe("useDedupStore - scans and bulk auto-stack", () => {
     try {
       const running = {
         status: "running",
-        tiers: ["exact"],
+        phase: "near",
+        tiers: ["exact", "near"],
         threshold: 0.9,
         scanned_pictures: 3,
         total_pictures: 3,

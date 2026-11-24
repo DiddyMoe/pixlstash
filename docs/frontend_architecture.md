@@ -8182,6 +8182,19 @@ Three rules from the design are load-bearing and are easy to break by accident:
 - **Never block on a full pass.** `listQueue` returns whatever has been found
   plus the scan's progress, so the view renders a partial queue with a streaming
   banner. There is no state in which a user waits on a complete scan.
+
+  **The banner states only what it measured.** The progress carries `phase`,
+  the tier running, and that tier's own counters, which restart at zero with
+  each tier (backend §22.8). `useDedupStore.normalizeScan` turns them into
+  `percent`, `measured` and `step`: the exact tier is measured in pictures, the
+  near tier in candidate batches once they exist, and the embedding tier not at
+  all. `DedupScanBanner` draws a filled meter with its percentage when
+  `measured`, and otherwise the sliding indeterminate segment (the
+  `ProgressOverlay` recipe, parked under reduced motion) with a line naming
+  what is happening, never "0 of N" or 0%. A scan running more than one tier
+  says "Exact matches, step 1 of 2 · 40%", so a meter that restarts for the
+  next tier reads as a new step rather than progress going backwards; a
+  single-tier scan has no step text. There is no time estimate.
 - **Never render the queue whole.** Groups are paged by confidence descending,
   the row list is windowed around the focus, and only the focused row and the
   one after it decode real thumbnails (the next group is prefetched into the

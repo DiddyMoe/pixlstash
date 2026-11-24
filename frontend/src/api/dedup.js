@@ -317,8 +317,9 @@ export async function getCounts({ policy, scopes = [] } = {}) {
  * @param {string} [options.scopeType=GLOBAL_SCOPE]
  * @param {number|string} [options.scopeId]
  * @returns {Promise<Object>} the response body:
- *   `{ status, scanned_pictures, total_pictures, scanned_buckets,
- *   total_buckets, groups_found, error }`.
+ *   `{ status, phase, scanned_pictures, total_pictures, scanned_buckets,
+ *   total_buckets, groups_found, error }`. `phase` names the tier a running
+ *   scan is in, and the counters are that tier's own.
  */
 export async function startScan({
   policy,

@@ -179,13 +179,18 @@ Shapes and rules the frontend depends on:
   renders as the red x; the client orders counter-evidence first, because a
   collapsed row only has room for two pills and the warning is the half that
   matters.
-- **`scan` is `{ status, scanned_pictures, total_pictures, scanned_buckets,
-  total_buckets, groups_found, error }`** and rides on the queue, the counts and
-  the scan trigger, so any of the three can feed the progress banner. `status`
-  is `idle | pending | running | complete | failed`. There is **no percentage
-  and no time estimate**: the client derives the percentage from pictures, or
-  from buckets when no picture total is known yet, and deliberately shows no
-  "N min left" rather than inventing one.
+- **`scan` is `{ status, phase, scanned_pictures, total_pictures,
+  scanned_buckets, total_buckets, groups_found, error }`** and rides on the
+  queue, the counts and the scan trigger, so any of the three can feed the
+  progress banner. `status` is `idle | pending | running | complete | partial |
+  failed`. **`phase` names the tier a `running` scan is in** (`exact | near |
+  embedding`, null otherwise), and the counters are that tier's own, reset to
+  zero as each tier starts: `exact` reports pictures settled, after every page;
+  `near` reports buckets, with `total_buckets` 0 until they are built;
+  `embedding` reports no counter. There is **no percentage and no time
+  estimate**: the client derives the percentage from the running tier's
+  counter, shows an indeterminate meter when that tier has nothing to count
+  against, and deliberately shows no "N min left" rather than inventing one.
 - **Scope is `(scope_type, scope_id)`** with `scope_type` one of
   `global | project | set | character | folder`, published in
   `bounds.scope_types`. The whole vault is `global` and takes no id; every other
@@ -3288,7 +3293,8 @@ into the list's tail); the server never invents a stamp for them.
   "cursor": null,                    // echo of the cursor this page was read from
   "next_cursor": "MXwxfDQy",         // pass back as ?cursor=; null at end-of-found
   "policy": { … }, "scope": { "scope_type": "global", "scope_id": null, "key": "global" },
-  "scan": { "status": "running", "scanned_pictures": 79412, "total_pictures": 112000,
+  "scan": { "status": "running", "phase": "near",
+            "scanned_pictures": 21040, "total_pictures": 112000,
             "scanned_buckets": 210, "total_buckets": 940, "groups_found": 128,
             "error": null }
 }

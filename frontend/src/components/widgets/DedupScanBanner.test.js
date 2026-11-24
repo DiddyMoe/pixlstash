@@ -16,14 +16,25 @@ const globalOpts = { global: { stubs: { "v-icon": true } } };
 function scan(overrides = {}) {
   return {
     status: "running",
+    phase: "exact",
+    step: { number: 1, of: 1, label: "Exact matches" },
     scanned: 1200,
     total: 48000,
     percent: 2.5,
+    measured: true,
     buckets: 0,
     totalBuckets: 0,
     error: null,
     ...overrides,
   };
+}
+
+/** Whether the meter is sliding ("working, length unknown"). */
+function slides(wrapper) {
+  return wrapper
+    .find(".scan-banner__fill")
+    .classes()
+    .includes("scan-banner__fill--indeterminate");
 }
 
 /** Text with runs of whitespace collapsed, so template wrapping is not asserted. */
@@ -55,6 +66,8 @@ describe("DedupScanBanner", () => {
   it("prefers candidate batches for a running person scan", () => {
     const text = textOf(
       mountBanner({
+        phase: "near",
+        step: { number: 2, of: 2, label: "Near-identical" },
         total: 8,
         scanned: 8,
         buckets: 3,
@@ -95,11 +108,14 @@ describe("DedupScanBanner", () => {
   it("announces a pending person scan as queued without inventing zero totals", () => {
     const wrapper = mountBanner({
       status: "pending",
+      phase: null,
+      step: null,
       scanned: 0,
       total: 0,
       buckets: 0,
       totalBuckets: 0,
       percent: 0,
+      measured: false,
     });
     expect(textOf(wrapper)).toContain("Duplicate scan queued.");
     expect(textOf(wrapper)).toContain("Queued");
@@ -108,16 +124,21 @@ describe("DedupScanBanner", () => {
     expect(
       wrapper.find(".scan-banner__track").attributes("aria-valuenow"),
     ).toBeUndefined();
+    // Queued is waiting, not working: a sliding meter would claim otherwise.
+    expect(slides(wrapper)).toBe(false);
   });
 
   it("announces a running person scan with unknown totals as starting", () => {
     const wrapper = mountBanner({
       status: "running",
+      phase: null,
+      step: null,
       scanned: 0,
       total: 0,
       buckets: 0,
       totalBuckets: 0,
       percent: 0,
+      measured: false,
     });
     expect(textOf(wrapper)).toContain("Duplicate scan is starting.");
     expect(textOf(wrapper)).toContain("Starting");
@@ -125,6 +146,87 @@ describe("DedupScanBanner", () => {
     expect(
       wrapper.find(".scan-banner__track").attributes("aria-valuenow"),
     ).toBeUndefined();
+    expect(slides(wrapper)).toBe(true);
+  });
+
+  // The reported fault: an exact-only scan read "0 of 376,889" until it was
+  // done. A figure the store did not measure must never be printed as one,
+  // and a figure it did measure must be.
+  it("prints a figure only when the store measured it", () => {
+    const unmeasured = mountBanner({ scanned: 0, percent: 0, measured: false });
+    expect(textOf(unmeasured)).not.toContain("pictures compared");
+    expect(textOf(unmeasured)).not.toContain("0%");
+    expect(slides(unmeasured)).toBe(true);
+
+    const measured = mountBanner({ scanned: 12000, percent: 25 });
+    expect(textOf(measured)).toContain(
+      `${(12000).toLocaleString()} of ${(48000).toLocaleString()} pictures compared.`,
+    );
+    expect(slides(measured)).toBe(false);
+  });
+
+  it("says the near tier is building its batches before it can count them", () => {
+    const wrapper = mountBanner({
+      phase: "near",
+      step: { number: 2, of: 2, label: "Near-identical" },
+      scanned: 48000,
+      percent: 0,
+      measured: false,
+      totalBuckets: 0,
+    });
+    const text = textOf(wrapper);
+    expect(text).toContain("Sorting pictures into candidate batches to compare.");
+    expect(text).toContain("Near-identical, step 2 of 2");
+    // The exact tier's finished count is not this tier's progress.
+    expect(text).not.toContain("pictures compared");
+    expect(text).not.toContain("%");
+    expect(
+      wrapper.find(".scan-banner__track").attributes("aria-label"),
+    ).toBe("Duplicate candidate batches being prepared");
+    expect(
+      wrapper.find(".scan-banner__track").attributes("aria-valuenow"),
+    ).toBeUndefined();
+    expect(slides(wrapper)).toBe(true);
+  });
+
+  // The embedding tier has no counter, and it writes its groups only once its
+  // comparison is complete, so "groups appear as they are found" would be
+  // false here.
+  it("describes the same-scene tier without a figure it does not have", () => {
+    const wrapper = mountBanner({
+      phase: "embedding",
+      step: { number: 3, of: 3, label: "Same scene" },
+      percent: 0,
+      measured: false,
+    });
+    const text = textOf(wrapper);
+    expect(text).toContain("Comparing pictures for the same scene.");
+    expect(text).toContain("These groups appear when this step finishes.");
+    expect(text).not.toContain("Groups appear here as they are found.");
+    expect(text).toContain("Same scene, step 3 of 3");
+    expect(text).not.toContain("%");
+    expect(
+      wrapper.find(".scan-banner__track").attributes("aria-label"),
+    ).toBe("Same-scene comparison in progress");
+    expect(slides(wrapper)).toBe(true);
+  });
+
+  // Every tier counts from zero again, so the step is what stops a restarted
+  // meter reading as progress going backwards.
+  it("names the step beside the figure on a scan of several tiers", () => {
+    const wrapper = mountBanner({
+      step: { number: 1, of: 2, label: "Exact matches" },
+      percent: 25,
+    });
+    expect(wrapper.find(".scan-banner__meta").text()).toBe(
+      "Exact matches, step 1 of 2 · 25%",
+    );
+  });
+
+  it("states only the figure on a scan of one tier", () => {
+    expect(mountBanner({ percent: 25 }).find(".scan-banner__meta").text()).toBe(
+      "25%",
+    );
   });
 
   // The server reports no time estimate, and inventing one from a bucket rate

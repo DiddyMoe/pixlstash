@@ -222,9 +222,16 @@ class DedupScan(SQLModel, table=True):
 
     Attributes:
         scope_key: Canonical scope identifier. Unique.
-        scanned_pictures / total_pictures: The "scanned N of M" banner.
+        phase: The tier the running scan is working through (``exact``,
+            ``near`` or ``embedding``), so each tier's progress is read on its
+            own scale. ``None`` whenever the scan is not running.
+        scanned_pictures / total_pictures: The tier's "N of M pictures" count.
+            During ``exact`` it is the pictures whose exact comparison is
+            final; during ``near`` the pictures in a finished bucket. The
+            ``embedding`` tier has no picture count and leaves it at 0.
         scanned_buckets / total_buckets: Tier-2 bucket progress; a bucket's
             groups become visible in the queue the moment its bucket finishes.
+            ``total_buckets`` stays 0 while the buckets are still being built.
         tiers: JSON list of the tiers this scan was asked to run.
     """
 
@@ -245,6 +252,9 @@ class DedupScan(SQLModel, table=True):
     status: str = Field(
         default=SCAN_PENDING,
         sa_column=Column("status", String, nullable=False, index=True),
+    )
+    phase: Optional[str] = Field(
+        default=None, sa_column=Column("phase", String, nullable=True)
     )
     total_pictures: int = Field(default=0)
     scanned_pictures: int = Field(default=0)

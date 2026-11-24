@@ -521,10 +521,10 @@ def test_paged_exact_groups_match_the_unpaged_result(server, monkeypatch):
     # Ordered by each key's lowest picture id, not by hash: alphabetically
     # "big" would come first and "pair" last.
     assert keys == [
-        tiers.ExactKey("pair", 100, 2),
-        tiers.ExactKey("pair", 200, 2),
-        tiers.ExactKey("nosize", None, 2),
-        tiers.ExactKey("big", 100, 5),
+        tiers.ExactKey("pair", 100, 2, ids[0]),
+        tiers.ExactKey("pair", 200, 2, ids[2]),
+        tiers.ExactKey("nosize", None, 2, ids[4]),
+        tiers.ExactKey("big", 100, 5, ids[6]),
     ]
     unpaged = _run(server, tiers.build_exact_groups_for_keys_in_session, keys, None)
 
@@ -1765,7 +1765,7 @@ def test_legacy_exact_plus_embedding_scan_has_defined_phase_progress(monkeypatch
                     "scope_id": None,
                     "total_pictures": 1,
                 }
-            if func.__name__ == "_embedding_scope_slice":
+            if func.__name__ == "_begin_phase_slice":
                 return None
             if func.__name__ == "_embedding_edge_page_slice":
                 return {"edges": [], "cursor": (-1, -1), "done": True}
@@ -1782,6 +1782,9 @@ def test_legacy_exact_plus_embedding_scan_has_defined_phase_progress(monkeypatch
         def run_immediate_read_task(self, func, *args):
             if func.__name__ in ("_exact_keys_read", "_obsolete_groups_read"):
                 return []
+            # The scope's id filter is a whole-scope read: a reader's job.
+            if func.__name__ == "_embedding_scope_read":
+                return None
             raise AssertionError(f"unexpected read {func.__name__}")
 
     task = DedupScanTask(FakeDatabase(), scan_id=1)
@@ -1799,8 +1802,8 @@ def test_near_scan_with_no_buckets_keeps_finalisation_remaining():
                     "scope_id": None,
                     "total_pictures": 0,
                 }
-            if func.__name__ == "_prepare_near_slice":
-                return []
+            if func.__name__ in ("_begin_phase_slice", "_publish_bucket_total_slice"):
+                return None
             if func.__name__ == "_finish_scan_slice":
                 assert task.task_progress() == (2, 3)
                 return {
@@ -1813,6 +1816,9 @@ def test_near_scan_with_no_buckets_keeps_finalisation_remaining():
 
         def run_immediate_read_task(self, func, *args):
             if func.__name__ in ("_exact_keys_read", "_obsolete_groups_read"):
+                return []
+            # Building the buckets reads the whole scope: a reader's job.
+            if func.__name__ == "_near_buckets_read":
                 return []
             raise AssertionError(f"unexpected read {func.__name__}")
 
@@ -2653,19 +2659,27 @@ def test_failed_and_cancelled_rescans_preserve_prior_complete_evidence(
     _run(server, make_distinct)
     cancelled = _run(server, tiers.request_scan_in_session, TierPolicy(), None)
     _run(server, DedupScanTask._start_scan_slice, cancelled["scan_id"])
+    assert _run(server, tiers.scan_progress_in_session, None)["phase"] == "exact"
     _run(server, DedupScanTask._mark_pending_after_cancel, cancelled["scan_id"])
     assert len(_run(server, lambda s: s.exec(select(DedupGroup)).all())) == 1
+    # A pending scan is not in any tier: the banner would name a step that is
+    # not running.
+    assert _run(server, tiers.scan_progress_in_session, None)["phase"] is None
 
     # Allow a fresh request, then fail before a successful finalisation. Neither
     # path is allowed to erase the last complete generation's queue evidence.
+    # The row also carries a tier from whatever wrote it last, which the
+    # request must not hand on to the run it queues.
     def make_complete(session):
         scan = session.get(DedupScan, cancelled["scan_id"])
         scan.status = "complete"
+        scan.phase = "near"
         session.add(scan)
         session.commit()
 
     _run(server, make_complete)
     failed = _run(server, tiers.request_scan_in_session, TierPolicy(), None)
+    assert failed["phase"] is None
 
     def fail_exact(_session, _scope):
         raise RuntimeError("forced exact scan failure")
@@ -2675,6 +2689,7 @@ def test_failed_and_cancelled_rescans_preserve_prior_complete_evidence(
         DedupScanTask(server.vault.db, failed["scan_id"])._run_task()
     progress = _run(server, tiers.scan_progress_in_session, None)
     assert progress["status"] == "failed"
+    assert progress["phase"] is None
     assert len(_run(server, lambda s: s.exec(select(DedupGroup)).all())) == 1
 
 
@@ -2838,9 +2853,9 @@ def test_the_exact_tier_holds_the_writer_one_page_at_a_time(server, monkeypatch)
     """Tier 1 never holds the database writer for the whole library.
 
     The start slice only prunes, counts and marks the scan running. The keys are
-    read once on a concurrent reader; then each page is its own writer slice,
-    publishes the running count, and lets an interactive callback queued after
-    it run before the next page.
+    read once on a concurrent reader, and so is each page's picture count; then
+    each page is its own writer slice, publishes the running counts, and lets an
+    interactive callback queued after it run before the next page.
     """
     _seed(
         server,
@@ -2888,18 +2903,134 @@ def test_the_exact_tier_holds_the_writer_one_page_at_a_time(server, monkeypatch)
 
     assert summary["status"] == "complete"
     assert summary["groups_found"] == 7
-    assert order[:2] == ["writer:_start_scan_slice", "reader:_exact_keys_read"], order
+    assert order[:3] == [
+        "writer:_start_scan_slice",
+        "reader:_exact_keys_read",
+        "reader:_exact_progress_read",
+    ], order
     persists = [i for i, item in enumerate(order) if item.startswith("persist:")]
     assert [order[i] for i in persists] == ["persist:3", "persist:3", "persist:1"]
     assert persists[0] < order.index("interactive") < persists[1], order
-    # The running count after each page, and the scope counted as seen only
-    # once the last page of an exact-only scan is in.
-    assert published == [(3, 0), (6, 0), (7, 14)]
+    # The running counts after each page: every picture below the next page's
+    # first key is settled, and the last page settles the whole scope.
+    assert published == [(3, 6), (6, 12), (7, 14)]
     assert order[-2:] == [
         "reader:_obsolete_groups_read",
         "writer:_finish_scan_slice",
     ], order
     assert len(_stored_memberships(server)) == 7
+
+
+# Three duplicated keys, a page each at EXACT_PAGE_MAX_KEYS = 1, with pictures
+# that have no duplicate between them and a scrapheaped one before the first
+# frontier. Live ids in order: a a . b b . c c plus one more single at the end.
+_SETTLED_SPECS = [
+    {"pixel_sha": "a", "perceptual_hash": PHASH_FAR},
+    {"pixel_sha": "a", "perceptual_hash": PHASH_FAR},
+    {"pixel_sha": "gone", "perceptual_hash": PHASH_FAR, "deleted": True},
+    {"pixel_sha": "single-1", "perceptual_hash": PHASH_ZERO},
+    {"pixel_sha": "b", "perceptual_hash": PHASH_FAR},
+    {"pixel_sha": "b", "perceptual_hash": PHASH_FAR},
+    {"pixel_sha": "single-2", "perceptual_hash": PHASH_ZERO},
+    {"pixel_sha": "c", "perceptual_hash": PHASH_FAR},
+    {"pixel_sha": "c", "perceptual_hash": PHASH_FAR},
+    {"pixel_sha": "single-3", "perceptual_hash": PHASH_ZERO},
+]
+# Live pictures below b's first id: a, a, single-1. Below c's: those plus b, b,
+# single-2. The last page settles the scope. Counting only the members of the
+# keys persisted so far would read 2, 4, 9 instead.
+_SETTLED_AFTER_PAGES = [3, 6, 9]
+
+
+def _scan_snapshot(server, scope):
+    """The scope's scan progress as the API serialises it."""
+    progress = _run(server, tiers.scan_progress_in_session, scope)
+    return {
+        "phase": progress["phase"],
+        "scanned": progress["scanned_pictures"],
+        "total": progress["total_pictures"],
+        "buckets": progress["scanned_buckets"],
+        "total_buckets": progress["total_buckets"],
+    }
+
+
+def test_every_tier_publishes_its_own_progress_as_it_runs(server, monkeypatch):
+    """The banner can count every tier of a running scan, never "0 of N".
+
+    The exact tier publishes the pictures it has settled after every page, in
+    a scan that goes on to the near tier as much as in an exact-only one. Each
+    tier then names itself in ``phase`` with its counters reset, so one tier's
+    count is never read on another's scale, and the reads that cover the whole
+    scope (the near buckets, the embedding scope) run off the writer.
+    """
+    _seed(server, _SETTLED_SPECS)
+    monkeypatch.setattr(tiers, "EXACT_PAGE_MAX_KEYS", 1)
+    policy = TierPolicy(near_enabled=True, embedding_enabled=True)
+    scope = DedupScope()
+    scan_id = _run(server, tiers.request_scan_in_session, policy, scope)["scan_id"]
+    task = DedupScanTask(server.vault.db, scan_id)
+    writes: list[tuple[str, dict]] = []
+    reads: list[str] = []
+    original_low_slice = task._run_low_slice
+    original_read_slice = task._run_read_slice
+
+    def run_low_slice(func, *args):
+        result = original_low_slice(func, *args)
+        writes.append((func.__name__, _scan_snapshot(server, scope)))
+        return result
+
+    def run_read_slice(read, *args):
+        reads.append(read.__name__)
+        return original_read_slice(read, *args)
+
+    monkeypatch.setattr(task, "_run_low_slice", run_low_slice)
+    monkeypatch.setattr(task, "_run_read_slice", run_read_slice)
+    summary = task._run_task()
+
+    assert summary["status"] == "complete"
+    assert summary["total_pictures"] == 9
+    assert [name for name, _ in writes][:4] == [
+        "_start_scan_slice",
+        "_persist_exact_page_slice",
+        "_persist_exact_page_slice",
+        "_persist_exact_page_slice",
+    ]
+    assert writes[0][1]["phase"] == "exact"
+    assert writes[0][1]["scanned"] == 0
+    assert [
+        (snapshot["phase"], snapshot["scanned"], snapshot["total"])
+        for name, snapshot in writes
+        if name == "_persist_exact_page_slice"
+    ] == [("exact", settled, 9) for settled in _SETTLED_AFTER_PAGES]
+
+    phases = [snapshot for name, snapshot in writes if name == "_begin_phase_slice"]
+    assert phases == [
+        {"phase": "near", "scanned": 0, "total": 9, "buckets": 0, "total_buckets": 0},
+        {
+            "phase": "embedding",
+            "scanned": 0,
+            "total": 9,
+            "buckets": 0,
+            "total_buckets": 0,
+        },
+    ]
+    near = [
+        snapshot
+        for name, snapshot in writes
+        if name in ("_publish_bucket_total_slice", "_run_near_bucket_slice")
+    ]
+    bucket_total = near[0]["total_buckets"]
+    assert bucket_total > 0
+    assert [(s["phase"], s["buckets"], s["total_buckets"]) for s in near] == [
+        ("near", index, bucket_total) for index in range(bucket_total + 1)
+    ]
+    assert writes[-1][0] == "_finish_scan_slice"
+    assert writes[-1][1]["phase"] is None
+    assert writes[-1][1]["scanned"] == 9
+
+    for whole_scope_read in ("_near_buckets_read", "_embedding_scope_read"):
+        assert whole_scope_read in reads
+    assert reads.index("_exact_progress_read") < reads.index("_near_buckets_read")
 
 
 def test_each_exact_page_is_built_from_the_pictures_as_they_are_now(
@@ -3136,3 +3267,49 @@ def test_the_synchronous_scan_pages_tier_one_and_retires_what_it_lost(
         1,
     )
     assert _stored_memberships(server) == [ids[2:5]]
+
+
+def test_the_synchronous_scan_publishes_the_same_progress(server, monkeypatch):
+    """``run_scan_in_session`` counts each exact page and names each tier too."""
+    _seed(server, _SETTLED_SPECS)
+    monkeypatch.setattr(tiers, "EXACT_PAGE_MAX_KEYS", 1)
+    seen: list[tuple[str, str | None, int]] = []
+    original_persist = DedupScanTask._persist_exact_page_slice
+    original_begin = DedupScanTask._begin_phase_slice
+
+    def scan_row(session, scan_id):
+        session.expire_all()
+        return session.get(DedupScan, scan_id)
+
+    def persist(session, scan_id, *args):
+        result = original_persist(session, scan_id, *args)
+        row = scan_row(session, scan_id)
+        seen.append(("page", row.phase, row.scanned_pictures))
+        return result
+
+    def begin(session, scan_id, phase):
+        original_begin(session, scan_id, phase)
+        row = scan_row(session, scan_id)
+        seen.append(("phase", row.phase, row.scanned_pictures))
+
+    monkeypatch.setattr(
+        DedupScanTask, "_persist_exact_page_slice", staticmethod(persist)
+    )
+    monkeypatch.setattr(DedupScanTask, "_begin_phase_slice", staticmethod(begin))
+
+    def scan(session):
+        progress = tiers.request_scan_in_session(
+            session, TierPolicy(near_enabled=True, embedding_enabled=True), None
+        )
+        summary = DedupScanTask.run_scan_in_session(session, progress["scan_id"])
+        return summary, scan_row(session, progress["scan_id"]).phase
+
+    summary, phase_after = _run(server, scan)
+
+    assert summary["status"] == "complete"
+    assert seen == [
+        *(("page", "exact", settled) for settled in _SETTLED_AFTER_PAGES),
+        ("phase", "near", 0),
+        ("phase", "embedding", 0),
+    ]
+    assert phase_after is None

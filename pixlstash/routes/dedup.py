@@ -1049,12 +1049,33 @@ class ScanProgressModel(BaseModel):
             "the prior complete near evidence was preserved."
         )
     )
-    scanned_pictures: int = Field(description="Pictures covered so far.")
+    phase: Optional[str] = Field(
+        default=None,
+        description=(
+            "The tier a `running` scan is working through: `exact`, `near` or "
+            "`embedding`. Each reports on its own scale: `exact` in pictures, "
+            "`near` in candidate buckets, `embedding` not at all. Null when the "
+            "scan is not running."
+        ),
+    )
+    scanned_pictures: int = Field(
+        description=(
+            "Pictures the current tier has finished with: during `exact`, the "
+            "pictures whose exact comparison is final, published after every "
+            "page; during `near`, the pictures in a finished bucket. 0 during "
+            "`embedding`, and the scope's total once the scan has finished."
+        )
+    )
     total_pictures: int = Field(description="Pictures in scope.")
     scanned_buckets: int = Field(
         description="Tier-2 candidate buckets finished. Groups appear as these land."
     )
-    total_buckets: int = Field(description="Tier-2 candidate buckets in total.")
+    total_buckets: int = Field(
+        description=(
+            "Tier-2 candidate buckets in total. 0 until the near tier has "
+            "built them, which is itself a full read of the scope."
+        )
+    )
     groups_found: int = Field(description="Unresolved groups this scan produced.")
     error: Optional[str] = Field(
         default=None,

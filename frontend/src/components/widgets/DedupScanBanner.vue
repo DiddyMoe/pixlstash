@@ -20,12 +20,15 @@ const WARNING_STATES = new Set(["partial", "failed"]);
 const props = defineProps({
   /**
    * Normalised scan progress from `useDedupStore`:
-   * `{ status, scanned, total, percent, buckets, totalBuckets, error }`.
+   * `{ status, phase, step, scanned, total, percent, measured, buckets,
+   * totalBuckets, error }`.
    *
-   * The server reports pictures and candidate buckets but no percentage and no
-   * time estimate, so `percent` is derived in the store and there is
-   * deliberately no "N min left": inventing one from a bucket rate would be a
-   * guess presented as a fact, and a wrong estimate is worse than none.
+   * The server reports each tier's own counters but no percentage and no time
+   * estimate, so `percent` is derived in the store and there is deliberately no
+   * "N min left": inventing one from a bucket rate would be a guess presented
+   * as a fact, and a wrong estimate is worse than none. `measured` is false
+   * while the running tier has nothing to count against, and the meter then
+   * says "working" instead of a 0% it does not know.
    */
   scan: { type: Object, required: true },
 });
@@ -38,42 +41,67 @@ const percent = computed(() => {
 });
 
 const status = computed(() => props.scan?.status ?? "idle");
+const phase = computed(() => props.scan?.phase ?? null);
 const visible = computed(
   () => RUNNING_STATES.has(status.value) || WARNING_STATES.has(status.value),
 );
 const pending = computed(() => status.value === "pending");
+const running = computed(() => status.value === "running");
 const partial = computed(() => status.value === "partial");
 const failed = computed(() => status.value === "failed");
 const terminalWarning = computed(() => partial.value || failed.value);
 const warningDetail = computed(() => String(props.scan?.error ?? "").trim());
 
 /**
- * Tier 2 streams its groups in as each candidate bucket finishes, so a scope
- * whose picture total is not known yet still has honest progress to report.
+ * Whether the running tier has a counter to report. The store owns the rule
+ * (exact counts pictures, near counts batches once built, embedding counts
+ * nothing); the banner only renders it.
  */
-const countsBuckets = computed(
-  () =>
-    status.value === "running" && Number(props.scan?.totalBuckets) > 0,
+const determinate = computed(
+  () => running.value && props.scan?.measured === true,
 );
 const countsPictures = computed(
-  () =>
-    status.value === "running" &&
-    !countsBuckets.value &&
-    Number(props.scan?.total) > 0,
+  () => determinate.value && phase.value === "exact",
 );
-const determinate = computed(
-  () => countsBuckets.value || countsPictures.value,
+const countsBuckets = computed(
+  () => determinate.value && phase.value === "near",
 );
+/** The near tier before its candidate batches exist: a whole-scope read. */
+const preparingBuckets = computed(
+  () => running.value && phase.value === "near" && !determinate.value,
+);
+const comparingScenes = computed(
+  () => running.value && phase.value === "embedding",
+);
+/** Running, but with nothing to measure yet: the meter slides instead. */
+const indeterminate = computed(() => running.value && !determinate.value);
+
+/**
+ * "Exact matches, step 1 of 2" on a scan that runs more than one tier. Each
+ * tier counts from zero again, so without the step a meter that restarts reads
+ * as progress going backwards.
+ */
+const stepText = computed(() => {
+  const step = props.scan?.step;
+  if (!running.value || !step || !(Number(step.of) > 1)) return "";
+  return `${step.label}, step ${step.number} of ${step.of}`;
+});
+
 const progressLabel = computed(() => {
   if (pending.value) return "Duplicate scan queued";
   if (countsBuckets.value) return "Duplicate candidate batches processed";
   if (countsPictures.value) return "Duplicate pictures processed";
+  if (preparingBuckets.value) return "Duplicate candidate batches being prepared";
+  if (comparingScenes.value) return "Same-scene comparison in progress";
   return "Duplicate scan starting";
 });
 const metaText = computed(() => {
   if (pending.value) return "Queued";
-  if (!determinate.value) return "Starting";
-  return `${percent.value}%`;
+  const figure = determinate.value ? `${percent.value}%` : "";
+  if (stepText.value) {
+    return figure ? `${stepText.value} · ${figure}` : stepText.value;
+  }
+  return figure || "Starting";
 });
 const bucketsText = computed(() =>
   Number(props.scan?.buckets ?? 0).toLocaleString(),
@@ -122,6 +150,13 @@ const totalText = computed(() =>
       <b>{{ totalText }}</b> pictures compared. Groups appear here as they are
       found.
     </p>
+    <p v-else-if="preparingBuckets" class="scan-banner__line">
+      Still scanning. Sorting pictures into candidate batches to compare.
+    </p>
+    <p v-else-if="comparingScenes" class="scan-banner__line">
+      Still scanning. Comparing pictures for the same scene. These groups
+      appear when this step finishes.
+    </p>
     <p v-else class="scan-banner__line">
       Duplicate scan is starting. Preparing pictures to compare.
     </p>
@@ -137,6 +172,7 @@ const totalText = computed(() =>
     >
       <span
         class="scan-banner__fill"
+        :class="{ 'scan-banner__fill--indeterminate': indeterminate }"
         :style="{ width: determinate ? `${percent}%` : '0%' }"
       ></span>
     </span>
@@ -213,5 +249,36 @@ const totalText = computed(() =>
   /* Progress arrives in polls, so the fill eases between them instead of
      snapping. The global reduced-motion rule collapses this. */
   transition: width var(--dur-2) var(--ease-standard);
+}
+
+/* Running with nothing to count yet (the near tier building its batches, the
+   embedding tier, which has no counter): a sliding segment says "working,
+   length unknown". An empty track would read as stalled at 0%. Same technique
+   as ProgressOverlay's `.progress-overlay__fill--indeterminate`. */
+.scan-banner__fill--indeterminate {
+  width: 38% !important;
+  animation: scan-banner-indeterminate 1.2s ease-in-out infinite;
+  transition: none;
+}
+
+@keyframes scan-banner-indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+  50% {
+    transform: translateX(90%);
+  }
+  100% {
+    transform: translateX(220%);
+  }
+}
+
+/* Not a no-op: the segment still has to read as "running, length unknown",
+   so it stays visible and simply stops moving. */
+@media (prefers-reduced-motion: reduce) {
+  .scan-banner__fill--indeterminate {
+    animation: none;
+    transform: translateX(0);
+  }
 }
 </style>

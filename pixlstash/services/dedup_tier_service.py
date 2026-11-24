@@ -1429,11 +1429,17 @@ class ExactKey(NamedTuple):
     ``member_count`` is the count when the key was discovered. It only sizes the
     pages (:func:`page_exact_keys`); the page re-reads the members, so a picture
     imported or scrapheaped since discovery is seen.
+
+    ``first_id`` is the lowest live picture id carrying the key, the order the
+    keys come back in. Every picture below the first key of a page has had its
+    exact comparison by the time that page starts, which is how the scan
+    publishes picture progress between pages.
     """
 
     pixel_sha: str
     size_bytes: Optional[int]
     member_count: int
+    first_id: int
 
 
 def find_exact_keys_in_session(
@@ -1458,7 +1464,12 @@ def find_exact_keys_in_session(
     scope = scope or DedupScope()
     predicate = scope.picture_predicate()
     duplicated = (
-        select(Picture.pixel_sha, Picture.size_bytes, func.count(Picture.id))
+        select(
+            Picture.pixel_sha,
+            Picture.size_bytes,
+            func.count(Picture.id),
+            func.min(Picture.id),
+        )
         .where(
             Picture.pixel_sha.is_not(None),
             Picture.deleted.is_(False),
@@ -1470,8 +1481,8 @@ def find_exact_keys_in_session(
     if predicate is not None:
         duplicated = duplicated.where(predicate)
     return [
-        ExactKey(str(sha), size_bytes, int(count))
-        for sha, size_bytes, count in session.exec(duplicated).all()
+        ExactKey(str(sha), size_bytes, int(count), int(first_id))
+        for sha, size_bytes, count, first_id in session.exec(duplicated).all()
     ]
 
 
@@ -3193,6 +3204,9 @@ def request_scan_in_session(
     row.tiers = json.dumps(requested_tiers)
     row.threshold = float(policy.threshold)
     row.status = SCAN_PENDING
+    # The tier is only known once the task runs. The row is reused across
+    # rescans, so it must not hand on a tier from whatever wrote it last.
+    row.phase = None
     row.error = None
     row.started_at = now
     row.updated_at = now
@@ -3219,6 +3233,7 @@ def scan_progress(row: Optional[DedupScan]) -> dict[str, Any]:
     if row is None:
         return {
             "status": "idle",
+            "phase": None,
             "scanned_pictures": 0,
             "total_pictures": 0,
             "scanned_buckets": 0,
@@ -3232,6 +3247,7 @@ def scan_progress(row: Optional[DedupScan]) -> dict[str, Any]:
         "scan_id": row.id,
         "scope_key": row.scope_key,
         "status": row.status,
+        "phase": row.phase,
         "tiers": json.loads(row.tiers or "[]"),
         "threshold": float(row.threshold or DEFAULT_THRESHOLD),
         "scanned_pictures": int(row.scanned_pictures or 0),
