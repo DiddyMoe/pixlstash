@@ -188,6 +188,7 @@ def test_services_no_direct_db_calls():
         "pixlstash/services/restore/preview.py",  # vault-injection pattern; restore previews + hash compare
         "pixlstash/services/comfyui_service.py",  # vault-injection pattern; owns ComfyUI output-import orchestration
         "pixlstash/services/scrapheap_service.py",  # vault-injection pattern; thin wrappers around the *_in_session purge/retention functions
+        "pixlstash/services/scrapheap_run_service.py",  # vault-injection pattern; start_run's thin wrapper around scrapheap_ids_in_session, the selection a run fixes before it is queued
         # The op-log's whole point is that capture -> mutation -> capture ->
         # record run in ONE queued task; the wrapper owning that submission is
         # the atomicity guarantee, not transitional debt.

@@ -9,8 +9,8 @@
 // nextTick callbacks. So the request always landed while `scrapheapEmptyDisabled`
 // was true and was dropped on the floor.
 //
-// The fix is that the confirm gates only on a purge already running, and lets the
-// AUTHORITATIVE server preview (POST /pictures/scrapheap/delete-preview) decide
+// The fix is that the confirm gates only on a Scrapheap run already going, and
+// lets the AUTHORITATIVE server preview (POST /pictures/scrapheap/delete-preview) decide
 // what is in the heap - the grid's loaded rows can undercount it.
 //
 // This mounts the REAL ImageGrid.vue and reproduces the exact call ordering the
@@ -24,6 +24,8 @@ import { setActivePinia, createPinia } from "pinia";
 import { useSelectionStore } from "../../stores/useSelectionStore.js";
 import { useProjectStore } from "../../stores/useProjectStore.js";
 import { useSortStore } from "../../stores/useSortStore.js";
+import { useScrapheapRunStore } from "../../stores/useScrapheapRunStore.js";
+import { useNoticeStore } from "../../stores/useNoticeStore.js";
 import { ref, nextTick } from "vue";
 
 const apiGet = vi.fn();
@@ -91,6 +93,18 @@ function previewCalls() {
   return apiPost.mock.calls.filter(([url]) =>
     String(url ?? "").includes("/pictures/scrapheap/delete-preview"),
   );
+}
+
+/** The starts of a background Scrapheap run: what replaced the one-request purge. */
+function runStarts() {
+  return apiPost.mock.calls.filter(([url]) =>
+    String(url ?? "").endsWith("/pictures/scrapheap/runs"),
+  );
+}
+
+/** The live notice raised under `key`, if any. */
+function noticeWithKey(key) {
+  return useNoticeStore().notices.find((notice) => notice.key === key);
 }
 
 // Selection, project and sort state live in the stores now; the old
@@ -227,37 +241,79 @@ describe('sidebar "Empty Scrapheap" opens the delete-forever confirm', () => {
     wrapper.unmount();
   });
 
-  it("refreshes the sidebar counts when the purge itself fails", async () => {
-    // A 500 from the purge can come after rows were already destroyed, so the
-    // sidebar must re-read its counts rather than keep the stale one.
-    apiDelete.mockRejectedValue(new Error("Internal Server Error"));
-    const consoleError = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => {});
+  it("refreshes the sidebar counts when the run will not start", async () => {
+    // The purge is a background run now; the request only starts it. A refusal
+    // may still come after the server queued one, so the sidebar re-reads its
+    // counts rather than keep the stale one.
+    apiPost.mockImplementation((url) =>
+      String(url).endsWith("/pictures/scrapheap/runs")
+        ? Promise.reject(
+            Object.assign(new Error("Request failed with status code 500"), {
+              response: { status: 500, data: { detail: "Internal Server Error" } },
+            }),
+          )
+        : Promise.resolve({ data: {} }),
+    );
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const wrapper = mountGrid({ selectedCharacter: SCRAPHEAP_PICTURES_ID });
     await nextTick();
     wrapper.vm.deleteForeverMode = "all";
+    wrapper.vm.deleteForeverConfirmToken = "test-confirmation";
 
     await wrapper.vm.confirmDeleteForever({ includeProtected: false });
 
-    expect(apiDelete).toHaveBeenCalledTimes(1);
+    expect(runStarts()).toEqual([
+      [
+        "/pictures/scrapheap/runs",
+        {
+          kind: "purge",
+          include_protected: false,
+          confirm_token: "test-confirmation",
+        },
+      ],
+    ]);
+    // The one-request purge that timed out on a large heap is not used.
+    expect(apiDelete).not.toHaveBeenCalled();
     expect(wrapper.emitted("refresh-sidebar")).toHaveLength(1);
+    expect(noticeWithKey("scrapheap-empty")).toMatchObject({
+      level: "error",
+      text: "Couldn't empty the scrapheap. Internal Server Error.",
+    });
+    // The token is spent on the first attempt; a retry re-runs the preview.
+    expect(wrapper.vm.deleteForeverConfirmToken).toBe("");
+    expect(wrapper.vm.deleteForeverOpen).toBe(false);
 
-    consoleError.mockRestore();
+    consoleWarn.mockRestore();
     wrapper.unmount();
   });
 
-  it("ignores a second request while a purge is already running", async () => {
+  it("refuses, and says so, while a Scrapheap run is already going", async () => {
     const wrapper = mountGrid({ selectedCharacter: SCRAPHEAP_PICTURES_ID });
     await nextTick();
     apiPost.mockClear();
 
-    wrapper.vm.scrapheapEmptying = true;
+    useScrapheapRunStore().run = {
+      id: "example-run",
+      kind: "restore",
+      status: "running",
+      active: true,
+      total: 10,
+      processed: 2,
+    };
     await nextTick();
     wrapper.vm.confirmEmptyScrapheap();
     await nextTick();
 
     expect(previewCalls()).toHaveLength(0);
+    expect(runStarts()).toHaveLength(0);
+    // Refused aloud: a gesture that does nothing silently is the bug this file
+    // was written for.
+    expect(noticeWithKey("scrapheap-run-busy")).toMatchObject({
+      level: "info",
+      text:
+        "Another Scrapheap run is going, and its progress shows above the " +
+        "grid. This can start once it ends.",
+    });
 
     wrapper.unmount();
   });

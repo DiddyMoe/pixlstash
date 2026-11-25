@@ -52,6 +52,7 @@ import { useSnapshotsStore } from "./useSnapshotsStore";
 import { useTrainingRunsStore } from "./useTrainingRunsStore";
 import { useTrainingStore } from "./useTrainingStore";
 import { useDedupStore } from "./useDedupStore";
+import { useScrapheapRunStore } from "./useScrapheapRunStore";
 import { useReviewSessionsStore } from "./useReviewSessionsStore";
 import { useOperationStore } from "./useOperationStore";
 import { useLibrariesStore } from "./useLibrariesStore";
@@ -388,6 +389,32 @@ const STORES = [
       s.openCount === 0 &&
       Object.keys(s.scopeCounts).length === 0 &&
       s.mixedStacks.length === 0,
+  },
+  {
+    // An owner-only run over the active library's Scrapheap: its counts, the
+    // locked sets it skipped and the snapshots that still hold what it
+    // destroyed. The run carries on server-side; this session stops following
+    // it, and a start or stop still on the wire answers into nothing.
+    name: "useScrapheapRunStore",
+    use: useScrapheapRunStore,
+    seed: (s) => {
+      s.run = {
+        id: "run-1",
+        kind: "purge",
+        status: "running",
+        active: true,
+        total: 50000,
+        processed: 12000,
+      };
+      s.outcome = { run: { id: "run-0", active: false }, context: null };
+      s.action = "cancel";
+      s.unreachable = true;
+    },
+    isEmpty: (s) =>
+      s.run === null &&
+      s.outcome === null &&
+      s.action === null &&
+      s.unreachable === false,
   },
   {
     name: "useReviewSessionsStore",

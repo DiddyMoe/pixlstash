@@ -21,6 +21,7 @@ const stores = vi.hoisted(() => ({
   invalidateScopeCounts: vi.fn(),
   refreshCounts: vi.fn(),
   resumeAutoStackRun: vi.fn(),
+  resumeScrapheapRun: vi.fn(),
 }));
 vi.mock("../stores/useEntityListsStore", () => ({
   useEntityListsStore: () => ({ invalidate: stores.invalidate }),
@@ -34,6 +35,9 @@ vi.mock("../stores/useDedupStore", () => ({
     refreshCounts: stores.refreshCounts,
     resumeAutoStackRun: stores.resumeAutoStackRun,
   }),
+}));
+vi.mock("../stores/useScrapheapRunStore", () => ({
+  useScrapheapRunStore: () => ({ resume: stores.resumeScrapheapRun }),
 }));
 
 let wrapper;
@@ -111,5 +115,15 @@ describe("useSidebarRefresh", () => {
     api.refreshSidebar();
     expect(stores.resumeAutoStackRun).toHaveBeenCalledTimes(1);
     expect(stores.resumeAutoStackRun).toHaveBeenCalledWith();
+  });
+
+  // The Scrapheap's empty and restore runs outlive the tab too, and a restore
+  // run records History steps under the origin of the tab that started it.
+  // Not forced: the store reads the newest run once per session from here, and
+  // the Scrapheap view forces its own fresh read when it opens.
+  it("asks the Scrapheap run store to pick up a background run", () => {
+    api.refreshSidebar();
+    expect(stores.resumeScrapheapRun).toHaveBeenCalledTimes(1);
+    expect(stores.resumeScrapheapRun).toHaveBeenCalledWith();
   });
 });

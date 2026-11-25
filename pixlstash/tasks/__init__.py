@@ -40,6 +40,7 @@ from .tag_health_auto_rebuild_task import TagHealthAutoRebuildTask
 from .tag_health_auto_rebuild_finder import TagHealthAutoRebuildFinder
 from .scrapheap_retention_purge_task import ScrapheapRetentionPurgeTask
 from .scrapheap_retention_purge_finder import ScrapheapRetentionPurgeFinder
+from .scrapheap_run_task import ScrapheapRunTask
 from .thumbnail_generation_task import ThumbnailGenerationTask
 from .missing_thumbnail_finder import MissingThumbnailFinder
 from .pixel_sha_task import PixelShaTask
@@ -93,6 +94,7 @@ __all__ = [
     "TagHealthAutoRebuildFinder",
     "ScrapheapRetentionPurgeTask",
     "ScrapheapRetentionPurgeFinder",
+    "ScrapheapRunTask",
     "ThumbnailGenerationTask",
     "MissingThumbnailFinder",
     "PixelShaTask",

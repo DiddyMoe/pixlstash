@@ -345,14 +345,17 @@ describe("useOperationStore - receipts narrate this client only", () => {
   // on the stack, and the high-water mark still moves past them.
   it("stays silent for an own operation a narration filter holds back", async () => {
     const store = await primed([op({ id: 9 })]);
-    store.setNarrationFilter((operation) => operation.batch_id === "seg-1");
+    store.setNarrationFilter(
+      "run",
+      (operation) => operation.batch_id === "seg-1",
+    );
     serve([op({ id: 10, batch_id: "seg-1" }), op({ id: 9 })]);
     await store.refresh();
     expect(store.receipt).toBeNull();
     expect(store.past.map((o) => o.id)).toEqual([10, 9]);
 
     // Lifting the rule does not narrate a step already seen...
-    store.setNarrationFilter(null);
+    store.setNarrationFilter("run", null);
     await store.refresh();
     expect(store.receipt).toBeNull();
 
@@ -368,15 +371,54 @@ describe("useOperationStore - receipts narrate this client only", () => {
 
   it("narrates an own operation the narration filter lets through", async () => {
     const store = await primed([op({ id: 9 })]);
-    store.setNarrationFilter((operation) => operation.batch_id === "seg-1");
+    store.setNarrationFilter(
+      "run",
+      (operation) => operation.batch_id === "seg-1",
+    );
     serve([op({ id: 10, batch_id: "own-gesture" }), op({ id: 9 })]);
     await store.refresh();
     expect(store.receipt).toMatchObject({ mode: "did", operationId: 10 });
   });
 
+  // Two kinds of run hold their steps back (the auto-stack, the Scrapheap
+  // restore); one owner installing or lifting its rule must not touch the
+  // other's.
+  it("keeps each owner's rule, and lifting one leaves the other", async () => {
+    const store = await primed([op({ id: 9 })]);
+    store.setNarrationFilter("stacks", (o) => o.batch_id === "stack-seg");
+    store.setNarrationFilter("heap", (o) => o.batch_id === "heap-seg");
+    serve([
+      op({ id: 11, batch_id: "heap-seg" }),
+      op({ id: 10, batch_id: "stack-seg" }),
+      op({ id: 9 }),
+    ]);
+    await store.refresh();
+    expect(store.receipt).toBeNull();
+
+    store.setNarrationFilter("heap", null);
+    serve([
+      op({ id: 12, batch_id: "stack-seg" }),
+      op({ id: 11, batch_id: "heap-seg" }),
+      op({ id: 10, batch_id: "stack-seg" }),
+      op({ id: 9 }),
+    ]);
+    await store.refresh();
+    expect(store.receipt).toBeNull();
+
+    serve([
+      op({ id: 13, batch_id: "heap-seg" }),
+      op({ id: 12, batch_id: "stack-seg" }),
+      op({ id: 11, batch_id: "heap-seg" }),
+      op({ id: 10, batch_id: "stack-seg" }),
+      op({ id: 9 }),
+    ]);
+    await store.refresh();
+    expect(store.receipt).toMatchObject({ mode: "did", operationId: 13 });
+  });
+
   it("treats a filter that is not a function as no filter", async () => {
     const store = await primed([op({ id: 9 })]);
-    store.setNarrationFilter(true);
+    store.setNarrationFilter("run", true);
     serve([op({ id: 10 }), op({ id: 9 })]);
     await store.refresh();
     expect(store.receipt).toMatchObject({ mode: "did", operationId: 10 });

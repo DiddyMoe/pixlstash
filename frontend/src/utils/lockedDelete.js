@@ -38,13 +38,17 @@ export function plural(count, singular, pluralForm) {
  *
  * @param {Object} counts
  * @param {number} counts.lockedCount - pictures skipped because they are locked.
- * @param {number} counts.deletedCount - pictures actually moved to the scrapheap.
+ * @param {number} counts.deletedCount - pictures actually moved to the scrapheap,
+ *   or destroyed when `forever`.
+ * @param {boolean} [counts.forever=false] - the delete was Delete forever, out
+ *   of the Scrapheap, so nothing "moved to the scrapheap".
  * @returns {{kind: string, title: string, body: string, hint: string}|null}
  *   `null` when nothing was skipped - i.e. there is nothing to tell the user.
  */
 export function buildLockedDeleteMessage({
   lockedCount = 0,
   deletedCount = 0,
+  forever = false,
 } = {}) {
   const locked = Number.isFinite(lockedCount) ? Math.max(0, lockedCount) : 0;
   const deleted = Number.isFinite(deletedCount) ? Math.max(0, deletedCount) : 0;
@@ -71,7 +75,8 @@ export function buildLockedDeleteMessage({
     kind: LOCKED_DELETE_PARTIAL,
     title: "Some pictures were kept",
     body:
-      `${deleted} ${plural(deleted, "picture", "pictures")} moved to the scrapheap; ` +
+      `${deleted} ${plural(deleted, "picture", "pictures")} ` +
+      `${forever ? "deleted forever" : "moved to the scrapheap"}; ` +
       `${locked} ${lockedIsAre} in ${lockedSet} and ${plural(locked, "was", "were")} kept.`,
     hint: LOCKED_DELETE_HINT,
   };

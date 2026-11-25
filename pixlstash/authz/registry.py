@@ -1195,6 +1195,36 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
         _OWNER,
         justification="Returns protected reference-original file paths; owner only",
     ),
+    ("POST", "/api/v1/pictures/scrapheap/runs"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "Starts a background empty, delete-forever or restore over the "
+            "whole Scrapheap or a selection, the same destruction "
+            "DELETE /pictures/scrapheap performs (a purge also spends a "
+            "delete-preview confirm_token). POST is also blocked for READ tokens"
+        ),
+    ),
+    ("GET", "/api/v1/pictures/scrapheap/runs/latest"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "A library-wide run's progress: Scrapheap counts, locked picture "
+            "ids, snapshots holding destroyed metadata and the History batches "
+            "it wrote. Owner data, like the delete-preview it follows"
+        ),
+    ),
+    ("GET", "/api/v1/pictures/scrapheap/runs/{run_id}"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "The same run payload addressed by run id; same reasoning as "
+            "GET /pictures/scrapheap/runs/latest"
+        ),
+    ),
+    ("POST", "/api/v1/pictures/scrapheap/runs/{run_id}/cancel"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "Stops a library-wide Scrapheap run. POST is also blocked for READ tokens"
+        ),
+    ),
     # PICTURE_SCOPED, like every other per-picture mutation on this surface, and
     # shaped exactly like ("DELETE", "/api/v1/pictures") above. The in-place
     # write is a metadata-only EXIF-orientation splice: the entropy-coded pixel

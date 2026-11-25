@@ -15,6 +15,7 @@ from pixlstash.resources.ledger import Ledger
 from pixlstash.services import config_service
 from pixlstash.tasks.dedup_auto_stack_task import DedupAutoStackTask
 from pixlstash.tasks.dedup_scan_task import DedupScanTask
+from pixlstash.tasks.scrapheap_run_task import ScrapheapRunTask
 from pixlstash.tasks.task_type import TaskType
 from tests.authz_guard import assert_real_route
 from tests.utils import API_PREFIX, bearer_client, mint_read_token
@@ -151,6 +152,37 @@ def test_an_active_auto_stack_run_reports_its_own_groups_as_task_progress(
         assert snapshot["total"] == 6
         assert snapshot["remaining"] == 1
         assert workers[TaskType.DEDUP_SCAN.value]["active"] is False
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_an_active_scrapheap_run_reports_its_own_pictures_as_task_progress(
+    monkeypatch,
+):
+    """The Scrapheap row counts the run's pictures, never the library's, and
+    holds back the last one until the task has left the runner's active set."""
+    temp_dir, _client, server = _setup()
+    try:
+        task = ScrapheapRunTask(server.vault, run_id="example-run")
+        task._set_progress(6, 6)
+        original = server.vault._task_runner.get_active_tasks_of_type
+
+        def active_tasks(task_type):
+            if task_type == "ScrapheapRunTask":
+                return [task]
+            return original(task_type)
+
+        monkeypatch.setattr(
+            server.vault._task_runner, "get_active_tasks_of_type", active_tasks
+        )
+        snapshot = server.vault.get_worker_progress()[TaskType.SCRAPHEAP_RUN.value]
+        assert snapshot["label"] == "scrapheap_run"
+        assert snapshot["active"] is True
+        assert snapshot["current"] == 5
+        assert snapshot["total"] == 6
+        assert snapshot["remaining"] == 1
     finally:
         server.close()
         temp_dir.cleanup()

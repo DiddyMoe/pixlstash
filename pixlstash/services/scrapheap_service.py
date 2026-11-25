@@ -1,11 +1,15 @@
 """Scrapheap retention policy and the single permanent-destruction path.
 
 This module owns **everything that permanently destroys a soft-deleted picture**.
-Both callers go through :func:`purge_scrapheap_pictures`:
+Every caller goes through :func:`purge_scrapheap_pictures`:
 
 1. the manual, consent-gated ``DELETE /api/v1/pictures/scrapheap`` endpoint
-   (``include_protected`` chosen by the user), and
-2. the scheduled auto-purge (``ScrapheapRetentionPurgeTask``), which *always*
+   (``include_protected`` chosen by the user),
+2. a background purge run (``POST /api/v1/pictures/scrapheap/runs``, see
+   :mod:`pixlstash.services.scrapheap_run_service`), the same consent gate and
+   choice, applied one LOW-priority slice of pictures at a time so emptying a
+   large Scrapheap never holds the writer for longer than a slice, and
+3. the scheduled auto-purge (``ScrapheapRetentionPurgeTask``), which *always*
    passes ``include_protected=False``.
 
 **The hub reach is a step inside it, not a sibling** (implementation plan §B4).
@@ -72,8 +76,8 @@ Retention policy (settled with the maintainer, do not redesign):
   session that issues the DELETE, so the guarantee survives any future change to
   how the work is scheduled. The skipped ids are logged and reported as
   ``skipped_restored``; their rows, files and ledger entries are untouched.
-* The endpoint is gated by a server-side ``confirm_token`` minted by
-  ``POST /pictures/scrapheap/delete-preview`` (see
+* The endpoint, and a purge run, are gated by a server-side ``confirm_token``
+  minted by ``POST /pictures/scrapheap/delete-preview`` (see
   :class:`ScrapheapDeleteConfirmations`). The type-to-confirm dialog is a client
   control and proves nothing. This is an INTENT control; authorization stays with
   the AuthzGate. The unattended sweep calls :func:`purge_scrapheap_pictures`
@@ -536,7 +540,9 @@ def restore_pictures(
     actor: Optional[str] = None,
     source: str = "external",
     origin_client_id: Optional[str] = None,
-    batch_id: Optional[str] = None,
+    batch_id: operation_log_service.BatchIdSpec = None,
+    priority: DBPriority = DBPriority.IMMEDIATE,
+    announce: bool = True,
 ) -> list[int]:
     """Bring pictures back out of the Scrapheap, recorded and announced.
 
@@ -553,6 +559,14 @@ def restore_pictures(
         source: WS-envelope source (``ui`` or ``external``).
         origin_client_id: The originating tab, for origin-stamped events.
         batch_id: The gesture's batch id; a server one is minted when absent.
+            A background restore run passes a chooser instead
+            (:data:`~pixlstash.services.operation_log_service.BatchIdSpec`), so
+            each slice extends the run's current History segment only while
+            that segment is still the top of History.
+        priority: The writer-queue priority; a background slice passes
+            ``DBPriority.LOW``.
+        announce: ``False`` leaves the ``restored`` event to the caller, which
+            a run uses to coalesce its slices' events.
 
     Returns:
         The ids that actually left the Scrapheap: a requested id that is live,
@@ -610,6 +624,7 @@ def restore_pictures(
         # Always batched: the caller's gesture id when it sent one, a
         # server-minted ``srv-…`` otherwise.
         batch_id=batch_id or operation_log_service.new_batch_id(),
+        priority=priority,
     )
     # ``restored``, not ``added``: the card comes back, but the picture is not
     # new to the vault. The SPA's sidebar treats ``added`` as a fresh import and
@@ -617,7 +632,7 @@ def restore_pictures(
     # something that was in the library the whole time. The ids are the ones
     # that actually came back, so the grid inserts exactly those (an empty list
     # would make it reload everything) and a no-op restore announces nothing.
-    if restored_ids:
+    if restored_ids and announce:
         vault.notify(
             EventType.CHANGED_PICTURES,
             {
@@ -1749,6 +1764,7 @@ def purge_scrapheap_pictures(
     include_protected: bool,
     schedule_file_removal: Optional[Callable[..., None]] = None,
     retention_guard: Optional[RetentionGuard] = None,
+    priority: DBPriority = DBPriority.IMMEDIATE,
 ) -> ScrapheapPurgeOutcome:
     """Permanently destroy a scrapheap selection. THE destruction path.
 
@@ -1771,6 +1787,10 @@ def purge_scrapheap_pictures(
             ``deleted_at``. Supplied by the auto-purge task; ``None`` on the
             manual, consent-gated path. (The locked-set freeze is NOT part of
             this - it binds on every path and is enforced unconditionally below.)
+        priority: The writer-queue priority of every DB step here. A request
+            handler keeps ``IMMEDIATE``; a background run's slice passes
+            ``DBPriority.LOW`` so interactive writes get the writer between
+            slices. It changes only when a step runs, never what it checks.
 
     Returns:
         A :class:`ScrapheapPurgeOutcome`.
@@ -1785,7 +1805,7 @@ def purge_scrapheap_pictures(
             ids,
             include_protected,
             retention_guard,
-            priority=DBPriority.IMMEDIATE,
+            priority=priority,
         )
     )
     # Rows + ledger first, files second: a crash between the two leaves orphaned
@@ -1834,7 +1854,7 @@ def purge_scrapheap_pictures(
         recheck_surviving=lambda hashes: vault.db.run_task(
             surviving_instance_hashes_in_session,
             sorted(hashes),
-            priority=DBPriority.IMMEDIATE,
+            priority=priority,
         ),
     )
     if ghosts_kept:
@@ -1850,6 +1870,7 @@ def purge_scrapheap_pictures(
                 for candidate in ghost_context.candidates
                 if candidate.picture_id in purged
             ],
+            priority=priority,
         )
     # Always the removal+reconcile pair, never the bare removal: the ledger rows
     # were committed above and assert file_removed=True, which stays a PREDICTION

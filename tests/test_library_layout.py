@@ -23,6 +23,7 @@ from pixlstash.db_models import (
 )
 from pixlstash.db_models.external_move_review import ExternalMoveReview
 from pixlstash.db_models.library_settings import LibrarySettings
+from pixlstash.database import _before_flush_layout_tracker
 from pixlstash.db_models import DeletedFileLog
 from pixlstash.db_models.picture_move import PictureMove
 from pixlstash.db_models.reference_folder import ReferenceFolder
@@ -1629,6 +1630,58 @@ def test_the_task_finds_only_what_is_due(stamped):
     assert LayoutMoveTask.find_due_pictures(session, 10, due_at - 1) == []
     found = LayoutMoveTask.find_due_pictures(session, 10, due_at + 1)
     assert [picture.id for picture in found] == [stamped["picture_id"]]
+
+
+class _CountedPendingReads:
+    """A session whose pending-change collections count how often they are read.
+
+    ``Session.dirty`` and ``Session.deleted`` are rebuilt from the identity map
+    on every access, so a listener that reads one per row costs O(rows) per row.
+    """
+
+    def __init__(self, session):
+        self._session = session
+        self.reads = {"new": 0, "dirty": 0, "deleted": 0}
+
+    @property
+    def info(self):
+        return self._session.info
+
+    @property
+    def new(self):
+        self.reads["new"] += 1
+        return self._session.new
+
+    @property
+    def dirty(self):
+        self.reads["dirty"] += 1
+        return self._session.dirty
+
+    @property
+    def deleted(self):
+        self.reads["deleted"] += 1
+        return self._session.deleted
+
+
+def test_the_tracker_reads_the_pending_changes_once_per_flush(library):
+    """One read of each collection per flush, however many rows it holds.
+
+    Read per row, restoring a 50,000-picture Scrapheap spent most of its five
+    minutes rebuilding ``session.dirty`` inside this listener.
+    """
+    session = library["session"]
+    pictures = [Picture(file_path=f"bulk/{index}.png") for index in range(40)]
+    session.add_all(pictures)
+    session.commit()
+    for picture in pictures:
+        picture.score = 3
+    counted = _CountedPendingReads(session)
+    try:
+        assert len(session.dirty) == 40
+        _before_flush_layout_tracker(counted, None, None)
+        assert counted.reads == {"new": 1, "dirty": 1, "deleted": 1}
+    finally:
+        session.rollback()
 
 
 # ---------------------------------------------------------------------------

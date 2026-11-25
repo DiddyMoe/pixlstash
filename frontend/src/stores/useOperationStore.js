@@ -271,7 +271,7 @@ export const useOperationStore = defineStore("operation", () => {
   let pendingReceiptNote = null;
 
   /**
-   * A caller's rule for operations this tab must not narrate, or null.
+   * Rules for operations this tab must not narrate, one per owner.
    *
    * A background run records its work as many History steps under the origin
    * of the tab that started it, so that tab would narrate each step as its
@@ -279,8 +279,14 @@ export const useOperationStore = defineStore("operation", () => {
    * run. The run's progress has a surface of its own, so its owner keeps those
    * steps off the pill. Only narration is silenced: the steps stay in History
    * and on the undo stack, and the high-water mark still moves past them.
+   *
+   * Keyed by owner because more than one kind of run does this (the exact-tier
+   * auto-stack, the Scrapheap's restore), and one owner installing its rule
+   * must not lift another's.
+   *
+   * @type {Map<string, Function>}
    */
-  let narrationFilter = null;
+  const narrationFilters = new Map();
 
   // Highest operation id seen by a completed refresh. Used to tell a genuinely
   // new operation from a re-read of the same history - an id we have already
@@ -862,19 +868,23 @@ export const useOperationStore = defineStore("operation", () => {
     const mine =
       newest.origin_client_id && newest.origin_client_id === myClientId();
     if (!mine) return;
-    if (narrationFilter?.(newest)) return;
+    for (const holdsBack of narrationFilters.values()) {
+      if (holdsBack(newest)) return;
+    }
     showReceipt(buildReceipt(newest, newest.undoable ? "did" : "blocked"));
   }
 
   /**
    * Keep some of this tab's own operations off the receipt pill.
    *
+   * @param {string} owner - who installs the rule; a second call from the same
+   *   owner replaces its first, and leaves every other owner's alone.
    * @param {Function|null} filter - `(operation) => boolean`, true to stay
-   *   silent; null removes the rule. One owner at a time: a second call
-   *   replaces the first.
+   *   silent; anything that is not a function removes the owner's rule.
    */
-  function setNarrationFilter(filter) {
-    narrationFilter = typeof filter === "function" ? filter : null;
+  function setNarrationFilter(owner, filter) {
+    if (typeof filter === "function") narrationFilters.set(owner, filter);
+    else narrationFilters.delete(owner);
   }
 
   /**

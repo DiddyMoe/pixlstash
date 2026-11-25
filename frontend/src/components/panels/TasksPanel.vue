@@ -1787,6 +1787,9 @@ const tmLabelMap = {
   // The background Auto-stack run on the Duplicates screen: its groups, or for
   // an undo its History steps (`Vault` names the counter).
   duplicate_auto_stack: "Auto-stack",
+  // Emptying or restoring the Scrapheap in the background, or Delete forever
+  // and Restore on a selection of it: its pictures (`Vault` names the counter).
+  scrapheap_run: "Scrapheap",
 };
 
 const tmWorkerLabelMap = {

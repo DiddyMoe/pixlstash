@@ -8,7 +8,9 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
 )
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
@@ -18,7 +20,7 @@ from sqlalchemy import (
 )
 from sqlmodel import Session, select
 from starlette.concurrency import run_in_threadpool
-from typing import Optional
+from typing import Any, Literal, Optional
 
 from pixlstash.db_models import (
     Detection,
@@ -31,7 +33,18 @@ from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.scoring.prompt_match import looks_like_prompt
 from pixlstash.scoring.smart_score import is_anchor_score
-from pixlstash.services import operation_log_service, scrapheap_service
+from pixlstash.services import (
+    operation_log_service,
+    scrapheap_run_service,
+    scrapheap_service,
+)
+from pixlstash.services.scrapheap_run_service import (
+    ERROR_ACTIVE as SCRAPHEAP_RUN_ACTIVE,
+    ERROR_NOT_FOUND as SCRAPHEAP_RUN_NOT_FOUND,
+    ERROR_UNAVAILABLE as SCRAPHEAP_RUNS_UNAVAILABLE,
+    SEGMENT_PICTURE_CAP,
+    ScrapheapRunError,
+)
 from pixlstash.services.set_lock_service import (
     enforce_pictures_not_locked,
     locked_by_sets_for_picture,
@@ -320,6 +333,135 @@ class ScrapheapDeletePreviewResponse(BaseModel):
     # selection and spent by the first delete that presents it; re-run the
     # preview to get another.
     confirm_token: str = ""
+
+
+SCRAPHEAP_RUN_POLL_AFTER_S = 1
+"""``Retry-After`` on an active Scrapheap run: how often a client should poll.
+
+A run commits a 500-picture slice in about a third of a second, so a one-second
+poll moves the progress line visibly without reading the same counters twice."""
+
+SCRAPHEAP_RUN_ERROR_STATUS = {
+    SCRAPHEAP_RUN_ACTIVE: 409,
+    SCRAPHEAP_RUN_NOT_FOUND: 404,
+    SCRAPHEAP_RUNS_UNAVAILABLE: 503,
+}
+"""HTTP status per refused run request; the body carries the code itself."""
+
+
+class ScrapheapRunRequest(BaseModel):
+    """Start a background run that empties, deletes or restores Scrapheap pictures."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["purge", "restore"] = Field(
+        description=(
+            "`purge` destroys the pictures (Empty / Delete forever); `restore` "
+            "brings them back to the library."
+        )
+    )
+    picture_ids: Optional[list[int]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "The selection; omitted or null means the whole Scrapheap, resolved "
+            "to the pictures in it when the run starts."
+        ),
+    )
+    include_protected: bool = Field(
+        default=False,
+        description=(
+            "Purge only: also destroy protected reference-folder originals. "
+            "Ignored for a restore."
+        ),
+    )
+    confirm_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "Purge only, and required there: the token "
+            "`POST /pictures/scrapheap/delete-preview` minted for exactly this "
+            "selection. Single-use; ignored for a restore."
+        ),
+    )
+
+
+class ScrapheapRunView(BaseModel):
+    """One background Scrapheap run: the request and its progress."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str = Field(description="The run id; its status is `GET .../runs/{id}`.")
+    kind: str = Field(description="`purge` or `restore`.")
+    status: str = Field(
+        description=(
+            "`pending` (queued), `running`, then one of `complete`, `cancelled` "
+            "(stopped on request), `interrupted` (the server stopped; never "
+            "resumed) or `failed` (an unexpected error; see `error`). Whatever "
+            "committed before a run stopped stays committed; the pictures it "
+            "had not reached are still in the Scrapheap."
+        )
+    )
+    active: bool = Field(description="True while `pending` or `running`.")
+    include_protected: bool = Field(
+        description="A purge's choice to destroy protected originals too."
+    )
+    total: int = Field(description="Pictures the run set out to handle.")
+    processed: int = Field(description="Pictures handled so far, whatever the outcome.")
+    cancel_requested: bool = Field(description="A cancel is waiting for the slice.")
+    deleted_count: int = Field(description="Pictures destroyed (purge).")
+    skipped_count: int = Field(
+        description="Protected originals left in the Scrapheap (purge)."
+    )
+    skipped_locked_count: int = Field(
+        description="Pictures a locked picture set froze (purge)."
+    )
+    skipped_locked: list[int] = Field(
+        description=(
+            "Their ids, once the run has ended; empty while it runs, so a poll "
+            "never carries every id."
+        )
+    )
+    skipped_restored: int = Field(
+        description="Pictures that left the Scrapheap before their slice (purge)."
+    )
+    ghosts_kept: int = Field(description="Picture ghosts the hub kept (purge).")
+    ghosts_cascaded: int = Field(
+        description="Picture ghosts the hub destroyed (purge)."
+    )
+    restored_count: int = Field(description="Pictures brought back (restore).")
+    snapshots_with_deleted: Optional[list[dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Once a purge has ended: the snapshots still holding metadata for "
+            "the destroyed pictures, each `{id, kind, label, created_at, "
+            "matched_count}`."
+        ),
+    )
+    segment_batch_ids: list[str] = Field(
+        description=(
+            "The History batches a restore recorded into, oldest first, each at "
+            f"most {SEGMENT_PICTURE_CAP} pictures and one Ctrl+Z."
+        )
+    )
+    error_code: Optional[str] = Field(
+        default=None,
+        description="Why it ended early: `server_stopped` or `unexpected_error`.",
+    )
+    error: Optional[str] = Field(default=None, description="The detail, if any.")
+    created_at: Optional[str] = Field(default=None)
+    started_at: Optional[str] = Field(default=None)
+    updated_at: Optional[str] = Field(default=None)
+    finished_at: Optional[str] = Field(default=None)
+
+
+class ScrapheapRunLatestResponse(BaseModel):
+    """The newest run, so a reopened Scrapheap can pick one up again."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run: Optional[ScrapheapRunView] = Field(
+        description="The newest run of either kind; null before the first."
+    )
 
 
 # What the undo toast says. The direction is a property of the *request*, not of
@@ -1573,6 +1715,48 @@ def register_routes(router, server):
         )
         return preview
 
+    def _redeem_delete_confirmation(
+        request: Request, token: Optional[str], ids: Optional[list[int]]
+    ) -> None:
+        """Spend a delete-forever confirmation, or refuse the request.
+
+        A server-side intent check, NOT an authorization check (the AuthzGate
+        owns authorization: OWNER_ONLY in authz/registry.py). The type-to-
+        confirm dialog lives entirely in the client, so without this an
+        irreversible endpoint would accept a bare, bodyless request. Shared by
+        ``DELETE /pictures/scrapheap`` and a purge run, so neither can destroy
+        anything the preview was not fetched for.
+
+        Raises:
+            HTTPException: 400 when the token is missing; 409 when it is
+                unknown, spent, expired or minted for another selection.
+        """
+        confirmed, reason = scrapheap_confirmations.redeem(
+            token,
+            ids,
+            library_uuid=request.state.library_lease.library_uuid,
+            generation=request.state.library_lease.generation,
+        )
+        if confirmed:
+            return
+        if reason == scrapheap_service.CONFIRM_MISSING:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "confirm_token is required. Call POST "
+                    "/pictures/scrapheap/delete-preview and send back the "
+                    "confirm_token it returns; nothing was deleted."
+                ),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This delete confirmation is no longer valid (already used, "
+                "expired, or for a different selection). Nothing was "
+                "deleted - re-check what would be destroyed and try again."
+            ),
+        )
+
     @router.delete(
         "/pictures/scrapheap",
         summary="Permanently delete scrapheap pictures",
@@ -1618,34 +1802,11 @@ def register_routes(router, server):
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         ids = _parse_scrapheap_ids(payload)
-        # Server-side intent check, NOT an authorization check (the AuthzGate
-        # owns authorization: OWNER_ONLY in authz/registry.py). The type-to-
-        # confirm dialog lives entirely in the client, so without this the one
-        # irreversible endpoint in the product accepted a bare, bodyless DELETE.
-        confirmed, reason = scrapheap_confirmations.redeem(
+        _redeem_delete_confirmation(
+            request,
             payload.get("confirm_token") if isinstance(payload, dict) else None,
             ids,
-            library_uuid=request.state.library_lease.library_uuid,
-            generation=request.state.library_lease.generation,
         )
-        if not confirmed:
-            if reason == scrapheap_service.CONFIRM_MISSING:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "confirm_token is required. Call POST "
-                        "/pictures/scrapheap/delete-preview and send back the "
-                        "confirm_token it returns; nothing was deleted."
-                    ),
-                )
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "This delete confirmation is no longer valid (already used, "
-                    "expired, or for a different selection). Nothing was "
-                    "deleted - re-check what would be destroyed and try again."
-                ),
-            )
         # Default false: absent body (delete-all) never destroys protected
         # originals - that requires an explicit include_protected=true.
         include_protected = bool(
@@ -1693,6 +1854,147 @@ def register_routes(router, server):
             "ghosts_cascaded": outcome.ghosts_cascaded,
             "snapshots_with_deleted": snapshots_with_deleted,
         }
+
+    def _run_refused(exc: ScrapheapRunError) -> HTTPException:
+        """Map a refused run request to its status; the body names the code."""
+        status_code = SCRAPHEAP_RUN_ERROR_STATUS[exc.code]
+        logger.info("[scrapheap-run] request refused (%s): %s", exc.code, exc)
+        return HTTPException(
+            status_code=status_code,
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                "run": jsonable_encoder(exc.run),
+            },
+        )
+
+    def _set_poll_hint(response: Response, run: dict[str, Any]) -> None:
+        """Tell the client how often to poll a run that is still active."""
+        if run["active"]:
+            response.headers["Retry-After"] = str(SCRAPHEAP_RUN_POLL_AFTER_S)
+
+    @router.post(
+        "/pictures/scrapheap/runs",
+        summary="Empty, delete or restore Scrapheap pictures in the background",
+        description=(
+            "Records a run and returns 202 at once with the run, a `Location` "
+            "naming its status resource and a `Retry-After` poll hint; a "
+            "background task then works through the pictures in short writer "
+            "slices, so the request never waits on the work and other writes "
+            "keep getting the database between slices. Use this rather than "
+            "`DELETE /pictures/scrapheap` or `POST /pictures/scrapheap/restore` "
+            "for anything larger than a handful of pictures.\n\n"
+            "`kind: purge` destroys the selection exactly as "
+            "`DELETE /pictures/scrapheap` would, slice by slice (locked sets "
+            "frozen, protected originals kept unless `include_protected`), and "
+            "**requires the `confirm_token`** "
+            "`POST /pictures/scrapheap/delete-preview` minted for the same "
+            "selection: missing is 400, spent, expired or for another "
+            "selection is 409, and nothing starts. `kind: restore` brings the "
+            "selection back, recorded in History in segments of at most "
+            f"{SEGMENT_PICTURE_CAP} pictures, each one Ctrl+Z.\n\n"
+            "Omitting `picture_ids` means the whole Scrapheap as it is when "
+            "the run starts. One run at a time: while one is active this is "
+            "409 `scrapheap_run_active`, naming it. A server that runs no "
+            "background tasks answers 503 `scrapheap_runs_unavailable`."
+        ),
+        status_code=202,
+        response_model=ScrapheapRunView,
+        responses={
+            400: {"description": "A purge without its confirm_token."},
+            409: {
+                "description": (
+                    "A run is already active (`scrapheap_run_active`, with the "
+                    "run), or a purge's confirm_token is unknown, spent, "
+                    "expired or for a different selection."
+                )
+            },
+            503: {"description": "This server runs no background tasks."},
+        },
+    )
+    def post_scrapheap_run(
+        request: Request, response: Response, payload: ScrapheapRunRequest
+    ):
+        include_protected = False
+        if payload.kind == scrapheap_run_service.KIND_PURGE:
+            _redeem_delete_confirmation(
+                request, payload.confirm_token, payload.picture_ids
+            )
+            include_protected = payload.include_protected
+        # §21 origin discipline, read in the handler. A restore run mints its
+        # own History batches (one per segment), so the ambient gesture batch
+        # is not used.
+        context = operation_log_service.request_context(request)
+        context.pop("batch_id", None)
+        try:
+            run = scrapheap_run_service.start_run(
+                server.vault,
+                payload.kind,
+                picture_ids=payload.picture_ids,
+                include_protected=include_protected,
+                **context,
+            )
+        except ScrapheapRunError as exc:
+            raise _run_refused(exc) from exc
+        response.headers["Location"] = request.url_for(
+            "get_scrapheap_run", run_id=run["id"]
+        ).path
+        _set_poll_hint(response, run)
+        return run
+
+    # Declared before ``/runs/{run_id}`` so ``latest`` is never read as an id.
+    @router.get(
+        "/pictures/scrapheap/runs/latest",
+        summary="The newest Scrapheap run",
+        description=(
+            "The newest run of either kind, or `run: null` before the first. "
+            "A client reads it when the Scrapheap opens so a run started before "
+            "a reload, or in another tab, is picked up again. A read: it never "
+            "takes the writer."
+        ),
+        response_model=ScrapheapRunLatestResponse,
+    )
+    def get_latest_scrapheap_run():
+        return {"run": scrapheap_run_service.latest_run(server.vault)}
+
+    @router.get(
+        "/pictures/scrapheap/runs/{run_id}",
+        summary="A Scrapheap run's status and progress",
+        description=(
+            "The run's status and counters. While it is active the response "
+            "carries `Retry-After`, the interval to poll at. Runs live in "
+            "memory, so after a restart an old id is 404. A read: it never "
+            "takes the writer."
+        ),
+        response_model=ScrapheapRunView,
+    )
+    def get_scrapheap_run(run_id: str, response: Response):
+        try:
+            run = scrapheap_run_service.get_run(server.vault, run_id)
+        except ScrapheapRunError as exc:
+            raise _run_refused(exc) from exc
+        _set_poll_hint(response, run)
+        return run
+
+    @router.post(
+        "/pictures/scrapheap/runs/{run_id}/cancel",
+        summary="Stop a Scrapheap run",
+        description=(
+            "A queued run is cancelled at once. A running one stops at its next "
+            "slice, within about a second; poll the run for `cancelled`. Nothing "
+            "is rolled back: what a purge destroyed stays destroyed and what a "
+            "restore brought back stays restored (and undoable). An ended run "
+            "is returned unchanged, so a repeated cancel is harmless."
+        ),
+        response_model=ScrapheapRunView,
+    )
+    def post_cancel_scrapheap_run(run_id: str, response: Response):
+        try:
+            run = scrapheap_run_service.cancel_run(server.vault, run_id)
+        except ScrapheapRunError as exc:
+            raise _run_refused(exc) from exc
+        _set_poll_hint(response, run)
+        return run
 
     @router.delete(
         "/pictures/{id}",

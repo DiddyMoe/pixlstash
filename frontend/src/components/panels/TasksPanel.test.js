@@ -1430,6 +1430,27 @@ describe("the GPU queue in the task manager", () => {
     ]);
   });
 
+  it("names a background Scrapheap run by the place it works on", () => {
+    // The worker's counter is `scrapheap_run`; spelled out it would read
+    // "Scrapheap Run", and no control the user pressed is called a run.
+    const tasksStore = setGpu(gpuAnswer({ leases: [] }));
+    tasksStore.workerSnapshots = {
+      ScrapheapRunTask: {
+        label: "scrapheap_run",
+        current: 12500,
+        total: 50123,
+        running: true,
+        active: true,
+      },
+    };
+    localStorage.setItem("pixlstash:tasks:pixlstash-fold", "1");
+    const wrapper = mount(TasksPanel, globalOpts);
+    const rows = wrapper.findAll('[data-testid="tm-pixl-child"]');
+    expect(rows.map((row) => row.find(".tm-child-name").text())).toEqual([
+      "Scrapheap 12500 / 50123",
+    ]);
+  });
+
   it("marks a task the backend stopped as stopped, not as lost", async () => {
     setGpu(
       gpuAnswer({

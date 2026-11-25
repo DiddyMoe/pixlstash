@@ -2400,7 +2400,7 @@ The backend's [EventType](../pixlstash/event_types.py) enum names are **not** se
 | `origin_client_id` | `string` \| `null` | The `X-Client-Id` of the originating tab, or `null` for background/external work. **The primary signal** — a tab recognises the echo of its own change by matching this against its own id. |
 | `picture_ids` | `number[]` | Affected picture ids. |
 | `fields` | `string[]` (optional) | Columns that changed (e.g. `["smart_score"]`); drives the silent-vs-sort-changed decision. Omitted for edits that may affect any view (user edits, imports). Four values are **not** columns and name a routing class instead: `detections` and `faces` (card content; a face redetect's event also carries `new_faces`, the count of faces it added), `pixels` (the picture's own bytes were rewritten — see §8.3) and `stack_count` (the stack's live member count, derived by the listing endpoint and re-read by its own targeted call). See §8.2. |
-| `change_kind` | `"added"` \| `"updated"` \| `"removed"` \| `"restored"` (optional) | Set at the emit site where cheap (`removed` on deletes is free; `added` is implicit for `picture_imported`). **Omitted entirely when unset** — the SPA infers `added` for `picture_imported` and falls back to `updated` otherwise. `"restored"` is a scrapheap comeback (undo of a move, or `POST /pictures/scrapheap/restore`): the card returns, but the picture is **not** new to the vault, so the sidebar must not raise its NEW marker for it. The value set is a closed allowlist on **both** ends — `WsBroadcasterMixin.CHANGE_KINDS` and `resolveChangeKind` — and each silently degrades an unknown kind (the backend drops the field, the SPA falls back to `updated`), so the two move together or not at all. |
+| `change_kind` | `"added"` \| `"updated"` \| `"removed"` \| `"restored"` (optional) | Set at the emit site where cheap (`removed` on deletes is free; `added` is implicit for `picture_imported`). **Omitted entirely when unset** — the SPA infers `added` for `picture_imported` and falls back to `updated` otherwise. `"restored"` is a scrapheap comeback (undo of a move, `POST /pictures/scrapheap/restore`, or a restore run, §11.4): the card returns, but the picture is **not** new to the vault, so the sidebar must not raise its NEW marker for it. The value set is a closed allowlist on **both** ends — `WsBroadcasterMixin.CHANGE_KINDS` and `resolveChangeKind` — and each silently degrades an unknown kind (the backend drops the field, the SPA falls back to `updated`), so the two move together or not at all. |
 
 Per-type payload specifics (all carry the envelope fields above):
 
@@ -2921,8 +2921,9 @@ Auto-stack once stacked a whole library's exact tier (~169k groups at 14-24 ms
 each, about an hour) inside one `POST`; the client's 60 s timeout fired while
 the server kept going, and the client could only say the outcome was unknown.
 Such work is now a **run**: a row that is both the request and its progress,
-worked by a background task in short writer slices. Auto-stack (§19) is the only
-run today; a second one copies this shape rather than inventing another.
+worked by a background task in short writer slices. Auto-stack (§19) was the
+first run and emptying or restoring the Scrapheap (below) is the second; a third
+copies this shape rather than inventing another.
 
 The pattern is the async request-reply / long-running-operation one
 ([Azure Async Request-Reply](https://learn.microsoft.com/azure/architecture/patterns/async-request-reply),
@@ -2964,6 +2965,50 @@ interactive writes get the single SQLite writer
 ([WAL: one writer at a time](https://www.sqlite.org/wal.html)) between them. A
 run left `pending` or `running` by a server that stopped is closed
 `interrupted` at start-up.
+
+**Scrapheap runs: `POST /pictures/scrapheap/runs`.** Empty scrapheap, Delete
+forever on a selection, Restore all and Restore on a selection. A purge at about
+0.7 ms a picture held the writer past the 60 s timeout on a 50,000-picture heap.
+The body is `{kind: "purge" | "restore", picture_ids?, include_protected,
+confirm_token}` (unknown fields are 422). An omitted `picture_ids` means the
+whole heap **as it is when the run starts**, so a picture scrapheaped after the
+confirm is not destroyed by it. A purge requires the `confirm_token` that
+`POST /pictures/scrapheap/delete-preview` minted for the same selection, with the
+same refusals as `DELETE /pictures/scrapheap`: 400 when it is missing, and 409
+when it is spent, expired or for another selection. The token is spent even if
+the start is then refused, so a retry re-runs the preview. Status, latest and
+cancel are `GET …/runs/{id}`, `GET …/runs/latest` and `POST …/runs/{id}/cancel`
+under `/pictures/scrapheap`. `Retry-After` is 1 s. The counters are `total`,
+`processed`, `deleted_count`, `restored_count`, `skipped_count` (protected
+kept), `skipped_locked_count` / `skipped_locked` (locked-set members kept, ids
+included so the grid can select them), `skipped_restored` (left the heap before
+their slice) and, on a finished purge, `snapshots_with_deleted`. A restore
+reports `segment_batch_ids`: it records History in segments of at most 5,000
+pictures, each one Ctrl+Z (backend §5). Refusals follow the shape above:
+`scrapheap_run_active` (409, one run of either kind at a time),
+`scrapheap_run_not_found` (404) and `scrapheap_runs_unavailable` (503, a server
+with no background workers; nothing is reserved). Each is
+`{ "detail": { "code", "message", "run" } }`.
+
+It differs from auto-stack in two places, both on purpose:
+
+- **No `request_id`.** The client does not resend an unanswered start. It reads
+  `GET …/runs/latest` and follows the run it finds, so a start that reached the
+  server shows its progress and is never doubled. A purge cannot be doubled in
+  any case, because its `confirm_token` is single-use.
+- **In memory, not a row.** A purge leaves nothing to revert and a restore's
+  undo is History's, so nothing needs a run once it ends. A restart therefore
+  forgets every run (an old id is 404 and `latest` is `run: null`), rather than
+  closing them `interrupted` at start-up. A stopping server still closes the
+  active run `interrupted` at its next slice boundary. What committed stays
+  committed and the rest is still in the Scrapheap, so starting again finishes
+  the job.
+
+Its events are the ordinary ones (§8): `pictures_changed` with `removed` for a
+purge and `restored` for a restore, coalesced to at most one every 2 s, carrying
+the starting request's `origin_client_id`. `DELETE /pictures/scrapheap` and
+`POST /pictures/scrapheap/restore` remain for a single picture and for API
+clients.
 
 ## 12. Configuration Sync
 

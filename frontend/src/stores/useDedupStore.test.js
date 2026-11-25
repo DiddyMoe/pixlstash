@@ -1398,7 +1398,7 @@ describe("useDedupStore - the verdict receipt", () => {
       });
       await store.startAutoStack();
       expect(useOperationStore().setNarrationFilter).toHaveBeenCalledTimes(1);
-      const heldBack = useOperationStore().setNarrationFilter.mock.calls[0][0];
+      const heldBack = useOperationStore().setNarrationFilter.mock.calls[0][1];
       const stackOp = (batchId) => ({
         batch_id: batchId,
         op_type: "dedup.stack",
@@ -3813,7 +3813,7 @@ describe("useDedupStore - the auto-stack run", () => {
   // on, on the server.
   it("forgets the run at a session reset and drops an answer still on the wire", async () => {
     const store = await followRun({ segment_batch_ids: ["seg-1"] });
-    const heldBack = useOperationStore().setNarrationFilter.mock.calls[0][0];
+    const heldBack = useOperationStore().setNarrationFilter.mock.calls[0][1];
     expect(heldBack({ batch_id: "seg-1", op_type: "dedup.stack" })).toBe(true);
     const late = deferred();
     getAutoStackRun.mockReturnValueOnce(late.promise);

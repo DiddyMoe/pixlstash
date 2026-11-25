@@ -26,8 +26,11 @@ import {
   deletePictures,
   movePicturesToLibrary,
   setPicturesProject,
-  purgeScrapheap,
   restoreScrapheap,
+  startScrapheapRun,
+  getScrapheapRun,
+  getLatestScrapheapRun,
+  cancelScrapheapRun,
   startExport,
   getExportStatus,
   downloadExport,
@@ -221,39 +224,6 @@ describe("api/pictures", () => {
     });
   });
 
-  // Omitting the ids means "empty the whole heap", so the key must not appear
-  // as undefined and accidentally scope the purge to nothing.
-  it("purgeScrapheap omits picture_ids when emptying everything", async () => {
-    apiClient.delete.mockResolvedValue({ data: {} });
-    await purgeScrapheap({ includeProtected: true, confirmToken: "tok-a" });
-    expect(apiClient.delete).toHaveBeenCalledWith("/pictures/scrapheap", {
-      data: { include_protected: true, confirm_token: "tok-a" },
-    });
-  });
-
-  it("purgeScrapheap scopes to the given ids when they are supplied", async () => {
-    apiClient.delete.mockResolvedValue({ data: {} });
-    await purgeScrapheap({ pictureIds: [3], confirmToken: "tok-b" });
-    expect(apiClient.delete).toHaveBeenCalledWith("/pictures/scrapheap", {
-      data: {
-        include_protected: false,
-        confirm_token: "tok-b",
-        picture_ids: [3],
-      },
-    });
-  });
-
-  // The server refuses the purge without the preview's single-use
-  // confirm_token, so the field must always be on the wire - never silently
-  // dropped when a caller forgets it.
-  it("purgeScrapheap always sends confirm_token", async () => {
-    apiClient.delete.mockResolvedValue({ data: {} });
-    await purgeScrapheap({});
-    expect(apiClient.delete).toHaveBeenCalledWith("/pictures/scrapheap", {
-      data: { include_protected: false, confirm_token: undefined },
-    });
-  });
-
   it("restoreScrapheap sends no body when restoring everything", async () => {
     apiClient.post.mockResolvedValue({ data: {} });
     await restoreScrapheap();
@@ -269,6 +239,97 @@ describe("api/pictures", () => {
     expect(apiClient.post).toHaveBeenCalledWith("/pictures/scrapheap/restore", {
       picture_ids: [3],
     });
+  });
+
+  // The run request forbids unknown fields, so each kind sends only its own:
+  // a restore carrying include_protected or confirm_token would be a 422.
+  it("startScrapheapRun sends a whole-heap purge with its token and no ids", async () => {
+    const run = { id: "run-a", active: true };
+    apiClient.post.mockResolvedValue({
+      data: run,
+      headers: { "retry-after": "1" },
+    });
+    const reply = await startScrapheapRun({
+      kind: "purge",
+      includeProtected: true,
+      confirmToken: "test-token-a",
+    });
+    expect(apiClient.post).toHaveBeenCalledWith("/pictures/scrapheap/runs", {
+      kind: "purge",
+      include_protected: true,
+      confirm_token: "test-token-a",
+    });
+    expect(reply.run).toBe(run);
+    expect(reply.retryAfterMs).toBe(1000);
+  });
+
+  it("startScrapheapRun scopes a purge to the selection", async () => {
+    apiClient.post.mockResolvedValue({ data: { id: "run-b" }, headers: {} });
+    await startScrapheapRun({
+      kind: "purge",
+      pictureIds: [3, 4],
+      confirmToken: "test-token-b",
+    });
+    expect(apiClient.post).toHaveBeenCalledWith("/pictures/scrapheap/runs", {
+      kind: "purge",
+      picture_ids: [3, 4],
+      include_protected: false,
+      confirm_token: "test-token-b",
+    });
+  });
+
+  // The server refuses a purge without the preview's single-use
+  // confirm_token, so the field must always be on the wire - never silently
+  // dropped when a caller forgets it.
+  it("startScrapheapRun always sends confirm_token on a purge", async () => {
+    apiClient.post.mockResolvedValue({ data: { id: "run-d" }, headers: {} });
+    await startScrapheapRun({ kind: "purge" });
+    expect(apiClient.post).toHaveBeenCalledWith("/pictures/scrapheap/runs", {
+      kind: "purge",
+      include_protected: false,
+      confirm_token: undefined,
+    });
+  });
+
+  it("startScrapheapRun sends a restore with no purge-only fields", async () => {
+    apiClient.post.mockResolvedValue({ data: { id: "run-c" }, headers: {} });
+    await startScrapheapRun({
+      kind: "restore",
+      pictureIds: [7],
+      includeProtected: true,
+      confirmToken: "test-token-c",
+    });
+    expect(apiClient.post).toHaveBeenCalledWith("/pictures/scrapheap/runs", {
+      kind: "restore",
+      picture_ids: [7],
+    });
+  });
+
+  it("getScrapheapRun and cancelScrapheapRun address the run by its id", async () => {
+    apiClient.get.mockResolvedValue({ data: { id: "a/b" }, headers: {} });
+    apiClient.post.mockResolvedValue({
+      data: { id: "a/b", active: true },
+      headers: { "retry-after": "1" },
+    });
+    expect((await getScrapheapRun("a/b")).retryAfterMs).toBeNull();
+    expect(apiClient.get).toHaveBeenCalledWith(
+      "/pictures/scrapheap/runs/a%2Fb",
+    );
+    expect((await cancelScrapheapRun("a/b")).retryAfterMs).toBe(1000);
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/pictures/scrapheap/runs/a%2Fb/cancel",
+    );
+  });
+
+  it("getLatestScrapheapRun unwraps the run, and null before the first", async () => {
+    const run = { id: "run-d" };
+    apiClient.get.mockResolvedValueOnce({ data: { run } });
+    expect(await getLatestScrapheapRun()).toBe(run);
+    expect(apiClient.get).toHaveBeenCalledWith(
+      "/pictures/scrapheap/runs/latest",
+    );
+    apiClient.get.mockResolvedValueOnce({ data: { run: null } });
+    expect(await getLatestScrapheapRun()).toBeNull();
   });
 
   it("startExport appends the selection query", async () => {

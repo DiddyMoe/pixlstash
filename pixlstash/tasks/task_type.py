@@ -28,6 +28,7 @@ class TaskType(str, Enum):
     GFS_SNAPSHOT = "EnsureGfsSnapshotTask"
     TAG_HEALTH_AUTO_REBUILD = "TagHealthAutoRebuildTask"
     SCRAPHEAP_RETENTION_PURGE = "ScrapheapRetentionPurgeTask"
+    SCRAPHEAP_RUN = "ScrapheapRunTask"
     PENDING_SCORE_INVALIDATION = "PendingScoreInvalidationTask"
     THUMBNAIL_GENERATION = "ThumbnailGenerationTask"
     PIXEL_SHA = "PixelShaTask"

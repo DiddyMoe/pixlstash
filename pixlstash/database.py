@@ -419,7 +419,12 @@ def _before_flush_layout_tracker(session, flush_context, instances) -> None:
     whenever something about it changes.
     """
     dirty_pids: set = session.info.setdefault("_layout_dirty_pids", set())
-    for obj in itertools.chain(session.new, session.dirty, session.deleted):
+    # Both are rebuilt from the identity map on every access, so read once per
+    # flush. Tested per row they made this listener quadratic: restoring 50,000
+    # pictures spent most of its five minutes here.
+    dirty = session.dirty
+    deleted = session.deleted
+    for obj in itertools.chain(session.new, dirty, deleted):
         if isinstance(obj, (PictureSetMember, PictureProjectMember)):
             if obj.picture_id is not None:
                 dirty_pids.add(obj.picture_id)
@@ -431,7 +436,7 @@ def _before_flush_layout_tracker(session, flush_context, instances) -> None:
             # narrowing, so face *detection* does not stamp the library.
             changed = (
                 obj.character_id is not None
-                if obj in session.deleted
+                if obj in deleted
                 else _attribute_changed(obj, "character_id")
             )
             if changed:
@@ -440,7 +445,7 @@ def _before_flush_layout_tracker(session, flush_context, instances) -> None:
             # Deliberately NOT session.new: a picture that has just been created
             # is either where the engine placed it or where the owner already
             # had it, and both are true by construction.
-            if obj in session.dirty and _attribute_changed(obj, "project_id"):
+            if obj in dirty and _attribute_changed(obj, "project_id"):
                 dirty_pids.add(obj.id)
 
 

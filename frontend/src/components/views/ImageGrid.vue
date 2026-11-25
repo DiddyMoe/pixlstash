@@ -282,9 +282,13 @@
       :visible="showScrapheapBar"
       :disabled="scrapheapEmptyDisabled"
       :restoreDisabled="scrapheapRestoreDisabled"
+      :run="scrapheapRunStore.run"
+      :run-unreachable="scrapheapRunStore.unreachable"
+      :run-action="scrapheapRunStore.action"
       :retention-label="scrapheapRetentionLabel"
       @empty-scrapheap="confirmEmptyScrapheap"
       @restore-scrapheap="confirmRestoreScrapheap"
+      @stop-run="stopScrapheapRun"
       @open-retention-settings="emit('open-settings', 'scrapheap')"
     />
     <SnapshotsWithDeletedDialog
@@ -1326,6 +1330,7 @@ import { useLockedSetsStore } from "../../stores/useLockedSetsStore";
 import { useRunDialogStore } from "../../stores/useRunDialogStore";
 import { useNewBatchStore } from "../../stores/useNewBatchStore";
 import { useScrapheapRetentionStore } from "../../stores/useScrapheapRetentionStore";
+import { useScrapheapRunStore } from "../../stores/useScrapheapRunStore";
 import {
   GHOST_PENDING,
   useOperationStore,
@@ -1360,6 +1365,11 @@ import {
   coverBboxRect,
 } from "../../utils/squareCrop.js";
 import { errorMessage, requestFailure } from "../../utils/apiError.js";
+import {
+  SCRAPHEAP_GESTURES,
+  scrapheapRunFailureSentence,
+  scrapheapRunOutcomeNotice,
+} from "../../utils/scrapheapRun.js";
 import {
   isSupportedImageFile,
   isSupportedVideoFile,
@@ -1413,7 +1423,6 @@ import {
   movePicturesToLibrary,
   setPicturesProject,
   previewScrapheapDelete,
-  purgeScrapheap,
   restoreScrapheap,
   openPictureLocation,
   openPictureWith,
@@ -3405,6 +3414,10 @@ const tasksStore = useTasksStore();
 const reviewSessionsStore = useReviewSessionsStore();
 const lockedSetsStore = useLockedSetsStore();
 const scrapheapRetentionStore = useScrapheapRetentionStore();
+// Emptying, restoring all, and Delete forever or Restore on a selection run on
+// the server in slices (`POST /pictures/scrapheap/runs`); the store follows the
+// one run the server allows at a time, and the bar above the grid shows it.
+const scrapheapRunStore = useScrapheapRunStore();
 const operationStore = useOperationStore();
 // Every failure path in this component reports through the notice surface. A
 // native alert() is unstyled, blocking and focus-stealing; a bare `catch` that
@@ -3570,28 +3583,15 @@ async function removeFromGroup() {
       clearFaceSelection();
       return;
     }
-    restoreScrapheap(pictureIds)
-      .catch((err) => {
-        console.error("Failed to restore pictures from the scrapheap", err);
-        noticeStore.error(
-          `Couldn't restore those pictures. ${errorDetail(err)}`,
-          { key: "scrapheap-restore-selection" },
-        );
-      })
-      .finally(() => {
-        allGridImages.value = allGridImages.value.filter(
-          (img) => !pictureIds.includes(img.id),
-        );
-        selectedImageIds.value = [];
-        clearFaceSelection();
-        lastSelectedImageId.value = null;
-        fetchAllGridImages().then(() => {
-          loadedRanges.value = [];
-          updateVisibleThumbnails();
-          emit("refresh-sidebar");
-        });
-        updateVisibleThumbnails();
-      });
+    if (refuseWhileScrapheapRunBusy(SCRAPHEAP_GESTURES.RESTORE_SELECTION)) {
+      return;
+    }
+    // A background run, like the heap's other bulk work: a selection can be
+    // the whole heap. The selection stays until the run ends and settles it.
+    await beginScrapheapRun(
+      { kind: "restore", pictureIds },
+      { gesture: SCRAPHEAP_GESTURES.RESTORE_SELECTION, ids: pictureIds },
+    );
     return;
   }
   // Remove from character
@@ -5228,6 +5228,9 @@ watch(
     if (!isScrapheap) return;
     purgeNowMs.value = Date.now();
     scrapheapRetentionStore.fetchRetention();
+    // A run started in another tab, or before a reload, shows on the bar here:
+    // the sidebar's once-per-session look may predate it.
+    if (!isReadOnly.value) scrapheapRunStore.resume({ force: true });
   },
   { immediate: true },
 );
@@ -5344,7 +5347,6 @@ function compareSelection() {
   openLightbox({ id: after.id });
 }
 
-const scrapheapEmptying = ref(false);
 const showSelectionBar = computed(() => {
   return selectedImageIds.value.length > 0 || selectedFaceIds.value.length > 0;
 });
@@ -5705,17 +5707,21 @@ const arrivingWrapperStyle = computed(() => ({
   left: "0",
   right: "0",
 }));
+// A Scrapheap run, or a request about one, is under way: the server runs one
+// at a time, so every gesture that would start another waits for it.
+const scrapheapRunBusy = computed(
+  () => scrapheapRunStore.active || scrapheapRunStore.action != null,
+);
 const scrapheapEmptyDisabled = computed(() => {
   return (
-    scrapheapEmptying.value ||
+    scrapheapRunBusy.value ||
     imagesLoading.value ||
     filteredGridCount.value === 0
   );
 });
-const scrapheapRestoring = ref(false);
 const scrapheapRestoreDisabled = computed(() => {
   return (
-    scrapheapRestoring.value ||
+    scrapheapRunBusy.value ||
     imagesLoading.value ||
     filteredGridCount.value === 0
   );
@@ -5759,6 +5765,7 @@ const deleteForeverScoped = ref(false);
 const deleteForeverConfirmToken = ref("");
 
 function openDeleteForeverForSelection(ids, scoped = false) {
+  if (refuseWhileScrapheapRunBusy(SCRAPHEAP_GESTURES.PURGE_SELECTION)) return;
   deleteForeverMode.value = "selection";
   deleteForeverScoped.value = scoped;
   deleteForeverIds.value = ids.slice();
@@ -5766,6 +5773,7 @@ function openDeleteForeverForSelection(ids, scoped = false) {
 }
 
 function openDeleteForeverForAll() {
+  if (refuseWhileScrapheapRunBusy(SCRAPHEAP_GESTURES.EMPTY)) return;
   deleteForeverMode.value = "all";
   deleteForeverScoped.value = false;
   deleteForeverIds.value = [];
@@ -5848,68 +5856,150 @@ async function runScrapheapSelectionPurge(idsToRemove, includeProtected) {
     deleteForeverOpen.value = false;
     return;
   }
+  await beginScrapheapPurge(
+    { pictureIds: idsToRemove, includeProtected },
+    {
+      gesture: SCRAPHEAP_GESTURES.PURGE_SELECTION,
+      ids: idsToRemove.slice(),
+      scoped: deleteForeverScoped.value,
+    },
+  );
+}
+
+function showSnapshotsWithDeleted(snaps) {
+  if (userPrefsStore.hidePurgeSnapshotWarning) return;
+  if (Array.isArray(snaps) && snaps.length) {
+    snapshotsWithDeleted.value = snaps;
+    snapshotsWithDeletedOpen.value = true;
+  }
+}
+
+// Only a run already under way blocks this. It must NOT be gated on
+// `scrapheapEmptyDisabled`'s grid terms: `imagesLoading || filteredGridCount ===
+// 0` describe the loaded grid, not the heap. The sidebar context menu navigates
+// here and asks for the confirm in the same gesture, so it always arrives while
+// the view-switch fetch is still in flight and the grid has just been reset - the
+// request was silently dropped and the menu item looked like it only navigated.
+// What is actually in the heap is decided one step later by the AUTHORITATIVE
+// server preview, which counts the whole heap (the grid can undercount) and
+// declines to open the dialog when there is nothing to delete.
+function confirmEmptyScrapheap() {
+  // Route through the tokenized Delete-forever confirm (names any reference-folder
+  // originals being destroyed); the purge runs on @confirm.
+  openDeleteForeverForAll();
+}
+
+async function runEmptyScrapheap(includeProtected) {
+  // The user has typed the confirm and we hold a single-use server token for
+  // exactly this purge; the grid's load state must not veto it, or a refetch
+  // that lands while the dialog is open would swallow a confirmed deletion. The
+  // store refuses a second request while one is on the wire, and the server a
+  // second run; the server re-validates the token and the scope.
+  await beginScrapheapPurge(
+    { includeProtected },
+    { gesture: SCRAPHEAP_GESTURES.EMPTY },
+  );
+}
+
+async function confirmRestoreScrapheap() {
+  if (refuseWhileScrapheapRunBusy(SCRAPHEAP_GESTURES.RESTORE_ALL)) return;
+  if (scrapheapRestoreDisabled.value) return;
+  const confirmed = confirm(
+    "Restore all scrapheap pictures? This will make them visible again.",
+  );
+  if (!confirmed) return;
+  await beginScrapheapRun(
+    { kind: "restore" },
+    { gesture: SCRAPHEAP_GESTURES.RESTORE_ALL },
+  );
+}
+
+// ── The Scrapheap's background runs ─────────────────────────────────────────
+// Emptying the heap, restoring all of it, and Delete forever or Restore on a
+// selection each start a run on the server (`POST /pictures/scrapheap/runs`)
+// that works through the pictures in slices. They used to be one request that
+// did everything before answering, which a heap of tens of thousands of
+// pictures outlasted: the request timed out at the client while the server
+// carried on, and the user was told it had failed. The start now answers at
+// once; the bar above the grid shows the run's progress and a Stop, and what
+// the old answer used to trigger happens when the run ends
+// (`settleScrapheapRun`).
+
+/** The notice key each gesture's start failure is shown under. */
+const SCRAPHEAP_FAILURE_KEYS = Object.freeze({
+  [SCRAPHEAP_GESTURES.EMPTY]: "scrapheap-empty",
+  [SCRAPHEAP_GESTURES.PURGE_SELECTION]: "scrapheap-purge",
+  [SCRAPHEAP_GESTURES.RESTORE_ALL]: "scrapheap-restore-all",
+  [SCRAPHEAP_GESTURES.RESTORE_SELECTION]: "scrapheap-restore-selection",
+});
+
+/**
+ * Refuse a gesture that would start a run while one is under way, and say so.
+ *
+ * Asked before any confirm opens, so nobody types a confirmation the server
+ * would refuse. Never silent: the sidebar's Empty arrives through here, and a
+ * request dropped without a word looked like the menu item only navigated.
+ *
+ * @param {string} gesture - one of SCRAPHEAP_GESTURES.
+ * @returns {boolean} true when the gesture was refused.
+ */
+function refuseWhileScrapheapRunBusy(gesture) {
+  if (!scrapheapRunBusy.value) return false;
+  const error = scrapheapRunStore.active
+    ? {
+        kind: "conflict",
+        code: "scrapheap_run_active",
+        run: scrapheapRunStore.run,
+      }
+    : { kind: "busy" };
+  noticeStore.info(scrapheapRunFailureSentence("start", error, gesture), {
+    key: "scrapheap-run-busy",
+  });
+  return true;
+}
+
+/**
+ * Start a run for one of the gestures. Only a start that did not go through
+ * is reported here; how the run ended is settled when it does.
+ *
+ * @param {Object} options - the store's `start` options, without `context`.
+ * @param {Object} context - `{gesture, ...}`, handed back with the outcome.
+ * @returns {Promise<boolean>} whether the run started.
+ */
+async function beginScrapheapRun(options, context) {
+  const result = await scrapheapRunStore.start({ ...options, context });
+  if (result.ok) return true;
+  // The store has logged the refusal and its cause. A start that went
+  // unanswered may still have queued a run, so the counts are re-read.
+  emit("refresh-sidebar");
+  const message = scrapheapRunFailureSentence(
+    "start",
+    result.error,
+    context.gesture,
+  );
+  if (!message) return false;
+  // A run that is going (somebody else's, or this one, unanswered) is on the
+  // bar already: a caution, not a failure.
+  const level = result.error?.run?.active ? "warning" : "error";
+  noticeStore[level](message, { key: SCRAPHEAP_FAILURE_KEYS[context.gesture] });
+  return false;
+}
+
+/**
+ * Start a purge with the Delete-forever confirm's token, and close the
+ * confirm: from here the bar carries the run.
+ */
+async function beginScrapheapPurge(options, context) {
   deleteForeverBusy.value = true;
   try {
-    const resp = await purgeScrapheap({
-      pictureIds: idsToRemove,
-      includeProtected,
-      confirmToken: deleteForeverConfirmToken.value,
-    });
-    // Locked pictures survive a purge too, and this endpoint reports them under
-    // the same `skipped_locked` name as the bulk soft-delete. Same rule as
-    // there: never drop a tile the server kept.
-    const skippedLocked = new Set(
-      (Array.isArray(resp?.data?.skipped_locked)
-        ? resp.data.skipped_locked
-        : []
-      ).map(String),
+    await beginScrapheapRun(
+      {
+        ...options,
+        kind: "purge",
+        confirmToken: deleteForeverConfirmToken.value,
+      },
+      context,
     );
-    if (includeProtected) {
-      removeImagesById(
-        idsToRemove.filter((id) => !skippedLocked.has(String(id))),
-      );
-    } else {
-      // The protected originals in the selection are intentionally kept - refetch
-      // so the grid reflects exactly what the server removed.
-      preserveScrollOnNextFetch.value = true;
-      debouncedFetchAllGridImages();
-    }
-    // Grid path only: keep the frozen pictures selected so the user can retry
-    // after unlocking. The lightbox-scoped path leaves the grid selection alone.
-    if (!deleteForeverScoped.value) {
-      selectedImageIds.value = selectedImageIds.value.filter((id) =>
-        skippedLocked.has(String(id)),
-      );
-      const stillSelected = new Set(selectedImageIds.value.map(String));
-      if (!stillSelected.has(String(lastSelectedImageId.value))) {
-        lastSelectedImageId.value = null;
-      }
-    }
-    if (deleteForeverScoped.value) {
-      // The lightbox's one picture. Kept when it is a protected original the
-      // confirm chose to spare, or a locked one.
-      const kept = !includeProtected && deleteForeverProtectedCount.value > 0;
-      leaveDeletedLightboxPictures(
-        kept ? [] : idsToRemove.filter((id) => !skippedLocked.has(String(id))),
-      );
-    }
-    updateVisibleThumbnails();
-    emit("refresh-sidebar");
-    showSnapshotsWithDeleted(resp);
-    showLockedDeleteNotice(
-      buildLockedDeleteMessage({
-        lockedCount: skippedLocked.size,
-        // Counted from the server's own report, not from what we asked for.
-        deletedCount: idsToRemove.length - skippedLocked.size,
-      }),
-    );
-  } catch (err) {
-    console.error("Scrapheap purge failed", err);
-    // A failed purge can still have destroyed rows, so the counts are re-read.
-    emit("refresh-sidebar");
-    noticeStore.error(`Couldn't delete those pictures. ${errorDetail(err)}`, {
-      key: "scrapheap-purge",
-    });
   } finally {
     // The server spends the confirmation on the first attempt, so a retry must
     // go back through the preview rather than replaying a dead token.
@@ -5919,100 +6009,129 @@ async function runScrapheapSelectionPurge(idsToRemove, includeProtected) {
   }
 }
 
-function showSnapshotsWithDeleted(response) {
-  if (userPrefsStore.hidePurgeSnapshotWarning) return;
-  const snaps = response?.data?.snapshots_with_deleted;
-  if (Array.isArray(snaps) && snaps.length) {
-    snapshotsWithDeleted.value = snaps;
-    snapshotsWithDeletedOpen.value = true;
-  }
+/** The bar's Stop: the run ends after its current slice. */
+async function stopScrapheapRun() {
+  const result = await scrapheapRunStore.cancel();
+  if (result.ok) return;
+  const message = scrapheapRunFailureSentence("stop", result.error);
+  if (message) noticeStore.error(message, { key: "scrapheap-run-stop" });
 }
 
-// Only re-entrancy blocks this. It must NOT be gated on `scrapheapEmptyDisabled`:
-// that computed exists for the placeholder button's `:disabled` state, and its
-// `imagesLoading || filteredGridCount === 0` terms describe the loaded grid, not
-// the heap. The sidebar context menu navigates here and asks for the confirm in
-// the same gesture, so it always arrives while the view-switch fetch is still in
-// flight and the grid has just been reset - the request was silently dropped and
-// the menu item looked like it only navigated. What is actually in the heap is
-// decided one step later by the AUTHORITATIVE server preview, which counts the
-// whole heap (the grid can undercount) and declines to open the dialog when
-// there is nothing to delete.
-function confirmEmptyScrapheap() {
-  if (scrapheapEmptying.value) return;
-  // Route through the tokenized Delete-forever confirm (names any reference-folder
-  // originals being destroyed); the purge runs on @confirm.
-  openDeleteForeverForAll();
-}
-
-async function runEmptyScrapheap(includeProtected) {
-  // Re-entrancy only. The user has typed the confirm and we hold a single-use
-  // server token for exactly this purge; the grid's load state must not veto it,
-  // or a refetch that lands while the dialog is open would swallow a confirmed
-  // deletion. The server re-validates the token and the scope.
-  if (scrapheapEmptying.value) return;
-  scrapheapEmptying.value = true;
-  deleteForeverBusy.value = true;
-  try {
-    const resp = await purgeScrapheap({
-      includeProtected,
-      confirmToken: deleteForeverConfirmToken.value,
-    });
-    // Clear + refetch reconciles either case: when only the unprotected subset
-    // was purged, the refetch brings the kept protected originals back.
-    allGridImages.value = [];
-    selectedImageIds.value = [];
-    selectedFaceIds.value = [];
-    lastSelectedImageId.value = null;
+/** Clear the grid and read the heap again from the top. */
+function reloadScrapheapGrid() {
+  allGridImages.value = [];
+  selectedImageIds.value = [];
+  selectedFaceIds.value = [];
+  lastSelectedImageId.value = null;
+  updateVisibleThumbnails();
+  fetchAllGridImages().then(() => {
     updateVisibleThumbnails();
-    emit("refresh-sidebar");
-    fetchAllGridImages().then(() => {
-      updateVisibleThumbnails();
-    });
-    showSnapshotsWithDeleted(resp);
-  } catch (e) {
-    console.error("Failed to empty the scrapheap", e);
-    // A failed purge can still have destroyed rows, so the counts are re-read.
-    emit("refresh-sidebar");
-    noticeStore.error(`Couldn't empty the scrapheap. ${errorDetail(e)}`, {
-      key: "scrapheap-empty",
-    });
-  } finally {
-    // Spent server-side on the first attempt; a retry re-runs the preview.
-    deleteForeverConfirmToken.value = "";
-    scrapheapEmptying.value = false;
-    deleteForeverBusy.value = false;
-    deleteForeverOpen.value = false;
-  }
+  });
 }
 
-async function confirmRestoreScrapheap() {
-  if (scrapheapRestoreDisabled.value) return;
-  const confirmed = confirm(
-    "Restore all scrapheap pictures? This will make them visible again.",
+/**
+ * Settle the selection a selection run was about. Locked pictures survive a
+ * purge and stay selected, so the user can retry after unlocking; the rest
+ * leave the selection, while anything selected since the run started stays.
+ * The lightbox's own Delete forever leaves the grid selection alone and closes
+ * the picture only when the server destroyed it, not when the confirm spared
+ * it as a protected original, a lock kept it, or a Stop came first.
+ */
+function settleScrapheapSelection(run, context) {
+  const ids = Array.isArray(context?.ids) ? context.ids : [];
+  const kept = new Set(
+    (Array.isArray(run.skipped_locked) ? run.skipped_locked : []).map(String),
   );
-  if (!confirmed) return;
-  scrapheapRestoring.value = true;
-  try {
-    await restoreScrapheap(undefined);
-    allGridImages.value = [];
-    selectedImageIds.value = [];
-    selectedFaceIds.value = [];
-    lastSelectedImageId.value = null;
-    updateVisibleThumbnails();
-    emit("refresh-sidebar");
-    fetchAllGridImages().then(() => {
-      updateVisibleThumbnails();
-    });
-  } catch (e) {
-    console.error("Failed to restore the scrapheap", e);
-    noticeStore.error(`Couldn't restore the scrapheap. ${errorDetail(e)}`, {
-      key: "scrapheap-restore-all",
-    });
-  } finally {
-    scrapheapRestoring.value = false;
+  const gone = ids.filter((id) => !kept.has(String(id)));
+  if (context.scoped) {
+    if (Number(run.deleted_count) === gone.length) {
+      leaveDeletedLightboxPictures(gone);
+    }
+    return;
   }
+  const goneIds = new Set(gone.map(String));
+  selectedImageIds.value = selectedImageIds.value.filter(
+    (id) => !goneIds.has(String(id)),
+  );
+  if (goneIds.has(String(lastSelectedImageId.value))) {
+    lastSelectedImageId.value = null;
+  }
+  clearFaceSelection();
 }
+
+/**
+ * Act on a followed run that has ended. Every one re-reads the counts and, in
+ * the Scrapheap view, the heap. One this tab started also gets what its
+ * gesture's answer used to bring: the selection settled, the snapshots that
+ * still hold what was destroyed, the restore's receipt, and a notice saying
+ * how it ended. One started elsewhere (another tab, before a reload) gets the
+ * notice only where its progress was on show, the Scrapheap's bar.
+ *
+ * @param {{run: Object, context: (Object|null), startedHere: boolean}} ended
+ */
+async function settleScrapheapRun({ run, context, startedHere }) {
+  scrapheapRunStore.acknowledgeOutcome(run.id);
+  emit("refresh-sidebar");
+  const gesture = startedHere ? (context?.gesture ?? null) : null;
+  if (
+    gesture === SCRAPHEAP_GESTURES.PURGE_SELECTION ||
+    gesture === SCRAPHEAP_GESTURES.RESTORE_SELECTION
+  ) {
+    settleScrapheapSelection(run, context);
+  }
+  if (isScrapheapView.value) {
+    if (
+      gesture === SCRAPHEAP_GESTURES.EMPTY ||
+      gesture === SCRAPHEAP_GESTURES.RESTORE_ALL
+    ) {
+      reloadScrapheapGrid();
+    } else {
+      preserveScrollOnNextFetch.value = true;
+      debouncedFetchAllGridImages();
+      updateVisibleThumbnails();
+    }
+  }
+  if (!gesture) {
+    if (!isScrapheapView.value) return;
+    const { level, message } = scrapheapRunOutcomeNotice(run, null);
+    noticeStore[level](message, { key: "scrapheap-run" });
+    return;
+  }
+  if (run.kind === "purge") {
+    showSnapshotsWithDeleted(run.snapshots_with_deleted);
+    const lockedCount = Number(run.skipped_locked_count) || 0;
+    if (
+      gesture === SCRAPHEAP_GESTURES.PURGE_SELECTION &&
+      run.status === "complete" &&
+      lockedCount > 0
+    ) {
+      // The locked-set notice carries the lever (how to unlock).
+      showLockedDeleteNotice(
+        buildLockedDeleteMessage({
+          lockedCount,
+          deletedCount: Number(run.deleted_count) || 0,
+          forever: true,
+        }),
+      );
+      return;
+    }
+  } else if (
+    run.status === "complete" &&
+    (await scrapheapRunStore.raiseRestoreReceipt(run))
+  ) {
+    return;
+  }
+  const { level, message } = scrapheapRunOutcomeNotice(run, gesture);
+  noticeStore[level](message, { key: "scrapheap-run" });
+}
+
+watch(
+  () => scrapheapRunStore.outcome,
+  (ended) => {
+    if (ended) void settleScrapheapRun(ended);
+  },
+  { immediate: true },
+);
 
 async function openReferenceLocation(picId) {
   try {

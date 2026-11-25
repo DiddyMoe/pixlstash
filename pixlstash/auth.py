@@ -340,6 +340,9 @@ READ_BLOCKED_GET_PATHS: frozenset[str] = frozenset(
         "/api/v1/operations/undo-state",
         "/api/v1/pictures/import/status",
         "/api/v1/pictures/plugins",
+        # The newest Scrapheap run: its counts, the locked pictures it
+        # skipped and the snapshots still holding what it destroyed.
+        "/api/v1/pictures/scrapheap/runs/latest",
         "/api/v1/recipes",
         "/api/v1/reviews",
         "/api/v1/reviews/preview",
@@ -422,6 +425,8 @@ READ_BLOCKED_GET_PREFIXES: tuple[str, ...] = (
     "/api/v1/models/",
     "/api/v1/operations/",
     "/api/v1/pictures/import/",
+    # A Scrapheap run, by id.
+    "/api/v1/pictures/scrapheap/runs/",
     # A saved recipe is the owner's own prompt, and the only GET under this
     # prefix is `/recipes/{id}/export`, which returns it verbatim (v1.12 B8).
     # `GET /api/v1/recipes` itself has no trailing slash, so it is held by the

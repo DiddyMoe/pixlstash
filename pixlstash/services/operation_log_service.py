@@ -62,6 +62,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import defer
 from sqlmodel import Session, select
 
+from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Detection,
     Face,
@@ -515,6 +516,14 @@ def diff_states(
 # skips locked pictures, or a "restore everything" that never named an id.
 SummarySpec = Union[str, Callable[[dict, dict], Optional[str]], None]
 
+# A batch id is either fixed or a ``(session) -> str`` chooser called on the
+# recording's own session, just before the mutation. The chooser is for a
+# background run that writes one gesture over many writer slices: it must decide
+# whether the next slice still extends the batch at the top of History, and only
+# a decision made inside the slice's own transaction cannot be overtaken by a
+# write landing between the check and the record.
+BatchIdSpec = Union[str, Callable[[Session], str], None]
+
 
 SERVER_BATCH_ID_PREFIX = "srv-"
 """Namespace for a batch id the *server* minted.
@@ -533,6 +542,24 @@ server batch. Every minting site in the backend goes through
 def new_batch_id() -> str:
     """Return a fresh opaque batch id grouping one bulk action's operations."""
     return f"{SERVER_BATCH_ID_PREFIX}{uuid.uuid4().hex}"
+
+
+def newest_undo_batch_id_in_session(session: Session) -> Optional[str]:
+    """The batch id of the newest applied undoable operation, if it has one.
+
+    A batch can only be undone while it is contiguous at the top of History
+    (:func:`_enforce_latest_undo_unit`). A writer that appends to one batch over
+    several transactions asks this before each one: when the answer is no longer
+    its batch, something else has been recorded on top, and appending would split
+    the batch around that operation and leave both un-undoable.
+    """
+    return session.exec(
+        select(Operation.batch_id)
+        .where(Operation.status == STATUS_APPLIED)
+        .where(Operation.undoable.is_(True))
+        .order_by(Operation.id.desc())
+        .limit(1)
+    ).first()
 
 
 def lifecycle_split(state: dict[str, dict]) -> tuple[list[int], list[int]]:
@@ -863,12 +890,13 @@ def run_recorded_metadata_task(
     actor: Optional[str] = None,
     source: str = "external",
     origin_client_id: Optional[str] = None,
-    batch_id: Optional[str] = None,
+    batch_id: BatchIdSpec = None,
     summary: SummarySpec = None,
     undoable: bool = True,
     expand_stacks: bool = False,
     expand_stacks_include_deleted: bool = False,
     resolve_picture_ids: Optional[Callable[[Session], Iterable[Any]]] = None,
+    priority: DBPriority = DBPriority.IMMEDIATE,
     **kwargs,
 ) -> tuple[Any, Optional[dict]]:
     """Run a metadata mutation on the DB queue and record it in one task.
@@ -887,7 +915,9 @@ def run_recorded_metadata_task(
         actor: Who is performing the change.
         source: WS-envelope source, read from the request by the caller.
         origin_client_id: WS-envelope per-tab origin, likewise.
-        batch_id: Group id when this call is one step of a bulk action.
+        batch_id: Group id when this call is one step of a bulk action, or a
+            ``(session) -> str`` chooser called on this task's session before the
+            mutation (:data:`BatchIdSpec`).
         summary: Short human sentence for the undo toast, or a
             ``(before_delta, after_delta) -> str | None`` builder (:data:`SummarySpec`).
         undoable: ``False`` records for audit only.
@@ -904,6 +934,9 @@ def run_recorded_metadata_task(
             result is unioned with *picture_ids*; without it those pictures fall
             outside the snapshot and the operation records a half-change that
             undo could not fully reverse.
+        priority: The writer-queue priority. A request handler keeps the
+            default; a background slice passes ``DBPriority.LOW`` so every
+            interactive write gets the writer between its slices.
         **kwargs: Keyword arguments forwarded to *work*.
 
     Returns:
@@ -929,6 +962,7 @@ def run_recorded_metadata_task(
                     )
                 )
             before = capture_state_in_session(session, ids)
+            recorded_batch_id = batch_id(session) if callable(batch_id) else batch_id
             # Prevent a newly-added callback (or a helper it calls) from quietly
             # reintroducing the split transaction this wrapper exists to avoid.
             # Raising in before_commit leaves the transaction open, so the
@@ -945,7 +979,7 @@ def run_recorded_metadata_task(
                 actor=actor,
                 source=source,
                 origin_client_id=origin_client_id,
-                batch_id=batch_id,
+                batch_id=recorded_batch_id,
                 summary=summary,
                 undoable=undoable,
                 commit=False,
@@ -964,7 +998,7 @@ def run_recorded_metadata_task(
             session.rollback()
             raise
 
-    return vault.db.run_task(_task)
+    return vault.db.run_task(_task, priority=priority)
 
 
 # ---------------------------------------------------------------------------

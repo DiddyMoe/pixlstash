@@ -10,6 +10,7 @@ import {
   API_BASE_URL,
   operationBatchHeaders,
 } from "../utils/apiClient";
+import { runReply } from "../utils/runReply";
 import { unwrap } from "../utils/unwrap";
 
 // The grid's reads take an optional AbortSignal so a superseded load can cancel
@@ -543,8 +544,8 @@ export async function setPicturesProject(
  * destructive confirm, never as "nothing would be deleted".
  *
  * The response also carries `confirm_token`, a single-use, five-minute proof
- * bound to exactly this selection. `purgeScrapheap` will not delete without it,
- * so this call is a required step, not an optional courtesy.
+ * bound to exactly this selection. A purge run (`startScrapheapRun`) will not
+ * start without it, so this call is a required step, not an optional courtesy.
  *
  * @param {Array<number|string>|null} [ids=null] - null means the whole heap.
  * @returns {Promise<Object>} the counts, the protected-file list, and
@@ -560,38 +561,6 @@ export async function previewScrapheapDelete(
 }
 
 /**
- * Permanently delete pictures from the scrapheap.
- *
- * Omitting `pictureIds` empties the whole heap. Protected pictures are kept
- * unless `includeProtected` is set, and locked ones are always kept and
- * reported in `skipped_locked`.
- *
- * `confirmToken` is REQUIRED and comes from `previewScrapheapDelete` for the
- * same selection. The type-to-confirm dialog is a client control that proves
- * nothing to the server, so the server mints its own single-use confirmation
- * with the destruction preview and refuses this call without it (400 when it is
- * missing, 409 when it is spent, expired, or for a different selection).
- *
- * @param {Object} [options]
- * @param {Array<number|string>} [options.pictureIds]
- * @param {boolean} [options.includeProtected=false]
- * @param {string} options.confirmToken - from the matching preview.
- * @returns {Promise<Object>} the response body, including `skipped_locked`.
- */
-export async function purgeScrapheap({
-  pictureIds,
-  includeProtected = false,
-  confirmToken,
-} = {}) {
-  const data = {
-    include_protected: includeProtected,
-    confirm_token: confirmToken,
-  };
-  if (pictureIds) data.picture_ids = pictureIds;
-  return unwrap(apiClient.delete(`/pictures/scrapheap`, { data }));
-}
-
-/**
  * Restore pictures from the scrapheap; omit the ids to restore all of them.
  * @param {Array<number|string>} [pictureIds]
  * @returns {Promise<Object>} the response body.
@@ -601,6 +570,97 @@ export async function restoreScrapheap(pictureIds) {
     `/pictures/scrapheap/restore`,
     pictureIds ? { picture_ids: pictureIds } : undefined,
   ));
+}
+
+// Emptying or restoring a large Scrapheap is an asynchronous request-reply:
+// `POST /pictures/scrapheap/runs` answers 202 at once with the run, and the
+// client polls it until it is no longer `active`. A 50,000-picture heap takes
+// longer than any request should wait, so these are what the Scrapheap's
+// gestures use; `restoreScrapheap` above stays for the lightbox's one picture.
+//
+//   * **One run at a time.** A start while one is active is 409
+//     `scrapheap_run_active`, and `detail.run` names the run to follow instead.
+//   * **No request id.** A start whose answer was lost is not retried: the
+//     caller reads `getLatestScrapheapRun` and follows the run that is active.
+//   * **A restore is many History steps**, one per segment of at most 5,000
+//     pictures; `segment_batch_ids` names them for the operation store.
+//   * **Runs live in the server's memory.** A restart forgets them, and
+//     `getScrapheapRun` answers 404 `scrapheap_run_not_found`.
+
+/**
+ * Start a background run that destroys or restores Scrapheap pictures.
+ *
+ * A purge needs the `confirmToken` that `previewScrapheapDelete` minted for the
+ * same selection (400 when missing, 409 when spent, expired or for another
+ * selection, and nothing starts); a restore sends none. Omitting `pictureIds`
+ * means the whole Scrapheap as it is when the run starts.
+ *
+ * @param {Object} options
+ * @param {"purge"|"restore"} options.kind
+ * @param {Array<number|string>} [options.pictureIds] - the selection.
+ * @param {boolean} [options.includeProtected=false] - purge only.
+ * @param {string} [options.confirmToken] - purge only, and required there.
+ * @returns {Promise<{run: Object, retryAfterMs: number|null}>} 202 with the
+ *   run. Refusals carry `detail.code`: 409 `scrapheap_run_active` (with
+ *   `detail.run`) and 503 `scrapheap_runs_unavailable` (this server runs no
+ *   background tasks).
+ */
+export async function startScrapheapRun({
+  kind,
+  pictureIds,
+  includeProtected = false,
+  confirmToken,
+} = {}) {
+  // The request model forbids unknown fields, so a restore sends only what a
+  // restore reads.
+  const body = { kind };
+  if (pictureIds) body.picture_ids = pictureIds;
+  if (kind === "purge") {
+    body.include_protected = includeProtected;
+    body.confirm_token = confirmToken;
+  }
+  return runReply(await apiClient.post(`/pictures/scrapheap/runs`, body));
+}
+
+/**
+ * Read one run's status and progress.
+ *
+ * @param {string} runId
+ * @returns {Promise<{run: Object, retryAfterMs: number|null}>} 404
+ *   `scrapheap_run_not_found` for an unknown id.
+ */
+export async function getScrapheapRun(runId) {
+  return runReply(
+    await apiClient.get(
+      `/pictures/scrapheap/runs/${encodeURIComponent(runId)}`,
+    ),
+  );
+}
+
+/**
+ * The newest run, so a run started before a reload or in another tab is
+ * picked up again.
+ *
+ * @returns {Promise<Object|null>} the run, or null before the first.
+ */
+export async function getLatestScrapheapRun() {
+  const body = await unwrap(apiClient.get(`/pictures/scrapheap/runs/latest`));
+  return body?.run ?? null;
+}
+
+/**
+ * Ask a run to stop. A pending run stops at once; a running one at the end of
+ * its current slice, keeping what the slices before it did.
+ *
+ * @param {string} runId
+ * @returns {Promise<{run: Object, retryAfterMs: number|null}>}
+ */
+export async function cancelScrapheapRun(runId) {
+  return runReply(
+    await apiClient.post(
+      `/pictures/scrapheap/runs/${encodeURIComponent(runId)}/cancel`,
+    ),
+  );
 }
 
 /**

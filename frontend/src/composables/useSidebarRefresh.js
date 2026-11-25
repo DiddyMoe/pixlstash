@@ -3,6 +3,7 @@ import { isReadOnly } from "../utils/apiClient";
 import { useDedupStore } from "../stores/useDedupStore";
 import { useEntityListsStore } from "../stores/useEntityListsStore";
 import { useLockedSetsStore } from "../stores/useLockedSetsStore";
+import { useScrapheapRunStore } from "../stores/useScrapheapRunStore";
 
 const SIDEBAR_REFRESH_DEBOUNCE_MS = 150;
 const SIDEBAR_REFRESH_PICTURES_DEBOUNCE_MS = 800;
@@ -22,6 +23,7 @@ export function useSidebarRefresh({ sidebarRef }) {
   const dedupStore = useDedupStore();
   const entityListsStore = useEntityListsStore();
   const lockedSetsStore = useLockedSetsStore();
+  const scrapheapRunStore = useScrapheapRunStore();
 
   let sidebarRefreshDebounceTimeout = null;
   let sidebarRefreshPicturesDebounceTimeout = null;
@@ -77,6 +79,10 @@ export function useSidebarRefresh({ sidebarRef }) {
       // off this tab's receipt pill, as they did before the reload. Once per
       // session; the store makes every later call a no-op.
       dedupStore.resumeAutoStackRun();
+      // The Scrapheap's empty and restore runs outlive the tab the same way,
+      // and a restore run's History steps would otherwise reach this tab's
+      // pill as its own. Once per session, like the Auto-stack resume.
+      scrapheapRunStore.resume();
     }
   }
 

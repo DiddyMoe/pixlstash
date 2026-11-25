@@ -80,6 +80,17 @@ describe("buildLockedDeleteMessage - partial", () => {
     expect(msg.body).toMatch(/^1 picture moved/);
     expect(msg.body).toMatch(/9 are in locked sets/);
   });
+
+  it("says a Delete forever destroyed what it did, not that it moved it", () => {
+    const msg = buildLockedDeleteMessage({
+      lockedCount: 2,
+      deletedCount: 3,
+      forever: true,
+    });
+    expect(msg.body).toBe(
+      "3 pictures deleted forever; 2 are in locked sets and were kept.",
+    );
+  });
 });
 
 describe("buildLockedPurgeNote", () => {

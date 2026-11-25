@@ -68,6 +68,7 @@
 
 import { apiClient} from "../utils/apiClient";
 import { unwrap } from "../utils/unwrap";
+import { runReply } from "../utils/runReply";
 
 /** The whole-vault scope. Every other scope type requires a `scope_id`. */
 export const GLOBAL_SCOPE = "global";
@@ -511,40 +512,11 @@ export async function previewAutoStackExact({
 //      the run it already started (200) instead of starting a second one. A
 //      start whose answer was lost is therefore retried, never guessed at.
 //   2. **The server sets the poll interval.** An active run's answer carries
-//      `Retry-After`; each function below returns it as `retryAfterMs`, null
-//      when absent (an ended run has nothing left to poll).
+//      `Retry-After`; each function below returns it as `retryAfterMs`
+//      (`utils/runReply`), null when absent.
 //   3. **A run is many History steps.** It records its stacks in segments of a
 //      bounded size, each one Ctrl+Z; {@link revertAutoStackRun} undoes them
 //      all, and `segment_batch_ids` names them for the operation store.
-
-const RETRY_AFTER_HEADER = "retry-after";
-
-/**
- * Read a `Retry-After` header as milliseconds.
- *
- * Only RFC 9110's `delay-seconds` form is read, because it is the only form
- * the run routes send. The HTTP-date form is deliberately not: `Date.parse` is
- * lenient enough to read "-2" or "1.5" as a date in 2001, which would turn a
- * malformed hint into a zero wait. Anything else is not a hint, and null
- * leaves the interval to the caller.
- *
- * @param {Object} [headers] - the axios response headers.
- * @returns {number|null}
- */
-export function retryAfterMs(headers) {
-  const raw =
-    typeof headers?.get === "function"
-      ? headers.get(RETRY_AFTER_HEADER)
-      : headers?.[RETRY_AFTER_HEADER];
-  if (raw == null) return null;
-  const text = String(raw).trim();
-  return /^\d+$/.test(text) ? Number(text) * 1000 : null;
-}
-
-/** A run route's answer: the run, plus the server's poll hint. */
-function runReply(response) {
-  return { run: response.data, retryAfterMs: retryAfterMs(response.headers) };
-}
 
 /**
  * Start a background run that stacks the exact tier.

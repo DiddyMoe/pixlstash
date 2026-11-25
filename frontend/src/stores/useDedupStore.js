@@ -3113,7 +3113,10 @@ export const useDedupStore = defineStore("dedup", () => {
    */
   function installNarrationFilter() {
     if (narrationFilterInstalled) return;
-    useOperationStore().setNarrationFilter(isAutoStackOperation);
+    useOperationStore().setNarrationFilter(
+      "dedup-auto-stack",
+      isAutoStackOperation,
+    );
     narrationFilterInstalled = true;
   }
 

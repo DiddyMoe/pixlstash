@@ -127,7 +127,15 @@ test.describe('deleting pictures and the Scrapheap', () => {
     for (const id of ids) await expect(grid.card(id)).toBeVisible()
   }
 
-  /** Block the purge so a confirm that slips through destroys nothing. */
+  /**
+   * Block the purge so a confirm that slips through destroys nothing.
+   *
+   * A purge starts a background run (POST /pictures/scrapheap/runs, kind
+   * "purge"), for a selection and for the whole heap alike. The one-request
+   * DELETE /pictures/scrapheap is blocked as well: the server still serves it,
+   * and a page that went back to it must not destroy the fixture either.
+   * Restore runs go through.
+   */
   const blockPurges = async (page) => {
     const purges = []
     await page.route(
@@ -135,6 +143,17 @@ test.describe('deleting pictures and the Scrapheap', () => {
       (route) => {
         if (route.request().method() !== 'DELETE') return route.continue()
         purges.push(route.request().postData())
+        return route.abort()
+      },
+    )
+    await page.route(
+      (url) => url.pathname === `${API}/pictures/scrapheap/runs`,
+      (route) => {
+        const request = route.request()
+        if (request.method() !== 'POST' || request.postDataJSON()?.kind !== 'purge') {
+          return route.continue()
+        }
+        purges.push(request.postData())
         return route.abort()
       },
     )
@@ -323,13 +342,17 @@ test.describe('deleting pictures and the Scrapheap', () => {
     expect((await scrapheapIds(apiContext)).sort()).toEqual([...mine].sort())
 
     page.once('dialog', (dialog) => dialog.accept())
-    const restored = page.waitForResponse(
+    // Restore all starts a background run; the 202 only says it was accepted.
+    const started = page.waitForResponse(
       (response) =>
-        response.url().endsWith('/pictures/scrapheap/restore') &&
+        new URL(response.url()).pathname === `${API}/pictures/scrapheap/runs` &&
         response.request().method() === 'POST',
     )
     await page.getByRole('button', { name: 'Restore all' }).click()
-    expect((await restored).ok()).toBe(true)
+    const start = await started
+    expect(start.status(), await start.text()).toBe(202)
+    expect(start.request().postDataJSON()).toEqual({ kind: 'restore' })
+    // The grid reloads once the run has ended, so an empty grid is its end.
     await expect(grid.thumbnails).toHaveCount(0)
 
     expect(await scrapheapIds(apiContext)).toEqual([])

@@ -220,6 +220,10 @@ Rationale column is empty where it equals the policy-meaning table above (e.g. `
 | DELETE | `/api/v1/pictures/scrapheap` | owner_only |  | require_unscoped_owner |
 | POST | `/api/v1/pictures/scrapheap/delete-preview` | owner_only |  | (v1.8.0) Authoritative delete-forever preview. Returns absolute on-disk paths of protected reference-folder originals; per-object data → owner_only, not any_token (POST not in READ_SAFE; gate-enforced). Rows constrained to `Picture.deleted.is_(True)`, so it cannot leak paths of live/non-scrapheap ids |
 | POST | `/api/v1/pictures/scrapheap/restore` | owner_only |  | require_unscoped_owner |
+| POST | `/api/v1/pictures/scrapheap/runs` | owner_only |  | Starts a background empty, delete-forever or restore over the whole Scrapheap or a selection: the same destruction `DELETE /api/v1/pictures/scrapheap` performs, a slice at a time. A purge also spends a `delete-preview` `confirm_token` (an intent check, not authorization). POST not in READ_SAFE |
+| GET | `/api/v1/pictures/scrapheap/runs/latest` | owner_only |  | A library-wide run's progress: Scrapheap counts, locked picture ids, the snapshots still holding destroyed metadata and the History batches it wrote. Owner data, like the `delete-preview` it follows. Untemplated, so it is listed in `READ_BLOCKED_GET_PATHS` for the rollback |
+| GET | `/api/v1/pictures/scrapheap/runs/{run_id}` | owner_only |  | The same run payload addressed by run id; same reasoning as `runs/latest`. `/api/v1/pictures/scrapheap/runs/` in `READ_BLOCKED_GET_PREFIXES` holds it under the rollback |
+| POST | `/api/v1/pictures/scrapheap/runs/{run_id}/cancel` | owner_only |  | Stops a library-wide Scrapheap run; nothing is rolled back. POST not in READ_SAFE |
 | GET | `/api/v1/pictures/search` | scoped_list |  |  |
 | GET | `/api/v1/pictures/stats` | scoped_list |  |  |
 | GET | `/api/v1/pictures/stream` | scoped_list |  |  |

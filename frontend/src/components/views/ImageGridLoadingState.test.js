@@ -90,11 +90,11 @@ vi.mock("vue-router", () => ({
 import ImageGrid from "./ImageGrid.vue";
 import LibraryEmptyState from "./LibraryEmptyState.vue";
 
-function mountGrid() {
+function mountGrid({ view = "ALL" } = {}) {
   const selectionStore = useSelectionStore();
   const projectStore = useProjectStore();
   const sortStore = useSortStore();
-  selectionStore.selectedCharacter = "ALL";
+  selectionStore.selectedCharacter = view;
   selectionStore.selectedSet = null;
   selectionStore.selectedSetIds = [];
   projectStore.projectViewMode = "global";
@@ -402,16 +402,42 @@ describe("a filter change while the grid loads", () => {
 });
 
 describe("emptying the scrapheap refreshes the grid", () => {
-  // Before the purge the view holds a picture the purge deletes (11) and a
-  // protected one it keeps (22). Every read after the first sees only 22.
+  // Before the purge the Scrapheap holds a picture the purge deletes (11) and
+  // a protected one it keeps (22). Every read after the first sees only 22.
   const DELETED = { id: 11, name: "test-deleted.png" };
   const PROTECTED = { id: 22, name: "test-protected.png" };
 
+  // The purge is a background run. Its start is answered by the run already
+  // ended, as a run over two pictures can be by the time the answer leaves, so
+  // the grid acts on how it ended straight away.
+  const ENDED_PURGE = {
+    id: "example-run",
+    kind: "purge",
+    status: "complete",
+    active: false,
+    include_protected: false,
+    cancel_requested: false,
+    total: 2,
+    processed: 2,
+    deleted_count: 1,
+    skipped_count: 1,
+    skipped_locked_count: 0,
+    skipped_locked: [],
+    snapshots_with_deleted: [],
+    segment_batch_ids: [],
+    error_code: null,
+    error: null,
+  };
+
   function answerAroundPurge({ firstStream }) {
     const reads = { counts: 0, streams: 0 };
-    apiDelete.mockResolvedValue({
-      data: { deleted_count: 1, skipped_protected: [PROTECTED.id] },
-    });
+    apiPost.mockImplementation((url) =>
+      Promise.resolve({
+        data: String(url).endsWith("/pictures/scrapheap/runs")
+          ? ENDED_PURGE
+          : {},
+      }),
+    );
     apiGet.mockImplementation((url) => {
       const u = String(url);
       if (u.includes("/summary")) {
@@ -435,16 +461,17 @@ describe("emptying the scrapheap refreshes the grid", () => {
   async function purge(wrapper) {
     wrapper.vm.deleteForeverConfirmToken = "test-confirmation";
     await wrapper.vm.runEmptyScrapheap(false);
-    expect(apiDelete).toHaveBeenCalledWith(
-      "/pictures/scrapheap",
-      expect.anything(),
-    );
+    expect(apiPost).toHaveBeenCalledWith("/pictures/scrapheap/runs", {
+      kind: "purge",
+      include_protected: false,
+      confirm_token: "test-confirmation",
+    });
   }
 
   it("re-reads after a purge that lands while the grid is still reading", async () => {
     const firstStream = held();
     const reads = answerAroundPurge({ firstStream: () => firstStream.promise });
-    const wrapper = mountGrid();
+    const wrapper = mountGrid({ view: "SCRAPHEAP" });
     try {
       await vi.waitFor(() => expect(reads.streams).toBe(1));
       await purge(wrapper);
@@ -469,7 +496,7 @@ describe("emptying the scrapheap refreshes the grid", () => {
         firstStream: () =>
           Promise.resolve({ data: { pictures: [DELETED, PROTECTED] } }),
       });
-      const wrapper = mountGrid();
+      const wrapper = mountGrid({ view: "SCRAPHEAP" });
       try {
         await vi.waitFor(() => expect(reads.streams).toBe(1));
         await vi.waitFor(() => expect(wrapper.vm.imagesLoading).toBe(false));

@@ -79,6 +79,7 @@ from pixlstash.utils.quality.tag_exclusion import (
     exclusion_generation,
     exclusions_from_tagger_settings,
 )
+from pixlstash.services.scrapheap_run_service import ScrapheapRunRegistry
 from pixlstash.services.scrapheap_service import DEFAULT_RETENTION_DAYS
 from pixlstash.services.workflow_ghost_service import DEFAULT_GHOST_RETENTION
 from pixlstash.services.snapshot_service import SnapshotService
@@ -352,6 +353,11 @@ class Vault:
         # into every writer session; before the early-return for the same reason.
         self.smart_score_anchor_watch = SmartScoreAnchorWatch(self.db)
         self.db.add_session_hook(self.smart_score_anchor_watch.attach)
+        # The background Scrapheap runs (empty, delete forever, restore all) and
+        # the last few that ended. Before the early-return so a server without
+        # workers can still answer "no run" rather than raise; it refuses to
+        # start one (scrapheap_run_service.start_run).
+        self.scrapheap_runs = ScrapheapRunRegistry()
 
         if disable_background_workers:
             logger.info(
@@ -2766,6 +2772,14 @@ class Vault:
                 label = "duplicate_auto_stack"
                 total, missing, worker_active_override = self._task_phase_progress(
                     TaskType.DEDUP_AUTO_STACK
+                )
+            elif worker_type == TaskType.SCRAPHEAP_RUN:
+                # Counts the run's own pictures, not the library: a 50,000-picture
+                # Scrapheap empties in slices, and the generic total would read
+                # "N / N" for the whole of it.
+                label = "scrapheap_run"
+                total, missing, worker_active_override = self._task_phase_progress(
+                    TaskType.SCRAPHEAP_RUN
                 )
             elif worker_type == TaskType.CHECKPOINT_HASH:
                 # The one worker here whose denominator is the model shelf and
