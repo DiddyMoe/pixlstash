@@ -194,7 +194,7 @@ def _add_face(server, picture_id, character_id=None):
                 frame_index=0,
                 face_index=0,
                 character_id=character_id,
-                bbox_="0,0,20,20",
+                bbox=[0, 0, 20, 20],
             )
         )
         session.commit()

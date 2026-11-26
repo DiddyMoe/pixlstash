@@ -106,7 +106,7 @@ def _make_anchor(session, kind, project_id, pic_id, name, face_index=0):
                 frame_index=0,
                 face_index=face_index,
                 character_id=entity.id,
-                bbox_="0,0,10,10",
+                bbox=[0, 0, 10, 10],
             )
         )
     else:

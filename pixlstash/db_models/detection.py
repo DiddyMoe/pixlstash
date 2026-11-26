@@ -1,6 +1,7 @@
 import json
 
 from sqlalchemy import Float
+from sqlalchemy.orm import validates
 from sqlmodel import (
     Column,
     ForeignKey,
@@ -13,6 +14,8 @@ from sqlmodel import (
     UniqueConstraint,
 )
 from typing import List, Optional, TYPE_CHECKING
+
+from .face import check_bbox_text
 
 if TYPE_CHECKING:
     from .picture import Picture
@@ -65,6 +68,22 @@ class Detection(SQLModel, table=True):
         super().__init__(*args, **kwargs)
         if bbox is not None:
             self.bbox = bbox
+
+    @validates("bbox_")
+    def _validate_bbox_text(self, key: str, value: Optional[str]) -> Optional[str]:
+        """Refuse to store a ``bbox`` column value that the reader cannot use.
+
+        The same check as ``Face``'s, for the same reason: ``bbox_`` is a
+        public field, so ``Detection(bbox_=...)`` and ``detection.bbox_ = ...``
+        skip the setter's ``json.dumps``, and the setter itself writes whatever
+        list it is given. SQLAlchemy runs this on every attribute set, not on
+        a load from the database.
+
+        Raises:
+            ValueError: the text is not JSON, or not ``null`` or a list of
+                exactly four finite numbers.
+        """
+        return check_bbox_text(f"Detection.{key}", value)
 
     @property
     def bbox(self) -> Optional[List[int]]:

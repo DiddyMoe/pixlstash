@@ -239,7 +239,7 @@ def test_face_addition_changes_hash(server):
                 picture_id=pic.id,
                 frame_index=0,
                 face_index=0,
-                bbox_="0,0,10,10",
+                bbox=[0, 0, 10, 10],
             )
         )
         session.commit()
@@ -274,7 +274,7 @@ def test_face_character_assignment_changes_hash(server):
             frame_index=0,
             face_index=0,
             character_id=c1.id,
-            bbox_="0,0,10,10",
+            bbox=[0, 0, 10, 10],
         )
         session.add(face)
         session.commit()

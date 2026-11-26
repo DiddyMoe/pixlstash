@@ -200,7 +200,8 @@ def test_task_generates_whole_frame_bitmap_and_square_crop(tmp_path):
 
 def test_task_square_crop_follows_faces(tmp_path):
     _write_source(tmp_path, "b.png", 1200, 600)
-    face = SimpleNamespace(bbox=[900, 250, 1050, 400])  # right side
+    # A loaded face row: its box is the stored ``bbox_`` text.
+    face = SimpleNamespace(id=21, bbox_="[900, 250, 1050, 400]")  # right side
     pic = SimpleNamespace(id=2, file_path="b.png", width=1200, height=600, faces=[face])
     task = ThumbnailGenerationTask(_FakeDB(str(tmp_path)), [pic])
     columns = task._resolve_columns(pic)

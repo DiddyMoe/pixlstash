@@ -1,6 +1,9 @@
 import json
 import math
+import sys
+import threading
 
+from sqlalchemy.orm import validates
 from sqlmodel import (
     Column,
     ForeignKey,
@@ -16,9 +19,171 @@ from sqlmodel import (
 )
 from typing import List, Optional, TYPE_CHECKING
 
+from pixlstash.pixl_logging import get_logger
+
 if TYPE_CHECKING:
     from .picture import Picture
     from .character import Character
+
+logger = get_logger(__name__)
+
+# The largest finite float. A coordinate is kept only within it: ``json.loads``
+# reads ``NaN``, ``Infinity`` and integers of any size, and none of those is a
+# position a box can have. Comparing against it never raises, where
+# ``math.isfinite`` raises ``OverflowError`` on an int too large for a float.
+_FLOAT_MAX = sys.float_info.max
+
+
+def is_finite_bbox(value) -> bool:
+    """Whether *value* is ``[x1, y1, x2, y2]``: four finite, non-bool numbers."""
+    return (
+        isinstance(value, list)
+        and len(value) == 4
+        and all(
+            isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and -_FLOAT_MAX <= v <= _FLOAT_MAX
+            for v in value
+        )
+    )
+
+
+# Each stored box :func:`read_stored_bbox` refused, so a reader that runs every
+# cycle logs a row once and not once per cycle. It gates only that log line:
+# the box is left out either way. Bounded: past the limit the set is cleared,
+# and a row still bad is logged once more. Keyed by row id, which another
+# library reuses, so a library switch clears it (:func:`clear_refused_bboxes`).
+_REFUSED_BBOXES: set = set()
+_REFUSED_BBOXES_LOCK = threading.Lock()
+_REFUSED_BBOXES_LIMIT = 10_000
+# How much of a refused text the log line quotes: an integer can be thousands
+# of digits long.
+_REFUSED_BBOX_REPR_CHARS = 80
+
+
+def _shown_bbox_text(raw) -> str:
+    """*raw* for a log line: its repr cut to :data:`_REFUSED_BBOX_REPR_CHARS`.
+
+    A value that is not text (an assignment of the wrong type, which only the
+    write check sees) is named by its type: the repr of a huge int raises.
+    """
+    if not isinstance(raw, (str, bytes, bytearray)):
+        return f"a {type(raw).__name__}, not text"
+    shown = repr(raw)
+    if len(shown) > _REFUSED_BBOX_REPR_CHARS:
+        shown = f"{shown[:_REFUSED_BBOX_REPR_CHARS]}... ({len(raw)} chars)"
+    return shown
+
+
+def clear_refused_bboxes() -> None:
+    """Forget every stored box :func:`read_stored_bbox` has refused.
+
+    Called when the server switches libraries. The memory is keyed by row id
+    and text, and the next library numbers its rows from 1 again: a copy of
+    the old library holds the same bad row under the same id, and its one log
+    line would otherwise never be written for the library it is in.
+    """
+    with _REFUSED_BBOXES_LOCK:
+        _REFUSED_BBOXES.clear()
+
+
+def read_stored_bbox(
+    raw: Optional[str], *, owner: str, row_id, picture_id
+) -> Optional[list]:
+    """Return a stored ``bbox`` column text as ``[x1, y1, x2, y2]``, or None.
+
+    For a reader of a row loaded from the database. The ``bbox_`` validator
+    runs when a value is set, not on load, so a row written before that check
+    or by a tool outside the app can hold text the ``bbox`` property raises on
+    (not JSON) or returns unusable (``NaN``, ``Infinity``, an integer too large
+    for a float, the wrong shape). A reader that met one raised, answered 500,
+    wrote ``NaN`` into an export, or failed the same picture every cycle.
+
+    None means there is no box to use: ``null`` (a no-face row has none) and
+    no text are normal and not logged; any other text that is not four finite
+    numbers is logged once per row and text, with the picture and row ids,
+    and is never replaced by a made-up box. The caller leaves the box out.
+
+    Args:
+        raw: The ``bbox_`` column text, or None.
+        owner: ``"Face"`` or ``"Detection"``, named in the log line.
+        row_id: The face or detection id.
+        picture_id: The picture the row belongs to.
+    """
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, RecursionError) as exc:
+        # ValueError covers JSONDecodeError and the plain ValueError of an
+        # integer past Python's int-string limit (4300 digits). RecursionError
+        # is a RuntimeError: the parser raises it on arrays or objects nested
+        # past the interpreter's recursion limit ("[" * 100000).
+        reason = f"is not JSON ({type(exc).__name__})"
+    else:
+        if parsed is None:
+            return None
+        if is_finite_bbox(parsed):
+            return parsed
+        reason = "is not four finite numbers [x1, y1, x2, y2]"
+    key = (owner, row_id, hash(raw))
+    with _REFUSED_BBOXES_LOCK:
+        if key in _REFUSED_BBOXES:
+            return None
+        if len(_REFUSED_BBOXES) >= _REFUSED_BBOXES_LIMIT:
+            _REFUSED_BBOXES.clear()
+        _REFUSED_BBOXES.add(key)
+    logger.warning(
+        "%s %s on picture %s has a stored bbox that %s: %s; leaving the box out",
+        owner,
+        row_id,
+        picture_id,
+        reason,
+        _shown_bbox_text(raw),
+    )
+    return None
+
+
+def check_bbox_text(owner: str, value: Optional[str]) -> Optional[str]:
+    """Return *value* if it is a ``bbox`` column text a reader can use.
+
+    The column, on ``Face`` and ``Detection`` alike, is JSON text:
+    ``[x1, y1, x2, y2]`` or ``null``.
+
+    Args:
+        owner: ``"Face.bbox_"`` or ``"Detection.bbox_"``, named in the error.
+        value: The text about to be stored, or None.
+
+    Raises:
+        ValueError: the text is not JSON, or not ``null`` or four finite
+            numbers. The message is fixed; the refused text goes to the log,
+            cut short, since a caller may pass the message on.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, RecursionError) as exc:
+        # ValueError, not only JSONDecodeError: an integer longer than
+        # Python's int-string limit (4300 digits) fails the parse with a
+        # plain ValueError. RecursionError (a RuntimeError) is the parse of
+        # arrays or objects nested past the recursion limit.
+        logger.warning(
+            "%s refused a bbox text that is not JSON (%s): %s",
+            owner,
+            type(exc).__name__,
+            _shown_bbox_text(value),
+        )
+        raise ValueError(f"{owner} must be JSON text") from exc
+    if parsed is None or is_finite_bbox(parsed):
+        return value
+    logger.warning(
+        "%s refused a bbox text that is not null or four finite numbers "
+        "[x1, y1, x2, y2]: %s",
+        owner,
+        _shown_bbox_text(value),
+    )
+    raise ValueError(f"{owner} must be null or [x1, y1, x2, y2] of finite numbers")
 
 
 class Face(SQLModel, table=True):
@@ -87,6 +252,25 @@ class Face(SQLModel, table=True):
         if bbox is not None:
             self.bbox = bbox
 
+    @validates("bbox_")
+    def _validate_bbox_text(self, key: str, value: Optional[str]) -> Optional[str]:
+        """Refuse to store a ``bbox`` column value that the reader cannot use.
+
+        The column is JSON text: ``[x1, y1, x2, y2]`` or ``null`` (the setter
+        writes ``null`` for a frame with no face). Every app writer goes
+        through the ``bbox`` setter, but ``bbox_`` is itself a public model
+        field, so ``Face(bbox_=...)`` and ``face.bbox_ = ...`` skip
+        ``json.dumps``. A non-JSON value written that way (``"0,0,10,10"``)
+        made every later ``face.bbox`` read raise ``JSONDecodeError`` far from
+        the write. SQLAlchemy calls this on every attribute set, including
+        the constructor's and the setter's, and not on load from the database.
+
+        Raises:
+            ValueError: the text is not JSON, or not ``null`` or a list of
+                exactly four finite numbers.
+        """
+        return check_bbox_text(f"Face.{key}", value)
+
     @property
     def bbox(self) -> Optional[List[int]]:
         """
@@ -104,22 +288,31 @@ class Face(SQLModel, table=True):
         self.bbox_ = json.dumps(bbox)
 
     @property
-    def width(self) -> Optional[float]:
+    def width(self) -> float:
+        """Return the width of the stored face box, or 0.0 when there is none.
+
+        A stored box that is not four finite numbers counts as none (logged
+        once by :func:`read_stored_bbox`): the callers rank faces by area, and
+        a bad row must sort last rather than fail the ranking.
         """
-        Return the width of the face bounding box, or 0.0 if bbox is not set.
-        """
-        if self.bbox and len(self.bbox) == 4:
-            return self.bbox[2] - self.bbox[0]
-        return 0.0
+        box = self._stored_box()
+        return box[2] - box[0] if box is not None else 0.0
 
     @property
-    def height(self) -> Optional[float]:
+    def height(self) -> float:
+        """Return the height of the stored face box, or 0.0 when there is none.
+
+        A stored box that is not four finite numbers counts as none, as in
+        :attr:`width`.
         """
-        Return the height of the face bounding box, or 0.0 if bbox is not set.
-        """
-        if self.bbox and len(self.bbox) == 4:
-            return self.bbox[3] - self.bbox[1]
-        return 0.0
+        box = self._stored_box()
+        return box[3] - box[1] if box is not None else 0.0
+
+    def _stored_box(self) -> Optional[list]:
+        """The ``bbox_`` text read through :func:`read_stored_bbox`."""
+        return read_stored_bbox(
+            self.bbox_, owner="Face", row_id=self.id, picture_id=self.picture_id
+        )
 
     def to_public_dict(self) -> dict:
         """Return the face fields that may be served over the API.
@@ -142,10 +335,10 @@ class Face(SQLModel, table=True):
           occurrence is server-side model loading). Omitted by the same
           least-disclosure rule; add it back only with a named consumer.
 
-        ``bbox`` is taken from the property, which parses the ``bbox_`` text
-        column. That reproduces exactly what ``safe_model_dict`` did for the
-        trailing-underscore field on the old path, so the wire value is
-        unchanged.
+        ``bbox`` is the ``bbox_`` text column parsed by
+        :func:`read_stored_bbox`: the stored list, or ``null`` for a row with no
+        box and for a stored box that is not four finite numbers (logged once),
+        which would otherwise fail the whole response.
 
         Returns:
             A JSON-safe dict with ``id``, ``picture_id``, ``character_id``,
@@ -157,7 +350,9 @@ class Face(SQLModel, table=True):
             "character_id": self.character_id,
             "frame_index": self.frame_index,
             "face_index": self.face_index,
-            "bbox": self.bbox,
+            "bbox": read_stored_bbox(
+                self.bbox_, owner="Face", row_id=self.id, picture_id=self.picture_id
+            ),
         }
 
     @classmethod

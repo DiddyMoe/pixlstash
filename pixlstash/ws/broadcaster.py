@@ -24,6 +24,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.routes.pictures import clear_stats_cache
+from pixlstash.ws.close_reasons import LIBRARY_SWITCHED, WS_CLOSE_SERVICE_RESTART
 
 logger = get_logger(__name__)
 
@@ -93,7 +94,9 @@ class WsBroadcasterMixin:
         """Close a group of clients on the event loop that owns their sockets."""
         for client in clients:
             try:
-                await client["ws"].close(code=1012, reason="Library switched")
+                await client["ws"].close(
+                    code=WS_CLOSE_SERVICE_RESTART, reason=LIBRARY_SWITCHED
+                )
             except Exception as exc:
                 logger.debug("WebSocket close during library switch failed: %s", exc)
 
@@ -413,6 +416,12 @@ class WsBroadcasterMixin:
             # asked can offer a more sensitive run when it found none.
             if isinstance(data, dict) and "new_faces" in data:
                 payload["new_faces"] = int(data["new_faces"])
+            # A background Scrapheap run names itself on every slice's event,
+            # so a tab can tell a run's progress from a single gesture's change
+            # (scrapheap_run_task). Absent, not null, on every other event.
+            if isinstance(data, dict) and data.get("run_id"):
+                payload["run_id"] = str(data["run_id"])
+                payload["run_kind"] = str(data.get("run_kind") or "")
         # Uniform origin-aware envelope on EVERY event. ``source`` and
         # ``origin_client_id`` let the frontend recognise the echo of its own
         # change (origin id match) and apply a targeted grid update instead of a
@@ -485,7 +494,9 @@ class WsBroadcasterMixin:
                     return
                 admission_lease = self.auth.register_authenticated_websocket(websocket)
                 if admission_lease is None:
-                    await websocket.close(code=1012)
+                    # Refused before accept, so the client sees a failed
+                    # handshake (HTTP 403) and no close reason can reach it.
+                    await websocket.close(code=WS_CLOSE_SERVICE_RESTART)
                     return
                 await websocket.accept()
                 # Always refresh _ws_loop so it tracks the currently-running event loop.

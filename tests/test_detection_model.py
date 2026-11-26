@@ -102,6 +102,13 @@ def test_detection_cascade_deletes_with_picture():
         assert Detection.find(session, picture_id=pic_id) == []
 
 
+def _det(bbox, *, label, score):
+    """A stand-in detection row: the sidecars read the stored box text."""
+    return SimpleNamespace(
+        id=1, picture_id=1, bbox_=json.dumps(bbox), label=label, score=score
+    )
+
+
 def _read_zip_json(buf, name):
     with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
         return json.loads(zf.read(name))
@@ -111,8 +118,8 @@ def test_export_sidecar_schema_and_scores():
     buf = io.BytesIO()
     pic = SimpleNamespace(width=1920, height=1080)
     dets = [
-        SimpleNamespace(bbox=[10, 20, 110, 220], label="dog", score=None),
-        SimpleNamespace(bbox=[0, 0, 50, 50], label="cat", score=0.9),
+        _det([10, 20, 110, 220], label="dog", score=None),
+        _det([0, 0, 50, 50], label="cat", score=0.9),
     ]
     with zipfile.ZipFile(buf, "w") as zf:
         ExportUtils._write_detection_sidecar(
@@ -137,7 +144,7 @@ def test_export_sidecar_scales_with_resolution():
     """Downscaled exports scale both the dimensions and the box coordinates."""
     buf = io.BytesIO()
     pic = SimpleNamespace(width=1920, height=1080)
-    dets = [SimpleNamespace(bbox=[10, 20, 110, 220], label="dog", score=None)]
+    dets = [_det([10, 20, 110, 220], label="dog", score=None)]
     with zipfile.ZipFile(buf, "w") as zf:
         ExportUtils._write_detection_sidecar(
             zf, "IMG_0002", "IMG_0002.jpg", pic, dets, 0.5
@@ -153,8 +160,8 @@ def test_ideogram_sidecar_schema_and_normalized_yxyx():
     buf = io.BytesIO()
     pic = SimpleNamespace(width=2000, height=1000)
     dets = [
-        SimpleNamespace(bbox=[100, 200, 1100, 800], label="dog", score=None),
-        SimpleNamespace(bbox=[0, 0, 2000, 1000], label="cat", score=0.9),
+        _det([100, 200, 1100, 800], label="dog", score=None),
+        _det([0, 0, 2000, 1000], label="cat", score=0.9),
     ]
     with zipfile.ZipFile(buf, "w") as zf:
         ExportUtils._write_ideogram_sidecar(
@@ -182,7 +189,7 @@ def test_ideogram_sidecar_schema_and_normalized_yxyx():
 
 def test_ideogram_sidecar_handles_missing_caption_and_dims():
     buf = io.BytesIO()
-    dets = [SimpleNamespace(bbox=[1, 2, 3, 4], label="x", score=None)]
+    dets = [_det([1, 2, 3, 4], label="x", score=None)]
     with zipfile.ZipFile(buf, "w") as zf:
         ExportUtils._write_ideogram_sidecar(
             zf, "IMG_0009", SimpleNamespace(width=0, height=0), dets, None

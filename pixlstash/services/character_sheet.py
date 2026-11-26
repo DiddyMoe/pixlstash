@@ -55,6 +55,7 @@ from scipy import ndimage
 from sqlmodel import Session, select
 
 from pixlstash.db_models import Character, Face, Picture
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.image_plugins.service import import_derived_outputs
 from pixlstash.pixl_logging import get_logger
 from pixlstash.scoring import select_reference_faces_for_character
@@ -1591,7 +1592,9 @@ def sheet_faces_in_session(
     ``None`` when the character does not exist. A sheet's list holds a
     ``(features, bbox)`` row per face, *features* ``None`` on the row face
     extraction leaves on a picture with no face, so an empty list means its
-    faces are not read yet. The references are every face of the character's
+    faces are not read yet. *bbox* is the stored box text, or ``None`` when
+    it is not four finite numbers (logged once by :func:`read_stored_bbox`):
+    the face still counts, its box is left out of panels and the cut. The references are every face of the character's
     reference cluster (without one, its reference faces), or, given
     *reference_picture_ids*, the faces of those
     pictures: what the sheets were drawn from. The sheets' own faces are never
@@ -1601,12 +1604,15 @@ def sheet_faces_in_session(
     if session.get(Character, character_id) is None:
         return None
     faces: dict[int, list] = {pid: [] for pid in picture_ids}
-    for picture_id, features, bbox in session.exec(
-        select(Face.picture_id, Face.features, Face.bbox_).where(
+    for face_id, picture_id, features, bbox in session.exec(
+        select(Face.id, Face.picture_id, Face.features, Face.bbox_).where(
             Face.picture_id.in_(picture_ids)
         )
     ).all():
-        faces[picture_id].append((features, bbox))
+        readable = read_stored_bbox(
+            bbox, owner="Face", row_id=face_id, picture_id=picture_id
+        )
+        faces[picture_id].append((features, bbox if readable is not None else None))
     if reference_picture_ids is None:
         cluster = reference_cluster_faces(
             session, character_id, CLUSTER_FACES
@@ -1778,12 +1784,23 @@ def sheets_in_session(
 def sheet_face_boxes_in_session(
     session: Session, picture_ids: list[int]
 ) -> dict[int, list[list[int]]]:
-    """Each picture's stored face boxes, for cutting it as it was ranked."""
+    """Each picture's stored face boxes, for cutting it as it was ranked.
+
+    A box that is not four finite numbers is left out (logged once by
+    :func:`read_stored_bbox`), as :func:`sheet_faces_in_session` leaves it
+    out of the ranking.
+    """
     boxes: dict[int, list] = {pid: [] for pid in picture_ids}
-    for picture_id, bbox in session.exec(
-        select(Face.picture_id, Face.bbox_).where(Face.picture_id.in_(picture_ids))
+    for face_id, picture_id, bbox in session.exec(
+        select(Face.id, Face.picture_id, Face.bbox_).where(
+            Face.picture_id.in_(picture_ids)
+        )
     ).all():
-        boxes[picture_id].extend(_face_boxes([bbox]))
+        box = read_stored_bbox(
+            bbox, owner="Face", row_id=face_id, picture_id=picture_id
+        )
+        if box is not None:
+            boxes[picture_id].append(box)
     return boxes
 
 
