@@ -31,6 +31,13 @@ env:
 
 jobs:
   refresh:
+    # Upstream only. A fork inherits the daily schedule (it runs on the fork's
+    # default branch) but has neither a `develop` to check out and target nor
+    # RELEASE_BOT_TOKEN to open the PR with, so it failed at checkout every day.
+    # Skipped, the job reports success; a fork that wants the refresh opens the
+    # PR upstream instead. Secrets cannot appear in `if:`, so this keys on the
+    # repository rather than on the token being set.
+    if: ${{ github.repository == 'Pikselkroken/pixlstash' }}
     runs-on: ubuntu-latest
     # The downloads' timeouts are per read, not in total.
     timeout-minutes: 15

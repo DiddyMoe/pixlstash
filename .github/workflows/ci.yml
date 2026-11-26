@@ -127,9 +127,15 @@ jobs:
           npm ci
           npm test
 
-      # `npm run lint` is `tsc --noEmit`. `npm test` compiles with
-      # tsconfig.test.json, which only covers src/ + test/; the lint pass is
-      # what type-checks the main-process build as electron-builder will.
+      # Reuses the install above. Warnings fail too, so a new one is fixed
+      # where it lands rather than piling up unread.
+      - name: Lint Frontend
+        working-directory: frontend
+        run: npm run lint -- --max-warnings=0
+
+      # In electron/, `npm run lint` is `tsc --noEmit`. `npm test` compiles
+      # with tsconfig.test.json, which only covers src/ + test/; the lint pass
+      # is what type-checks the main-process build as electron-builder will.
       # Electron's install script fetches its binary from a GitHub release on
       # every `npm ci`, and a 504 there has failed this job with nothing wrong
       # in the tree (runs 42467486129 and 42469975695). @electron/get looks in
@@ -295,7 +301,7 @@ jobs:
   # 0.43 s/test. Move those onto shared fixtures and both the shard count and
   # its wall clock stop mattering.
   #
-  # The list below is the GATED set. The ~52 files that are not in it are not
+  # The list below is the GATED set. The few files that are not in it are not
   # forgotten — they are declared as DEFERRED in tests/test_ci_shards.py, and
   # that test fails if any file under tests/ is in neither list. Adding a test
   # file therefore forces an explicit decision: gate it, or record why it is
@@ -325,21 +331,12 @@ jobs:
   # to cost. This does NOT approach the widened release-prep budget, and it
   # must not: regular PRs stay fast.
   #
-  # Why the rest of the deferred set is not simply gated too: it is not yet
-  # known green, and some of it is not deterministic. Measured 2026-07-26,
-  # tests/test_smart_score_invalidation.py returns a DIFFERENT pass count
-  # depending on machine load — 41 passed on an idle tree, 4 failed under two
-  # concurrent workloads — because its assertions race an async invalidation
-  # that has not landed yet (the failures read `assert <float> is None`).
-  # Collection order is deterministic (no randomising plugin), so load is the
-  # variable. Do not record a specific failure count for that file, and do not
-  # gate it on a loaded runner, which is its failing condition. Most of the
-  # rest have simply never run as a blocking check. Gating them today would
-  # turn every PR red. The flip to full discovery (`pytest tests/`, no list at
-  # all) is a follow-up, blocked on getting the deferred set green AND on
-  # making the load-sensitive ones deterministic — the informational sweep
-  # below keeps it
-  # visible in the meantime.
+  # Why the deferred set is not simply gated too: each of its files is red,
+  # or not yet confirmed green, for a reason recorded next to its entry in
+  # DEFERRED_FROM_GATE. A file moves here only after a green local run of the
+  # whole file. The flip to full discovery (`pytest tests/`, no list at all)
+  # waits on that list being empty; the informational sweep below keeps the
+  # deferred files visible in the meantime.
   #
   # `--ci-shard i/N` (implemented in tests/conftest.py) splits by *test* rather
   # than by file, which is what breaks up the authz suites and the 6-minute
@@ -494,21 +491,31 @@ jobs:
           tests/multi_project_authz/test_generic_field_reader_allowlist.py
           tests/multi_project_authz/test_multi_project_membership_authz.py
           tests/routes/test_training_api.py
+          tests/routes/test_training_row_writes_api.py
           tests/test_adapter_attachment.py
           tests/test_adapter_header.py
           tests/test_aitoolkit_run.py
+          tests/test_anomaly_penalty.py
           tests/test_anomaly_region_scope.py
+          tests/test_anomaly_thresholds_cache.py
+          tests/test_api_coverage.py
+          tests/test_app_logging_setup.py
           tests/test_app_permission_repair.py
           tests/test_architecture_guardrails.py
           tests/test_async_import_staging.py
           tests/test_auth_read_path.py
           tests/test_authentication.py
+          tests/test_authz_gate_id_range.py
           tests/test_authz_gate_step3.py
           tests/test_authz_gate_step4.py
           tests/test_authz_host_capability_16_3.py
           tests/test_authz_library_pin.py
           tests/test_backend_order_stability.py
+          tests/test_batch_apply_scores.py
           tests/test_batch_character_likeness_scope.py
+          tests/test_bbox_text_validation.py
+          tests/test_bounded_http.py
+          tests/test_build_desktop_runtime.py
           tests/test_builtin_models.py
           tests/test_character_face_assignment.py
           tests/test_character_sheet.py
@@ -527,7 +534,11 @@ jobs:
           tests/test_comfyui_stack_filter.py
           tests/test_comfyui_submit_prompt.py
           tests/test_comfyui_ui_graph_conversion.py
+          tests/test_comfyui_url.py
           tests/test_comfyui_workflow_extraction.py
+          tests/test_config_route_inputs.py
+          tests/test_connect_guard.py
+          tests/test_counts_scrapheap_scope.py
           tests/test_cpu_query_encoders.py
           tests/test_database_engine_config.py
           tests/test_dedup_auto_stack_runs.py
@@ -537,17 +548,28 @@ jobs:
           tests/test_dedup_tier_service.py
           tests/test_dedup_tiers_api.py
           tests/test_dedup_verdict_service.py
+          tests/test_default_device_override.py
           tests/test_default_tag_groups.py
           tests/test_description_cancel_blanking.py
           tests/test_desktop_dev_scratch.py
+          tests/test_detection_florence.py
+          tests/test_detection_model.py
           tests/test_detections_scope.py
           tests/test_docker_demo_hub_rewrite.py
+          tests/test_docker_windows_host_paths.py
           tests/test_downloads_intake.py
           tests/test_e2e_workflow_run_fakes.py
           tests/test_edit_selection.py
           tests/test_except_hygiene_guardrail.py
+          tests/test_exif_orientation_loads.py
           tests/test_export_api.py
+          tests/test_export_by_ids_api.py
+          tests/test_export_face_crop_bad_box.py
+          tests/test_export_folder_by_ids_api.py
+          tests/test_face_bbox_column.py
           tests/test_face_clusters.py
+          tests/test_face_detection_extreme_aspect_ratio.py
+          tests/test_face_extraction_speed.py
           tests/test_face_score_aggregation.py
           tests/test_facial_features_worker.py
           tests/test_find_orphaned_files.py
@@ -555,24 +577,36 @@ jobs:
           tests/test_finder_query_cost.py
           tests/test_florence.py
           tests/test_florence_model_variant.py
+          tests/test_folder_prefix.py
           tests/test_folder_structure_commit.py
           tests/test_folder_structure_read.py
           tests/test_frame_count.py
+          tests/test_full_pipeline.py
+          tests/test_gfs_snapshot_schedule.py
+          tests/test_guest_scoring.py
           tests/test_hub_bootstrap.py
           tests/test_hub_engine.py
           tests/test_hub_model_shelf_schema.py
           tests/test_hub_registry.py
+          tests/test_id_lists_routes.py
+          tests/test_id_lists_services.py
           tests/test_identity_storage_guardrail.py
           tests/test_image_embedding_worker.py
+          tests/test_image_plugins_api.py
+          tests/test_import_partial_failures.py
           tests/test_import_scrapheap_match.py
+          tests/test_impossible_clear.py
           tests/test_impossible_clear_authz.py
+          tests/test_impossible_filter.py
           tests/test_index_install_type.py
           tests/test_inline_rotate.py
           tests/test_inpaint_conversion.py
+          tests/test_insightface_model_pack.py
           tests/test_insightface_relocation.py
           tests/test_install_type_buckets.py
           tests/test_invalid_image_endless_retry.py
           tests/test_ip_locality_fail_closed.py
+          tests/test_justified_thumbnails.py
           tests/test_keep_cover_only.py
           tests/test_known_base_model_identify.py
           tests/test_known_base_models.py
@@ -592,17 +626,25 @@ jobs:
           tests/test_library_settings.py
           tests/test_library_switch.py
           tests/test_likeness_and_face_search.py
+          tests/test_likeness_sort_id_filter.py
           tests/test_likeness_worker.py
+          tests/test_links.py
+          tests/test_listing_and_character_int_bounds.py
+          tests/test_listing_field_projection.py
+          tests/test_loaded_module.py
           tests/test_log_token_redaction.py
+          tests/test_long_name_and_set_lists.py
           tests/test_managed_model_store.py
           tests/test_many_to_many_face_data.py
           tests/test_mcp_server.py
           tests/test_metadata_hash.py
           tests/test_metadata_hash_batching.py
           tests/test_migrations.py
+          tests/test_ml_first_import_race.py
           tests/test_model_downloads.py
           tests/test_model_file_classification.py
           tests/test_model_folder_scanner.py
+          tests/test_model_folders_listing_and_scan_claim.py
           tests/test_model_icons.py
           tests/test_model_move.py
           tests/test_model_run_import.py
@@ -613,6 +655,7 @@ jobs:
           tests/test_model_unload_race.py
           tests/test_mps_device_check.py
           tests/test_mps_memory_and_providers.py
+          tests/test_near_neighbor.py
           tests/test_node_pack_install.py
           tests/test_ocr_text.py
           tests/test_open_with.py
@@ -621,8 +664,13 @@ jobs:
           tests/test_orientation.py
           tests/test_package_data.py
           tests/test_path_containment.py
+          tests/test_penalised_tag_default.py
           tests/test_penalised_tag_exclusion.py
+          tests/test_pending_people_after_commit.py
+          tests/test_pending_people_reconciliation.py
           tests/test_pending_score_invalidation.py
+          tests/test_person_tags.py
+          tests/test_picture_find_id_lists.py
           tests/test_picture_is_video.py
           tests/test_picture_mutation_scope.py
           tests/test_picture_plugins.py
@@ -635,33 +683,52 @@ jobs:
           tests/test_pipeline_stage_contracts.py
           tests/test_pipeline_throughput_verification.py
           tests/test_pixlstash_tagger_dinov3.py
+          tests/test_pixlstash_tagger_load_retry.py
+          tests/test_pixlstash_tagger_plugin_init.py
           tests/test_plugin_create.py
           tests/test_plugin_install.py
           tests/test_plugin_lifecycle_gaps.py
+          tests/test_predicate_filter.py
           tests/test_process_teardown.py
+          tests/test_project_attachment_integrity.py
           tests/test_project_membership_service.py
           tests/test_projects_api.py
           tests/test_prompt_assist.py
           tests/test_prompt_match.py
+          tests/test_quality_task_shutdown.py
           tests/test_rate_limiter.py
           tests/test_read_token_security.py
+          tests/test_reference_folder_listing_count_parity.py
           tests/test_reference_folder_moves.py
+          tests/test_reference_folder_sidecars.py
           tests/test_reference_folder_watcher.py
           tests/test_repair_copied_face_rows.py
           tests/test_resource_arbiter.py
+          tests/test_resource_arbiter_stale_reading.py
           tests/test_resources_routes.py
           tests/test_restore.py
+          tests/test_restore_drain.py
+          tests/test_restore_face_bbox_refusal.py
+          tests/test_restore_library_fence.py
           tests/test_reviews_api.py
           tests/test_rocm_device_check.py
           tests/test_root_scan_first_import.py
+          tests/test_root_scan_import_lock.py
+          tests/test_route_int_bounds.py
+          tests/test_saved_comfyui_address_reads.py
           tests/test_saved_recipes.py
           tests/test_scope_table.py
           tests/test_score_agreement_stats.py
           tests/test_scrapheap_retention.py
           tests/test_scrapheap_runs.py
+          tests/test_search_export_parity.py
+          tests/test_search_listing_filter_parity.py
           tests/test_security_supported_versions.py
           tests/test_server.py
           tests/test_server_config_encoding.py
+          tests/test_server_external_listener.py
+          tests/test_server_http_contract.py
+          tests/test_server_simple.py
           tests/test_share_copies.py
           tests/test_share_link_library_pin.py
           tests/test_sidebar_counts_query_cost.py
@@ -669,40 +736,63 @@ jobs:
           tests/test_smart_score_consistency.py
           tests/test_smart_score_face_resolution.py
           tests/test_smart_sets.py
+          tests/test_snapshot_compression.py
           tests/test_snapshots.py
           tests/test_snapshots_auth.py
           tests/test_ssl_generation.py
           tests/test_stack_detection.py
           tests/test_stack_leader_scope.py
+          tests/test_stack_position_invariant.py
+          tests/test_stack_reads_scrapheap.py
           tests/test_stack_state_filter.py
           tests/test_stacks_api.py
           tests/test_stacks_membership.py
+          tests/test_startup_banner_encoding.py
           tests/test_startup_permissions.py
+          tests/test_stats_api.py
+          tests/test_stored_bbox_readers.py
+          tests/test_stored_picture_values.py
+          tests/test_sync_node_versions.py
           tests/test_system_utils.py
+          tests/test_tag_crop_skip_integration.py
           tests/test_tag_groups.py
+          tests/test_tag_health_api.py
           tests/test_tag_prediction_backfill.py
           tests/test_tag_prediction_scope.py
+          tests/test_tag_predictions_api.py
+          tests/test_tag_scan_vote_arrays.py
+          tests/test_tag_suggestions_api.py
           tests/test_tag_task.py
           tests/test_tag_worker.py
           tests/test_tagger_plugin_registry.py
+          tests/test_tagger_runs_api.py
           tests/test_tagger_user_plugins.py
+          tests/test_task_db_priorities.py
+          tests/test_task_failure_text.py
           tests/test_task_preemption.py
+          tests/test_task_runner_lifecycle.py
           tests/test_task_runner_submit_and_wait.py
-          tests/test_temp_vault_first_import.py
-          tests/test_thumbnail_cache_headers.py
-          tests/test_thumbnail_location.py
-          tests/test_token_identity.py
           tests/test_telemetry_install_id.py
           tests/test_telemetry_install_id_authz.py
           tests/test_telemetry_sender.py
+          tests/test_temp_vault_first_import.py
+          tests/test_thumbnail_cache_headers.py
+          tests/test_thumbnail_location.py
+          tests/test_thumbnail_overlay_bbox.py
+          tests/test_token_identity.py
           tests/test_training_dataset.py
           tests/test_trash_restore.py
+          tests/test_unprocessable_image_persistence.py
+          tests/test_user_settings_tagger_settings.py
+          tests/test_vault_background_writers.py
+          tests/test_vault_start_hooks.py
+          tests/test_vault_worker_lanes.py
           tests/test_vram_batch_budget.py
           tests/test_vram_oom_retry.py
           tests/test_watch_folder_worker.py
           tests/test_websocket_auth.py
-          tests/test_workers_api.py
           tests/test_work_planner.py
+          tests/test_workers_api.py
           tests/test_workflow_cards.py
           tests/test_workflow_group_convert.py
           tests/test_workflow_identity.py
@@ -714,6 +804,7 @@ jobs:
           tests/test_workflow_versions.py
           tests/test_workflows_api.py
           tests/test_ws_broadcaster.py
+          tests/test_ws_close_reasons.py
           tests/training/test_ai_toolkit_install.py
           tests/training/test_config_render.py
           tests/training/test_dataset_picker.py
@@ -725,6 +816,9 @@ jobs:
           tests/training/test_preview_likeness.py
           tests/training/test_sample_prompts.py
           tests/training/test_trainer_detach.py
+          tests/training/test_training_gpu_lease_release.py
+          tests/training/test_training_import_admission.py
+          tests/training/test_training_run_row_writes.py
           tests/training/test_training_service.py
 
   # ---------------------------------------------------------------------------
@@ -736,9 +830,9 @@ jobs:
   # order- or shard-dependence. This job is the control for that.
   #
   # Note it is ALSO the only run for the files in DEFERRED_FROM_GATE
-  # (tests/test_ci_shards.py) — a substantial slice of tests/. Those are
-  # therefore covered only here, only during release prep, and only
-  # informationally. That is a known gap, not a design goal: an earlier version
+  # (tests/test_ci_shards.py). Those are therefore covered only here, only
+  # during release prep, and only informationally. That is a known gap, not a
+  # design goal: an earlier version
   # of this comment claimed "the whole suite now blocks on every run", which was
   # never true and contradicted the deferral list in the same tree. The
   # behavioural authz/fail-closed suites used to be in that gap and are now
@@ -790,11 +884,10 @@ jobs:
   # is informational and must never be a required check. Nothing is a required
   # check in this repo — see the removal note above `e2e`.
   #
-  # The old "1.7.0 headline API surface" step is gone: its five files
-  # (test_tag_health_api, test_reviews_api, test_tag_predictions_api,
-  # test_tag_suggestions_api, test_tagger_runs_api) are now collected and
-  # blocking on every run, which is strictly stronger than blocking only during
-  # release prep.
+  # The old "1.7.0 headline API surface" step is gone. Its five files are
+  # collected by this sweep, and all five (test_tag_health_api,
+  # test_reviews_api, test_tag_predictions_api, test_tagger_runs_api,
+  # test_tag_suggestions_api) are also in the gate and block every run.
   # ---------------------------------------------------------------------------
   backend_release_sweep:
     name: backend-full block ${{ matrix.shard }} (informational, release-prep only)
@@ -1131,6 +1224,7 @@ jobs:
             tests/test_comfyui_recipe_route.py \
             tests/test_comfyui_submit_prompt.py \
             tests/test_comfyui_workflow_extraction.py \
+            tests/test_model_downloads.py \
             tests/test_watch_folder_worker.py \
             tests/test_work_planner.py \
             tests/test_process_teardown.py \
