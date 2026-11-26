@@ -7772,6 +7772,7 @@ watch(
     () => filterStore.faceBboxFilter,
     () => filterStore.impossibleSources,
     () => filterStore.stackStateFilter,
+    () => filterStore.tagStateFilter,
     () => filterStore.sharedOnlyFilter,
     () => filterStore.importedFromFilter,
     () => filterStore.noCharacterFilter,

@@ -18,6 +18,7 @@ import Tooltip from "../widgets/Tooltip.vue";
 import LightboxRecipePanel from "../views/LightboxRecipePanel.vue";
 import { getPictureRecipe } from "../../api/comfyui";
 import { getPictureStats } from "../../api/pictures";
+import { UNTAGGED_STATES } from "../../utils/filterChips";
 import { isReadOnly } from "../../utils/apiClient";
 import { formatUserDate } from "../../utils/utils.js";
 import { recipeForPanel } from "../../utils/pictureRecipe.js";
@@ -538,6 +539,8 @@ function buildQueryParams() {
   if (filterStore.faceBboxFilter != null) {
     params.append("face_filter", filterStore.faceBboxFilter);
   }
+  if (filterStore.tagStateFilter)
+    params.append("tag_state", filterStore.tagStateFilter);
   (filterStore.tagConfidenceAboveFilter || []).forEach((e) =>
     params.append("tag_confidence_above", e),
   );
@@ -735,6 +738,24 @@ const donutUntaggedOffset = computed(() => {
   const taggedFraction = stats.value.tagged / stats.value.total;
   return -(taggedFraction * DONUT_CIRCUMFERENCE);
 });
+
+// ─── Untagged breakdown ───────────────────────────────────────────────────────
+// Why the untagged are untagged, each row a filter on the view (`tag_state`).
+// A row with none is left out, except the one filtered on, which clears it.
+const untaggedRows = computed(() => {
+  const breakdown = stats.value?.untagged_breakdown;
+  if (!breakdown) return [];
+  return UNTAGGED_STATES.map((row) => ({
+    ...row,
+    count: breakdown[row.state],
+  })).filter(
+    (row) => row.count > 0 || filterStore.tagStateFilter === row.state,
+  );
+});
+function toggleTagStateFilter(state) {
+  filterStore.tagStateFilter =
+    filterStore.tagStateFilter === state ? null : state;
+}
 
 // ─── Bar chart ────────────────────────────────────────────────────────────────
 const maxTagCount = computed(() => {
@@ -1450,6 +1471,36 @@ function handleResolutionBarClick(label) {
               >Untagged {{ stats.untagged.toLocaleString() }}</span
             >
           </div>
+          <div
+            v-if="untaggedRows.length"
+            class="untagged-breakdown"
+            role="group"
+            aria-label="Why pictures are untagged"
+          >
+            <button
+              v-for="row in untaggedRows"
+              :key="row.state"
+              type="button"
+              class="untagged-row"
+              :class="{ active: filterStore.tagStateFilter === row.state }"
+              :aria-pressed="filterStore.tagStateFilter === row.state"
+              :data-tag-state="row.state"
+              @click="toggleTagStateFilter(row.state)"
+            >
+              <span class="untagged-row-label">{{ row.label }}</span>
+              <span class="untagged-row-count">{{
+                row.count.toLocaleString()
+              }}</span>
+              <Tooltip
+                :text="
+                  filterStore.tagStateFilter === row.state
+                    ? 'Show every picture again'
+                    : row.tooltip
+                "
+                activator="parent"
+              />
+            </button>
+          </div>
         </div>
       </div>
 
@@ -2130,6 +2181,42 @@ function handleResolutionBarClick(label) {
 .legend-text {
   font-size: var(--text-2xs);
   color: rgba(var(--v-theme-on-surface), 0.65);
+}
+
+/* The Untagged split: a filter row each, olive when it is the view's filter. */
+.untagged-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  margin-top: var(--space-2);
+}
+
+.untagged-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-2xs);
+  color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
+  text-align: left;
+  transition: background var(--dur-1) var(--ease-standard);
+}
+
+.untagged-row:hover {
+  background: var(--hover-wash);
+}
+
+.untagged-row.active {
+  background: var(--active-wash);
+  box-shadow: inset var(--rail-w) 0 0 var(--active-bar);
+  color: var(--active-text);
+}
+
+.untagged-row-count {
+  font-variant-numeric: tabular-nums;
 }
 
 .penalised-toggle {

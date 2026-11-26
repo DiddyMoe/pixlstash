@@ -221,6 +221,7 @@ export function useGridFetch(
       // Changes which pictures the grid shows, so an unforced fetch must not
       // early-return as a no-op against the previous state's key.
       stackStateFilter: filterStore.stackStateFilter ?? "all",
+      tagStateFilter: filterStore.tagStateFilter ?? null,
       favouriteOnlyFilter: Boolean(filterStore.favouriteOnlyFilter),
       similarityCharacter: sortStore.selectedSimilarityCharacter ?? null,
       comfyuiModelFilter: filterStore.comfyuiModelFilter ?? [],
@@ -521,6 +522,9 @@ export function useGridFetch(
       filterStore.stackStateFilter !== "all"
     ) {
       params.append("stack_state", filterStore.stackStateFilter);
+    }
+    if (filterStore.tagStateFilter) {
+      params.append("tag_state", filterStore.tagStateFilter);
     }
     if (filterStore.sharedOnlyFilter) {
       params.append("shared_only", "true");
@@ -855,6 +859,8 @@ export function useGridFetch(
       filterStore.stackStateFilter !== "all"
     )
       _filterP.set("stack_state", String(filterStore.stackStateFilter));
+    if (filterStore.tagStateFilter)
+      _filterP.set("tag_state", filterStore.tagStateFilter);
     // Filter params: shared only
     if (filterStore.sharedOnlyFilter) _filterP.set("shared_only", "true");
     // Filter params: hidden-tag filter

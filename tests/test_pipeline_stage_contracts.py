@@ -787,6 +787,36 @@ def test_undecodable_pictures_do_not_crowd_the_tag_candidate_window(tmp_path):
         assert task.params["picture_ids"] == [good]
 
 
+def test_the_tagger_count_leaves_out_pictures_it_will_not_take_up(tmp_path):
+    """ "Awaiting tagging" counts only what the tag finder would select.
+
+    A picture the tagger could not read keeps its sentinel, but the finder
+    holds it out, so counting it kept the tagger's remaining number above
+    zero with no work left to do.
+    """
+    with Vault(image_root=str(tmp_path)) as vault:
+        good, unreadable = _seed_pending(vault, tmp_path, ["ok.png", "bad.png"])
+
+        def add_face_rows(session: Session):
+            for pid in (good, unreadable):
+                session.add(Face(picture_id=pid, face_index=-1))
+            session.commit()
+
+        vault.db.run_task(add_face_rows)
+        assert vault.db.unprocessable_images.mark_unprocessable(
+            unreadable, str(tmp_path / "bad.png"), reason="test-corrupt fixture"
+        )
+        progress = vault.get_worker_progress()[TaskType.TAGGER.value]
+        assert progress["remaining"] == 1
+        suppressed = vault.db.unprocessable_images.active_suppressed_ids()
+        assert (
+            vault.db.run_immediate_read_task(
+                lambda s: TagTask.count_missing_tags(s, suppressed)
+            )
+            == 1
+        )
+
+
 def test_an_unreachable_picture_is_held_out_of_the_window_not_retired(tmp_path):
     """The second door into the same starvation - closed WITHOUT deleting.
 

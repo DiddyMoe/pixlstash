@@ -23,6 +23,8 @@ export const useFilterStore = defineStore("filter", () => {
   const tagConfidenceAboveFilter = ref([]);
   const tagConfidenceBelowFilter = ref([]);
   const faceBboxFilter = ref(null);
+  // Why the picture is untagged (`tag_state`), set from the stats rail.
+  const tagStateFilter = ref(null);
   const sharedOnlyFilter = ref(false);
   // "Imported from": an import folder's path, or null for any picture.
   const importedFromFilter = ref(null);
@@ -101,6 +103,7 @@ export const useFilterStore = defineStore("filter", () => {
     tagConfidenceAboveFilter.value = [];
     tagConfidenceBelowFilter.value = [];
     faceBboxFilter.value = null;
+    tagStateFilter.value = null;
     sharedOnlyFilter.value = false;
     importedFromFilter.value = null;
     noCharacterFilter.value = false;
@@ -126,6 +129,7 @@ export const useFilterStore = defineStore("filter", () => {
     tagConfidenceAboveFilter,
     tagConfidenceBelowFilter,
     faceBboxFilter,
+    tagStateFilter,
     sharedOnlyFilter,
     importedFromFilter,
     noCharacterFilter,

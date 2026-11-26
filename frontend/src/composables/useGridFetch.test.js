@@ -316,6 +316,19 @@ describe("useGridFetch streaming path", () => {
     );
   });
 
+  it("sends tag_state on the stream and count requests when an Untagged row is on", async () => {
+    getPictureCount.mockResolvedValue({ count: 1 });
+    streamPictures.mockResolvedValue({ pictures: [{ id: 41 }] });
+
+    const { grid } = makeHarness();
+    useFilterStore().tagStateFilter = "none";
+
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(streamPictures.mock.calls[0][0]).toContain("tag_state=none");
+    expect(getPictureCount.mock.calls[0][0]).toContain("tag_state=none");
+  });
+
   // *Show all N pictures* on a workflow card (F7). The chip is set on one
   // screen and read on another, so the half that could rot in silence is this
   // one: the strip would go on showing "Workflow: X" over the whole library.

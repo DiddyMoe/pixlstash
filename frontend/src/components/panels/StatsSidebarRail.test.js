@@ -789,6 +789,30 @@ describe("stats narrowed by a tag group (#2469)", () => {
   });
 });
 
+describe("the Untagged breakdown", () => {
+  it("lists why pictures are untagged, and a row filters the view to them", async () => {
+    getPictureStats.mockResolvedValue({
+      total: 111,
+      tagged: 109,
+      untagged: 2,
+      untagged_breakdown: { pending: 2, unprocessable: 0, none: 0 },
+      total_tags: 1987,
+      avg_tags_per_image: 17.9,
+      top_tags: [],
+    });
+    const wrapper = mountRail();
+    await flush();
+    const rows = wrapper.findAll("button.untagged-row");
+    expect(rows.map((r) => r.text())).toEqual(["Waiting for the tagger2"]);
+
+    await rows[0].trigger("click");
+    await flush();
+    expect(useFilterStore().tagStateFilter).toBe("pending");
+    expect(getPictureStats.mock.lastCall[0]).toContain("tag_state=pending");
+    expect(rows[0].attributes("aria-pressed")).toBe("true");
+  });
+});
+
 // The lightbox's Info | Recipe band on the grid's inspector, for one picture.
 describe("one picture's Recipe tab", () => {
   const RECIPES = {

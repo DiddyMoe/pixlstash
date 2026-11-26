@@ -2251,6 +2251,25 @@ from tagging* in §9 of the backend document.
 ---
 
 
+### 2.13 Why a picture is untagged
+
+**`GET /pictures/stats` explains its `untagged`.** The response carries
+`untagged_breakdown: {pending, unprocessable, none}`, which sums to `untagged`:
+
+| Key | The picture | Filter value |
+|---|---|---|
+| `pending` | is waiting for the tagger, which will take it up | `tag_state=pending` |
+| `unprocessable` | is a file the tagger could not read | `tag_state=unprocessable` |
+| `none` | was tagged and nothing applied, its tags were removed, or the tagger will not act on it | `tag_state=none` |
+
+`tag_state` narrows every figure of the stats response to that set; any other
+value is **422**. `StatsSidebar.vue` writes it from
+`useFilterStore.tagStateFilter`. `GET /pictures`, `/pictures/stream` and
+`/pictures/count` take the same `tag_state` and list exactly the pictures the
+breakdown counts under it, `character_id=UNASSIGNED` and `inbox` included, and
+`useGridFetch` sends it, so a row narrows the grid and the rail together.
+`GET /pictures/search` and `/pictures/likeness-groups` do not take it.
+
 ## 3. API Client ([apiClient.js](../frontend/src/utils/apiClient.js))
 
 Single shared **axios** instance with:

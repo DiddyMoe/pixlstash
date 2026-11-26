@@ -73,6 +73,29 @@ export const IMPOSSIBLE_OPTIONS = [
   },
 ];
 
+// Why an untagged picture is untagged: the listing's `tag_state` values. The
+// stats rail offers each as a row and the strip shows the active one as a chip.
+export const UNTAGGED_STATES = [
+  {
+    state: "pending",
+    label: "Waiting for the tagger",
+    chip: "waiting for the tagger",
+    tooltip: "Show the pictures waiting for the tagger",
+  },
+  {
+    state: "unprocessable",
+    label: "Couldn't be read",
+    chip: "couldn't be read",
+    tooltip: "Show the pictures the tagger couldn't read",
+  },
+  {
+    state: "none",
+    label: "No tags apply",
+    chip: "no tags apply",
+    tooltip: "Show the pictures the tagger found no tags for",
+  },
+];
+
 export const CONFIDENCE_THRESHOLDS = [0.9, 0.8, 0.7, 0.6];
 // Doubtful asks for an unsure tagger, so its thresholds sit lower.
 export const DOUBTFUL_THRESHOLDS = [0.6, 0.5, 0.4, 0.3];
@@ -303,6 +326,15 @@ export function filterChips(store, { allPicturesView = true } = {}) {
   if (faces) {
     push("faces", "Faces", faces.chip, () => {
       store.faceBboxFilter = null;
+    });
+  }
+  // Set from the stats rail's Untagged rows, which have no menu row.
+  const untagged = UNTAGGED_STATES.find(
+    (o) => o.state === store.tagStateFilter,
+  );
+  if (untagged) {
+    push("untagged", "Untagged", untagged.chip, () => {
+      store.tagStateFilter = null;
     });
   }
   // "unresolved" is not offered in the menu but can arrive from a URL; it still

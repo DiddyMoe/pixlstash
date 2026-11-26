@@ -5,6 +5,7 @@ from sqlmodel import Session, select, delete
 import os
 import threading
 import time
+from typing import Collection
 from sqlalchemy.exc import IntegrityError
 
 from PIL import Image as PILImage
@@ -46,6 +47,7 @@ from pixlstash.tagger_plugins.pixlstash_tagger import (
     QUALITY_CROP_TAG_WHITELIST,
 )
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.query.predicate_filter import awaiting_tagger_clauses
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
 
@@ -1636,16 +1638,18 @@ class TagTask(BaseTask):
         return written
 
     @staticmethod
-    def count_missing_tags(session: Session) -> int:
-        """Count pictures with a pending-retag sentinel (awaiting tagging)."""
-        has_sentinel = Tag.tag.like(
-            TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
-        )
+    def count_missing_tags(
+        session: Session, suppressed_ids: Collection[int] = frozenset()
+    ) -> int:
+        """Count the pictures the tagger will take up (awaiting tagging).
+
+        Args:
+            suppressed_ids: ``unprocessable_images.active_suppressed_ids()``.
+        """
         result = session.exec(
             select(func.count())
             .select_from(Picture)
-            .where(Picture.tags.any(has_sentinel))
-            .where(*taggable_picture_clauses())
+            .where(*awaiting_tagger_clauses(suppressed_ids))
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]

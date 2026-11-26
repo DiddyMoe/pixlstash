@@ -7,11 +7,15 @@ import tempfile
 import time
 
 from fastapi.testclient import TestClient
+from sqlmodel import delete, select
 
 import pixlstash.routes.pictures as pictures_module  # noqa: F401  (kept for backward compat with other tests)
 from pixlstash.utils.service import picture_stats as picture_stats_module
 from pixlstash.utils.service.picture_stats import STATS_TTL, clear_stats_cache
+from pixlstash.db_models import Picture, Tag
+from pixlstash.db_models.tag import make_tag_sentinel
 from pixlstash.server import Server
+from pixlstash.utils.image_processing.image_utils import ImageUtils
 from tests.utils import upload_pictures_and_wait
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
@@ -75,6 +79,66 @@ def test_stats_basic_counts():
         assert data["score_distribution"] == []
         assert data["smart_score_distribution"] == []
         assert data["resolution_distribution"] == []
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_untagged_breakdown_says_why_and_each_part_filters_the_grid():
+    """Details splits the untagged count by why, and the grid lists each part.
+
+    Waiting for the tagger (a sentinel it will act on), couldn't be read
+    (suppressed by the unprocessable registry) and no tags apply (neither).
+    """
+    temp_dir, client, server = _setup()
+    clear_stats_cache()
+    try:
+        tagged = _upload_picture(client, "Bad1.png")
+        waiting = _upload_picture(client, "Bad2.png")
+        unreadable = _upload_picture(client, "Changed1.png")
+        no_tags = _upload_picture(client, "Reference1.png")
+        assert (
+            client.post(f"/pictures/{tagged}/tags", json={"tag": "a_tag"}).status_code
+            == 200
+        )
+        db = server.vault.db
+
+        def seed(session):
+            session.exec(delete(Tag).where(Tag.picture_id.in_([tagged, no_tags])))
+            session.add(Tag(picture_id=tagged, tag="a_tag"))
+            for pid in (waiting, unreadable):
+                if not session.exec(select(Tag).where(Tag.picture_id == pid)).all():
+                    session.add(Tag(picture_id=pid, tag=make_tag_sentinel()))
+            session.commit()
+            return session.get(Picture, unreadable).file_path
+
+        unreadable_path = db.run_task(seed)
+        assert db.unprocessable_images.mark_unprocessable(
+            unreadable,
+            ImageUtils.resolve_picture_path(db.image_root, unreadable_path),
+            reason="test-corrupt fixture",
+        )
+
+        clear_stats_cache()
+        data = client.get("/pictures/stats").json()
+        assert data["untagged"] == 3
+        assert data["untagged_breakdown"] == {
+            "pending": 1,
+            "unprocessable": 1,
+            "none": 1,
+        }
+
+        expected = {"pending": waiting, "unprocessable": unreadable, "none": no_tags}
+        for state, pid in expected.items():
+            resp = client.get("/pictures", params={"tag_state": state})
+            assert resp.status_code == 200, resp.text
+            assert [row["id"] for row in resp.json()] == [pid], state
+            clear_stats_cache()
+            data = client.get("/pictures/stats", params={"tag_state": state}).json()
+            assert data["total"] == 1, state
+
+        assert client.get("/pictures", params={"tag_state": "x"}).status_code == 422
     finally:
         server.close()
         temp_dir.cleanup()

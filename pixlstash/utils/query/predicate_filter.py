@@ -31,7 +31,7 @@ with a pre-resolved set via the caller's own ``Picture.id.in_(...)`` clause.
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Sequence
+from typing import Collection, List, Optional, Sequence
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -41,7 +41,14 @@ from sqlmodel import select
 
 from pixlstash.db_models.dedup import DedupGroup, DedupGroupMember
 from pixlstash.db_models.picture import Picture
-from pixlstash.db_models.tag import TAG_SENTINEL_LIKE_PATTERN, TAG_SENTINEL_ESCAPE_CHAR
+from pixlstash.db_models.tag import (
+    TAG_PENDING_SENTINEL,
+    TAG_SENTINEL_ESCAPE_CHAR,
+    TAG_SENTINEL_LIKE_PATTERN,
+    Tag,
+)
+from pixlstash.services.set_lock_service import locked_picture_id_subquery
+from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.utils.workflow_ids import AUTO_PREFIX, MANUAL_PREFIX
 from pixlstash.utils.service.person_tags import (
     FACE_REQUIRING_TAGS,
@@ -202,6 +209,99 @@ _NO_REAL_FACE_SQL = (
     "NOT EXISTS (SELECT 1 FROM face WHERE face.picture_id = picture.id "
     "AND face.face_index != -1)"
 )
+
+
+# Why an untagged picture has no tags (``?tag_state=``). "Untagged" is no tag
+# but the pending sentinels, the test the stats ``untagged`` count uses, and the
+# three states partition those pictures:
+#
+# * ``unprocessable``: the unprocessable registry suppresses it (the tagger
+#   could not read the file), so nothing retries it until the file changes.
+# * ``pending``: the tagger will take it up (:func:`awaiting_tagger_clauses`).
+# * ``none``: neither. Usually the tagger ran and wrote nothing, or every tag was
+#   removed since; a manual Re-tag re-queues it. A sentinel the tagger will not
+#   act on where the picture is now (Scrapheap, locked set, no file) also lands
+#   here, and turns ``pending`` again on a restore or an unlock.
+TAG_STATES = ("pending", "unprocessable", "none")
+
+
+def parse_tag_state(raw: Optional[str]) -> Optional[str]:
+    """The ``tag_state`` query param, validated. ``None`` or empty is no filter.
+
+    Raises:
+        HTTPException: 422 for a value outside :data:`TAG_STATES`.
+    """
+    if not raw:
+        return None
+    if raw not in TAG_STATES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid tag_state: must be one of {', '.join(TAG_STATES)}",
+        )
+    return raw
+
+
+def untagged_predicate() -> ColumnElement:
+    """The picture has no tag but the pending sentinels."""
+    is_sentinel = Tag.tag.like(
+        TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
+    )
+    return ~Picture.tags.any(and_(~is_sentinel, Tag.tag.is_not(None)))
+
+
+def tag_state_predicates(
+    state: str, unprocessable_ids: Collection[int]
+) -> list[ColumnElement]:
+    """The clauses for one of :data:`TAG_STATES`.
+
+    Args:
+        state: One of :data:`TAG_STATES`.
+        unprocessable_ids: ``unprocessable_images.active_suppressed_ids()``.
+    """
+    unsuppressed = not_in_json(Picture.id, unprocessable_ids)
+    if state == "unprocessable":
+        return [untagged_predicate(), ~unsuppressed]
+    awaiting = awaiting_tagger_clauses(unprocessable_ids)
+    if state == "pending":
+        return [untagged_predicate(), *awaiting]
+    return [untagged_predicate(), unsuppressed, not_(and_(*awaiting))]
+
+
+# Every sentinel value starts with TAG_PENDING_SENTINEL (``__tag`` or
+# ``__tag:<engine>``), so the half-open range [``__tag``, ``__tah``) is the
+# sentinel set. Written as a range rather than the LIKE pattern because SQLite
+# cannot serve LIKE ... ESCAPE from an index: this form walks ``ix_tag_tag``.
+_TAG_SENTINEL_RANGE_END = TAG_PENDING_SENTINEL[:-1] + chr(
+    ord(TAG_PENDING_SENTINEL[-1]) + 1
+)
+
+
+def awaiting_tagger_clauses(suppressed_ids: Collection[int]) -> tuple:
+    """The pictures the tagger will take up, as WHERE terms on ``Picture``.
+
+    A pending-retag sentinel on a taggable picture, not frozen by a locked set
+    and not suppressed by the unprocessable registry. The tag finder's
+    selection, the tagger's remaining count and the ``pending`` tag state all
+    apply these, so the three cannot disagree.
+
+    Args:
+        suppressed_ids: ``unprocessable_images.active_suppressed_ids()``.
+    """
+    # The lock test must be set_lock_service's (stack arm included), the one
+    # TagTask's write guard uses: a narrower one selects pictures whose write
+    # is then skipped, so they keep the sentinel and come back every sweep.
+    # Local import: tag_task imports this module.
+    from pixlstash.tasks.tag_task import taggable_picture_clauses
+
+    sentinel_picture_ids = select(Tag.picture_id).where(
+        Tag.tag >= TAG_PENDING_SENTINEL, Tag.tag < _TAG_SENTINEL_RANGE_END
+    )
+    return (
+        Picture.id.in_(sentinel_picture_ids),
+        *taggable_picture_clauses(),
+        ~Picture.id.in_(locked_picture_id_subquery()),
+        not_in_json(Picture.id, suppressed_ids),
+    )
 
 
 # Tag-group terms travel inside the ordinary ``tag`` / ``rejected_tag`` params:
@@ -387,6 +487,10 @@ class PredicateFilter(BaseModel):
     import_source_folder: Optional[str] = None
     # Added at or after this time (the Inbox's period, see ``inbox_cutoff``).
     imported_since: Optional[datetime] = None
+    # Why the picture is untagged (one of ``TAG_STATES``), split on the
+    # unprocessable registry's suppressed ids, which only the caller can read.
+    tag_state: Optional[str] = None
+    unprocessable_ids: frozenset[int] = frozenset()
 
     # --- scope / lifecycle flags ---
     include_deleted: bool = False
@@ -711,6 +815,9 @@ class PredicateFilter(BaseModel):
                 )
             if clauses:
                 preds.append(or_(*clauses))
+
+        if self.tag_state is not None:
+            preds.extend(tag_state_predicates(self.tag_state, self.unprocessable_ids))
 
         return preds
 

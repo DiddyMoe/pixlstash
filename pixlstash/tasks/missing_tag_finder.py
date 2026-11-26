@@ -5,22 +5,13 @@ from sqlalchemy.orm import selectinload
 
 from pixlstash.db_models import (
     Picture,
-    Tag,
-    TAG_PENDING_SENTINEL,
     is_tag_sentinel,
     parse_tag_engine_from_sentinel,
 )
-from pixlstash.services.set_lock_service import locked_picture_id_subquery
-from pixlstash.utils.sql_chunking import not_in_json
+from pixlstash.utils.query.predicate_filter import awaiting_tagger_clauses
 from pixlstash.worker_config import IMAGE_TASK_PIXEL_BUDGET, TAGGER_MAX_INFLIGHT
 from .base_task_finder import BaseTaskFinder
-from .tag_task import TagTask, taggable_picture_clauses
-
-# Every sentinel value starts with TAG_PENDING_SENTINEL (``__tag`` or
-# ``__tag:<engine>``), so the half-open range [``__tag``, ``__tah``) is the
-# sentinel set. Written as a range rather than the LIKE pattern because SQLite
-# cannot serve LIKE ... ESCAPE from an index: this form walks ``ix_tag_tag``.
-_SENTINEL_RANGE_END = TAG_PENDING_SENTINEL[:-1] + chr(ord(TAG_PENDING_SENTINEL[-1]) + 1)
+from .tag_task import TagTask
 
 
 class MissingTagFinder(BaseTaskFinder):
@@ -119,9 +110,6 @@ class MissingTagFinder(BaseTaskFinder):
     def _fetch_missing_tags(
         session: Session, limit: int, suppressed_ids: Collection[int] = frozenset()
     ):
-        pending = select(Tag.picture_id).where(
-            Tag.tag >= TAG_PENDING_SENTINEL, Tag.tag < _SENTINEL_RANGE_END
-        )
         # Per-row stage dependency: tag a picture once ITS faces are known, not
         # once the whole face stage has drained. Face extraction always writes
         # at least one Face row (a ``face_index=-1`` sentinel when there is no
@@ -133,33 +121,11 @@ class MissingTagFinder(BaseTaskFinder):
         # The wait is bounded because `MissingFaceExtractionFinder` selects on
         # the exact complement, `~Picture.faces.any()`: a picture with no row
         # is by definition still face-stage work, so a cancelled or failed
-        # batch is re-offered rather than stranded. The one predicate the two
-        # finders did not share was the suppressed set, which is why it is
-        # applied above.
+        # batch is re-offered rather than stranded.
         faces_known = Picture.faces.any()
-        # A picture frozen by a locked set keeps its confirmed tags: never re-queue
-        # it for tagging (the write-side skip in TagTask is the belt; this is the
-        # braces, and it avoids re-queuing a locked picture that still carries a
-        # stray retag sentinel on every finder pass).
-        #
-        # Must be the shared set_lock_service predicate, not a local
-        # PictureSetMember join. The local join had no stack arm, while TagTask's
-        # write guard (`locked_picture_ids`) does: a picture merely *sharing a
-        # stack* with a locked-set member was therefore selected here, ran full
-        # GPU tagging, had its write skipped, kept its retag sentinel, and was
-        # selected again on the very next sweep - an unbounded inference loop.
-        # One definition on both sides is what closes it.
-        locked_member = ~Picture.id.in_(locked_picture_id_subquery())
-        # `taggable_picture_clauses` is the predicate `TagTask.count_missing_tags`
-        # applies, imported rather than repeated: the two disagreed (#1206 item
-        # 3), so the "awaiting tagging" number excluded scrapheaped pictures
-        # while this query kept selecting them and spending the GPU on them.
         stmt = select(Picture).where(
-            Picture.id.in_(pending),
+            *awaiting_tagger_clauses(suppressed_ids),
             faces_known,
-            locked_member,
-            *taggable_picture_clauses(),
-            not_in_json(Picture.id, suppressed_ids),
         )
         return session.exec(
             stmt.options(

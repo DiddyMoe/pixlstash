@@ -62,7 +62,7 @@ from pixlstash.utils.service.filter_helpers import (
     project_unassigned_clause,
     request_targets_scrapheap,
 )
-from pixlstash.utils.query.predicate_filter import PredicateFilter
+from pixlstash.utils.query.predicate_filter import PredicateFilter, parse_tag_state
 
 from ._helpers import (
     _face_cluster_ids,
@@ -115,6 +115,8 @@ class PictureStatsResponse(BaseModel):
     total_tags: Optional[int] = None
     tagged: Optional[int] = None
     untagged: Optional[int] = None
+    # Why the untagged pictures have no tags: the counts per ``tag_state``.
+    untagged_breakdown: Optional[dict[str, int]] = None
     avg_tags_per_image: Optional[float] = None
     top_tags: Optional[list] = None
     top_cooccurrences: Optional[list] = None
@@ -1305,6 +1307,10 @@ def register_routes(router, server):
             rejected_tags=rejected_tags,
             face_filter=face_filter,
             stack_state=stack_state,
+            tag_state=parse_tag_state(request.query_params.get("tag_state")),
+            unprocessable_ids=frozenset(
+                server.vault.db.unprocessable_images.active_suppressed_ids()
+            ),
             confidence_tag=confidence_tag,
             confidence_above=confidence_above,
             confidence_below=confidence_below,

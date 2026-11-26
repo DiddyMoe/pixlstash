@@ -16,7 +16,10 @@ from pixlstash.utils.service.filter_helpers import (
     project_membership_exists_clause,
     project_unassigned_clause,
 )
-from pixlstash.utils.query.predicate_filter import PredicateFilter
+from pixlstash.utils.query.predicate_filter import (
+    PredicateFilter,
+    tag_state_predicates,
+)
 
 logger = get_logger(__name__)
 
@@ -71,6 +74,10 @@ class PictureStatsParams:
     scoped_picture_ids: list[int] | None = None
     favourite_only: bool = False
     imported_since: datetime | None = None
+    tag_state: str | None = None
+    # ``unprocessable_images.active_suppressed_ids()``: splits the untagged
+    # count and the ``tag_state`` filter.
+    unprocessable_ids: frozenset[int] = frozenset()
 
 
 def _empty_stats() -> dict:
@@ -79,6 +86,7 @@ def _empty_stats() -> dict:
         "total_tags": 0,
         "tagged": 0,
         "untagged": 0,
+        "untagged_breakdown": {"pending": 0, "unprocessable": 0, "none": 0},
         "avg_tags_per_image": 0.0,
         "top_tags": [],
         "top_cooccurrences": [],
@@ -228,6 +236,8 @@ def _build_filtered_picture_subquery(session: Session, params: PictureStatsParam
         tags_confidence_below_filter=params.confidence_below or None,
         face_filter=params.face_filter,
         stack_state=params.stack_state,
+        tag_state=params.tag_state,
+        unprocessable_ids=params.unprocessable_ids,
         apply_deleted_filter=False,
     ).apply(pic_q)
 
@@ -245,8 +255,8 @@ def _compute_basic_counts(
         params: Filter params (used for penalised_tag_set).
 
     Returns:
-        Dict with keys: total, tagged, untagged, avg_tags_per_image,
-        total_tags, top_tags.
+        Dict with keys: total, tagged, untagged, untagged_breakdown,
+        avg_tags_per_image, total_tags, top_tags.
     """
     total = session.exec(select(func.count()).select_from(pic_subq)).one()
 
@@ -292,10 +302,24 @@ def _compute_basic_counts(
     ).all()
     top_tags = [{"tag": row[0], "count": row[1]} for row in top_tags_rows]
 
+    untagged = int(total) - int(tagged)
+    breakdown = {}
+    for state in ("pending", "unprocessable"):
+        breakdown[state] = session.exec(
+            select(func.count())
+            .select_from(Picture)
+            .where(
+                Picture.id.in_(select(pic_subq.c.id)),
+                *tag_state_predicates(state, params.unprocessable_ids),
+            )
+        ).one()
+    breakdown["none"] = untagged - breakdown["pending"] - breakdown["unprocessable"]
+
     return {
         "total": int(total),
         "tagged": int(tagged),
-        "untagged": int(total) - int(tagged),
+        "untagged": untagged,
+        "untagged_breakdown": breakdown,
         "avg_tags_per_image": round(avg_tags, 2),
         "total_tags": total_tags,
         "top_tags": top_tags,
@@ -808,7 +832,7 @@ def compute_picture_stats(vault, params: PictureStatsParams) -> dict:
 
     Returns:
         A dict with keys: total, total_tags, tagged, untagged,
-        avg_tags_per_image, top_tags, top_cooccurrences,
+        untagged_breakdown, avg_tags_per_image, top_tags, top_cooccurrences,
         confidence_histogram, regular_tags, score_distribution,
         smart_score_distribution, resolution_distribution, score_agreement.
     """
