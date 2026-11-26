@@ -87,7 +87,9 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request
 from platformdirs import user_config_dir
 from pydantic import BaseModel, ConfigDict, Field
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.pixl_logging import get_logger
+from pixlstash.routes.comfyui import _comfyui_url
 from pixlstash.services.builtin_caches import huggingface_cache_dir
 from pixlstash.services.builtin_models import is_declared_root
 from pixlstash.services import comfyui_link_service, model_downloads
@@ -95,6 +97,7 @@ from pixlstash.services.comfyui_service import (
     comfyui_folder_paths,
     comfyui_model_roots,
 )
+from pixlstash.middleware.library_admission import BUSY_RETRY_AFTER
 from pixlstash.services.downloads_intake import (
     IN_FLIGHT_SUFFIXES,
     safetensors_complete,
@@ -107,7 +110,6 @@ from pixlstash.services.managed_model_store import (
     relocatable_identity,
 )
 from pixlstash.services.model_folder_scanner import (
-    _LIKE_ESCAPE,
     DOWNLOADS_FOLDER_KIND,
     SHELF_MODEL_SUFFIXES,
     TAKEN_FROM_KINDS,
@@ -125,8 +127,10 @@ from pixlstash.tasks.model_folder_scan_task import (
 from pixlstash.utils.adapter_header import FILE_ENGINE
 from pixlstash.utils.host_open import open_in_file_manager
 from pixlstash.utils.library_layout import refusal_for_folder_name
+from pixlstash.utils.links import is_link_entry
 from pixlstash.utils.host_path_utils import is_absolute_host_path, normalize_host_path
 from pixlstash.utils.path_utils import path_is_within, resolve_path_within
+from pixlstash.utils.query.folder_prefix import FolderPrefix
 from pixlstash.utils.reference_folder_validator import (
     data_folder_conflict_detail,
     validate_reference_folder_accessible,
@@ -159,6 +163,10 @@ DEFAULT_ELIGIBLE_KINDS = ("user", MANAGED_KIND)
 # workflow names a missing file exactly while it is downloading, and `curl -O`
 # writes straight to the final name; the Downloads intake waits the same way.
 PICK_UP_SETTLE_S = 10.0
+
+# The 409 for a create or a rename onto a name that is taken. The caller sees
+# the name in its own field; a detail never repeats what they typed.
+NAME_TAKEN_MESSAGE = "A folder of that name already exists there."
 
 
 def _stability_matrix_roots() -> list[str]:
@@ -548,9 +556,20 @@ class ModelFolderDirResponse(BaseModel):
     has_dirs: bool = Field(
         description=(
             "Whether this directory holds at least one subdirectory the tree "
-            "would show, so the client knows to draw an expand arrow before it "
-            "asks."
+            "would show, a link node included, so the client knows to draw an "
+            "expand arrow before it asks. Always false on a link node."
         )
+    )
+    link: bool = Field(
+        default=False,
+        description=(
+            "True for a symlink or junction to a directory. The scanner follows "
+            "it, and the counts are the models it registered under this name "
+            "(zero when it skipped the link: one it already walked, one inside "
+            "or above this folder, or one inside another registered folder). "
+            "Read-only: no move, rename, removal or new folder goes through it, "
+            "and the tree does not expand it."
+        ),
     )
 
 
@@ -775,33 +794,73 @@ def _is_samples_dir_of(name: str, sample_stems: set[str]) -> bool:
 
 
 def _offered_dir(entry: os.DirEntry, sample_stems: set[str]) -> bool:
-    """Whether the tree shows *entry* as a subdirectory.
+    """Whether the tree shows *entry* as a subdirectory: a place to browse,
+    move into, rename and remove.
 
-    Dot-names, symlinks and Windows junctions (``DirEntry.is_junction``, 3.12+;
-    a junction is not a symlink to ``is_symlink``) are never offered. A bind
-    mount is a directory to every API here and is offered, as the scanner walks
-    it. A ``<stem>_samples`` directory is
-    hidden beside a model whose filename stem is ``<stem>``: its previews belong
-    to that model and are not a folder of their own.
+    Dot-names, symlinks and Windows junctions (a junction is not a symlink to
+    ``is_symlink``; :mod:`pixlstash.utils.links`) are never offered as a
+    place, and nor is an entry that can no longer be inspected. A link to a
+    directory is shown instead as a read-only node (:func:`_offered_link`). A bind mount is a directory to
+    every API here and is offered, as the scanner walks it. A
+    ``<stem>_samples`` directory is hidden beside a model whose filename stem
+    is ``<stem>``: its previews belong to that model and are not a folder of
+    their own.
     """
     if entry.name.startswith("."):
         return False
-    if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
+    try:
+        if is_link_entry(entry):
+            return False
+    except OSError as exc:
+        logger.warning(
+            "Leaving %s out of the folder tree: it could not be inspected, "
+            "most likely removed since the listing (%s).",
+            entry.path,
+            exc,
+        )
         return False
     if not entry.is_dir(follow_symlinks=False):
         return False
     return not _is_samples_dir_of(entry.name, sample_stems)
 
 
+def _offered_link(entry: os.DirEntry, sample_stems: set[str]) -> bool:
+    """Whether the tree shows *entry* as a read-only link node.
+
+    A symlink or a Windows junction to a directory, which the scanner follows
+    (``ModelFolderScanner._walk``), so the models behind it have a node to be
+    counted under. A broken link and a link to a file are not shown, nor is a
+    dot-name or a ``<stem>_samples`` link beside its model, as for a
+    directory. ``entry.is_dir()`` follows the link and answers False for a
+    target that is gone, so an entry removed since the listing, which
+    :func:`_offered_dir` has already logged, is left out quietly.
+    """
+    if entry.name.startswith(".") or _is_samples_dir_of(entry.name, sample_stems):
+        return False
+    try:
+        return entry.is_dir() and is_link_entry(entry)
+    except OSError as exc:
+        logger.warning(
+            "Leaving %s out of the folder tree: the link or its target could "
+            "not be inspected (%s).",
+            entry.path,
+            exc,
+        )
+        return False
+
+
 def _has_offered_dir(directory: str, sample_stems: set[str]) -> bool:
-    """Whether *directory* holds at least one offered subdirectory.
+    """Whether *directory* holds at least one subdirectory or link node to show.
 
     Raises:
         OSError: When the directory cannot be listed. The caller decides what
             that means for its answer.
     """
     with os.scandir(directory) as entries:
-        return any(_offered_dir(entry, sample_stems) for entry in entries)
+        return any(
+            _offered_dir(entry, sample_stems) or _offered_link(entry, sample_stems)
+            for entry in entries
+        )
 
 
 class ModelFolderDeleteResponse(BaseModel):
@@ -889,6 +948,59 @@ def _normalize_optional_host_path(value: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def move_refusal_error(exc: MoveRefused, unchanged: str) -> HTTPException:
+    """The HTTP answer to a :class:`MoveRefused` from a step that checks space.
+
+    A 4xx refusal keeps the mover's own sentence. A 507 (the destination's free
+    space is short or could not be read) names a server folder and its free
+    space, so it answers a fixed sentence and the mover's goes to the log.
+
+    Args:
+        exc: The refusal.
+        unchanged: What the caller can rely on, e.g. ``"Nothing was moved."``.
+    """
+    if exc.status_code < 500:
+        return HTTPException(status_code=exc.status_code, detail=str(exc))
+    logger.error(
+        "Refused for want of space (%s): %s", exc.status_code, exc, exc_info=exc
+    )
+    return HTTPException(
+        status_code=exc.status_code,
+        detail=(
+            "There is not enough free space at the destination, or its free "
+            f"space could not be read. {unchanged}"
+        ),
+    )
+
+
+DOWNLOADING_INTO_FOLDER = (
+    "A model is downloading, or waiting to download, into this folder. "
+    "Try again when it is done."
+)
+
+
+def reserve_while_moving(path: str) -> str:
+    """Reserve *path* for a move, a removal or a rename, or refuse (409).
+
+    A running download writes a partial inside its folder and publishes to it
+    by name, so a move or a removal of a directory it writes in strands or
+    loses the partial; a queued one makes the path again once it starts. The
+    reservation (``model_downloads.reserve_folder``) is refused while a
+    download that has not finished writes inside *path*, and while it is held
+    no download into *path* starts. Every route that moves or removes a model
+    folder's directory on disk takes one once it holds ``SHELF_IO_LOCK``: the
+    rename, the relocations and a directory's move or removal.
+
+    Returns:
+        The token the caller hands to ``model_downloads.release_folder`` when
+        its job ends, however it ends.
+    """
+    try:
+        return model_downloads.reserve_folder(path)
+    except model_downloads.FolderBusy as exc:
+        raise HTTPException(status_code=409, detail=DOWNLOADING_INTO_FOLDER) from exc
+
+
 def _validate_folder_conflicts(
     server, path: str, exclude_id: Optional[int] = None
 ) -> None:
@@ -923,14 +1035,26 @@ def _validate_folder_conflicts(
             continue
         other = str(row["path"])
         if path_is_within(path, other):
+            logger.info(
+                "Refusing model folder %s: it is inside registered folder %s (id=%s).",
+                path,
+                other,
+                row["id"],
+            )
             raise HTTPException(
                 status_code=409,
-                detail=f"Path is inside a registered model folder: {other}",
+                detail="This path is inside a registered model folder.",
             )
         if path_is_within(other, path):
+            logger.info(
+                "Refusing model folder %s: registered folder %s (id=%s) is inside it.",
+                path,
+                other,
+                row["id"],
+            )
             raise HTTPException(
                 status_code=409,
-                detail=f"A registered model folder is inside this path: {other}",
+                detail="A registered model folder is inside this path.",
             )
 
 
@@ -1052,8 +1176,17 @@ def queue_model_folder_scan(server, folder_id: int, path: str, kind: str) -> boo
     ``pending``, so the folder reads as being looked at rather than as empty.
 
     Returns:
-        False when it was not queued: one is already in flight, or the task
-        runner refused it, in which case the finder's next check takes it.
+        False when it was not queued: one is already in flight, or no task
+        runner will run it (none, or stopped), in which case the claim is
+        released and the finder's next check takes it.
+
+    Raises:
+        Whatever ``submit_task`` raised, after the claim is released and the
+        failure logged: ``TaskAdmissionRefused`` while a restore has paused
+        admission, ``RuntimeError`` when a dead worker's replacement could not
+        start, or anything else. The caller decides what the folder's row
+        becomes: the create route undoes it, the ComfyUI registration keeps it
+        for the finder.
     """
     task = claim_scan(
         server.hub,
@@ -1067,16 +1200,21 @@ def queue_model_folder_scan(server, folder_id: int, path: str, kind: str) -> boo
         return False
     try:
         task_id = server.vault.submit_task(task)
-    except RuntimeError as exc:
+    except BaseException as exc:
+        # `claim_scan` recorded the task, and only the task's own run settles
+        # it. Left in place, a task that never queued reads as `pending` for
+        # good and the finder never claims the folder again.
+        release_scan(task)
         logger.error(
-            "Could not queue the first scan of model folder %s (id=%s): the "
-            "task runner refused the submission: %s. The background scan will "
-            "pick it up instead.",
+            "Could not queue the first scan of model folder %s (id=%s): "
+            "submitting it raised %s: %s; its scan claim is released.",
             path,
             folder_id,
+            type(exc).__name__,
             exc,
+            exc_info=True,
         )
-        task_id = None
+        raise
     if task_id is None:
         release_scan(task)
         return False
@@ -1088,6 +1226,32 @@ def queue_model_folder_scan(server, folder_id: int, path: str, kind: str) -> boo
         task_id,
     )
     return True
+
+
+FIRST_SCAN_NOT_STARTED = (
+    "The folder was not added: PixlStash could not start its first scan. "
+    "Try again in a moment."
+)
+"""503 detail when a new folder's first scan raised ``RuntimeError`` on submit."""
+
+
+def undo_model_folder_registration(server, folder_id: int, path: str) -> None:
+    """Delete the row a registration request just wrote, with anything under it.
+
+    For a request that is about to answer with an error: it leaves no partial
+    state behind, so the client's retry registers the folder afresh rather
+    than hitting "already registered".
+    """
+    with server.hub.transaction() as conn:
+        conn.execute("DELETE FROM model_file WHERE model_folder_id = ?", (folder_id,))
+        conn.execute("DELETE FROM model_folder WHERE id = ?", (folder_id,))
+    forget_scan(folder_id)
+    logger.info(
+        "Model folder %s (id=%s) unregistered again: its first scan could not "
+        "be submitted.",
+        path,
+        folder_id,
+    )
 
 
 def register_comfyui_model_folders(server, base_url: str) -> list[int]:
@@ -1126,6 +1290,16 @@ def register_comfyui_model_folders(server, base_url: str) -> list[int]:
     # Asked at the address `locate` vetted, so a second DNS answer cannot
     # supply the paths from somewhere else.
     for root in comfyui_model_roots(pinned.rstrip("/")):
+        # ComfyUI's answer, so checked before anything resolves it: realpath
+        # raises on a NUL byte (isdir answers False for one) and silently
+        # anchors a relative path at this server's working directory.
+        if not os.path.isabs(root) or not os.path.isdir(root):
+            logger.warning(
+                "ComfyUI reported %r as a model folder; it is not an absolute "
+                "path to a directory on this computer, so it is skipped.",
+                root,
+            )
+            continue
         resolved = os.path.realpath(root)
         if os.path.dirname(resolved) == resolved or resolved in too_broad:
             logger.warning(
@@ -1144,7 +1318,18 @@ def register_comfyui_model_folders(server, base_url: str) -> list[int]:
             )
             continue
         registered.append(folder_id)
-        queue_model_folder_scan(server, folder_id, resolved, "user")
+        try:
+            queue_model_folder_scan(server, folder_id, resolved, "user")
+        except RuntimeError:
+            # A dead worker's replacement could not start (logged, claim
+            # released). Nobody is waiting on an answer here, so the row stays
+            # for the finder's next check and the next root still gets its turn.
+            logger.warning(
+                "ComfyUI model folder %s (id=%s) stays registered; its first "
+                "scan is left to the background scan.",
+                root,
+                folder_id,
+            )
     return registered
 
 
@@ -1364,7 +1549,8 @@ def create_router(server) -> APIRouter:
     def list_comfyui_reads(request: Request):
         server.auth.ensure_secure_when_required(request)
         user = server.auth.get_user_for_request(request)
-        url = (getattr(user, "comfyui_url", None) or "").strip()
+        # Through the normaliser: an invalid saved address is the 409.
+        url = _comfyui_url(user, None)
         if not url:
             return ComfyuiReadsResponse(known=False)
         try:
@@ -1386,11 +1572,13 @@ def create_router(server) -> APIRouter:
         reads = comfyui_reads([dict(row) for row in rows], folder_paths)
         return ComfyuiReadsResponse(known=bool(reads), reads=reads)
 
-    def _present_copies(folder_id: int, prefix: str) -> list:
-        """Every `present` copy under *prefix*, in one query.
+    def _present_copies(folder_id: int, under: FolderPrefix | None) -> list:
+        """Every `present` copy below *under*, in one query.
 
-        ``prefix`` is the listed directory's relpath with a trailing ``os.sep``,
-        escaped for LIKE. ``""`` reads the whole folder, and then no LIKE is run.
+        ``under`` is the listed directory's relpath; ``None`` reads the whole
+        folder. The range :class:`FolderPrefix` builds is exact on its own: no
+        LIKE wildcards to escape, and case folds only where the platform's
+        paths do, so no Python filter has to tidy the result up afterwards.
         """
         sql = (
             "SELECT mf.relpath AS relpath, mf.model_id AS model_id, "
@@ -1398,12 +1586,10 @@ def create_router(server) -> APIRouter:
             "FROM model_file mf JOIN model m ON m.id = mf.model_id "
             "WHERE mf.model_folder_id = ? AND mf.state = 'present'"
         )
-        if not prefix:
+        if under is None:
             return server.hub.fetchall(sql, (folder_id,))
-        return server.hub.fetchall(
-            sql + " AND mf.relpath LIKE ? ESCAPE '\\'",
-            (folder_id, prefix.translate(_LIKE_ESCAPE) + "%"),
-        )
+        below, bounds = under.under_sql("mf.relpath")
+        return server.hub.fetchall(f"{sql} AND {below}", (folder_id, *bounds))
 
     @router.get(
         "/model-folders/{folder_id}/dirs",
@@ -1413,8 +1599,14 @@ def create_router(server) -> APIRouter:
             "level per call, so the models tree opens lazily.\n\n"
             "`path` is POSIX and relative to the folder; leave it empty for the "
             "root. Every directory carries the `present` models under it, "
-            "recursively, and those directly in it. Empty directories are listed. Dot-names, symlinks and a "
+            "recursively, and those directly in it. Empty directories are "
+            "listed. Dot-names, broken links, links to files and a "
             "`<stem>_samples` directory beside its model are not.\n\n"
+            "A symlink or junction to a directory is listed with `link: true` "
+            "and `has_dirs: false`, carrying the models the scanner registered "
+            "under its name (zero when the scanner skipped it). It is read-only "
+            "and has nothing to expand: a move, rename, removal or new folder "
+            "through it is refused.\n\n"
             "A locked folder answers `locked: true` with no `dirs`, and its disk "
             "is not read; the counts still come from the database."
         ),
@@ -1422,7 +1614,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderDirsResponse,
     )
     def list_model_folder_dirs(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         path: str = Query(
             "",
@@ -1433,7 +1625,8 @@ def create_router(server) -> APIRouter:
         folder = _fetch_folder(folder_id)
         segments = _subpath_segments(path)
         subpath = "/".join(segments)
-        prefix = subpath.replace("/", os.sep) + os.sep if segments else ""
+        listed = subpath.replace("/", os.sep)
+        prefix = listed + os.sep if segments else ""
         locked = folder["movable"] != "per_item"
 
         directory = ""
@@ -1458,12 +1651,9 @@ def create_router(server) -> APIRouter:
         here_stems: set[str] = set()
         children: dict[str, _Subtree] = {}
         child_stems: dict[str, set[str]] = {}
-        for row in _present_copies(folder_id, prefix):
+        under = FolderPrefix.of(listed) if segments else None
+        for row in _present_copies(folder_id, under):
             relpath = row["relpath"]
-            # LIKE folds ASCII case, so `Alpha/` would match a listing of
-            # `alpha/`; the exact prefix is checked here.
-            if not relpath.startswith(prefix):
-                continue
             model_id = int(row["model_id"])
             size = int(row["file_size"])
             totals.model_ids.add(model_id)
@@ -1483,11 +1673,15 @@ def create_router(server) -> APIRouter:
         dirs: list[ModelFolderDirResponse] = []
         if not locked:
             try:
+                # (entry, is a link node) for each entry the tree shows.
+                offered: list[tuple[os.DirEntry, bool]] = []
                 with os.scandir(directory) as entries:
-                    offered = sorted(
-                        (e for e in entries if _offered_dir(e, here_stems)),
-                        key=lambda e: (e.name.casefold(), e.name),
-                    )
+                    for entry in entries:
+                        if _offered_dir(entry, here_stems):
+                            offered.append((entry, False))
+                        elif _offered_link(entry, here_stems):
+                            offered.append((entry, True))
+                offered.sort(key=lambda node: (node[0].name.casefold(), node[0].name))
             except OSError as exc:
                 logger.warning(
                     "Could not list model folder %s at %r (%s): %s",
@@ -1500,10 +1694,12 @@ def create_router(server) -> APIRouter:
                     status_code=409,
                     detail="Could not read this directory.",
                 ) from exc
-            for entry in offered:
+            for entry, link in offered:
                 child = children.get(entry.name, _Subtree())
                 try:
-                    has_dirs = _has_offered_dir(
+                    # A link node is read-only, so the tree has nothing to
+                    # expand on it, and nothing behind it is read.
+                    has_dirs = not link and _has_offered_dir(
                         entry.path, child_stems.get(entry.name, set())
                     )
                 except OSError as exc:
@@ -1523,6 +1719,7 @@ def create_router(server) -> APIRouter:
                         direct_model_count=len(child.direct_ids),
                         bytes=child.bytes,
                         has_dirs=has_dirs,
+                        link=link,
                     )
                 )
 
@@ -1551,7 +1748,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderDirCreateResponse,
     )
     def create_model_folder_dir(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ModelFolderDirCreateRequest = Body(...),
     ):
@@ -1585,9 +1782,7 @@ def create_router(server) -> APIRouter:
         try:
             os.mkdir(target)
         except FileExistsError as exc:
-            raise HTTPException(
-                status_code=409, detail=f"{payload.name!r} already exists there."
-            ) from exc
+            raise HTTPException(status_code=409, detail=NAME_TAKEN_MESSAGE) from exc
         except OSError as exc:
             logger.error(
                 "Could not create %s in model folder %s: %s", target, folder_id, exc
@@ -1619,7 +1814,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderOpenResponse,
     )
     def open_model_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         path: str = Query(
             "",
@@ -1666,6 +1861,15 @@ def create_router(server) -> APIRouter:
         payload: ModelFolderCreateRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
+        # A catalogued folder's first scan is submitted after its row is
+        # written, so a restore's paused admission is asked first: refused
+        # (409), the request has written nothing. A look, not a hold: a pause
+        # that lands after it still refuses the submit. Whatever the submit
+        # raises, the row is undone before the error answers, so an error
+        # never leaves a registered folder behind for the retry to trip on.
+        scanned = payload.kind not in TAKEN_FROM_KINDS
+        if scanned:
+            server.vault.refuse_while_admission_paused()
         folder_id = register_model_folder(
             server,
             payload.path,
@@ -1674,8 +1878,27 @@ def create_router(server) -> APIRouter:
             delete_after_import=payload.delete_after_import,
         )
         folder = _fetch_folder(folder_id)
-        if folder["kind"] not in TAKEN_FROM_KINDS:
-            queue_model_folder_scan(server, folder_id, folder["path"], folder["kind"])
+        if scanned:
+            try:
+                queue_model_folder_scan(
+                    server, folder_id, folder["path"], folder["kind"]
+                )
+            except RuntimeError as exc:
+                # A dead worker's replacement could not start (logged with its
+                # cause by the queue). A transient server condition, so 503
+                # with Retry-After (RFC 9110 15.6.4), the admission gate's
+                # value.
+                undo_model_folder_registration(server, folder_id, folder["path"])
+                raise HTTPException(
+                    status_code=503,
+                    detail=FIRST_SCAN_NOT_STARTED,
+                    headers={"Retry-After": BUSY_RETRY_AFTER},
+                ) from exc
+            except BaseException:
+                # The restore pause (409 by the server's handler) or anything
+                # else: undone, then answered as it would have been.
+                undo_model_folder_registration(server, folder_id, folder["path"])
+                raise
             # So the background scan sets up the folder's watch now rather
             # than on its next check.
             server.vault.wake()
@@ -1694,7 +1917,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderResponse,
     )
     def update_model_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ModelFolderUpdateRequest = Body(...),
     ):
@@ -1794,7 +2017,7 @@ def create_router(server) -> APIRouter:
             "and download marks, the shelf's copies and their curation follow "
             "without a rescan. 409 for a locked folder, a name already taken or "
             "a registered path, and while a move, an import or a scan of this "
-            "folder or a download into it runs; 400 with the reason for a name the drive cannot hold; "
+            "folder or a download into it runs or waits; 400 with the reason for a name the drive cannot hold; "
             "404 when the folder is not on disk. Refused in Docker, as creating "
             "a host folder is. Tools outside PixlStash that name the old path "
             "(ComfyUI, StabilityMatrix) are not told."
@@ -1803,7 +2026,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderResponse,
     )
     def rename_model_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ModelFolderRenameRequest = Body(...),
     ):
@@ -1843,18 +2066,9 @@ def create_router(server) -> APIRouter:
                 status_code=409,
                 detail="A move or an import is running. Try again when it is done.",
             )
+        reservation = None
         try:
-            # A download writes a partial under the old path and publishes to
-            # it by name, so a rename under it would strand the partial.
-            if any(
-                entry["status"] == model_downloads.STATUS_RUNNING
-                and entry["folder_path"] == old_path
-                for entry in model_downloads.live_downloads()
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="A model is downloading into this folder. Try again when it is done.",
-                )
+            reservation = reserve_while_moving(old_path)
             # Holding the folder's scan slot keeps the finder from handing out a
             # scan of the old path while it is renamed: that scan would find the
             # folder gone and mark every model in it unreachable.
@@ -1869,6 +2083,8 @@ def create_router(server) -> APIRouter:
             finally:
                 release_scan(hold)
         finally:
+            if reservation is not None:
+                model_downloads.release_folder(reservation)
             SHELF_IO_LOCK.release()
         logger.info(
             "Model folder %s (id=%s) renamed to %s.", old_path, folder_id, new_path
@@ -1897,10 +2113,7 @@ def create_router(server) -> APIRouter:
         # "exists" but is the same directory. The window between the check and
         # the rename is the one `model_dir_mover` accepts too.
         if os.path.lexists(new_path) and not _same_directory(old_path, new_path):
-            raise HTTPException(
-                status_code=409,
-                detail=f"{os.path.basename(new_path)!r} already exists there.",
-            )
+            raise HTTPException(status_code=409, detail=NAME_TAKEN_MESSAGE)
         try:
             os.rename(old_path, new_path)
         except OSError as exc:
@@ -1961,7 +2174,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=ModelFolderDeleteResponse,
     )
-    def delete_model_folder(folder_id: int, request: Request):
+    def delete_model_folder(folder_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         folder = _fetch_folder(folder_id)
         if is_declared_root(folder["owner"], folder["kind"]):

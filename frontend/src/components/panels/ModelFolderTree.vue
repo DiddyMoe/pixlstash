@@ -109,21 +109,30 @@
         </template>
         <template v-else>
           <!-- The lock is the glyph, so nothing after the name changes width
-               with it and the counts stay one column. -->
+               with it and the counts stay one column. A link to a directory
+               elsewhere wears an arrow out the same way. -->
           <v-icon
             size="16"
             class="mft-glyph"
             aria-hidden="true"
             :class="{ 'mft-glyph--in': welcomes.has(node.key) }"
-            :data-testid="node.locked ? 'model-folder-lock' : undefined"
+            :data-testid="
+              node.locked
+                ? 'model-folder-lock'
+                : node.link
+                  ? 'model-folder-link'
+                  : undefined
+            "
             >{{
               node.locked
                 ? "mdi-folder-lock-outline"
-                : welcomes.has(node.key)
-                  ? "mdi-folder-download-outline"
-                  : node.expanded
-                    ? "mdi-folder-open-outline"
-                    : "mdi-folder-outline"
+                : node.link
+                  ? "mdi-folder-arrow-right-outline"
+                  : welcomes.has(node.key)
+                    ? "mdi-folder-download-outline"
+                    : node.expanded
+                      ? "mdi-folder-open-outline"
+                      : "mdi-folder-outline"
             }}</v-icon
           >
           <!-- A registered folder is two lines: its name, and where it is from
@@ -357,6 +366,12 @@ import TypeMark from "../widgets/TypeMark.vue";
  * folder, nor any row `disabled` refuses, has no verbs, and reads the same
  * `selected` back so the parent owns the choice.
  *
+ * A link (a symlink or junction to a directory, which the scanner follows) is
+ * a row of its own, carrying the models found through it. It opens on the
+ * shelf like any folder, and is read-only otherwise: no expand, no verbs, no
+ * drag, no drop, and never a destination to pick, as the server refuses every
+ * move, rename or new folder through it.
+ *
  * In `browse` the rows also take model rows dragged off the shelf (#2204): a
  * drop asks for a move to that folder. While they are dragged, the folders
  * their Type belongs in welcome them: the glyph gains an arrow in and the Type
@@ -472,6 +487,7 @@ function pushFolderRows(out, entry) {
   const open = expanded.value.has(key);
   const expandable =
     !entry.locked &&
+    !entry.link &&
     (listing?.listing
       ? listing.listing.dirs.length > 0
       : (entry.hasDirs ?? !listing?.error));
@@ -483,7 +499,8 @@ function pushFolderRows(out, entry) {
       ? listing?.listing?.model_count
       : listing?.listing?.direct_model_count);
   const refused =
-    props.mode === "pick" && (entry.locked || props.disabled?.(entry));
+    props.mode === "pick" &&
+    (entry.locked || entry.link || props.disabled?.(entry));
   const marks = comfyuiMarks(
     entry.folderId,
     entry.path,
@@ -509,6 +526,7 @@ function pushFolderRows(out, entry) {
       typeLine.map((type) => type.label).join(", "),
       n == null ? "" : `${count(n)} ${Number(n) === 1 ? "model" : "models"}`,
       entry.locked ? "locked" : "",
+      entry.link ? "link" : "",
       ...marks.map(comfyuiLoadsTitle),
     ]
       .filter(Boolean)
@@ -523,6 +541,7 @@ function pushFolderRows(out, entry) {
       name: dir.name,
       level: entry.level + 1,
       locked: false,
+      link: dir.link === true,
       hasDirs: dir.has_dirs,
       count: dir.direct_model_count,
     });
@@ -531,7 +550,8 @@ function pushFolderRows(out, entry) {
 
 /**
  * Where each Type belongs in the folders the tree lists. A locked folder takes
- * no file, so nothing in it is a destination.
+ * no file, so nothing in it is a destination; `modelDestinations` leaves out a
+ * link and anything behind it.
  */
 const destinations = computed(() =>
   modelDestinations(
@@ -661,8 +681,9 @@ const OPEN_ENTRY = {
 
 /**
  * The menu a row offers, in the order the design draws it. Empty for a drive,
- * a locked folder (it shows its lock and nothing else), and every row in pick
- * mode. A registered root has no Move or Remove: it is a place the owner
+ * a locked folder (it shows its lock and nothing else), a link (the server
+ * refuses every verb through one, and will not open one either), and every
+ * row in pick mode. A registered root has no Move or Remove: it is a place the owner
  * registered, and leaving the registry is Stop watching. Its Rename renames the
  * directory on disk and the registration with it.
  *
@@ -671,7 +692,7 @@ const OPEN_ENTRY = {
  */
 function menuFor(node) {
   if (props.mode !== "browse") return [];
-  if (node.kind === "drive" || node.locked) return [];
+  if (node.kind === "drive" || node.locked || node.link) return [];
   const busy = gates.folderVerbReason({ id: node.folderId });
   // Models cut on the shelf (Ctrl X or Cut) land here, through the Move
   // dialog. Listed only while something is cut, first: it is why the reader
@@ -776,7 +797,7 @@ function onMoreClick(event, node) {
  * the Delete that asked, for an empty folder, which goes without a dialog.
  */
 function act(key, node, options = {}) {
-  if (key === "paste") shelf.pasteCut(dropDestination(node));
+  if (key === "paste") shelf.pasteCut(pasteDestination(node));
   else if (key === "new") startNew(node);
   else if (key === "rename") startRename(node);
   else if (key === "move") shelf.requestFolderMove(sourceOf(node));
@@ -843,8 +864,9 @@ function runEntry(entry) {
  */
 function verbKey(event, node) {
   const chord = event.ctrlKey || event.metaKey;
-  // Ctrl V pastes what the shelf cut into this folder. A locked folder offers
-  // no menu, so it is asked directly and says why it refuses.
+  // Ctrl V pastes what the shelf cut into this folder. A locked folder and a
+  // link offer no menu, so the shelf's pasteCut is asked directly and says why
+  // it refuses.
   if (
     chord &&
     !event.shiftKey &&
@@ -854,7 +876,7 @@ function verbKey(event, node) {
     node.kind !== "drive"
   ) {
     if (verbFor(node, "paste")) return true;
-    shelf.pasteCut(dropDestination(node));
+    shelf.pasteCut(pasteDestination(node));
     return true;
   }
   if (
@@ -918,6 +940,7 @@ function canDrag(node) {
     node.kind !== "drive" &&
     node.path !== "" &&
     !node.locked &&
+    !node.link &&
     editor.value == null
   );
 }
@@ -1257,9 +1280,21 @@ function reveal(folderId, parent, focusPath) {
 
 // ── Drops ───────────────────────────────────────────────────────────────────
 
-/** Where a drop on this row lands: null for a drive, which is no place. */
+/**
+ * Where a drop on this row lands: null for a drive, which is no place, and for
+ * a link, which takes no move.
+ */
 function dropDestination(node) {
-  if (node.kind === "drive") return null;
+  if (node.kind === "drive" || node.link) return null;
+  return pasteDestination(node);
+}
+
+/**
+ * Where a paste on this row goes: its own directory, a locked one or a link
+ * included, so the shelf's `pasteCut`, which owns every paste refusal, says
+ * why it refuses. Never asked of a drive.
+ */
+function pasteDestination(node) {
   return { folderId: node.folderId, path: node.path, locked: node.locked };
 }
 

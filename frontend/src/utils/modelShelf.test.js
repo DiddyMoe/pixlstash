@@ -21,6 +21,7 @@ import {
   collapseStacks,
   comfyuiLoadsTitle,
   comfyuiMarks,
+  isBehindLink,
   layoutKind,
   modelDestinations,
   unsaidTypes,
@@ -1988,6 +1989,48 @@ describe("where a dragged model belongs", () => {
     // A parent known only from before the change offers nothing yet.
     const before = new Map([["1:", stale(listing([dir("Lora", 4)]))]]);
     expect(modelDestinations([sm], before, none)).toEqual([]);
+  });
+
+  it("never names a link, nor anything behind one, a destination", () => {
+    const link = (path, direct) => ({ ...dir(path, direct), link: true });
+    const listings = new Map([
+      ["1:", listing([link("Lora", 7), dir("DiffusionModels", 6)])],
+      ["2:", listing([link("loras", 3), dir("vae", 1)])],
+    ]);
+    // By the layout: the linked Lora is left out, its sibling kept.
+    expect(modelDestinations([sm], listings, { known: false, reads: [] })).toEqual([
+      { folderId: 1, path: "DiffusionModels", kind: "checkpoint", count: 6 },
+    ]);
+    // By ComfyUI's reads: one into the link and one behind it are both left out.
+    const reads = {
+      known: true,
+      reads: [
+        { folder_id: 2, subpath: "loras", kind: "lora" },
+        { folder_id: 2, subpath: "loras/flux", kind: "lora" },
+        { folder_id: 2, subpath: "vae", kind: "vae" },
+      ],
+    };
+    expect(modelDestinations([comfy], listings, reads)).toEqual([
+      { folderId: 2, path: "vae", kind: "vae", count: 1 },
+    ]);
+  });
+
+  it("knows a link and what is behind it from the listings read so far", () => {
+    const link = (path) => ({ ...dir(path, 0), link: true });
+    const listings = new Map([
+      ["1:", listing([dir("Models", 0)])],
+      // Stale since a change under it, and still a link.
+      ["1:Models", { ...listing([link("Models/Lora"), dir("Models/VAE", 0)]), stale: true }],
+    ]);
+    expect(isBehindLink(listings, 1, "Models/Lora")).toBe(true);
+    expect(isBehindLink(listings, 1, "Models/Lora/flux/deep")).toBe(true);
+    expect(isBehindLink(listings, 1, "Models/VAE")).toBe(false);
+    expect(isBehindLink(listings, 1, "Models")).toBe(false);
+    expect(isBehindLink(listings, 1, "")).toBe(false);
+    // The same path in another registered folder is not behind this link.
+    expect(isBehindLink(listings, 2, "Models/Lora")).toBe(false);
+    // A level not read yet says nothing: the server still refuses.
+    expect(isBehindLink(new Map(), 1, "Models/Lora")).toBe(false);
   });
 
   it("puts a Type on a second line only where the name does not say it", () => {

@@ -1506,11 +1506,45 @@ export function layoutKind(folder, path) {
   return known ? (LAYOUT_KINDS[squash(segments.at(-1))] ?? "") : "";
 }
 
+/** Why a link takes nothing: what the server's refusal comes to. */
+export const LINK_REFUSAL =
+  "This folder is a link to another place, so nothing can be moved or made inside it.";
+
+/**
+ * Whether a directory is a link (a symlink or junction to a directory) or lies
+ * behind one, by the listings read so far: the listing of each segment's
+ * parent names that segment with `link: true`. A stale listing still counts,
+ * since a change to the models under a link does not make it any less one.
+ * The server refuses every move, rename and new folder through a link
+ * (`resolve_subfolder`) and stays the authority; this only keeps the shelf
+ * and the tree from offering one.
+ *
+ * @param {Map<string, {listing?: Object}>} listings - the folders store's
+ *   `dirListings`, keyed `"<folder id>:<path>"`.
+ * @param {number} folderId - the registered folder.
+ * @param {string} [path=""] - POSIX, relative to it.
+ * @returns {boolean}
+ */
+export function isBehindLink(listings, folderId, path = "") {
+  const parts = path ? String(path).split("/") : [];
+  for (let i = 0; i < parts.length; i += 1) {
+    const here = parts.slice(0, i + 1).join("/");
+    const parent = `${Number(folderId)}:${parts.slice(0, i).join("/")}`;
+    const listing = listings?.get(parent)?.listing;
+    if (listing?.dirs?.some((dir) => dir.link && dir.path === here)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Where models of each Type belong in the registered folders: the directories
  * ComfyUI loads them from, or for a folder none of its reads lands in, the
  * directories its tool's layout names. A layout directory is only found once
- * its parent has been listed and is not stale.
+ * its parent has been listed and is not stale. A link, and anything behind
+ * one ({@link isBehindLink}), is never a destination: the server refuses a
+ * move through it.
  *
  * @param {Array<{id: number, path: string, tool?: string}>} folders
  * @param {Map<string, {listing?: Object, stale?: boolean}>} listings - the
@@ -1541,6 +1575,7 @@ export function modelDestinations(folders, listings, reads) {
     const seen = new Set();
     for (const [path, kind] of found) {
       if (!kind || seen.has(`${path}\u0000${kind}`)) continue;
+      if (isBehindLink(listings, id, path)) continue;
       seen.add(`${path}\u0000${kind}`);
       out.push({ folderId: id, path, kind, count: Number(counts.get(path)) || 0 });
     }

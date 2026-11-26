@@ -6,8 +6,8 @@
     @close="emit('close')"
     @accept="submit"
   >
-    <!-- Step one: where it goes. The tree picks, and the folder itself and
-         everything under it are refused. -->
+    <!-- Step one: where it goes. The tree picks, and the folder itself,
+         everything under it and any link are refused. -->
     <div v-if="!facts" class="fmd-field">
       <span class="fmd-label" aria-hidden="true">Move it into</span>
       <div class="fmd-tree">

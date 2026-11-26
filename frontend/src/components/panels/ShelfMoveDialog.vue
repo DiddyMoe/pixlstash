@@ -24,8 +24,8 @@
       <div class="smd-field">
         <span class="smd-label" aria-hidden="true">Move them to</span>
         <!-- The Folders tree, picking (#2204): any subfolder is a destination,
-             and each drive shows its free space. Locked folders and the folder
-             every file is already in are refused. -->
+             and each drive shows its free space. Locked folders, links and the
+             folder every file is already in are refused. -->
         <div ref="treeBoxEl" class="smd-tree">
           <ModelFolderTree
             ref="treeRef"

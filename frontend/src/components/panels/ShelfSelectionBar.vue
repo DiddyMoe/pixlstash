@@ -683,14 +683,21 @@ const movable = computed(
 
 /**
  * Paste, while something is cut: into the open folder, so only in a folder
- * view. Anywhere else it says where a paste can go instead.
+ * view. Anywhere else it says where a paste can go instead. A locked folder,
+ * and a link or a folder behind one (`behindLink`, from the listings read so
+ * far), take nothing, so Paste is disabled there with why; the store's
+ * `pasteCut` refuses the same places for every other way in.
  */
 const pasteTitle = computed(() => {
-  if (store.place !== "folder" || !store.folderScope) {
+  const scope = store.folderScope;
+  if (store.place !== "folder" || !scope) {
     return "Open a folder to paste into it, or right-click a folder in Folders";
   }
-  if (store.folderScope.locked) {
+  if (scope.locked) {
     return "That folder is locked, so nothing can be moved into it";
+  }
+  if (folders.behindLink(scope.folderId, scope.path ?? "")) {
+    return "That folder is a link to another place, so nothing can be moved into it";
   }
   return "";
 });

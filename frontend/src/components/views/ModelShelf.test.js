@@ -4987,6 +4987,49 @@ describe("the open folder (#2203)", () => {
       wrapper.unmount();
     });
 
+    it("refuses a paste into a linked folder before asking the server, and says why", async () => {
+      const { wrapper, store } = await selectLoose();
+      await press("x");
+      // The root's listing names Lora a link (a symlink or junction).
+      const plain = listModelFolderDirs.getMockImplementation();
+      listModelFolderDirs.mockImplementation(async (id, at) => {
+        const listing = await plain(id, at);
+        return {
+          ...listing,
+          dirs: listing.dirs.map((dir) => ({ ...dir, link: dir.name === "Lora" })),
+        };
+      });
+      await useModelFoldersStore().loadDirs(1, "", { force: true });
+
+      store.setFolderScope({ folderId: 1, path: "Lora" });
+      await flushPromises();
+      const refused = () => {
+        expect(startModelMove).not.toHaveBeenCalled();
+        expect(dialog(wrapper).props("open")).toBe(false);
+        expect(useNoticeStore().notices.at(-1)?.text).toBe(
+          "This folder is a link to another place, so nothing can be moved or made inside it.",
+        );
+        // The cut is kept for a paste somewhere that takes it.
+        expect(store.cutCopies?.items).toEqual([LOOSE]);
+      };
+      await press("v");
+      refused();
+      // The bar's Paste is not offered there, and says why.
+      const bar = wrapper.findComponent({ name: "ShelfSelectionBar" });
+      const paste = bar.find(".ctx-item[data-verb='paste']");
+      expect(paste.attributes("disabled")).toBeDefined();
+      expect(tip(paste)).toBe(
+        "That folder is a link to another place, so nothing can be moved into it",
+      );
+
+      // The positive control: a plain folder beside it takes the paste.
+      store.setFolderScope({ folderId: 1, path: "VAE" });
+      await flushPromises();
+      await press("v");
+      expect(startModelMove).toHaveBeenCalledWith(1, [LOOSE], "VAE");
+      wrapper.unmount();
+    });
+
     it("refuses a paste into the folder the cut files are already in", async () => {
       const { wrapper } = await selectLoose();
       await press("x");

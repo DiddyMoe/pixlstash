@@ -1349,6 +1349,7 @@ import { useUserPrefsStore } from "../../stores/useUserPrefsStore";
 import { errorDetail } from "../../utils/apiError";
 import { formatUserDate, formatUserDay } from "../../utils/utils";
 import { isTypingTarget } from "../../utils/dom.js";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import { driveFullness } from "../../utils/libraryChrome";
 import {
   companionsSentences,
@@ -2212,7 +2213,11 @@ function cutSelected() {
   if (!store.cutSelection(foldersById.value)) noticeUnmovable();
 }
 
-/** Ctrl V and the menu's Paste: the cut copies into the open folder. */
+/**
+ * Ctrl V and the menu's Paste: the cut copies into the open folder. The store's
+ * `pasteCut` owns every refusal, an open link (or a folder behind one)
+ * included.
+ */
 function pasteCut() {
   store.pasteCut(store.folderScope);
 }
@@ -2698,9 +2703,9 @@ const thumbnailSubject = computed(() => {
  * run is one row wearing the cover's `icon_sha256`, and prompting on that
  * would be counting one of twelve.
  *
- * Everything material goes in `message`. `useConfirm` has no host mounted yet
- * and falls back to `window.confirm(message)`, which shows nothing else - a
- * count parked in `title` would simply not reach the reader.
+ * Everything material goes in `message`, not only in `title`. The app's
+ * `ConfirmDialog` shows all three, but wherever no host is mounted `useConfirm`
+ * falls back to `window.confirm(message)`, which shows nothing else.
  */
 async function pickIcon() {
   const models = store.selectedRows.flatMap((row) => row.members ?? [row]);
@@ -3825,6 +3830,9 @@ async function commitRename() {
  */
 function onRenameKeydown(event) {
   event.stopPropagation();
+  // The Enter that commits an input method's composition, and the Escape that
+  // cancels it, are the IME's: the name is not committed or dropped.
+  if (isImeComposing(event)) return;
   if (event.key !== "Enter" && event.key !== "Escape") return;
   event.preventDefault();
   const key = editingRowKey.value;

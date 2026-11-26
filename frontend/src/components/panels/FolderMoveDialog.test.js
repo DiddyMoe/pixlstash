@@ -19,6 +19,8 @@ vi.mock("../../api/modelFolders", async (importOriginal) => ({
         ? [
             { name: "Lora", path: "Lora", model_count: 1, bytes: 1, has_dirs: false },
             { name: "VAE", path: "VAE", model_count: 0, bytes: 0, has_dirs: false },
+            // A symlink or junction to a directory elsewhere: no destination.
+            { name: "Shared", path: "Shared", model_count: 0, bytes: 0, has_dirs: false, link: true },
           ]
         : [],
   })),
@@ -119,6 +121,19 @@ describe("FolderMoveDialog", () => {
     expect(row(1, "Lora").attributes("aria-disabled")).toBe("true");
     expect(row(1, "").attributes("aria-disabled")).toBe("true");
     expect(row(1, "VAE").attributes("aria-disabled")).toBeUndefined();
+    wrapper.unmount();
+  });
+
+  it("refuses a linked directory, which takes no move", async () => {
+    mountDialog();
+    await flushPromises();
+    await expandFolderOne();
+    expect(row(1, "Shared").attributes("aria-disabled")).toBe("true");
+    await row(1, "Shared").trigger("click");
+    await flushPromises();
+    expect(row(1, "Shared").attributes("aria-selected")).toBe("false");
+    expect(moveButton().attributes("disabled")).toBeDefined();
+    expect(moveModelFolderDir).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 

@@ -1722,4 +1722,214 @@ describe("ModelFolderTree welcomes the dragged model", () => {
     expect(wrapper.find('[data-testid="model-folder-type"]').exists()).toBe(false);
     wrapper.unmount();
   });
+
+  it("never welcomes a model into a link, nor into what is behind one", async () => {
+    // Lora is a link here: the server would refuse the move, so the tree
+    // never routes one there, collapsed or open.
+    listModelFolderDirs.mockImplementation(async (id, path) => ({
+      folder_id: id,
+      path,
+      locked: id === 2,
+      model_count: 65,
+      direct_model_count: 3,
+      bytes: 0,
+      dirs:
+        id === 1 && path === ""
+          ? SM_DIRS.map((dir) => (dir.name === "Lora" ? { ...dir, link: true } : dir))
+          : [],
+    }));
+    useModelShelfStore().dragCopies = copies("lora");
+    const wrapper = mountTree();
+    await flushPromises();
+    expect(welcomed(wrapper)).toEqual([]);
+    await open(wrapper);
+    expect(welcomed(wrapper)).toEqual([]);
+
+    // Nor where ComfyUI reads from below the link.
+    useModelFoldersStore().comfyuiReads = {
+      known: true,
+      reads: [{ folder_id: 1, subpath: "Lora/flux", category: "loras", kind: "lora" }],
+    };
+    await flushPromises();
+    expect(welcomed(wrapper)).toEqual([]);
+    wrapper.unmount();
+  });
+});
+
+describe("ModelFolderTree and a linked directory", () => {
+  // A symlink or junction to a directory elsewhere: the server lists it with
+  // its models and refuses every move, rename and new folder through it.
+  const SHARED = {
+    name: "Shared",
+    path: "Shared",
+    model_count: 7,
+    direct_model_count: 5,
+    bytes: 1,
+    has_dirs: false,
+    link: true,
+  };
+  const ROOT_LISTING = LISTINGS["1:"];
+  const LINK_REFUSAL =
+    "This folder is a link to another place, so nothing can be moved or made inside it.";
+  const rightClick = (el) => {
+    const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    el.element.dispatchEvent(event);
+    return event;
+  };
+
+  beforeEach(() => {
+    LISTINGS["1:"] = [...ROOT_LISTING, SHARED];
+    useLibrariesStore().canManage = true;
+    moveModelFolderDir.mockReset();
+  });
+
+  afterEach(() => {
+    LISTINGS["1:"] = ROOT_LISTING;
+    delete LISTINGS["1:Shared"];
+    useModelShelfStore().dragCopies = null;
+    useModelShelfStore().cutCopies = null;
+  });
+
+  async function openFolder(props = {}) {
+    const wrapper = mountTree(props);
+    await flushPromises();
+    await item(wrapper, 1).find(".mft-twist").trigger("click");
+    await flushPromises();
+    return wrapper;
+  }
+
+  it("draws a link with its arrow and its models, never expandable, and opens it on the shelf", async () => {
+    const wrapper = await openFolder();
+    const link = item(wrapper, 1, "Shared");
+    expect(link.find('[data-testid="model-folder-link"]').exists()).toBe(true);
+    expect(link.find('[data-testid="model-folder-lock"]').exists()).toBe(false);
+    expect(link.find(".mft-count").text()).toBe("5");
+    expect(link.attributes("aria-label")).toContain("link");
+    expect(link.attributes("aria-expanded")).toBe(undefined);
+    await link.trigger("click");
+    expect(wrapper.emitted("select")).toEqual([
+      [{ folderId: 1, path: "Shared", locked: false }],
+    ]);
+    wrapper.unmount();
+  });
+
+  it("stays shut once the shelf has read what is behind the link", async () => {
+    // The shelf reads the open place, a link included, and the server answers
+    // through it; the tree still has nothing to expand there.
+    LISTINGS["1:Shared"] = [
+      { name: "inner", path: "Shared/inner", model_count: 2, direct_model_count: 2, bytes: 1, has_dirs: false },
+    ];
+    const wrapper = await openFolder();
+    await useModelFoldersStore().loadDirs(1, "Shared");
+    await flushPromises();
+    const link = item(wrapper, 1, "Shared");
+    expect(link.attributes("aria-expanded")).toBe(undefined);
+    await link.find(".mft-twist").trigger("click");
+    await flushPromises();
+    expect(item(wrapper, 1, "Shared/inner").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("gives a link no menu, and never picks it up", async () => {
+    const wrapper = await openFolder();
+    const link = item(wrapper, 1, "Shared");
+    expect(link.find('[data-testid="model-folder-more"]').exists()).toBe(false);
+    const event = rightClick(link);
+    await flushPromises();
+    expect(event.defaultPrevented).toBe(false);
+    expect(wrapper.find('[data-testid="model-folder-menu"]').exists()).toBe(false);
+    expect(link.attributes("draggable")).toBe(undefined);
+    // A plain sibling keeps both.
+    expect(item(wrapper, 1, "VAE").attributes("draggable")).toBe("true");
+    wrapper.unmount();
+  });
+
+  it("refuses dragged model rows on a link", async () => {
+    const shelf = useModelShelfStore();
+    shelf.dragCopies = {
+      items: [{ folder_id: 1, relpath: "alice.safetensors" }],
+      totalBytes: 10,
+      bytesByFolderId: new Map([[1, 10]]),
+    };
+    const wrapper = await openFolder();
+    const link = item(wrapper, 1, "Shared");
+    const over = new CustomEvent("model-copies-over", {
+      cancelable: true,
+      detail: { x: 5, y: 6 },
+    });
+    link.element.dispatchEvent(over);
+    await flushPromises();
+    expect(over.defaultPrevented).toBe(false);
+    expect(link.classes()).toContain("not-droppable");
+    link.element.dispatchEvent(
+      new CustomEvent("model-copies-drop", { cancelable: true, detail: { x: 5, y: 6 } }),
+    );
+    expect(shelf.moveRequest).toBe(null);
+    wrapper.unmount();
+  });
+
+  it("refuses a folder dropped on a link", async () => {
+    const wrapper = await openFolder();
+    const dragEvent = (type) => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      event.dataTransfer = {
+        types: [FOLDER_TYPE],
+        dropEffect: "",
+        effectAllowed: "",
+        setData: vi.fn(),
+      };
+      return event;
+    };
+    item(wrapper, 1, "VAE").element.dispatchEvent(dragEvent("dragstart"));
+    const over = dragEvent("dragover");
+    item(wrapper, 1, "Shared").element.dispatchEvent(over);
+    await flushPromises();
+    expect(over.defaultPrevented).toBe(false);
+    expect(item(wrapper, 1, "Shared").classes()).toContain("not-droppable");
+    item(wrapper, 1, "Shared").element.dispatchEvent(dragEvent("drop"));
+    await flushPromises();
+    expect(moveModelFolderDir).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("answers Ctrl V on a link with why, and pastes nothing", async () => {
+    const shelf = useModelShelfStore();
+    // Not stubbed: the shelf's own pasteCut owns the link refusal.
+    const paste = vi.spyOn(shelf, "pasteCut");
+    const cut = {
+      items: [{ folder_id: 1, relpath: "Lora/alice.safetensors" }],
+      ids: new Set([1]),
+    };
+    shelf.cutCopies = cut;
+    const wrapper = await openFolder();
+    const link = item(wrapper, 1, "Shared");
+    link.element.focus();
+    await link.trigger("keydown", { key: "v", ctrlKey: true });
+    expect(paste).toHaveBeenLastCalledWith(
+      expect.objectContaining({ folderId: 1, path: "Shared" }),
+    );
+    expect(paste).toHaveLastReturnedWith(false);
+    expect(shelf.moveRequest).toBe(null);
+    expect(shelf.cutCopies).toBe(cut);
+    expect(useNoticeStore().notices.at(-1).text).toBe(LINK_REFUSAL);
+    // A plain folder still pastes.
+    paste.mockReturnValue(true);
+    item(wrapper, 1, "VAE").element.focus();
+    await item(wrapper, 1, "VAE").trigger("keydown", { key: "v", ctrlKey: true });
+    expect(paste).toHaveBeenLastCalledWith({ folderId: 1, path: "VAE", locked: false });
+    wrapper.unmount();
+  });
+
+  it("refuses a link in pick mode", async () => {
+    const wrapper = await openFolder({ mode: "pick" });
+    const link = item(wrapper, 1, "Shared");
+    expect(link.attributes("aria-disabled")).toBe("true");
+    await link.trigger("click");
+    expect(wrapper.emitted("select")).toBe(undefined);
+    await item(wrapper, 1, "VAE").trigger("click");
+    expect(wrapper.emitted("select")).toEqual([
+      [{ folderId: 1, path: "VAE", locked: false }],
+    ]);
+    wrapper.unmount();
+  });
 });

@@ -34,7 +34,12 @@ from pixlstash.hub.bootstrap import (
 )
 from pixlstash.hub.db import HubDatabase
 from pixlstash.server import Server
-from pixlstash.hub.registry import LibraryError, LibraryRegistry, read_vault_uuid
+from pixlstash.hub.registry import (
+    LibraryError,
+    LibraryRegistry,
+    NotAVaultError,
+    read_vault_uuid,
+)
 from pixlstash.trusted_sqlite import TrustedSQLiteLocation
 from pixlstash.vault import Vault
 
@@ -2094,7 +2099,10 @@ class TestPortableIdentityScrub:
 
         (snapshots / "linked.sqlite").unlink()
         (snapshots / ".pixlstash_identity_scrub_evil").symlink_to(tmp_path)
-        with pytest.raises(PortableIdentityScrubError, match="symlinked stale"):
+        with pytest.raises(
+            PortableIdentityScrubError,
+            match=r"stale scrub directory .* is a link \(a symlink or junction\)",
+        ):
             sanitize_historical_snapshots(live, str(root))
         live.close()
         assert outside.read_bytes() == original
@@ -2393,6 +2401,9 @@ class TestAVaultThisMachineCannotRead:
                 "a locked or unreadable vault must never be offered 'start over'"
             )
             assert "could not be read" in str(raised.value)
+            # The registry's refusal no longer repeats SQLite; start-up is read
+            # at this machine, so it quotes the cause the registry chained.
+            assert "unable to open database file" in str(raised.value)
             assert sorted(os.listdir(folder)) == ["vault.db"], (
                 "nothing may be moved aside"
             )
@@ -2400,6 +2411,14 @@ class TestAVaultThisMachineCannotRead:
             # In the `finally` because a failing assertion above would otherwise
             # leave a 0000 file behind for whatever runs next in this shard.
             os.chmod(vault, 0o600)
+
+    def test_a_lock_is_read_from_the_cause_rather_than_the_message(self):
+        """The registry words its refusal without SQLite's text, and keeps that
+        text on ``__cause__``; a lock must still not read as a damaged file."""
+        refusal = NotAVaultError("The vault.db in that folder could not be opened.")
+        assert not bootstrap_module._is_environmental_failure(refusal)
+        refusal.__cause__ = sqlite3.OperationalError("database is locked")
+        assert bootstrap_module._is_environmental_failure(refusal)
 
     @unreadable_files_work
     def test_a_later_run_does_not_rename_it_even_once_authorised(

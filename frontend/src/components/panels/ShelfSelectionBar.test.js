@@ -803,6 +803,58 @@ describe("Copy SHA-256", () => {
   });
 });
 
+describe("Paste into a link", () => {
+  const paste = (wrapper) => wrapper.find(".ctx-item[data-verb='paste']");
+
+  /** Something cut, a folder open at `path`, and folder 1's root listing read. */
+  function mountIn(path) {
+    setActivePinia(createPinia());
+    useModelShelfStore().setView({ groupBy: "none" });
+    useModelFoldersStore().dirListings.set("1:", {
+      listing: {
+        dirs: [
+          { name: "Lora", path: "Lora", link: true },
+          { name: "VAE", path: "VAE", link: false },
+        ],
+      },
+      stale: false,
+    });
+    const store = useModelShelfStore();
+    store.setFolderScope({ folderId: 1, path });
+    selectRows([
+      row(1, "present", {
+        locations: [
+          { state: "present", folder_id: 1, folder_path: "/m", relpath: `${path}/x` },
+        ],
+      }),
+    ]);
+    store.cutCopies = {
+      items: [{ folder_id: 2, relpath: "y" }],
+      ids: new Set([9]),
+    };
+    return mount(ShelfSelectionBar, globalOpts);
+  }
+
+  it("is disabled in a link, and in a folder behind one, with why", () => {
+    for (const path of ["Lora", "Lora/flux"]) {
+      const wrapper = mountIn(path);
+      expect(paste(wrapper).exists()).toBe(true);
+      expect(paste(wrapper).attributes("disabled")).toBeDefined();
+      expect(tip(paste(wrapper))).toBe(
+        "That folder is a link to another place, so nothing can be moved into it",
+      );
+      wrapper.unmount();
+    }
+  });
+
+  it("is offered in a plain folder beside the link", () => {
+    const wrapper = mountIn("VAE");
+    expect(paste(wrapper).exists()).toBe(true);
+    expect(paste(wrapper).attributes("disabled")).toBeUndefined();
+    wrapper.unmount();
+  });
+});
+
 describe("Open in file manager", () => {
   // The verb acts on the machine PixlStash runs on rather than on the library,
   // so what this file can assert is the gate and the emit: whether the item is

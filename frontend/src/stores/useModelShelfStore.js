@@ -37,6 +37,7 @@ import {
 import { onSessionReset } from "../utils/apiClient";
 import { useConfirm } from "../composables/useConfirm";
 import { useNoticeStore } from "./useNoticeStore";
+import { useModelFoldersStore } from "./useModelFoldersStore";
 import { favouritesFirst, useFavouritesStore } from "./useFavouritesStore";
 import { useOperationStore } from "./useOperationStore";
 import { errorDetail } from "../utils/apiError";
@@ -55,6 +56,7 @@ import {
   fileKindLabel,
   hideModelsVerb,
   inFolderScopeOf,
+  LINK_REFUSAL,
   locationState,
   movableCopies,
   presentCopies,
@@ -3952,8 +3954,9 @@ export const useModelShelfStore = defineStore("modelShelf", () => {
    * Paste the cut into a folder: a move to it, as a drop asks for. One rule
    * for every way in - `Ctrl V` and *Paste* in the row menu (the open folder),
    * and *Paste here* or `Ctrl V` on a folder row - so each refuses the same
-   * way: a locked folder, a cut that has since moved or gone, and a folder
-   * every cut file is already in.
+   * way: a locked folder, a link or a folder behind one (the server refuses
+   * a move through it, so nothing is asked for and the cut is kept), a cut
+   * that has since moved or gone, and a folder every cut file is already in.
    *
    * @param {{folderId: number, path?: string, locked?: boolean}} destination
    * @returns {boolean} whether the dialog was asked for.
@@ -3965,6 +3968,15 @@ export const useModelShelfStore = defineStore("modelShelf", () => {
         level: "info",
         text: "That folder is locked, so nothing can be moved into it.",
       });
+      return false;
+    }
+    if (
+      useModelFoldersStore().behindLink(
+        destination.folderId,
+        destination.path ?? "",
+      )
+    ) {
+      notices.push({ level: "info", text: LINK_REFUSAL });
       return false;
     }
     const copies = liveCut();

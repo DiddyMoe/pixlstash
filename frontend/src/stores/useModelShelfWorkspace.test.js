@@ -16,6 +16,8 @@ import {
   useModelShelfStore,
 } from "./useModelShelfStore";
 import { useFavouritesStore } from "./useFavouritesStore";
+import { useModelFoldersStore } from "./useModelFoldersStore";
+import { useNoticeStore } from "./useNoticeStore";
 
 const DAY = 86400000;
 const ago = (days) => new Date(Date.now() - days * DAY).toISOString();
@@ -268,6 +270,39 @@ describe("moving: cut, and the open folder's copy (#2204)", () => {
     store.selectedIds = new Set([5]);
     expect(store.cutSelection()).toBe(false);
     expect(store.cutCopies).toBe(null);
+  });
+
+  it("refuses a paste into a link, or a folder behind one, asking nothing and saying why", () => {
+    // Folder 1's root listing, as read so far: Lora is a link, VAE is not.
+    useModelFoldersStore().dirListings.set("1:", {
+      listing: {
+        dirs: [
+          { name: "Lora", path: "Lora", link: true },
+          { name: "VAE", path: "VAE", link: false },
+        ],
+      },
+      stale: false,
+    });
+    store.setFolderScope({ folderId: 1, path: "" });
+    store.selectedIds = new Set([5]);
+    store.cutSelection();
+    const cut = store.cutCopies;
+    const notices = useNoticeStore();
+    for (const path of ["Lora", "Lora/flux"]) {
+      notices.notices.splice(0);
+      expect(store.pasteCut({ folderId: 1, path })).toBe(false);
+      expect(store.moveRequest).toBe(null);
+      expect(store.cutCopies).toBe(cut);
+      expect(notices.notices.map((notice) => notice.text)).toEqual([
+        "This folder is a link to another place, so nothing can be moved or made inside it.",
+      ]);
+    }
+    // The same path in another registered folder is no link, and VAE beside
+    // it takes the paste.
+    expect(store.pasteCut({ folderId: 2, path: "Lora" })).toBe(true);
+    expect(store.moveRequest.destination).toEqual({ folderId: 2, path: "Lora" });
+    expect(store.pasteCut({ folderId: 1, path: "VAE" })).toBe(true);
+    expect(store.moveRequest.destination).toEqual({ folderId: 1, path: "VAE" });
   });
 
   it("forgets the cut, the drag and a pending drop with the session", () => {

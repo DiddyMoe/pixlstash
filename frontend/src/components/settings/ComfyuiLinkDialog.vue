@@ -73,6 +73,9 @@ const showManual = ref(false);
 // The older copies the last install moved to the trash. Kept apart from
 // `install` so the automatic re-link after the install does not wipe the list.
 const replaced = ref([]);
+// Links to another copy of the nodes the last install left in place (it never
+// trashes a link). Kept apart from `install` for the same reason.
+const keptLinks = ref([]);
 
 // "Link <name>?" before anything is asked of a ComfyUI on another computer.
 const confirming = ref(false);
@@ -213,6 +216,7 @@ async function installPack() {
   showManual.value = false;
   install.value = { phase: "installing" };
   replaced.value = [];
+  keptLinks.value = [];
   const run = pollRun;
   try {
     const got = await installComfyuiPack({
@@ -225,6 +229,7 @@ async function installPack() {
       detail: got?.detail || null,
     };
     replaced.value = got?.replaced || [];
+    keptLinks.value = got?.kept_links || [];
     pollForNodes();
   } catch (e) {
     if (run !== pollRun) return;
@@ -265,6 +270,7 @@ watch(
     reply.value = null;
     requestError.value = "";
     replaced.value = [];
+    keptLinks.value = [];
     confirming.value = offThisComputer.value;
     if (!confirming.value) link();
   },
@@ -448,6 +454,23 @@ onBeforeUnmount(stopPolling);
               </li>
             </ul>
           </div>
+
+          <div
+            v-if="row.id === 'nodes' && keptLinks.length"
+            class="cl-fix"
+            data-testid="comfyui-link-kept-links"
+          >
+            <p v-for="path in keptLinks" :key="path" class="cl-kept">
+              <v-icon class="cl-kept__glyph" size="18" aria-hidden="true"
+                >mdi-alert-outline</v-icon
+              >
+              <span
+                ><span class="cl-path">{{ path }}</span> is a link to another
+                copy of the nodes, so ComfyUI may load both. Remove the link
+                and it loads only this one.</span
+              >
+            </p>
+          </div>
         </div>
       </li>
     </ol>
@@ -621,6 +644,23 @@ onBeforeUnmount(stopPolling);
   line-height: var(--leading-body);
   overflow-wrap: anywhere;
   color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
+}
+
+/* A kept link: the notice shape (ComfyuiExposureNotice.vue) cut to one line.
+   The glyph and the rail carry the warning hue; the sentence stays text. */
+.cl-kept {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: var(--rail-w) solid rgb(var(--v-theme-surface-warning));
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.cl-kept__glyph {
+  color: rgb(var(--v-theme-surface-warning));
 }
 
 /* The node pack link's shape (ComfyuiHostSection.vue). */

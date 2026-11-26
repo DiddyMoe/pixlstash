@@ -104,6 +104,34 @@ describe("ShelfMoveDialog", () => {
     expect(moveButton().attributes("disabled")).toBeDefined();
   });
 
+  it("refuses a linked directory, which takes no move", async () => {
+    listModelFolderDirs.mockImplementation(async (id, path) => ({
+      folder_id: id,
+      path,
+      locked: false,
+      model_count: 1,
+      bytes: 0,
+      dirs:
+        id === 1 && path === ""
+          ? [
+              { name: "Lora", path: "Lora", model_count: 0, bytes: 0, has_dirs: false },
+              { name: "Shared", path: "Shared", model_count: 0, bytes: 0, has_dirs: false, link: true },
+            ]
+          : [],
+    }));
+    mountDialog();
+    await flushPromises();
+    await row(1).find(".mft-twist").trigger("click");
+    await flushPromises();
+    expect(row(1, "Shared").attributes("aria-disabled")).toBe("true");
+    await row(1, "Shared").trigger("click");
+    expect(row(1, "Shared").attributes("aria-selected")).toBe("false");
+    expect(moveButton().attributes("disabled")).toBeDefined();
+    // Its plain sibling is still a destination.
+    await row(1, "Lora").trigger("click");
+    expect(moveButton().attributes("disabled")).toBeUndefined();
+  });
+
   it("states a drop's move from and to, without the tree, Move focused", async () => {
     mountDialog({ initialDestination: { folderId: 1, path: "Lora" } });
     await flushPromises();

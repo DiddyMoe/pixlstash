@@ -67,6 +67,7 @@ import { useUserPrefsStore } from "../../stores/useUserPrefsStore";
 import { useLibrariesStore } from "../../stores/useLibrariesStore";
 import { useModelFoldersStore } from "../../stores/useModelFoldersStore";
 import { useModelShelfStore } from "../../stores/useModelShelfStore";
+import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useTasksStore } from "../../stores/useTasksStore";
 import { useTrainingStore } from "../../stores/useTrainingStore";
 
@@ -245,6 +246,42 @@ describe("ModelsSideBar", () => {
     expect(field.element.value).toBe("flux");
     expect(document.activeElement).toBe(field.element);
     wrapper.unmount();
+  });
+
+  it("refuses the Folders + inside a linked directory, and says why", async () => {
+    // The server refuses a new folder through a symlink or junction.
+    const { listModelFolderDirs } = await import("../../api/modelFolders");
+    const plain = listModelFolderDirs.getMockImplementation();
+    listModelFolderDirs.mockImplementation(async (id, path) => ({
+      ...(await plain(id, path)),
+      dirs:
+        id === 2 && path === ""
+          ? [{ name: "Shared", path: "Shared", model_count: 1, direct_model_count: 1, bytes: 1, has_dirs: false, link: true }]
+          : [],
+    }));
+    let wrapper;
+    try {
+      useLibrariesStore().canManage = true;
+      wrapper = mountBar();
+      await flushPromises();
+      const add = () => wrapper.find('[data-testid="models-sidebar-new-folder"]');
+      // Its parent still takes one.
+      store.setFolderScope({ folderId: 2, path: "" });
+      await flushPromises();
+      expect(add().attributes("aria-disabled")).toBe(undefined);
+
+      store.setFolderScope({ folderId: 2, path: "Shared" });
+      await flushPromises();
+      expect(add().attributes("aria-disabled")).toBe("true");
+      await add().trigger("click");
+      expect(wrapper.find('[data-testid="model-folder-name"]').exists()).toBe(false);
+      expect(useNoticeStore().notices.at(-1).text).toBe(
+        "This folder is a link to another place, so nothing can be made inside it.",
+      );
+    } finally {
+      wrapper?.unmount();
+      listModelFolderDirs.mockImplementation(plain);
+    }
   });
 
   it("closes the Folders + field when Training runs hides the open folder", async () => {

@@ -378,6 +378,30 @@ describe("ComfyuiLinkDialog: installing the nodes", () => {
     expect(comfyui.probeComfyui).toHaveBeenCalledTimes(3);
   });
 
+  it("names a link the install kept, and keeps saying so after the re-link", async () => {
+    const kept = "/example/custom_nodes/ComfyUI-PixlStash-dev";
+    const wrapper = await openAndInstall(installed({ kept_links: [kept] }));
+    const warning = byTestId(wrapper, "comfyui-link-kept-links");
+    expect(warning.findAll(".cl-kept")).toHaveLength(1);
+    expect(warning.find(".cl-path").text()).toBe(kept);
+    expect(warning.text()).toContain(
+      "is a link to another copy of the nodes, so ComfyUI may load both. " +
+        "Remove the link and it loads only this one.",
+    );
+
+    comfyui.probeComfyui.mockResolvedValue({ can_open_workflows: true });
+    comfyui.linkComfyuiConnection.mockResolvedValue(replyWith(step("link", "done")));
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushPromises();
+    expect(stateOf(wrapper, "nodes")).toBe("done");
+    expect(byTestId(wrapper, "comfyui-link-kept-links").text()).toContain(kept);
+  });
+
+  it("says nothing about links when the install kept none", async () => {
+    const wrapper = await openAndInstall(installed());
+    expect(byTestId(wrapper, "comfyui-link-kept-links").exists()).toBe(false);
+  });
+
   it("a manual restart asks for one and says why", async () => {
     const wrapper = await openAndInstall(
       installed({

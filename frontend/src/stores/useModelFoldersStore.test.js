@@ -522,6 +522,30 @@ describe("subfolder listings", () => {
     expect(await forced).toBe(null);
     expect(store.dirListings.size).toBe(0);
   });
+
+  it("knows a place at or under a linked directory by the listings read", async () => {
+    listModelFolderDirs.mockReset().mockImplementation(async (id, path) => ({
+      folder_id: id,
+      path,
+      dirs:
+        path === ""
+          ? [
+              { name: "Lora", path: "Lora" },
+              { name: "Shared", path: "Shared", link: true },
+            ]
+          : [],
+    }));
+    const store = useModelFoldersStore();
+    // Nothing read yet: nothing is known to be a link.
+    expect(store.behindLink(1, "Shared")).toBe(false);
+    await store.loadDirs(1, "");
+    expect(store.behindLink(1, "Shared")).toBe(true);
+    expect(store.behindLink(1, "Shared/loras/flux")).toBe(true);
+    expect(store.behindLink(1, "Lora")).toBe(false);
+    expect(store.behindLink(1, "")).toBe(false);
+    // Another folder's listing says nothing about this one.
+    expect(store.behindLink(2, "Shared")).toBe(false);
+  });
 });
 
 describe("registry reads", () => {

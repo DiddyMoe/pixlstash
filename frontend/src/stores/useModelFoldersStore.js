@@ -18,6 +18,7 @@ import {
 } from "../api/modelFolders";
 import { onSessionReset } from "../utils/apiClient";
 import { errorDetail } from "../utils/apiError";
+import { isBehindLink } from "../utils/modelShelf";
 import { useModelShelfStore } from "./useModelShelfStore";
 import { useNoticeStore } from "./useNoticeStore";
 
@@ -248,6 +249,20 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
   function splitDirsKey(key) {
     const at = key.indexOf(":");
     return { id: Number(key.slice(0, at)), path: key.slice(at + 1) };
+  }
+
+  /**
+   * Whether a directory is a link (a symlink or junction to a directory, which
+   * the scanner follows) or lies behind one, by the listings read so far. The
+   * server refuses every move, rename and new folder through a link, so the
+   * tree and the sidebar offer none.
+   *
+   * @param {number} id - the registered folder.
+   * @param {string} [path=""] - POSIX, relative to it.
+   * @returns {boolean}
+   */
+  function behindLink(id, path = "") {
+    return isBehindLink(dirListings.value, id, path);
   }
 
   /**
@@ -773,6 +788,7 @@ export const useModelFoldersStore = defineStore("modelFolders", () => {
     treeExpanded,
     treeClosedDrives,
     dirsKey,
+    behindLink,
     comfyuiReads,
     loadComfyuiReads,
     loadDirs,

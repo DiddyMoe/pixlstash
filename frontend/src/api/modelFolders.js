@@ -101,13 +101,15 @@ export async function listModelFolderDevices() {
  * Lazy by design: the tree asks once per expand. Read from the disk, so an
  * empty directory is listed; its counts are the `present` copies under it,
  * recursively. A folder the owner does not lay out (the managed store, the
- * HuggingFace cache) answers `locked: true` with no `dirs`.
+ * HuggingFace cache) answers `locked: true` with no `dirs`. A symlink or
+ * junction to a directory is listed with `link: true` and `has_dirs: false`:
+ * read-only, with nothing to expand, and refused as a move destination.
  *
  * @param {number|string} id - the registered folder.
  * @param {string} [path=""] - POSIX, relative to the folder; `""` is its root.
  * @returns {Promise<Object>} `{folder_id, path, locked, model_count,
  *   direct_model_count, bytes, dirs: [{name, path, model_count,
- *   direct_model_count, bytes, has_dirs}]}`.
+ *   direct_model_count, bytes, has_dirs, link}]}`.
  */
 export async function listModelFolderDirs(id, path = "") {
   return unwrap(

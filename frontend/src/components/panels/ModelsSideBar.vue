@@ -380,6 +380,10 @@ const newFolderReason = computed(() => {
   if (scope.locked) {
     return "This folder is locked, so nothing can be made inside it.";
   }
+  // The server refuses a new folder through a link (a symlink or junction).
+  if (foldersStore.behindLink(scope.folderId, scope.path ?? "")) {
+    return "This folder is a link to another place, so nothing can be made inside it.";
+  }
   return gates.folderVerbReason({ id: scope.folderId });
 });
 

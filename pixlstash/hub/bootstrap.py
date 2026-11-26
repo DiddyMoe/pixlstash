@@ -88,6 +88,19 @@ class LibraryFingerprintConflictError(HubBootstrapError):
     """The registered folder holds a readable vault that is another library."""
 
 
+class NewerLibraryError(HubBootstrapError):
+    """The vault records a schema revision this build has never heard of.
+
+    Carries those revision ids, so a caller whose answer must not repeat this
+    message (it names the folder) can word its own with
+    :func:`newer_library_message` - the library switch does, for HTTP.
+    """
+
+    def __init__(self, message: str, unknown: list[str]):
+        super().__init__(message)
+        self.unknown = list(unknown)
+
+
 class LibraryUnavailableError(HubBootstrapError):
     """The active library cannot be opened, and nothing was done about it.
 
@@ -152,10 +165,23 @@ def _is_environmental_failure(reason: object) -> bool:
     recovery in :func:`_offer_a_usable_library`, and
     :func:`unusable_vault_from_open_failure` - reach the same offer from three
     different exception types, so the question they all have to ask lives here
-    rather than in the one that happened to be written first. Takes an exception
-    or a message, because the recovery path keeps only the reason string.
+    rather than in the one that happened to be written first. Pass the
+    exception rather than its message: the causes below are read only from an
+    exception, and every caller has one.
+
+    An exception is judged together with its chain of causes. A
+    ``NotAVaultError`` says "could not be opened" in the registry's own words
+    and keeps SQLite's on ``__cause__``, and that is where "database is locked"
+    is, not in the message.
     """
-    lowered = str(reason).lower()
+    texts = [str(reason)]
+    seen = {id(reason)}
+    cause = reason.__cause__ if isinstance(reason, BaseException) else None
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        texts.append(str(cause))
+        cause = cause.__cause__
+    lowered = " ".join(texts).lower()
     return any(marker in lowered for marker in _ENVIRONMENTAL_SQLITE_FAILURES)
 
 
@@ -534,11 +560,17 @@ def _register_first_library(
                 # this machine simply cannot read it right now. Offering to
                 # start over here would rename a working catalogue away over a
                 # transient condition, so say what is wrong and stop.
+                # Start-up, read by the person at this machine: the path and
+                # SQLite's words are what they need to fix it. The registry's
+                # own message leaves both out, so they come from the cause.
+                cause = exc.__cause__ or exc
                 logger.error(
-                    "Could not read the library database at %s: %s", vault_path, exc
+                    "Could not read the library database at %s",
+                    vault_path,
+                    exc_info=True,
                 )
                 raise HubBootstrapError(
-                    f"{vault_path} could not be read: {exc}. That looks like a "
+                    f"{vault_path} could not be read ({cause}). That looks like a "
                     "permissions, locking or disk problem rather than a damaged "
                     "library, so nothing was changed. Fix it and start "
                     "PixlStash again."
@@ -1170,14 +1202,16 @@ def prevalidate_opened_library(connection, library: Library) -> None:
     elif row:
         observed = row[0]
     expected = library.vault_uuid
+    # Typed, so the library switch can say which of these it was without
+    # repeating these messages, which name the vault's path.
     if expected is not None and observed != expected:
-        raise HubBootstrapError(
+        raise LibraryFingerprintConflictError(
             f"Library fingerprint conflict at {library.vault_path}: the vault "
             f"contains {observed or 'no fingerprint'}, but the hub expects "
             f"{expected}. The vault was not opened or migrated."
         )
     if expected is None and observed not in (None, library.uuid):
-        raise HubBootstrapError(
+        raise LibraryFingerprintConflictError(
             f"Library fingerprint conflict at {library.vault_path}: the vault "
             f"contains {observed}, but this registration expects {library.uuid}."
         )
@@ -1185,10 +1219,11 @@ def prevalidate_opened_library(connection, library: Library) -> None:
     known = known_vault_revisions()
     unknown = [rev for rev in _opened_revision_rows(connection) if rev not in known]
     if unknown:
-        raise HubBootstrapError(
+        raise NewerLibraryError(
             newer_library_message(
                 unknown, library=f'The library "{library.name}" ({library.path})'
-            )
+            ),
+            unknown,
         )
 
 

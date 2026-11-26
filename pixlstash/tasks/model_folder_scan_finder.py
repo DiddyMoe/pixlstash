@@ -9,6 +9,11 @@ folder reads no bytes: a file whose size and mtime match its row is touched, not
 hashed (``ModelFolderScanner._describe``), so a repeat walk costs one ``stat``
 and one row upsert per model file.
 
+A change behind a linked folder (a symlink or junction to a directory, which
+the scan follows) is found by that timer, within ``RESCAN_INTERVAL_S`` (600 s),
+not by the watch: watchdog's inotify walk does not follow a directory link,
+and watchdog 6's ``schedule()`` has no option to.
+
 The roots PixlStash declares rather than walks (its own downloads,
 InsightFace, the HuggingFace cache) are re-declared on the same timer, so a
 repo deleted from the cache leaves the shelf without a restart.
