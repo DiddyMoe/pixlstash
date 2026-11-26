@@ -310,12 +310,26 @@ export async function likenessSearch(
   ));
 }
 
+// The lowest score a text search keeps, set at the top of what the server's
+// own score gives a picture by chance. `semantic_search`
+// (db_models/picture.py) scores 0.5 * fuzzy + 0.5 * sqrt((2 * sbert + 2.5 * clip) / 2)
+// + 0.35 * text-in-picture. Its comment puts CLIP for an unrelated text and
+// picture at 0.1-0.2 and a good match at 0.25-0.35 (2.5 is CLIPScore's w,
+// https://arxiv.org/abs/2104.08718). Against a query that names nothing, a
+// picture with no tags scores 0.18-0.25 and a tagged one up to about 0.30
+// (an unrelated SBERT cosine of 0.1 or less); a picture CLIP alone matches
+// scores 0.28-0.33, one whose tags match 0.5 or more. 0.1 kept every picture
+// with an embedding, so a nonsense search never narrowed the grid. The two
+// bands overlap, so no fixed number separates them: a floor measured against
+// chance belongs in the server's score, not here.
+export const SEARCH_CHANCE_CEILING = 0.3;
+
 /**
  * Text-search the library.
  *
  * @param {string} text
  * @param {Object} [options]
- * @param {number} [options.threshold=0.1]
+ * @param {number} [options.threshold=SEARCH_CHANCE_CEILING]
  * @param {number} [options.topN=10000]
  * @param {string} [options.query=""] - pre-encoded filter query string to
  *   narrow the search to the current scope.
@@ -324,7 +338,7 @@ export async function likenessSearch(
  */
 export async function searchPictures(
   text,
-  { threshold = 0.1, topN = 10000, query = "", signal } = {},
+  { threshold = SEARCH_CHANCE_CEILING, topN = 10000, query = "", signal } = {},
 ) {
   return unwrap(getCancellable(
     `/pictures/search?query=${encodeURIComponent(text)}&threshold=${threshold}&top_n=${topN}${query ? `&${query}` : ""}`,
@@ -561,31 +575,63 @@ export async function previewScrapheapDelete(
 }
 
 /**
- * Restore pictures from the scrapheap; omit the ids to restore all of them.
- * @param {Array<number|string>} [pictureIds]
+ * Restore a few named pictures from the Scrapheap in one request.
+ *
+ * Only for a handful of ids (the lightbox's one picture). The server answers
+ * 422 `use_scrapheap_runs` (with `runs_url` and `max_ids`, 1,000) for no ids
+ * or more than that, so the whole heap and any large selection go through a
+ * restore run (`startScrapheapRun`), which is what every bulk gesture uses.
+ *
+ * A gesture's own `cli-` batch id tells its History step apart from a restore
+ * run's server-minted (`srv-`) slices, which the run's receipt stands in for.
+ *
+ * @param {Array<number|string>} pictureIds - at least one id.
+ * @param {Object} [options]
+ * @param {string} [options.batchId] - the gesture's id, from
+ *   `newOperationBatchId()`.
  * @returns {Promise<Object>} the response body.
  */
-export async function restoreScrapheap(pictureIds) {
-  return unwrap(apiClient.post(
-    `/pictures/scrapheap/restore`,
-    pictureIds ? { picture_ids: pictureIds } : undefined,
-  ));
+export async function restoreScrapheap(pictureIds, { batchId } = {}) {
+  return unwrap(
+    apiClient.post(
+      `/pictures/scrapheap/restore`,
+      { picture_ids: pictureIds },
+      operationBatchHeaders(batchId),
+    ),
+  );
 }
 
+/**
+ * How long a run start asks the server to wait for the run to end before it
+ * answers (RFC 7240 `wait`, in seconds). One second covers a small heap while
+ * the bar would barely show; the server caps any wait at 2.
+ */
+const START_WAIT_PREFERENCE = "wait=1";
+
 // Emptying or restoring a large Scrapheap is an asynchronous request-reply:
-// `POST /pictures/scrapheap/runs` answers 202 at once with the run, and the
-// client polls it until it is no longer `active`. A 50,000-picture heap takes
-// longer than any request should wait, so these are what the Scrapheap's
-// gestures use; `restoreScrapheap` above stays for the lightbox's one picture.
+// `POST /pictures/scrapheap/runs` answers 202 with the run, and the client
+// polls it until it is no longer `active`. A 50,000-picture heap takes longer
+// than any request should wait, so these are what the Scrapheap's gestures
+// use; `restoreScrapheap` above stays for the lightbox's one picture.
+//
+//   * **A short run answers at once.** The start sends `Prefer: wait=1`
+//     (RFC 7240 §4.3, https://www.rfc-editor.org/rfc/rfc7240#section-4.3): a
+//     run that ends within a second comes back as 200 with the ended run, so a
+//     small heap needs no poll. The run's `active` decides, never the status.
 //
 //   * **One run at a time.** A start while one is active is 409
 //     `scrapheap_run_active`, and `detail.run` names the run to follow instead.
-//   * **No request id.** A start whose answer was lost is not retried: the
-//     caller reads `getLatestScrapheapRun` and follows the run that is active.
-//   * **A restore is many History steps**, one per segment of at most 5,000
-//     pictures; `segment_batch_ids` names them for the operation store.
-//   * **Runs live in the server's memory.** A restart forgets them, and
-//     `getScrapheapRun` answers 404 `scrapheap_run_not_found`.
+//   * **A request id makes a start safe to send again.** Each gesture mints
+//     one (`request_id`); the same id again is answered with the run it
+//     already started (200), never a second run, so a start or an undo whose
+//     answer was lost is resent as is. The same id with other parameters is
+//     422 `request_id_reused`.
+//   * **A restore is many History steps**, one per segment of at most 1,000
+//     pictures; `segment_batch_ids` names them for the operation store, and
+//     `undoScrapheapRun` undoes them all as a run of its own.
+//   * **A restart ends a run.** Runs are kept on disk; one the server was
+//     running when it stopped is closed `interrupted` when it starts again,
+//     not resumed. An unknown id is 404 `scrapheap_run_not_found`.
 
 /**
  * Start a background run that destroys or restores Scrapheap pictures.
@@ -600,16 +646,21 @@ export async function restoreScrapheap(pictureIds) {
  * @param {Array<number|string>} [options.pictureIds] - the selection.
  * @param {boolean} [options.includeProtected=false] - purge only.
  * @param {string} [options.confirmToken] - purge only, and required there.
+ * @param {string} [options.requestId] - the gesture's idempotency key. Send
+ *   the same one again for a start whose answer was lost.
  * @returns {Promise<{run: Object, retryAfterMs: number|null}>} 202 with the
- *   run. Refusals carry `detail.code`: 409 `scrapheap_run_active` (with
- *   `detail.run`) and 503 `scrapheap_runs_unavailable` (this server runs no
- *   background tasks).
+ *   active run, or 200 with a run that ended within the wait (no
+ *   `retryAfterMs`) or that `requestId` already started. Refusals carry
+ *   `detail.code`: 409 `scrapheap_run_active` (with `detail.run`), 422
+ *   `request_id_reused` (with the original run) and 503
+ *   `scrapheap_runs_unavailable` (this server runs no background tasks).
  */
 export async function startScrapheapRun({
   kind,
   pictureIds,
   includeProtected = false,
   confirmToken,
+  requestId,
 } = {}) {
   // The request model forbids unknown fields, so a restore sends only what a
   // restore reads.
@@ -619,7 +670,12 @@ export async function startScrapheapRun({
     body.include_protected = includeProtected;
     body.confirm_token = confirmToken;
   }
-  return runReply(await apiClient.post(`/pictures/scrapheap/runs`, body));
+  if (requestId) body.request_id = requestId;
+  return runReply(
+    await apiClient.post(`/pictures/scrapheap/runs`, body, {
+      headers: { Prefer: START_WAIT_PREFERENCE },
+    }),
+  );
 }
 
 /**
@@ -659,6 +715,32 @@ export async function cancelScrapheapRun(runId) {
   return runReply(
     await apiClient.post(
       `/pictures/scrapheap/runs/${encodeURIComponent(runId)}/cancel`,
+    ),
+  );
+}
+
+/**
+ * Undo a restore run: put every picture it restored back in the Scrapheap, as
+ * a run of its own (`kind: "undo"`, `target_run_id` the restore). It works
+ * through the restore's History steps newest first and stops, `blocked`, at
+ * one that a later change in History sits above (`history_moved_on`) or that
+ * the undo itself refuses (`undo_refused`); what it undid stays undone.
+ *
+ * @param {string} runId - the restore run.
+ * @param {Object} [options]
+ * @param {string} [options.requestId] - the gesture's idempotency key.
+ * @returns {Promise<{run: Object, retryAfterMs: number|null}>} the undo run,
+ *   as `startScrapheapRun` returns a start. Refusals carry `detail.code`: 404
+ *   `scrapheap_run_not_found`, 409 `not_a_restore_run`, `scrapheap_run_active`
+ *   or `nothing_to_undo`, 422 `request_id_reused`, 503
+ *   `scrapheap_runs_unavailable`.
+ */
+export async function undoScrapheapRun(runId, { requestId } = {}) {
+  return runReply(
+    await apiClient.post(
+      `/pictures/scrapheap/runs/${encodeURIComponent(runId)}/undo`,
+      requestId ? { request_id: requestId } : {},
+      { headers: { Prefer: START_WAIT_PREFERENCE } },
     ),
   );
 }
@@ -927,7 +1009,31 @@ export async function startExport(query = "") {
 }
 
 /**
- * Start a folder export of a picture selection or filter scope (#291).
+ * Start a ZIP export of named pictures, the selection in a JSON body.
+ *
+ * {@link startExport} names a selection as one `?id=` per picture, which a
+ * large selection takes past what a server or reverse proxy accepts in a URL
+ * (414). This sends the same selection, in its order, as `picture_ids`; the
+ * server exports those pictures and nothing else, in that order. Poll and
+ * download as for {@link startExport}.
+ *
+ * @param {Array<number|string>} pictureIds - 1 to 200,000 picture ids.
+ * @param {Object} [options] - the export's options, as the server names them:
+ *   `only_deleted` (the selection is in the Scrapheap), `export_type`,
+ *   `caption_mode`, `tag_format`, `include_character_name`,
+ *   `use_original_file_names`, `resolution`, `bbox_mode`,
+ *   `keep_generation_data`.
+ * @returns {Promise<Object>} the response body, whose `task_id` drives polling.
+ */
+export async function startExportByIds(pictureIds, options = {}) {
+  return unwrap(apiClient.post(`/pictures/export`, {
+    picture_ids: pictureIds.map(Number),
+    ...options,
+  }));
+}
+
+/**
+ * Start a folder export of a view: its filter, search or set (#291).
  *
  * The local-owner counterpart to {@link startExport}: instead of packaging a
  * ZIP to download, the server writes the pictures straight into a folder on
@@ -935,12 +1041,35 @@ export async function startExport(query = "") {
  * file manager once done. Poll the same {@link getExportStatus}; a completed
  * folder export never gets a `download_url`.
  *
- * @param {string} query - pre-encoded selection/filter query string,
- *   including `destination`.
+ * @param {string} query - pre-encoded filter query string, including
+ *   `destination`. A selection goes to {@link startFolderExportByIds}.
  * @returns {Promise<Object>} the response body, whose `task_id` drives polling.
  */
 export async function startFolderExport(query) {
   return unwrap(apiClient.post(`/pictures/export/folder?${query}`));
+}
+
+/**
+ * Start a folder export of named pictures, the selection in a JSON body.
+ *
+ * {@link startFolderExport} names a selection as one `?id=` per picture, and
+ * a large selection makes a request line the server refuses. This sends the
+ * selection, in its order, as `picture_ids` with the `destination`; the server
+ * checks the destination as for {@link startFolderExport} and writes those
+ * pictures and nothing else. Poll as for {@link startFolderExport}.
+ *
+ * @param {string} destination - an empty folder on the server's machine.
+ * @param {Array<number|string>} pictureIds - 1 to 200,000 picture ids.
+ * @param {Object} [options] - the options {@link startExportByIds} takes,
+ *   `only_deleted` included.
+ * @returns {Promise<Object>} the response body, whose `task_id` drives polling.
+ */
+export async function startFolderExportByIds(destination, pictureIds, options = {}) {
+  return unwrap(apiClient.post(`/pictures/export/folder/selection`, {
+    destination,
+    picture_ids: pictureIds.map(Number),
+    ...options,
+  }));
 }
 
 /**
@@ -1062,24 +1191,143 @@ export async function clearGuestScoreSession() {
 }
 
 /**
+ * The most ids one by-ids GET carries: the server's cap on repeated `id`
+ * params (`LIST_MAX_IDS`, routes/pictures/_listing.py), which refuses a longer
+ * list with a 400 rather than truncate it.
+ */
+export const PICTURES_BY_IDS_CHUNK = 1000;
+
+/**
+ * The most bytes one by-ids target (`/pictures?id=…&id=…&fields=…`, as handed
+ * to the client) may take; ids past it go in the next request.
+ *
+ * The id count alone does not bound the URL: 1,000 ten-digit ids are a 14 KB
+ * request line. nginx answers 414 to a request line longer than one
+ * `large_client_header_buffers` buffer, 8k by default
+ * (https://nginx.org/en/docs/http/ngx_http_core_module.html#large_client_header_buffers),
+ * and uvicorn's h11 parser buffers at most `h11_max_incomplete_event_size`
+ * (16 KiB by default) for the request line and headers together
+ * (https://h11.readthedocs.io/en/latest/api.html, uvicorn/config.py). The
+ * request line adds to this target the `/api/v1` prefix (7 bytes), "GET " and
+ * " HTTP/1.1" (13) and a share link's `&token=` (50), so the worst case is
+ * 7,070 bytes: under 8,000, with the rest of the 8k buffer as margin, and
+ * leaving h11 over 9 KB for the headers.
+ */
+export const PICTURES_BY_IDS_URL_BUDGET = 7000;
+
+/**
+ * Split `ids` into the chunks one request each carries, as `target` spells the
+ * request for a chunk: each at most {@link PICTURES_BY_IDS_CHUNK} ids and at
+ * most {@link PICTURES_BY_IDS_URL_BUDGET} bytes of target, in order. An empty
+ * list is one empty chunk.
+ *
+ * @param {Array<number|string>} ids
+ * @param {(chunk: Array<number|string>) => string} target
+ * @returns {Array<Array<number|string>>}
+ */
+function idChunksWithinBudget(ids, target) {
+  // An empty chunk's target is the fixed part: the path and the other params.
+  // Each id then costs its encoded pair and a "&".
+  const fixed = target([]).length;
+  const chunks = [];
+  let chunk = [];
+  let size = fixed;
+  for (const id of ids) {
+    const cost = new URLSearchParams({ id: String(id) }).toString().length + 1;
+    if (
+      chunk.length &&
+      (chunk.length >= PICTURES_BY_IDS_CHUNK ||
+        size + cost > PICTURES_BY_IDS_URL_BUDGET)
+    ) {
+      chunks.push(chunk);
+      chunk = [];
+      size = fixed;
+    }
+    chunk.push(id);
+    size += cost;
+  }
+  if (chunk.length || !chunks.length) chunks.push(chunk);
+  return chunks;
+}
+
+/**
+ * Split `ids` into by-ids requests: each at most {@link PICTURES_BY_IDS_CHUNK}
+ * ids and at most {@link PICTURES_BY_IDS_URL_BUDGET} bytes of target, in order.
+ *
+ * @param {Array<number|string>} ids
+ * @param {string} [fields]
+ * @returns {Array<string>} the request targets, `/pictures?…`.
+ */
+export function picturesByIdsTargets(ids, fields) {
+  const target = (chunk) => {
+    const params = new URLSearchParams();
+    chunk.forEach((id) => params.append("id", String(id)));
+    if (fields) params.append("fields", fields);
+    return `/pictures?${params.toString()}`;
+  };
+  return idChunksWithinBudget(ids, target).map(target);
+}
+
+/**
+ * Ask a stream query which of `ids` it still lists: the same query narrowed by
+ * a repeated `id`, which the listing ANDs with the rest of its selection under
+ * every sort (`select_pictures_for_listing`). A long list goes a request at a
+ * time, split as {@link picturesByIdsTargets} splits one, and a failed request
+ * rejects the whole call. Each request reads from the first row, and no chunk
+ * can list more rows than it names ids.
+ *
+ * @param {string} query - pre-encoded stream query string, no leading `?`.
+ * @param {Array<number|string>} ids
+ * @param {{signal?: AbortSignal}} [options]
+ * @returns {Promise<Array<Object>>} the rows listed, the requests' joined.
+ */
+export async function streamPicturesAmongIds(query, ids, { signal } = {}) {
+  if (!ids.length) return [];
+  const target = (chunk) => {
+    const params = new URLSearchParams();
+    chunk.forEach((id) => params.append("id", String(id)));
+    const idParams = chunk.length ? `&${params.toString()}` : "";
+    return `/pictures/stream?${query}${idParams}&offset=0&batch_limit=${PICTURES_BY_IDS_CHUNK}`;
+  };
+  const rows = [];
+  for (const chunk of idChunksWithinBudget(ids, target)) {
+    const body = await unwrap(getCancellable(target(chunk), signal));
+    if (!Array.isArray(body?.pictures)) {
+      throw new Error("streamPicturesAmongIds: a stream read returned no pictures list");
+    }
+    rows.push(...body.pictures);
+  }
+  return rows;
+}
+
+/**
  * Fetch a specific set of pictures by id.
  *
  * The ids go out as a repeated `id` query param, and the server is free to
  * return them in any order (and to omit ones the caller may not see), so
  * callers that need the requested order re-index the result themselves.
+ * A list too long for one request (see {@link picturesByIdsTargets}) is
+ * fetched a request at a time, one after another, and the rows joined in
+ * order. A failed request rejects the whole call: a caller never gets a
+ * silently partial list.
  *
  * @param {Array<number|string>} ids
  * @param {Object} [options]
  * @param {string} [options.fields] - projection, e.g. `"grid"`; omitted for
  *   the full record.
  * @param {AbortSignal} [options.signal]
- * @returns {Promise<Array<Object>>} the pictures (the response body).
+ * @returns {Promise<Array<Object>>} the pictures (the response bodies, joined).
  */
 export async function listPicturesByIds(ids, { fields, signal } = {}) {
-  const params = new URLSearchParams();
-  ids.forEach((id) => params.append("id", String(id)));
-  if (fields) params.append("fields", fields);
-  return unwrap(getCancellable(`/pictures?${params.toString()}`, signal));
+  const targets = picturesByIdsTargets(ids, fields);
+  if (targets.length === 1) {
+    return unwrap(getCancellable(targets[0], signal));
+  }
+  const rows = [];
+  for (const target of targets) {
+    rows.push(...(await unwrap(getCancellable(target, signal))));
+  }
+  return rows;
 }
 
 /**
