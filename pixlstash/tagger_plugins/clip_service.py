@@ -18,10 +18,12 @@ import numpy as np
 # transformers) are deliberately FUNCTION-LOCAL throughout
 # this module. They cost seconds to import, and this module sits on the API
 # server's import path - so importing them at module scope would make server
-# startup and every single test pay that cost before doing any work.
+# startup and every single test pay that cost before doing any work. Each one
+# sits in an ``ml_imports()`` block, so that two threads importing the stack
+# for the first time cannot hand each other half-built modules.
 
 from pixlstash.utils.accelerator import is_device_error, supports_fp16
-from pixlstash.utils.model_utils import MODEL_CONSTRUCTION_LOCK
+from pixlstash.utils.model_utils import MODEL_CONSTRUCTION_LOCK, ml_imports
 from pixlstash.utils.vram_utils import empty_device_cache, is_vram_oom
 
 logger = logging.getLogger(__name__)
@@ -39,13 +41,14 @@ def _unloaded_first_resize():
     image size. ``tests/test_image_embedding_worker.py`` holds it to the
     transform a real load returns.
     """
-    import open_clip
-    from open_clip.pretrained import get_pretrained_cfg
-    from open_clip.transform import (
-        PreprocessCfg,
-        image_transform_v2,
-        merge_preprocess_dict,
-    )
+    with ml_imports():
+        import open_clip
+        from open_clip.pretrained import get_pretrained_cfg
+        from open_clip.transform import (
+            PreprocessCfg,
+            image_transform_v2,
+            merge_preprocess_dict,
+        )
 
     cfg = merge_preprocess_dict(
         asdict(PreprocessCfg()),
@@ -55,6 +58,60 @@ def _unloaded_first_resize():
         "image_size"
     ]
     return image_transform_v2(PreprocessCfg(**cfg), is_train=False).transforms[0]
+
+
+# The files open_clip fetches for a tag that names only a Hugging Face repo,
+# in the order it tries them (``open_clip.pretrained.download_pretrained_from_hf``).
+_HF_WEIGHT_FILES = ("open_clip_model.safetensors", "open_clip_pytorch_model.bin")
+
+
+def _weights_from_cache(hf_hub: str) -> Optional[str]:
+    """The cached checkpoint for a tag's Hugging Face repo, or None on a miss.
+
+    Asked with ``local_files_only=True``, so a load whose weights are already
+    downloaded makes no request: given the tag, open_clip asks the hub for
+    the file's metadata on every load. A tag that names a file in its repo
+    misses here and is loaded from the network, as before.
+
+    Args:
+        hf_hub: The tag's ``hf_hub`` entry, ``"org/repo/"``.
+    """
+    with ml_imports():
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+    repo_id = hf_hub.rstrip("/")
+    for filename in _HF_WEIGHT_FILES:
+        try:
+            return hf_hub_download(
+                repo_id=repo_id, filename=filename, local_files_only=True
+            )
+        except LocalEntryNotFoundError:
+            # Not downloaded under this name: try the next one, then the hub.
+            continue
+    return None
+
+
+def _cached_load_kwargs(weights: str, tag_cfg: dict) -> dict:
+    """``create_model_and_transforms`` arguments for a cached checkpoint.
+
+    Given a file path, open_clip takes nothing from the tag, so its
+    preprocessing and activation are passed here: the model and transform
+    the tag itself gives. ``tests/test_image_embedding_worker.py``
+    holds the two transforms equal.
+
+    Args:
+        weights: The checkpoint :func:`_weights_from_cache` found.
+        tag_cfg: ``open_clip.get_pretrained_cfg`` for the tag.
+    """
+    return {
+        "pretrained": weights,
+        "image_mean": tag_cfg["mean"],
+        "image_std": tag_cfg["std"],
+        "image_interpolation": tag_cfg["interpolation"],
+        "image_resize_mode": tag_cfg["resize_mode"],
+        "force_quick_gelu": tag_cfg.get("quick_gelu", False),
+    }
 
 
 class ClipService:
@@ -101,12 +158,23 @@ class ClipService:
             self._tokenizer = None
 
     def _load(self) -> None:
-        import open_clip
+        with ml_imports():
+            import open_clip
 
+        tag_cfg = open_clip.get_pretrained_cfg(CLIP_MODEL_NAME, CLIP_MODEL_WEIGHTS)
+        weights = _weights_from_cache(tag_cfg["hf_hub"])
+        if weights is None:
+            logger.info(
+                "Downloading the CLIP weights (%s) for the first time...",
+                CLIP_MODEL_WEIGHTS,
+            )
+            load_kwargs = {"pretrained": CLIP_MODEL_WEIGHTS}
+        else:
+            load_kwargs = _cached_load_kwargs(weights, tag_cfg)
         # Built under the process-wide lock; see MODEL_CONSTRUCTION_LOCK.
         with MODEL_CONSTRUCTION_LOCK:
             model, _, preprocess = open_clip.create_model_and_transforms(
-                CLIP_MODEL_NAME, pretrained=CLIP_MODEL_WEIGHTS
+                CLIP_MODEL_NAME, **load_kwargs
             )
         model = model.to(self._device)
         if supports_fp16(self._device):
@@ -199,7 +267,11 @@ class ClipService:
         Returns:
             Float32 numpy array of shape ``(N, D)`` or ``None`` on failure.
         """
-        import torch
+        # Named: a likeness search encodes its uploaded picture here on the
+        # request thread (``ClipEmbeddingWorkflow.encode_query_image``), and an
+        # unnamed first run would wait out another model's download.
+        with ml_imports("torch"):
+            import torch
 
         if not images:
             return None
@@ -257,7 +329,11 @@ class ClipService:
         Returns:
             1-D numpy array or ``None`` on failure.
         """
-        import torch
+        # Named: a text search encodes its query here on the request thread
+        # (``TextEmbeddingWorkflow.encode_clip_query``), and an unnamed first
+        # run would wait out another model's download.
+        with ml_imports("torch"):
+            import torch
 
         if not query:
             return None
@@ -283,7 +359,8 @@ class ClipService:
         Returns:
             Float32 array of shape ``(len(texts), D)``, or ``None`` on failure.
         """
-        import torch
+        with ml_imports():
+            import torch
 
         if not texts:
             return None
@@ -318,7 +395,8 @@ class ClipService:
             List of 1-D numpy arrays (or ``None`` for failed crops), same
             length as ``crops``.
         """
-        import torch
+        with ml_imports():
+            import torch
 
         self.ensure_ready()
         results: list[Optional[np.ndarray]] = []
