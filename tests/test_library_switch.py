@@ -10,6 +10,7 @@ not apply), and until it succeeds nothing has been given up.
 """
 
 import functools
+import logging
 import os
 import sqlite3
 import tempfile
@@ -21,6 +22,7 @@ import pytest
 from sqlmodel import delete, select
 
 from pixlstash.db_models import Picture
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.utils.image_processing.image_utils import THUMBNAIL_DIR_NAME
 from pixlstash.hub.registry import (
     TEMP_VAULT_FILENAME,
@@ -29,6 +31,10 @@ from pixlstash.hub.registry import (
 )
 from pixlstash.server import Server
 from pixlstash.services import snapshot_service as snapshot_service_module
+from pixlstash.services.library_generation_coordinator import (
+    LibraryNotReadyError,
+    LibrarySwitchTimeoutError,
+)
 from pixlstash.services.library_switch_service import (
     LibrarySwitchError,
     SwitchState,
@@ -162,6 +168,97 @@ class TestSwitching:
         with pytest.raises(LibraryNotFoundError):
             server.library_switch.switch_to("00000000-0000-4000-8000-000000000000")
 
+    def test_what_was_asked_for_is_not_repeated_back(self, server):
+        """The uuid is the caller's text, unchecked; the answer is a fixed one."""
+        typed = "/home/me/test-not-a-uuid"
+        with pytest.raises(LibraryNotFoundError) as excinfo:
+            server.library_switch.switch_to(typed)
+        assert str(excinfo.value) == "No attached library has that uuid."
+
+        with pytest.raises(LibraryNotFoundError) as excinfo:
+            with server.library_switch.open_other_library(typed):
+                pass
+        assert str(excinfo.value) == "No attached library has that uuid."
+
+    def test_a_refusal_with_no_known_holder_keeps_the_coordinator_to_the_log(
+        self, server, second_library, monkeypatch, caplog
+    ):
+        def refuse(*args, **kwargs):
+            raise LibrarySwitchTimeoutError("test-internal: readers did not drain")
+
+        monkeypatch.setattr(server.library_coordinator, "begin_switch", refuse)
+        monkeypatch.setattr(
+            server.library_switch, "describe_library_holders", lambda: None
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="pixlstash.services.library_switch_service"
+        ):
+            with pytest.raises(LibrarySwitchError) as excinfo:
+                server.library_switch.switch_to(second_library.uuid)
+
+        assert str(excinfo.value) == (
+            "PixlStash is not ready to switch libraries just now. Try again in a "
+            "moment."
+        )
+        assert any(
+            record.exc_info
+            and "test-internal" in str(record.exc_info[1])
+            and "Second" in record.getMessage()
+            for record in caplog.records
+        ), "the coordinator's own words go to the log, with the library"
+
+    def test_a_coordinator_that_is_not_ready_refuses_the_switch(
+        self, server, second_library, monkeypatch
+    ):
+        """A restore holding admission is a refusal, not a server error.
+
+        The switch route is hub-only, so a switch asked for during a full
+        restore passes the admission fence and meets ``begin_switch``'s
+        ``LibraryNotReadyError`` here.
+        """
+
+        def refuse(*args, **kwargs):
+            raise LibraryNotReadyError(SwitchState.SWITCHING)
+
+        monkeypatch.setattr(server.library_coordinator, "begin_switch", refuse)
+        monkeypatch.setattr(
+            server.library_switch, "describe_library_holders", lambda: None
+        )
+        before = server.vault
+        with pytest.raises(LibrarySwitchError) as excinfo:
+            server.library_switch.switch_to(second_library.uuid)
+
+        assert str(excinfo.value) == (
+            "PixlStash is not ready to switch libraries just now. Try again in a "
+            "moment."
+        )
+        assert isinstance(excinfo.value.__cause__, LibraryNotReadyError)
+        assert server.vault is before
+
+    def test_an_unrelated_runtime_error_is_not_dressed_as_a_refusal(
+        self, server, second_library, monkeypatch
+    ):
+        """Only the coordinator's own refusals become "not ready to switch".
+
+        Any other RuntimeError from ``begin_switch`` is a defect; answering it
+        with "try again in a moment" would hide it behind a retry that can
+        never succeed.
+        """
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("test-internal: unrelated defect")
+
+        monkeypatch.setattr(server.library_coordinator, "begin_switch", broken)
+        with pytest.raises(
+            RuntimeError, match="test-internal: unrelated defect"
+        ) as excinfo:
+            server.library_switch.switch_to(second_library.uuid)
+
+        assert not isinstance(excinfo.value, LibrarySwitchError)
+        lock = server.library_switch._lock
+        assert lock.acquire(blocking=False), "the switch lock is released"
+        lock.release()
+
     def test_switching_to_a_detached_library_is_refused(self, server, tmp_path):
         library = server.library_registry.create(str(tmp_path / "detached"), "Gone")
         server.library_registry.detach(library.id)
@@ -193,9 +290,42 @@ class TestSwitching:
         finally:
             server.library_switch.switch_to(original.uuid)
 
+    def test_a_refused_stored_box_is_logged_again_in_the_next_library(
+        self, server, tmp_path, caplog
+    ):
+        """The log-once memory is keyed by row id, which the next library reuses.
+
+        A copy of a library holds the same bad text under the same row id; were
+        the memory kept across the switch, that library's line never appeared.
+        """
+        library = server.library_registry.create(str(tmp_path / "boxes-b"), "Boxes B")
+        original = server.library_registry.active_library()
+        raw = "example-not-a-box"
+
+        def refusals():
+            caplog.clear()
+            read_stored_bbox(raw, owner="Face", row_id=7, picture_id=3)
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == "pixlstash.db_models.face"
+            ]
+
+        with caplog.at_level(logging.WARNING, logger="pixlstash.db_models.face"):
+            refusals()
+            assert refusals() == [], "precondition: the second read is not logged"
+            try:
+                server.library_switch.switch_to(library.uuid)
+                (line,) = refusals()
+            finally:
+                server.library_switch.switch_to(original.uuid)
+        assert "Face 7 on picture 3" in line
+
 
 class TestFailingToSwitch:
-    def test_a_missing_folder_leaves_the_session_where_it_was(self, server, tmp_path):
+    def test_a_missing_folder_leaves_the_session_where_it_was(
+        self, server, tmp_path, caplog
+    ):
         """The failure the construct-then-swap ordering exists for."""
         folder = str(tmp_path / "removable")
         library = server.library_registry.create(folder, "Removable")
@@ -205,10 +335,18 @@ class TestFailingToSwitch:
         # The drive goes away between attach and switch.
         os.rename(folder, folder + "-unplugged")
 
-        with pytest.raises(LibrarySwitchError) as excinfo:
-            server.library_switch.switch_to(library.uuid)
+        with caplog.at_level(
+            logging.WARNING, logger="pixlstash.services.library_switch_service"
+        ):
+            with pytest.raises(LibrarySwitchError) as excinfo:
+                server.library_switch.switch_to(library.uuid)
 
         assert "not where PixlStash left it" in str(excinfo.value)
+        assert str(excinfo.value).startswith('"Removable" ')
+        assert str(tmp_path) not in str(excinfo.value)
+        assert any(folder in record.getMessage() for record in caplog.records), (
+            "the folder it looked in goes to the log"
+        )
         assert server.vault is before_vault, "the old vault must still be open"
         assert server.library_registry.active_library().uuid == before_active.uuid
         assert server.library_switch.state is SwitchState.READY
@@ -222,13 +360,17 @@ class TestFailingToSwitch:
 
         os.remove(os.path.join(folder, "vault.db"))
 
-        with pytest.raises(LibrarySwitchError):
+        with pytest.raises(LibrarySwitchError) as excinfo:
             server.library_switch.switch_to(library.uuid)
+        assert str(excinfo.value).startswith(
+            '"Emptied" no longer looks like a library: No vault.db in that folder.'
+        )
+        assert str(tmp_path) not in str(excinfo.value)
         assert server.vault is before_vault
         assert server.library_switch.state is SwitchState.READY
 
     def test_a_recorded_fingerprint_that_disappears_is_refused_before_open(
-        self, server, tmp_path
+        self, server, tmp_path, caplog
     ):
         folder = str(tmp_path / "missing-fingerprint")
         target = server.library_registry.create(folder, "Missing fingerprint")
@@ -242,11 +384,24 @@ class TestFailingToSwitch:
         conn.commit()
         conn.close()
 
-        with pytest.raises(
-            LibrarySwitchError,
-            match="Could not verify the registered library fingerprint",
+        with caplog.at_level(
+            logging.ERROR, logger="pixlstash.services.library_switch_service"
         ):
-            server.library_switch.switch_to(target.uuid)
+            with pytest.raises(LibrarySwitchError) as excinfo:
+                server.library_switch.switch_to(target.uuid)
+
+        # The answer goes over HTTP: the library by name, no path, no exception
+        # text. What actually failed is in the log, with its traceback.
+        assert str(excinfo.value) == (
+            'Could not open "Missing fingerprint". PixlStash is still using the '
+            "library it was already on, and nothing has been changed."
+        )
+        assert any(
+            record.exc_info
+            and "Could not verify the registered library fingerprint"
+            in str(record.exc_info[1])
+            for record in caplog.records
+        )
 
         conn = sqlite3.connect(os.path.join(folder, "vault.db"))
         try:
@@ -306,6 +461,8 @@ class TestFailingToSwitch:
         assert "newer PixlStash" in str(excinfo.value)
         assert "releases/latest" in str(excinfo.value)
         assert "revision 9999;" in str(excinfo.value)
+        assert str(excinfo.value).startswith('"Future" was last opened by')
+        assert str(tmp_path) not in str(excinfo.value)
         assert server.vault is before_vault
         assert server.library_switch.state is SwitchState.READY
 
@@ -343,8 +500,13 @@ class TestFailingToSwitch:
             return real_build(image_root)
 
         monkeypatch.setattr(server, "build_vault", observed_build)
-        with pytest.raises(LibrarySwitchError, match="fingerprint conflict"):
+        with pytest.raises(LibrarySwitchError, match="fingerprint conflict") as caught:
             server.library_switch.switch_to(library.uuid)
+        assert str(caught.value) == (
+            '"Replaced" was not opened: its folder now holds a different library '
+            "(a fingerprint conflict). PixlStash is still using the library it "
+            "was already on, and nothing has been changed."
+        )
 
         assert len(build_calls) == 1, (
             "the decisive fingerprint check belongs inside the securely bound "
@@ -367,6 +529,46 @@ class TestFailingToSwitch:
         assert columns == {"id", "library_uuid"}
         assert sentinel == ("untouched",)
 
+    def test_a_recorded_fingerprint_that_no_longer_matches_is_a_conflict(
+        self, server, tmp_path
+    ):
+        """The registry recorded one fingerprint; the folder now holds another."""
+        folder = str(tmp_path / "fingerprint-swapped")
+        target = server.library_registry.create(folder, "Swapped")
+        original = server.library_registry.active_library()
+        server.library_switch.switch_to(target.uuid)
+        server.library_switch.switch_to(original.uuid)
+        assert server.library_registry.by_uuid(target.uuid).vault_uuid is not None
+        foreign_uuid = "00000000-0000-4000-8000-000000000098"
+        conn = sqlite3.connect(os.path.join(folder, "vault.db"))
+        conn.execute("UPDATE library_settings SET library_uuid = ?", (foreign_uuid,))
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(LibrarySwitchError) as excinfo:
+            server.library_switch.switch_to(target.uuid)
+
+        assert str(excinfo.value) == (
+            '"Swapped" was not opened: its folder now holds a different library '
+            "(a fingerprint conflict). PixlStash is still using the library it "
+            "was already on, and nothing has been changed."
+        )
+        assert foreign_uuid not in str(excinfo.value)
+        assert server.library_registry.active_library().uuid == original.uuid
+
+    def test_a_library_that_will_not_open_to_move_into_says_so_in_words(
+        self, server, second_library, monkeypatch
+    ):
+        def refuse(image_root, **kwargs):
+            raise RuntimeError(f"test-internal: {image_root} would not open")
+
+        monkeypatch.setattr(server, "build_vault", refuse)
+        with pytest.raises(LibrarySwitchError) as excinfo:
+            with server.library_switch.open_other_library(second_library.uuid):
+                pass
+
+        assert str(excinfo.value) == 'Could not open "Second". Nothing was moved.'
+
     def test_failure_after_old_close_reopens_previous_vault(
         self, server, tmp_path, monkeypatch
     ):
@@ -384,8 +586,14 @@ class TestFailingToSwitch:
             return vault
 
         monkeypatch.setattr(server, "build_vault", build_with_failing_candidate)
-        with pytest.raises(LibrarySwitchError, match="still using the previous"):
+        with pytest.raises(
+            LibrarySwitchError, match="still using the previous"
+        ) as caught:
             server.library_switch.switch_to(library.uuid)
+        assert str(caught.value) == (
+            'Could not switch to "Post-close failure". PixlStash is still using '
+            "the previous library."
+        )
 
         assert server.library_registry.active_library().uuid == before.uuid
         assert server.vault.image_root == before.path
@@ -744,6 +952,37 @@ class TestSchemaGuard:
         assert "0001_baseline" in known
         assert any(rev.startswith("0094") for rev in known)
 
+    def test_a_future_revision_is_refused_without_naming_the_file(self, tmp_path):
+        vault_path = str(tmp_path / "vault.db")
+        conn = sqlite3.connect(vault_path)
+        conn.execute("CREATE TABLE alembic_version (version_num TEXT NOT NULL)")
+        conn.execute("INSERT INTO alembic_version VALUES ('9999_from_the_future')")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(LibrarySwitchError) as excinfo:
+            assert_vault_not_newer(vault_path)
+
+        assert str(excinfo.value).startswith("That library was last opened by")
+        assert "revision 9999;" in str(excinfo.value)
+        assert str(tmp_path) not in str(excinfo.value)
+
+    def test_a_file_that_will_not_open_is_refused_in_words(self, tmp_path, caplog):
+        vault_path = str(tmp_path / "test-missing" / "vault.db")
+
+        with caplog.at_level(
+            logging.ERROR, logger="pixlstash.services.library_switch_service"
+        ):
+            with pytest.raises(LibrarySwitchError) as excinfo:
+                assert_vault_not_newer(vault_path)
+
+        assert str(excinfo.value) == "That library's database could not be opened."
+        assert isinstance(excinfo.value.__cause__, sqlite3.Error)
+        assert any(
+            record.exc_info and vault_path in record.getMessage()
+            for record in caplog.records
+        ), "the path and SQLite's words go to the log"
+
 
 class TestSwitchingCreatesAFingerprint:
     def test_a_library_created_by_the_cli_is_fingerprinted_on_first_switch(
@@ -1081,8 +1320,13 @@ class TestPromotingAFirstImport:
         """Nothing is promoted onto an existing library, whatever the mark says."""
         (Path(pending_library.path) / VAULT_FILENAME).write_bytes(b"not mine")
 
-        with pytest.raises(LibrarySwitchError, match="already exists"):
+        with pytest.raises(LibrarySwitchError) as caught:
             server.library_switch.promote_pending_vault(pending_library)
+        # Named by the library, not by the path of the file in the way.
+        assert str(caught.value) == (
+            f'The folder of "{pending_library.name}" already has a vault.db, so '
+            "the import cannot be promoted onto it."
+        )
 
         # Refused before anything closed: the session is still serving.
         assert server.vault.image_root == pending_library.path
@@ -1092,7 +1336,7 @@ class TestPromotingAFirstImport:
         )
 
     def test_a_failed_rename_leaves_the_import_where_it_was(
-        self, server, pending_library, monkeypatch
+        self, server, pending_library, monkeypatch, caplog
     ):
         """The window between closing and reopening, with the rename lost.
 
@@ -1111,8 +1355,21 @@ class TestPromotingAFirstImport:
 
         monkeypatch.setattr(os, "replace", refuse_this_one)
 
-        with pytest.raises(LibrarySwitchError, match="could not be finished|held by"):
-            server.library_switch.promote_pending_vault(pending_library)
+        with caplog.at_level(
+            logging.ERROR, logger="pixlstash.services.library_switch_service"
+        ):
+            with pytest.raises(LibrarySwitchError) as caught:
+                server.library_switch.promote_pending_vault(pending_library)
+        # The OS's words go to the log with the traceback, not into the answer.
+        assert str(caught.value) == (
+            f'Could not finish the import into "{pending_library.name}". Nothing '
+            "was indexed twice and no picture was touched; the import can be "
+            "finished again."
+        )
+        assert any(
+            record.exc_info and "held by another process" in str(record.exc_info[1])
+            for record in caplog.records
+        )
 
         monkeypatch.undo()
         still = server.library_registry.by_uuid(pending_library.uuid)

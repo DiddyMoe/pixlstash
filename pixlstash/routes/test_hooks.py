@@ -362,10 +362,11 @@ def create_router(server) -> APIRouter:
                     emitted,
                     payload.repeat,
                     exc,
+                    exc_info=True,
                 )
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Failed to inject event after {emitted} emits: {exc}",
+                    detail=f"Failed to inject event after {emitted} emits.",
                 ) from exc
 
         return InjectWsEventResponse(

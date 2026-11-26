@@ -21,6 +21,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.db_models.operation import VALID_STATUSES
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import operation_log_service
@@ -79,7 +80,7 @@ class UndoRequest(BaseModel):
 
     # Undo this specific operation instead of the newest reversible one. Its
     # whole batch goes with it - a bulk action is one undoable unit.
-    operation_id: Optional[int] = None
+    operation_id: Optional[SqliteInt] = None
 
 
 def create_router(server) -> APIRouter:
@@ -105,7 +106,7 @@ def create_router(server) -> APIRouter:
     )
     def list_operations(
         request: Request,
-        limit: int = 50,
+        limit: SqliteInt = 50,
         status: Optional[str] = None,
         batch_id: Optional[str] = None,
         op_type: Optional[str] = None,
@@ -150,7 +151,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=OperationResponse,
     )
-    def get_operation(request: Request, operation_id: int):
+    def get_operation(request: Request, operation_id: SqliteInt):
         operation = operation_log_service.get_operation(server.vault, operation_id)
         if operation is None:
             raise HTTPException(status_code=404, detail="Operation not found")
@@ -218,7 +219,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=UndoResultResponse,
     )
-    def undo_specific_operation(request: Request, operation_id: int):
+    def undo_specific_operation(request: Request, operation_id: SqliteInt):
         try:
             return operation_log_service.undo(
                 server.vault,

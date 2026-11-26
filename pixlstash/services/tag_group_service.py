@@ -72,6 +72,11 @@ IMPORT_CONFLICT_SAMPLE = 10
 # An import may name at most this many categories that are not groups yet; a file
 # with more is refused, so one upload cannot create an unbounded number of groups.
 MAX_IMPORT_NEW_GROUPS = 50
+# Refusal texts that once repeated the caller's tag or a library's error text.
+PENDING_MARKER_NOT_FILEABLE = (
+    "A pending-retag marker is not a tag you can file. Remove it from the list."
+)
+CSV_UNREADABLE = "Could not read the .csv file. Save it again as UTF-8 CSV and retry."
 # SQLite's INTEGER is 64-bit; a larger group id names no group.
 _SQLITE_MAX_INT = 2**63 - 1
 
@@ -320,9 +325,7 @@ def _clean_tags(tags: list[str]) -> list[str]:
     cleaned = list(dict.fromkeys(name for name in stripped if name))
     for name in cleaned:
         if is_tag_sentinel(name):
-            raise TagGroupError(
-                400, f"“{name}” is a pending-retag marker, not a tag you can file"
-            )
+            raise TagGroupError(400, PENDING_MARKER_NOT_FILEABLE)
     if len(cleaned) > MAX_ASSIGN_TAGS:
         raise TagGroupError(
             400, f"At most {MAX_ASSIGN_TAGS} tags can be filed in one request"
@@ -588,7 +591,11 @@ def parse_tag_file(filename: str, data: bytes) -> list[tuple[str, str, str]]:
         try:
             raw_rows = list(iter_first_sheet_rows(data))
         except XlsxError as exc:
-            logger.warning("tag_groups: refused import file %r: %s", filename, exc)
+            # XlsxError's text is the reader's own (never the upload's bytes or
+            # a library's message), so it may be shown; the cause is logged.
+            logger.warning(
+                "tag_groups: refused import file %r: %s", filename, exc, exc_info=True
+            )
             raise TagGroupError(400, f"Could not read the .xlsx file: {exc}") from None
     elif lower.endswith(".csv"):
         try:
@@ -597,8 +604,11 @@ def parse_tag_file(filename: str, data: bytes) -> list[tuple[str, str, str]]:
             raise TagGroupError(400, "The .csv file is not UTF-8 text") from None
         try:
             raw_rows = list(csv.reader(io.StringIO(text)))
-        except csv.Error as exc:
-            raise TagGroupError(400, f"Could not read the .csv file: {exc}") from None
+        except csv.Error:
+            logger.warning(
+                "tag_groups: refused import file %r", filename, exc_info=True
+            )
+            raise TagGroupError(400, CSV_UNREADABLE) from None
     else:
         raise TagGroupError(400, "Upload a .xlsx or .csv tag file")
     # Both formats alike: a blank row (a common Excel artefact above the

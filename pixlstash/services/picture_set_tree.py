@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from sqlmodel import Session, select, update
 
 from pixlstash.db_models import Character, PictureSet
+from pixlstash.utils.sql_chunking import in_json
 
 # How far below a person or top-level set a set may sit: three levels in all.
 MAX_DEPTH = 2
@@ -39,9 +40,8 @@ def validate_parent(
         if value is not None and (
             isinstance(value, bool) or not isinstance(value, int)
         ):
-            raise HTTPException(
-                status_code=400, detail=f"A parent id must be a number, not {value!r}."
-            )
+            # The value is the caller's, so the sentence does not repeat it.
+            raise HTTPException(status_code=400, detail="A parent id must be a number.")
     if parent_set_id is not None and parent_character_id is not None:
         raise HTTPException(
             status_code=400,
@@ -91,7 +91,7 @@ def _check_depth(session: Session, set_id: Optional[int], depth: int) -> None:
         kids = [
             kid
             for kid in session.exec(
-                select(PictureSet.id).where(PictureSet.parent_set_id.in_(frontier))
+                select(PictureSet.id).where(in_json(PictureSet.parent_set_id, frontier))
             ).all()
             if kid not in seen
         ]

@@ -19,7 +19,10 @@ the reader is deliberately narrow:
   a row counts every column up to its last one.
 * A corrupt, encrypted or unsupported member, a non-numeric shared-string index
   and a malformed sheet all raise :class:`XlsxError`, the only error that leaves
-  this module.
+  this module. Its message is composed here from the member names and limits
+  above, never from the upload's bytes or a library's exception text, so a
+  caller may show it; the library error, when there is one, is its
+  ``__cause__``, for the caller's log.
 * Nothing is extracted to disk.
 
 Memory: the parser holds one completed row at a time, and shared strings are held
@@ -65,7 +68,11 @@ _READ_ERRORS = (
 
 
 class XlsxError(ValueError):
-    """The upload is not a readable workbook, or breaks one of the limits above."""
+    """The upload is not a readable workbook, or breaks one of the limits above.
+
+    The message is server text (see the module docstring); the zip, zlib or XML
+    error behind it, if any, is chained as ``__cause__``.
+    """
 
 
 class _Budget:
@@ -100,9 +107,7 @@ def _check_encoding(name: str, head: bytes) -> None:
     except LookupError:
         found = declared
     if found != "utf-8":
-        raise XlsxError(
-            f"{name} declares the encoding {declared!r}, not UTF-8, and is refused"
-        )
+        raise XlsxError(f"{name} declares an encoding other than UTF-8, and is refused")
 
 
 def _streamed(zf: zipfile.ZipFile, name: str, budget: _Budget) -> Iterator[bytes]:
@@ -133,7 +138,7 @@ def _streamed(zf: zipfile.ZipFile, name: str, budget: _Budget) -> Iterator[bytes
                 tail = window[-_TAIL:]
                 yield chunk
     except _READ_ERRORS as exc:
-        raise XlsxError(f"{name} could not be read: {exc}") from None
+        raise XlsxError(f"{name} could not be read") from exc
 
 
 def _completed(
@@ -164,7 +169,7 @@ def _completed(
             yield from _drain(parser.read_events())
         parser.close()
     except ET.ParseError as exc:
-        raise XlsxError(f"{name} is not well-formed XML: {exc}") from None
+        raise XlsxError(f"{name} is not well-formed XML") from exc
     yield from _drain(parser.read_events())
 
 
@@ -199,12 +204,12 @@ def _shared_strings(zf: zipfile.ZipFile, budget: _Budget) -> list[str]:
 def _column_index(ref: str) -> int:
     match = _COLUMN_RE.match(ref or "")
     if match is None:
-        raise XlsxError(f"a cell reference {ref!r} has no column letters")
+        raise XlsxError("a cell reference has no column letters")
     number = 0
     for letter in match.group(1):
         number = number * 26 + ord(letter) - 64
     if number > MAX_COLUMNS:
-        raise XlsxError(f"a cell in column {match.group(1)} is past the reader's limit")
+        raise XlsxError("a cell is past the reader's column limit")
     return number - 1
 
 
@@ -221,7 +226,7 @@ def _cell_text(cell: ET.Element, shared: list[str]) -> str:
             index = int(value.text)
         except ValueError:
             raise XlsxError(
-                f"a cell names shared string {value.text!r}, which is not a whole number"
+                "a cell names a shared string by something that is not a whole number"
             ) from None
         if not 0 <= index < len(shared):
             raise XlsxError(f"a cell names shared string {index}, which does not exist")
@@ -264,7 +269,7 @@ def iter_first_sheet_rows(data: bytes) -> Iterator[list[str]]:
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except (zipfile.BadZipFile, EOFError, ValueError, NotImplementedError) as exc:
-        raise XlsxError(f"not a readable .xlsx workbook: {exc}") from None
+        raise XlsxError("not a readable .xlsx workbook") from exc
     budget = _Budget(MAX_UNCOMPRESSED_BYTES)
     rows_seen = 0
     cells_seen = 0

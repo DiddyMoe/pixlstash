@@ -74,6 +74,7 @@ from pixlstash.db_models import (
     Tag,
     TagPrediction,
 )
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.db_models.operation import (
     STATUS_APPLIED,
     STATUS_SUPERSEDED,
@@ -85,6 +86,9 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.services.layout_move_service import (
     restore_location,
     rollback_applied_moves,
+)
+from pixlstash.services.folder_structure_commit_service import (
+    resolve_pending_people_with_faces,
 )
 from pixlstash.services.set_lock_service import enforce_pictures_not_locked
 from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
@@ -198,6 +202,11 @@ PURGED_STATUS_CODE = 410
 
 # How many operations the API will ever return in one page.
 MAX_LIST_LIMIT = 500
+
+# The 409 for a batch undo with nothing left to revert. The batch id is the
+# caller's path text, never checked against a recorded batch, so the refusal
+# does not repeat it; the log does.
+BATCH_HAS_NOTHING_TO_UNDO = "That batch has nothing to undo."
 
 # Facet -> the event this facet's restoration should announce. CHANGED_PICTURES
 # is the catch-all the grid listens to; the tag/character events additionally
@@ -1346,8 +1355,9 @@ def _rotate_picture_boxes(
     """Turn every stored face/detection box with the picture's display.
 
     Both box tables are stored in **EXIF-corrected** space - the extraction tasks
-    load through ``load_image_bgr_reduced``, which runs ``ImageOps.exif_transpose``
-    - so a change of orientation moves them even though not one pixel moved.
+    load through ``load_image_bgr_reduced``, which runs
+    ``ImageUtils.apply_exif_orientation`` - so a change of orientation moves them
+    even though not one pixel moved.
     ``Picture.width`` / ``height`` are RAW and stay as they are; the display size
     the transform needs is those two swapped when the *current* orientation is a
     quarter turn.
@@ -1374,8 +1384,16 @@ def _rotate_picture_boxes(
         for row in session.exec(
             select(model).where(model.picture_id == picture.id)
         ).all():
-            box = row.bbox
-            if not box or len(box) != 4:
+            # A stored box that is not four finite numbers is left as it is
+            # (logged once with the ids): int() raised on NaN or infinity, and
+            # text that is not JSON failed the whole rotate.
+            box = read_stored_bbox(
+                row.bbox_,
+                owner=model.__name__,
+                row_id=row.id,
+                picture_id=picture.id,
+            )
+            if box is None:
                 continue
             row.bbox = transform([int(value) for value in box])
             session.add(row)
@@ -1568,11 +1586,11 @@ def apply_orientation(
     # NULLing the dimensions is what MissingThumbnailFinder selects on.
     picture.thumbnail_width = None
     picture.thumbnail_height = None
-    # Both are computed from the DECODED image, which exif_transpose has just
-    # started producing at a different rotation, so both are now describing a
-    # picture that no longer exists. Left stale they are worse than absent: the
-    # near-duplicate tiers compare a turned picture against its own pre-turn
-    # neighbours and mis-group it. NULLing re-queues them the way every other
+    # Both are computed from the DECODED image, which the loaders' orientation
+    # turn has just started producing at a different rotation, so both are now
+    # describing a picture that no longer exists. Left stale they are worse than
+    # absent: the near-duplicate tiers compare a turned picture against its own
+    # pre-turn neighbours and mis-group it. NULLing re-queues them the way every other
     # regeneration in this codebase is triggered - `ImageEmbeddingTask.fetch_work`
     # selects on `image_embedding IS NULL`, and that one task owns the perceptual
     # hash as well, so this is one finder and one pass rather than two.
@@ -1583,14 +1601,30 @@ def apply_orientation(
 
 
 def _apply_deleted(session: Session, picture: Picture, lifecycle) -> None:
-    """Restore a picture's scrapheap state (the soft-delete flag + its stamp)."""
+    """Restore a picture's scrapheap state (the soft-delete flag + its stamp).
+
+    A picture this puts INTO the Scrapheap is stamped now, as every other path
+    in does, never with the stamp it carried the last time it was there.
+    ``deleted_at`` is also the consent bound of a delete-forever
+    (:func:`~pixlstash.services.scrapheap_service.binned_by`): a confirmation
+    destroys only pictures binned by the time its preview read the Scrapheap.
+    Written back, the old stamp falls under the bound of a preview that never
+    showed the picture, and spending that confirmation destroys it. The cost
+    is that an undo or redo starts a fresh retention window instead of
+    resuming the old one, which only ever moves a deadline later.
+
+    A picture already in the Scrapheap keeps its stamp, as a second DELETE
+    does, and one that leaves it loses the stamp, as a restore does. The
+    recorded ``deleted_at`` is therefore not read back.
+    """
     if not isinstance(lifecycle, dict):
         return
-    picture.deleted = bool(lifecycle.get("deleted"))
-    # Written back verbatim rather than re-stamped to "now": the recorded value
-    # IS the retention deadline this state had, and re-stamping would silently
-    # extend (or invent) a purge window on every undo.
-    picture.deleted_at = _parse_utc(lifecycle.get("deleted_at"))
+    deleted = bool(lifecycle.get("deleted"))
+    if not deleted:
+        picture.deleted_at = None
+    elif not picture.deleted:
+        picture.deleted_at = datetime.now(timezone.utc)
+    picture.deleted = deleted
     session.add(picture)
 
 
@@ -2533,7 +2567,8 @@ def undo_batch_in_session(
         ).all()
     )
     if not members:
-        raise OperationLogError(f"Batch {batch_id} has nothing to undo")
+        logger.info("Batch undo refused (409): batch %r has nothing to undo.", batch_id)
+        raise OperationLogError(BATCH_HAS_NOTHING_TO_UNDO)
     _enforce_latest_undo_unit(session, members[0])
     applied: list = []
     try:
@@ -2684,6 +2719,10 @@ def announce_restore(
     non-picture operation moved. Shared by Ctrl+Z, Ctrl+Shift+Z, a named batch
     undo and the auto-stack run revert, which restores one segment per slice.
     """
+    if FACET_PENDING_CHARACTER_ID in facets:
+        # The restore replayed a pending person, possibly onto a picture whose
+        # faces were extracted since; extraction never revisits it (§24).
+        resolve_pending_people_with_faces(vault, touched, origin="Undo/redo")
     _emit(vault, touched, set(facets), origin_client_id, lifecycle)
     # A restore of a non-picture operation (a tag-group move) announces no
     # picture, so no event clears the stats cache, yet a stats query narrowed

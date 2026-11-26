@@ -251,10 +251,12 @@ def create_router(server) -> APIRouter:
         except PermissionError:
             raise HTTPException(status_code=403, detail="Permission denied.")
         except OSError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Could not create folder: {exc}",
+            logger.error(
+                "Could not create the folder %s: %s", target, exc, exc_info=True
             )
+            raise HTTPException(
+                status_code=500, detail="Could not create the folder."
+            ) from exc
         return FilesystemCreateFolderResponse(status="success", path=target)
 
     return router

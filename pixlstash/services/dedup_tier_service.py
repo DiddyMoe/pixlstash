@@ -20,9 +20,9 @@ That is why tier 1 groups on ``(pixel_sha, size_bytes)`` rather than
 ``pixel_sha`` alone: the sample offsets are derived from the file size, so equal
 size plus equal sampled digest is a far stronger claim than the digest alone.
 Finding the duplicated keys is not an index lookup, though: no index covers the
-live ``(pixel_sha, size_bytes)`` key, so the aggregate reads every live picture
-row once (see :func:`find_exact_keys_in_session` for how the scan keeps that
-read off the database writer). Tier 1 is still not a cryptographic identity
+live ``(pixel_sha, size_bytes)`` key, so the aggregate reads every picture row
+once (see :func:`find_exact_keys_in_session` for how the scan keeps that read
+off the database writer and stoppable). Tier 1 is still not a cryptographic identity
 proof, which is exactly why the design routes exact matches through a bulk
 auto-stack **dialog** with a dry-run count rather than stacking them at import
 without consent, and why no tier ever deletes anything.
@@ -92,7 +92,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, NamedTuple, Optional
 
 import numpy as np
-from sqlalchemy import case, delete, func, update
+from sqlalchemy import and_, case, delete, exists, func, or_, update
+from sqlalchemy.orm import aliased
 from sqlmodel import Session, select
 
 from pixlstash.db_models import Picture, PictureStack
@@ -124,6 +125,8 @@ from pixlstash.services.set_lock_service import (
     partition_stackable_members,
 )
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.near_neighbor import parse_dhash
+from pixlstash.utils.query.folder_prefix import FolderPrefix
 from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK as ID_CHUNK
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -202,6 +205,30 @@ A key is never split across pages (one key is one complete group), so a single
 key with more members than this gets a page of its own. This bounds the live
 members a slice builds, not the rows its member read returns: see
 :func:`page_exact_keys`."""
+
+EXACT_KEY_SHARD_BOUNDS: tuple[str, ...] = tuple("123456789abcdef")
+"""Where the tier-1 key discovery is cut into shards, as ``pixel_sha`` prefixes.
+
+Shard ``i`` holds the hashes from bound ``i - 1`` (inclusive) up to bound ``i``
+(exclusive); the first shard has no lower bound and the last no upper bound, so
+every hash, whatever its spelling, is in exactly one shard. A key's rows share
+their hash, so each shard's ``GROUP BY`` is complete on its own. The background
+scan reads one shard per reader step and checks for a stop between them (see
+:func:`find_exact_keys_in_session`)."""
+
+EXACT_KEY_SHARD_COUNT = len(EXACT_KEY_SHARD_BOUNDS) + 1
+"""How many shards :data:`EXACT_KEY_SHARD_BOUNDS` cuts the key discovery into."""
+
+EXACT_KEY_WHOLE_READ_MAX_PICTURES = 10_000
+"""Largest collection scope whose tier-1 keys are read in one statement.
+
+A shard reads its slice of the whole library's ``ix_picture_pixel_sha``,
+whatever the scope, so sixteen shards cost a walk of that index however few
+pictures the scope holds. A collection scope's whole read is driven by its
+membership instead and costs one probe per member, about 1-2 ms per thousand
+members, so up to this many live pictures it is no longer than one shard of a
+200,000-picture library and is read as one step (see :func:`exact_key_shards`).
+"""
 
 MAX_BUCKET_MEMBERS = 4000
 """Cap on one tier-2 bucket. The within-bucket comparison is O(k^2) popcounts,
@@ -379,9 +406,6 @@ _NUMERIC_SCOPE_TYPES = frozenset(
 )
 """Scopes whose ``scope_id`` is a row id and must parse as an integer."""
 
-LIKE_ESCAPE_CHAR = "\\"
-"""Escape character for the folder scope's ``LIKE`` prefix match."""
-
 
 @dataclass(frozen=True)
 class DedupScope:
@@ -414,9 +438,11 @@ class DedupScope:
             try:
                 object.__setattr__(self, "scope_id", str(int(str(self.scope_id))))
             except (TypeError, ValueError) as exc:
+                # The routes answer this text: it names the server's scope type,
+                # never the caller's id.
                 raise ValueError(
                     f"scope_id for scope_type={self.scope_type.value} must be an "
-                    f"integer id, got {self.scope_id!r}"
+                    "integer id"
                 ) from exc
             return
         if self.scope_type is ScopeType.FOLDER:
@@ -429,10 +455,11 @@ class DedupScope:
             # "/photos" and "/photos/" the same scope key instead of two scans.
             prefix = str(self.scope_id).rstrip("/\\")
             if not prefix:
+                # Answered as it is, so the caller's text is not repeated.
                 raise ValueError(
-                    "scope_id for scope_type=folder must name a folder; "
-                    f"{self.scope_id!r} normalises to an empty prefix, which "
-                    "would match the whole vault"
+                    "scope_id for scope_type=folder must name a folder; this one "
+                    "normalises to an empty prefix, which would match the whole "
+                    "vault"
                 )
             object.__setattr__(self, "scope_id", prefix)
 
@@ -442,6 +469,14 @@ class DedupScope:
         if self.scope_type is ScopeType.GLOBAL:
             return "global"
         return f"{self.scope_type.value}:{self.scope_id}"
+
+    @property
+    def is_collection(self) -> bool:
+        """True for a set, project or character: a membership table defines it.
+
+        The library and a folder are checks on the picture row itself.
+        """
+        return self.scope_type in _NUMERIC_SCOPE_TYPES
 
     def picture_predicate(self):
         """Return the SQLAlchemy predicate restricting ``Picture`` to this scope.
@@ -467,24 +502,64 @@ class DedupScope:
             return Picture.id.in_(
                 select(Face.picture_id).where(Face.character_id == int(self.scope_id))
             )
-        # FOLDER: a picture is in the folder when it was imported from it or its
-        # file lives under it. Both are prefix matches on an indexed column.
+        # FOLDER: a picture is in the folder when it was imported from it (an
+        # equality on the indexed ``import_source_folder``) or its file lives
+        # in it or below it. "Below" is separator-bounded, so ``/lib/photos``
+        # never takes ``/lib/photos-old``, and compares case the way the
+        # platform's paths do: see :class:`FolderPrefix`, the one spelling of
+        # this check the backend shares. ``scope_id`` was already stripped of
+        # trailing separators and rejected if that left it empty
+        # (__post_init__).
         #
-        # The LIKE pattern escapes ``%`` / ``_`` / the escape character itself:
-        # unescaped, a scope_id of "%" would silently mean "everywhere", so a
-        # "Find duplicates in this folder" entry could match far more than the
-        # folder it named. The literal path is still compared exactly on
-        # import_source_folder. ``scope_id`` was already stripped of trailing
-        # separators and rejected if that left it empty (__post_init__).
-        prefix = str(self.scope_id)
-        pattern = (
-            prefix.replace(LIKE_ESCAPE_CHAR, LIKE_ESCAPE_CHAR * 2)
-            .replace("%", f"{LIKE_ESCAPE_CHAR}%")
-            .replace("_", f"{LIKE_ESCAPE_CHAR}_")
+        # ``picture.file_path`` has no index, so the file arm is a check on
+        # each row the rest of the statement selects; the range form is the
+        # one an index on the column would serve if one is added.
+        folder = str(self.scope_id)
+        return (Picture.import_source_folder == folder) | FolderPrefix.of(folder).under(
+            Picture.file_path
         )
-        return (Picture.import_source_folder == prefix) | (
-            Picture.file_path.like(f"{pattern}%", escape=LIKE_ESCAPE_CHAR)
-        )
+
+    def picture_probe(self):
+        """Return the same restriction as a per-row check that cannot drive a plan.
+
+        :meth:`picture_predicate` is ``Picture.id IN (members)`` for a
+        collection scope, and SQLite plans that as a list built once per
+        statement and walked by ``rowid``: the read is driven by the scope's
+        membership, whatever else its ``WHERE`` says. That is right for a read
+        of the whole scope, and wrong for one meant to cover a slice of an index
+        (a ``pixel_sha`` range or an id range), which then costs a read of the
+        whole scope instead. This form is a correlated ``EXISTS`` on the
+        membership table's key, probed once for each row the rest of the
+        ``WHERE`` selects. A folder scope is already a check on the row (an
+        equality and a separator-bounded path range, see
+        :meth:`picture_predicate`), and is returned as it is. ``None`` for the
+        global scope.
+
+        ``face`` has one index on ``picture_id`` and one on ``character_id``.
+        Without ``ANALYZE`` they tie, SQLite takes the one created last, and
+        ``create_all`` creates them in set order, so some databases took the
+        character's: every candidate row then walked every face of the
+        character. The character id is compared as ``character_id + 0``, an
+        expression no index serves, so the probe is the picture's own faces.
+        """
+        if self.scope_type is ScopeType.GLOBAL:
+            return None
+        if self.scope_type is ScopeType.PROJECT:
+            return exists().where(
+                PictureProjectMember.picture_id == Picture.id,
+                PictureProjectMember.project_id == int(self.scope_id),
+            )
+        if self.scope_type is ScopeType.SET:
+            return exists().where(
+                PictureSetMember.set_id == int(self.scope_id),
+                PictureSetMember.picture_id == Picture.id,
+            )
+        if self.scope_type is ScopeType.CHARACTER:
+            return exists().where(
+                Face.picture_id == Picture.id,
+                Face.character_id + 0 == int(self.scope_id),
+            )
+        return self.picture_predicate()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1442,44 +1517,110 @@ class ExactKey(NamedTuple):
     first_id: int
 
 
+def exact_key_shards(
+    scope: DedupScope, scope_pictures: int
+) -> tuple[Optional[int], ...]:
+    """The tier-1 key reads the background scan issues for *scope*, in order.
+
+    Each entry is one reader step's *shard* for :func:`find_exact_keys_in_session`
+    (``None`` meaning the whole scope in one statement). A collection scope of at
+    most :data:`EXACT_KEY_WHOLE_READ_MAX_PICTURES` live pictures (*scope_pictures*,
+    counted when the scan starts) is one whole read driven by its membership;
+    every other scope, the library and a folder included, is the
+    :data:`EXACT_KEY_SHARD_COUNT` ``pixel_sha`` shards. Either way no step reads
+    more than a bounded slice, so a stop lands within one.
+    """
+    if scope.is_collection and int(scope_pictures) <= EXACT_KEY_WHOLE_READ_MAX_PICTURES:
+        return (None,)
+    return tuple(range(EXACT_KEY_SHARD_COUNT))
+
+
 def find_exact_keys_in_session(
-    session: Session, scope: Optional[DedupScope] = None
+    session: Session,
+    scope: Optional[DedupScope] = None,
+    shard: Optional[int] = None,
 ) -> list[ExactKey]:
     """Tier-1 discovery: ``GROUP BY pixel_sha, size_bytes HAVING count(*) > 1``.
 
-    No index covers the live ``(pixel_sha, size_bytes)`` key, so this reads every
-    live picture row in *scope* once (SQLite walks ``ix_picture_deleted`` and
-    groups through a temporary B-tree). That is why the background scan runs it
-    exactly once per scan, on a concurrent WAL reader rather than the database
-    writer (:meth:`~pixlstash.database.VaultDatabase.run_immediate_read_task`).
-    Paging this aggregate by key would not make it cheaper: every page would
-    re-read the whole table.
+    The background scan runs this on a concurrent WAL reader rather than the
+    database writer
+    (:meth:`~pixlstash.database.VaultDatabase.run_immediate_read_task`), one
+    *shard* per step (:func:`exact_key_shards`), so a stop lands between two
+    steps instead of waiting for the whole library. ``None`` reads the whole
+    scope in one statement.
 
-    The keys come back ordered by the lowest picture id that carries each, so new
-    exact groups are created, and queued at equal confidence, oldest picture
-    first, whatever plan SQLite picks. The result is one small tuple per
+    **A shard** is one ``pixel_sha`` range (:data:`EXACT_KEY_SHARD_BOUNDS`), read
+    in two steps so that it costs that slice of ``ix_picture_pixel_sha`` in every
+    scope. The inner step groups the slice on the index alone (a covering read,
+    no table row), keeping each hash that two rows share in any state, size or
+    scope: a superset of the keys. The outer step reads only those hashes' rows
+    and applies the live count, the ``size_bytes`` co-key and the scope, as
+    :meth:`DedupScope.picture_probe`, a per-row check. The scope must not be the
+    ``IN`` list of :meth:`DedupScope.picture_predicate` here: SQLite builds that
+    list once per statement and drives the read from it by ``rowid``, so every
+    shard read the whole scope again, sixteen times one whole read for a set.
+
+    **The whole read** (``shard=None``) is one statement with the scope as that
+    ``IN`` list, the plan that suits it: a collection scope is read member by
+    member, the library or a folder row by row.
+
+    ``deleted`` is counted inside the aggregate, never put in the ``WHERE``.
+    PixlStash never runs ``ANALYZE``, and without statistics SQLite prefers a
+    ``deleted`` equality on ``ix_picture_deleted`` to a ``pixel_sha`` term,
+    which walks the whole live table. The price is that scrapheaped rows are
+    read and not counted.
+
+    The keys come back ordered by the lowest live picture id that carries each,
+    so new exact groups are created, and queued at equal confidence, oldest
+    picture first, whatever plan SQLite picks. The shards' keys, merged and
+    sorted by :attr:`ExactKey.first_id`, are the same list in the same order
+    (no two keys share a lowest id). The result is one small tuple per
     duplicated key; the members are read per page by
     :func:`build_exact_groups_for_keys_in_session`.
+
+    Raises:
+        ValueError: *shard* is outside ``0 .. EXACT_KEY_SHARD_COUNT - 1``.
     """
     scope = scope or DedupScope()
-    predicate = scope.picture_predicate()
+    live_id = case((Picture.deleted.is_(False), Picture.id))
     duplicated = (
         select(
             Picture.pixel_sha,
             Picture.size_bytes,
-            func.count(Picture.id),
-            func.min(Picture.id),
+            func.count(live_id),
+            func.min(live_id),
         )
-        .where(
-            Picture.pixel_sha.is_not(None),
-            Picture.deleted.is_(False),
-        )
+        .where(Picture.pixel_sha.is_not(None))
         .group_by(Picture.pixel_sha, Picture.size_bytes)
-        .having(func.count(Picture.id) > 1)
-        .order_by(func.min(Picture.id))
+        .having(func.count(live_id) > 1)
+        .order_by(func.min(live_id))
     )
-    if predicate is not None:
-        duplicated = duplicated.where(predicate)
+    if shard is None:
+        restriction = scope.picture_predicate()
+    else:
+        if not 0 <= int(shard) < EXACT_KEY_SHARD_COUNT:
+            raise ValueError(
+                f"exact key shard {shard!r} is outside 0..{EXACT_KEY_SHARD_COUNT - 1}"
+            )
+        slice_row = aliased(Picture)
+        shared_hashes = (
+            select(slice_row.pixel_sha)
+            .where(slice_row.pixel_sha.is_not(None))
+            .group_by(slice_row.pixel_sha)
+            .having(func.count() > 1)
+        )
+        if shard > 0:
+            shared_hashes = shared_hashes.where(
+                slice_row.pixel_sha >= EXACT_KEY_SHARD_BOUNDS[shard - 1]
+            )
+        if shard < EXACT_KEY_SHARD_COUNT - 1:
+            shared_hashes = shared_hashes.where(
+                slice_row.pixel_sha < EXACT_KEY_SHARD_BOUNDS[shard]
+            )
+        duplicated = duplicated.where(Picture.pixel_sha.in_(shared_hashes))
+        restriction = scope.picture_probe()
+    if restriction is not None:
+        duplicated = duplicated.where(restriction)
     return [
         ExactKey(str(sha), size_bytes, int(count), int(first_id))
         for sha, size_bytes, count, first_id in session.exec(duplicated).all()
@@ -1535,9 +1676,15 @@ def build_exact_groups_for_keys_in_session(
     imported, scrapheaped or rehashed in between is seen, and a key that no
     longer has two live members produces no group. Groups come back in the order
     of *keys*; each key's members are kept whole (see :func:`page_exact_keys`).
+
+    The scope is applied as :meth:`DedupScope.picture_probe`, checked on each
+    row the page's hashes select, so the read costs O(page) in every scope. As
+    the ``IN`` list of :meth:`DedupScope.picture_predicate` it was built from
+    the whole scope once per chunk: about 87 ms a page against 25 ms for a
+    100,000-picture set on a 200,000-picture library.
     """
     scope = scope or DedupScope()
-    predicate = scope.picture_predicate()
+    predicate = scope.picture_probe()
     by_key: dict[tuple[str, Optional[int]], list[int]] = {}
     for key in keys:
         by_key.setdefault((str(key[0]), key[1]), [])
@@ -1783,9 +1930,8 @@ def near_pairs_in_bucket(
                     bucket.key,
                 )
                 continue
-            try:
-                values.append(int(text[:PHASH_HEX_LEN], 16))
-            except ValueError:
+            value = parse_dhash(text[:PHASH_HEX_LEN])
+            if value is None:
                 logger.warning(
                     "[dedup-tier2] picture %s has an unparseable perceptual_hash "
                     "%r; excluded from bucket %s=%s",
@@ -1795,6 +1941,7 @@ def near_pairs_in_bucket(
                     bucket.key,
                 )
                 continue
+            values.append(value)
             kept.append(int(picture_id))
     if len(kept) < 2:
         return []
@@ -2010,6 +2157,88 @@ def verdict_signatures_in_session(
     return found
 
 
+def _decided_overlaps_in_session(
+    session: Session,
+    groups: list[DetectedGroup],
+    resolved_signatures: set[str],
+) -> tuple[set[str], set[int]]:
+    """Weigh each to-be-asked group in *groups* against the decisions it touches.
+
+    A decision is a ``resolved`` :class:`DedupGroup`. For a detected group
+    whose own signature carries no verdict, every decided group of the same
+    tier that holds one of its pictures (under a different signature) is
+    either:
+
+    * **covering** it, when every picture of the detected group is already a
+      member of that decided group. Pictures only left (the Scrapheap, a
+      purge, a scoped scan seeing part of the group): the decision was made
+      on all of them and still holds.
+    * **superseded** by it, when no decision covers it: the detected group
+      holds a picture the decision never saw, so the evidence changed and the
+      group is asked again.
+
+    Returns ``(covered signatures, superseded decided group ids)``. Only the
+    decided groups touching this batch are read, so the cost follows the
+    batch, not the number of decisions in the library.
+    """
+    asked = [group for group in groups if group.signature not in resolved_signatures]
+    picture_ids = sorted({pid for group in asked for pid in group.picture_ids})
+    if not picture_ids:
+        return set(), set()
+    touched: dict[int, tuple[str, str]] = {}
+    for start in range(0, len(picture_ids), ID_CHUNK):
+        chunk = picture_ids[start : start + ID_CHUNK]
+        for group_id, tier, signature in session.exec(
+            select(DedupGroup.id, DedupGroup.tier, DedupGroup.signature)
+            .join(DedupGroupMember, DedupGroupMember.group_id == DedupGroup.id)
+            .where(
+                DedupGroup.resolved.is_(True),
+                DedupGroupMember.picture_id.in_(chunk),
+            )
+            .distinct()
+        ).all():
+            touched[int(group_id)] = (str(tier), str(signature))
+    if not touched:
+        return set(), set()
+    members: dict[int, set[int]] = defaultdict(set)
+    decided_by_picture: dict[int, set[int]] = defaultdict(set)
+    touched_ids = sorted(touched)
+    for start in range(0, len(touched_ids), ID_CHUNK):
+        for group_id, picture_id in session.exec(
+            select(DedupGroupMember.group_id, DedupGroupMember.picture_id).where(
+                DedupGroupMember.group_id.in_(touched_ids[start : start + ID_CHUNK])
+            )
+        ).all():
+            members[int(group_id)].add(int(picture_id))
+            decided_by_picture[int(picture_id)].add(int(group_id))
+
+    # A decided group this same batch rediscovers under its own signature is
+    # refreshed by the caller, so it can never be the one superseded.
+    batch_signatures = {group.signature for group in groups}
+    covered: set[str] = set()
+    superseded: set[int] = set()
+    for group in asked:
+        found = set(group.picture_ids)
+        overlapping = {
+            group_id
+            for pid in found
+            for group_id in decided_by_picture.get(pid, ())
+            if touched[group_id][0] == group.tier.value
+            and touched[group_id][1] != group.signature
+        }
+        if not overlapping:
+            continue
+        if any(found <= members[group_id] for group_id in overlapping):
+            covered.add(group.signature)
+        else:
+            superseded.update(
+                group_id
+                for group_id in overlapping
+                if touched[group_id][1] not in batch_signatures
+            )
+    return covered, superseded
+
+
 def persist_groups_in_session(
     session: Session,
     groups: list[DetectedGroup],
@@ -2021,6 +2250,12 @@ def persist_groups_in_session(
     files produce the same signature, so the row is refreshed in place and the
     queue does not grow duplicates of its own. A group whose signature already
     carries a live verdict is stored ``resolved=True`` and never re-asked.
+
+    A decision also outlives a change of signature in one direction only
+    (:func:`_decided_overlaps_in_session`). A new group whose pictures all sit
+    inside one decided group of its tier is not stored: the decision covers
+    it. A group that adds a picture to a decided group deletes that decided
+    group in this commit and is stored unresolved, so it is asked again.
 
     The writes are set-based: one lookup per chunk of signatures, one
     multi-row insert for new groups, one update by primary key for refreshed
@@ -2049,6 +2284,36 @@ def persist_groups_in_session(
         ).all():
             group_ids[str(signature)] = int(group_id)
             stored_tiers[str(signature)] = str(tier)
+
+    covered, superseded = _decided_overlaps_in_session(
+        session, groups, resolved_signatures
+    )
+    # A covered signature that already has a row keeps being refreshed: only a
+    # group the decision would otherwise create is held back.
+    held_back = covered - set(group_ids)
+    if held_back:
+        logger.info(
+            "[dedup] %d group(s) found inside a decided group of their tier; "
+            "the decision covers them, so they are not asked again",
+            len(held_back),
+        )
+        groups = [group for group in groups if group.signature not in held_back]
+    if superseded:
+        ordered = sorted(superseded)
+        for start in range(0, len(ordered), ID_CHUNK):
+            session.execute(
+                delete(DedupGroup)
+                .where(
+                    DedupGroup.id.in_(ordered[start : start + ID_CHUNK]),
+                    DedupGroup.resolved.is_(True),
+                )
+                .execution_options(synchronize_session=False)
+            )
+        logger.info(
+            "[dedup] %d decided group(s) gained a picture they were never "
+            "decided on; they are asked again",
+            len(ordered),
+        )
 
     # Fold the groups in order, exactly as the one-at-a-time upsert applied
     # them: the first occurrence of a new signature creates the row, every later
@@ -2152,11 +2417,15 @@ def prune_stale_groups_in_session(session: Session) -> int:
     whose members were soft-deleted would keep inflating the sidebar badge, and
     the badge is the whole reason the verdict memory exists.
 
-    One set-based ``DELETE``: a group survives only if at least two of its
-    members are live pictures, so a group with no member rows at all goes too.
-    Member rows follow through their ``ON DELETE CASCADE`` key. Loading every
-    group to test it in Python cost a read of every row's evidence JSON per
-    call, and the auto-stack loop calls this once per batch.
+    One set-based ``DELETE``: an open group survives only if at least two of
+    its members are live pictures, so a group with no member rows at all goes
+    too. A decided (``resolved``) group survives while two member rows remain,
+    live or in the Scrapheap: thinning a group is usually what its verdict
+    did, and the decided page lists it so the decision can still be cleared
+    (backend_architecture.md §22.6). Only a purge, which cascades the member
+    rows away, ends it. Member rows follow through their ``ON DELETE CASCADE``
+    key. Loading every group to test it in Python cost a read of every row's
+    evidence JSON per call, and the auto-stack loop calls this once per batch.
     """
     live_groups = (
         select(DedupGroupMember.group_id)
@@ -2165,12 +2434,25 @@ def prune_stale_groups_in_session(session: Session) -> int:
         .group_by(DedupGroupMember.group_id)
         .having(func.count(DedupGroupMember.picture_id) >= 2)
     )
+    groups_of_two = (
+        select(DedupGroupMember.group_id)
+        .group_by(DedupGroupMember.group_id)
+        .having(func.count(DedupGroupMember.picture_id) >= 2)
+    )
     # ORM-enabled so pending changes are flushed first, as the row-by-row
     # version's SELECT did; nothing is synchronised because the rows are gone.
     removed = int(
         session.execute(
             delete(DedupGroup)
-            .where(DedupGroup.id.not_in(live_groups))
+            .where(
+                or_(
+                    and_(
+                        DedupGroup.resolved.is_(False),
+                        DedupGroup.id.not_in(live_groups),
+                    ),
+                    DedupGroup.id.not_in(groups_of_two),
+                )
+            )
             .execution_options(synchronize_session=False)
         ).rowcount
         or 0
@@ -2189,9 +2471,11 @@ def obsolete_scan_group_ids_in_session(
 ) -> list[int]:
     """Return the ids of groups one completed scan generation no longer found.
 
-    A group is obsolete when this scan was the last to produce it
-    (``DedupGroup.scan_id``), its tier ran to completion, and its signature is
-    not in that tier's set from this run. Only ``(id, tier, signature)`` is
+    A group is obsolete when it is still open (a decided group is never
+    retired: :func:`persist_groups_in_session` supersedes one whose members
+    change), this scan was the last to produce it (``DedupGroup.scan_id``),
+    its tier ran to completion, and its signature is not in that tier's set
+    from this run. Only ``(id, tier, signature)`` is
     read, never the evidence, so the background scan can run this on a
     concurrent reader and leave the deletion to its final writer slice
     (:func:`delete_scan_groups_in_session`).
@@ -2207,6 +2491,7 @@ def obsolete_scan_group_ids_in_session(
         select(DedupGroup.id, DedupGroup.tier, DedupGroup.signature).where(
             DedupGroup.scan_id == int(scan_id),
             DedupGroup.tier.in_(sorted(completed)),
+            DedupGroup.resolved.is_(False),
         )
     ).all()
     return [
@@ -2223,8 +2508,10 @@ def delete_scan_groups_in_session(
 
     The ``scan_id`` guard is what makes it safe to choose the ids on a reader
     and delete them later on the writer: a global or sibling scoped scan that
-    refreshed one of these rows in between now owns it, and it is kept. Member
-    rows follow through their ``ON DELETE CASCADE`` key. Left uncommitted so
+    refreshed one of these rows in between now owns it, and it is kept. The
+    ``resolved`` guard does the same for a verdict that landed in between: a
+    decided group is never retired. Member rows follow through their
+    ``ON DELETE CASCADE`` key. Left uncommitted so
     the caller commits it atomically with the terminal scan status.
     """
     wanted = sorted({int(group_id) for group_id in group_ids})
@@ -2236,6 +2523,7 @@ def delete_scan_groups_in_session(
                 .where(
                     DedupGroup.id.in_(wanted[start : start + ID_CHUNK]),
                     DedupGroup.scan_id == int(scan_id),
+                    DedupGroup.resolved.is_(False),
                 )
                 .execution_options(synchronize_session=False)
             ).rowcount
@@ -2243,8 +2531,9 @@ def delete_scan_groups_in_session(
         )
     if len(wanted) > removed:
         logger.info(
-            "[dedup-scan] %d group(s) scan %s chose to retire were already gone "
-            "or now belong to another scan; left as they are",
+            "[dedup-scan] %d group(s) scan %s chose to retire were already "
+            "gone, now belong to another scan or were decided since; left as "
+            "they are",
             len(wanted) - removed,
             scan_id,
         )
@@ -2348,7 +2637,9 @@ def decode_queue_cursor(cursor: str) -> tuple[float, int]:
             raise ValueError(f"non-finite cursor confidence {confidence!r}")
         return parsed, int(group_id)
     except (ValueError, UnicodeDecodeError, BinasciiError) as exc:
-        raise DedupCursorError(f"malformed queue cursor {cursor!r}: {exc}") from exc
+        # Neither the caller's cursor nor the decoder's text: why it failed is
+        # the chained cause.
+        raise DedupCursorError("malformed queue cursor") from exc
 
 
 def _keyset_predicate(cursor: str):
@@ -2412,7 +2703,8 @@ def decode_decided_cursor(cursor: str) -> tuple[Optional[datetime], int]:
             decided_at = decided_at.replace(tzinfo=timezone.utc)
         return decided_at, int(group_id)
     except (ValueError, UnicodeDecodeError, BinasciiError) as exc:
-        raise DedupCursorError(f"malformed decided cursor {cursor!r}: {exc}") from exc
+        # As in decode_queue_cursor: the cause is chained, never in the text.
+        raise DedupCursorError("malformed decided cursor") from exc
 
 
 def _decided_activity_at():
@@ -3130,15 +3422,24 @@ def scope_counts_in_session(
 
     The context menus need a count per project / set / character / folder; asking
     for them one at a time would be a request per menu item.
+
+    Each row also carries the scope's own ``by_tier`` split, under the same
+    rules as the vault-wide one. A scoped queue's Auto-stack button offers the
+    scope's exact groups, because that is what a run started from it acts on
+    (:func:`~pixlstash.services.dedup_verdict_service.plan_auto_stack_in_session`
+    takes the scope); the vault-wide split there offered a figure the run
+    would not reach. Both numbers come from one grouped read per scope.
     """
     policy = policy or TierPolicy()
-    return [
-        {
-            **scope.as_dict(),
-            "unresolved_groups": count_unresolved_in_session(session, policy, scope),
-        }
-        for scope in scopes
-    ]
+    rows = []
+    for scope in scopes:
+        unresolved, by_tier = count_unresolved_and_by_tier_in_session(
+            session, policy, scope
+        )
+        rows.append(
+            {**scope.as_dict(), "unresolved_groups": unresolved, "by_tier": by_tier}
+        )
+    return rows
 
 
 # --- Scan requests and progress ---------------------------------------------
@@ -3467,6 +3768,9 @@ __all__ = [
     "DEFAULT_PAGE_SIZE",
     "DEFAULT_STACK_MEMBER_PAGE_SIZE",
     "DEFAULT_THRESHOLD",
+    "EXACT_KEY_SHARD_BOUNDS",
+    "EXACT_KEY_SHARD_COUNT",
+    "EXACT_KEY_WHOLE_READ_MAX_PICTURES",
     "EXACT_PAGE_MAX_KEYS",
     "EXACT_PAGE_MAX_MEMBERS",
     "MAX_BUCKET_MEMBERS",
@@ -3509,6 +3813,7 @@ __all__ = [
     "decode_queue_cursor",
     "delete_scan_groups_in_session",
     "encode_queue_cursor",
+    "exact_key_shards",
     "find_embedding_groups_in_session",
     "find_exact_groups_in_session",
     "find_exact_keys_in_session",

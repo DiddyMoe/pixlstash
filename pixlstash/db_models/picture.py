@@ -6,7 +6,18 @@ import numpy as np
 from datetime import datetime
 
 from enum import Enum, auto, IntEnum
-from sqlalchemy import Float, Index, Select, String, desc, func, or_, text
+from sqlalchemy import (
+    Float,
+    Index,
+    Integer,
+    Select,
+    String,
+    desc,
+    false,
+    func,
+    or_,
+    text,
+)
 from sqlalchemy.orm import aliased, load_only, selectinload
 from sqlalchemy.types import LargeBinary
 from sqlmodel import (
@@ -39,7 +50,8 @@ from .tag import Tag
 from .tag_prediction import TagPrediction
 
 from pixlstash.pixl_logging import get_logger
-from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK, chunked, in_json
+from pixlstash.utils.sqlite_ints import SQLITE_INT_MAX, SQLITE_INT_MIN
 
 if TYPE_CHECKING:
     from .character import Character
@@ -127,7 +139,10 @@ class SortMechanism:
         if key_string in cls.Keys.__members__:
             return SortMechanism(cls.Keys[key_string], descending=descending)
 
-        raise ValueError(f"{key_string!r} is not a valid SortMechanism")
+        # A fixed sentence: the caller's text stays out of the message, which
+        # a handler may pass on. The value is logged here for diagnosis.
+        logger.debug("Refusing sort %r: not a SortMechanism key", key_string)
+        raise ValueError("That is not a sort this server knows.")
 
 
 class LikenessParameter(IntEnum):
@@ -151,6 +166,30 @@ LIKENESS_PARAMETER_SENTINEL = -1.0
 _NO_PROJECT_SCOPE = object()
 
 
+def _scope_table_ids(values) -> list[int]:
+    """The values of an ``IN`` list on an integer column, as the ints they name.
+
+    ``col IN (...)`` on an INTEGER column matches ``5`` and ``"5"`` alike and
+    matches nothing for a value that is not an integer, so a long list moved
+    into a temp table keeps exactly the values that could ever match: ints and
+    digit strings inside SQLite's range. The rest are dropped, as the ``IN``
+    would have passed over them.
+    """
+    ids: list[int] = []
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            number = value
+        elif isinstance(value, str) and value.lstrip("-").isdigit():
+            number = int(value)
+        else:
+            continue
+        if SQLITE_INT_MIN <= number <= SQLITE_INT_MAX:
+            ids.append(number)
+    return ids
+
+
 def _default_likeness_parameters() -> np.ndarray:
     return np.full(
         len(LikenessParameter), LIKENESS_PARAMETER_SENTINEL, dtype=np.float32
@@ -170,18 +209,67 @@ class ExportType(Enum):
         return cls.FULL
 
 
+def _column_filter_clause(column, value):
+    """The clause one keyword column filter of ``Picture.find`` applies.
+
+    A list, or a SELECT (a long list's temp table or a caller's subquery), is a
+    membership test; any other value is an equality. The outer query and the
+    stack-leader collapse both build the clause here, so they cannot disagree.
+
+    A list on an integer column is one ``IN`` list: ``find`` has already moved
+    one too long to bind twice into a temp table. Any other column has no temp
+    table, so its list is bound as one JSON array (:func:`in_json`), however
+    long it is and however many times the statement repeats it.
+    """
+    if isinstance(value, Select):
+        return column.in_(value)
+    if isinstance(value, list):
+        if isinstance(column.type, Integer):
+            return column.in_(value)
+        return in_json(column, value)
+    return column == value
+
+
+def _project_scope_clause(project_id):
+    """The clause ``Picture.find``'s ``project_id`` filter applies.
+
+    ``None`` is the unassigned scope (no membership at all), a list is
+    membership of any of those projects, anything else membership of that one.
+    The outer query and the stack-leader collapse both build it here, so a list
+    is bound as one JSON array: the statement carries it twice.
+    """
+    members = select(PictureProjectMember.picture_id).where(
+        PictureProjectMember.picture_id == Picture.id
+    )
+    if project_id is None:
+        return ~exists(members)
+    if isinstance(project_id, list):
+        return exists(
+            members.where(in_json(PictureProjectMember.project_id, project_id))
+        )
+    return exists(members.where(PictureProjectMember.project_id == project_id))
+
+
 def _scope_predicates_for_leaders(
     *,
+    column_filters: Optional[dict] = None,
     file_path_prefix: Optional[str] = None,
     face_filter: Optional[str] = None,
     favourite_only: bool = False,
+    import_source_folder: Optional[str] = None,
+    imported_since: Optional[datetime] = None,
+    format: Optional[List[str]] = None,
+    resolution_bucket: Optional[str] = None,
+    stack_state: Optional[str] = None,
+    workflow_structural_hashes: Optional[List[str]] = None,
 ) -> list:
-    """The intrinsic narrowings a stack-leader collapse has to know about.
+    """The narrowings a stack-leader collapse has to know about.
 
     Compiled from :class:`~pixlstash.utils.query.predicate_filter.PredicateFilter`
-    rather than restated, so the clause that decides which member represents the
-    stack is character-for-character the clause that decides which members show.
-    A second spelling is how the leader and the members get to disagree.
+    and :func:`_column_filter_clause` rather than restated, so the clause that
+    decides which member represents the stack is character-for-character the
+    clause that decides which members show. A second spelling is how the leader
+    and the members get to disagree.
 
     Only the predicates that can hide a stack's global position-0 member belong
     here. A score range or a tag filter can too, in principle - they are left
@@ -190,19 +278,44 @@ def _scope_predicates_for_leaders(
     and a FACE facet are different: they are *where the picture is* and *what is
     in it*, and a stack routinely straddles both. "Favourites only" is the same
     kind: the heart is often on a variant, not the cover, and that stack must
-    still show, represented by its favourite.
+    still show, represented by its favourite. Where a picture came from and when
+    it arrived are the same kind too: a new variant joins an old stack, so the
+    import source and the Inbox's period (``imported_since``) are here. So is
+    anything that differs between the cover and a variant: the file format, the
+    resolution, the workflow that made it, and the duplicate queue's
+    "unresolved" (a variant is often the one the detector paired). A filter
+    never hides a matching picture behind a cover that does not match.
+    "Stacked" and "unstacked" are not: they hold or fail for a whole stack.
+
+    ``column_filters`` maps a ``Picture`` column name to the value the outer
+    query filtered it by - an id list or its temp table, a reference folder,
+    an import source - each applied as :func:`_column_filter_clause` applies
+    it. Every column filter is here, not a chosen few: a column filter the
+    collapse does not know about is exactly the bug (``reference_folder_id``
+    was one). A list value is bound again here, so the caller must pass one
+    that fits the statement twice.
     """
     from pixlstash.utils.query.predicate_filter import PredicateFilter
 
-    predicates: list = []
-    if file_path_prefix is not None:
-        predicates += PredicateFilter(
-            file_path_prefix=file_path_prefix
-        ).file_path_prefix_predicates()
-    if face_filter in ("with_face", "without_face"):
-        predicates += PredicateFilter(face_filter=face_filter).face_predicates()
-    if favourite_only:
-        predicates += PredicateFilter(favourite_only=True).favourite_predicates()
+    predicates: list = [
+        _column_filter_clause(getattr(Picture, attr), value)
+        for attr, value in (column_filters or {}).items()
+    ]
+    # One compile of every intrinsic narrowing above, by the compiler the
+    # outer query uses. The deleted clause is the caller's (the rank already
+    # skips deleted members), and a value left unset compiles to nothing.
+    predicates += PredicateFilter(
+        file_path_prefix=file_path_prefix,
+        face_filter=face_filter,
+        favourite_only=favourite_only,
+        import_source_folder=import_source_folder,
+        imported_since=imported_since,
+        format=format,
+        resolution_bucket=resolution_bucket,
+        stack_state="unresolved" if stack_state == "unresolved" else None,
+        workflow_structural_hashes=workflow_structural_hashes,
+        apply_deleted_filter=False,
+    ).predicates()
     return predicates
 
 
@@ -402,8 +515,9 @@ class Picture(SQLModel, table=True):
     tag_uncertainty: Optional[float] = Field(default=None, index=True)
     anomaly_tag_uncertainty: Optional[float] = Field(default=None, index=True)
     # Set by the character-assignment endpoint when picture_ids are provided but
-    # face extraction has not yet run.  Cleared (and the best face assigned) when
-    # FaceExtractionTask completes for the picture.
+    # face extraction has not yet run.  Cleared (and the best face assigned)
+    # once the FaceExtractionTask's face rows for the picture have landed, or by
+    # the start-up pass `reconcile_pending_people_with_faces`.
     pending_character_id: Optional[int] = Field(default=None, index=True)
     # Set on T2I-generated pictures when the prompt was associated with a source
     # picture.  SourceFaceLikenessTask compares face embeddings against the source
@@ -1106,6 +1220,8 @@ class Picture(SQLModel, table=True):
         file_path_prefix: Optional[str] = None,
         guest_session_id: Optional[str] = None,
         guest_token_public_id: Optional[str] = None,
+        tag_state: Optional[str] = None,
+        unprocessable_ids: Optional[frozenset[int]] = None,
         count_only: bool = False,
         **search,
     ) -> Union[List["Picture"], int]:
@@ -1114,10 +1230,17 @@ class Picture(SQLModel, table=True):
 
         When count_only=True, returns the integer count of matching pictures
         instead of the picture objects.  Sort, offset, and limit are ignored.
+
+        ``tag_state`` narrows to one untagged reason (see
+        ``predicate_filter.TAG_STATES``).  It needs ``unprocessable_ids``, the
+        caller's read of the active suppressed set, because the reasons split
+        on it.
         """
-        # Imported lazily: predicate_filter imports Picture, so a module-level
-        # import here would be circular.
+        # Imported lazily: predicate_filter imports Picture, and the
+        # utils.service package imports export_utils, which imports Picture, so
+        # module-level imports here would be circular.
         from pixlstash.utils.query.predicate_filter import PredicateFilter
+        from pixlstash.utils.service.scope_table import scope_id_subquery
 
         query = select(func.count(cls.id)) if count_only else select(cls)
 
@@ -1146,37 +1269,34 @@ class Picture(SQLModel, table=True):
         # was redundant (idempotent AND, no row drift) and is removed so the
         # filter has a single owner.
 
+        # An integer column's ``IN`` list longer than SQLite binds in one
+        # statement is read from a temp table instead (``scope_id_subquery``),
+        # one per column so two long lists cannot overwrite each other. The
+        # membership test stays in this one statement, so the sort, offset and
+        # limit below still apply over the whole list. A stack-leader collapse
+        # applies every column filter a second time, inside its leader scope,
+        # so there a list binds twice and must fit the statement twice: past
+        # half the limit it goes to the temp table, which both reads share.
+        list_cap = SQLITE_ID_CHUNK // 2 if stack_leaders_only else SQLITE_ID_CHUNK
+        column_filters: dict = {}
         for attr, value in search.items():
             if attr == "project_id":
-                membership_query = select(PictureProjectMember.picture_id).where(
-                    PictureProjectMember.picture_id == cls.id
-                )
-                if value is None:
-                    query = query.where(~exists(membership_query))
-                elif isinstance(value, list):
-                    query = query.where(
-                        exists(
-                            membership_query.where(
-                                PictureProjectMember.project_id.in_(value)
-                            )
-                        )
-                    )
-                else:
-                    query = query.where(
-                        exists(
-                            membership_query.where(
-                                PictureProjectMember.project_id == value
-                            )
-                        )
-                    )
+                query = query.where(_project_scope_clause(value))
                 continue
             if hasattr(cls, attr):
-                # A SELECT (e.g. ``scope_id_subquery``) is a membership test
-                # like a list, without binding one parameter per id.
-                if isinstance(value, (list, Select)):
-                    query = query.where(getattr(cls, attr).in_(value))
-                else:
-                    query = query.where(getattr(cls, attr) == value)
+                if (
+                    isinstance(value, list)
+                    and len(value) > list_cap
+                    and attr in cls.__table__.columns
+                    and isinstance(cls.__table__.columns[attr].type, Integer)
+                ):
+                    value = scope_id_subquery(
+                        session,
+                        _scope_table_ids(value),
+                        name=f"_pixlstash_find_{attr}_ids",
+                    )
+                query = query.where(_column_filter_clause(getattr(cls, attr), value))
+                column_filters[attr] = value
 
         # All lifecycle + intrinsic-attribute predicates are compiled by the shared
         # PredicateFilter (the single source of truth for the WHERE logic that used
@@ -1204,6 +1324,8 @@ class Picture(SQLModel, table=True):
             only_deleted=only_deleted,
             include_deleted=include_deleted,
             include_unimported=include_unimported,
+            tag_state=tag_state,
+            unprocessable_ids=unprocessable_ids,
         )
         query = predicate_filter.apply(query)
 
@@ -1213,52 +1335,36 @@ class Picture(SQLModel, table=True):
         # was unacceptably slow on large libraries.
         if stack_leaders_only:
             project_scope = search.get("project_id", _NO_PROJECT_SCOPE)
-            id_scope: list[int] = []
-            raw_id_scope = search.get("id")
-            if isinstance(raw_id_scope, (list, tuple, set)):
-                for raw in raw_id_scope:
-                    try:
-                        id_scope.append(int(raw))
-                    except (TypeError, ValueError):
-                        continue
 
             # Every narrowing that can hide a stack's global position-0 member,
             # collected in ONE list and answered by ONE rule
             # (`stack_leader_filter`). Written out as a list rather than a
             # branch per scope because the failure mode is a scope nobody added
-            # to the branch: `file_path_prefix` was such a scope, and a folder
-            # grid silently dropped every stack whose cover sat in a sibling
-            # folder. The predicates must be the same ones the outer query
-            # applies, so each is compiled from the same source.
+            # to the branch: `file_path_prefix` was such a scope, and so was
+            # `reference_folder_id`, and each grid silently dropped every stack
+            # whose cover sat outside it. The predicates must be the same ones
+            # the outer query applies, so each is compiled from the same source:
+            # the project membership is `_project_scope_clause`, and every column
+            # filter (an id list or its temp table, a reference folder, an
+            # import source) is the clause `_column_filter_clause` built there.
             leader_scope: list = []
-            if id_scope:
-                # An id filter (a picture set, a share token's scope, a split).
-                leader_scope.append(cls.id.in_(id_scope))
-            if project_scope is not _NO_PROJECT_SCOPE and not isinstance(
-                project_scope, (list, tuple)
-            ):
-                project_members = select(PictureProjectMember.picture_id).where(
-                    PictureProjectMember.picture_id == cls.id
-                )
-                leader_scope.append(
-                    ~exists(project_members)
-                    if project_scope is None
-                    else exists(
-                        project_members.where(
-                            PictureProjectMember.project_id == project_scope
-                        )
-                    )
-                )
+            if project_scope is not _NO_PROJECT_SCOPE:
+                leader_scope.append(_project_scope_clause(project_scope))
             leader_scope += _scope_predicates_for_leaders(
+                column_filters=column_filters,
                 file_path_prefix=file_path_prefix,
                 face_filter=face_filter,
                 favourite_only=favourite_only,
+                format=format,
+                resolution_bucket=resolution_bucket,
+                stack_state=stack_state,
+                workflow_structural_hashes=workflow_structural_hashes,
             )
 
             if not leader_scope:
-                # Unscoped (or multi-project) grid: fast path - the leader is
-                # the global stack_position == 0, backed by the partial leader
-                # index. Left untouched so the common grid stays fast.
+                # Unscoped grid: fast path - the leader is the global
+                # stack_position == 0, backed by the partial leader index. Left
+                # untouched so the common grid stays fast.
                 query = query.where(
                     or_(cls.stack_id.is_(None), cls.stack_position == 0)
                 )
@@ -1454,6 +1560,7 @@ class Picture(SQLModel, table=True):
         stack_state: Optional[str] = None,
         impossible_sources: Optional[List[str]] = None,
         file_path_prefix: Optional[str] = None,
+        reference_folder_id: Optional[int] = None,
         import_source_folder: Optional[str] = None,
         imported_since: Optional[datetime] = None,
         comfyui_models_filter: Optional[List[str]] = None,
@@ -1463,9 +1570,22 @@ class Picture(SQLModel, table=True):
         guest_session_id: Optional[str] = None,
         guest_token_public_id: Optional[str] = None,
         count_only: bool = False,
+        tag_state: Optional[str] = None,
+        unprocessable_ids: Optional[frozenset[int]] = None,
     ):
-        # Imported lazily to avoid a circular import (predicate_filter imports Picture).
+        """List (or count) the pictures no person and no set claims.
+
+        ``tag_state`` and ``unprocessable_ids`` narrow to one untagged reason,
+        exactly as they do in :meth:`find`, so the Inbox and the Unassigned
+        view list the pictures the stats breakdown counts for that reason.
+        ``reference_folder_id`` narrows to one reference folder's pictures, as
+        the ``Picture.find`` column filter and the stats do.
+        """
+        # Imported lazily to avoid a circular import (predicate_filter imports
+        # Picture; the utils.service package imports export_utils, which
+        # imports Picture).
         from pixlstash.utils.query.predicate_filter import PredicateFilter
+        from pixlstash.utils.service.scope_table import scope_id_subquery
 
         query = select(func.count(cls.id)) if count_only else select(Picture)
         unassigned_conditions = cls.build_unassigned_conditions(
@@ -1474,27 +1594,42 @@ class Picture(SQLModel, table=True):
             assignment_unassigned_project=only_unassigned_project,
             unassigned_by=unassigned_by,
         )
+        # ``deleted = 0``, not ``IS 0``: the partial leader indexes say
+        # ``deleted = 0``, and SQLite chooses a partial index only for that
+        # exact term (``PredicateFilter.predicates`` spells it the same way).
         query = query.where(
             *unassigned_conditions,
-            Picture.deleted.is_(False),
+            Picture.deleted == false(),
         )
 
+        picture_scope = None
         if picture_ids is not None:
-            query = query.where(Picture.id.in_(picture_ids))
-
-        project_membership_query = select(PictureProjectMember.picture_id).where(
-            PictureProjectMember.picture_id == Picture.id
-        )
-        if only_unassigned_project:
-            query = query.where(~exists(project_membership_query))
-        elif project_id is not None:
-            query = query.where(
-                exists(
-                    project_membership_query.where(
-                        PictureProjectMember.project_id == project_id
-                    )
+            # A list longer than SQLite binds in one statement is read from a
+            # temp table, as ``find`` does. Not chunked: the sort, offset and
+            # limit below apply over the whole list, which chunks cannot give.
+            # The stack-leader collapse below binds it a second time, so there
+            # it must fit the statement twice, as in ``find``.
+            list_cap = SQLITE_ID_CHUNK // 2 if stack_leaders_only else SQLITE_ID_CHUNK
+            picture_scope = (
+                scope_id_subquery(
+                    session,
+                    _scope_table_ids(picture_ids),
+                    name="_pixlstash_unassigned_ids",
                 )
+                if len(picture_ids) > list_cap
+                else list(picture_ids)
             )
+            query = query.where(_column_filter_clause(Picture.id, picture_scope))
+        if reference_folder_id is not None:
+            query = query.where(
+                _column_filter_clause(Picture.reference_folder_id, reference_folder_id)
+            )
+
+        # Built by the helpers the leader scope below uses, so the outer query
+        # and the collapse cannot drift apart.
+        project_scope = None if only_unassigned_project else project_id
+        if only_unassigned_project or project_id is not None:
+            query = query.where(_project_scope_clause(project_scope))
 
         # Intrinsic-attribute predicates via the shared compiler.  The unassigned /
         # project / deleted scoping is applied above; stack-leader collapsing stays
@@ -1529,6 +1664,8 @@ class Picture(SQLModel, table=True):
             import_source_folder=import_source_folder,
             imported_since=imported_since,
             workflow_structural_hashes=workflow_structural_hashes,
+            tag_state=tag_state,
+            unprocessable_ids=unprocessable_ids,
             apply_deleted_filter=False,
         ).apply(query)
         for clause in cls.comfyui_filter_clauses(
@@ -1539,25 +1676,31 @@ class Picture(SQLModel, table=True):
         if stack_leaders_only:
             # Same rule and same implementation as `find` - see
             # `stack_leader_filter`. This branch used to be a fourth private
-            # copy of it, and the copy was the slow shape.
+            # copy of it, and the copy was the slow shape. Every narrowing
+            # above that can hide a stack's cover is repeated here, built the
+            # way it was built there: the id list (or its temp table), the
+            # reference folder, the import source and the Inbox's period. The
+            # unassigned conditions are not: they already hold or fail for a
+            # whole stack at once (`enforce_stack_assignment`).
             leader_scope: list = []
             if project_id is not None or only_unassigned_project:
-                project_members = select(PictureProjectMember.picture_id).where(
-                    PictureProjectMember.picture_id == cls.id
-                )
-                leader_scope.append(
-                    ~exists(project_members)
-                    if only_unassigned_project
-                    else exists(
-                        project_members.where(
-                            PictureProjectMember.project_id == project_id
-                        )
-                    )
-                )
+                leader_scope.append(_project_scope_clause(project_scope))
+            column_filters: dict = {}
+            if picture_scope is not None:
+                column_filters["id"] = picture_scope
+            if reference_folder_id is not None:
+                column_filters["reference_folder_id"] = reference_folder_id
             leader_scope += _scope_predicates_for_leaders(
+                column_filters=column_filters,
                 file_path_prefix=file_path_prefix,
                 face_filter=face_filter,
                 favourite_only=favourite_only,
+                import_source_folder=import_source_folder,
+                imported_since=imported_since,
+                format=format,
+                resolution_bucket=resolution_bucket,
+                stack_state=stack_state,
+                workflow_structural_hashes=workflow_structural_hashes,
             )
 
             if not leader_scope:
@@ -1755,7 +1898,7 @@ class Picture(SQLModel, table=True):
             )
             .where(
                 cls.stack_id.is_not(None),
-                cls.deleted.is_(False),
+                cls.deleted == false(),
                 *scope_predicates,
             )
             .subquery("scoped_stack_members")
@@ -1891,10 +2034,30 @@ class Picture(SQLModel, table=True):
     def fetch_features(session, picture_ids):
         """
         Fetch faces for a list of picture IDs.
+
+        A list longer than SQLite binds in one statement is read from a temp
+        table (``scope_id_subquery``), so *picture_ids* may be any length.
+
         Returns:
             faces_by_pic: dict[picture_id, list[Face]]
         """
-        faces = session.exec(select(Face).where(Face.picture_id.in_(picture_ids))).all()
+        # Imported lazily: the utils.service package imports export_utils,
+        # which imports Picture.
+        from pixlstash.utils.service.scope_table import scope_id_subquery
+
+        picture_ids = list(picture_ids)
+        picture_scope = (
+            scope_id_subquery(
+                session,
+                _scope_table_ids(picture_ids),
+                name="_pixlstash_features_picture_ids",
+            )
+            if len(picture_ids) > SQLITE_ID_CHUNK
+            else picture_ids
+        )
+        faces = session.exec(
+            select(Face).where(Face.picture_id.in_(picture_scope))
+        ).all()
 
         faces_by_pic = {}
         for face in faces:

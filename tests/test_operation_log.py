@@ -195,11 +195,11 @@ def reset_operation_log(_env):
     log its assertions assume, including the derived undo/redo state, which is
     read straight off these rows.
 
-    The Scrapheap is the other thing a test can observe globally:
-    ``POST /pictures/scrapheap/restore`` with no body restores *every*
-    soft-deleted picture, so pictures a previous test left scrapheaped would
-    inflate its ``restored_count``. Clearing the flag is the whole reset: the
-    endpoint's own query is ``Picture.deleted is True`` and nothing else.
+    The Scrapheap is the other thing a test can observe globally: a
+    whole-heap delete preview counts *every* soft-deleted picture, so pictures
+    a previous test left scrapheaped would inflate its ``total_count``.
+    Clearing the flag is the whole reset: the preview's own query is
+    ``Picture.deleted is True`` and nothing else.
 
     The third check is that the finders ``_disable_conflicting_backfill``
     removed are still gone, so a later test cannot silently run with the tagging
@@ -1438,6 +1438,32 @@ def test_batch_undo_reverts_the_whole_bulk_action_in_one_call(client, server):
     assert client.post(f"{API}/operations/batches/{batch_id}/undo").status_code == 409
 
 
+def test_a_batch_with_nothing_to_undo_is_refused_without_repeating_its_id(
+    client, server, caplog
+):
+    """The batch id is the caller's path text, so the 409 does not repeat it.
+
+    Held at the raise (the service's message) and at the answer (the body),
+    with the id kept for the log.
+    """
+    batch_id = "cli-example-leak-marker"
+    with pytest.raises(operation_log_service.OperationLogError) as caught:
+        server.vault.db.run_task(operation_log_service.undo_batch_in_session, batch_id)
+    assert str(caught.value) == operation_log_service.BATCH_HAS_NOTHING_TO_UNDO
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger=operation_log_service.logger.name):
+        response = client.post(f"{API}/operations/batches/{batch_id}/undo")
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": operation_log_service.BATCH_HAS_NOTHING_TO_UNDO
+    }
+    assert "example-leak-marker" not in response.text
+    assert any(batch_id in record.getMessage() for record in caplog.records), [
+        record.getMessage() for record in caplog.records
+    ]
+
+
 def test_undoing_one_member_of_a_batch_reverts_the_whole_batch(client, server):
     ids = [_upload(client) for _ in range(2)]
     batch_id = operation_log_service.new_batch_id()
@@ -1587,7 +1613,7 @@ def test_scrapheap_move_is_recorded_and_undo_brings_the_picture_back(client, ser
     assert operation["origin_client_id"] == "tab-1"
 
     # The recorded facet is the soft-delete state itself, retention stamp
-    # included, so undo restores the deadline rather than inventing one.
+    # included, for History to show; an undo or redo does not read the stamp back.
     detail = client.get(f"{API}/operations/{operation['id']}").json()
     assert detail["before"][str(picture_id)]["deleted"] == {
         "deleted": False,
@@ -1603,12 +1629,16 @@ def test_scrapheap_move_is_recorded_and_undo_brings_the_picture_back(client, ser
     assert _lifecycle(server, picture_id) == (False, None)
     assert _visible(client, picture_id) is True
 
-    # Redo puts it back in the Scrapheap, with the SAME retention stamp.
+    # Redo puts it back in the Scrapheap stamped now, not with the old stamp:
+    # the stamp is also a delete-forever's consent bound, and a preview read
+    # while the picture was out must not cover it.
     redo = client.post(f"{API}/operations/redo")
     assert redo.status_code == 200, redo.text
     assert redo.json()["scrapheaped_picture_ids"] == [picture_id]
     assert redo.json()["restored_picture_ids"] == []
-    assert _lifecycle(server, picture_id) == (True, deleted_at)
+    redone, restamped = _lifecycle(server, picture_id)
+    assert redone is True
+    assert restamped > deleted_at
     assert _visible(client, picture_id) is False
 
 
@@ -1715,7 +1745,7 @@ def test_restore_from_the_scrapheap_is_recorded_symmetrically(client, server):
     stamps = {pid: _lifecycle(server, pid)[1] for pid in ids}
     assert all(stamp is not None for stamp in stamps.values())
 
-    resp = client.post(f"{API}/pictures/scrapheap/restore")
+    resp = client.post(f"{API}/pictures/scrapheap/restore", json={"picture_ids": ids})
     assert resp.status_code == 200, resp.text
     assert resp.json()["restored_count"] == 2
     assert all(_lifecycle(server, pid) == (False, None) for pid in ids)
@@ -1727,12 +1757,15 @@ def test_restore_from_the_scrapheap_is_recorded_symmetrically(client, server):
     assert restore_op["batch_id"]
     assert restore_op["summary"] == "Restored 2 pictures from the Scrapheap"
 
-    # Undoing the restore is a re-scrapheap, stamp and all.
+    # Undoing the restore is a re-scrapheap, stamped at the undo rather than
+    # with the old stamp: the stamp is also a delete-forever's consent bound.
     undo = client.post(f"{API}/operations/undo")
     assert undo.status_code == 200, undo.text
     assert sorted(undo.json()["scrapheaped_picture_ids"]) == sorted(ids)
     for pid in ids:
-        assert _lifecycle(server, pid) == (True, stamps[pid])
+        rebinned, restamped = _lifecycle(server, pid)
+        assert rebinned is True
+        assert restamped > stamps[pid]
 
     # And redoing it restores them again.
     assert client.post(f"{API}/operations/redo").status_code == 200
@@ -1805,19 +1838,10 @@ def test_permanent_deletes_record_no_operation(client, server):
     client.request("DELETE", f"{API}/pictures", json={"picture_ids": ids})
     before = {op["id"] for op in _operations(server)}
 
-    # Named selection, then "Empty Scrapheap" (no ids at all).
+    # One named selection, then a second. "Empty Scrapheap" (no ids) is a
+    # purge run now; the synchronous DELETE refuses it.
     _purge_forever(client, [ids[0]])
-    preview = client.post(f"{API}/pictures/scrapheap/delete-preview", json=None)
-    assert preview.status_code == 200, preview.text
-    emptied = client.request(
-        "DELETE",
-        f"{API}/pictures/scrapheap",
-        json={
-            "include_protected": True,
-            "confirm_token": preview.json()["confirm_token"],
-        },
-    )
-    assert emptied.status_code == 200, emptied.text
+    _purge_forever(client, [ids[1]])
 
     assert {op["id"] for op in _operations(server)} == before
     assert _operations(server, op_type="pictures.scrapheap.purge") == []

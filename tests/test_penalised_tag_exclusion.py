@@ -59,10 +59,12 @@ from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.quality.tag_exclusion import (
     EXCLUDED_TAGS_GENERATION_KEY,
     EXCLUDED_TAGS_KEY,
+    RESERVED_TAG_NAME,
     SESSION_INFO_KEY,
     expand_aliases,
     filter_tag_names,
     session_tag_exclusions,
+    validate_tag_name,
 )
 from pixlstash.utils.service.label_ledger import HUMAN, NEG, POS, record_human_label
 from pixlstash.utils.service.tag_prediction_utils import (
@@ -72,12 +74,16 @@ from tests.utils import bearer_client, mint_read_token, upload_pictures_and_wait
 
 API = "/api/v1"
 
-# The sweeps whose tasks rewrite the rows these tests seed by hand.
+# The sweeps whose tasks rewrite the rows these tests seed by hand. The
+# library-root scan comes due every few minutes, and while a test has tag
+# write-back on it writes a sidecar for any picture that has none, which is
+# the very file the cleanup tests assert was or was not written.
 _CONFLICTING_FINDERS = (
     TaskType.TAGGER,
     TaskType.TAG_PREDICTION_BACKFILL,
     TaskType.SMART_SCORE,
     TaskType.TEXT_EMBEDDING,
+    TaskType.REFERENCE_FOLDER_SCAN,
 )
 
 
@@ -1548,6 +1554,23 @@ def test_a_penalised_tag_name_is_checked(client, server, owner_settings):
     assert r.status_code == 200, r.text
     assert "test-blob" in r.json()["excluded"]
     assert "test-blob" in server.vault.db.tag_exclusions
+
+
+def test_a_reserved_tag_name_is_refused_without_repeating_it(
+    client, server, owner_settings
+):
+    name = "__tag_example-leak-marker"
+    with pytest.raises(ValueError) as caught:
+        validate_tag_name(name)
+    assert str(caught.value) == RESERVED_TAG_NAME
+
+    for r in (
+        client.delete(f"{PENALISED}/{name}"),
+        client.put(f"{PENALISED}/{name}", json={"weight": 2}),
+    ):
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"] == RESERVED_TAG_NAME
+        assert "example-leak-marker" not in r.text
 
 
 def test_a_tag_with_a_slash_can_be_penalised_and_removed(

@@ -26,12 +26,16 @@ Every test that needs a defaults file writes its own small one and points
 ``tag_group_service.DEFAULT_TAGS_FILE`` at it, so no test depends on the real file.
 """
 
+import csv
 import gc
 import io
 import json
+import logging
 import os
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from xml.sax.saxutils import escape
 
 import pytest
@@ -1185,6 +1189,162 @@ def test_a_corrupt_deflate_member_is_a_400(client, server, use_defaults):
 
     assert resp.status_code == 400, resp.text
     assert "Could not read the .xlsx" in resp.json()["detail"]
+
+
+_LEAK = "example-leak-marker"
+
+
+def _corrupt_deflate_book():
+    data = bytearray(_xlsx([["english", "category"], ["zlib-girl", "Person"]]))
+    name_len = int.from_bytes(data[26:28], "little")
+    extra_len = int.from_bytes(data[28:30], "little")
+    start = 30 + name_len + extra_len
+    data[start : start + 16] = bytes(b ^ 0xFF for b in data[start : start + 16])
+    return bytes(data)
+
+
+# (upload, filename, the 400's whole detail, a library or upload text it must not
+# carry, the class the logged cause must be).
+_UNREADABLE_UPLOADS = [
+    pytest.param(
+        b"plainly not a zip",
+        "table.xlsx",
+        "Could not read the .xlsx file: not a readable .xlsx workbook",
+        "not a zip file",
+        zipfile.BadZipFile,
+        id="not-a-zip",
+    ),
+    pytest.param(
+        _corrupt_deflate_book(),
+        "zlib.xlsx",
+        "Could not read the .xlsx file: xl/worksheets/sheet1.xml could not be read",
+        "Error -3",
+        zlib.error,
+        id="corrupt-deflate",
+    ),
+    pytest.param(
+        _book(
+            (
+                _SHEET_OPEN + f'<row r="1"><c r="{_LEAK}"></c></row>' + _SHEET_CLOSE
+            ).encode()
+        ),
+        "ref.xlsx",
+        "Could not read the .xlsx file: a cell reference has no column letters",
+        _LEAK,
+        None,
+        id="cell-reference",
+    ),
+    pytest.param(
+        _book(
+            (
+                _SHEET_OPEN
+                + f'<row r="1"><c r="A1" t="s"><v>{_LEAK}</v></c></row>'
+                + _SHEET_CLOSE
+            ).encode(),
+            f'<sst xmlns="{_NS_MAIN}"><si><t>english</t></si></sst>'.encode(),
+        ),
+        "sst.xlsx",
+        "Could not read the .xlsx file: a cell names a shared string by something "
+        "that is not a whole number",
+        _LEAK,
+        None,
+        id="shared-string-index",
+    ),
+    pytest.param(
+        _book((_SHEET_OPEN + "<row><c>" + _LEAK).encode()),
+        "torn.xlsx",
+        "Could not read the .xlsx file: xl/worksheets/sheet1.xml is not "
+        "well-formed XML",
+        "line 1",
+        ET.ParseError,
+        id="torn-xml",
+    ),
+    pytest.param(
+        _book(
+            (
+                f'<?xml version="1.0" encoding="{_LEAK}"?>' + _SHEET_OPEN + _SHEET_CLOSE
+            ).encode()
+        ),
+        "enc.xlsx",
+        "Could not read the .xlsx file: xl/worksheets/sheet1.xml declares an "
+        "encoding other than UTF-8, and is refused",
+        _LEAK,
+        None,
+        id="declared-encoding",
+    ),
+    pytest.param(
+        _book(
+            (
+                _SHEET_OPEN + '<row r="1"><c r="EXAMPLELEAK1"></c></row>' + _SHEET_CLOSE
+            ).encode()
+        ),
+        "far.xlsx",
+        "Could not read the .xlsx file: a cell is past the reader's column limit",
+        "EXAMPLELEAK",
+        None,
+        id="column-limit",
+    ),
+    pytest.param(
+        b"english,category\n" + b"x" * (csv.field_size_limit() + 1) + b",y\n",
+        "wide.csv",
+        tag_group_service.CSV_UNREADABLE,
+        "field limit",
+        csv.Error,
+        id="csv-field-limit",
+    ),
+]
+
+
+@pytest.mark.parametrize("data, filename, detail, leak, cause", _UNREADABLE_UPLOADS)
+def test_an_unreadable_upload_is_refused_in_the_servers_words(
+    data, filename, detail, leak, cause
+):
+    with pytest.raises(tag_group_service.TagGroupError) as caught:
+        tag_group_service.parse_tag_file(filename, data)
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail == detail
+    assert leak not in caught.value.detail
+    if cause is not None:
+        # The library's own error survives for the log, chained under ours.
+        chain = [caught.value.__context__, caught.value.__context__.__cause__]
+        assert any(isinstance(link, cause) for link in chain), chain
+
+
+@pytest.mark.parametrize("data, filename, detail, leak, cause", _UNREADABLE_UPLOADS)
+def test_an_unreadable_upload_answers_server_text_and_logs_the_cause(
+    client, server, use_defaults, caplog, data, filename, detail, leak, cause
+):
+    use_defaults({"People": ["leak-girl"]})
+
+    with caplog.at_level(logging.WARNING, logger=tag_group_service.logger.name):
+        resp = _import(client, data, filename, dry_run=True)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == detail
+    assert leak not in resp.text
+    [logged] = [
+        r
+        for r in caplog.records
+        if r.name == tag_group_service.logger.name and r.exc_info
+    ]
+    if cause is not None:
+        logged_chain = [logged.exc_info[1], logged.exc_info[1].__cause__]
+        assert any(isinstance(link, cause) for link in logged_chain), logged_chain
+
+
+def test_a_pending_retag_marker_is_refused_without_repeating_it(client, server):
+    meta = _create(client, "Meta")
+    marker = f"{TAG_PENDING_SENTINEL}{_LEAK}"
+
+    with pytest.raises(tag_group_service.TagGroupError) as caught:
+        tag_group_service._clean_tags([marker])
+    assert caught.value.detail == tag_group_service.PENDING_MARKER_NOT_FILEABLE
+
+    resp = _assign(client, [marker], meta)
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"] == tag_group_service.PENDING_MARKER_NOT_FILEABLE
+    assert _LEAK not in resp.text
 
 
 def test_the_row_cap_refuses_a_longer_sheet_with_a_400(monkeypatch):

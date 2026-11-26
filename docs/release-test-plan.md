@@ -293,7 +293,7 @@ needs a real server run with workers ON.
 Requires a live ComfyUI server.
 
 - [ ] Settings → **ComfyUI**, no address saved, ComfyUI running locally: "Found ComfyUI on this computer" offers its address → **Connect** → Connected, with the node-pack line
-- [ ] Same, ComfyUI stopped: the address form appears; a wrong port shows "Nothing answered at …" and saves nothing (reopen Settings: still not connected)
+- [ ] Same, ComfyUI stopped: the address form appears; a wrong port shows "Nothing answered at that address. Check that ComfyUI is running and that the port matches the one in its console." and saves nothing (reopen Settings: still not connected)
 - [ ] Toolbar ComfyUI menu: run a text-to-image workflow with a prompt — progress shows; the output picture appears in the grid
 - [ ] Run an image-to-image workflow from a source picture — output appears and is linked to the source
 - [ ] **Abort** during a run — execution stops and the progress indicator disappears

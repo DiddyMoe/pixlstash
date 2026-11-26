@@ -11,6 +11,8 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
 
+from pixlstash.utils.sqlite_ints import SqliteInt
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.database import DBPriority
 from pixlstash.db_models.tag import (
     TAG_PENDING_SENTINEL,
@@ -21,6 +23,7 @@ from pixlstash.db_models.tag import (
 from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.reference_folder import ReferenceFolder, ReferenceFolderStatus
 from pixlstash.pixl_logging import get_logger
+from pixlstash.routes.library_layout import NOT_A_LAYOUT_FACET, UNFILED_NOT_SAFE
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.utils.caption_file_utils import (
     SIDECAR_TYPE_DESCRIPTION,
@@ -60,6 +63,14 @@ from pixlstash.utils.quality.tag_exclusion import (
 from sqlmodel import Session, delete, select
 
 logger = get_logger(__name__)
+
+# What a relocation report says of a file that could not be read for its hash.
+# The OS's text, which can name paths, goes to the log with its traceback.
+RELOCATED_FILE_UNREADABLE = "The file could not be read. The server log says why."
+
+# The 409 for a sidecar import whose commit broke a constraint: the driver's
+# text names tables, columns and bound values, so it goes to the log.
+METADATA_IMPORT_FAILED = "Could not import the metadata. The server log says why."
 
 
 def _validate_suffix_pair(
@@ -200,7 +211,7 @@ class ReferenceFolderResponse(BaseModel):
 
 
 class MoveReferencePicturesRequest(BaseModel):
-    picture_ids: list[int]
+    picture_ids: list[SqliteInt]
     destination_subpath: Optional[str] = None
 
 
@@ -780,7 +791,7 @@ def create_router(server) -> APIRouter:
     )
     @holding_folder_overlap_lock
     def update_reference_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ReferenceFolderUpdateRequest = Body(...),
     ):
@@ -859,12 +870,20 @@ def create_router(server) -> APIRouter:
                                         )
                                     elif not pic.pixel_sha:
                                         pic.pixel_sha = new_sha
-                                except Exception as exc:
+                                except OSError:
+                                    logger.warning(
+                                        "Reference folder %s relocation: picture "
+                                        "%s could not be hashed at %s.",
+                                        folder_id,
+                                        pic.id,
+                                        new_path,
+                                        exc_info=True,
+                                    )
                                     unmatched.append(
                                         {
                                             "picture_id": pic.id,
                                             "path": new_path,
-                                            "error": str(exc),
+                                            "error": RELOCATED_FILE_UNREADABLE,
                                         }
                                     )
                             else:
@@ -978,19 +997,27 @@ def create_router(server) -> APIRouter:
                             "library's own root."
                         ),
                     )
+                # The refusals name the server's own vocabulary, never the
+                # text that was sent (or, for a stored layout, was saved).
                 if unfiled is not None and unfiled != folder_name(unfiled):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "layout_unfiled must be a single safe path "
-                            f"component, got {unfiled!r} (try "
-                            f"{folder_name(unfiled)!r})"
-                        ),
+                    logger.info(
+                        "Reference folder %s layout refused (400): unfiled %r "
+                        "is not safe.",
+                        folder_id,
+                        unfiled,
                     )
+                    raise HTTPException(status_code=400, detail=UNFILED_NOT_SAFE)
                 try:
                     parse_layout(layout, unfiled or DEFAULT_LAYOUT.unfiled)
                 except ValueError as exc:
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                    logger.info(
+                        "Reference folder %s layout refused (400): %s",
+                        folder_id,
+                        exc,
+                    )
+                    raise HTTPException(
+                        status_code=400, detail=NOT_A_LAYOUT_FACET
+                    ) from exc
                 rf.layout = layout
                 rf.layout_unfiled = unfiled
 
@@ -1038,7 +1065,7 @@ def create_router(server) -> APIRouter:
     )
     @holding_folder_overlap_lock
     def relocate_reference_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: RelocateReferenceFolderRequest = Body(...),
     ):
@@ -1100,11 +1127,17 @@ def create_router(server) -> APIRouter:
         else:
             try:
                 os.makedirs(new_root, exist_ok=False)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Could not create destination folder: {exc}",
+            except OSError as exc:
+                logger.error(
+                    "Relocating reference folder %s: could not create %s: %s",
+                    folder_id,
+                    new_root,
+                    exc,
+                    exc_info=True,
                 )
+                raise HTTPException(
+                    status_code=500, detail="Could not create the destination folder."
+                ) from exc
 
         rollback_moves: list[tuple[str, str]] = []
         moved_entry_count = 0
@@ -1153,8 +1186,23 @@ def create_router(server) -> APIRouter:
             _rollback_relocation(rollback_moves, destination_existed, new_root)
             raise
         except Exception as exc:
+            logger.error(
+                "Relocating reference folder %s from %s to %s failed; moving the "
+                "files back: %s",
+                folder_id,
+                old_root,
+                new_root,
+                exc,
+                exc_info=True,
+            )
             _rollback_relocation(rollback_moves, destination_existed, new_root)
-            raise HTTPException(status_code=500, detail=f"Relocation failed: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Relocation failed; the files were moved back. The server log "
+                    "says why."
+                ),
+            ) from exc
 
         try:
             os.rmdir(old_root)
@@ -1202,7 +1250,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
     )
     def move_reference_folder_pictures(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: MoveReferencePicturesRequest = Body(...),
     ):
@@ -1233,8 +1281,15 @@ def create_router(server) -> APIRouter:
 
         def fetch_picture_records(session: Session):
             ids = [int(pid) for pid in payload.picture_ids]
-            pictures = session.exec(select(Picture).where(Picture.id.in_(ids))).all()
-            by_id = {pic.id: pic for pic in pictures}
+            # The body has no cap, so the pictures are read in chunks under
+            # SQLite's bound-parameter limit; ``by_id`` joins them back up.
+            by_id = {
+                pic.id: pic
+                for id_chunk in chunked(sorted(set(ids)))
+                for pic in session.exec(
+                    select(Picture).where(Picture.id.in_(id_chunk))
+                ).all()
+            }
             folders = {
                 rf.id: rf
                 for rf in session.exec(select(ReferenceFolder)).all()
@@ -1421,6 +1476,14 @@ def create_router(server) -> APIRouter:
                         )
             raise
         except Exception as exc:
+            logger.error(
+                "Moving pictures into reference folder %s failed after %d moves; "
+                "moving them back: %s",
+                folder_id,
+                len(rollback_moves),
+                exc,
+                exc_info=True,
+            )
             for destination, source in reversed(rollback_moves):
                 if os.path.exists(destination):
                     try:
@@ -1431,7 +1494,12 @@ def create_router(server) -> APIRouter:
                             destination,
                             rollback_exc,
                         )
-            raise HTTPException(status_code=500, detail=f"Move failed: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Move failed; the files were moved back. The server log says why."
+                ),
+            ) from exc
 
         from pixlstash.event_types import EventType
 
@@ -1460,7 +1528,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
     )
     def export_reference_folder_metadata(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ReferenceFolderMetadataRequest = Body(...),
     ):
@@ -1476,11 +1544,15 @@ def create_router(server) -> APIRouter:
             pictures = _pictures_for_metadata_scope(
                 session, folder_id, rf.folder, scope
             )
-            tag_rows = session.exec(
-                select(Tag.picture_id, Tag.tag).where(
-                    Tag.picture_id.in_([p.id for p in pictures if p.id is not None])
-                )
-            ).all()
+            # A folder's pictures scale with the library, so their tags are read
+            # in chunks under SQLite's bound-parameter limit.
+            tag_rows = [
+                row
+                for id_chunk in chunked([p.id for p in pictures if p.id is not None])
+                for row in session.exec(
+                    select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(id_chunk))
+                ).all()
+            ]
             # A tag the owner removed from tagging is not exported, though a
             # picture may still carry it (a locked picture keeps it).
             exclusions = session_tag_exclusions(session)
@@ -1564,7 +1636,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
     )
     def import_reference_folder_metadata(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ReferenceFolderMetadataRequest = Body(...),
     ):
@@ -1664,10 +1736,17 @@ def create_router(server) -> APIRouter:
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Could not import metadata: {exc}",
+                logger.warning(
+                    "Reference folder %s metadata import broke a constraint on "
+                    "commit (409); %d picture(s) in scope %s.",
+                    folder_id,
+                    len(pictures),
+                    scope,
+                    exc_info=True,
                 )
+                raise HTTPException(
+                    status_code=409, detail=METADATA_IMPORT_FAILED
+                ) from exc
             server.vault.db.tag_resets.mark_reset(retagged)
             return scope, tags_count, descriptions_count, skipped_count
 
@@ -1707,7 +1786,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
         response_model=ReferenceFolderDeleteResponse,
     )
-    def delete_reference_folder(folder_id: int, request: Request):
+    def delete_reference_folder(folder_id: SqliteInt, request: Request):
 
         def remove(session: Session):
             rf = session.get(ReferenceFolder, folder_id)
@@ -1793,7 +1872,7 @@ def create_router(server) -> APIRouter:
         response_model=ReferenceFolderOpenResponse,
     )
     def open_reference_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         subpath: Optional[str] = None,
     ):

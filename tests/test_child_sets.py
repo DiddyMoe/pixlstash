@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from pixlstash.server import Server
 from pixlstash.services import comfyui_service
+from pixlstash.utils.bounded_http import BoundedResponse
 from pixlstash.utils.service.filter_helpers import narrow_project_fields
 
 
@@ -78,12 +79,12 @@ def test_a_set_is_created_under_a_set_or_a_person(client):
         ).status_code
         == 404
     )
-    assert (
-        client.post(
-            "/picture_sets", json={"name": "text", "parent_set_id": "1"}
-        ).status_code
-        == 400
+    # A parent id that is not a number is refused without repeating it.
+    r = client.post(
+        "/picture_sets", json={"name": "text", "parent_set_id": "test-caller-id"}
     )
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "A parent id must be a number."
 
 
 def test_a_set_moves_and_cannot_become_its_own_ancestor(client):
@@ -264,18 +265,15 @@ def test_deleting_a_set_being_built_stops_its_sheet_runs_and_no_others(client):
 def test_cancel_runs_takes_only_its_prompts_off_comfyui(monkeypatch):
     calls = []
 
-    class Answer:
-        status_code = 200
-        text = ""
-
-    def post(url, json=None, timeout=None, allow_redirects=True, proxies=None):
+    def post(method, url, json=None, proxies=None, **kwargs):
         # Straight to ComfyUI: no environment proxy, no redirect followed.
-        assert allow_redirects is False
+        assert method == "POST"
+        assert kwargs.get("redirects", 0) == 0
         assert proxies == comfyui_service.NO_PROXY
         calls.append((url, json))
-        return Answer()
+        return BoundedResponse(url, 200, b"")
 
-    monkeypatch.setattr(comfyui_service.requests, "post", post)
+    monkeypatch.setattr(comfyui_service, "bounded_request", post)
     base = "http://comfy.invalid"
     live = {
         "p-running": {"status": "running"},
@@ -307,19 +305,14 @@ def test_cancel_runs_takes_only_its_prompts_off_comfyui(monkeypatch):
 
 
 def test_cancel_runs_does_not_count_a_run_comfyui_refused(monkeypatch):
-    class Answer:
-        def __init__(self, code):
-            self.status_code = code
-            self.text = "nope"
-
     codes = {"p-ok": 200, "p-refused": 500}
 
-    def post(url, json=None, timeout=None, allow_redirects=True, proxies=None):
-        assert allow_redirects is False
+    def post(method, url, json=None, proxies=None, **kwargs):
+        assert kwargs.get("redirects", 0) == 0
         assert proxies == comfyui_service.NO_PROXY
-        return Answer(codes[json["delete"][0]])
+        return BoundedResponse(url, codes[json["delete"][0]], b"nope")
 
-    monkeypatch.setattr(comfyui_service.requests, "post", post)
+    monkeypatch.setattr(comfyui_service, "bounded_request", post)
     with comfyui_service._run_outcomes_lock:
         for pid in codes:
             comfyui_service._live_runs[pid] = {

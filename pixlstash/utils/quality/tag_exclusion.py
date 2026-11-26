@@ -34,6 +34,10 @@ EXCLUDED_TAGS_KEY = "excluded_tags"
 EXCLUDED_TAGS_GENERATION_KEY = "excluded_tags_generation"
 SESSION_INFO_KEY = "tag_exclusions"
 MAX_TAG_NAME_LENGTH = 128
+# Fixed: the name is the caller's, so the refusal does not repeat it.
+RESERVED_TAG_NAME = (
+    "Names starting with __tag are reserved for PixlStash and cannot be used as a tag."
+)
 
 
 class TagExcludedError(HTTPException):
@@ -78,6 +82,8 @@ def validate_tag_name(name: Any) -> str:
 
     Raises:
         ValueError: The name is empty, too long, or a reserved internal marker.
+            The message is fixed text that never repeats *name*, so a route may
+            answer it.
     """
     clean = normalise_tag(name)
     if not clean:
@@ -87,7 +93,7 @@ def validate_tag_name(name: Any) -> str:
             f"A tag name can be at most {MAX_TAG_NAME_LENGTH} characters long."
         )
     if is_tag_sentinel(clean):
-        raise ValueError(f"'{clean}' is reserved and cannot be used as a tag.")
+        raise ValueError(RESERVED_TAG_NAME)
     return clean
 
 
