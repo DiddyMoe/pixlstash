@@ -145,6 +145,7 @@ except ImportError:  # pragma: no cover - Windows
     pwd = None  # type: ignore[assignment]
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.links import is_link_or_missing
 
 logger = get_logger(__name__)
 
@@ -295,29 +296,10 @@ def _is_redirect(path: str) -> bool:
     That is the redirection primitive an unprivileged local account actually
     has, so it is the one that matters most here.
 
-    ``os.path.isjunction`` would say this in one call but is 3.12+, and the
-    floor is 3.11 (``pyproject.toml``), so read the reparse tag. The constants
-    and ``st_reparse_tag`` are Windows-only, hence ``getattr``: the tests
-    simulate ``nt`` while running on Linux, where neither exists.
+    A component that does not exist yet cannot redirect anywhere and answers
+    False; ``create=True`` opens depend on that.
     """
-    if os.path.islink(path):
-        return True
-    if os.name != "nt":
-        return False
-    tags = {
-        tag
-        for tag in (
-            getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None),
-            getattr(stat, "IO_REPARSE_TAG_SYMLINK", None),
-        )
-        if tag is not None
-    }
-    try:
-        return getattr(os.lstat(path), "st_reparse_tag", None) in tags
-    except OSError:
-        # A component that does not exist yet cannot redirect anywhere;
-        # `create=True` opens depend on this.
-        return False
+    return is_link_or_missing(path)
 
 
 def _reject_symlinked_path(path: str) -> None:

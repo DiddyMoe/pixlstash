@@ -84,6 +84,7 @@ from pixlstash.services import model_downloads
 from pixlstash.services import model_shelf_service, model_workflow_sets
 from pixlstash.services.model_folder_scanner import ModelFolderScanner
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.links import JUNCTION_REPARSE_TAG
 from pixlstash.services.model_mover import SHELF_IO_LOCK
 from pixlstash.services import workflow_set_verdicts as verdicts
 from pixlstash.services import workflow_templates
@@ -6277,6 +6278,31 @@ def test_clearing_refuses_what_is_not_a_run(shelf_env, import_folders, run_trash
     assert (outside / "elsewhere.safetensors").exists()
     assert list(run_trash.iterdir()) == []
     # Over-blocking is its own regression: a real run beside them still goes.
+    assert _trash_run(shelf_env, import_folders, "Clementine").status_code == 200
+
+
+def test_clearing_refuses_a_junction_that_reads_as_a_run(
+    shelf_env, import_folders, run_trash, monkeypatch
+):
+    """A junction inside the root passes containment as the ``alias`` symlink
+    above does, and is refused the same way. The plain run is the control."""
+    alias = import_folders.output_root / "alias"
+    alias.mkdir()
+    _write_run_adapter(alias / "alias.safetensors", b"x")
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        if not isinstance(path, int) and os.fspath(path) == str(alias):
+            return SimpleNamespace(
+                st_mode=info.st_mode, st_reparse_tag=JUNCTION_REPARSE_TAG
+            )
+        return info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+    assert _trash_run(shelf_env, import_folders, "alias").status_code == 409
+    assert (alias / "alias.safetensors").exists()
     assert _trash_run(shelf_env, import_folders, "Clementine").status_code == 200
 
 
@@ -12614,7 +12640,7 @@ def test_a_junction_is_listed_as_a_link_and_never_walked(tmp_path, monkeypatch):
                 st_mode=stat.S_IFDIR,
                 st_size=0,
                 st_mtime_ns=0,
-                st_reparse_tag=model_files_routes._JUNCTION_TAG,
+                st_reparse_tag=JUNCTION_REPARSE_TAG,
             )
         return real_lstat(path, *args, **kwargs)
 

@@ -64,6 +64,7 @@ from pixlstash.utils.aitoolkit_run import (
     read_run,
 )
 from pixlstash.utils.known_base_models import training_base_tile
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.system_utils import TRASH_NAME
 
@@ -490,7 +491,7 @@ def create_router(server) -> APIRouter:
                 status_code=400,
                 detail=f"{run_name!r} is not a run inside that folder.",
             ) from exc
-        if os.path.islink(joined):
+        if is_link_or_missing(joined):
             # The trash would take the link and the listing reads its target:
             # what the card showed is not what would go.
             raise HTTPException(

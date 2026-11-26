@@ -2415,6 +2415,7 @@ This rule is enforced by **`tests/test_architecture_guardrails.py::test_services
 | [utils/path_mapper.py](../pixlstash/utils/path_mapper.py) | Host↔container path translation |
 | [utils/host_path_utils.py](../pixlstash/utils/host_path_utils.py) | Host-aware path resolution |
 | [utils/reference_folder_watcher.py](../pixlstash/utils/reference_folder_watcher.py) | watchdog-based folder monitoring |
+| [utils/links.py](../pixlstash/utils/links.py) | Whether a path is a link: a symlink or a Windows directory junction, read from the `lstat` reparse tag (`os.path.isjunction` is 3.12+). Every walk, move and delete that must not leave its folder asks this, since `os.walk` descends a junction unasked |
 | [utils/reference_folder_validator.py](../pixlstash/utils/reference_folder_validator.py) | Reference folder validation |
 | [utils/rate_limiter.py](../pixlstash/utils/rate_limiter.py) | IP-based rate-limit middleware |
 | [utils/request_origin.py](../pixlstash/utils/request_origin.py) | `OriginClientMiddleware` — captures the per-tab `X-Client-Id` for the real-time event envelope (see §15) |
@@ -6406,7 +6407,8 @@ and updates `file_path` on the existing row instead.
   path inside their insert transaction, the one place their check-then-insert
   cannot interleave, so whichever lands first owns the row.
   Removals are only ever believed for a subtree the walk actually read: a
-  directory it could not list, a directory symlink it would not follow, a pruned
+  directory it could not list, a directory symlink or Windows junction it would
+  not follow (`utils.links`, §11), a pruned
   folder and another reference folder's root all go into `unscanned_roots`, and
   rows beneath any of them are kept. A pass that finds no files at all while rows
   exist deletes nothing — an unmounted drive is an empty directory, and
@@ -13381,7 +13383,8 @@ arrow before it is asked.
   404. A directory that cannot be listed is logged with the folder id, the path
   and the error, and answers 409.
 - **What the tree offers.** Dot-names, symlinks and Windows junctions
-  (`DirEntry.is_junction`, Python 3.12+) are skipped, and non-directories too.
+  (`utils.links.is_link_entry`, §11) are skipped, and non-directories too; an
+  entry removed since the listing is left out with a warning.
   A bind mount is a plain directory to every API here and is offered, as the
   scanner walks it: it is the owner's own mount inside their own folder. Names sort case-insensitively. A `<stem>_samples` directory is
   hidden when a `present` model file directly in the same directory has the stem
@@ -13636,7 +13639,7 @@ list (previews, notes, sidecars) go too.
   process outside it that swaps a directory on the way for a link, between the
   re-walk and the removal, redirects the trash or `rmtree`; that needs write
   access to the model folder already. Junctions are recognised by their reparse
-  tag (`_is_link`), not `os.path.isjunction`, which Python 3.11 lacks; other
+  tag (`utils.links`, §11), not `os.path.isjunction`, which Python 3.11 lacks; other
   reparse points (cloud placeholders) are walked as directories, because the
   removal takes their contents.
 

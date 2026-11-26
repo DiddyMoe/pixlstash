@@ -116,6 +116,42 @@ def test_only_weights_are_reported_as_unclaimed(tmp_path):
     assert [item["relpath"] for item in unclaimed_files(str(tmp_path))] == ["best.pt"]
 
 
+class _JunctionStat:
+    """An ``lstat`` result carrying the Windows junction reparse tag."""
+
+    st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+    def __init__(self, info):
+        self._info = info
+
+    def __getattr__(self, name):
+        return getattr(self._info, name)
+
+
+def test_a_file_behind_a_junction_is_not_unclaimed(tmp_path, monkeypatch):
+    """The list is offered for cleanup and the delete refuses a file whose
+    directory resolves outside the folder. ``junction`` is a real directory
+    whose ``lstat`` carries the junction tag, and ``os.walk`` descends it as it
+    descends a real junction; ``plain`` is the control."""
+    (tmp_path / "best.pt").write_bytes(b"y" * 20)
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "plain" / "mine.pt").write_bytes(b"y" * 20)
+    junction = tmp_path / "junction"
+    junction.mkdir()
+    (junction / "theirs.pt").write_bytes(b"z" * 20)
+    real_lstat = os.lstat
+
+    def lstat(candidate, *args, **kwargs):
+        info = real_lstat(candidate, *args, **kwargs)
+        return _JunctionStat(info) if os.fspath(candidate) == str(junction) else info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+    found = sorted(item["relpath"] for item in unclaimed_files(str(tmp_path)))
+
+    assert found == ["best.pt", "plain/mine.pt"]
+
+
 def test_a_folder_that_has_never_been_downloaded_into_reports_nothing(tmp_path):
     """The normal state before the first run, and not an error."""
     assert unclaimed_files(str(tmp_path / "never-created")) == []

@@ -12,6 +12,7 @@ from pixlstash.hub.registry import LIBRARY_MADE_ENTRIES
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.image_utils import THUMBNAIL_EXTENSION
 from pixlstash.utils.image_processing.video_utils import VIDEO_EXTENSIONS
+from pixlstash.utils.links import is_link_or_missing
 
 logger = get_logger(__name__)
 
@@ -134,12 +135,17 @@ def is_supported_media_file(name_or_path: str) -> bool:
 
 
 def _walkable(dirpath: str, root: str, dirnames: list[str]) -> list[str]:
-    """The subfolders a count descends into: not hidden, not the root's own."""
+    """The subfolders a count descends into: not hidden, not the root's own.
+
+    Nor a link: ``os.walk`` descends a Windows junction even unasked.
+    """
     at_root = dirpath == root
     return [
         name
         for name in dirnames
-        if not is_hidden_entry(name) and not (at_root and name in LIBRARY_OWN_FOLDERS)
+        if not is_hidden_entry(name)
+        and not (at_root and name in LIBRARY_OWN_FOLDERS)
+        and not is_link_or_missing(os.path.join(dirpath, name))
     ]
 
 

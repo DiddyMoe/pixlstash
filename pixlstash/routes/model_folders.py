@@ -125,6 +125,7 @@ from pixlstash.tasks.model_folder_scan_task import (
 from pixlstash.utils.adapter_header import FILE_ENGINE
 from pixlstash.utils.host_open import open_in_file_manager
 from pixlstash.utils.library_layout import refusal_for_folder_name
+from pixlstash.utils.links import is_link_entry
 from pixlstash.utils.host_path_utils import is_absolute_host_path, normalize_host_path
 from pixlstash.utils.path_utils import path_is_within, resolve_path_within
 from pixlstash.utils.reference_folder_validator import (
@@ -777,8 +778,7 @@ def _is_samples_dir_of(name: str, sample_stems: set[str]) -> bool:
 def _offered_dir(entry: os.DirEntry, sample_stems: set[str]) -> bool:
     """Whether the tree shows *entry* as a subdirectory.
 
-    Dot-names, symlinks and Windows junctions (``DirEntry.is_junction``, 3.12+;
-    a junction is not a symlink to ``is_symlink``) are never offered. A bind
+    Dot-names, symlinks and Windows junctions are never offered. A bind
     mount is a directory to every API here and is offered, as the scanner walks
     it. A ``<stem>_samples`` directory is
     hidden beside a model whose filename stem is ``<stem>``: its previews belong
@@ -786,7 +786,13 @@ def _offered_dir(entry: os.DirEntry, sample_stems: set[str]) -> bool:
     """
     if entry.name.startswith("."):
         return False
-    if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
+    try:
+        if is_link_entry(entry):
+            return False
+    except OSError as exc:
+        # The junction check reads the entry's own lstat, which fails for an
+        # entry removed since the listing: one entry, not the whole listing.
+        logger.warning("Left %s out of the folder tree: %s", entry.path, exc)
         return False
     if not entry.is_dir(follow_symlinks=False):
         return False

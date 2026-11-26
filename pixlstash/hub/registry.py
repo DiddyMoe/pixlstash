@@ -31,6 +31,7 @@ from typing import Optional
 from pixlstash.hub.db import HubDatabase
 from pixlstash.startup_permissions import mkdir_private
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.sqlite_uri import sqlite_file_uri
 
 logger = get_logger(__name__)
@@ -105,7 +106,7 @@ def remove_library_made_entries(library: Library) -> None:
         if name in library.pending_import_kept:
             continue
         path = os.path.join(library.path, name)
-        if not os.path.isdir(path) or os.path.islink(path):
+        if not os.path.isdir(path) or is_link_or_missing(path):
             continue
         try:
             shutil.rmtree(path)

@@ -53,6 +53,7 @@ from pixlstash.services.model_folder_scanner import (
     STATE_UNREACHABLE,
 )
 from pixlstash.utils.adapter_header import FILE_ENGINE, FILE_UNKNOWN
+from pixlstash.utils.links import is_link_or_missing
 
 logger = get_logger(__name__)
 
@@ -501,6 +502,10 @@ def unclaimed_files(folder_path: str) -> list[dict]:
 
     Detection proposes and never applies: nothing here deletes.
 
+    **Not behind a link.** A directory link inside the folder (a symlink, or a
+    Windows junction, which ``os.walk`` descends even unasked) is not entered:
+    the delete refuses a file that resolves outside the folder.
+
     Args:
         folder_path: The built-in folder to inspect.
 
@@ -513,7 +518,12 @@ def unclaimed_files(folder_path: str) -> list[dict]:
     declared = declared_paths()
     found: list[dict] = []
     for directory, dirs, files in os.walk(folder_path):
-        dirs[:] = [d for d in dirs if d not in TOOLING_DIRS]
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in TOOLING_DIRS
+            and not is_link_or_missing(os.path.join(directory, d))
+        ]
         for name in files:
             if not name.lower().endswith(MODEL_SUFFIXES):
                 continue
