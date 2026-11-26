@@ -1,4 +1,11 @@
-import { ref, computed, watch } from "vue";
+import {
+  ref,
+  computed,
+  watch,
+  nextTick,
+  getCurrentScope,
+  onScopeDispose,
+} from "vue";
 import {
   packJustifiedRows,
   rowAtOffset,
@@ -14,6 +21,9 @@ const MIN_THUMBNAIL_SIZE = 96;
 const MAX_THUMBNAIL_SIZE = 288;
 const THUMBNAIL_INFO_ROW_HEIGHT = 24;
 const VIEW_WINDOW = 100;
+// Square mode always renders the top spacer, at least this tall, so the first
+// rendered row sits one spacer plus one row-gap below the top of the grid.
+const SQUARE_TOP_SPACER_MIN = 1;
 
 /**
  * Manages viewport geometry, row height, and scroll position for the virtual
@@ -117,6 +127,13 @@ export function useVirtualScroll(
   }
 
   // ── Row height ────────────────────────────────────────────────────────────
+  // Square mode: rowHeight is the row PITCH, the distance from one row's top
+  // to the next row's top (row track + CSS row-gap), measured from the
+  // rendered grid by measureSquareRowPitch. The spacers, the visible range and
+  // the cursor scroll all place row r at squareRowTop(r), so the rendered block
+  // sits exactly where the spacers say it does and a render-window move never
+  // shifts it. Until the first measurement (and in justified mode, where rows
+  // come from the packed layout instead) it holds a whole-pixel estimate.
   const rowHeight = ref(
     Math.round(
       Math.min(
@@ -128,6 +145,101 @@ export function useVirtualScroll(
       ) + (gridStore.compactMode ? 0 : THUMBNAIL_INFO_ROW_HEIGHT),
     ),
   );
+  // Measured CSS row-gap of the square grid, in px (0 until measured).
+  const squareRowGap = ref(0);
+  // True once rowHeight holds a measured square pitch rather than an estimate.
+  let squarePitchMeasured = false;
+
+  function squareRowTop(row) {
+    return SQUARE_TOP_SPACER_MIN + squareRowGap.value + row * rowHeight.value;
+  }
+
+  // Reads the square-mode row pitch from the rendered grid. Cards have no
+  // margin and stretch to their row track, and every row has the same track
+  // height, so one card's height plus the grid's row-gap is the exact pitch,
+  // including the engine's sub-pixel rounding of the fr columns (the
+  // TanStack Virtual approach: the rendered element is the source of truth,
+  // the estimate only seeds it). One card is enough, so a grid with less than
+  // a full row rendered measures the same way. Returns null when there is
+  // nothing laid out to measure (no card, a grid that is not displayed, or a
+  // container that is not a CSS grid).
+  function measureSquareRowPitch() {
+    const grid = gridContainer.value;
+    if (!grid) return null;
+    const card = grid.querySelector(":scope > .image-card");
+    if (!card) return null;
+    const trackHeight = card.getBoundingClientRect().height;
+    if (!(trackHeight > 0)) return null;
+    const gridStyle = getComputedStyle(grid);
+    // The pitch formula is a CSS Grid property. Right after a switch out of
+    // justified mode the DOM can still be the flex layout; the post-flush
+    // watcher measures again once it is a grid.
+    if (gridStyle.display !== "grid") return null;
+    const rowGapText = gridStyle.rowGap;
+    const rowGap = parseFloat(rowGapText);
+    if (!Number.isFinite(rowGap)) {
+      console.error(
+        "useVirtualScroll: the square grid's row-gap is not a length; keeping the previous row pitch",
+        { rowGap: rowGapText, trackHeight, rowHeight: rowHeight.value },
+      );
+      return null;
+    }
+    return { pitch: trackHeight + rowGap, gap: rowGap };
+  }
+
+  // The viewport's position in square-row terms: the first item of the row at
+  // the top edge, and how far into that row the edge sits (fraction of pitch).
+  // Taken under the geometry that is about to change, restored under the new
+  // one, so a resize, column change or compact toggle keeps the same pictures
+  // at the top. The browser's scroll anchoring is off for the grid (see
+  // ImageGrid.css), so nothing else does this.
+  function captureSquareAnchor(cols) {
+    const el = scrollWrapper.value;
+    if (!el || !(el.scrollTop > 0)) return null;
+    const into = Math.max(0, el.scrollTop - squareRowTop(0));
+    const row = Math.floor(into / rowHeight.value);
+    return {
+      idx: row * cols,
+      frac: (into - row * rowHeight.value) / rowHeight.value,
+    };
+  }
+
+  function restoreSquareAnchor(anchor) {
+    const el = scrollWrapper.value;
+    if (!el || !anchor) return;
+    const cols = Math.max(1, gridStore.columns || 1);
+    const row = Math.floor(anchor.idx / cols);
+    el.scrollTop = squareRowTop(row) + anchor.frac * rowHeight.value;
+  }
+
+  // Measures the square pitch and, when it (or the column count, given as
+  // prevCols) changed, applies it. The scroll position is restored after the
+  // DOM has the new spacers, so the browser cannot clamp it against the old
+  // scroll height; the visible range is then recomputed. Returns whether a
+  // measurement was available.
+  function syncSquarePitch(prevCols) {
+    const measured = measureSquareRowPitch();
+    if (!measured) return false;
+    const cols = Math.max(1, gridStore.columns || 1);
+    const pitchChanged =
+      !squarePitchMeasured ||
+      measured.pitch !== rowHeight.value ||
+      measured.gap !== squareRowGap.value;
+    if (!pitchChanged && prevCols === cols) return true;
+    const anchor = captureSquareAnchor(Math.max(1, prevCols || cols));
+    rowHeight.value = measured.pitch;
+    squareRowGap.value = measured.gap;
+    squarePitchMeasured = true;
+    if (!anchor) {
+      recalculateVisibleRange();
+      return true;
+    }
+    nextTick(() => {
+      restoreSquareAnchor(anchor);
+      recalculateVisibleRange();
+    });
+    return true;
+  }
 
   function getGridColumnWidth() {
     const cols = Math.max(1, gridStore.columns || 1);
@@ -150,12 +262,26 @@ export function useVirtualScroll(
     );
   }
 
-  function updateRowHeightFromGrid() {
+  function estimateRowHeight() {
     const columnWidth = getGridColumnWidth();
     const infoHeight = gridStore.compactMode ? 0 : THUMBNAIL_INFO_ROW_HEIGHT;
-    rowHeight.value = Math.round(columnWidth + infoHeight);
+    return Math.round(columnWidth + infoHeight);
+  }
+
+  // Called on mount, from the grid's ResizeObserver and from ImageGrid's
+  // layout watchers. Those watchers run before Vue patches the DOM, so in
+  // square mode the measurement here can still see the old layout; the
+  // post-flush watcher below measures again once the new layout is in place.
+  function updateRowHeightFromGrid() {
     if (isJustifiedMode.value) {
+      rowHeight.value = estimateRowHeight();
+      squarePitchMeasured = false;
       remeasureJustifiedWidth();
+    } else if (!syncSquarePitch(gridStore.columns) && !squarePitchMeasured) {
+      // Nothing rendered to measure yet: seed with the estimate. A measured
+      // pitch is kept instead, since the grid being briefly empty or hidden
+      // says nothing about the row geometry.
+      rowHeight.value = estimateRowHeight();
     }
     afterRowHeightUpdate?.();
   }
@@ -208,8 +334,9 @@ export function useVirtualScroll(
   // items whose row intersects the viewport. This is the contract the parent's
   // updateVisibleThumbnails depends on - if these drifted from what is painted
   // the grid would show blank tiles.
-  function computeVisibleRange() {
-    const el = scrollWrapper.value;
+  // `viewport` ({ scrollTop, clientHeight }) defaults to the live scroller.
+  function computeVisibleRange(viewport = scrollWrapper.value) {
+    const el = viewport;
     if (!el) return null;
     if (isJustifiedMode.value) {
       if (!hasJustifiedLayout()) return { start: 0, end: 0 };
@@ -224,11 +351,14 @@ export function useVirtualScroll(
         end: layout.rowStarts[lastRow + 1],
       };
     }
-    const cardHeight = rowHeight.value;
-    const scrollTop = el.scrollTop;
+    const pitch = rowHeight.value;
+    const intoGrid = el.scrollTop - squareRowTop(0);
     const cols = gridStore.columns;
-    const firstVisibleRow = scrollTop / cardHeight;
-    const lastVisibleRow = (scrollTop + el.clientHeight - 1) / cardHeight;
+    const firstVisibleRow = Math.max(0, intoGrid / pitch);
+    const lastVisibleRow = Math.max(
+      0,
+      (intoGrid + el.clientHeight - 1) / pitch,
+    );
     return {
       start: Math.floor(firstVisibleRow) * cols,
       end: Math.ceil(lastVisibleRow) * cols,
@@ -278,10 +408,16 @@ export function useVirtualScroll(
   });
 
   // ── Spacers ───────────────────────────────────────────────────────────────
+  // Both modes use the same construction: a spacer is the exact offset of the
+  // first rendered row (or the exact remaining height below the last one),
+  // minus the one row-gap the layout itself inserts next to the spacer.
   // Justified mode: exact pixel sums from rowOffsets (never rows * rowHeight).
   // The grid renders as a flex-wrap container with `gap` between lines, so a
   // rendered spacer line contributes one extra inter-line gap that the spacer
   // height must not double-count.
+  // Square mode: the measured pitch and row-gap. The top spacer is always
+  // rendered (SQUARE_TOP_SPACER_MIN px when no rows are above), so row r is at
+  // squareRowTop(r) whichever rows are rendered.
   const topSpacerHeight = computed(() => {
     if (isJustifiedMode.value) {
       if (!hasJustifiedLayout()) return 0;
@@ -298,7 +434,7 @@ export function useVirtualScroll(
     }
     const cols = gridStore.columns;
     const rowsAbove = Math.floor(renderStart.value / cols);
-    return rowsAbove > 0 ? rowsAbove * rowHeight.value : 1;
+    return SQUARE_TOP_SPACER_MIN + rowsAbove * rowHeight.value;
   });
 
   const bottomSpacerHeight = computed(() => {
@@ -319,16 +455,36 @@ export function useVirtualScroll(
     const lastRenderedRow = Math.floor((renderEnd.value - 1) / cols) + 1;
     const totalRows = Math.ceil(allGridImagesLength.value / cols);
     const rowsBelow = totalRows - lastRenderedRow;
-    return rowsBelow > 0 ? rowsBelow * rowHeight.value : 0;
+    // The row-gap before the spacer supplies squareRowGap px of it.
+    return rowsBelow > 0
+      ? Math.max(0, rowsBelow * rowHeight.value - squareRowGap.value)
+      : 0;
   });
 
   // ── Scroll handler ────────────────────────────────────────────────────────
+  // At most one range update per animation frame, for as long as the grid
+  // scrolls, so a fling keeps rendering the rows it passes. A trailing
+  // debounce only updated once the scrolling stopped, so a fast fling ran off
+  // the render buffer into blank spacer. The viewport is read in the scroll
+  // event, while layout is still clean, and applied in the frame callback, so
+  // the frame never forces a layout of a DOM that Vue has just patched (the
+  // vue-virtual-scroller scheme). The range only changes at row boundaries,
+  // so most frames end at the equality check below. The state is
+  // per-instance: each grid tracks its own scroll.
+  let scrollFrame = 0;
+  let pendingViewport = null;
   function onGridScroll() {
-    if (!window._scrollDebounceTimeout) window._scrollDebounceTimeout = null;
-    if (window._scrollDebounceTimeout)
-      clearTimeout(window._scrollDebounceTimeout);
-    window._scrollDebounceTimeout = setTimeout(() => {
-      const range = computeVisibleRange();
+    const el = scrollWrapper.value;
+    if (!el) return;
+    pendingViewport = {
+      scrollTop: el.scrollTop,
+      clientHeight: el.clientHeight,
+    };
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      const range = computeVisibleRange(pendingViewport);
+      pendingViewport = null;
       if (!range) return;
       if (
         visibleStart.value !== range.start ||
@@ -338,13 +494,20 @@ export function useVirtualScroll(
         visibleEnd.value = range.end;
         onVisibleRangeChange?.();
       }
-    }, 50);
+    });
+  }
+  // The composable also runs outside a component (unit tests), where there is
+  // no scope to tie the pending frame to.
+  if (getCurrentScope()) {
+    onScopeDispose(() => {
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
+    });
   }
 
   // ── Immediate visible-range recalculation ──────────────────────────────────
   // Used when the layout changes (column count, compact mode, justified
-  // repack) without a scroll event - the debounced onGridScroll would not fire
-  // in time to fill the newly visible slots.
+  // repack) without a scroll event - onGridScroll only runs on scroll, and
+  // only in the next frame.
   function recalculateVisibleRange() {
     const range = computeVisibleRange();
     if (!range) return;
@@ -373,6 +536,28 @@ export function useVirtualScroll(
     recalculateVisibleRange();
   });
 
+  // ── Keep the square pitch in step with the rendered grid ──────────────────
+  // Runs after Vue has patched the DOM, so it sees the layout the column
+  // count, compact mode, thumbnail mode or render window just produced
+  // (ImageGrid's own watchers measure before the patch). It is one
+  // getBoundingClientRect and one getComputedStyle per render-window change,
+  // read after all of Vue's writes for that change; the pitch itself does not
+  // depend on the spacers, so applying it converges in one step.
+  watch(
+    [
+      renderStart,
+      renderEnd,
+      () => gridStore.columns,
+      () => gridStore.compactMode,
+      () => gridStore.thumbnailMode,
+    ],
+    (_values, [, , prevCols]) => {
+      if (isJustifiedMode.value) return;
+      syncSquarePitch(prevCols);
+    },
+    { flush: "post" },
+  );
+
   // ── Cursor scroll-into-view ───────────────────────────────────────────────
   function scrollCursorIntoView(idx) {
     if (!scrollWrapper.value) return;
@@ -393,8 +578,8 @@ export function useVirtualScroll(
     } else {
       const cols = Math.max(1, gridStore.columns || 1);
       const row = Math.floor(idx / cols);
-      itemTop = row * rowHeight.value;
-      itemBottom = itemTop + rowHeight.value;
+      itemTop = squareRowTop(row);
+      itemBottom = itemTop + rowHeight.value - squareRowGap.value;
     }
     const scrollTop = scrollWrapper.value.scrollTop;
     const clientHeight = scrollWrapper.value.clientHeight;
@@ -418,6 +603,8 @@ export function useVirtualScroll(
     bottomSpacerHeight,
     getGridColumnWidth,
     updateRowHeightFromGrid,
+    // Document offset of square row r (spacer + gap + r * measured pitch).
+    squareRowTop,
     recalculateVisibleRange,
     onGridScroll,
     scrollCursorIntoView,

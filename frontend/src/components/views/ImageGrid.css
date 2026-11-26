@@ -337,6 +337,12 @@
 .grid-scroll-wrapper {
   overflow-y: auto;
   overflow-x: hidden;
+  /* The virtualizer owns the scroll position. Its spacers match the rendered
+     rows exactly, and it restores the top picture itself when the geometry
+     changes (useVirtualScroll), as collapseGhostedImages does for ghosts.
+     Browser anchoring would only add a second, whole-pixel correction on top,
+     and Safari has none, so nothing may depend on it. */
+  overflow-anchor: none;
   width: 100%;
   padding-right: 0px;
   /* Shared amber scrollbar treatment - keep in sync with .sidebar-scroll in SideBar.vue */
