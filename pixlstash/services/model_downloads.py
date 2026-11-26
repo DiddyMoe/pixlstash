@@ -116,7 +116,7 @@ from pixlstash.utils.bounded_http import (
     vet_target,
     wire_split,
 )
-from pixlstash.utils.path_utils import resolve_path_within
+from pixlstash.utils.path_utils import real_path, resolve_path_within
 
 logger = get_logger(__name__)
 
@@ -565,9 +565,10 @@ def reserve_folder(path: str) -> str:
             whatever its status reads) writes inside *path*. Nothing was
             reserved.
     """
-    # Resolved before the lock, as every download's `_target` was, so the
-    # checks under it compare strings and never wait on the filesystem.
-    resolved = os.path.realpath(path)
+    # Resolved before the lock, and spelled as every download's `_target` was
+    # (resolve_path_within), so the checks under it compare strings and never
+    # wait on the filesystem.
+    resolved = real_path(path)
     with _lock:
         busy = next(
             (
@@ -600,8 +601,8 @@ def release_folder(token: str) -> None:
 def _resolved_within(path: str, base: str) -> bool:
     """Whether *path* lies inside the directory *base*, both already resolved.
 
-    Both were passed through ``os.path.realpath`` before ``_lock`` was taken,
-    so this only compares strings. A filesystem call under ``_lock`` would hold
+    Both were passed through ``real_path`` before ``_lock`` was taken, so
+    this only compares strings. A filesystem call under ``_lock`` would hold
     up every download request behind a folder on an unresponsive network share.
     """
     norm_path = os.path.normcase(path)

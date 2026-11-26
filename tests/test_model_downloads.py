@@ -7,6 +7,7 @@ import importlib.util
 import ipaddress
 import json
 import logging
+import ntpath
 import os
 import socket
 import sqlite3
@@ -68,6 +69,7 @@ from pixlstash.services.workflow_run_service import (
 )
 from pixlstash.utils import bounded_http
 from pixlstash.utils.bounded_http import PinnedAdapter, RedirectRefused, TargetRefused
+from pixlstash.utils.path_utils import real_path, resolve_path_within
 from tests.network_vectors import LAN_IPV4, PRIVATE_10_IPV4
 from tests.test_bounded_http import (
     _Peer,
@@ -378,6 +380,43 @@ def test_the_same_file_twice_at_once_is_refused(hub, target, adapter_bytes, link
         assert str(caught.value) == ALREADY_DOWNLOADING
         gate.set()
         assert _wait(first["id"])["status"] == STATUS_DONE
+
+
+_EXTENDED_PREFIX = "\\\\?\\"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the race is in Windows' realpath")
+def test_a_folder_made_mid_resolve_leaves_the_download_inside_its_folder(
+    tmp_path, monkeypatch
+):
+    """CPython strips the prefix only if the plain path fails with the error
+    its first try did. A parent made in between turns 3 (path not found) into
+    2 (file not found) and the prefix stays: a second download of a file the
+    first was still writing read as outside its folder (400), not as already
+    downloading (409)."""
+    real_final_path = ntpath._getfinalpathname
+    make_on_next_miss = []
+    own_folder = ntpath.normcase(str(tmp_path))
+
+    def final_path(path):
+        try:
+            return real_final_path(path)
+        except OSError:
+            # Only this test's own misses, so no other thread's can use it up.
+            mine = ntpath.normcase(str(path)).startswith(own_folder)
+            if make_on_next_miss and mine:
+                os.mkdir(make_on_next_miss.pop())
+            raise
+
+    monkeypatch.setattr(ntpath, "_getfinalpathname", final_path)
+    make_on_next_miss.append(tmp_path / "staged")
+    raced = os.path.realpath(tmp_path / "staged" / "x.bin")
+    assert raced.startswith(_EXTENDED_PREFIX), f"the race was not staged: {raced}"
+
+    make_on_next_miss.append(tmp_path / "new")
+    resolved = resolve_path_within(str(tmp_path), "new", "x.bin")
+    assert not make_on_next_miss, "the folder was never made mid-resolve"
+    assert resolved == os.path.join(real_path(tmp_path), "new", "x.bin")
 
 
 class _OwnedLock:

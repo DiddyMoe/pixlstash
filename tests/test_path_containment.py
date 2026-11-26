@@ -39,7 +39,10 @@ from pixlstash.utils.path_utils import LibraryRootsUnavailable
 from pixlstash.utils.caption_file_utils import SIDECAR_TYPE_TAGS, writeback_path
 from pixlstash.utils.image_processing.orientation import read_orientation
 from pixlstash.utils.media_files import has_hidden_component
-from pixlstash.utils.path_utils import path_is_within
+from pixlstash.utils.path_utils import (
+    _without_added_prefix,
+    path_is_within,
+)
 from pixlstash.utils.reference_folder_validator import (
     canonical_path,
     validate_reference_folder_path,
@@ -113,6 +116,65 @@ def test_path_is_within_follows_a_symlinked_root(tmp_path):
         pytest.skip("symlinks are not available here")
     # The same directory spelled through its alias is still contained.
     assert path_is_within(str(real / "pic.png"), str(link))
+
+
+# ---------------------------------------------------------------------------
+# real_path: the prefix Windows' realpath adds to a missing path
+# ---------------------------------------------------------------------------
+
+_EXTENDED = "\\\\?\\"
+
+
+@pytest.mark.parametrize(
+    "given, resolved, expected",
+    [
+        # Missing, on a drive and on a share: spelled as given.
+        (
+            "C:\\lib\\new\\x.bin",
+            _EXTENDED + "C:\\lib\\new\\x.bin",
+            "C:\\lib\\new\\x.bin",
+        ),
+        (
+            "\\\\host\\share\\new\\x.bin",
+            _EXTENDED + "UNC\\host\\share\\new\\x.bin",
+            "\\\\host\\share\\new\\x.bin",
+        ),
+        # A volume GUID path has no plain spelling to fall back to (gh-89760).
+        (
+            "C:\\mnt\\x.bin",
+            _EXTENDED + "Volume{00000000-0000-0000-0000-000000000000}\\x.bin",
+            _EXTENDED + "Volume{00000000-0000-0000-0000-000000000000}\\x.bin",
+        ),
+        # A prefix the caller wrote, in either slash, is theirs to keep.
+        (_EXTENDED + "C:\\lib\\x.bin", _EXTENDED + "C:\\lib\\x.bin", None),
+        ("//?/C:/lib/x.bin", _EXTENDED + "C:\\lib\\x.bin", None),
+        # Nothing was added.
+        ("C:\\lib\\x.bin", "C:\\lib\\x.bin", None),
+    ],
+    ids=["drive", "share", "volume-guid", "given", "given-slashes", "none-added"],
+)
+def test_real_path_drops_only_a_prefix_realpath_added(
+    given, resolved, expected, monkeypatch
+):
+    """Wrong if a missing path keeps the extended-length prefix CPython's
+    realpath leaves on it when a folder is made mid-call: ``commonpath`` then
+    refuses to compare it with a plain root and the path reads as outside it."""
+    with monkeypatch.context() as patched:
+        # The plain spelling's second walk, with nothing racing it this time.
+        patched.setattr(os.path, "realpath", lambda path: path)
+        plain = _without_added_prefix(given, resolved)
+    assert plain == (resolved if expected is None else expected)
+
+
+def test_real_path_resolves_the_plain_spelling_again(monkeypatch):
+    """Wrong if the plain spelling is returned unresolved: a folder made in
+    between as a junction would be compared by its own name, not by where it
+    points."""
+    plain = "C:\\lib\\new\\x.bin"
+    with monkeypatch.context() as patched:
+        patched.setattr(os.path, "realpath", lambda path: f"resolved {path}")
+        again = _without_added_prefix(plain, _EXTENDED + plain)
+    assert again == f"resolved {plain}"
 
 
 def test_blocklist_refuses_a_symlink_pointing_into_a_restricted_directory(tmp_path):
