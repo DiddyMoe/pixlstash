@@ -71,6 +71,20 @@ def _record_close_codes(monkeypatch, websocket) -> list:
     return codes
 
 
+def _capture_admission_leases(monkeypatch, server) -> list:
+    """Every restore admission lease the updates handler is granted."""
+    leases: list[int | None] = []
+    original = server.auth.register_authenticated_websocket
+
+    def _register(websocket):
+        lease = original(websocket)
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(server.auth, "register_authenticated_websocket", _register)
+    return leases
+
+
 @pytest.fixture(scope="module")
 def server():
     with tempfile.TemporaryDirectory() as tmp:
@@ -515,17 +529,25 @@ def test_updates_accept_failure_releases_generation_lease(
         raise RuntimeError("injected accept failure")
 
     monkeypatch.setattr(WebSocket, "accept", fail_accept)
+    leases = _capture_admission_leases(monkeypatch, server)
     with pytest.raises(RuntimeError, match="injected accept failure"):
         with owner_client.websocket_connect(WS_UPDATES):
             pass
     assert server.library_coordinator._readers == {}
+    # Wrong if the restore lease outlives the failed handshake: every later
+    # restore's drain then waits for it, times out and keeps sign-in closed.
+    assert leases and leases[0] is not None
+    assert leases[0] not in server.auth._active_restore_websockets
 
 
-def test_updates_registration_failure_releases_generation_lease(server, owner_client):
+def test_updates_registration_failure_releases_generation_lease(
+    server, owner_client, monkeypatch
+):
     class ExplodingClients(list):
         def append(self, _client):
             raise RuntimeError("injected registration failure")
 
+    leases = _capture_admission_leases(monkeypatch, server)
     original = server._ws_clients
     server._ws_clients = ExplodingClients(original)
     try:
@@ -533,6 +555,8 @@ def test_updates_registration_failure_releases_generation_lease(server, owner_cl
             with owner_client.websocket_connect(WS_UPDATES):
                 pass
         assert server.library_coordinator._readers == {}
+        assert leases and leases[0] is not None
+        assert leases[0] not in server.auth._active_restore_websockets
     finally:
         server._ws_clients = original
 
