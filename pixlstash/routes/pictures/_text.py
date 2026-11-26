@@ -13,6 +13,7 @@ from typing import Annotated, Literal, Optional
 
 from fastapi import HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 from pixlstash.database import ocr_query_terms, ocr_text_match, ocr_word_matches
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import picture_service
@@ -34,7 +35,7 @@ class PictureTextResponse(BaseModel):
 
 def _picture_id(id: str) -> int:
     try:
-        return int(id)
+        return parse_sqlite_int(id)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid picture id") from exc
 

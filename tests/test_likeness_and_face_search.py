@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlmodel import select, func
 
@@ -20,6 +21,7 @@ from pixlstash.db_models.tag import Tag
 from pixlstash.routes import characters as _characters_module
 from pixlstash.routes.pictures import _character_likeness as _character_likeness_module
 from pixlstash.routes.pictures import _face_search as _face_search_module
+from pixlstash.routes.pictures._helpers import _face_cluster_ids
 from pixlstash.routes.pictures import _likeness_search as _likeness_search_module
 from pixlstash.routes.pictures import _misc as _pictures_misc_module
 from pixlstash.scoring.character_likeness import count_pictures_by_character_likeness
@@ -235,7 +237,7 @@ def _add_face(server, pic_id, char_id, seed, face_index=0):
                 frame_index=0,
                 face_index=face_index,
                 character_id=char_id,
-                bbox_="0,0,10,10",
+                bbox=[0, 0, 10, 10],
                 features=_face_features(seed),
             )
         )
@@ -462,7 +464,7 @@ def _add_face_with_features(server, pic_id, char_id, features, face_index=0):
             frame_index=0,
             face_index=face_index,
             character_id=char_id,
-            bbox_="0,0,10,10",
+            bbox=[0, 0, 10, 10],
             features=features,
         )
         session.add(face)
@@ -1650,3 +1652,41 @@ def test_scoring_an_upload_against_a_character_runs_off_the_event_loop(
     [result] = resp.json()["results"]
     assert result["eligible"] is True, result
     assert result["character_likeness"] == pytest.approx(1.0, abs=1e-3), result
+
+
+@pytest.mark.parametrize(
+    ("character_id", "cluster", "threshold", "detail"),
+    [
+        (str(2**63), "1", None, "face_cluster needs one person's character_id"),
+        ("9" * 5000, "1", None, "face_cluster needs one person's character_id"),
+        (2**63, "1", None, "face_cluster needs one person's character_id"),
+        (
+            "7",
+            "example-not-a-number",
+            None,
+            "face_cluster must be a whole number and face_cluster_threshold a number",
+        ),
+        (
+            "7",
+            "1",
+            "example-not-a-number",
+            "face_cluster must be a whole number and face_cluster_threshold a number",
+        ),
+    ],
+    ids=["past-sqlite", "past-int-parsing", "int-past-sqlite", "cluster", "threshold"],
+)
+def test_a_face_cluster_filter_the_helper_cannot_use_is_a_fixed_422(
+    character_id, cluster, threshold, detail
+):
+    """The person's id is refused before it is looked up (``2**63`` overflowed
+    the driver, and a 5000-digit id ``int()`` itself refuses), and a value
+    that did not parse is not repeated back."""
+    owner = SimpleNamespace(
+        auth=SimpleNamespace(require_unscoped_owner=lambda _r: None)
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        _face_cluster_ids(owner, None, character_id, cluster, threshold)
+
+    assert refused.value.status_code == 422
+    assert refused.value.detail == detail

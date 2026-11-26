@@ -19,6 +19,7 @@ from typing import Optional
 from fastapi import HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import picture_service
 from pixlstash.tasks.anomaly_region_task import (
@@ -139,7 +140,7 @@ def register_routes(router, server):
         ),
     ):
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid picture id") from exc
 

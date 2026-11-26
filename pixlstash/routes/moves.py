@@ -8,6 +8,7 @@ this module is the schema and the owner-only gate.
 from fastapi import APIRouter, Body, Request
 from pydantic import BaseModel, Field
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.event_types import EventType
 from pixlstash.services import move_reconciliation_service, operation_log_service
 
@@ -58,7 +59,7 @@ class PendingMovesResponse(BaseModel):
 
 
 class MoveReviewIdsRequest(BaseModel):
-    review_ids: list[int] = Field(
+    review_ids: list[SqliteInt] = Field(
         description="review_id values from GET /moves/pending."
     )
 

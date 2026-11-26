@@ -12,6 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.db_models.tag_suggestion import TagSuggestion
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
@@ -77,12 +78,12 @@ class BulkAcceptRequest(BaseModel):
     dry_run: bool = False
     # Optional review-scope narrowing - the dry-run count and the apply both honour
     # the same filter, matched on the suspect picture only. They AND together.
-    project_id: Optional[int] = None
-    set_id: Optional[int] = None
+    project_id: Optional[SqliteInt] = None
+    set_id: Optional[SqliteInt] = None
     character_id: Optional[str] = None
     # Optional review-session narrowing: only rows with this TagSuggestion.review_id
     # are counted/resolved (the review creation receipt's "auto-resolve?" path).
-    review_id: Optional[int] = None
+    review_id: Optional[SqliteInt] = None
 
 
 class BulkReopenRequest(BaseModel):
@@ -92,9 +93,9 @@ class BulkReopenRequest(BaseModel):
     decided rows (SKIPPED rows made no changes and are left as-is).
     """
 
-    ids: list[int] = []
+    ids: list[SqliteInt] = []
     # When set, ids belonging to a different (or no) review are skipped.
-    review_id: Optional[int] = None
+    review_id: Optional[SqliteInt] = None
 
 
 class ScanRequest(BaseModel):
@@ -308,10 +309,10 @@ def create_router(server) -> APIRouter:
         tag: str | None = None,
         direction: str | None = None,
         status: str = "PENDING",
-        limit: int = 100,
-        offset: int = 0,
-        project_id: int | None = None,
-        set_id: int | None = None,
+        limit: SqliteInt = 100,
+        offset: SqliteInt = 0,
+        project_id: SqliteInt | None = None,
+        set_id: SqliteInt | None = None,
         character_id: str | None = None,
     ):
         if direction is not None and direction not in ("add", "remove"):
@@ -367,7 +368,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ReviewSuggestionResponse,
     )
-    def accept_tag_suggestion(suggestion_id: int, request: Request):
+    def accept_tag_suggestion(suggestion_id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             result = tag_suggestion_service.accept_suggestion(
@@ -402,7 +403,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ReviewSuggestionResponse,
     )
-    def reopen_tag_suggestion(suggestion_id: int, request: Request):
+    def reopen_tag_suggestion(suggestion_id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             result = tag_suggestion_service.reopen_suggestion(
@@ -430,7 +431,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ReviewSuggestionResponse,
     )
-    def fix_twin_tag_suggestion(suggestion_id: int, request: Request):
+    def fix_twin_tag_suggestion(suggestion_id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             result = tag_suggestion_service.fix_twin_suggestion(
@@ -453,7 +454,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ReviewSuggestionResponse,
     )
-    def swap_tag_suggestion(suggestion_id: int, request: Request):
+    def swap_tag_suggestion(suggestion_id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             result = tag_suggestion_service.swap_suggestion(server.vault, suggestion_id)
@@ -574,7 +575,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ReviewSuggestionResponse,
     )
-    def skip_tag_suggestion(suggestion_id: int):
+    def skip_tag_suggestion(suggestion_id: SqliteInt):
         try:
             result = tag_suggestion_service.skip_suggestion(server.vault, suggestion_id)
         except KeyError:
@@ -587,7 +588,7 @@ def create_router(server) -> APIRouter:
         description="Marks the suggestion DISMISSED. Does not modify the Tag table.",
         response_model=ReviewSuggestionResponse,
     )
-    def dismiss_tag_suggestion(suggestion_id: int):
+    def dismiss_tag_suggestion(suggestion_id: SqliteInt):
         try:
             result = tag_suggestion_service.dismiss_suggestion(
                 server.vault, suggestion_id

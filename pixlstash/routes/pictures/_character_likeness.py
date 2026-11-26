@@ -14,7 +14,7 @@ and upload endpoints filter inline via ``fetch_scope_allowed_picture_ids`` /
 """
 
 from io import BytesIO
-from typing import Optional
+from typing import Annotated, Optional
 
 import cv2
 import numpy as np
@@ -23,6 +23,7 @@ from fastapi import Body, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.database import DBPriority
 from pixlstash.db_models import Face, Picture, PictureSetMember
 from pixlstash.pixl_logging import get_logger
@@ -32,6 +33,7 @@ from pixlstash.scoring import (
     pack_reference_blobs,
     select_reference_faces_for_character,
 )
+from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.utils.service.filter_helpers import (
     VALID_COMBINE_MODES,
     fetch_scope_allowed_character_ids,
@@ -101,7 +103,7 @@ class BatchCharacterLikenessRequest(BaseModel):
         },
     )
 
-    reference_character_id: int = Field(
+    reference_character_id: SqliteInt = Field(
         ...,
         description=(
             "Id of the character whose reference faces define the likeness "
@@ -110,7 +112,7 @@ class BatchCharacterLikenessRequest(BaseModel):
             "faces."
         ),
     )
-    picture_ids: list[int] = Field(
+    picture_ids: list[SqliteInt] = Field(
         ...,
         description=(
             "Picture ids to score. Must contain at least one id and at most "
@@ -230,13 +232,24 @@ def register_routes(router, server):
     def get_picture_character_likeness(
         request: Request,
         id: str,
-        reference_character_id: int = Query(...),
+        reference_character_id: Annotated[SqliteInt, Query()],
         character_id: str = Query(None),
     ):
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
+        if character_id not in (None, "", "ALL", "UNASSIGNED"):
+            try:
+                parse_sqlite_int(character_id)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "character_id must be 'ALL', 'UNASSIGNED', or a numeric "
+                        "character id"
+                    ),
+                ) from exc
 
         def fetch_picture_characters(session):
             pic = session.exec(
@@ -410,7 +423,7 @@ def register_routes(router, server):
         # in a query (the single-id endpoint's unguarded int() would 500 here).
         if character_id is not None and character_id not in ("ALL", "UNASSIGNED", ""):
             try:
-                int(character_id)
+                parse_sqlite_int(character_id)
             except (TypeError, ValueError):
                 raise HTTPException(
                     status_code=422,
@@ -454,12 +467,19 @@ def register_routes(router, server):
         #   assigned_ids    - has a Face assigned to some character
         #   in_set_ids      - is a member of a picture set
         #   matched_ids     - has >=1 Face matching the character_id filter
+        #
+        # BATCH_CHARACTER_LIKENESS_MAX_IDS is above SQLite's historical
+        # 999-parameter limit, so the ids are read from one temp table that
+        # every query below shares, rather than bound per id in each.
         def gather_signals(session: Session, ids: list[int]):
+            id_scope = scope_id_subquery(
+                session, ids, name="_pixlstash_batch_likeness_ids"
+            )
             live_ids = {
                 row
                 for row in session.exec(
                     select(Picture.id)
-                    .where(Picture.id.in_(ids))
+                    .where(Picture.id.in_(id_scope))
                     .where(Picture.deleted.is_(False))
                 ).all()
                 if row is not None
@@ -468,7 +488,7 @@ def register_routes(router, server):
                 row
                 for row in session.exec(
                     select(Face.picture_id)
-                    .where(Face.picture_id.in_(ids))
+                    .where(Face.picture_id.in_(id_scope))
                     .group_by(Face.picture_id)
                 ).all()
                 if row is not None
@@ -478,7 +498,7 @@ def register_routes(router, server):
                 for row in session.exec(
                     select(Face.picture_id)
                     .where(
-                        Face.picture_id.in_(ids),
+                        Face.picture_id.in_(id_scope),
                         Face.character_id.is_not(None),
                     )
                     .group_by(Face.picture_id)
@@ -489,7 +509,7 @@ def register_routes(router, server):
                 row
                 for row in session.exec(
                     select(PictureSetMember.picture_id)
-                    .where(PictureSetMember.picture_id.in_(ids))
+                    .where(PictureSetMember.picture_id.in_(id_scope))
                     .group_by(PictureSetMember.picture_id)
                 ).all()
                 if row is not None
@@ -503,7 +523,7 @@ def register_routes(router, server):
             # map (a sentinel/featureless-only picture matches but cannot be
             # scored, so single-id reports it ineligible).
             def _match_query():
-                q = select(Face.picture_id).where(Face.picture_id.in_(ids))
+                q = select(Face.picture_id).where(Face.picture_id.in_(id_scope))
                 if character_id == "UNASSIGNED":
                     q = q.where(Face.character_id.is_(None))
                 elif character_id and character_id not in ("ALL", ""):
@@ -680,14 +700,16 @@ def register_routes(router, server):
     )
     def score_character_likeness(
         request: Request,
-        files: list[UploadFile] = File(
-            ...,
-            description="Images to score against the reference character.",
-        ),
-        reference_character_id: int = Form(
-            ...,
-            description="Character to score each uploaded image's face(s) against.",
-        ),
+        files: Annotated[
+            list[UploadFile],
+            File(description="Images to score against the reference character."),
+        ],
+        reference_character_id: Annotated[
+            SqliteInt,
+            Form(
+                description="Character to score each uploaded image's face(s) against."
+            ),
+        ],
         combine: str = Form(
             "softmax",
             description=(

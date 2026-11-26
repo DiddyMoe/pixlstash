@@ -11,6 +11,7 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import operation_log_service, tag_group_service
 from pixlstash.services.tag_group_service import (
@@ -71,12 +72,12 @@ class CreateTagGroupResponse(TagGroupMapResponse):
 
 
 class ReorderTagGroupsRequest(BaseModel):
-    ids: list[int]
+    ids: list[SqliteInt]
 
 
 class AssignTagGroupRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
-    group_id: Optional[int] = None
+    group_id: Optional[SqliteInt] = None
 
 
 class TagImportResponse(BaseModel):

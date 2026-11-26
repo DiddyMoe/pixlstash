@@ -11,6 +11,7 @@ from sqlmodel import select
 from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture, PictureStack
 from pixlstash.server import Server
+from pixlstash.services import keep_cover_only_service
 from tests.utils import upload_pictures_and_wait
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
@@ -345,6 +346,132 @@ def test_reorder_needs_only_the_live_members_of_a_stack_with_a_scrapheaped_one()
             f"/stacks/{stack_id}/order", json={"picture_ids": [ids[0], ids[2]]}
         )
         assert resp.status_code == 400
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+# ── Ids SQLite cannot store ──────────────────────────────────────────────────
+
+TOO_BIG = 2**63
+LARGEST = 2**63 - 1
+
+
+def test_an_id_sqlite_cannot_store_is_refused_before_any_query():
+    """``2**63`` overflows the driver while binding, which was a 500. Every
+    stack route refuses it during validation (422, or 400 for the ``dict``
+    bodies, which answer a non-integer id with 400 already), and the largest
+    storable id still reaches the handler, so the route resolved."""
+    temp_dir, client, server = _setup_direct()
+    try:
+        stack_id, ids = _make_stack_directly(server, 2)
+
+        for path in (
+            f"/stacks/{TOO_BIG}",
+            f"/stacks/{TOO_BIG}/pictures",
+            f"/pictures/{TOO_BIG}/stack",
+        ):
+            assert client.get(path).status_code == 422, path
+        # A picture with no stack answers 200 with no stack.
+        for path, status in (
+            ("/stacks/{}", 404),
+            ("/stacks/{}/pictures", 404),
+            ("/pictures/{}/stack", 200),
+        ):
+            assert client.get(path.format(LARGEST)).status_code == status, path
+
+        assert (
+            client.patch(
+                f"/stacks/{TOO_BIG}/order", json={"picture_ids": ids}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                f"/stacks/{TOO_BIG}/members", json={"picture_ids": ids}
+            ).status_code
+            == 422
+        )
+        assert _delete_members(client, TOO_BIG, ids).status_code == 422
+        assert (
+            client.patch(
+                f"/stacks/{TOO_BIG}/members/{ids[0]}", json={"position": 0}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.patch(
+                f"/stacks/{stack_id}/members/{TOO_BIG}", json={"position": 0}
+            ).status_code
+            == 422
+        )
+
+        for path, method in (
+            ("/stacks", client.post),
+            (f"/stacks/{stack_id}/members", client.post),
+            (f"/stacks/{stack_id}/order", client.patch),
+        ):
+            resp = method(path, json={"picture_ids": [ids[0], TOO_BIG]})
+            assert resp.status_code == 400, (path, resp.text)
+            assert resp.json()["detail"] == "picture_ids must be integers"
+        resp = _delete_members(client, stack_id, [TOO_BIG])
+        assert resp.status_code == 400, resp.text
+
+        for field in ("stack_ids", "picture_ids"):
+            resp = client.post(
+                "/stacks/keep-cover-only/preview", json={field: [TOO_BIG]}
+            )
+            assert resp.status_code == 422, (field, resp.text)
+            assert resp.json()["detail"][0]["loc"][-2:] == [field, 0]
+        resp = client.post(
+            "/stacks/keep-cover-only",
+            json={"stack_ids": [stack_id], "expected_picture_ids": [TOO_BIG]},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"][0]["loc"][-2:] == ["expected_picture_ids", 0]
+
+        resp = client.post(
+            "/stacks/keep-cover-only/preview", json={"stack_ids": [LARGEST]}
+        )
+        assert resp.status_code == 200, resp.text
+        assert _stack_state(server, ids) == {
+            ids[0]: (stack_id, 0),
+            ids[1]: (stack_id, 1),
+        }
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_a_preview_whose_figures_do_not_add_up_answers_a_fixed_sentence(
+    monkeypatch, caplog
+):
+    """The service's own message stays in the log; the caller gets a fixed
+    sentence, and the 500 is logged with its traceback."""
+    temp_dir, client, server = _setup_direct()
+    try:
+        stack_id, _ids = _make_stack_directly(server, 2)
+
+        def mismatched(*_args, **_kwargs):
+            raise keep_cover_only_service.KeepCoverOnlyError("example-internal-detail")
+
+        monkeypatch.setattr(keep_cover_only_service, "preview", mismatched)
+        with caplog.at_level("ERROR", logger="pixlstash.routes.stacks"):
+            resp = client.post(
+                "/stacks/keep-cover-only/preview", json={"stack_ids": [stack_id]}
+            )
+
+        assert resp.status_code == 500, resp.text
+        assert resp.json()["detail"] == (
+            "The preview's figures did not add up, so none are shown."
+        )
+        assert "example-internal-detail" not in resp.text
+        assert any(
+            record.exc_info and "example-internal-detail" in record.getMessage()
+            for record in caplog.records
+        ), "the refusal was not logged with its traceback"
     finally:
         server.close()
         temp_dir.cleanup()

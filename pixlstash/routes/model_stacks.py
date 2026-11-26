@@ -41,6 +41,7 @@ from typing import Optional
 from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.stack_detector import (
     MAX_MEMBERS_PER_STACK,
@@ -137,7 +138,7 @@ class ApplyStackRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model_ids: list[int] = Field(
+    model_ids: list[SqliteInt] = Field(
         description=(
             "The models to collapse, by hub `model.id`. Order is **recomputed** "
             "server-side, so the caller cannot choose the cover by reordering "
@@ -188,7 +189,7 @@ class SetCoverRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model_id: int = Field(
+    model_id: SqliteInt = Field(
         description=(
             "The member to promote to the cover, by hub `model.id`. It must "
             "already be in this stack. Example: `101`."
@@ -356,7 +357,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=UnstackResponse,
     )
-    def delete_stack(request: Request, stack_id: int):
+    def delete_stack(request: Request, stack_id: SqliteInt):
         server.auth.ensure_secure_when_required(request)
         try:
             released = unstack(server.hub, stack_id)
@@ -392,7 +393,7 @@ def create_router(server) -> APIRouter:
         response_model=SetCoverResponse,
     )
     def set_stack_cover(
-        request: Request, stack_id: int, payload: SetCoverRequest = Body(...)
+        request: Request, stack_id: SqliteInt, payload: SetCoverRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         try:
@@ -426,7 +427,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=RemoveMemberResponse,
     )
-    def delete_stack_member(request: Request, stack_id: int, model_id: int):
+    def delete_stack_member(request: Request, stack_id: SqliteInt, model_id: SqliteInt):
         server.auth.ensure_secure_when_required(request)
         try:
             released, dissolved = remove_member(server.hub, stack_id, model_id)

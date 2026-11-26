@@ -19,10 +19,12 @@ from sqlalchemy import func, text
 from sqlmodel import Session, select
 from starlette.concurrency import run_in_threadpool
 
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 from pixlstash.database import DBPriority
 from pixlstash.db_models.guest_score import GuestScore
 from pixlstash.db_models.guest_session import GuestSession
 from pixlstash.pixl_logging import get_logger
+from pixlstash.routes._helpers import read_json_object
 from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
 
 logger = get_logger(__name__)
@@ -142,6 +144,7 @@ def create_router(server) -> APIRouter:
 
         Raises:
             400: Validation error (bad session_id, bad score value, too many entries).
+            422: The body is not a JSON object.
             503: Too many concurrent active guest sessions (new session refused).
         """
         token_scope = getattr(request.state, "token_scope", None)
@@ -154,7 +157,7 @@ def create_router(server) -> APIRouter:
                 status_code=403, detail="No token_public_id on request state"
             )
 
-        body: dict[str, Any] = await request.json()
+        body: dict[str, Any] = await read_json_object(request)
 
         # Validate session_id - rebind from the match group so the value used
         # downstream is the regex-validated string, not raw user input.
@@ -191,16 +194,16 @@ def create_router(server) -> APIRouter:
         validated_scores: dict[int, int] = {}
         for key, val in raw_scores.items():
             try:
-                pic_id = int(key)
-            except (TypeError, ValueError):
+                pic_id = parse_sqlite_int(key)
+            except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Picture id must be an integer, got: {key!r}",
-                )
+                    detail="Every key of scores must be a picture id",
+                ) from exc
             if not isinstance(val, int) or not (0 <= val <= 5):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Score must be an integer 0-5, got {val!r} for picture {pic_id}",
+                    detail=f"The score for picture {pic_id} must be an integer 0-5",
                 )
             validated_scores[pic_id] = val
 

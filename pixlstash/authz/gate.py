@@ -81,6 +81,7 @@ from pixlstash.authz.policy import (
 )
 from pixlstash.authz.registry import CONDITIONALLY_MOUNTED_ROUTES, ROUTE_POLICIES
 from pixlstash.route_inventory import iter_api_route_contexts
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 if TYPE_CHECKING:
     from pixlstash.auth import AuthService
@@ -680,13 +681,22 @@ class AuthzGate:
             enforce_picture_scope(self._server, request, picture_id)
             return
 
+        # A long digit string parses as int() and overflows the membership
+        # query's bind (a 500); outside SQLite's range is malformed too.
         try:
-            obj_id = int(raw_id)
-        except (TypeError, ValueError):
+            obj_id = parse_sqlite_int(raw_id)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "[authz-gate] scoped token named an id that is not a SQLite "
+                "integer (%s) on %s %s; refusing (403)",
+                exc,
+                request.method,
+                request.url.path,
+            )
             raise HTTPException(
                 status_code=403,
                 detail="Token is not authorised to access this resource",
-            )
+            ) from exc
         check = _MEMBERSHIP_BY_POLICY[route_policy.policy]
         check(self._server, request, obj_id)
 
@@ -708,6 +718,12 @@ class AuthzGate:
         if route_policy.library_access is not LibraryAccessMode.ACTIVE_VAULT:
             return
 
+        # Local imports: library_admission imports pixlstash.authz, which
+        # imports this module, so a top-level import here is circular.
+        from pixlstash.middleware.library_admission import (
+            BUSY_DETAIL,
+            BUSY_RETRY_AFTER,
+        )
         from pixlstash.services.library_switch_service import (
             SwitchState,
             switching_state_of,
@@ -717,14 +733,22 @@ class AuthzGate:
         if state is SwitchState.READY:
             return
 
+        if state is SwitchState.UNAVAILABLE:
+            detail = "PixlStash has no verified open library. Restart the server."
+        elif getattr(request.state, "auth_user_id", None) is None:
+            # No principal: a PUBLIC route (a share link) reaches the gate
+            # without authentication. Such a caller gets admission's busy
+            # sentence, so it cannot tell a restore from a switch (CWE-204).
+            detail = BUSY_DETAIL
+        elif self._server.library_coordinator.restoring:
+            # An authenticated caller may be told which work holds the library.
+            detail = "PixlStash is restoring the library. Try again in a moment."
+        else:
+            detail = "PixlStash is switching library. Try again in a moment."
         raise HTTPException(
             status_code=503,
-            detail=(
-                "PixlStash has no verified open library. Restart the server."
-                if state is SwitchState.UNAVAILABLE
-                else "PixlStash is switching library. Try again in a moment."
-            ),
-            headers={"Retry-After": "2"},
+            detail=detail,
+            headers={"Retry-After": BUSY_RETRY_AFTER},
         )
 
     def _enforce_library_pin(self, request: Request, route_policy: RoutePolicy) -> None:

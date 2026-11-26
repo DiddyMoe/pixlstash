@@ -19,6 +19,7 @@ from fastapi import File, HTTPException, Query, Request, UploadFile
 from PIL import Image
 from pydantic import BaseModel, ConfigDict
 
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.authz.membership import enforce_set_scope
 from pixlstash.inference.cpu_query_encoders import CpuQueryEncodersNotReadyError
 from pixlstash.pixl_logging import get_logger
@@ -156,11 +157,11 @@ def register_routes(router, server):
         files: List[UploadFile] = File(
             default=[], description="One or more query images to search against."
         ),
-        source_picture_id: int | None = Query(
+        source_picture_id: SqliteInt | None = Query(
             None,
             description="Use the stored embedding of this picture ID as the query (single ID, kept for backward compatibility).",
         ),
-        source_picture_ids: List[int] = Query(
+        source_picture_ids: List[SqliteInt] = Query(
             default=[],
             description="Use the stored embeddings of these picture IDs as the query. When multiple IDs are supplied results are ranked by the minimum similarity across all sources.",
         ),
@@ -216,14 +217,14 @@ def register_routes(router, server):
             None,
             description="Filter to pictures containing a specific character (numeric ID).",
         ),
-        source_set_id: int | None = Query(
+        source_set_id: SqliteInt | None = Query(
             None,
             description=(
                 "Use this set's centroid (the mean of its members' embeddings) as "
                 "the query, so the search finds more pictures that belong in it."
             ),
         ),
-        exclude_set_id: int | None = Query(
+        exclude_set_id: SqliteInt | None = Query(
             None,
             description=(
                 "Drop pictures already in this set. Pair it with `source_set_id` "
@@ -282,7 +283,7 @@ def register_routes(router, server):
 
         if character_id is not None and character_id not in ("ALL", ""):
             try:
-                char_id_int = int(character_id)
+                char_id_int = parse_sqlite_int(character_id)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Invalid character_id")
 

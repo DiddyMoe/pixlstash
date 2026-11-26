@@ -10,6 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, ConfigDict
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.db_models.tagger_run import TaggerRun
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import tagger_run_service
@@ -72,7 +73,7 @@ def create_router(server) -> APIRouter:
         description="Returns stored runs for the stats panel, most recent first.",
         response_model=list[TaggerRunResponse],
     )
-    def list_tagger_runs(limit: int = 100):
+    def list_tagger_runs(limit: SqliteInt = 100):
         limit = max(1, min(limit, 1000))
         rows = tagger_run_service.list_runs(server.vault, limit)
         return [_serialize(r) for r in rows]

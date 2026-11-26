@@ -16,6 +16,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.event_types import EventType
 from pixlstash.services import face_clusters
 
@@ -90,7 +91,7 @@ class FaceClusters(BaseModel):
 
 
 class ReferenceClusterRequest(BaseModel):
-    picture_ids: list[int] = Field(max_length=MAX_REFERENCE_CLUSTER)
+    picture_ids: list[SqliteInt] = Field(max_length=MAX_REFERENCE_CLUSTER)
 
 
 class ReferenceCluster(BaseModel):
@@ -117,14 +118,14 @@ def create_router(server) -> APIRouter:
         response_model=FaceClusters,
     )
     def get_face_clusters(
-        character_id: int,
+        character_id: SqliteInt,
         threshold: float = Query(
             face_clusters.SAME_PERSON,
             ge=0.05,
             le=0.95,
             description="The mean likeness two groups need to count as one person.",
         ),
-        centre: int | None = Query(
+        centre: SqliteInt | None = Query(
             None,
             description="A picture of this person's: also rank every face by "
             "likeness to its face.",
@@ -229,7 +230,7 @@ def create_router(server) -> APIRouter:
         response_model=ReferenceCluster,
     )
     def put_reference_cluster(
-        request: Request, id: int, payload: ReferenceClusterRequest
+        request: Request, id: SqliteInt, payload: ReferenceClusterRequest
     ):
         try:
             stored = face_clusters.save_reference_cluster(

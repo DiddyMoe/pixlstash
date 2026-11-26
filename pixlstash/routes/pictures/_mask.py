@@ -13,6 +13,7 @@ import os
 
 from fastapi import HTTPException, Response
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import picture_service
 from pixlstash.services.edit_selection import (
@@ -39,7 +40,7 @@ def register_routes(router, server):
         response_class=Response,
         responses={200: {"content": {"image/png": {}}}},
     )
-    def render_picture_mask(id: int, selection: Selection):
+    def render_picture_mask(id: SqliteInt, selection: Selection):
         file_path = picture_service.fetch_picture_file_path(server.vault.db, id)
         path = (
             ImageUtils.resolve_picture_path(server.vault.image_root, file_path)

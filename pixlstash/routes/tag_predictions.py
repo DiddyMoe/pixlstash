@@ -4,6 +4,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict
 
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import operation_log_service, tag_prediction_service
@@ -25,7 +26,7 @@ class ResetTagsRequest(BaseModel):
 class BulkResetRequest(BaseModel):
     """Request body for the multi-picture reset_tags / reset_description endpoints."""
 
-    picture_ids: list[int]
+    picture_ids: list[SqliteInt]
     model: str | None = None
 
 
@@ -146,12 +147,12 @@ def create_router(server) -> APIRouter:
     )
     def get_tag_predictions(
         request: Request,
-        id: int,
+        id: SqliteInt,
         status: str | None = None,
         include_meta: bool = False,
     ):
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -194,10 +195,10 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ConfirmTagPredictionResponse,
     )
-    def confirm_tag_prediction(id: int, tag: str, request: Request):
+    def confirm_tag_prediction(id: SqliteInt, tag: str, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -249,10 +250,10 @@ def create_router(server) -> APIRouter:
         ),
         response_model=RejectTagPredictionResponse,
     )
-    def reject_tag_prediction(id: int, tag: str, request: Request):
+    def reject_tag_prediction(id: SqliteInt, tag: str, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -298,10 +299,10 @@ def create_router(server) -> APIRouter:
         ),
         response_model=DeleteTagPredictionsResponse,
     )
-    def delete_tag_predictions(id: int, request: Request):
+    def delete_tag_predictions(id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -332,14 +333,18 @@ def create_router(server) -> APIRouter:
         response_model=ResetStatusResponse,
     )
     def reset_picture_tags(
-        id: int, request: Request, payload: ResetTagsRequest | None = None
+        id: SqliteInt, request: Request, payload: ResetTagsRequest | None = None
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
+        # The reset deletes the picture's tags, then queues the retag; while a
+        # library restore has paused admission the retag would be refused
+        # after the delete, so the request is refused before it (409).
+        server.vault.refuse_while_admission_paused()
         model = payload.model if payload else None
         tag_prediction_service.reset_picture_tags(
             server.vault, pic_id, engine_name=model, origin_client_id=origin_client_id
@@ -366,14 +371,17 @@ def create_router(server) -> APIRouter:
         response_model=ResetStatusResponse,
     )
     def reset_picture_description(
-        id: int, request: Request, payload: ResetTagsRequest | None = None
+        id: SqliteInt, request: Request, payload: ResetTagsRequest | None = None
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
+        # As reset_tags: the sentinel is written before the redescribe is
+        # queued, so a paused admission refuses the request before the write.
+        server.vault.refuse_while_admission_paused()
         model = payload.model if payload else None
         found = server.vault.reset_description_interactive(
             pic_id, engine_name=model, origin_client_id=origin_client_id

@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func
 from sqlmodel import Session, select
 
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.database import DBPriority
 from pixlstash.db_models import Face, Picture
 from pixlstash.event_types import EventType
@@ -125,7 +126,7 @@ def register_routes(router, server):
         # route. Moving `_faces.register_routes` after `_crud.register_routes`
         # makes this handler dead code that silently never runs.
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid picture id") from exc
 
@@ -153,7 +154,7 @@ def register_routes(router, server):
     def create_picture_face(request: Request, id: str, payload: dict = Body(...)):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -163,10 +164,16 @@ def register_routes(router, server):
             raise HTTPException(status_code=400, detail="bbox must be [x1, y1, x2, y2]")
         try:
             bbox_vals = [int(round(float(v))) for v in bbox]
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="bbox values must be numbers")
+        except (TypeError, ValueError, OverflowError) as exc:
+            # The body parser reads ``NaN``, ``Infinity`` and integers of any
+            # size. ``round`` raises OverflowError on an infinity (``1e999``
+            # reads as one) and ``float`` on an int too large for it; ``round``
+            # of a NaN raises ValueError.
+            raise HTTPException(
+                status_code=400, detail="bbox values must be finite numbers"
+            ) from exc
         try:
-            frame_index = int(frame_index)
+            frame_index = parse_sqlite_int(frame_index)
         except (TypeError, ValueError):
             frame_index = 0
 
@@ -221,10 +228,10 @@ def register_routes(router, server):
         description="Deletes a face at frame 0 by index and reindexes remaining faces for stable ordering.",
         response_model=FaceDeleteResponse,
     )
-    def delete_picture_face(request: Request, id: str, index: int):
+    def delete_picture_face(request: Request, id: str, index: SqliteInt):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 

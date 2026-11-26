@@ -13,6 +13,7 @@ from typing import Annotated, Literal, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import review_service
 from pixlstash.services.review_service import (
@@ -39,8 +40,8 @@ class CreateReviewRequest(BaseModel):
         ge=1,
         le=review_service.tag_scan_service.MAX_BOUNDARY_LIMIT,
     )
-    project_id: Optional[int] = None
-    set_id: Optional[int] = None
+    project_id: Optional[SqliteInt] = None
+    set_id: Optional[SqliteInt] = None
     character_id: Optional[str] = None
     # Re-surface suspects already decided in earlier reviews (default off -
     # same protection as the old permanent suppression, now a visible choice).
@@ -326,8 +327,8 @@ def create_router(server) -> APIRouter:
     def preview_review(
         request: Request,
         tag: str,
-        project_id: int | None = None,
-        set_id: int | None = None,
+        project_id: SqliteInt | None = None,
+        set_id: SqliteInt | None = None,
         character_id: str | None = None,
     ):
         # Owner-only surface (see create_review / the /reviews reads): a scoped
@@ -358,7 +359,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ReviewResponse,
     )
-    def get_review(review_id: int, request: Request):
+    def get_review(review_id: SqliteInt, request: Request):
         if _token_scope_ids(server, request) is not None:
             raise HTTPException(status_code=403, detail="Not available to this token")
         try:
@@ -378,7 +379,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=DeleteReviewsResponse,
     )
-    def delete_review(review_id: int, request: Request):
+    def delete_review(review_id: SqliteInt, request: Request):
         # Owner-only surface (see the /reviews reads): a scoped share token is
         # READ-only and must not delete a review session. Check BEFORE any DB read.
         if _token_scope_ids(server, request) is not None:
@@ -401,7 +402,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=RefreshReviewResponse,
     )
-    def refresh_review(review_id: int, request: Request):
+    def refresh_review(review_id: SqliteInt, request: Request):
         # Owner-only surface (see create_review / the /reviews reads): a scoped
         # share token is READ-only and must not mutate a review's queue.
         if _token_scope_ids(server, request) is not None:
@@ -425,7 +426,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ReviewResponse,
     )
-    def archive_review(review_id: int, request: Request):
+    def archive_review(review_id: SqliteInt, request: Request):
         # Owner-only surface (see the /reviews reads): a scoped share token is
         # READ-only and must not close a review session.
         if _token_scope_ids(server, request) is not None:
@@ -441,7 +442,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ReviewResponse,
     )
-    def abort_review(review_id: int, request: Request):
+    def abort_review(review_id: SqliteInt, request: Request):
         # Owner-only surface (see the /reviews reads): a scoped share token is
         # READ-only and must not close a review session.
         if _token_scope_ids(server, request) is not None:
@@ -468,11 +469,11 @@ def create_router(server) -> APIRouter:
         response_model=list[ReviewSuggestionItemResponse],
     )
     def list_review_suggestions(
-        review_id: int,
+        review_id: SqliteInt,
         request: Request,
         status: str = "PENDING",
-        limit: int = 100,
-        offset: int = 0,
+        limit: SqliteInt = 100,
+        offset: SqliteInt = 0,
     ):
         # Reviews are an owner-only curation surface (like /reviews and
         # /reviews/{id}). A scoped share token must not read this queue: the
