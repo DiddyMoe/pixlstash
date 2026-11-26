@@ -1588,6 +1588,11 @@ def _report_dependencies(
     for change in changes:
         note = f"replaces {change.installed}" if change.moves else "new"
         print(f"  {change.name:<{width}}  {change.version:<12}  {note}")
+        # pip's report cannot say which index served an artefact, so every
+        # index or find-links option the requirements carry is a possible
+        # source of every entry, and is named against each one.
+        for source in change.index_sources:
+            print(f"  {'':<{width}}  may come from {source}")
         # Named, because it is the one line that changes what agreeing means:
         # this package does not come from PyPI, so the name above says nothing
         # about who wrote it. The URL is what actually gets installed.

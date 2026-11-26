@@ -4,35 +4,60 @@ import contextlib
 import gzip
 import hashlib
 import importlib.util
+import ipaddress
 import json
+import logging
 import os
+import socket
 import sqlite3
+import ssl
 import threading
 import time
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
+import requests
+import urllib3.util.connection
 
 from pixlstash.hub.db import HubDatabase
 from pixlstash.routes.workflows import RunGroup, _mark_live_downloads
 from pixlstash.services import comfyui_templates, model_downloads
 from pixlstash.services.model_downloads import (
+    ALREADY_DOWNLOADING,
+    DOWNLOAD_ENDED_EARLY,
+    DOWNLOAD_FAILED,
+    DOWNLOAD_STALLED,
+    FOLDER_BEING_MOVED,
+    MAX_CONCURRENT_DOWNLOADS,
+    OUTSIDE_FOLDER,
+    START_FAILED,
     STATUS_CANCELLED,
     STATUS_DONE,
     STATUS_FAILED,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    STILL_STOPPING,
+    UNKNOWN_SOURCE,
     DownloadRefused,
+    DownloadStopped,
+    FolderBusy,
     cancel_download,
     digest_source,
     download_source,
     live_download_source,
     live_downloads,
+    release_folder,
+    reserve_folder,
     start_download,
     trusted_live_link,
 )
-from pixlstash.services.model_folder_scanner import ModelFolderScanner
-from pixlstash.services.model_mover import PARTIAL_SUFFIX, SHELF_IO_LOCK
+from pixlstash.services.model_folder_scanner import (
+    SHELF_MODEL_SUFFIXES,
+    ModelFolderScanner,
+)
+from pixlstash.services.model_mover import PARTIAL_SUFFIX, SHELF_IO_LOCK, MoveRefused
 from pixlstash.services.workflow_run_service import (
     MISSING_MODELS,
     MODELS_DOWNLOADING,
@@ -41,7 +66,20 @@ from pixlstash.services.workflow_run_service import (
     judge,
     missing_digest_models,
 )
+from pixlstash.utils import bounded_http
+from pixlstash.utils.bounded_http import PinnedAdapter, RedirectRefused, TargetRefused
+from tests.network_vectors import LAN_IPV4, PRIVATE_10_IPV4
+from tests.test_bounded_http import (
+    _Peer,
+    _rebinding_every_name,
+    _tls_files,
+    allow_local_link,
+)
 from tests.test_downloads_intake import _register, write_adapter
+
+# A subfolder a request may put in front of a name the list matches: no
+# refusal or failure the server answers may repeat it.
+LEAK = "example-leak-marker"
 
 
 @contextlib.contextmanager
@@ -112,7 +150,13 @@ def no_downloads_left():
 
 @pytest.fixture
 def linked(monkeypatch):
-    """Point every file name at *url*, in the ComfyUI folder *directory*."""
+    """Point every file name at *url*, in the ComfyUI folder *directory*.
+
+    A plain-http *url* is one of this file's loopback servers, let through
+    the first request's public-https check by the one test allowance,
+    ``allow_local_link``; any other address is still checked. An https *url*
+    is checked as it would be for real.
+    """
 
     def link(url, directory="loras", sha256=None):
         monkeypatch.setattr(
@@ -120,6 +164,8 @@ def linked(monkeypatch):
             "download_source",
             lambda file: {"url": url, "directory": directory, "sha256": sha256},
         )
+        if urlsplit(url).scheme == "http":
+            allow_local_link(monkeypatch, model_downloads, url)
 
     return link
 
@@ -156,10 +202,15 @@ def adapter_bytes(tmp_path):
 
 
 def _wait(download_id, timeout=10):
+    """The entry once its download has ended and its thread is done: a
+    cancel reads ``cancelled`` at once, before the thread has discarded the
+    partial file."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        # Read first: once the thread is done the status no longer moves.
+        done = model_downloads._downloads[download_id]["_done"].is_set()
         entry = next(d for d in live_downloads() if d["id"] == download_id)
-        if entry["status"] != "running":
+        if done and entry["status"] not in model_downloads.ACTIVE_STATUSES:
             return entry
         time.sleep(0.05)
     raise AssertionError(f"download {download_id} never ended")
@@ -281,26 +332,36 @@ def test_with_no_marked_folder_the_default_folder_takes_it(
 
 def test_a_file_the_list_does_not_link_is_refused(hub, target):
     with pytest.raises(DownloadRefused) as caught:
-        start_download(hub, "my_own_merge_v3.safetensors")
+        start_download(hub, f"{LEAK}/my_own_merge_v3.safetensors")
     assert caught.value.status_code == 404
+    assert str(caught.value) == UNKNOWN_SOURCE
     assert live_downloads() == []
 
 
 @pytest.mark.parametrize(
-    "file, status",
+    "file, status, says",
     [
-        ("a.txt", 400),
-        ("../../escape.safetensors", 400),
-        ("taken.safetensors", 409),
+        (
+            f"{LEAK}/a.txt",
+            400,
+            "That file is not a model file the shelf keeps "
+            f"({', '.join(SHELF_MODEL_SUFFIXES)}).",
+        ),
+        (f"../../{LEAK}.safetensors", 400, OUTSIDE_FOLDER),
+        (f"{LEAK}-taken.safetensors", 409, "That file is already in {chosen}."),
     ],
 )
-def test_refused_before_a_byte_is_fetched(hub, target, linked, file, status):
+def test_refused_before_a_byte_is_fetched(hub, target, linked, file, status, says):
+    """Wrong if a refusal repeats the name the request sent: the server's own
+    sentence, naming at most the registered folder."""
     chosen, _ = target
-    (chosen / "taken.safetensors").write_bytes(b"x")
+    (chosen / f"{LEAK}-taken.safetensors").write_bytes(b"x")
     linked("https://example.com/never-fetched", None)
     with pytest.raises(DownloadRefused) as caught:
         start_download(hub, file)
     assert caught.value.status_code == status
+    assert str(caught.value) == says.format(chosen=chosen)
+    assert LEAK not in str(caught.value)
     assert not any(d["file"] == os.path.basename(file) for d in live_downloads())
 
 
@@ -308,12 +369,79 @@ def test_the_same_file_twice_at_once_is_refused(hub, target, adapter_bytes, link
     gate = threading.Event()
     with serve_bytes(adapter_bytes, gate=gate) as url:
         linked(url)
-        first = start_download(hub, "twice.safetensors")
+        first = start_download(hub, f"{LEAK}/twice.safetensors")
         with pytest.raises(DownloadRefused) as caught:
-            start_download(hub, "twice.safetensors")
+            start_download(hub, f"{LEAK}/twice.safetensors")
         assert caught.value.status_code == 409
+        assert str(caught.value) == ALREADY_DOWNLOADING
         gate.set()
         assert _wait(first["id"])["status"] == STATUS_DONE
+
+
+class _OwnedLock:
+    """A stand-in for the registry's lock that knows which thread holds it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.owner = None
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.owner = threading.get_ident()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.owner = None
+        self._lock.release()
+
+
+def test_a_folder_reserved_by_a_symlink_is_checked_without_disk_calls_under_the_lock(
+    hub, target, linked, tmp_path, monkeypatch
+):
+    """Wrong if a folder reserved by another spelling (a symlink to it) still
+    takes a download, if a download writing inside it lets that reservation
+    through, or if either check resolves a path while it holds the registry's
+    lock: a folder on an unresponsive network share would then hold up every
+    download request behind it."""
+    chosen, _ = target
+    alias = tmp_path / "alias"
+    alias.symlink_to(chosen, target_is_directory=True)
+    lock = _OwnedLock()
+    monkeypatch.setattr(model_downloads, "_lock", lock)
+    real_realpath = os.path.realpath
+    resolved_under_lock = []
+
+    def spying_realpath(path, *args, **kwargs):
+        if lock.owner == threading.get_ident():
+            resolved_under_lock.append(os.fspath(path))
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", spying_realpath)
+
+    token = reserve_folder(str(alias))
+    try:
+        linked("https://example.com/never-fetched", None)
+        with pytest.raises(DownloadRefused) as caught:
+            start_download(hub, "held.safetensors")
+        assert (caught.value.status_code, str(caught.value)) == (
+            409,
+            FOLDER_BEING_MOVED,
+        )
+    finally:
+        release_folder(token)
+
+    writing = {
+        "id": "dl-writing",
+        "file": "inside.safetensors",
+        "status": STATUS_RUNNING,
+        "_target": real_realpath(chosen / "inside.safetensors"),
+        "_done": threading.Event(),
+    }
+    model_downloads._downloads[writing["id"]] = writing
+    with pytest.raises(FolderBusy):
+        reserve_folder(str(alias))
+    assert model_downloads._reserved == {}
+    assert resolved_under_lock == []
 
 
 def test_a_cancel_stops_it_and_leaves_nothing(hub, target, adapter_bytes, linked):
@@ -340,12 +468,280 @@ def test_a_cancel_stops_it_and_leaves_nothing(hub, target, adapter_bytes, linked
     assert cancel_download(entry["id"]) is False
 
 
+# A link that has begun to answer and then sends a byte every 50 ms: in its
+# headers, or after 96 KiB of a body it says is 1 MiB.
+_TRICKLE_HEADS = {
+    "headers": b"HTTP/1.1 200 OK\r\nX-Slow: ",
+    "body": (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+        b"Content-Length: %d\r\n\r\n" % (1 << 20)
+    )
+    + b"\0" * (96 * 1024),
+}
+
+
+def _trickling(head, release):
+    """A ``_Peer`` handler that sends *head*, then a byte every 50 ms until
+    *release* is set: a link that never falls silent and never finishes."""
+
+    def handler(conn, _request):
+        conn.sendall(head)
+        while not release.wait(0.05):
+            conn.sendall(b"x")
+
+    return handler
+
+
+def _under_way(peer, where):
+    """Wait until the download is reading the trickle: its request asked and
+    the head part sent, or a 64 KiB chunk of the body taken."""
+    deadline = time.monotonic() + 5
+    while True:
+        if where == "headers" and peer.requests:
+            time.sleep(0.2)
+            return
+        if where == "body" and any(
+            d["received"] >= 64 * 1024 for d in live_downloads()
+        ):
+            return
+        assert time.monotonic() < deadline, f"the download never read the {where}"
+        time.sleep(0.02)
+
+
+@pytest.mark.parametrize("where", ["headers", "body"])
+def test_a_cancel_ends_a_link_that_trickles_at_once(hub, target, linked, where):
+    """A byte every 50 ms never lets a receive time out, and a cancel was
+    only looked at between chunks, so the entry read running, and a retry was
+    refused as already downloading, until the link stopped on its own. The
+    cancel shuts the socket down: the entry reads cancelled within moments,
+    the partial file is gone, and the file can be asked for again at once.
+    Wrong too if the body's first 64 KiB is not counted while the rest is
+    still coming."""
+    chosen, _ = target
+    release = threading.Event()
+    with _Peer(_trickling(_TRICKLE_HEADS[where], release)) as peer:
+        try:
+            linked(peer.url, None)
+            entry = start_download(hub, "trickle.safetensors")
+            _under_way(peer, where)
+            assert cancel_download(entry["id"]) is True
+            done = _wait(entry["id"], timeout=3)
+            assert done["status"] == STATUS_CANCELLED, done
+            assert os.listdir(chosen) == ["loras"]
+            again = start_download(hub, "trickle.safetensors")
+            assert cancel_download(again["id"]) is True
+            assert _wait(again["id"], timeout=3)["status"] == STATUS_CANCELLED
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize("where", ["headers", "body"])
+def test_a_link_that_trickles_is_given_up_as_failed(
+    hub, target, adapter_bytes, linked, monkeypatch, caplog, where
+):
+    """Nobody cancels it: fewer than ``_STALL_BYTES`` in a window, here 1 s,
+    fails the download, the cause logged and the server's own sentence for a
+    stall shown, which says to try again rather than send the owner to the log.
+    The positive control: a link that keeps up lands under the same floor."""
+    chosen, _ = target
+    monkeypatch.setattr(model_downloads, "_STALL_SECONDS", 1.0)
+    caplog.set_level(logging.WARNING, logger=model_downloads.logger.name)
+    release = threading.Event()
+    with _Peer(_trickling(_TRICKLE_HEADS[where], release)) as peer:
+        try:
+            linked(peer.url, None)
+            done = _wait(start_download(hub, "slow.safetensors")["id"], timeout=5)
+        finally:
+            release.set()
+    assert done["status"] == STATUS_FAILED, done
+    assert done["error"] == DOWNLOAD_STALLED
+    assert "fewer than 65536 bytes came in 1 s" in caplog.text, caplog.text
+    assert os.listdir(chosen) == ["loras"]
+
+    with serve_bytes(adapter_bytes) as url:
+        linked(url, None)
+        landed = _wait(start_download(hub, "slow.safetensors")["id"])
+    assert landed["status"] == STATUS_DONE, landed
+
+
 def test_a_body_cut_short_is_not_saved(hub, target, adapter_bytes, linked):
     chosen, _ = target
     with serve_bytes(adapter_bytes, length=len(adapter_bytes) + 100) as url:
         linked(url, None)
         done = _wait(start_download(hub, "short.safetensors")["id"])
     assert done["status"] == STATUS_FAILED, done
+    assert os.listdir(chosen) == ["loras"]
+
+
+def _ending_short(monkeypatch, then=None):
+    """The body read whole but handed on only in its first half, then the
+    stream ends without raising: a cut-off urllib3 did not notice. *then*,
+    when given, runs after that half is taken and before the stream ends."""
+    real = requests.Response.iter_content
+
+    def iter_content(response, chunk_size=1, decode_unicode=False):
+        whole = b"".join(real(response, chunk_size, decode_unicode))
+        yield whole[: len(whole) // 2]
+        if then is not None:
+            then()
+
+    monkeypatch.setattr(requests.Response, "iter_content", iter_content)
+
+
+def test_a_body_that_ends_quietly_short_of_its_length_is_not_saved(
+    hub, target, adapter_bytes, linked, monkeypatch
+):
+    """Wrong if half a model lands on the shelf because the stream simply
+    stopped: the length it gave is checked where the bytes are kept, and the
+    owner is told to try again. The positive control lands the same file whole."""
+    chosen, chosen_id = target
+    with serve_bytes(adapter_bytes) as url:
+        linked(url, None)
+        with monkeypatch.context() as short:
+            _ending_short(short)
+            done = _wait(start_download(hub, "half.safetensors")["id"])
+        assert done["status"] == STATUS_FAILED, done
+        assert done["error"] == DOWNLOAD_ENDED_EARLY
+        assert done["received"] == len(adapter_bytes) // 2
+        assert os.listdir(chosen) == ["loras"]
+        assert (
+            hub.fetchone(
+                "SELECT 1 FROM model_file WHERE model_folder_id = ?", (chosen_id,)
+            )
+            is None
+        )
+        landed = _wait(start_download(hub, "half.safetensors")["id"])
+    assert landed["status"] == STATUS_DONE, landed
+
+
+def test_a_cancel_that_ends_the_stream_short_is_said_as_a_cancel(
+    hub, target, adapter_bytes, linked, monkeypatch, caplog
+):
+    """A cancel's shutdown can read as the body simply ending. Wrong if that
+    is judged as a body that ended early: the log would record a failed
+    download the owner had cancelled."""
+    chosen, _ = target
+    caplog.set_level(logging.INFO, logger=model_downloads.logger.name)
+    ids = []
+    _ending_short(monkeypatch, then=lambda: cancel_download(ids[0]))
+    with serve_bytes(adapter_bytes) as url:
+        linked(url, None)
+        ids.append(start_download(hub, "stopped.safetensors")["id"])
+        done = _wait(ids[0])
+    assert done["status"] == STATUS_CANCELLED, done
+    assert os.listdir(chosen) == ["loras"]
+    assert "stopped.safetensors cancelled." in caplog.text, caplog.text
+    assert "bytes declared" not in caplog.text, caplog.text
+
+
+def _statuses(ids):
+    by_id = {d["id"]: d["status"] for d in live_downloads()}
+    return [by_id[i] for i in ids]
+
+
+def _until(condition, what, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, f"never {what}"
+        time.sleep(0.02)
+
+
+def test_downloads_past_the_limit_wait_queued_and_can_be_cancelled_there(
+    hub, target, adapter_bytes, linked
+):
+    """Three downloads at once; the next ones read queued and ask nothing
+    until a slot frees. Wrong if a fourth connects at once, if a queued one
+    cannot be cancelled (it would start later regardless), or if one never
+    leaves the queue once a slot is free."""
+    assert MAX_CONCURRENT_DOWNLOADS == 3
+    chosen, _ = target
+    gate = threading.Event()
+    asked = []
+    with serve_bytes(adapter_bytes, gate=gate, asked=asked) as url:
+        linked(url, None)
+        try:
+            running = [
+                start_download(hub, f"slot{n}.safetensors")["id"] for n in range(3)
+            ]
+            _until(lambda: len(asked) == 3, "asked by all three")
+            queued = start_download(hub, "waits.safetensors")["id"]
+            later = start_download(hub, "later.safetensors")["id"]
+            # Past two polls of the queue, and still nothing asked.
+            time.sleep(2 * model_downloads._QUEUE_POLL_SECONDS + 0.2)
+            assert _statuses(running) == [STATUS_RUNNING] * 3
+            assert _statuses([queued, later]) == [STATUS_QUEUED] * 2
+            assert len(asked) == 3
+
+            assert cancel_download(queued) is True
+            assert _statuses([queued]) == [STATUS_CANCELLED]
+            assert _wait(queued, timeout=3)["status"] == STATUS_CANCELLED
+        finally:
+            gate.set()
+        ended = [_wait(i)["status"] for i in [*running, later]]
+    assert ended == [STATUS_DONE] * 4
+    # The cancelled one never asked; the later one did once a slot was free.
+    assert len(asked) == 4
+    assert sorted(os.listdir(chosen)) == [
+        "later.safetensors",
+        "loras",
+        "slot0.safetensors",
+        "slot1.safetensors",
+        "slot2.safetensors",
+    ]
+
+
+def test_a_cancel_during_the_connect_reads_cancelled_at_once_and_sends_nothing(
+    hub, target, linked, monkeypatch
+):
+    """A connect in progress is not interrupted from another thread, so the
+    entry reads cancelled at once and only the thread lingers, for at most
+    the connect. Wrong if the entry reads running until the connect ends, if
+    the file can be started again while that thread still runs, or if the
+    socket it then opens carries a byte: the TLS handshake, which would start
+    before any later check, or the request."""
+    chosen, _ = target
+    dialling = threading.Event()
+    release = threading.Event()
+    peers = []
+
+    def connect(address, *args, **kwargs):
+        dialling.set()
+        assert release.wait(10), "the connect was never let go"
+        ours, theirs = socket.socketpair()
+        # Bounds a handshake that should never start.
+        ours.settimeout(5)
+        peers.append(theirs)
+        return ours
+
+    # An https link checked for real: its name stands for a public host.
+    _rebinding_every_name(monkeypatch, 443, 443)
+    monkeypatch.setattr(urllib3.util.connection, "create_connection", connect)
+    linked("https://models.example/dialling.safetensors", None)
+    try:
+        entry = start_download(hub, "dialling.safetensors")
+        assert dialling.wait(5), "the download never connected"
+        assert cancel_download(entry["id"]) is True
+        assert _statuses([entry["id"]]) == [STATUS_CANCELLED]
+        with pytest.raises(DownloadRefused) as caught:
+            start_download(hub, "dialling.safetensors")
+        # Not "already being downloaded": the owner stopped it, and the
+        # retry is told it is only stopping.
+        assert str(caught.value) == STILL_STOPPING
+        assert caught.value.status_code == 409
+    finally:
+        release.set()
+    try:
+        _until(lambda: peers, "returned from the connect")
+        [peer] = peers
+        peer.settimeout(5)
+        # Closed with nothing written: the end of the stream, not a
+        # ClientHello.
+        assert peer.recv(4096) == b""
+    finally:
+        for peer in peers:
+            peer.close()
+    done = _wait(entry["id"])
+    assert done["status"] == STATUS_CANCELLED, done
     assert os.listdir(chosen) == ["loras"]
 
 
@@ -373,7 +769,10 @@ def test_a_gated_header_from_another_host_is_its_plain_error(hub, target, linked
         linked(url, "loras")
         done = _wait(start_download(hub, "gated.safetensors")["id"])
     assert done["status"] == STATUS_FAILED
-    assert done["error"].startswith("401 Client Error"), done["error"]
+    # The status in the server's words, not requests' sentence, which carries
+    # the whole URL.
+    assert done["error"] == "The link answered HTTP 401, so nothing was downloaded."
+    assert url not in done["error"]
     assert done["page_url"] is None
     assert os.listdir(chosen) == ["loras"]
 
@@ -391,10 +790,6 @@ class _Answer:
     def __exit__(self, *exc):
         return False
 
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise model_downloads.requests.HTTPError(f"{self.status_code} Error")
-
 
 @pytest.mark.parametrize(
     "headers, page",
@@ -408,19 +803,53 @@ def test_a_gated_hugging_face_file_links_its_model_page(
     tmp_path, monkeypatch, headers, page
 ):
     """Wrong if a gated file's error is the bare 401, or does not name where
-    the download would have put it, its ComfyUI subfolder included."""
+    the download would have put it (the entry's ``_save_into``)."""
     url = "https://huggingface.co/org/repo/resolve/main/x.safetensors"
-    monkeypatch.setattr(model_downloads, "_open", lambda u, live: _Answer(401, headers))
-    entry = {"_target": str(tmp_path / "loras" / "x"), "page_url": None}
-    with pytest.raises(
-        model_downloads.requests.HTTPError if page is None else ValueError
-    ) as caught:
+    monkeypatch.setattr(
+        model_downloads, "_open", lambda u, live, adapter: _Answer(401, headers)
+    )
+    entry = {"_save_into": str(tmp_path / "loras"), "page_url": None}
+    with pytest.raises(DownloadStopped) as caught:
         model_downloads._fetch(url, str(tmp_path / "x.part"), entry, threading.Event())
     assert entry["page_url"] == page
     if page:
         assert str(caught.value).startswith("It is gated on Hugging Face.")
         assert f"into {tmp_path / 'loras'};" in str(caught.value)
+    else:
+        assert str(caught.value) == (
+            "The link answered HTTP 401, so nothing was downloaded."
+        )
     assert not (tmp_path / "x.part").exists()
+
+
+@pytest.mark.parametrize(
+    "file, into",
+    [
+        # The caller's subfolders are theirs: the folder named is the server's.
+        (f"{LEAK}/x.safetensors", "loras"),
+        # A name already under the ComfyUI folder, which the download folder
+        # does not have yet: the download would make it, so it is named.
+        (f"loras/{LEAK}/x.safetensors", "loras"),
+    ],
+)
+def test_a_gated_file_names_the_servers_folder_not_the_callers_path(
+    hub, tmp_path, linked, monkeypatch, file, into
+):
+    """Wrong if the gated sentence repeats a subfolder the request put in
+    front of the name, or drops the ComfyUI subfolder the download uses."""
+    folder = tmp_path / "plain"
+    folder.mkdir()
+    _register(hub, folder, "user", is_default=1)
+    if not file.startswith("loras/"):
+        (folder / "loras").mkdir()
+    linked("https://huggingface.co/org/repo/resolve/main/x.safetensors", "loras")
+    gated = _Answer(401, {"X-Error-Code": "GatedRepo"})
+    monkeypatch.setattr(model_downloads, "_open", lambda u, live, adapter: gated)
+    done = _wait(start_download(hub, file)["id"])
+    assert done["status"] == STATUS_FAILED
+    assert f"save the file into {folder / into};" in done["error"], done["error"]
+    assert LEAK not in done["error"]
+    assert done["page_url"] == "https://huggingface.co/org/repo"
 
 
 @pytest.mark.parametrize(
@@ -461,6 +890,21 @@ def test_a_compressed_body_is_asked_against_and_refused(
     assert done["status"] == STATUS_FAILED
     assert "compressed" in done["error"]
     assert os.listdir(chosen) == ["loras"]
+
+
+@pytest.mark.parametrize("encoding", ["IDENTITY", "identity "])
+def test_identity_spelled_any_way_is_not_a_compressed_body(
+    hub, target, adapter_bytes, linked, encoding
+):
+    """Content codings are case-insensitive (RFC 9110 section 8.4.1) and a
+    field value's trailing space is not part of it (section 5.5), which
+    ``http.client`` leaves on. Wrong if such a file is refused as compressed."""
+    chosen, _ = target
+    with serve_bytes(adapter_bytes, encoding=encoding) as url:
+        linked(url, None)
+        done = _wait(start_download(hub, "plain.safetensors")["id"])
+    assert done["status"] == STATUS_DONE, done
+    assert (chosen / "plain.safetensors").is_file()
 
 
 def test_bytes_that_are_not_a_model_are_removed_again(hub, target, linked):
@@ -729,12 +1173,14 @@ def test_a_model_still_downloading_refuses_the_run_until_it_lands():
             "file": "SDXL/Hunyuan_3D_v2.1.safetensors",
             "folder": "checkpoints",
             "percent": 43.0,
+            "status": "running",
         },
         {
             "file": "qwen_image_vae.safetensors",
             "folder": "vae",
             "sha256": _QWEN_VAE,
             "percent": 43.0,
+            "status": "running",
         },
     ]
     assert by_code[MISSING_MODELS] == [
@@ -749,6 +1195,38 @@ def test_a_model_still_downloading_refuses_the_run_until_it_lands():
     assert (
         len(next(r for r in reasons if r.code == MISSING_MODELS).detail["models"]) == 3
     )
+
+
+def test_a_queued_download_reaches_the_run_refusal_as_queued():
+    """Wrong if a download waiting for a slot reads as one at 0% under
+    `models_downloading`: the entry carries its download's `status`, so the
+    notice can say it is queued rather than stuck."""
+    graph = {
+        "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {"ckpt_name": "waiting.safetensors"},
+        },
+        "2": {"class_type": "SaveImage", "inputs": {}},
+    }
+    object_info = {
+        "CheckpointLoaderSimple": {
+            "input": {"required": {"ckpt_name": [["other.safetensors"], {}]}}
+        },
+        "SaveImage": {"input": {"required": {}}},
+    }
+    entry = _running("waiting.safetensors", slot="checkpoint")
+    entry.update(status=STATUS_QUEUED, received=0, total=0)
+    reasons, _ = judge(graph, object_info, None)
+    assert [r.detail["models"] for r in reasons if r.code == MODELS_DOWNLOADING] == [
+        [
+            {
+                "file": "waiting.safetensors",
+                "folder": "checkpoints",
+                "percent": 0,
+                "status": STATUS_QUEUED,
+            }
+        ]
+    ]
 
 
 def test_a_lora_still_downloading_is_not_bypassed():
@@ -783,7 +1261,14 @@ def test_a_lora_still_downloading_is_not_bypassed():
     assert graph["4"]["inputs"]["model"] == ["2", 0]
     reasons, _ = judge(graph, object_info, None)
     assert [r.detail["models"] for r in reasons if r.code == MODELS_DOWNLOADING] == [
-        [{"file": "Coming.safetensors", "folder": "loras", "percent": 43.0}]
+        [
+            {
+                "file": "Coming.safetensors",
+                "folder": "loras",
+                "percent": 43.0,
+                "status": "running",
+            }
+        ]
     ]
 
 
@@ -868,20 +1353,86 @@ def test_a_body_of_unknown_length_is_refused(hub, target, adapter_bytes, linked)
 
 
 def test_a_row_the_hub_refuses_takes_the_file_with_it(
-    hub, target, adapter_bytes, linked, monkeypatch
+    hub, target, adapter_bytes, linked, monkeypatch, caplog
 ):
     chosen, _ = target
+    cause = sqlite3.IntegrityError("FOREIGN KEY constraint failed")
 
     def refuse(*args, **kwargs):
-        raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+        raise cause
 
     monkeypatch.setattr(ModelFolderScanner, "register_file", refuse)
+    caplog.set_level(logging.WARNING, logger=model_downloads.logger.name)
     with serve_bytes(adapter_bytes) as url:
         linked(url, None)
         done = _wait(start_download(hub, "refused.safetensors")["id"])
     assert done["status"] == STATUS_FAILED
+    # The database's sentence goes to the log with its traceback, not to
+    # every client polling the progress.
+    assert done["error"] == DOWNLOAD_FAILED
+    assert [
+        r.exc_info[1]
+        for r in caplog.records
+        if r.name == model_downloads.logger.name and r.exc_info
+    ] == [cause]
     # Nothing stranded at the real name, so a retry is not "already there".
     assert os.listdir(chosen) == ["loras"]
+
+
+def test_a_library_failure_is_the_servers_sentence_and_the_logs_cause(
+    hub, target, linked, monkeypatch, caplog
+):
+    """Wrong if requests' own sentence, which carries the URL and the name
+    asked for, reaches the entry every client polling the progress reads."""
+    linked("https://example.com/never-fetched", None)
+    cause = requests.ConnectionError(
+        "HTTPSConnectionPool(host='example.com', port=443): Max retries "
+        f"exceeded with url: /{LEAK}/x.safetensors"
+    )
+
+    def unreachable(url, live, adapter):
+        raise cause
+
+    monkeypatch.setattr(model_downloads, "_open", unreachable)
+    caplog.set_level(logging.WARNING, logger=model_downloads.logger.name)
+    done = _wait(start_download(hub, f"{LEAK}/x.safetensors")["id"])
+    assert done["status"] == STATUS_FAILED
+    assert done["error"] == DOWNLOAD_FAILED
+    assert [
+        r.exc_info[1]
+        for r in caplog.records
+        if r.name == model_downloads.logger.name and r.exc_info
+    ] == [cause]
+
+
+def test_no_room_names_the_registered_folder_not_the_callers_path(
+    hub, target, adapter_bytes, linked, monkeypatch, caplog
+):
+    """The space check's sentence names the directory the caller's subfolders
+    made; the entry says the registered folder and the size instead."""
+    chosen, _ = target
+    cause = MoveRefused(f"There is not enough free space in {chosen / 'loras' / LEAK}.")
+
+    def full(directory, size):
+        raise cause
+
+    monkeypatch.setattr(model_downloads, "require_space", full)
+    caplog.set_level(logging.WARNING, logger=model_downloads.logger.name)
+    with serve_bytes(adapter_bytes) as url:
+        linked(url, "loras")
+        done = _wait(start_download(hub, f"{LEAK}/x.safetensors")["id"])
+    assert done["status"] == STATUS_FAILED
+    assert done["error"] == (
+        f"PixlStash could not confirm room for its "
+        f"{len(adapter_bytes) / 1024**3:.2f} GB in {chosen}, so nothing was "
+        "downloaded. The server log says why."
+    )
+    assert LEAK not in done["error"]
+    assert [
+        r.exc_info[1]
+        for r in caplog.records
+        if r.name == model_downloads.logger.name and r.exc_info
+    ] == [cause]
 
 
 def test_a_cancel_while_waiting_for_the_shelf_wins(hub, target, adapter_bytes, linked):
@@ -951,41 +1502,214 @@ def test_a_name_already_under_its_folder_is_not_put_under_it_twice(
     assert (chosen / "loras" / "style.safetensors").is_file()
 
 
+def _resolving_to(monkeypatch, *addresses):
+    """Every name resolves to *addresses*, an IP literal to itself: no lookup
+    leaves the machine."""
+    real = socket.getaddrinfo
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        with contextlib.suppress(ValueError):
+            ipaddress.ip_address(host)
+            return real(host, port, *args, **kwargs)
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
+            for address in addresses
+        ]
+
+    monkeypatch.setattr(bounded_http.socket, "getaddrinfo", getaddrinfo)
+
+
+def _redirecting(monkeypatch, hops):
+    """The download's session answering each URL in *hops* with a redirect
+    to its value (``None`` ends the chain); returns the URLs asked, in order."""
+    asked = []
+
+    def get(session, url, **kwargs):
+        assert kwargs["allow_redirects"] is False
+        asked.append(url)
+        return _Hop(hops.get(url))
+
+    monkeypatch.setattr(model_downloads.requests.Session, "get", get)
+    return asked
+
+
 @pytest.mark.parametrize(
-    "hops, refused",
+    "live, refusal, says",
+    [(False, RedirectRefused, "not https"), (True, ValueError, "not Hugging Face")],
+)
+def test_a_redirect_onto_plain_http_is_never_asked(monkeypatch, live, refusal, says):
+    """Both kinds of link. Wrong if the plain http hop is asked at all."""
+    _resolving_to(monkeypatch, "8.8.8.8")
+    first = "https://huggingface.co/a/resolve/main/x.safetensors"
+    asked = _redirecting(monkeypatch, {first: "http://cdn-lfs.huggingface.co/x"})
+    with pytest.raises(refusal, match=says):
+        with model_downloads._open(first, live=live, adapter=PinnedAdapter()):
+            raise AssertionError("a refused hop was answered")
+    assert asked == [first]
+
+
+@pytest.mark.parametrize(
+    "location",
     [
-        (["https://example.com/a"], False),
-        (["https://example.com/a", "https://cdn.example.com/a"], False),
-        (["https://example.com/a", "http://cdn.example.com/a"], True),
-        (
-            [
-                "https://example.com/a",
-                "http://example-hop.test/a",
-                "https://cdn.example.com/a",
-            ],
-            True,
-        ),
+        "https://127.0.0.1/x",
+        f"https://{LAN_IPV4}/x",
+        f"https://{PRIVATE_10_IPV4}/x",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://[::1]/x",
+        "https://[::ffff:127.0.0.1]/x",
     ],
 )
-def test_no_hop_of_a_redirect_may_be_plain_http(hops, refused):
-    """Wrong if a chain that passes through plain http and back is let in."""
-    response = SimpleNamespace(
-        url=hops[-1], history=[SimpleNamespace(url=hop) for hop in hops[:-1]]
-    )
-    assert model_downloads._left_https(hops[0], response) is refused
+def test_a_list_link_redirected_into_this_network_is_never_asked(monkeypatch, location):
+    _resolving_to(monkeypatch, "8.8.8.8")
+    first = "https://example.com/model.safetensors"
+    asked = _redirecting(monkeypatch, {first: location})
+    with pytest.raises(RedirectRefused, match="private or local"):
+        with model_downloads._open(first, live=False, adapter=PinnedAdapter()):
+            raise AssertionError("a refused hop was answered")
+    assert asked == [first]
+
+
+def test_a_list_link_whose_redirect_resolves_into_this_network_is_never_asked(
+    monkeypatch,
+):
+    """A public-looking name is resolved before it is asked: the link's own
+    host is public, the host it redirects to also resolves into the LAN."""
+    _resolving_to(monkeypatch, "8.8.8.8")
+    public = bounded_http.socket.getaddrinfo
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        if host == "cdn.example.com":
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
+                for address in ("8.8.8.8", LAN_IPV4)
+            ]
+        return public(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(bounded_http.socket, "getaddrinfo", getaddrinfo)
+    first = "https://example.com/model.safetensors"
+    asked = _redirecting(monkeypatch, {first: "https://cdn.example.com/x"})
+    with pytest.raises(RedirectRefused, match="cdn.example.com"):
+        with model_downloads._open(first, live=False, adapter=PinnedAdapter()):
+            raise AssertionError("a refused hop was answered")
+    assert asked == [first]
+
+
+def test_a_list_link_redirected_to_a_public_https_host_is_followed(monkeypatch):
+    _resolving_to(monkeypatch, "8.8.8.8")
+    first = "https://example.com/model.safetensors"
+    asked = _redirecting(monkeypatch, {first: "https://cdn.example.com/x"})
+    with model_downloads._open(first, live=False, adapter=PinnedAdapter()) as final:
+        assert final.status_code == 200
+    assert asked == [first, "https://cdn.example.com/x"]
+
+
+def test_a_link_that_never_stops_redirecting_is_given_up(monkeypatch):
+    """Given up at the eleventh redirect before its target is checked, so the
+    name it points at is never looked up. Wrong if ``hop-eleven.example`` is
+    resolved: a chain would spend a lookup past its limit."""
+    _resolving_to(monkeypatch, "8.8.8.8")
+    resolve = bounded_http.socket.getaddrinfo
+    looked_up = []
+
+    def recording(host, port, *args, **kwargs):
+        looked_up.append(host)
+        return resolve(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(bounded_http.socket, "getaddrinfo", recording)
+    last = model_downloads._MAX_HOPS
+    hops = {
+        f"https://example.com/{n}": f"https://example.com/{n + 1}" for n in range(last)
+    }
+    hops[f"https://example.com/{last}"] = "https://hop-eleven.example/x"
+    asked = _redirecting(monkeypatch, hops)
+    with pytest.raises(ValueError, match="more than 10 times"):
+        with model_downloads._open(
+            "https://example.com/0", live=False, adapter=PinnedAdapter()
+        ):
+            raise AssertionError("a chain past the limit was answered")
+    assert len(asked) == last + 1
+    # The hops within the limit were each checked, which is a lookup.
+    assert looked_up.count("example.com") == last + 1
+    assert "hop-eleven.example" not in looked_up
+
+
+def test_a_plain_http_link_past_the_test_allowance_is_refused_unasked(
+    linked, adapter_bytes
+):
+    """Only the test's own server is let through: a plain-http link anywhere
+    else, here a second loopback server, is refused before it is asked."""
+    asked = []
+    with (
+        serve_bytes(adapter_bytes) as own,
+        serve_bytes(adapter_bytes, asked=asked) as other,
+    ):
+        linked(own)
+        with pytest.raises(TargetRefused, match="is not https"):
+            with model_downloads._open(other, live=False, adapter=PinnedAdapter()):
+                raise AssertionError("a plain-http link was answered")
+    assert asked == []
+
+
+def test_a_chunked_body_past_its_content_length_is_not_saved(hub, target, linked):
+    """urllib3 holds a plain body to its Content-Length, not a chunked one;
+    the space was checked for that length."""
+    chosen, _ = target
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", "10")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for _ in range(64):
+                    self.wfile.write(b"400\r\n" + b"x" * 1024 + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            except OSError as exc:
+                # The client hung up past the size it was given: expected.
+                print(f"chunked server: client went away ({exc})")
+
+        def log_message(self, *args):
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        linked(f"http://127.0.0.1:{httpd.server_port}/big.safetensors", None)
+        done = _wait(start_download(hub, "big.safetensors")["id"])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert done["status"] == STATUS_FAILED, done
+    assert "more than the size it gave" in done["error"]
+    assert os.listdir(chosen) == ["loras"]
 
 
 def test_a_thread_that_will_not_start_leaves_no_entry_behind(
-    hub, target, linked, monkeypatch
+    hub, target, linked, monkeypatch, caplog
 ):
+    cause = RuntimeError("can't start new thread")
+
     def refuse(self):
-        raise RuntimeError("can't start new thread")
+        raise cause
 
     linked("https://example.com/never-fetched", None)
     monkeypatch.setattr(threading.Thread, "start", refuse)
+    caplog.set_level(logging.ERROR, logger=model_downloads.logger.name)
     with pytest.raises(DownloadRefused) as caught:
         start_download(hub, "unstarted.safetensors")
     assert caught.value.status_code == 503
+    # A fixed sentence; the cause and the name are the log's.
+    assert str(caught.value) == START_FAILED
+    assert [
+        r.exc_info[1]
+        for r in caplog.records
+        if r.name == model_downloads.logger.name and r.exc_info
+    ] == [cause]
     assert live_downloads() == []
     monkeypatch.undo()
     linked("https://example.com/never-fetched", None)
@@ -1038,6 +1762,10 @@ def live_listing(monkeypatch):
         ("a.safetensors", "https://huggingface.co.example.com/a.safetensors", False),
         ("a.safetensors", "https://user@huggingface.co/a.safetensors", False),
         ("a.safetensors", "https://huggingface.co:8443/a.safetensors", False),
+        # Hugging Face to urlsplit; evil.example, or nothing, to requests.
+        ("a.safetensors", "https://evil.example\\.huggingface.co/a.safetensors", False),
+        ("a.safetensors", "https://hugging\tface.co/a.safetensors", False),
+        ("a.safetensors", "https://hugging\nface.co/a.safetensors", False),
         # A pickle: loading it runs code, so a live link never fetches one.
         ("a.pth", HF_LINK.format("a.pth"), False),
         ("a.ckpt", HF_LINK.format("a.ckpt"), False),
@@ -1146,59 +1874,98 @@ def test_the_preflight_asks_no_templates_while_comfyui_is_down(monkeypatch):
         ("https://evilhf.co/abc", False),
         ("https://user@cdn.hf.co/abc", False),
         ("https://cdn.hf.co:8443/abc", False),
+        ("https://hf.co/abc", True),
+        ("https://huggingface.co/abc", True),
+        # urlsplit reads each host below as Hugging Face's; requests sends
+        # the first two to evil.example and will not send the next two.
+        ("https://evil.example\\.huggingface.co/abc", False),
+        ("https://evil.example\\x.hf.co/abc", False),
+        ("https://hugging\tface.co/abc", False),
+        ("https://cdn.hf\n.co/abc", False),
+        ("https://huggingface.co@evil.example/abc", False),
+        ("https://evil.example@huggingface.co/abc", False),
     ],
 )
 def test_a_live_link_may_only_hop_within_hugging_face(url, allowed):
+    """Judged as requests sends the link, never as urlsplit reads it."""
     assert model_downloads._live_hop(url) is allowed
 
 
-class _Hop:
-    """A response that redirects to *location*, or ends with *location* None."""
+class _Hop(requests.Response):
+    """A response that redirects to *location*, or ends with *location* None.
+
+    A real ``requests.Response`` with no connection behind it, so the session
+    reads its status and Location the way it reads one off the wire.
+    """
 
     def __init__(self, location=None):
-        self.is_redirect = location is not None
-        self.headers = {"Location": location} if location else {}
+        super().__init__()
+        self.status_code = 302 if location is not None else 200
+        if location is not None:
+            self.headers["Location"] = location
 
     def close(self):
-        pass
+        """There is no connection to release."""
+        return None
 
 
 def test_a_live_link_redirected_off_hugging_face_is_never_asked(monkeypatch):
-    asked = []
+    _resolving_to(monkeypatch, "8.8.8.8")
     hops = {
         "https://huggingface.co/a/resolve/main/x.safetensors": "/b/resolve/main/x.safetensors",
         "https://huggingface.co/b/resolve/main/x.safetensors": "https://example.com/x",
     }
-
-    def get(url, **kwargs):
-        assert kwargs["allow_redirects"] is False
-        asked.append(url)
-        return _Hop(hops.get(url))
-
-    monkeypatch.setattr(model_downloads.requests, "get", get)
+    asked = _redirecting(monkeypatch, hops)
     with pytest.raises(ValueError, match="example.com"):
-        model_downloads._open(
-            "https://huggingface.co/a/resolve/main/x.safetensors", live=True
-        )
+        with model_downloads._open(
+            "https://huggingface.co/a/resolve/main/x.safetensors",
+            live=True,
+            adapter=PinnedAdapter(),
+        ):
+            raise AssertionError("a hop off Hugging Face was answered")
     assert asked == list(hops)
 
 
 def test_a_live_link_redirected_to_the_hugging_face_cdn_is_followed(monkeypatch):
-    asked = []
+    _resolving_to(monkeypatch, "8.8.8.8")
     hops = {
         "https://huggingface.co/a/resolve/main/x.safetensors": "https://us.aws.cdn.hf.co/x",
     }
-
-    def get(url, **kwargs):
-        asked.append(url)
-        return _Hop(hops.get(url))
-
-    monkeypatch.setattr(model_downloads.requests, "get", get)
-    final = model_downloads._open(
-        "https://huggingface.co/a/resolve/main/x.safetensors", live=True
-    )
-    assert not final.is_redirect
+    asked = _redirecting(monkeypatch, hops)
+    with model_downloads._open(
+        "https://huggingface.co/a/resolve/main/x.safetensors",
+        live=True,
+        adapter=PinnedAdapter(),
+    ) as final:
+        assert final.status_code == 200
     assert asked == [*hops, "https://us.aws.cdn.hf.co/x"]
+
+
+@pytest.mark.parametrize(
+    "url, named",
+    [
+        ("https://example.com/a/resolve/main/x.safetensors", "example.com"),
+        ("https://evil.example\\.huggingface.co/x.safetensors", "evil.example"),
+    ],
+)
+def test_a_live_first_link_off_hugging_face_is_refused_with_nothing_asked(
+    monkeypatch, url, named
+):
+    """The backstop: start_download takes a live link only once
+    trusted_live_link has passed it, and _open refuses one that did not,
+    before it is checked, looked up or asked."""
+    asked = _redirecting(monkeypatch, {})
+    checked = []
+    monkeypatch.setattr(
+        model_downloads, "vet_target", lambda link: checked.append(link) or ()
+    )
+    with pytest.raises(DownloadStopped) as caught:
+        with model_downloads._open(url, live=True, adapter=PinnedAdapter()):
+            raise AssertionError("a live link off Hugging Face was answered")
+    assert str(caught.value) == (
+        f"The link led to {named}, which is not Hugging Face, so it was not followed."
+    )
+    assert (checked, asked) == ([], [])
 
 
 def test_a_live_source_reaches_the_fetch_as_live(
@@ -1220,3 +1987,470 @@ def test_a_live_source_reaches_the_fetch_as_live(
     assert seen.wait(5)
     _wait(entry["id"])
     assert calls == [(HF_LINK.format("fresh.safetensors"), True)]
+
+
+# ---------------------------------------------------------------------------
+# DNS rebinding: every request a download makes, its link and each redirect
+# hop, connects to the address its check resolved (bounded_http.PinnedAdapter)
+# ---------------------------------------------------------------------------
+
+ORIGIN_NAME = "origin.test"
+CDN_NAME = "cdn.test"
+STANDIN_PUBLIC = "127.0.0.1"
+STANDIN_PRIVATE = "127.0.0.2"
+
+
+@pytest.fixture
+def tls_names(tmp_path, monkeypatch):
+    """``files(name)`` gives ``(chain, key)`` for a certificate naming *name*,
+    from its own CA; every CA made is trusted through ``REQUESTS_CA_BUNDLE``.
+    No environment proxy is taken, so a request goes where it is pinned."""
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(b"")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(bundle))
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
+
+    def files(name):
+        folder = tmp_path / name
+        folder.mkdir()
+        ca, chain, key = _tls_files(folder, name)
+        bundle.write_bytes(bundle.read_bytes() + ca.read_bytes())
+        return chain, key
+
+    return files
+
+
+def _tls_server(chain, key, answer):
+    """A local https peer; *answer(tls, head)* writes the response.
+    ``.names`` records each handshake's SNI name, ``.heads`` each request
+    head read over TLS, ``.refused`` each handshake the client refused."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(chain, key)
+    names = []
+    context.sni_callback = lambda sock, name, ctx: names.append(name)
+
+    def handler(conn, _):
+        try:
+            with context.wrap_socket(conn, server_side=True) as tls:
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    piece = tls.recv(65536)
+                    if not piece:
+                        return
+                    head += piece
+                peer.heads.append(head)
+                answer(tls, head)
+        except ssl.SSLError as exc:
+            # The client refused the certificate, which a test may intend.
+            peer.refused.append(exc)
+
+    peer = _Peer(handler, read_request=False)
+    peer.names = names
+    peer.heads = []
+    peer.refused = []
+    return peer
+
+
+def _redirect_to(location):
+    def answer(tls, _head):
+        tls.sendall(
+            b"HTTP/1.1 302 Found\r\nLocation: %s\r\nContent-Length: 0\r\n\r\n"
+            % location.encode()
+        )
+
+    return answer
+
+
+def _body(data, length=None):
+    def answer(tls, _head):
+        tls.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+            b"Content-Length: %d\r\n\r\n%s"
+            % (len(data) if length is None else length, data)
+        )
+
+    return answer
+
+
+def _resolving(monkeypatch, ports):
+    """Each name in *ports* resolves to this computer at its listed ports in
+    turn (the last one repeated), as a short-TTL record changed between the
+    check and the connect would; an IP literal resolves to itself. 127.0.0.1
+    stands in for a public address and every other one stays what it is.
+    Returns ``{name: [port handed out, ...]}``."""
+    real = socket.getaddrinfo
+    handed = {name: [] for name in ports}
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        if host not in ports:
+            return real(host, port, *args, **kwargs)
+        address, *rest = ports[host]
+        listed = [address, *rest]
+        given = handed[host]
+        chosen = listed[min(len(given), len(listed) - 1)]
+        given.append(chosen[1])
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", chosen)]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(
+        bounded_http,
+        "_is_public",
+        lambda address: str(address) == STANDIN_PUBLIC,
+    )
+    return handed
+
+
+def _read(url):
+    with model_downloads._open(url, live=False, adapter=PinnedAdapter()) as response:
+        response.raise_for_status()
+        return response.content
+
+
+def test_a_redirect_hop_that_rebinds_connects_to_the_address_checked(
+    tls_names, monkeypatch
+):
+    """The hop's name is looked up once, by the check; a second answer naming
+    another place is never asked. Host and SNI keep the name. Wrong if the
+    hop's connection makes its own lookup."""
+    chain, key = tls_names(CDN_NAME)
+    origin_chain, origin_key = tls_names(ORIGIN_NAME)
+    with (
+        _tls_server(chain, key, _body(b"vetted")) as vetted,
+        _tls_server(chain, key, _body(b"rebound")) as rebound,
+    ):
+        hop = f"https://{CDN_NAME}:{vetted.port}/x"
+        with _tls_server(origin_chain, origin_key, _redirect_to(hop)) as origin:
+            handed = _resolving(
+                monkeypatch,
+                {
+                    ORIGIN_NAME: [(STANDIN_PUBLIC, origin.port)],
+                    CDN_NAME: [
+                        (STANDIN_PUBLIC, vetted.port),
+                        (STANDIN_PUBLIC, rebound.port),
+                    ],
+                },
+            )
+            body = _read(f"https://{ORIGIN_NAME}:{origin.port}/model.safetensors")
+    assert body == b"vetted"
+    assert handed[CDN_NAME] == [vetted.port]
+    assert rebound.asked == 0
+    assert vetted.names == [CDN_NAME]
+    assert vetted.refused == []
+    assert vetted.heads[0].startswith(b"GET /x HTTP/1.1\r\n")
+    assert f"host: {CDN_NAME}:{vetted.port}\r\n".encode() in vetted.heads[0].lower()
+
+
+def test_the_link_itself_connects_to_the_address_checked(tls_names, monkeypatch):
+    """The first request is checked and pinned like a hop. Wrong if the link
+    is asked by a fresh lookup of its name."""
+    chain, key = tls_names(ORIGIN_NAME)
+    with (
+        _tls_server(chain, key, _body(b"vetted")) as vetted,
+        _tls_server(chain, key, _body(b"rebound")) as rebound,
+    ):
+        handed = _resolving(
+            monkeypatch,
+            {
+                ORIGIN_NAME: [
+                    (STANDIN_PUBLIC, vetted.port),
+                    (STANDIN_PUBLIC, rebound.port),
+                ]
+            },
+        )
+        body = _read(f"https://{ORIGIN_NAME}:{vetted.port}/model.safetensors")
+    assert body == b"vetted"
+    assert handed[ORIGIN_NAME] == [vetted.port]
+    assert rebound.asked == 0
+    assert vetted.names == [ORIGIN_NAME]
+    host = f"host: {ORIGIN_NAME}:{vetted.port}\r\n".encode()
+    assert host in vetted.heads[0].lower()
+
+
+@pytest.mark.parametrize(
+    "typed, sent",
+    [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("straße.example", "xn--strae-oqa.example"),
+    ],
+)
+@pytest.mark.parametrize("via", ["link", "redirect"])
+def test_a_non_ascii_host_is_pinned_as_the_name_sent(
+    tls_names, monkeypatch, typed, sent, via
+):
+    """A download's own requests check, pin and connect for the ``xn--`` name
+    ``requests`` sends, looked up once. Wrong if the connection is refused as
+    unchecked (the pin filed under the typed name), or looks the name up
+    afresh and reaches the rebound address."""
+    chain, key = tls_names(sent)
+    with (
+        _tls_server(chain, key, _body(b"vetted")) as vetted,
+        _tls_server(chain, key, _body(b"rebound")) as rebound,
+    ):
+        asked = _rebinding_every_name(monkeypatch, vetted.port, rebound.port)
+        link = f"https://{typed}:{vetted.port}/model.safetensors"
+        if via == "link":
+            body = _read(link)
+        else:
+
+            def handler(conn, _):
+                # UTF-8 bytes in the Location, decoded back by requests.
+                conn.sendall(
+                    b"HTTP/1.1 302 Found\r\nLocation: %s\r\n"
+                    b"Content-Length: 0\r\n\r\n" % link.encode("utf-8")
+                )
+
+            with _Peer(handler) as origin:
+                allow_local_link(monkeypatch, model_downloads, origin.url)
+                body = _read(f"{origin.url}/model.safetensors")
+    assert body == b"vetted"
+    assert asked == [sent]
+    assert rebound.asked == 0
+    assert vetted.names == [sent]
+    assert f"host: {sent}:{vetted.port}\r\n".encode() in vetted.heads[0].lower()
+
+
+def test_a_redirects_body_is_never_read(tls_names, monkeypatch):
+    """A redirect that declares a GiB body and sends a little of it is
+    followed at once. Wrong if the download waits for the rest, here until
+    its read timeout: a plain ``requests.Session`` reads a redirect's whole
+    body, under no cap, before it hands the answer over."""
+    monkeypatch.setattr(model_downloads, "_TIMEOUT_SECONDS", (5, 3))
+    chain, key = tls_names(CDN_NAME)
+    with _tls_server(chain, key, _body(b"vetted")) as vetted:
+        _resolving(monkeypatch, {CDN_NAME: [(STANDIN_PUBLIC, vetted.port)]})
+        hop = f"https://{CDN_NAME}:{vetted.port}/model.safetensors"
+
+        def handler(conn, _):
+            conn.sendall(
+                b"HTTP/1.1 302 Found\r\nLocation: %s\r\n"
+                b"Content-Length: %d\r\n\r\n" % (hop.encode(), 1 << 30)
+            )
+            conn.sendall(b"x" * (256 * 1024))
+            # Held open until the client hangs up.
+            conn.recv(1)
+
+        with _Peer(handler) as origin:
+            allow_local_link(monkeypatch, model_downloads, origin.url)
+            body = _read(f"{origin.url}/model.safetensors")
+    assert body == b"vetted"
+    assert vetted.asked == 1
+
+
+def test_a_redirect_whose_location_is_not_utf8_is_refused_naming_its_host(
+    monkeypatch,
+):
+    """Location bytes that are not UTF-8 are a RedirectRefused naming the host
+    that sent them, and the place is never checked. Wrong if they are read as
+    ``http.client``'s Latin-1 text and checked, or escape as a bare
+    ``UnicodeDecodeError``."""
+    checked = []
+
+    def check(current, location):
+        checked.append(location)
+        return location, ("127.0.0.1",)
+
+    monkeypatch.setattr(model_downloads, "vet_redirect_target", check)
+
+    def handler(conn, _):
+        conn.sendall(
+            b"HTTP/1.1 302 Found\r\nLocation: https://b\xfccher.example/x\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        )
+
+    with _Peer(handler) as origin:
+        allow_local_link(monkeypatch, model_downloads, origin.url)
+        with pytest.raises(RedirectRefused) as refused:
+            _read(f"{origin.url}/model.safetensors")
+    assert str(refused.value) == "127.0.0.1 sent a redirect whose address is not UTF-8."
+    assert checked == []
+
+
+@contextlib.contextmanager
+def _listening_at(address):
+    """A socket listening at *address* that counts the connections it takes."""
+    server = socket.socket()
+    server.bind((address, 0))
+    server.listen(8)
+    server.settimeout(0.1)
+    taken = []
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            taken.append(conn)
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield server.getsockname()[1], taken
+    finally:
+        stop.set()
+        thread.join(5)
+        server.close()
+
+
+@pytest.mark.parametrize("hop", [True, False], ids=["hop", "link"])
+def test_a_private_address_is_refused_with_nothing_sent(tls_names, monkeypatch, hop):
+    """A name resolving to a private address is refused before anything
+    connects to it, whether a hop names it or the link itself does. Wrong if
+    the check is skipped: the listener there would be connected to."""
+    chain, key = tls_names(ORIGIN_NAME)
+    with _listening_at(STANDIN_PRIVATE) as (port, taken):
+        private = f"https://{CDN_NAME}:{port}/x"
+        with _tls_server(chain, key, _redirect_to(private)) as origin:
+            _resolving(
+                monkeypatch,
+                {
+                    ORIGIN_NAME: [(STANDIN_PUBLIC, origin.port)],
+                    CDN_NAME: [(STANDIN_PRIVATE, port)],
+                },
+            )
+            first = f"https://{ORIGIN_NAME}:{origin.port}/m" if hop else private
+            refusal = RedirectRefused if hop else TargetRefused
+            with pytest.raises(refusal, match="private or local"):
+                _read(first)
+        assert origin.asked == (1 if hop else 0)
+        assert taken == []
+
+
+@pytest.mark.parametrize("hop", [True, False], ids=["hop", "link"])
+def test_a_pinned_request_still_refuses_a_certificate_for_another_name(
+    tls_names, monkeypatch, hop
+):
+    """Connecting by address must not turn the certificate check off: a
+    certificate that does not name the host asked is refused, and SNI still
+    carries that name."""
+    chain, key = tls_names("other.test")
+    origin_chain, origin_key = tls_names(ORIGIN_NAME)
+    with _tls_server(chain, key, _body(b"impostor")) as impostor:
+        named = CDN_NAME if hop else ORIGIN_NAME
+        target = f"https://{named}:{impostor.port}/x"
+        with _tls_server(origin_chain, origin_key, _redirect_to(target)) as origin:
+            _resolving(
+                monkeypatch,
+                {
+                    ORIGIN_NAME: [
+                        (STANDIN_PUBLIC, origin.port if hop else impostor.port)
+                    ],
+                    CDN_NAME: [(STANDIN_PUBLIC, impostor.port)],
+                },
+            )
+            first = f"https://{ORIGIN_NAME}:{origin.port}/m" if hop else target
+            with pytest.raises(requests.exceptions.SSLError):
+                _read(first)
+    assert impostor.names == [named]
+    assert impostor.heads == []
+
+
+def _pinned_chain(tls_names, monkeypatch, cdn_answer):
+    """A list link on ``origin.test`` redirected to ``cdn.test``, which answers
+    with *cdn_answer*; yields ``(link, origin, cdn)``."""
+    chain, key = tls_names(CDN_NAME)
+    origin_chain, origin_key = tls_names(ORIGIN_NAME)
+
+    @contextlib.contextmanager
+    def chained():
+        with _tls_server(chain, key, cdn_answer) as cdn:
+            hop = f"https://{CDN_NAME}:{cdn.port}/blob"
+            with _tls_server(origin_chain, origin_key, _redirect_to(hop)) as origin:
+                _resolving(
+                    monkeypatch,
+                    {
+                        ORIGIN_NAME: [(STANDIN_PUBLIC, origin.port)],
+                        CDN_NAME: [(STANDIN_PUBLIC, cdn.port)],
+                    },
+                )
+                link = f"https://{ORIGIN_NAME}:{origin.port}/model.safetensors"
+                yield link, origin, cdn
+
+    return chained()
+
+
+def test_a_public_redirect_chain_still_downloads_onto_the_shelf(
+    hub, target, adapter_bytes, linked, tls_names, monkeypatch
+):
+    """The positive control: a link redirected to a CDN, both pinned, lands
+    on the shelf with the bytes the CDN sent."""
+    chosen, chosen_id = target
+    with _pinned_chain(tls_names, monkeypatch, _body(adapter_bytes)) as chained:
+        link, origin, cdn = chained
+        linked(link)
+        done = _wait(start_download(hub, "pinned.safetensors")["id"])
+    assert done["status"] == STATUS_DONE, done
+    assert (chosen / "loras" / "pinned.safetensors").read_bytes() == adapter_bytes
+    assert (origin.asked, cdn.asked) == (1, 1)
+    assert (origin.names, cdn.names) == ([ORIGIN_NAME], [CDN_NAME])
+    assert hub.fetchone(
+        "SELECT 1 FROM model_file WHERE model_folder_id = ?", (chosen_id,)
+    )
+
+
+def test_a_pinned_download_streams_its_body(
+    hub, target, adapter_bytes, linked, tls_names, monkeypatch
+):
+    """Bytes are written as they arrive, not after the whole body is in:
+    the download has received some while the CDN still holds the rest. The
+    body is several read chunks long, as in the cancel test above."""
+    chosen, _ = target
+    body = adapter_bytes * 16384
+    assert len(body) // 2 > model_downloads._CHUNK_BYTES
+    gate = threading.Event()
+
+    def held(tls, _head):
+        half = len(body) // 2
+        tls.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+            b"Content-Length: %d\r\n\r\n%s" % (len(body), body[:half])
+        )
+        gate.wait(10)
+        tls.sendall(body[half:])
+
+    with _pinned_chain(tls_names, monkeypatch, held) as chained:
+        link, _origin, _cdn = chained
+        linked(link)
+        entry = start_download(hub, "streamed.safetensors")
+        deadline = time.monotonic() + 5
+        try:
+            while not any(
+                d["id"] == entry["id"] and d["received"] for d in live_downloads()
+            ):
+                assert time.monotonic() < deadline, "nothing arrived before the end"
+                time.sleep(0.02)
+            assert not gate.is_set()
+        finally:
+            gate.set()
+        done = _wait(entry["id"])
+    assert done["status"] == STATUS_DONE, done
+    assert (chosen / "loras" / "streamed.safetensors").read_bytes() == body
+
+
+def test_a_pinned_download_past_the_size_it_gave_is_not_saved(
+    hub, target, linked, tls_names, monkeypatch
+):
+    """The size cap holds through a pinned chain: a chunked body that runs
+    past its Content-Length is refused and nothing is kept."""
+    chosen, _ = target
+
+    def oversized(tls, _head):
+        tls.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+            b"Content-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        for _ in range(64):
+            tls.sendall(b"400\r\n" + b"x" * 1024 + b"\r\n")
+        tls.sendall(b"0\r\n\r\n")
+
+    with _pinned_chain(tls_names, monkeypatch, oversized) as chained:
+        link, _origin, _cdn = chained
+        linked(link)
+        done = _wait(start_download(hub, "big.safetensors")["id"])
+    assert done["status"] == STATUS_FAILED, done
+    assert "more than the size it gave" in done["error"]
+    assert os.listdir(chosen) == ["loras"]

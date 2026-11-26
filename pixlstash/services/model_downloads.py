@@ -18,7 +18,9 @@ registers it on the shelf, so the next run finds it there.
 
 **One thread per download, followed in memory.** A download is minutes of
 waiting on a socket, not work for the task runner's queues, and the runs in
-flight are followed the same way (``comfyui_service.live_runs``).
+flight are followed the same way (``comfyui_service.live_runs``). At most
+:data:`MAX_CONCURRENT_DOWNLOADS` fetch at once; a later one reads ``queued``
+until one of them ends, and can be cancelled while it waits.
 :func:`live_downloads` is what ``GET /workers/progress`` reports as
 ``downloads``; a finished one stays in it for :data:`FINISHED_KEEP_SECONDS` so
 every client polling sees how it ended. ponytail: in memory, so a restart
@@ -34,23 +36,56 @@ Cancel, failure and refusal all discard the partial file, and a file the
 hub then refuses to register is removed again. A response with no
 ``Content-Length`` is refused, since there would be no space check.
 
+**What a failed download says is the server's own sentence.** A refusal and
+a failed entry's ``error`` (shown to every client polling
+``GET /workers/progress``) never repeat the caller's ``file``, which may carry
+any subfolder in front of the name the list matched, nor a library's error
+text: a :class:`DownloadStopped` is composed from fixed text, sizes, digests,
+the registered folder and the hosts the link led to, and anything else is
+answered with :data:`DOWNLOAD_FAILED` and logged with its traceback (CWE-209).
+
 **Where it lands inside the folder.** The name is the one the workflow asked
 for, its own subfolders included (``SDXL/foo.safetensors``). When the folder
 has a subfolder named for the ComfyUI model folder the loader reads
 (``loras``, ``checkpoints``), the file goes in it, so a ComfyUI ``models``
 folder registered on the shelf is filled the way ComfyUI itself would read it.
+
+**A folder being moved takes no download, and one being downloaded into is not
+moved.** A move, removal or rename of a model folder's directory (the
+relocations, ``dirs/move``, ``dirs/remove``, the rename) reserves that
+directory with :func:`reserve_folder` for as long as its job runs, and
+releases it with :func:`release_folder` however the job ends. The reservation
+is refused (:class:`FolderBusy`) while a download that has not finished writes
+inside the directory, and :func:`start_download` refuses
+(:data:`FOLDER_BEING_MOVED`) a file whose destination lies inside a reserved
+one. Both checks and both registrations happen under ``_lock``, so neither
+side can slip in between the other's check and its registration. A download
+counts until its thread has ended (``_done``), not until it reads
+``cancelled``: a cancelled one can still be finishing a connect, and its
+thread then removes its partial. ``SHELF_IO_LOCK`` alone is no answer: an
+import, a forget and the intake hold it too, for minutes, and none of them
+touches a download's folder.
+
+**Lock order: ``SHELF_IO_LOCK``, then ``_lock``; never the other way.**
+:func:`_publish` takes ``_lock`` while it holds ``SHELF_IO_LOCK``, and so do
+the routes that reserve a folder, which reserve once they hold it. Nothing
+here waits for ``SHELF_IO_LOCK`` while it holds ``_lock``: every ``_lock``
+section is a short read or write of the registry, and :func:`_publish` waits
+for ``SHELF_IO_LOCK`` before it takes ``_lock``. ``_slots`` and the adapter's
+own lock are taken outside ``_lock`` too.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import threading
 import time
 import uuid
 from functools import lru_cache
-from typing import Callable, Optional
-from urllib.parse import urljoin, urlparse
+from typing import Callable, Iterator, Optional
+from urllib.parse import urljoin
 
 import requests
 
@@ -72,14 +107,33 @@ from pixlstash.services.model_mover import (
     require_space,
 )
 from pixlstash.utils.adapter_header import folder_name_role
+from pixlstash.utils.bounded_http import (
+    HandRedirectSession,
+    PinnedAdapter,
+    TargetRefused,
+    stalled,
+    vet_redirect_target,
+    vet_target,
+    wire_split,
+)
 from pixlstash.utils.path_utils import resolve_path_within
 
 logger = get_logger(__name__)
 
+STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
+# A download that has not ended: waiting for a slot, or fetching.
+ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING)
+
+# How many downloads fetch at once; a later one waits as queued. Each is a
+# thread and a connection held for minutes, and a click on every missing model
+# of a large workflow would otherwise open them all together.
+MAX_CONCURRENT_DOWNLOADS = 3
+# How often a queued download looks again for a slot, and for its cancel.
+_QUEUE_POLL_SECONDS = 0.25
 
 # Long enough for a client on the idle 5 s poll to see the ending twice.
 FINISHED_KEEP_SECONDS = 30
@@ -93,12 +147,45 @@ LIVE_SUFFIXES = (".safetensors", ".gguf")
 LIVE_HOP_DOMAINS = ("huggingface.co", "hf.co")
 _MAX_HOPS = 10
 
-_CHUNK_BYTES = 1 << 20
-# Connect, then the longest silence between two reads.
+# Small enough that a cancel is seen between two chunks of a slow body; a
+# cancel during a chunk is ended by `cancel_download` shutting the socket.
+_CHUNK_BYTES = 64 * 1024
+# Each connect attempt (one per checked address), then the longest any one
+# receive may wait. A receive can return a byte at a time, so this alone does
+# not end a trickle: the stall floor below does.
 _TIMEOUT_SECONDS = (15, 120)
+# A response, headers and body alike, must bring this many bytes in every
+# window this long or it is given up (`bounded_http.PinnedAdapter`'s
+# `stall_floor`). The window is the read timeout's own, so a link that pauses
+# no longer than it was already allowed to still downloads.
+_STALL_BYTES = 64 * 1024
+_STALL_SECONDS = _TIMEOUT_SECONDS[1]
+
+# Refusal and failure texts the server writes. None repeats the caller's file
+# name: a request may put any subfolder in front of the name the list matched.
+UNKNOWN_SOURCE = "PixlStash does not know where to download that file from."
+OUTSIDE_FOLDER = "That file would be written outside the download folder."
+ALREADY_DOWNLOADING = "That file is already being downloaded."
+# A retry of a cancelled download whose thread has not ended yet: the cancel
+# was taken, and the thread is finishing a connect (at most 15 s).
+STILL_STOPPING = "That file's download is still stopping. Try again in a few seconds."
+# A start whose destination lies inside a folder a move, removal or rename is
+# working on (`reserve_folder`).
+FOLDER_BEING_MOVED = (
+    "The folder this file would download into is being moved or removed. "
+    "Try again when that is done."
+)
+START_FAILED = "The download could not be started. The server log says why."
+DOWNLOAD_FAILED = "The download failed. The server log says why."
+DOWNLOAD_STALLED = "The download stopped receiving data. Try again."
+DOWNLOAD_ENDED_EARLY = "The download ended early. Try again."
 
 _downloads: dict[str, dict] = {}
+# The directories moves, removals and renames are working on, by the token
+# `reserve_folder` handed out for each.
+_reserved: dict[str, str] = {}
 _lock = threading.Lock()
+_slots = threading.BoundedSemaphore(MAX_CONCURRENT_DOWNLOADS)
 
 
 class DownloadRefused(ValueError):
@@ -109,8 +196,23 @@ class DownloadRefused(ValueError):
         self.status_code = status_code
 
 
+class DownloadStopped(ValueError):
+    """A download ended for a reason the server put in its own words.
+
+    Its message becomes the failed entry's ``error``, so it is composed only
+    from fixed text, sizes, digests, the registered download folder and the
+    host a link led to: never the caller's file name or subfolders, and never
+    a library's error text, which goes to the log instead.
+    """
+
+
 class _Cancelled(Exception):
     """The owner cancelled the download."""
+
+
+class FolderBusy(Exception):
+    """A download that has not finished writes inside the folder, so it cannot
+    be reserved for a move, a removal or a rename (:func:`reserve_folder`)."""
 
 
 @lru_cache(maxsize=1)
@@ -157,12 +259,16 @@ def trusted_live_link(name: str, url: Optional[str]) -> bool:
     Only ``https://huggingface.co/...``, exactly that host (no userinfo, no
     port), and only for a file format that loading cannot run as code: not
     ``.pth``, which is a pickle. The committed list's links were reviewed; a
-    live template's were not, so it gets the narrower rule.
+    live template's were not, so it gets the narrower rule. The host is read
+    as ``requests`` would send the link (``bounded_http.wire_split``), so a
+    link ``urlsplit`` would place on Hugging Face cannot reach another host.
     """
     if not isinstance(url, str) or not name.lower().endswith(LIVE_SUFFIXES):
         return False
-    parsed = urlparse(url)
-    return parsed.scheme == "https" and parsed.netloc in LIVE_HOSTS
+    parsed = _wire_parts(url)
+    return (
+        parsed is not None and parsed.scheme == "https" and parsed.netloc in LIVE_HOSTS
+    )
 
 
 def live_sources(comfyui_url: Optional[str], object_info: Optional[dict]) -> dict:
@@ -242,18 +348,27 @@ def digest_source(sha256: str) -> Optional[dict]:
     return None
 
 
-def _relpath(folder_path: str, file: str, comfyui_folder: Optional[str]) -> str:
-    """Where *file* goes inside the download folder, relative to it."""
+def _placement(
+    folder_path: str, file: str, comfyui_folder: Optional[str]
+) -> tuple[Optional[str], str]:
+    """Where *file* goes inside the download folder.
+
+    Returns:
+        The subfolder the server puts it under (``None`` for the folder's
+        top), and its path relative to the folder, the caller's own
+        subfolders included.
+    """
     name = file.replace("\\", "/").strip().strip("/")
     if not comfyui_folder:
-        return name
+        return None, name
     head, sep, rest = name.partition("/")
     if sep and head.casefold() == comfyui_folder.casefold():
         # Already under it, in whatever case: once, in the folder's own
         # subfolder for it, else spelled as the list does.
-        return f"{_subfolder_for(folder_path, comfyui_folder) or comfyui_folder}/{rest}"
+        subfolder = _subfolder_for(folder_path, comfyui_folder) or comfyui_folder
+        return subfolder, f"{subfolder}/{rest}"
     subfolder = _subfolder_for(folder_path, comfyui_folder)
-    return f"{subfolder}/{name}" if subfolder else name
+    return subfolder, (f"{subfolder}/{name}" if subfolder else name)
 
 
 def _subfolder_for(folder_path: str, comfyui_folder: str) -> Optional[str]:
@@ -310,14 +425,11 @@ def start_download(
         file, comfyui_url, object_info
     )
     if source is None:
-        raise DownloadRefused(
-            f"PixlStash does not know where to download {file} from.", 404
-        )
+        raise DownloadRefused(UNKNOWN_SOURCE, 404)
     url = source["url"]
-    parsed = urlparse(url)
     if not file.lower().endswith(SHELF_MODEL_SUFFIXES):
         raise DownloadRefused(
-            f"{file} is not a model file the shelf keeps "
+            "That file is not a model file the shelf keeps "
             f"({', '.join(SHELF_MODEL_SUFFIXES)})."
         )
     folder = find_download_folder(hub)
@@ -329,7 +441,7 @@ def start_download(
         raise DownloadRefused(
             f"{folder['path']} is not a readable directory right now.", 409
         )
-    relpath = _relpath(folder["path"], file, source["directory"])
+    subfolder, relpath = _placement(folder["path"], file, source["directory"])
     try:
         target = resolve_path_within(folder["path"], relpath)
     except ValueError as exc:
@@ -339,16 +451,16 @@ def start_download(
             folder["path"],
             exc,
         )
-        raise DownloadRefused(f"{file!r} would be written outside the folder.") from exc
+        raise DownloadRefused(OUTSIDE_FOLDER) from exc
     if os.path.lexists(target):
-        raise DownloadRefused(f"{relpath} is already in {folder['path']}.", 409)
+        raise DownloadRefused(f"That file is already in {folder['path']}.", 409)
 
     entry = {
         "id": uuid.uuid4().hex,
         "file": os.path.basename(target),
-        "host": parsed.netloc,
+        "host": _host_named(url),
         "folder_path": folder["path"],
-        "status": STATUS_RUNNING,
+        "status": STATUS_QUEUED,
         "received": 0,
         "total": 0,
         "error": None,
@@ -363,17 +475,50 @@ def start_download(
         "sha256": (source.get("sha256") or "").lower() or None,
         "directory": source.get("directory"),
         "slot": directory_slot(source.get("directory")),
+        # Where a gated file is to be saved by hand, in the server's words:
+        # the registered folder and the ComfyUI subfolder the download would
+        # use, not the subfolders the caller put in front of the name.
+        "_save_into": (
+            os.path.join(folder["path"], subfolder) if subfolder else folder["path"]
+        ),
     }
     with _lock:
         # Case folded: on macOS and Windows two spellings are one partial file.
-        if any(
-            d["_target"].casefold() == target.casefold()
-            and d["status"] == STATUS_RUNNING
-            for d in _downloads.values()
-        ):
-            raise DownloadRefused(f"{relpath} is already being downloaded.", 409)
+        # Until its thread has ended, not merely until it reads cancelled: a
+        # thread still finishing a connect would discard a retry's partial.
+        # One the owner cancelled is only stopping, and says so.
+        busy = next(
+            (
+                d
+                for d in _downloads.values()
+                if d["_target"].casefold() == target.casefold()
+                and not d["_done"].is_set()
+            ),
+            None,
+        )
+        if busy is not None:
+            stopping = busy["status"] == STATUS_CANCELLED
+            raise DownloadRefused(
+                STILL_STOPPING if stopping else ALREADY_DOWNLOADING, 409
+            )
+        # Checked under the lock `reserve_folder` takes, so a move reserving
+        # this folder either sees the entry below or is seen here. `target`
+        # and every reserved path are already resolved.
+        moving = next(
+            (path for path in _reserved.values() if _resolved_within(target, path)),
+            None,
+        )
+        if moving is not None:
+            logger.warning(
+                "Refusing to download %s: %s is being moved, removed or renamed.",
+                target,
+                moving,
+            )
+            raise DownloadRefused(FOLDER_BEING_MOVED, 409)
         entry["_target"] = target
         entry["_cancel"] = threading.Event()
+        # Set once the thread has ended and left nothing of its own behind.
+        entry["_done"] = threading.Event()
         _downloads[entry["id"]] = entry
     thread = threading.Thread(
         target=_run,
@@ -397,37 +542,123 @@ def start_download(
         # being downloaded" until a restart.
         with _lock:
             _downloads.pop(entry["id"], None)
-        logger.error("Could not start the download of %s: %s", target, exc)
-        raise DownloadRefused(
-            f"The download of {relpath} could not be started.", 503
-        ) from exc
-    logger.info("Downloading %s from %s into %s.", relpath, parsed.netloc, target)
+        logger.error(
+            "Could not start download %s of %s.", entry["id"], target, exc_info=True
+        )
+        raise DownloadRefused(START_FAILED, 503) from exc
+    logger.info("Downloading %s from %s into %s.", relpath, entry["host"], target)
     return _public(entry)
 
 
+def reserve_folder(path: str) -> str:
+    """Reserve the directory *path* for a move, a removal or a rename.
+
+    Until :func:`release_folder` is called with the token returned,
+    :func:`start_download` refuses a file whose destination lies inside
+    *path*, spelled directly or through a symlink. The caller releases it
+    however its job ends: success, failure, refusal or exception. Callers that
+    hold ``SHELF_IO_LOCK`` reserve after taking it (the module docstring's
+    lock order).
+
+    Raises:
+        FolderBusy: A download that has not finished (its thread has not ended,
+            whatever its status reads) writes inside *path*. Nothing was
+            reserved.
+    """
+    # Resolved before the lock, as every download's `_target` was, so the
+    # checks under it compare strings and never wait on the filesystem.
+    resolved = os.path.realpath(path)
+    with _lock:
+        busy = next(
+            (
+                d
+                for d in _downloads.values()
+                if not d["_done"].is_set() and _resolved_within(d["_target"], resolved)
+            ),
+            None,
+        )
+        if busy is not None:
+            logger.info(
+                "Not reserving %s: download %s (%s) writes %s inside it.",
+                path,
+                busy["id"],
+                busy["status"],
+                busy["_target"],
+            )
+            raise FolderBusy(path)
+        token = uuid.uuid4().hex
+        _reserved[token] = resolved
+        return token
+
+
+def release_folder(token: str) -> None:
+    """End the reservation :func:`reserve_folder` returned *token* for."""
+    with _lock:
+        del _reserved[token]
+
+
+def _resolved_within(path: str, base: str) -> bool:
+    """Whether *path* lies inside the directory *base*, both already resolved.
+
+    Both were passed through ``os.path.realpath`` before ``_lock`` was taken,
+    so this only compares strings. A filesystem call under ``_lock`` would hold
+    up every download request behind a folder on an unresponsive network share.
+    """
+    norm_path = os.path.normcase(path)
+    norm_base = os.path.normcase(base)
+    try:
+        return os.path.commonpath([norm_path, norm_base]) == norm_base
+    except ValueError:
+        # Paths on different drives (Windows): one cannot hold the other.
+        return False
+
+
 def cancel_download(download_id: str) -> bool:
-    """Ask a running download to stop. False when no such download is running."""
+    """Stop a queued or running download.
+
+    True says the cancel was taken: the entry reads ``cancelled`` at once,
+    and nothing it fetched is kept. Its thread stops on its own and discards
+    the partial file; only that thread can linger, and for at most one
+    connect attempt (:data:`_TIMEOUT_SECONDS`, 15 s), since a connect in
+    progress is not interrupted from here (no socket is closed across
+    threads) and the socket it opens is closed before a handshake or a byte
+    of the request. A request in flight has its socket shut down here, so a
+    receive blocked on a link that sends nothing, or a byte at a time, ends
+    at once rather than when the link next sends. Until the thread has ended
+    the same file cannot be started again. False when no such download is
+    queued or running, or it is already being published and will land.
+    """
     with _lock:
         entry = _downloads.get(download_id)
         # Past `_committed` the file is being published and will land.
         if (
             entry is None
-            or entry["status"] != STATUS_RUNNING
+            or entry["status"] not in ACTIVE_STATUSES
             or entry.get("_committed")
         ):
             return False
         entry["_cancel"].set()
+        entry["status"] = STATUS_CANCELLED
+        entry["ended_at"] = time.monotonic()
+        adapter = entry.get("_adapter")
+    # Outside the lock: the shutdown takes the adapter's own.
+    if adapter is not None:
+        adapter.abort()
     return True
 
 
 def live_downloads() -> list[dict]:
-    """The downloads running, and those that ended in the last few seconds."""
+    """The downloads queued or running, and those that ended in the last few
+    seconds. An entry is kept while its thread runs, so a cancelled one is
+    still there to refuse a second start of its file."""
     now = time.monotonic()
     with _lock:
         for key in [
             key
             for key, d in _downloads.items()
-            if d["ended_at"] is not None and now - d["ended_at"] > FINISHED_KEEP_SECONDS
+            if d["ended_at"] is not None
+            and now - d["ended_at"] > FINISHED_KEEP_SECONDS
+            and d["_done"].is_set()
         ]:
             del _downloads[key]
         return [_public(d) for d in _downloads.values()]
@@ -436,7 +667,7 @@ def live_downloads() -> list[dict]:
 def running_download(
     file: str, sha256: Optional[str] = None, folder: Optional[str] = None
 ) -> Optional[dict]:
-    """The running download of *file* or of *sha256*, or None.
+    """The queued or running download of *file* or of *sha256*, or None.
 
     *file* by its own name, case folded and without the loader's subfolder, as
     :func:`download_source` reads it; *sha256* where the list recorded one. A
@@ -456,7 +687,7 @@ def running_download(
     kind = directory_slot(folder) if folder else None
     with _lock:
         for entry in _downloads.values():
-            if entry["status"] != STATUS_RUNNING:
+            if entry["status"] not in ACTIVE_STATUSES:
                 continue
             if digest and entry.get("sha256") == digest:
                 return _public(entry)
@@ -482,9 +713,43 @@ def _public(entry: dict) -> dict:
 
 def _end(entry: dict, status: str, error: Optional[str] = None) -> None:
     with _lock:
+        if entry["status"] == STATUS_CANCELLED:
+            # Taken at once by cancel_download; whatever the thread then ran
+            # into (the shut-down socket's error) is the cancel, and the file
+            # cannot have landed (`_committed` refuses a cancel).
+            if status != STATUS_CANCELLED:
+                logger.info(
+                    "Download %s was cancelled; its thread ended as %s (%s).",
+                    entry["id"],
+                    status,
+                    error,
+                )
+            return
         entry["status"] = status
         entry["error"] = error
         entry["ended_at"] = time.monotonic()
+
+
+@contextlib.contextmanager
+def _slot(entry: dict, cancel: threading.Event) -> Iterator[None]:
+    """Hold one of the :data:`MAX_CONCURRENT_DOWNLOADS` slots while the block
+    runs, waiting as ``queued`` for one; the entry reads ``running`` once it
+    has one.
+
+    Raises:
+        _Cancelled: The download was cancelled while it waited.
+    """
+    while not _slots.acquire(timeout=_QUEUE_POLL_SECONDS):
+        if cancel.is_set():
+            raise _Cancelled()
+    try:
+        with _lock:
+            if cancel.is_set():
+                raise _Cancelled()
+            entry["status"] = STATUS_RUNNING
+        yield
+    finally:
+        _slots.release()
 
 
 def _run(
@@ -497,19 +762,40 @@ def _run(
     expected: Optional[str] = None,
     live: bool = False,
 ) -> None:
+    try:
+        _settle(hub, entry, url, folder_id, relpath, on_arrived, expected, live)
+    finally:
+        entry["_done"].set()
+
+
+def _settle(
+    hub: HubDatabase,
+    entry: dict,
+    url: str,
+    folder_id: int,
+    relpath: str,
+    on_arrived: Optional[Callable[[int], None]],
+    expected: Optional[str],
+    live: bool,
+) -> None:
+    """Fetch, check and publish the download, and end its entry however that
+    goes; :func:`_run`'s body."""
     target = entry["_target"]
     partial = target + PARTIAL_SUFFIX
     cancel = entry["_cancel"]
     try:
-        digest = _fetch(url, partial, entry, cancel, live=live)
+        # The network slot is let go before publishing: a move waits on the
+        # shelf's lock, not on another download's socket.
+        with _slot(entry, cancel):
+            digest = _fetch(url, partial, entry, cancel, live=live)
         # The file the list names, or nothing: another file under the same
         # link would land on the shelf and leave a loader that asks for the
         # listed digest still missing, with nothing said.
         if expected and digest != expected:
-            raise ValueError(
-                f"{entry['file']} arrived, but it is not the file the template "
-                f"list names (its SHA-256 is {digest}, the list says "
-                f"{expected}), so it was removed again."
+            raise DownloadStopped(
+                "It arrived, but it is not the file the template list names "
+                f"(its SHA-256 is {digest}, the list says {expected}), so it "
+                "was removed again."
             )
         model_id = _publish(hub, partial, entry, folder_id, relpath, digest)
     except _Cancelled:
@@ -517,17 +803,41 @@ def _run(
         logger.info("Download of %s cancelled.", target)
         _end(entry, STATUS_CANCELLED)
         return
-    except (OSError, requests.RequestException, MoveRefused, ValueError) as exc:
+    except (DownloadStopped, TargetRefused) as exc:
+        # Sentences the server composed (a TargetRefused names only the host
+        # it refused), so the entry may show them.
         discard_partial(partial)
-        logger.warning("Download of %s from %s failed: %s", target, entry["host"], exc)
+        logger.warning(
+            "Download %s of %s from %s stopped: %s",
+            entry["id"],
+            target,
+            entry["host"],
+            exc,
+        )
         _end(entry, STATUS_FAILED, str(exc))
         return
-    except Exception as exc:
+    except (OSError, requests.RequestException, MoveRefused, ValueError) as exc:
+        # A library's text (a URL, a path, a header value): logged, not shown.
+        discard_partial(partial)
+        logger.warning(
+            "Download %s of %s from %s failed.",
+            entry["id"],
+            target,
+            entry["host"],
+            exc_info=True,
+        )
+        # A link that went quiet is worth a retry; say so rather than send the
+        # owner to the log.
+        _end(
+            entry, STATUS_FAILED, DOWNLOAD_STALLED if stalled(exc) else DOWNLOAD_FAILED
+        )
+        return
+    except Exception:
         # A thread's last stop: anything else (the hub refusing the row) would
         # otherwise leave the entry reading "running" forever.
         discard_partial(partial)
-        logger.exception("Download of %s failed unexpectedly.", target)
-        _end(entry, STATUS_FAILED, f"The download failed: {exc}")
+        logger.exception("Download %s of %s failed unexpectedly.", entry["id"], target)
+        _end(entry, STATUS_FAILED, DOWNLOAD_FAILED)
         return
     entry["model_id"] = model_id
     _end(entry, STATUS_DONE)
@@ -547,31 +857,40 @@ def model_page(url: str) -> Optional[str]:
     ``https://huggingface.co/<org>/<repo>/resolve/...`` gives
     ``https://huggingface.co/<org>/<repo>``: where a gated model's licence is
     accepted. Only for that host, so the link handed to the browser is never
-    one a template could point anywhere.
+    one a template could point anywhere. Read as ``requests`` sends *url*
+    (``bounded_http.wire_split``).
     """
-    parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.netloc not in LIVE_HOSTS:
+    parsed = _wire_parts(url)
+    if parsed is None or parsed.scheme != "https" or parsed.netloc not in LIVE_HOSTS:
         return None
     repo, sep, _rest = parsed.path.partition("/resolve/")
     return f"https://{parsed.netloc}{repo}" if sep and repo.count("/") >= 2 else None
 
 
-def _left_https(url: str, response) -> bool:
-    """Whether an https link was redirected onto plain http at any hop.
+def _wire_parts(url: str):
+    """*url* split as ``requests`` sends it (``bounded_http.wire_split``), or
+    None when ``requests`` would not send it at all. Every host decision on a
+    link to fetch reads this, never ``urlparse``: the two disagree on a
+    backslash in the host, and ``requests`` is what connects."""
+    try:
+        return wire_split(url)
+    except (requests.RequestException, ValueError) as exc:
+        logger.info("A link requests would not send was not trusted: %s", exc)
+        return None
 
-    The list's links are https. A plain hop in the middle of the chain lets
-    anyone on that network point the rest of it somewhere else, so every hop
-    counts, not only where it ended.
-    """
-    hops = [hop.url for hop in response.history] + [response.url]
-    return url.startswith("https://") and not all(
-        hop.startswith("https://") for hop in hops
-    )
+
+def _host_named(url: str) -> str:
+    """The host *url* reaches, as ``requests`` sends it, for a sentence."""
+    parsed = _wire_parts(url)
+    return (parsed.hostname if parsed is not None else None) or "an unnamed host"
 
 
 def _live_hop(url: str) -> bool:
-    """Whether a live link may be asked at *url*: https on Hugging Face."""
-    parsed = urlparse(url)
+    """Whether a live link may be asked at *url*: https on Hugging Face, read
+    as ``requests`` sends it, with no port and no user name."""
+    parsed = _wire_parts(url)
+    if parsed is None:
+        return False
     host = parsed.hostname or ""
     return (
         parsed.scheme == "https"
@@ -582,39 +901,138 @@ def _live_hop(url: str) -> bool:
     )
 
 
-def _open(url: str, live: bool) -> requests.Response:
-    """GET *url* as a stream; for a *live* link, redirects followed by hand,
-    each hop's host checked (:func:`_live_hop`) before it is asked."""
+@contextlib.contextmanager
+def _cancellable(
+    entry: dict, cancel: threading.Event, adapter: PinnedAdapter
+) -> Iterator[None]:
+    """Let :func:`cancel_download` stop the requests *adapter* makes for
+    *entry* while the block runs.
+
+    The adapter is put on the entry under the lock the cancel takes, so a
+    cancel either finds it and shuts its sockets down, or is seen here first.
+    Whatever a shut-down socket raises inside the block (requests' connection
+    error, urllib3's cut-short body) is the cancel, and is raised as one.
+
+    Raises:
+        _Cancelled: *cancel* was set before or during the block.
+    """
+    with _lock:
+        if cancel.is_set():
+            raise _Cancelled()
+        entry["_adapter"] = adapter
+    try:
+        yield
+    except _Cancelled:
+        raise
+    except Exception as exc:
+        if not cancel.is_set():
+            raise
+        logger.info(
+            "Download %s of %s cancelled mid-request (%s: %s).",
+            entry["id"],
+            entry["_target"],
+            type(exc).__name__,
+            exc,
+        )
+        raise _Cancelled() from exc
+    finally:
+        with _lock:
+            entry.pop("_adapter", None)
+
+
+@contextlib.contextmanager
+def _open(url: str, live: bool, adapter: PinnedAdapter) -> Iterator[requests.Response]:
+    """GET *url* as a stream, its redirects followed by hand, at most
+    :data:`_MAX_HOPS` of them; the answer is closed when the block ends.
+
+    *url* is the server's own (the committed list, or a live link
+    :func:`trusted_live_link` took). It and every hop a redirect names are
+    checked before they are asked: https, no user name, and every address
+    the host resolves to public (``bounded_http.vet_target`` and
+    ``vet_redirect_target``), so a link cannot be bounced onto plain http or
+    into this network; a *live* link's hops must also stay on Hugging Face
+    (:func:`_live_hop`).
+
+    Each request connects to the addresses its check resolved, each in turn
+    until one answers (*adapter*, a ``bounded_http.PinnedAdapter`` the caller
+    keeps so it can stop the request), never to a second lookup of the name
+    that a short-lived DNS record could answer with a private address (DNS
+    rebinding). The name is checked and pinned as ``requests`` sends it, a
+    non-ASCII host in its ``xn--`` form. SNI, the certificate check and the
+    ``Host`` header keep the name. Not ``bounded_request``: a model is
+    gigabytes streamed for as long as it takes, past any one deadline, and
+    :func:`_fetch` reads its headers before deciding to take the body.
+
+    Raises:
+        DownloadStopped: A live hop off Hugging Face, or too many redirects.
+        TargetRefused: *url* failed ``vet_target``.
+        RedirectRefused: A hop that failed ``vet_redirect_target``, or one
+            named in bytes that are not UTF-8.
+    """
     kwargs = {
         "stream": True,
         "timeout": _TIMEOUT_SECONDS,
+        "allow_redirects": False,
         # Content-Length counts the bytes sent and requests decodes what it
         # is sent, so a compressed body would outgrow the space checked for it.
         "headers": {"User-Agent": "PixlStash", "Accept-Encoding": "identity"},
     }
-    if not live:
-        return requests.get(url, **kwargs)
-    for _hop in range(_MAX_HOPS):
-        if not _live_hop(url):
-            raise ValueError(
-                f"The link led to {urlparse(url).netloc or url}, which is not "
-                "Hugging Face, so it was not followed."
-            )
-        response = requests.get(url, allow_redirects=False, **kwargs)
-        if not response.is_redirect:
-            return response
-        url = urljoin(url, response.headers.get("Location", ""))
-        response.close()
-    raise ValueError(f"The link redirected more than {_MAX_HOPS} times.")
+    # Backstop: start_download only takes live links trusted_live_link passed.
+    if live and not _live_hop(url):
+        raise DownloadStopped(
+            f"The link led to {_host_named(url)}, "
+            "which is not Hugging Face, so it was not followed."
+        )
+    adapter.pin(url, vet_target(url))
+    # Not requests.Session: it reads a redirect's whole body, uncapped.
+    with HandRedirectSession() as session:
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        for _hop in range(_MAX_HOPS + 1):
+            response = session.get(url, **kwargs)
+            if not 300 <= response.status_code < 400:
+                with response:
+                    yield response
+                return
+            with response:
+                # Its body unread. None for a 3xx other than 301, 302, 303,
+                # 307 and 308, which vet_redirect_target refuses as no address.
+                location = session.redirect_target(response)
+            if _hop == _MAX_HOPS:
+                break
+            named = urljoin(url, (location or "").strip())
+            if live and not _live_hop(named):
+                raise DownloadStopped(
+                    f"The link led to {_host_named(named)}"
+                    ", which is not Hugging Face, so it was not followed."
+                )
+            url, addresses = vet_redirect_target(url, location)
+            adapter.pin(url, addresses)
+    raise DownloadStopped(f"The link redirected more than {_MAX_HOPS} times.")
 
 
 def _fetch(
     url: str, partial: str, entry: dict, cancel: threading.Event, live: bool = False
 ) -> str:
-    """Stream *url* into *partial* and return the SHA-256 of what was written."""
+    """Stream *url* into *partial* and return the SHA-256 of what was written.
+
+    A response that brings fewer than :data:`_STALL_BYTES` in any
+    :data:`_STALL_SECONDS` is given up as failed, and :func:`cancel_download`
+    shuts the request's socket down, so neither a trickle nor a cancel holds
+    the entry (and every retry of the file) as running.
+
+    Raises:
+        _Cancelled: The owner cancelled it.
+        DownloadStopped: Among others, :data:`DOWNLOAD_ENDED_EARLY` for a body
+            that ended short of its ``Content-Length``.
+    """
     os.makedirs(os.path.dirname(partial), exist_ok=True)
     sha = hashlib.sha256()
-    with _open(url, live) as response:
+    adapter = PinnedAdapter(stall_floor=(_STALL_BYTES, _STALL_SECONDS))
+    with (
+        _cancellable(entry, cancel, adapter),
+        _open(url, live, adapter) as response,
+    ):
         page = model_page(url)
         if page and response.headers.get("X-Error-Code") == "GatedRepo":
             # No Hugging Face token is sent, so a gated file is never served
@@ -625,20 +1043,25 @@ def _fetch(
             # Instruction first: the notice shows three lines. Where the
             # download would have put it, its ComfyUI subfolder included, so
             # the folder still says what kind of model it is.
-            raise ValueError(
+            raise DownloadStopped(
                 "It is gated on Hugging Face. Open its page, get access there, "
-                f"and save the file into {os.path.dirname(entry['_target'])}; "
+                f"and save the file into {entry['_save_into']}; "
                 "PixlStash picks it up from there."
             )
-        response.raise_for_status()
-        if _left_https(url, response):
-            raise ValueError("The download was redirected away from https.")
-        if response.headers.get("Content-Encoding", "identity") != "identity":
-            raise ValueError(
+        # The status, not requests' sentence, which carries the whole URL.
+        if 400 <= response.status_code < 600:
+            raise DownloadStopped(
+                f"The link answered HTTP {response.status_code}, so nothing was "
+                "downloaded."
+            )
+        # Content codings are case-insensitive (RFC 9110 section 8.4.1).
+        encoding = response.headers.get("Content-Encoding") or "identity"
+        if encoding.strip().lower() != "identity":
+            raise DownloadStopped(
                 "The link sent the file compressed, so its size cannot be checked."
             )
         if "text/html" in response.headers.get("Content-Type", ""):
-            raise ValueError(
+            raise DownloadStopped(
                 "The link answered with a web page, not a file. It may need "
                 "you to sign in, or it is the model's page rather than its "
                 "download link."
@@ -647,9 +1070,25 @@ def _fetch(
         if total <= 0:
             # Without a size there is no space check, and a stream that never
             # ends would fill the disk.
-            raise ValueError("The server did not say how large the file is.")
+            raise DownloadStopped("The server did not say how large the file is.")
         entry["total"] = total
-        require_space(os.path.dirname(partial), total)
+        try:
+            require_space(os.path.dirname(partial), total)
+        except MoveRefused as exc:
+            # Its sentence names the subfolder the caller's name put the file
+            # in; the registered folder and the size say the same to the owner.
+            logger.warning(
+                "Download %s: no room confirmed for %s bytes in %s.",
+                entry["id"],
+                total,
+                os.path.dirname(partial),
+                exc_info=True,
+            )
+            raise DownloadStopped(
+                f"PixlStash could not confirm room for its {total / 1024**3:.2f} "
+                f"GB in {entry['folder_path']}, so nothing was downloaded. The "
+                "server log says why."
+            ) from exc
         with open(partial, "wb") as out:
             for chunk in response.iter_content(_CHUNK_BYTES):
                 if cancel.is_set():
@@ -657,8 +1096,29 @@ def _fetch(
                 out.write(chunk)
                 sha.update(chunk)
                 entry["received"] += len(chunk)
-    # A body cut short of its Content-Length is raised by urllib3 itself
-    # (`enforce_content_length`), so it never reaches here as complete.
+                # A chunked body is not held to its Content-Length by urllib3,
+                # and the space was checked for that length only.
+                if entry["received"] > total:
+                    raise DownloadStopped(
+                        "The link sent more than the size it gave, so the "
+                        "file was not kept."
+                    )
+            # A cancel's shutdown can read as the end of the body; it is the
+            # cancel, and is said as one, before the length is judged.
+            if cancel.is_set():
+                raise _Cancelled()
+            # urllib3 2.x raises a body cut short of its Content-Length itself
+            # (`enforce_content_length`); this is the check where the bytes are
+            # kept, so a stream that ends quietly is never published. The body
+            # is identity here: any other coding was refused above.
+            if entry["received"] != total:
+                logger.warning(
+                    "Download %s ended at %s of the %s bytes declared.",
+                    entry["id"],
+                    entry["received"],
+                    total,
+                )
+                raise DownloadStopped(DOWNLOAD_ENDED_EARLY)
     return sha.hexdigest()
 
 
@@ -697,9 +1157,9 @@ def _publish(
             raise
         if model_id is None:
             discard_partial(target)
-            raise ValueError(
-                f"{os.path.basename(target)} downloaded but does not read as a "
-                "model file, so it was removed again. The server log says why."
+            raise DownloadStopped(
+                "It downloaded but does not read as a model file, so it was "
+                "removed again. The server log says why."
             )
         return model_id
     finally:

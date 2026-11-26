@@ -34,6 +34,7 @@ from pixlstash.services.comfyui_recipe_service import (
     PIXLSTASH_MULTI_ADAPTER_LOADER,
     LORA_FILENAME_FIELD_RE,
     VIDEO_SAVE_CLASSES,
+    _node_named,
     bypass_node,
     bypass_stage,
     detect_seed_targets,
@@ -947,6 +948,9 @@ def judge(
         )
         if live is not None:
             model["percent"] = live["percent"]
+            # "queued" while it waits for a download slot, so the notice can
+            # say it has not started rather than show it stuck at 0%.
+            model["status"] = live["status"]
             downloading.append(model)
     if downloading:
         # Ahead of the missing ones: it is not missing, only not here yet.
@@ -1890,19 +1894,20 @@ def skip_requested_loras(
             or (isinstance(inputs.get(field), str) and inputs.get(field))
         }
         kept = sorted(filled - set(asked))
+        # A slot holds text a caller wrote (an imported graph, a run's values),
+        # so a refusal names the node as `_node_named` rewrites it, and never a
+        # file name.
+        named = _node_named(node_id, class_type, object_info)
         if kept:
             # The owner's word for taking a loader out is *Remove*, in the Run
             # popup and in a save, which prints this too (`_refuse_unapplied`).
-            refuse(
-                f"Node {node_id} ({class_type}) also loads "
-                f"{', '.join(shown(f) or f for f in kept)}, and removing the "
-                "node would remove that too."
-            )
+            others = "another LoRA" if len(kept) == 1 else "other LoRAs"
+            refuse(f"Removing {named} would also remove {others} it loads.")
             continue
         if object_info is None:
             refuse(
                 "PixlStash could not reach ComfyUI, so it cannot tell what to "
-                f"wire in place of node {node_id} ({class_type})."
+                f"wire in place of {named}."
             )
             continue
         try:
@@ -1998,19 +2003,19 @@ def take_out_person_loras(
             )
         ]
         rows = all(LORA_DIGEST_FIELD_RE.match(slot_field) for slot_field in asked)
+        # The graph may be the caller's (a save), so a refusal names the node
+        # as `_node_named` rewrites it, and never a slot or file name.
+        named = _node_named(node_id, class_type, object_info)
         message = None
         if fields - set(here):
             # A write: a slot this cannot find is refused, never passed over
             # as though it had been taken out.
-            message = (
-                f"Node {node_id} ({class_type}) has no LoRA slot "
-                f"{', '.join(sorted(fields - set(here)))} PixlStash can empty."
-            )
+            message = f"PixlStash finds no LoRA slot it can empty on {named}."
         elif kept and not rows:
             message = (
-                f"Node {node_id} ({class_type}) also loads "
-                f"{', '.join(str(inputs[f]) for f in kept)}, and it has no empty "
-                "slot PixlStash can leave in its place."
+                f"PixlStash cannot take the LoRA out of {named}: it also loads "
+                "another LoRA, and has no empty slot PixlStash can leave in its "
+                "place."
             )
         elif kept:
             for slot_field in asked:
@@ -2022,7 +2027,7 @@ def take_out_person_loras(
                 if object_info is None:
                     raise LookupError(
                         "PixlStash could not reach ComfyUI, so it cannot tell "
-                        f"what to wire in place of node {node_id} ({class_type})."
+                        f"what to wire in place of {named}."
                     )
                 bypass_node(graph, node_id, object_info)
             except LookupError as exc:

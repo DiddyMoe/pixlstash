@@ -59,6 +59,29 @@ dependencies = [
     "python-multipart>=0.0.22",
     "onnxruntime>=1.24.3",
     "requests>=2.32.5",
+    # Already installed by requests, which accepts older ones: the model
+    # downloads and bounded_http rely on 2.x holding a body to its
+    # Content-Length (`enforce_content_length`). The floor is 2.8.0, the first
+    # release outside every advisory below; requests 2.33 and 2.34 accept it
+    # (`urllib3<3,>=1.26`).
+    # Fixed in 2.5.0: CVE-2025-50181 (redirects not disabled through
+    # PoolManager retries). Fixed in 2.6.0: CVE-2025-66418 and CVE-2025-66471
+    # (decompression bombs in the streaming API). Fixed in 2.6.3:
+    # CVE-2026-21441 (the same bombs reached through a redirect).
+    # Fixed in 2.7.0: GHSA-mf9v-mfxr-j63j / CVE-2026-44432 (decompression-bomb
+    # safeguards bypassed in parts of the streaming API),
+    # https://github.com/urllib3/urllib3/security/advisories/GHSA-mf9v-mfxr-j63j
+    # and GHSA-qccp-gfcp-xxvc / CVE-2026-44431 (sensitive headers forwarded
+    # across origins on proxied low-level redirects),
+    # https://github.com/urllib3/urllib3/security/advisories/GHSA-qccp-gfcp-xxvc
+    # Fixed in 2.8.0: GHSA-vxq7-64xx-v4gw / CVE-2026-97689 (an unbounded
+    # chunk-size line), GHSA-gh4c-6fx4-qh6g / CVE-2026-97688 (a chunked deflate
+    # body that loops forever) and GHSA-8988-9cw3-xx77 / CVE-2026-97687 (an
+    # HTTPS proxy's TLS settings ignored),
+    # https://github.com/urllib3/urllib3/security/advisories/GHSA-vxq7-64xx-v4gw
+    # https://github.com/urllib3/urllib3/security/advisories/GHSA-gh4c-6fx4-qh6g
+    # https://github.com/urllib3/urllib3/security/advisories/GHSA-8988-9cw3-xx77
+    "urllib3>=2.8.0,<3",
     "accelerate~=1.15",
     "transformers~=5.12",
     "bitsandbytes>=0.44.0",

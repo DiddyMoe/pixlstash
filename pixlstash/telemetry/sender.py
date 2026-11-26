@@ -22,13 +22,12 @@ from __future__ import annotations
 import json
 import os
 import threading
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.telemetry.install_id import read_install_identity
 from pixlstash.utils.atomic_write import write_json_atomic
+from pixlstash.utils.bounded_http import bounded_request
 
 logger = get_logger(__name__)
 
@@ -41,6 +40,12 @@ SEND_STATE_FILENAME = "telemetry-state.json"
 
 #: Short and unretried. The measurement is not worth holding a thread open.
 REQUEST_TIMEOUT_SECONDS = 10
+
+#: The longest the whole exchange may take, however slowly the answer arrives,
+#: and the most of an answer read. The endpoint answers with a status and next
+#: to no body; a redirect is not followed (it comes back as its status).
+REQUEST_DEADLINE_SECONDS = 20.0
+RESPONSE_MAX_BYTES = 4 * 1024
 
 #: How often the loop wakes to ask whether a ping is due. Well under a day, so a
 #: long-running container sends promptly once a new UTC day starts rather than
@@ -185,17 +190,12 @@ def send_install_ping(
         }
     ).encode("utf-8")
 
-    request = urllib.request.Request(
-        endpoint,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            # Cloudflare rejects Python urllib's default User-Agent before the
-            # request reaches the Worker. Use an explicit product identity.
-            "User-Agent": "pixlstash-telemetry/1.0",
-        },
-        method="POST",
-    )
+    headers = {
+        "Content-Type": "application/json",
+        # Cloudflare rejects a default library User-Agent before the request
+        # reaches the Worker. Use an explicit product identity.
+        "User-Agent": "pixlstash-telemetry/1.0",
+    }
 
     # Reserve the attempt BEFORE opening the connection. If this marker cannot
     # be persisted, sending would make the hourly loop transmit every hour once
@@ -208,26 +208,34 @@ def send_install_ping(
         return False
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            ok = 200 <= response.status < 300
-    except urllib.error.HTTPError as exc:
-        # A 4xx means we are sending something the endpoint refuses, which is a
-        # bug on our side and worth saying loudly. A 5xx is theirs and transient.
-        logger.warning(
-            "Telemetry ping rejected with HTTP %s from %s. No retry.",
-            exc.code,
+        response = bounded_request(
+            "POST",
             endpoint,
+            data=body,
+            headers=headers,
+            timeout=timeout,
+            deadline_s=REQUEST_DEADLINE_SECONDS,
+            max_bytes=RESPONSE_MAX_BYTES,
         )
-        return False
     except Exception as exc:
-        # Offline, DNS failure, TLS failure, timeout. Expected on any machine
-        # without internet access, so this is not a warning-level event.
+        # Offline, DNS failure, TLS failure, timeout, an answer too slow or too
+        # large. Expected on any machine without internet access, so this is
+        # not a warning-level event.
         logger.debug("Telemetry ping to %s did not complete (%s).", endpoint, exc)
         return False
 
-    if ok:
-        logger.debug("Sent the anonymous install ping.")
-    return ok
+    if not 200 <= response.status_code < 300:
+        # A 4xx means we are sending something the endpoint refuses, which is a
+        # bug on our side and worth saying loudly. A 5xx is theirs and
+        # transient, and a 3xx is not followed.
+        logger.warning(
+            "Telemetry ping rejected with HTTP %s from %s. No retry.",
+            response.status_code,
+            endpoint,
+        )
+        return False
+    logger.debug("Sent the anonymous install ping.")
+    return True
 
 
 def send_if_due(server_config_path: str, install_type: str) -> bool:

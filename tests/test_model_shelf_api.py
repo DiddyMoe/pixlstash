@@ -31,6 +31,7 @@ the refused token is live.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import itertools
 import json
@@ -42,12 +43,14 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import TypeAdapter, ValidationError
 from send2trash import TrashPermissionError
 from sqlmodel import Session, delete
 
@@ -59,8 +62,11 @@ from pixlstash.db_models.adapter_attachment import AdapterAttachment
 from pixlstash.db_models.picture import Picture
 from pixlstash.routes import model_files as model_files_routes
 from pixlstash.routes import model_folders as model_folders_routes
+from pixlstash.routes import model_icons as model_icons_routes
+from pixlstash.routes import model_moves
+from pixlstash.routes import model_downloads as model_downloads_routes
 from pixlstash.tasks import model_folder_scan_task
-from pixlstash.tasks.base_task import TaskStatus
+from pixlstash.tasks.base_task import TASK_FAILURE_MESSAGE, TaskStatus
 from pixlstash.tasks.model_folder_scan_finder import (
     ModelFolderScanFinder,
     scanned_folders,
@@ -73,6 +79,9 @@ from pixlstash.routes.model_imports import (
 )
 from pixlstash.training.local_ai_toolkit import LocalAiToolkit
 from pixlstash.routes.model_shelf import MAX_ATTACHMENTS_PER_MODEL
+from pixlstash.route_inventory import iter_api_route_contexts
+from pixlstash.utils.bounded_http import BoundedResponse
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.services.model_kind_suggestions import (
     loader_offers,
     may_refile_by_name,
@@ -80,15 +89,17 @@ from pixlstash.services.model_kind_suggestions import (
 from pixlstash.server import Server
 from pixlstash.services import builtin_caches, builtin_models, comfyui_service
 from pixlstash.services import civitai_lookup
-from pixlstash.services import model_downloads
+from pixlstash.services import model_dir_mover, model_downloads
 from pixlstash.services import model_shelf_service, model_workflow_sets
+from pixlstash.services import run_importer
 from pixlstash.services.model_folder_scanner import ModelFolderScanner
 from pixlstash.utils.image_processing.image_utils import ImageUtils
-from pixlstash.services.model_mover import SHELF_IO_LOCK
+from pixlstash.services.model_mover import SHELF_IO_LOCK, ModelMover
 from pixlstash.services import workflow_set_verdicts as verdicts
 from pixlstash.services import workflow_templates
 from tests.authz_guard import assert_real_route, no_spa_fallback  # noqa: F401
 from tests.network_vectors import LAN_IPV4
+from tests.test_bounded_http import allow_local_link
 from tests.test_model_downloads import serve_bytes
 from tests.test_model_folder_scanner import write_adapter, write_checkpoint
 from tests.utils import bearer_client, mint_read_token, quiesce_background_work
@@ -429,6 +440,168 @@ def test_every_shelf_route_is_declared_owner_only():
             f"{key} exempts itself from the library pin; the shelf joins hub "
             "content to the active vault's attachments and must stay pinned"
         )
+
+
+# ===========================================================================
+# An integer input past SQLite's range is a 422, never a 500
+# ===========================================================================
+
+_SQLITE_INT_MAX = 2**63 - 1
+_SQLITE_INT_MIN = -(2**63)
+_BOUNDED_ROUTE_MODULES = (
+    "pixlstash.routes.model_shelf",
+    "pixlstash.routes.model_icons",
+    "pixlstash.routes.workflows",
+)
+# Integers these routers take that never reach SQLite as an INTEGER, by the
+# schema path the sweep names them with, and the most each may be. A widget
+# value is ComfyUI's (a seed widget goes to 2**64 - 1) and is kept as TEXT
+# (`workflows._stored_value`); a run's seed is too (`SavedRecipe.seed`).
+_NOT_SQLITE_INTEGERS = {
+    "<RunValue>.value": None,
+    "<CardDefault>.value": None,
+    "<RunRequest>.seed": 2**64 - 1,
+}
+
+
+def _integer_inputs(schema, components, where, seen=()):
+    """Every integer schema reachable from *schema*, as ``(where, schema)``.
+
+    Follows ``$ref`` into the components (once per ref, so a recursive model
+    terminates), and ``anyOf``/``oneOf``/``allOf``, array items, object
+    properties and ``additionalProperties``.
+    """
+    if not isinstance(schema, dict):
+        return
+    ref = schema.get("$ref")
+    if ref:
+        name = ref.rsplit("/", 1)[-1]
+        if name not in seen:
+            yield from _integer_inputs(
+                components[name], components, f"{where}<{name}>", seen + (name,)
+            )
+        return
+    if schema.get("type") == "integer":
+        yield where, schema
+    for key in ("anyOf", "oneOf", "allOf"):
+        for branch in schema.get(key) or []:
+            yield from _integer_inputs(branch, components, where, seen)
+    yield from _integer_inputs(schema.get("items"), components, f"{where}[]", seen)
+    for prop, sub in (schema.get("properties") or {}).items():
+        yield from _integer_inputs(sub, components, f"{where}.{prop}", seen)
+    yield from _integer_inputs(
+        schema.get("additionalProperties"), components, f"{where}{{}}", seen
+    )
+
+
+def _within(integer, low_limit, high_limit):
+    """Whether an integer schema declares a range inside the limits.
+
+    FastAPI's OpenAPI model types ``maximum`` as a float, so 2**63 - 1 reads
+    back as 2**63: the bounds are compared as floats, which tells a missing
+    or wildly wrong bound from a right one but not an off-by-one. The one
+    type every site uses is held to the exact edge by
+    ``test_sqlite_int_admits_exactly_sqlites_range``."""
+    allowed = integer.get("enum") or (
+        [integer["const"]] if "const" in integer else None
+    )
+    if allowed is not None:
+        return all(low_limit <= value <= high_limit for value in allowed)
+    high = integer.get("maximum", integer.get("exclusiveMaximum"))
+    low = integer.get("minimum", integer.get("exclusiveMinimum"))
+    return (
+        high is not None
+        and low is not None
+        and float(high) <= float(high_limit)
+        and float(low) >= float(low_limit)
+    )
+
+
+def test_sqlite_int_admits_exactly_sqlites_range():
+    """The bounded type itself, at the exact edges the schema cannot show."""
+    adapter = TypeAdapter(SqliteInt)
+    assert adapter.validate_python(2**63 - 1) == 2**63 - 1
+    assert adapter.validate_python(-(2**63)) == -(2**63)
+    for outside in (2**63, -(2**63) - 1):
+        with pytest.raises(ValidationError):
+            adapter.validate_python(outside)
+
+
+def test_every_integer_input_on_the_shelf_and_workflow_routers_is_bounded(
+    shelf_env,
+):
+    """SQLite stores at most a signed 64-bit integer, and a larger
+    Python int raises ``OverflowError`` inside the driver: a 500. Every
+    integer a request can carry into these routers (path, query, form and
+    JSON body, nested models included) must declare SQLite's range, so
+    validation answers 422 before a query is built."""
+    server = shelf_env.server
+    schema = server.api.openapi()
+    components = schema.get("components", {}).get("schemas", {})
+    unbounded = []
+    checked = 0
+    by_location = Counter()
+    for method, path, route in iter_api_route_contexts(server.api):
+        endpoint = getattr(route, "endpoint", None)
+        if getattr(endpoint, "__module__", None) not in _BOUNDED_ROUTE_MODULES:
+            continue
+        # The sweep reads the schema, so a route left out of it would be a
+        # route left unchecked.
+        operation = schema["paths"].get(path, {}).get(method.lower())
+        assert operation is not None, f"{method} {path} is not in the schema"
+        sources = [
+            (f"{param['in']}:{param['name']}", param.get("schema"))
+            for param in operation.get("parameters") or []
+        ]
+        for media, body in (
+            (operation.get("requestBody") or {}).get("content") or {}
+        ).items():
+            sources.append((f"body({media})", body.get("schema")))
+        for source, sub in sources:
+            for where, integer in _integer_inputs(sub, components, source):
+                checked += 1
+                by_location[source.split(":")[0].split("(")[0]] += 1
+                exempt = next(
+                    (key for key in _NOT_SQLITE_INTEGERS if where.endswith(key)), None
+                )
+                ceiling = _SQLITE_INT_MAX
+                if exempt is not None:
+                    ceiling = _NOT_SQLITE_INTEGERS[exempt]
+                    if ceiling is None:
+                        continue
+                if not _within(integer, _SQLITE_INT_MIN, ceiling):
+                    unbounded.append(f"{method} {path} {where}")
+    print(
+        f"{checked} integer inputs checked on {_BOUNDED_ROUTE_MODULES}: "
+        f"{dict(sorted(by_location.items()))}"
+    )
+    assert checked, "no integer input found: the sweep is not reading the routes"
+    assert not unbounded, (
+        f"{len(unbounded)} of {checked} integer inputs accept a value SQLite "
+        "cannot store (a 500, not a 422):\n" + "\n".join(unbounded)
+    )
+
+
+@pytest.mark.parametrize(
+    "method, path, kwargs",
+    [
+        ("GET", "/models", {"params": {"set_id": 2**63}}),
+        ("GET", "/adapters", {"params": {"character_id": 2**63}}),
+        ("DELETE", f"/models/workflow-sets/{2**63}", {}),
+        ("PUT", "/models/hidden", {"json": {"ids": [2**63], "hidden": True}}),
+    ],
+)
+def test_an_out_of_range_integer_is_a_422_at_the_boundary(
+    shelf_env, method, path, kwargs
+):
+    """The same property at the HTTP boundary, on one path, query and body
+    input each: 2**63 is refused by validation, naming the input."""
+    r = shelf_env.owner.request(method, f"{API}{path}", **kwargs)
+    assert r.status_code == 422, (r.status_code, r.text[:500])
+    assert any(
+        error.get("type") in {"less_than_equal", "less_than"}
+        for error in r.json()["detail"]
+    ), r.text[:500]
 
 
 # ===========================================================================
@@ -851,12 +1024,15 @@ def test_a_models_read_computes_the_aggregates_once(shelf_env, monkeypatch):
 
 
 def test_a_models_read_answers_the_edges_of_its_kinds(shelf_env):
-    """A kind outside the shelf is refused rather than quietly dropped."""
+    """A kind outside the shelf is refused rather than quietly dropped, and
+    the refusal does not echo the caller's text back."""
     r = shelf_env.owner.get(
-        f"{API}/models", params={"file_kind": ["adapter", "test-bogus"]}
+        f"{API}/models",
+        params={"file_kind": ["adapter", "<script>test-echo</script>"]},
     )
     assert r.status_code == 400, r.text
     assert "file_kind" in r.json()["detail"]
+    assert "test-echo" not in r.text
 
     # Kinds with nothing on the shelf are an empty read, not an error.
     assert _models(shelf_env, ("controlnet", "vae")) == []
@@ -3565,6 +3741,19 @@ def test_a_verdict_refuses_a_key_it_cannot_store_and_a_model_not_in_it(shelf_env
     for path in (f"{root}/{unsorted}", f"{root}/{base},{base}", f"{root}/x"):
         r = shelf_env.owner.put(path, json={"verdict": "yes"})
         assert r.status_code == 422, f"{path}: {r.status_code} {r.text}"
+    # A member id past SQLite's range is canonical digits, so the key parses;
+    # binding it to the shelf check would overflow into a 500. Every verdict
+    # route refuses it with a sentence that does not repeat the key.
+    past = f"{base},{2**63}"
+    for method, path, body in (
+        ("PUT", f"{root}/{past}", {"verdict": "yes"}),
+        ("DELETE", f"{root}/{past}", None),
+        ("PUT", f"{root}/{past}/members/{base}", {"verdict": "problem"}),
+        ("DELETE", f"{root}/{past}/members/{base}", None),
+    ):
+        r = shelf_env.owner.request(method, path, json=body)
+        assert r.status_code == 422, f"{method} {path}: {r.status_code} {r.text}"
+        assert str(2**63) not in r.text, r.text
     key = verdicts.combo_key([base, alice])
     # A verdict word from the other vocabulary is a 422 too.
     assert (
@@ -3835,17 +4024,18 @@ def test_the_filesystem_root_is_refused(shelf_env):
 
 
 class _FolderPaths:
-    """``requests.get`` stand-in answering ComfyUI's ``/internal/folder_paths``."""
+    """``bounded_request`` stand-in answering ComfyUI's ``/internal/folder_paths``."""
 
     def __init__(self, folder_paths: dict):
         self.folder_paths = folder_paths
         self.urls: list[str] = []
 
-    def __call__(self, url, timeout=None, allow_redirects=True, proxies=None):
-        assert allow_redirects is False, "a redirect names a host nobody vetted"
+    def __call__(self, method, url, proxies=None, **kwargs):
+        assert method == "GET"
+        assert kwargs.get("redirects", 0) == 0, "a redirect names a host nobody vetted"
         assert proxies == comfyui_service.NO_PROXY
         self.urls.append(url)
-        return SimpleNamespace(status_code=200, json=lambda: self.folder_paths)
+        return BoundedResponse(url, 200, json.dumps(self.folder_paths).encode())
 
 
 def test_comfyui_model_roots_collapse_categories_to_their_root(monkeypatch):
@@ -3864,7 +4054,7 @@ def test_comfyui_model_roots_collapse_categories_to_their_root(monkeypatch):
             "configs": "not a list",
         }
     )
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake)
     assert comfyui_service.comfyui_model_roots("http://comfy:8188") == [
         "/comfy/custom_nodes2",
         "/comfy/models",
@@ -3888,7 +4078,7 @@ def test_comfyui_model_roots_group_by_category_not_by_folder_count(monkeypatch):
             "intrinsic_loras": ["c:\\COMFYUI\\Custom_Nodes\\kj\\loras"],
         }
     )
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake)
     assert comfyui_service.comfyui_model_roots("http://comfy:8188/") == [
         "/home/me/loras-a",
         "/home/me/loras-b",
@@ -3898,11 +4088,36 @@ def test_comfyui_model_roots_group_by_category_not_by_folder_count(monkeypatch):
 
 
 def test_comfyui_model_roots_is_empty_when_comfyui_cannot_be_asked(monkeypatch):
-    def refuse(url, **kwargs):
+    def refuse(method, url, **kwargs):
         raise comfyui_service.requests.ConnectionError("refused")
 
-    monkeypatch.setattr(comfyui_service.requests, "get", refuse)
+    monkeypatch.setattr(comfyui_service, "bounded_request", refuse)
     assert comfyui_service.comfyui_model_roots("http://comfy:8188") == []
+
+
+def test_a_refused_folder_paths_read_does_not_name_the_address(monkeypatch, caplog):
+    """The HTTPError text is a fixed sentence with ComfyUI's status: the address
+    it was asked at goes to the caller's log line beside it, never into the
+    text a caller could answer with."""
+
+    def not_found(method, url, proxies=None, **kwargs):
+        return BoundedResponse(url, 404, b"{}")
+
+    monkeypatch.setattr(comfyui_service, "bounded_request", not_found)
+    with pytest.raises(comfyui_service.requests.HTTPError) as refused:
+        comfyui_service.comfyui_folder_paths("http://192.0.2.88:8188")
+    assert str(refused.value) == "ComfyUI answered HTTP 404 to the folder-paths read"
+    assert "192.0.2.88" not in str(refused.value)
+    with caplog.at_level("WARNING", logger=comfyui_service.logger.name):
+        assert comfyui_service.comfyui_model_roots("http://192.0.2.88:8188") == []
+    (record,) = [
+        record
+        for record in caplog.records
+        if record.name == comfyui_service.logger.name
+        and record.getMessage().startswith("Could not read ComfyUI model folders")
+    ]
+    assert "192.0.2.88:8188" in record.getMessage()
+    assert "HTTP 404 to the folder-paths read" in record.getMessage()
 
 
 def test_saving_a_comfyui_url_puts_its_model_folder_on_the_shelf(
@@ -3920,7 +4135,7 @@ def test_saving_a_comfyui_url_puts_its_model_folder_on_the_shelf(
             "loras": [str(models / "loras"), str(tmp_path / "not-here" / "x" / "y")],
         }
     )
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake)
 
     def registered() -> dict[str, dict]:
         r = shelf_env.owner.get(f"{API}/model-folders")
@@ -3950,7 +4165,7 @@ def test_only_a_comfyui_on_this_computer_names_model_folders(shelf_env, monkeypa
     """The paths are ComfyUI's own filesystem's. From another host they name
     directories on a machine this is not, so they are not even asked for."""
     fake = _FolderPaths({"checkpoints": ["/home/me/models/checkpoints"]})
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake)
     for elsewhere in ("http://8.8.8.8:8188/", f"http://{LAN_IPV4}:8188/"):
         assert (
             model_folders_routes.register_comfyui_model_folders(
@@ -3976,7 +4191,7 @@ def test_the_home_folder_from_comfyui_is_never_put_on_the_shelf(
     fake = _FolderPaths(
         {"checkpoints": [str(home / "checkpoints")], "loras": [str(home / "loras")]}
     )
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake)
     before = {
         row["path"]
         for row in shelf_env.owner.get(f"{API}/model-folders").json()["folders"]
@@ -4494,7 +4709,30 @@ def test_downloads_follow_the_default_until_a_folder_is_marked(shelf_env, tmp_pa
 def test_a_model_download_lands_on_the_shelf_and_is_reported(
     shelf_env, tmp_path, monkeypatch
 ):
-    """Started over the API, followed in /workers/progress, registered when done."""
+    """Started over the API, followed in /workers/progress, registered when done.
+
+    No step may ask a ComfyUI over the network (one running on this machine
+    would answer at the default address), so the route's ``_read_object_info``
+    is a recorder for the whole test. The loopback server reaches the
+    download only through the test allowance; without it, it is refused.
+    """
+    asked = []
+
+    def settled(download_id):
+        deadline = time.monotonic() + 20
+        while True:
+            progress = shelf_env.owner.get(f"{API}/workers/progress").json()
+            mine = [d for d in progress["downloads"] if d["id"] == download_id]
+            assert mine, progress["downloads"]
+            if mine[0]["status"] != "running" or time.monotonic() > deadline:
+                return mine[0]
+            time.sleep(0.1)
+
+    def unreachable(comfyui_url, *, cached=False):
+        asked.append(comfyui_url)
+        return None, "test: ComfyUI is not asked"
+
+    monkeypatch.setattr(model_downloads_routes, "_read_object_info", unreachable)
     folder = _new_folder_path(str(tmp_path), "dl")
     folder_id = shelf_env.owner.post(
         f"{API}/model-folders", json={"path": folder}
@@ -4505,44 +4743,131 @@ def test_a_model_download_lands_on_the_shelf_and_is_reported(
     os.makedirs(os.path.join(folder, "loras"))
     source = tmp_path / "source.safetensors"
     write_adapter(source)
-    with serve_bytes(source.read_bytes()) as url:
-        monkeypatch.setattr(
-            model_downloads,
-            "download_source",
-            lambda file: {"url": url, "directory": "loras"},
-        )
+    with serve_bytes(source.read_bytes()) as url, monkeypatch.context() as listed:
+        # The route imports the name, so both the route's and the service's
+        # lookup are patched: either one missing sends the route to ComfyUI.
+        for module in (model_downloads, model_downloads_routes):
+            listed.setattr(
+                module,
+                "download_source",
+                lambda file: {"url": url, "directory": "loras"},
+            )
+        # The loopback server stands in for the list's public https host.
+        allowed = allow_local_link(listed, model_downloads, url)
         r = shelf_env.owner.post(
             f"{API}/model-downloads", json={"file": "Fetched.safetensors"}
         )
         assert r.status_code == 200, r.text
-        download_id = r.json()["id"]
-        deadline = time.monotonic() + 20
-        while True:
-            progress = shelf_env.owner.get(f"{API}/workers/progress").json()
-            mine = [d for d in progress["downloads"] if d["id"] == download_id]
-            assert mine, progress["downloads"]
-            if mine[0]["status"] != "running" or time.monotonic() > deadline:
-                break
-            time.sleep(0.1)
-    assert mine[0]["status"] == "done", mine
+        mine = settled(r.json()["id"])
+    assert mine["status"] == "done", mine
+    assert allowed == [url]
     assert os.path.isfile(os.path.join(folder, "loras", "Fetched.safetensors"))
     row = shelf_env.server.hub.fetchone(
         "SELECT model_id FROM model_file WHERE model_folder_id = ? AND relpath = ?",
         (folder_id, "loras/Fetched.safetensors"),
     )
-    assert row is not None and row["model_id"] == mine[0]["model_id"]
+    assert row is not None and row["model_id"] == mine["model_id"]
 
-    monkeypatch.undo()
+    # Without the allowance the same kind of link is refused, as it is in
+    # production: plain http, before anything is asked.
+    served = []
+    with (
+        serve_bytes(source.read_bytes(), asked=served) as url,
+        monkeypatch.context() as unallowed,
+    ):
+        for module in (model_downloads, model_downloads_routes):
+            unallowed.setattr(
+                module,
+                "download_source",
+                lambda file: {"url": url, "directory": "loras"},
+            )
+        r = shelf_env.owner.post(
+            f"{API}/model-downloads", json={"file": "Refused.safetensors"}
+        )
+        assert r.status_code == 200, r.text
+        refused = settled(r.json()["id"])
+    assert refused["status"] == "failed", refused
+    assert "is not https" in refused["error"], refused
+    assert served == []
+    assert not os.path.exists(os.path.join(folder, "loras", "Refused.safetensors"))
+    # A listed name never consults ComfyUI.
+    assert asked == []
+
+    # A library's sentence (requests', carrying the URL and the name asked
+    # for) is the log's: the progress every owner client polls shows the
+    # server's own.
+    leak = "example-leak-marker"
+    opened = []
+
+    def unreachable_link(link, live, adapter):
+        # The signature _open has, so the failure is this sentence and not a
+        # TypeError the catch-all would also turn into DOWNLOAD_FAILED.
+        opened.append(link)
+        raise model_downloads.requests.ConnectionError(
+            f"The connection to example.com failed for /{leak}/Failed.safetensors."
+        )
+
+    with monkeypatch.context() as failing:
+        for module in (model_downloads, model_downloads_routes):
+            failing.setattr(
+                module,
+                "download_source",
+                lambda file: {"url": "https://example.com/x", "directory": "loras"},
+            )
+        failing.setattr(model_downloads, "_open", unreachable_link)
+        r = shelf_env.owner.post(
+            f"{API}/model-downloads", json={"file": f"{leak}/Failed.safetensors"}
+        )
+        assert r.status_code == 200, r.text
+        failed = settled(r.json()["id"])
+    assert opened == ["https://example.com/x"]
+    assert failed["status"] == "failed", failed
+    assert failed["error"] == model_downloads.DOWNLOAD_FAILED
+    assert leak not in shelf_env.owner.get(f"{API}/workers/progress").text
+
+    # A name the committed list lacks falls back to the owner's ComfyUI, here
+    # the default address, answered as unreachable by the recorder.
     r = shelf_env.owner.post(
-        f"{API}/model-downloads", json={"file": "my_own_merge_v3.safetensors"}
+        f"{API}/model-downloads",
+        json={"file": f"{leak}/my_own_merge_v3.safetensors"},
     )
     assert r.status_code == 404, r.text
+    # The server's sentence, not the name the request sent.
+    assert r.json()["detail"] == model_downloads.UNKNOWN_SOURCE
+    assert asked == ["http://127.0.0.1:8188"]
     # A link is never taken from the caller.
     r = shelf_env.owner.post(
         f"{API}/model-downloads",
         json={"file": "x.safetensors", "url": "https://example.com/x"},
     )
     assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_a_folder_a_download_is_queued_or_running_into_is_not_renamed(
+    shelf_env, tmp_path, monkeypatch, status
+):
+    """A running download writes a partial under the folder's path, and a
+    queued one makes that path once it starts, so either refuses a rename.
+    Wrong if the folder is renamed, or if one that has ended, or one into
+    another folder, still refuses it."""
+    assert status in model_downloads.ACTIVE_STATUSES
+    root = tmp_path / "loras"
+    root.mkdir()
+    _seeded_folder_at(shelf_env.server, str(root))
+    entry = _download_writing(monkeypatch, root / "test-new.safetensors", status)
+    r = shelf_env.owner.post(_RENAME, json={"name": "Loras"})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == (
+        "A model is downloading, or waiting to download, into this folder. "
+        "Try again when it is done."
+    )
+    assert root.is_dir() and not (tmp_path / "Loras").exists()
+    assert model_downloads._reserved == {}
+    _ended_or_elsewhere(monkeypatch, entry, tmp_path / "other" / "x.safetensors")
+    r = shelf_env.owner.post(_RENAME, json={"name": "Loras"})
+    assert r.status_code == 200, r.text
+    assert (tmp_path / "Loras").is_dir() and not root.exists()
 
 
 def test_a_patch_whose_second_write_fails_moves_no_default(shelf_env, tmp_path):
@@ -4874,7 +5199,9 @@ def test_a_crashed_scan_reports_failed_rather_than_looking_slow(
 
     row = _await_scan(shelf_env, folder_id)
     assert row["scan_status"] == "failed", row
-    assert "the drive went away mid-scan" in (row["scan_error"] or ""), row
+    # Served, so the fixed sentence: the exception's text stays in the log.
+    assert row["scan_error"] == TASK_FAILURE_MESSAGE, row
+    assert "the drive went away mid-scan" not in str(row), row
     # The evidence that the timestamp alone was never enough.
     assert row["last_checked"] is None, row
 
@@ -5772,6 +6099,25 @@ def test_a_folder_that_is_catalogued_in_place_holds_no_runs(shelf_env, import_fo
     assert r.status_code == 400, r.text
 
 
+def test_an_output_root_the_os_cannot_read_names_the_folder_not_the_cause(
+    shelf_env, import_folders, monkeypatch, caplog
+):
+    """The registered path is the owner's own; the OS text stays in the log."""
+
+    def unreadable(root):
+        raise PermissionError(13, "Permission denied", "/home/me/test-runs-cause")
+
+    monkeypatch.setattr(model_imports_routes, "read_output_root", unreadable)
+    with caplog.at_level("WARNING", logger=model_imports_routes.logger.name):
+        r = shelf_env.owner.get(f"{API}/model-folders/{import_folders.source_id}/runs")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == (
+        f"Could not read {import_folders.output_root}. Check that the folder "
+        "is still there and PixlStash can open it."
+    )
+    assert "test-runs-cause" in caplog.text, "the cause did not reach the log"
+
+
 # ── The sample route's containment (F6) ─────────────────────────────────────
 #
 # This is the one route on the shelf that serves file BYTES from a path the
@@ -6009,6 +6355,60 @@ def test_importing_a_run_registers_it_as_one_stack(shelf_env, import_folders):
     assert cover["member_count"] == 2
 
 
+def test_an_import_of_steps_the_run_lacks_does_not_repeat_them(
+    shelf_env, import_folders
+):
+    """The steps are the caller's; the 404 names the run the server found."""
+    r = shelf_env.owner.post(
+        f"{API}/model-imports",
+        json={
+            "source_folder_id": import_folders.source_id,
+            "run_name": "Clementine",
+            "destination_folder_id": import_folders.destination_id,
+            "steps": [987654321],
+        },
+    )
+    assert r.status_code == 404, r.text
+    assert r.json() == {
+        "detail": "Clementine has no checkpoint to import at the steps asked for."
+    }
+    assert "987654321" not in r.text
+    assert list(import_folders.destination_dir.iterdir()) == []
+
+
+def test_an_import_the_disk_refuses_answers_a_fixed_sentence_and_logs_why(
+    shelf_env, import_folders, monkeypatch, caplog
+):
+    """The OSError names server paths and the system's words: the log has them."""
+    cause = OSError(28, "example-leak: No space left", "/example/private/run")
+
+    def refuse(source, partial):
+        raise cause
+
+    monkeypatch.setattr(run_importer, "copy_and_digest", refuse)
+    with caplog.at_level("ERROR", logger=run_importer.logger.name):
+        r = shelf_env.owner.post(
+            f"{API}/model-imports",
+            json={
+                "source_folder_id": import_folders.source_id,
+                "run_name": "Clementine",
+                "destination_folder_id": import_folders.destination_id,
+            },
+        )
+    assert r.status_code == 200, r.text
+    files = r.json()["files"]
+    assert [f["status"] for f in files] == ["failed", "failed"]
+    assert [f["detail"] for f in files] == [run_importer.IMPORT_FAILED_DETAIL] * 2
+    assert "example-leak" not in r.text
+    assert "/example/private" not in r.text
+    logged = [
+        record
+        for record in caplog.records
+        if record.name == run_importer.logger.name and record.exc_info
+    ]
+    assert [record.exc_info[1] for record in logged] == [cause, cause]
+
+
 # ── The imported samples, read back off the shelf ───────────────────────────
 #
 # Imports before 2026-10-30 copied a run's previews into `<stem>_samples/`
@@ -6212,6 +6612,18 @@ def test_a_run_name_that_escapes_the_output_root_is_refused(shelf_env, import_fo
         },
     )
     assert r.status_code == 400, r.text
+    assert r.json()["detail"] == model_imports_routes.NOT_A_RUN_MESSAGE
+    # Contained but absent: a 404 that does not repeat the name either.
+    r = shelf_env.owner.post(
+        f"{API}/model-imports",
+        json={
+            "source_folder_id": import_folders.source_id,
+            "run_name": "test-no-such-run",
+            "destination_folder_id": import_folders.destination_id,
+        },
+    )
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == model_imports_routes.NO_SUCH_RUN_MESSAGE
     assert list(import_folders.destination_dir.iterdir()) == []
 
 
@@ -6267,12 +6679,18 @@ def test_clearing_refuses_what_is_not_a_run(shelf_env, import_folders, run_trash
         import_folders.run_dir, target_is_directory=True
     )
 
-    assert _trash_run(shelf_env, import_folders, "notes").status_code == 404
-    assert _trash_run(shelf_env, import_folders, "missing").status_code == 404
-    assert _trash_run(shelf_env, import_folders, "escapes").status_code == 400
-    assert _trash_run(shelf_env, import_folders, "alias").status_code == 409
+    # Each refusal is the server's sentence: the name is the caller's text until
+    # it is a run, so no answer repeats it.
+    for name, status, detail in (
+        ("notes", 404, model_imports_routes.NO_SUCH_RUN_MESSAGE),
+        ("missing", 404, model_imports_routes.NO_SUCH_RUN_MESSAGE),
+        ("escapes", 400, model_imports_routes.NOT_A_RUN_MESSAGE),
+        ("alias", 409, "That run is a link, so PixlStash leaves it alone."),
+        ("a%5Cb", 400, model_imports_routes.NOT_A_RUN_MESSAGE),
+    ):
+        r = _trash_run(shelf_env, import_folders, name)
+        assert (r.status_code, r.json()["detail"]) == (status, detail), name
     assert import_folders.run_dir.exists()
-    assert _trash_run(shelf_env, import_folders, "a%5Cb").status_code == 400
     assert (not_a_run / "todo.txt").exists()
     assert (outside / "elsewhere.safetensors").exists()
     assert list(run_trash.iterdir()) == []
@@ -6674,7 +7092,7 @@ def test_a_symlink_into_a_system_directory_is_refused_not_followed(
 
 
 def test_a_relocation_target_must_be_absolute_and_off_the_system_blocklist(
-    shelf_env, relocatable_store
+    shelf_env, relocatable_store, tmp_path
 ):
     """The only caller-supplied host path in the whole B7 stack, and it had no
     test at all: nulling the guard left the suite green.
@@ -6693,6 +7111,13 @@ def test_a_relocation_target_must_be_absolute_and_off_the_system_blocklist(
         r = shelf_env.owner.post(url, json={"path": path})
         assert r.status_code == 400, f"{path} was accepted: {r.status_code} {r.text}"
         assert why in r.text, f"{path} was refused without saying why: {r.text}"
+    # A path the OS cannot make: its reason, never the path the caller typed.
+    blocker = tmp_path / "test-a-file"
+    blocker.write_bytes(b"not a directory")
+    r = shelf_env.owner.post(url, json={"path": str(blocker / "models")})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"].startswith("Could not create the destination folder: ")
+    assert str(blocker) not in r.json()["detail"], r.text
     # Nothing moved and the store is still the store.
     assert sorted(p.name for p in relocatable_store.store.iterdir()) == [
         "one.safetensors",
@@ -8969,6 +9394,80 @@ def test_setting_an_icon_surfaces_it_on_the_list(shelf_env):
     shelf_env.owner.post(f"{API}/models/icons/clear", json={"ids": [alice]})
 
 
+def _on_event_loop() -> bool:
+    """Whether the calling thread is running an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def test_setting_an_icon_decodes_and_writes_off_the_event_loop(shelf_env, monkeypatch):
+    """The image decode and the hub read and write behind an icon upload wait
+    on a worker, not on the loop every other request shares.
+
+    Wrong if any of them records True: an upload then stalls every request
+    for as long as Pillow and SQLite take. Only the handler's own calls are
+    judged: the authz gate reads the active library from the hub for every
+    request, before the handler runs, and that read is not this route's.
+    """
+    alice = shelf_env.model_ids["alice.safetensors"]
+    hub = shelf_env.server.hub
+    seen = []
+
+    def spy(name, real):
+        def wrapped(*args, **kwargs):
+            caller = sys._getframe(1).f_code.co_filename
+            if caller == model_icons_routes.__file__:
+                seen.append((name, _on_event_loop()))
+            return real(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(
+        model_icons_routes,
+        "store_icon",
+        spy("store_icon", model_icons_routes.store_icon),
+    )
+    monkeypatch.setattr(hub, "fetchone", spy("fetchone", hub.fetchone))
+    monkeypatch.setattr(hub, "transaction", spy("transaction", hub.transaction))
+    try:
+        r = shelf_env.owner.post(
+            f"{API}/models/{alice}/icon",
+            files={"file": ("logo.png", _PNG, "image/png")},
+        )
+        assert r.status_code == 200, r.text
+        names = {name for name, _ in seen}
+        assert {"store_icon", "fetchone", "transaction"} <= names, seen
+        assert [name for name, on_loop in seen if on_loop] == [], seen
+    finally:
+        monkeypatch.undo()
+        shelf_env.owner.post(f"{API}/models/icons/clear", json={"ids": [alice]})
+
+
+def test_an_icon_upload_is_read_only_one_byte_past_the_cap(shelf_env, monkeypatch):
+    """The upload is read into memory only as far as one byte past the cap:
+    that is enough to refuse it, and an upload of any size costs no more."""
+    alice = shelf_env.model_ids["alice.safetensors"]
+    monkeypatch.setattr(model_icons_routes, "MAX_ICON_BYTES", 64)
+    handed = []
+    real_store = model_icons_routes.store_icon
+
+    def store(path, data):
+        handed.append(len(data))
+        return real_store(path, data)
+
+    monkeypatch.setattr(model_icons_routes, "store_icon", store)
+    r = shelf_env.owner.post(
+        f"{API}/models/{alice}/icon",
+        files={"file": ("big.png", b"0" * 4096, "image/png")},
+    )
+    assert r.status_code == 400, r.text
+    assert handed == [65]
+    assert _model_row(shelf_env, alice)["icon_sha256"] is None
+
+
 def test_two_models_given_one_logo_share_a_single_file(shelf_env):
     """The dedup that makes an icon the right object for a base-model mark:
     forty Flux checkpoints wanting one logo is the normal case."""
@@ -9187,12 +9686,16 @@ def test_a_file_that_is_not_a_model_is_refused_before_anything_is_copied(
     notes.write_text("not a model")
     r = shelf_env.owner.post(f"{API}/model-files", json={"path": str(notes)})
     assert r.status_code == 400, r.text
+    # The path is the caller's text: neither answer repeats any of it.
+    assert "notes" not in r.json()["detail"], r.text
+    assert r.json()["detail"].endswith("files, and that file is not one."), r.text
     assert list(loose_file.store.iterdir()) == []
 
     r = shelf_env.owner.post(
         f"{API}/model-files", json={"path": str(tmp_path / "nope.safetensors")}
     )
     assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "No such file on this machine.", r.text
     assert list(loose_file.store.iterdir()) == []
 
 
@@ -9213,11 +9716,54 @@ def test_adding_the_same_name_twice_is_refused_rather_than_overwritten(
 
     r = shelf_env.owner.post(f"{API}/model-files", json={"path": str(twin)})
     assert r.status_code == 409, r.text
+    # The folder is the registered row's path; the name is the caller's, so it
+    # is not repeated.
+    assert r.json()["detail"] == (
+        f"A file of that name already exists in {loose_file.store}. Nothing was added."
+    ), r.text
     assert (
         loose_file.store / "loose.safetensors"
     ).stat().st_size == loose_file.source.stat().st_size, (
         "the second file was written over the first"
     )
+
+
+def test_a_link_standing_at_the_destination_name_is_refused_without_the_name(
+    shelf_env, loose_file, tmp_path
+):
+    """A dangling link at the filename resolves out of the folder: the add is
+    refused there, and the answer repeats neither the name nor the target."""
+    (loose_file.store / "loose.safetensors").symlink_to(tmp_path / "test-elsewhere")
+    r = shelf_env.owner.post(
+        f"{API}/model-files", json={"path": str(loose_file.source)}
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == (
+        "That file would be written outside the destination folder."
+    ), r.text
+    assert not (tmp_path / "test-elsewhere").exists()
+
+
+def test_a_copy_the_os_refuses_answers_a_fixed_sentence_and_logs_the_cause(
+    shelf_env, loose_file, monkeypatch, caplog
+):
+    secret = "/home/me/test-copy-cause"
+
+    def refuse(source, partial):
+        raise PermissionError(13, "Permission denied", secret)
+
+    monkeypatch.setattr(model_files_routes, "copy_and_digest", refuse)
+    with caplog.at_level("ERROR", logger=model_files_routes.logger.name):
+        r = shelf_env.owner.post(
+            f"{API}/model-files", json={"path": str(loose_file.source)}
+        )
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"] == (
+        "Could not copy the file onto the shelf; the original is untouched."
+    ), r.text
+    assert secret in caplog.text, "the cause did not reach the log"
+    assert loose_file.source.exists()
+    assert list(loose_file.store.iterdir()) == []
 
 
 def test_a_source_folder_is_never_a_destination_for_a_loose_file(
@@ -11775,7 +12321,9 @@ def test_dirs_count_every_copy_beneath_each_entry(shelf_env, tmp_path):
     assert (dirs["empty"]["model_count"], dirs["empty"]["bytes"]) == (0, 0)
 
 
-def test_dot_dirs_symlinks_and_files_are_not_offered(shelf_env, tmp_path):
+def test_dot_dirs_and_files_are_not_offered_and_a_dir_link_is_a_link_node(
+    shelf_env, tmp_path
+):
     root = tmp_path / "loras"
     (root / "real").mkdir(parents=True)
     (root / ".cache").mkdir()
@@ -11788,7 +12336,12 @@ def test_dot_dirs_symlinks_and_files_are_not_offered(shelf_env, tmp_path):
     _set_copies(shelf_env, 1, [("real/a.safetensors", 4)])
 
     body = _listing(shelf_env).json()
-    assert [entry["name"] for entry in body["dirs"]] == ["real", "style"]
+    assert [(entry["name"], entry["link"]) for entry in body["dirs"]] == [
+        ("alias", True),
+        ("linked", True),
+        ("real", False),
+        ("style", False),
+    ]
 
 
 def test_a_samples_directory_is_hidden_beside_its_model_and_shown_without_one(
@@ -12003,7 +12556,7 @@ def _create_dir(shelf_env, name: str, path: str = "", **kwargs):
         ("CON.txt", "Windows reserves"),
         ("a/b", "cannot contain"),
         ("a\\b", "cannot contain"),
-        ("..", "not a folder name"),
+        ("..", "not folder names"),
         (".hidden", "hidden"),
         ("trailing.", "cannot end with"),
         ("trailing ", "cannot end with"),
@@ -12043,10 +12596,15 @@ def test_creating_a_taken_name_is_a_conflict_and_touches_nothing(shelf_env, tmp_
     os.symlink(str(tmp_path / "nowhere"), str(root / "dangling"))
     _seeded_folder_at(shelf_env.server, str(root))
 
-    assert _create_dir(shelf_env, "flux").status_code == 409
+    r = _create_dir(shelf_env, "flux")
+    assert r.status_code == 409, r.text
+    # The caller sees the name in its own field; the answer does not repeat it.
+    assert r.json()["detail"] == model_folders_routes.NAME_TAKEN_MESSAGE
     assert (root / "flux" / "keep.txt").read_text() == "mine"
     # A dangling link is a taken name, never a path to create through.
-    assert _create_dir(shelf_env, "dangling").status_code == 409
+    r = _create_dir(shelf_env, "dangling")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == model_folders_routes.NAME_TAKEN_MESSAGE
     assert not (tmp_path / "nowhere").exists()
 
 
@@ -12140,6 +12698,13 @@ def test_a_folder_move_runs_on_the_move_job_and_reports_its_kind(shelf_env, tmp_
     assert relpaths == {os.path.join("people", "sdxl", "a.safetensors")}
 
 
+# What refusal_for_folder_name answers for a reserved name.
+_WINDOWS_RESERVES = (
+    "Windows reserves CON, PRN, AUX, NUL, COM1 to COM9 and LPT1 to LPT9, with or "
+    "without an extension, so the folder could not exist there."
+)
+
+
 def test_a_folder_move_refusal_is_answered_before_the_job_starts(shelf_env, tmp_path):
     from pixlstash.routes import model_moves
 
@@ -12156,11 +12721,86 @@ def test_a_folder_move_refusal_is_answered_before_the_job_starts(shelf_env, tmp_
     )
     assert into_itself.status_code == 400, into_itself.text
     bad_name = shelf_env.owner.post(
-        url, json={"path": "a", "destination_folder_id": 1, "new_name": "con"}
+        url,
+        json={"path": "a", "destination_folder_id": 1, "new_name": "CON.example-leak"},
     )
     assert bad_name.status_code == 400, bad_name.text
+    # The reason names the server's list, never the name the caller typed.
+    assert bad_name.json() == {"detail": _WINDOWS_RESERVES}, bad_name.text
+    absent = shelf_env.owner.post(
+        url, json={"path": "example-absent", "destination_folder_id": 1}
+    )
+    assert absent.status_code == 404, absent.text
+    assert absent.json() == {
+        "detail": "There is no folder at that path in the model folder."
+    }, absent.text
+    taken = shelf_env.owner.post(
+        url, json={"path": "a/b", "destination_folder_id": 1, "new_name": "a"}
+    )
+    assert taken.status_code == 409, taken.text
+    assert taken.json() == {
+        "detail": "A folder with that name already exists there. Folders are "
+        "never merged; rename one of them first."
+    }, taken.text
     assert model_moves._job is None, "a refused folder move still took the job slot"
     assert (root / "a" / "b").is_dir()
+
+
+def test_a_name_windows_reserves_is_refused_without_repeating_it(shelf_env, tmp_path):
+    root = tmp_path / "loras"
+    root.mkdir()
+    _seeded_folder_at(shelf_env.server, str(root))
+    r = _create_dir(shelf_env, "CON.example-leak")
+    assert r.status_code == 400, r.text
+    assert r.json() == {"detail": _WINDOWS_RESERVES}, r.text
+    dots = _create_dir(shelf_env, "..")
+    assert dots.status_code == 400, dots.text
+    assert dots.json() == {"detail": "'.' and '..' are not folder names."}
+    assert list(root.iterdir()) == []
+
+
+def test_a_folder_move_that_fails_reports_a_fixed_sentence_and_logs_why(
+    shelf_env, tmp_path, monkeypatch, caplog
+):
+    """The outcome ``GET /model-moves`` reports carries the fixed sentence;
+    the cause, which names database internals, is in the log."""
+    from pixlstash.routes import model_moves
+
+    model_moves._job = None
+    root = tmp_path / "loras"
+    (root / "sdxl").mkdir(parents=True)
+    (root / "people").mkdir()
+    (root / "sdxl" / "a.safetensors").write_bytes(b"a" * 64)
+    _seeded_folder_at(shelf_env.server, str(root))
+    _set_copies(shelf_env, 1, [(os.path.join("sdxl", "a.safetensors"), 64)])
+    cause = model_dir_mover.RepointLost("example-leak: the rows went away")
+
+    def lost(hub, plan):
+        raise cause
+
+    monkeypatch.setattr(model_dir_mover, "_repoint", lost)
+    with caplog.at_level("ERROR", logger=model_dir_mover.logger.name):
+        r = shelf_env.owner.post(
+            f"{API}/model-folders/1/dirs/move",
+            json={
+                "path": "sdxl",
+                "destination_folder_id": 1,
+                "destination_path": "people",
+            },
+        )
+        assert r.status_code == 202, r.text
+        body = _wait_for_move(shelf_env)
+    assert [item["status"] for item in body["results"]] == ["failed"], body
+    assert body["results"][0]["detail"] == model_dir_mover.FOLDER_MOVE_FAILED_DETAIL
+    assert "example-leak" not in json.dumps(body)
+    failed = [
+        record
+        for record in caplog.records
+        if record.name == model_dir_mover.logger.name
+        and record.getMessage().startswith("Moving folder")
+    ]
+    assert [record.exc_info[1] for record in failed] == [cause]
+    assert (root / "sdxl" / "a.safetensors").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -12232,6 +12872,7 @@ def test_a_root_rename_onto_a_taken_name_merges_nothing(shelf_env, tmp_path):
     (tmp_path / "Loras").mkdir()
     root, r = _rename_root(shelf_env, tmp_path)
     assert r.status_code == 409, r.text
+    assert r.json()["detail"] == model_folders_routes.NAME_TAKEN_MESSAGE
     assert (root / "sdxl" / "a.safetensors").is_file()
     assert list((tmp_path / "Loras").iterdir()) == [], "an empty target was replaced"
     assert _folder_one(shelf_env)["path"] == str(root)
@@ -12299,14 +12940,14 @@ def test_a_root_rename_waits_for_a_download_into_the_folder(
     root = tmp_path / "loras"
     root.mkdir()
     _seeded_folder_at(shelf_env.server, str(root))
-    running = [{"status": "running", "folder_path": str(root)}]
-    monkeypatch.setattr(model_downloads, "live_downloads", lambda: running)
+    entry = _download_writing(monkeypatch, root / "sub" / "test-new.safetensors")
     r = shelf_env.owner.post(_RENAME, json={"name": "Loras"})
     assert r.status_code == 409 and "downloading" in r.text, r.text
     assert root.is_dir() and not (tmp_path / "Loras").exists()
     # One into another folder, or one that has ended, is no reason to wait.
-    running[0] = {"status": "running", "folder_path": str(tmp_path / "other")}
+    _ended_or_elsewhere(monkeypatch, entry, tmp_path / "other" / "x.safetensors")
     assert shelf_env.owner.post(_RENAME, json={"name": "Loras"}).status_code == 200
+    assert model_downloads._reserved == {}, "the rename kept its reservation"
 
 
 def test_a_case_only_root_rename_is_not_refused_as_overlapping_itself(
@@ -12504,6 +13145,10 @@ def test_a_stale_fingerprint_is_a_409_and_removes_nothing(
         _REMOVE, json={"path": "old", "expect": plan["fingerprint"]}
     )
     assert r.status_code == 409, r.text
+    assert r.json()["detail"] == (
+        "The folder changed since it was read, so nothing was removed. "
+        "Look at it again."
+    )
     assert (old_folder / "old" / "lost.safetensors").exists()
     assert list(fake_trash.iterdir()) == []
 
@@ -12614,7 +13259,7 @@ def test_a_junction_is_listed_as_a_link_and_never_walked(tmp_path, monkeypatch):
                 st_mode=stat.S_IFDIR,
                 st_size=0,
                 st_mtime_ns=0,
-                st_reparse_tag=model_files_routes._JUNCTION_TAG,
+                st_reparse_tag=0xA0000003,  # IO_REPARSE_TAG_MOUNT_POINT
             )
         return real_lstat(path, *args, **kwargs)
 
@@ -12635,9 +13280,62 @@ def test_a_folder_removal_through_a_link_is_refused(shelf_env, old_folder, tmp_p
     assert via_link.status_code == 400, via_link.text
 
 
+def test_an_unreadable_folder_is_refused_with_the_os_words_and_not_the_path(
+    shelf_env, old_folder, monkeypatch, caplog
+):
+    """The OS's sentence for the errno reaches the owner; the path it carried
+    goes to the log, where the cause is kept."""
+    secret = "/home/me/test-unreadable"
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", secret)
+
+    monkeypatch.setattr(model_files_routes, "_folder_listing", unreadable)
+    with caplog.at_level("ERROR", logger=model_files_routes.logger.name):
+        r = shelf_env.owner.post(_REMOVE, json={"path": "old", "dry_run": True})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == (
+        "Could not read everything in that folder (Permission denied), so "
+        "nothing was removed."
+    )
+    assert secret in caplog.text, "the cause did not reach the log"
+    assert (old_folder / "old" / "lost.safetensors").exists()
+
+
+def test_a_removal_the_os_refuses_answers_a_fixed_sentence_and_logs_the_cause(
+    shelf_env, old_folder, monkeypatch, caplog
+):
+    secret = "/home/me/test-remove-cause"
+
+    def refuse(path):
+        raise PermissionError(13, "Permission denied", secret)
+
+    monkeypatch.setattr(model_files_routes, "send2trash", refuse)
+    plan = _plan_removal(shelf_env)
+    with caplog.at_level("ERROR", logger=model_files_routes.logger.name):
+        r = shelf_env.owner.post(
+            _REMOVE, json={"path": "old", "expect": plan["fingerprint"]}
+        )
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"] == (
+        "Could not remove that folder. Whatever went is marked missing by the "
+        "folder's next scan."
+    ), r.text
+    assert secret in caplog.text, "the cause did not reach the log"
+    assert (old_folder / "old" / "lost.safetensors").exists()
+
+
 def test_a_folder_removal_is_refused_where_a_folder_move_is(shelf_env, old_folder):
     root = shelf_env.owner.post(_REMOVE, json={"path": "", "dry_run": True})
     assert root.status_code == 400, root.text
+
+    absent = shelf_env.owner.post(
+        _REMOVE, json={"path": "test-not-here", "dry_run": True}
+    )
+    assert absent.status_code == 404, absent.text
+    assert absent.json()["detail"] == (
+        "There is no folder at that path in the model folder."
+    )
 
     with shelf_env.server.hub.transaction() as conn:
         conn.execute(
@@ -12647,6 +13345,11 @@ def test_a_folder_removal_is_refused_where_a_folder_move_is(shelf_env, old_folde
         )
     holds_one = shelf_env.owner.post(_REMOVE, json={"path": "old", "dry_run": True})
     assert holds_one.status_code == 409, holds_one.text
+    # It names the folder it found registered, a hub value, not what was sent.
+    assert holds_one.json()["detail"] == (
+        f"{old_folder / 'old' / 'previews'} is a registered model folder inside "
+        "that folder. Stop watching it first."
+    )
 
     with shelf_env.server.hub.transaction() as conn:
         conn.execute("UPDATE model_folder SET movable = 'root_only' WHERE id = 1")
@@ -12707,10 +13410,24 @@ def comfyui_at(shelf_env, monkeypatch):
         model_folders_routes, "comfyui_link_service", SimpleNamespace(locate=locate)
     )
     monkeypatch.setattr(model_folders_routes, "comfyui_folder_paths", folder_paths)
+    # Saving the address starts the folder registration on a thread of its
+    # own, which reads `/internal/folder_paths` through the service rather than
+    # the route seam above: left running it asked the pinned loopback address
+    # over the network and outlived the test. Recorded instead, and joined.
+    registered: list[str] = []
+    monkeypatch.setattr(
+        "pixlstash.routes.config.register_comfyui_model_folders",
+        lambda server, base_url: registered.append(base_url) or [],
+    )
     r = shelf_env.owner.patch(
         f"{API}/users/me/config", json={"comfyui_url": "http://comfy.test:8188"}
     )
     assert r.status_code == 200, r.text
+    for thread in threading.enumerate():
+        if thread.name == "comfyui-model-folders":
+            thread.join(10)
+            assert not thread.is_alive(), "the folder registration did not end"
+    assert registered == ["http://comfy.test:8188"], registered
 
     def setter(answer, where="this_computer"):
         state["answer"], state["where"] = answer, where
@@ -13053,7 +13770,7 @@ def _civitai_answers(monkeypatch, status=200, body=None):
         sent.append(url)
         return SimpleNamespace(status_code=status, json=lambda: body)
 
-    monkeypatch.setattr(civitai_lookup.requests, "get", get)
+    monkeypatch.setattr(civitai_lookup, "bounded_get", get)
     return sent
 
 
@@ -13102,3 +13819,409 @@ def test_the_lookup_route_refuses_what_it_must_not_ask_about(
     assert r.status_code == 409, r.text
     assert sent == [], "a refused call still asked Civitai"
     assert _base_model_columns(shelf_env, noname)[0] is None
+
+
+def test_a_combo_key_naming_more_models_than_one_edit_is_refused_unread(shelf_env):
+    """The path has no length limit, so a key's size is the route's to bound:
+    past ``MAX_MODELS_PER_EDIT`` ids every verdict route answers one fixed 422
+    that repeats nothing sent, and a key at the ceiling still reaches the
+    write."""
+    root = f"{API}/models/workflow-sets/verdicts"
+    ceiling = model_shelf_service.MAX_MODELS_PER_EDIT
+    at = verdicts.combo_key(range(1, ceiling + 1))
+    past = verdicts.combo_key(range(1, ceiling + 2))
+    refusal = (
+        f"That combo key names more than {ceiling:,} models, the most one "
+        "request may name."
+    )
+    for method, path, body in (
+        ("PUT", f"{root}/{past}", {"verdict": "yes"}),
+        ("DELETE", f"{root}/{past}", None),
+        ("PUT", f"{root}/{past}/members/1", {"verdict": "problem"}),
+        ("DELETE", f"{root}/{past}/members/1", None),
+    ):
+        r = shelf_env.owner.request(method, path, json=body)
+        assert r.status_code == 422, f"{method}: {r.status_code} {r.text[:200]}"
+        assert r.json() == {"detail": refusal}, f"{method}: {r.text[:200]}"
+    # At the ceiling the key is read: clearing needs no shelf, so it answers.
+    r = shelf_env.owner.delete(f"{root}/{at}")
+    assert r.status_code == 200, r.text[:200]
+    assert r.json() == {"combo_key": at, "verdict": None, "previous": None}
+    r = shelf_env.owner.delete(f"{root}/{at}/members/{ceiling}")
+    assert r.status_code == 200, r.text[:200]
+    assert shelf_env.server.hub.fetchall("SELECT * FROM model_set_verdict") == []
+
+
+def test_clearing_refuses_a_junction_as_a_run(
+    shelf_env, import_folders, run_trash, monkeypatch
+):
+    """A Windows junction is a link as a symlink is, though ``os.path.islink``
+    says False for one, and trashing it would take the run it points at.
+    Simulated as tests/test_links.py does: the directory's ``lstat`` carries
+    the junction's reparse tag. Wrong if the run behind it goes to the trash;
+    the plain run is the control."""
+    junction = import_folders.output_root / "test-junction"
+    junction.mkdir()
+    _write_run_adapter(junction / "test-junction.safetensors", b"x")
+    real_lstat = os.lstat
+
+    class JunctionStat:
+        """The directory's real ``lstat``, carrying the junction's tag."""
+
+        st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+        def __init__(self, info):
+            self._info = info
+
+        def __getattr__(self, name):
+            return getattr(self._info, name)
+
+    def lstat(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        return JunctionStat(info) if os.fspath(path) == str(junction) else info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+    r = _trash_run(shelf_env, import_folders, "test-junction")
+    assert (r.status_code, r.json()["detail"]) == (
+        409,
+        "That run is a link, so PixlStash leaves it alone.",
+    )
+    assert (junction / "test-junction.safetensors").exists()
+    assert list(run_trash.iterdir()) == []
+    assert _trash_run(shelf_env, import_folders, "Clementine").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# A folder a download writes into is not moved or removed under it, and no
+# download starts inside a folder while it is moved or removed
+# ---------------------------------------------------------------------------
+
+_DOWNLOADING_INTO = (
+    "A model is downloading, or waiting to download, into this folder. "
+    "Try again when it is done."
+)
+_BEING_MOVED = (
+    "The folder this file would download into is being moved or removed. "
+    "Try again when that is done."
+)
+
+
+def _download_writing(monkeypatch, target, status="running") -> dict:
+    """A download in the registry the reservation reads, writing *target*,
+    whose thread has not ended. Put in with monkeypatch, so the test leaves
+    the registry as it found it."""
+    entry = {
+        "id": f"test-{len(model_downloads._downloads)}-{time.monotonic_ns()}",
+        "file": os.path.basename(str(target)),
+        "host": "example.com",
+        "folder_path": os.path.dirname(str(target)),
+        "status": status,
+        "received": 0,
+        "total": 0,
+        "error": None,
+        "page_url": None,
+        "model_id": None,
+        "ended_at": None,
+        "sha256": None,
+        "directory": None,
+        "slot": "other",
+        "_target": str(target),
+        "_cancel": threading.Event(),
+        "_done": threading.Event(),
+    }
+    monkeypatch.setitem(model_downloads._downloads, entry["id"], entry)
+    return entry
+
+
+def _ended_or_elsewhere(monkeypatch, entry, elsewhere) -> None:
+    """End *entry*'s thread, add ended downloads of the other two endings to
+    the same file, and a running one to *elsewhere*: none of them is a reason
+    to refuse."""
+    entry["status"] = "done"
+    entry["_done"].set()
+    for ended in ("failed", "cancelled"):
+        _download_writing(monkeypatch, entry["_target"], ended)["_done"].set()
+    _download_writing(monkeypatch, elsewhere, "running")
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_the_store_a_download_goes_into_is_not_relocated(
+    shelf_env, relocatable_store, monkeypatch, tmp_path, status
+):
+    """Where no folder is marked for downloads the store is where they go, and
+    the relocation takes the whole store along. Wrong if it starts while one
+    is queued or running into it, or still refuses once that one has ended or
+    when the download goes elsewhere."""
+    url = f"{API}/model-folders/{relocatable_store.managed_id}/relocate"
+    entry = _download_writing(
+        monkeypatch, relocatable_store.store / "test-new.safetensors", status
+    )
+    r = shelf_env.owner.post(url, json={"path": str(relocatable_store.target)})
+    assert (r.status_code, r.json().get("detail")) == (409, _DOWNLOADING_INTO)
+    assert sorted(p.name for p in relocatable_store.store.iterdir()) == [
+        "one.safetensors",
+        "two.safetensors",
+    ]
+    assert model_downloads._reserved == {}, "a refused move kept its reservation"
+
+    _ended_or_elsewhere(monkeypatch, entry, tmp_path / "other" / "x.safetensors")
+    r = shelf_env.owner.post(url, json={"path": str(relocatable_store.target)})
+    assert r.status_code == 202, r.text
+    assert [i["status"] for i in _await_move(shelf_env)["results"]] == [
+        "moved",
+        "moved",
+    ]
+
+
+def test_the_engines_folder_a_download_goes_into_is_not_relocated(
+    shelf_env, relocatable_downloads, monkeypatch, tmp_path
+):
+    """The engines' folder can be marked for downloads too, and a download into
+    a folder inside the one relocated is under it as well."""
+    url = f"{API}/model-folders/{relocatable_downloads.folder_id}/relocate"
+    entry = _download_writing(
+        monkeypatch, relocatable_downloads.downloads / "inside" / "x.safetensors"
+    )
+    r = shelf_env.owner.post(url, json={"path": str(relocatable_downloads.target)})
+    assert (r.status_code, r.json().get("detail")) == (409, _DOWNLOADING_INTO)
+    assert (
+        relocatable_downloads.downloads / "pixlstash-anomaly-tagger_meta.json"
+    ).exists()
+
+    _ended_or_elsewhere(monkeypatch, entry, tmp_path / "other" / "x.safetensors")
+    r = shelf_env.owner.post(url, json={"path": str(relocatable_downloads.target)})
+    assert r.status_code == 202, r.text
+    assert [i["status"] for i in _await_move(shelf_env)["results"]] == ["moved"]
+
+
+def _sdxl_folder(shelf_env, tmp_path):
+    """The seeded folder holding ``sdxl/`` (one model) and an empty
+    ``people/`` to move it into."""
+    model_moves._job = None
+    root = tmp_path / "loras"
+    (root / "sdxl").mkdir(parents=True)
+    (root / "people").mkdir()
+    (root / "sdxl" / "a.safetensors").write_bytes(b"a" * 64)
+    _seeded_folder_at(shelf_env.server, str(root))
+    _set_copies(shelf_env, 1, [(os.path.join("sdxl", "a.safetensors"), 64)])
+    return root
+
+
+_SDXL_MOVE = {"path": "sdxl", "destination_folder_id": 1, "destination_path": "people"}
+
+
+def test_a_directory_a_download_writes_in_is_not_moved(
+    shelf_env, tmp_path, monkeypatch
+):
+    """A download writing a strict subfolder of the directory refuses its
+    move. Wrong if the move starts, if a dry run (which moves nothing) is
+    refused, or if a download elsewhere in the same registered folder, or
+    one that has ended, still refuses it."""
+    root = _sdxl_folder(shelf_env, tmp_path)
+    url = f"{API}/model-folders/1/dirs/move"
+    entry = _download_writing(
+        monkeypatch, root / "sdxl" / "nested" / "b.safetensors", "queued"
+    )
+    r = shelf_env.owner.post(url, json={**_SDXL_MOVE, "dry_run": True})
+    assert r.status_code == 200, r.text
+    r = shelf_env.owner.post(url, json=_SDXL_MOVE)
+    assert (r.status_code, r.json().get("detail")) == (409, _DOWNLOADING_INTO)
+    assert (root / "sdxl" / "a.safetensors").is_file()
+    assert model_downloads._reserved == {}
+
+    # Beside the directory, in the folder it belongs to: not inside it.
+    _ended_or_elsewhere(monkeypatch, entry, root / "b.safetensors")
+    r = shelf_env.owner.post(url, json=_SDXL_MOVE)
+    assert r.status_code == 202, r.text
+    assert [i["status"] for i in _wait_for_move(shelf_env)["results"]] == ["moved"]
+    assert model_downloads._reserved == {}, "the finished move kept its reservation"
+
+
+def test_a_directory_a_download_writes_in_is_not_removed(
+    shelf_env, old_folder, fake_trash, monkeypatch
+):
+    """A queued download would make its subfolder again once it starts, and a
+    running one's partial would go to the trash with the directory."""
+    plan = _plan_removal(shelf_env)
+    entry = _download_writing(monkeypatch, old_folder / "old" / "x.safetensors")
+    r = shelf_env.owner.post(
+        _REMOVE, json={"path": "old", "expect": plan["fingerprint"]}
+    )
+    assert (r.status_code, r.json().get("detail")) == (409, _DOWNLOADING_INTO)
+    assert (old_folder / "old" / "lost.safetensors").exists()
+    assert list(fake_trash.iterdir()) == []
+    assert model_downloads._reserved == {}
+
+    _ended_or_elsewhere(monkeypatch, entry, old_folder / "keep" / "x.safetensors")
+    r = shelf_env.owner.post(
+        _REMOVE, json={"path": "old", "expect": plan["fingerprint"]}
+    )
+    assert r.status_code == 200, r.text
+    assert not (old_folder / "old").exists()
+    assert model_downloads._reserved == {}, "the removal kept its reservation"
+
+
+def test_a_cancelled_download_still_stopping_blocks_a_move(
+    shelf_env, relocatable_store, monkeypatch
+):
+    """A cancel reads ``cancelled`` at once, but its thread may still be
+    finishing a connect, and then removes its partial. Until that thread has
+    ended the folder is not moved."""
+    url = f"{API}/model-folders/{relocatable_store.managed_id}/relocate"
+    entry = _download_writing(
+        monkeypatch, relocatable_store.store / "test-new.safetensors", "cancelled"
+    )
+    r = shelf_env.owner.post(url, json={"path": str(relocatable_store.target)})
+    assert (r.status_code, r.json().get("detail")) == (409, _DOWNLOADING_INTO)
+
+    entry["_done"].set()
+    r = shelf_env.owner.post(url, json={"path": str(relocatable_store.target)})
+    assert r.status_code == 202, r.text
+    _await_move(shelf_env)
+
+
+def _downloads_into(monkeypatch, folder_id: int, folder) -> set:
+    """Make ``POST /model-downloads`` fetch ``test-model.safetensors`` (with
+    any subfolders in front) into *folder*, without a thread or a byte on the
+    wire. Returns the registry's ids before, for the caller to clear."""
+    source = {
+        "url": "https://example.com/test-model.safetensors",
+        "directory": None,
+        "sha256": None,
+        "live": False,
+    }
+    monkeypatch.setattr(model_downloads, "download_source", lambda f: dict(source))
+    monkeypatch.setattr(
+        model_downloads_routes, "download_source", lambda f: dict(source)
+    )
+    monkeypatch.setattr(
+        model_downloads,
+        "find_download_folder",
+        lambda hub: {"id": folder_id, "path": str(folder)},
+    )
+    monkeypatch.setattr(
+        model_downloads, "_run", lambda hub, entry, *a: entry["_done"].set()
+    )
+    return set(model_downloads._downloads)
+
+
+def _drop_downloads_since(before: set) -> None:
+    for key in set(model_downloads._downloads) - before:
+        del model_downloads._downloads[key]
+
+
+def test_a_download_into_the_store_is_refused_while_it_is_relocated(
+    shelf_env, relocatable_store, monkeypatch, tmp_path, caplog
+):
+    """The relocation holds the store for its whole job, not just at its start:
+    a download into it, or into a folder inside it, that starts while the
+    files are being moved is refused and registers nothing. One into another
+    folder still starts. Wrong if any of them goes the other way."""
+    started, release = threading.Event(), threading.Event()
+    original = ModelMover.execute
+
+    def held(self, *args, **kwargs):
+        started.set()
+        assert release.wait(30)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ModelMover, "execute", held)
+    store = relocatable_store.store
+    before = _downloads_into(monkeypatch, relocatable_store.managed_id, store)
+    try:
+        r = shelf_env.owner.post(
+            f"{API}/model-folders/{relocatable_store.managed_id}/relocate",
+            json={"path": str(relocatable_store.target)},
+        )
+        assert r.status_code == 202, r.text
+        assert started.wait(30)
+        for file in ("test-model.safetensors", "test-sub/test-model.safetensors"):
+            with caplog.at_level("WARNING", logger=model_downloads.logger.name):
+                d = shelf_env.owner.post(f"{API}/model-downloads", json={"file": file})
+            assert (d.status_code, d.json().get("detail")) == (409, _BEING_MOVED), file
+            assert set(model_downloads._downloads) == before, "it was registered"
+        assert str(store) in caplog.text, "the server log does not say which"
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.setattr(
+            model_downloads,
+            "find_download_folder",
+            lambda hub: {"id": 999, "path": str(elsewhere)},
+        )
+        d = shelf_env.owner.post(
+            f"{API}/model-downloads", json={"file": "test-model.safetensors"}
+        )
+        assert d.status_code == 200, d.text
+        assert d.json()["folder_path"] == str(elsewhere)
+    finally:
+        release.set()
+        moved = _await_move(shelf_env)
+        _drop_downloads_since(before)
+    assert [i["status"] for i in moved["results"]] == ["moved", "moved"]
+    assert model_downloads._reserved == {}, "the finished move kept its reservation"
+
+
+def test_a_relocation_that_fails_still_ends_its_reservation(
+    shelf_env, relocatable_store, monkeypatch
+):
+    """However the job ends, the store takes downloads again afterwards."""
+
+    def explode(self, *args, **kwargs):
+        raise RuntimeError("test-simulated move failure")
+
+    monkeypatch.setattr(ModelMover, "execute", explode)
+    r = shelf_env.owner.post(
+        f"{API}/model-folders/{relocatable_store.managed_id}/relocate",
+        json={"path": str(relocatable_store.target)},
+    )
+    assert r.status_code == 202, r.text
+    _await_move(shelf_env)
+    assert model_downloads._reserved == {}
+    before = _downloads_into(
+        monkeypatch, relocatable_store.managed_id, relocatable_store.store
+    )
+    try:
+        d = shelf_env.owner.post(
+            f"{API}/model-downloads", json={"file": "test-model.safetensors"}
+        )
+        assert d.status_code == 200, d.text
+    finally:
+        _drop_downloads_since(before)
+
+
+def test_a_download_into_a_subfolder_of_a_moving_directory_is_refused(
+    shelf_env, tmp_path, monkeypatch
+):
+    """While ``sdxl/`` moves, a download into ``sdxl/nested/`` is refused; one
+    into the same registered folder beside it starts."""
+    root = _sdxl_folder(shelf_env, tmp_path)
+    started, release = threading.Event(), threading.Event()
+    original = model_moves.execute_directory_move
+
+    def held(*args, **kwargs):
+        started.set()
+        assert release.wait(30)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model_moves, "execute_directory_move", held)
+    before = _downloads_into(monkeypatch, 1, root)
+    try:
+        r = shelf_env.owner.post(f"{API}/model-folders/1/dirs/move", json=_SDXL_MOVE)
+        assert r.status_code == 202, r.text
+        assert started.wait(30)
+        d = shelf_env.owner.post(
+            f"{API}/model-downloads",
+            json={"file": "sdxl/nested/test-model.safetensors"},
+        )
+        assert (d.status_code, d.json().get("detail")) == (409, _BEING_MOVED)
+        d = shelf_env.owner.post(
+            f"{API}/model-downloads", json={"file": "test-model.safetensors"}
+        )
+        assert d.status_code == 200, d.text
+    finally:
+        release.set()
+        moved = _wait_for_move(shelf_env)
+        _drop_downloads_since(before)
+    assert [i["status"] for i in moved["results"]] == ["moved"]

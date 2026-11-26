@@ -53,6 +53,7 @@ import requests
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.comfyui_service import NO_PROXY
 from pixlstash.services.workflow_hash import normalized_filename
+from pixlstash.utils.bounded_http import BoundedResponse, bounded_get
 
 logger = get_logger(__name__)
 
@@ -69,7 +70,10 @@ LISTING_TTL_S = 600.0
 # Graphs read at once. ComfyUI serves them from disk; a few hundred take a
 # fraction of a second on the same machine.
 GRAPH_READERS = 8
+# One receive, and one whole read: a server that trickles a graph or a
+# thumbnail is given up on, and the listing goes on without it.
 TIMEOUT_S = 10
+DEADLINE_S = 30.0
 # Larger than any template ComfyUI ships (the largest is well under 1 MB).
 MAX_GRAPH_BYTES = 8 * 1024 * 1024
 MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
@@ -169,24 +173,25 @@ def forget_listings() -> None:
         _listings.clear()
 
 
-def _get(url: str, *, max_bytes: int, proxies=NO_PROXY) -> requests.Response:
-    """GET *url* from ComfyUI, refusing a body past *max_bytes* as it arrives.
+def _get(url: str, *, max_bytes: int, proxies=NO_PROXY) -> BoundedResponse:
+    """GET *url*, read whole within ``DEADLINE_S`` and *max_bytes* (received
+    and decoded), never following a redirect; only a 200 is an answer.
 
     *proxies* ``None`` is the system's, for a URL that is not the owner's ComfyUI.
+
+    Raises:
+        requests.RequestException: no 200, or the read went past its bounds.
     """
-    with requests.get(
-        url, timeout=TIMEOUT_S, allow_redirects=False, proxies=proxies, stream=True
-    ) as response:
-        if response.status_code != 200:
-            raise requests.HTTPError(f"ComfyUI answered HTTP {response.status_code}")
-        body = bytearray()
-        for chunk in response.iter_content(64 * 1024):
-            body += chunk
-            if len(body) > max_bytes:
-                raise requests.HTTPError(f"past the {max_bytes} bytes allowed")
-        # Read whole, so `.content` and `.json()` serve what was counted.
-        response._content = bytes(body)
-        return response
+    response = bounded_get(
+        url,
+        deadline_s=DEADLINE_S,
+        max_bytes=max_bytes,
+        timeout=TIMEOUT_S,
+        proxies=proxies,
+    )
+    if response.status_code != 200:
+        raise requests.HTTPError(f"ComfyUI answered HTTP {response.status_code}")
+    return response
 
 
 def _get_json(url: str):

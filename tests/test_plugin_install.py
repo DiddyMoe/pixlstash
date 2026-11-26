@@ -21,12 +21,17 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
+import requests
 
 from pixlstash import cli, plugin_check, plugin_install, tagger_plugins
 from pixlstash.plugin_install import CAPTIONING, IMAGE, PluginError
+from pixlstash.utils import bounded_http
 from pixlstash.utils.accelerator import VALID_DEVICE_SETTINGS
+from pixlstash.utils.bounded_http import BoundedResponse
+from tests.test_bounded_http import NO_PROXY, _Peer, _trickle, _within
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -418,17 +423,160 @@ def test_a_zip_holding_a_symlink_is_refused(tmp_path, capsys):
     assert "symlink" in capsys.readouterr().err
 
 
+def test_a_zip_with_folder_entries_installs_as_codeload_ships_it(tmp_path, plugin_root):
+    """codeload and most zip tools write an entry for every folder as well as
+    for every file; streaming the members one by one has to create those."""
+    archive = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("my_captioner/", "")
+        bundle.writestr("my_captioner/data/", "")
+        bundle.writestr("my_captioner/__init__.py", CAPTIONER)
+        bundle.writestr("my_captioner/data/labels.txt", "a\nb\n")
+
+    assert _install(archive) == cli.EXIT_OK
+    installed = plugin_root / "tagger-plugins" / "user" / "my_captioner"
+    assert (installed / "__init__.py").read_text(encoding="utf-8") == CAPTIONER
+    assert (installed / "data" / "labels.txt").read_text() == "a\nb\n"
+
+
+def _understated_zip(archive: Path, *, declared: int, content: bytes) -> None:
+    """Write a zip whose last entry's header claims *declared* bytes while the
+    stream holds *content*, with the CRC of the whole of *content*.
+
+    The size is rewritten in the central directory, which is where Python's
+    zipfile takes it from when it reads a member.
+    """
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("plugin/__init__.py", CAPTIONER)
+        bundle.writestr("plugin/weights.bin", content)
+        bundle.filelist[-1].file_size = declared
+
+
+def test_a_header_understating_its_size_is_refused_and_leaves_nothing(
+    tmp_path, plugin_root, capsys
+):
+    """zipfile stops at the declared size and then finds the CRC wrong, after
+    that much is already on disk: the refusal has to take it away again."""
+    archive = tmp_path / "liar.zip"
+    _understated_zip(archive, declared=10, content=b"\0" * 200_000)
+    target = tmp_path / "unpacked"
+
+    with pytest.raises(PluginError, match="not a readable zip"):
+        plugin_install._extract_zip(archive, target)
+    assert not target.exists()
+
+    assert _install(archive) == cli.EXIT_REFUSED
+    assert "not a readable zip" in capsys.readouterr().err
+    assert not (plugin_root / "tagger-plugins").exists()
+
+
+def test_unpacking_stops_at_the_byte_cap_counted_as_written(tmp_path, monkeypatch):
+    """The headers here tell the truth and still add up past the cap: the
+    count is of what was written, and what was written is taken away."""
+    monkeypatch.setattr(plugin_install, "EXTRACT_MAX_BYTES", 150_000)
+    archive = tmp_path / "bomb.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("plugin/__init__.py", CAPTIONER)
+        bundle.writestr("plugin/a.bin", b"\0" * 100_000)
+        bundle.writestr("plugin/b.bin", b"\0" * 100_000)
+    assert archive.stat().st_size < 5_000
+    target = tmp_path / "unpacked"
+
+    with pytest.raises(PluginError, match="unpacks to more than"):
+        plugin_install._extract_zip(archive, target)
+    assert not target.exists()
+
+
+def test_an_archive_of_more_entries_than_the_cap_is_refused_before_writing(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("plugin/__init__.py", CAPTIONER)
+        for index in range(plugin_install.EXTRACT_MAX_MEMBERS):
+            bundle.writestr(f"plugin/e{index}", b"")
+    opened = []
+    real_open = zipfile.ZipFile.open
+    monkeypatch.setattr(
+        zipfile.ZipFile,
+        "open",
+        lambda self, *args, **kwargs: (
+            opened.append(args) or real_open(self, *args, **kwargs)
+        ),
+    )
+    target = tmp_path / "unpacked"
+
+    with pytest.raises(PluginError, match="more than the 10000 a plugin may have"):
+        plugin_install._extract_zip(archive, target)
+    assert opened == []
+    assert not target.exists()
+
+
+def test_a_central_directory_past_the_cap_is_refused_before_it_is_read(
+    tmp_path, monkeypatch
+):
+    """The member count comes from parsing the central directory, which is
+    held in memory whole: its size is checked first, from the end record."""
+    archive = tmp_path / "wide.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for index in range(40):
+            bundle.writestr(f"plugin/e{index}", b"")
+    monkeypatch.setattr(plugin_install, "EXTRACT_MAX_DIRECTORY_BYTES", 1024)
+    parsed = []
+    monkeypatch.setattr(
+        plugin_install.zipfile, "ZipFile", lambda *args, **kwargs: parsed.append(args)
+    )
+    target = tmp_path / "unpacked"
+
+    with pytest.raises(PluginError, match="list of entries larger than"):
+        plugin_install._extract_zip(archive, target)
+    assert parsed == []
+    assert not target.exists()
+
+
+def test_an_encrypted_entry_is_a_refusal_not_a_traceback(tmp_path):
+    archive = tmp_path / "locked.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("plugin/__init__.py", CAPTIONER)
+    # zipfile clears flag_bits when it writes, so the encrypted bit is set in
+    # the bytes: the local header (flags at offset 6) and the central
+    # directory entry (offset 8).
+    data = bytearray(archive.read_bytes())
+    for signature, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        data[data.index(signature) + offset] |= 0x1
+    archive.write_bytes(bytes(data))
+    with zipfile.ZipFile(archive) as bundle:
+        assert bundle.infolist()[0].flag_bits & 0x1
+    target = tmp_path / "unpacked"
+
+    with pytest.raises(PluginError, match="encrypted"):
+        plugin_install._extract_zip(archive, target)
+    assert not target.exists()
+
+
 # ----------------------------------------------------------------------
 # The plugins repository
 # ----------------------------------------------------------------------
 
 
-class _FakeResponse:
-    def __init__(self, content: bytes) -> None:
-        self.content = content
+def _serving(content: bytes, status_code: int = 200, requested: dict | None = None):
+    """A stand-in for ``bounded_get`` answering every download with *content*.
 
-    def raise_for_status(self) -> None:
-        pass
+    A 2xx body goes to the caller's sink, as the real one sends it; any other
+    comes back as the answer's content (a ref GitHub does not have is a 404).
+    *requested*, when given, records the URL and the bounds asked for.
+    """
+
+    def fake_get(url, **kwargs):
+        if requested is not None:
+            requested["url"] = url
+            requested.update(kwargs)
+        if status_code == 200:
+            kwargs["sink"](content)
+            return BoundedResponse(url, status_code, b"")
+        return BoundedResponse(url, status_code, content)
+
+    return fake_get
 
 
 # A published plugin as the repository actually ships one: a header declaring
@@ -478,13 +626,9 @@ def fake_repository(monkeypatch, tmp_path):
             CAPTIONER,
         )
 
-    def fake_get(url, timeout=None):
-        requested["url"] = url
-        return _FakeResponse(archive.getvalue())
-
-    import requests
-
-    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(
+        plugin_install, "bounded_get", _serving(archive.getvalue(), requested=requested)
+    )
     return requested
 
 
@@ -503,13 +647,7 @@ def published(monkeypatch):
             for path, content in files.items():
                 bundle.writestr(f"PixlStash-plugins-main/{path}", content)
 
-        import requests
-
-        monkeypatch.setattr(
-            requests,
-            "get",
-            lambda url, timeout=None: _FakeResponse(archive.getvalue()),
-        )
+        monkeypatch.setattr(plugin_install, "bounded_get", _serving(archive.getvalue()))
 
     return serve
 
@@ -521,6 +659,14 @@ def test_installing_a_named_plugin_from_the_repository(plugin_root, fake_reposit
         fake_repository["url"]
         == f"https://codeload.github.com/{plugin_install.PLUGINS_REPO}/zip/main"
     )
+    # Without them, a stalled or endless codeload answer hangs the CLI for good
+    # or fills the disk; and it is written as it arrives, not held in memory.
+    assert fake_repository["timeout"] == plugin_install.REPOSITORY_TIMEOUT_S
+    assert fake_repository["deadline_s"] == plugin_install.REPOSITORY_DEADLINE_S
+    assert fake_repository["max_bytes"] == plugin_install.REPOSITORY_MAX_BYTES
+    assert callable(fake_repository["sink"])
+    # codeload serves the zip itself: a redirect is never followed.
+    assert fake_repository.get("redirects", 0) == 0
 
 
 def test_a_repository_folder_captioner_installs_as_a_folder(
@@ -602,6 +748,92 @@ def test_a_published_folder_that_will_not_parse_blocks_nothing(
 def test_a_ref_may_choose_a_branch(plugin_root, fake_repository):
     assert _install("my_filter", "--ref", "v1.2.3") == cli.EXIT_OK
     assert fake_repository["url"].endswith("/zip/v1.2.3")
+
+
+def test_a_ref_the_repository_does_not_have_is_refused_and_installs_nothing(
+    plugin_root, monkeypatch, capsys
+):
+    """GitHub answers an unknown ref with a 404 page, not a zip: the install
+    says it could not download and writes nothing, rather than unpacking an
+    error page."""
+    monkeypatch.setattr(
+        plugin_install, "bounded_get", _serving(b"404: Not Found", status_code=404)
+    )
+    assert _install("my_filter", "--ref", "no-such-branch") == cli.EXIT_REFUSED
+    error = capsys.readouterr().err
+    assert "could not download" in error and "HTTP 404" in error
+    assert not (plugin_root / "image-plugins").exists()
+
+
+@pytest.fixture
+def codeload_at(monkeypatch):
+    """Send the repository download to a local peer instead of codeload, with
+    the bounds `_download_repository` chose, through the real bounded read."""
+
+    def point(peer_url: str) -> None:
+        def to_peer(_url, **kwargs):
+            return bounded_http.bounded_get(peer_url, proxies=NO_PROXY, **kwargs)
+
+        monkeypatch.setattr(plugin_install, "bounded_get", to_peer)
+
+    return point
+
+
+def test_a_redirected_repository_download_is_refused_and_never_followed(
+    plugin_root, codeload_at, capsys
+):
+    """The download is pinned to codeload; a redirect is the way off it."""
+    with _Peer(lambda conn, _: conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")) as target:
+
+        def handler(conn, _):
+            conn.sendall(
+                b"HTTP/1.1 302 Found\r\nLocation: %s/\r\n"
+                b"Content-Length: 0\r\n\r\n" % target.url.encode()
+            )
+
+        with _Peer(handler) as peer:
+            codeload_at(peer.url)
+            assert _install("my_filter") == cli.EXIT_REFUSED
+    assert target.asked == 0
+    assert "HTTP 302" in capsys.readouterr().err
+    assert not (plugin_root / "image-plugins").exists()
+
+
+def test_an_endless_repository_download_is_cut_at_the_cap(
+    plugin_root, codeload_at, monkeypatch, capsys
+):
+    monkeypatch.setattr(plugin_install, "REPOSITORY_MAX_BYTES", 64 * 1024)
+    sent = []
+
+    def handler(conn, _):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+        chunk = b"a" * 65536
+        while sum(sent) < 64 << 20:
+            conn.sendall(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+            sent.append(len(chunk))
+
+    with _Peer(handler) as peer, _within(5.0):
+        codeload_at(peer.url)
+        assert _install("my_filter") == cli.EXIT_REFUSED
+    assert sum(sent) < 16 << 20
+    assert "larger than" in capsys.readouterr().err
+    assert not (plugin_root / "image-plugins").exists()
+
+
+def test_a_dribbled_repository_download_is_cut_at_the_deadline(
+    plugin_root, codeload_at, monkeypatch, capsys
+):
+    monkeypatch.setattr(plugin_install, "REPOSITORY_DEADLINE_S", 0.5)
+
+    def handler(conn, _):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 60\r\n\r\n")
+        _trickle(conn, b"a" * 60)
+
+    with _Peer(handler) as peer, _within(3.0):
+        codeload_at(peer.url)
+        assert _install("my_filter") == cli.EXIT_REFUSED
+    assert "did not finish within 0.5 s" in capsys.readouterr().err
+    assert not (plugin_root / "image-plugins").exists()
 
 
 @pytest.mark.parametrize(
@@ -2536,3 +2768,528 @@ def test_without_with_deps_pip_is_never_consulted(
     monkeypatch.setattr(plugin_install, "resolve_requirements", explode)
     assert cli.main(["plugins", "install", str(source), "--yes"]) == 0
     assert "It is NOT installed" in capsys.readouterr().out
+
+
+_WHEEL_PATH = "/packages/aa/bb/zzprivate-1.0-py3-none-any.whl"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # urlparse ends the host at the `@`; requests ends it at the
+        # backslash, so pip fetches from evil.example.
+        "https://evil.example\\@files.pythonhosted.org" + _WHEEL_PATH,
+        "https://evil.example\\.files.pythonhosted.org" + _WHEEL_PATH,
+        "https://files.pythonhosted.org@evil.example" + _WHEEL_PATH,
+        # requests refuses to send it, so nothing says it is PyPI's.
+        "https://files.pythonhosted.org\t" + _WHEEL_PATH,
+    ],
+    ids=["backslash-userinfo", "backslash", "userinfo", "tab"],
+)
+def test_a_dependency_url_not_fetched_from_pypi_is_named(url):
+    """The listing names an artefact by the host pip's requests fetches it
+    from, not by urlparse's reading of its URL.
+
+    Wrong if any of these reads as PyPI's file host: the person consents to a
+    name while the wheel comes from somewhere else.
+    """
+    change = plugin_install.DependencyChange(
+        "zzprivate", "1.0", download_info={"url": url}
+    )
+    assert change.url == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://files.pythonhosted.org" + _WHEEL_PATH,
+        "https://FILES.pythonhosted.org" + _WHEEL_PATH,
+        "https://pypi.org" + _WHEEL_PATH,
+    ],
+)
+def test_a_dependency_url_on_pypi_s_own_host_is_not_named(url):
+    """Wrong if an ordinary PyPI artefact is named: a URL on every line trains
+    people to skip the one that matters."""
+    change = plugin_install.DependencyChange(
+        "zzprivate", "1.0", download_info={"url": url}
+    )
+    assert change.url is None
+
+
+def test_the_backslash_vector_reads_as_pypi_to_urlparse():
+    """The premise of the backslash-userinfo case above: without it, that case
+    would pass under urlparse too and prove nothing."""
+    url = "https://evil.example\\@files.pythonhosted.org" + _WHEEL_PATH
+    assert urlparse(url).hostname == "files.pythonhosted.org"
+    assert bounded_http.wire_split(url).hostname == "evil.example"
+
+
+# ----------------------------------------------------------------------
+# A failed repository download says what kind of failure it was
+# ----------------------------------------------------------------------
+
+#: Stands in for what requests puts in its own text: pool internals and an
+#: address. None of it may reach the terminal.
+_REQUESTS_DETAIL = "HTTPSConnectionPool(host='192.0.2.7', port=443): test-detail"
+
+
+@pytest.mark.parametrize(
+    "exc,sentence",
+    [
+        (
+            requests.exceptions.ProxyError(_REQUESTS_DETAIL),
+            "the proxy this computer is set to use did not pass the request "
+            "on. Check the proxy setting (HTTPS_PROXY, or the system's own).",
+        ),
+        (
+            requests.exceptions.SSLError(_REQUESTS_DETAIL),
+            "the secure connection to codeload.github.com could not be "
+            "verified, so nothing was downloaded. A network that intercepts "
+            "HTTPS can cause this.",
+        ),
+        (
+            requests.exceptions.ConnectionError(_REQUESTS_DETAIL),
+            "could not connect to codeload.github.com. Check that this "
+            "computer is online.",
+        ),
+        (
+            requests.exceptions.ReadTimeout(_REQUESTS_DETAIL),
+            "codeload.github.com stopped answering for "
+            f"{plugin_install.REPOSITORY_TIMEOUT_S} s.",
+        ),
+        (
+            requests.exceptions.ChunkedEncodingError(_REQUESTS_DETAIL),
+            "the answer from codeload.github.com could not be read.",
+        ),
+    ],
+    ids=["proxy", "tls", "connection", "timeout", "unreadable"],
+)
+def test_a_failed_repository_download_names_the_kind_of_failure(
+    plugin_root, monkeypatch, caplog, capsys, exc, sentence
+):
+    """Wrong if requests' own text reaches the terminal, or if the person is
+    told the network is down when it is their proxy or a TLS interception."""
+
+    def fail(_url, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(plugin_install, "bounded_get", fail)
+    with caplog.at_level("WARNING", logger="pixlstash.plugin_install"):
+        assert _install("my_filter") == cli.EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert err == (
+        f"error: could not download {plugin_install.PLUGINS_REPO} at ref "
+        f"'main': {sentence}\n"
+    )
+    assert "192.0.2.7" not in err and "test-detail" not in err
+    logged = [rec for rec in caplog.records if rec.exc_info]
+    assert logged and logged[-1].exc_info[1] is exc, "the detail goes to the log"
+    assert not (plugin_root / "image-plugins").exists()
+
+
+def test_a_syntax_error_names_the_line_and_not_the_path(tmp_path, capsys):
+    """The compiler's own message stays; the full path str(exc) carried goes."""
+    source = _write(tmp_path / "test-folder" / "broken.py", "x = 1\nclass Nope(:\n")
+    assert _install(source) == cli.EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "error: broken.py is not valid Python: " in err
+    assert "(line 2)." in err
+    assert "test-folder" not in err
+
+
+def test_a_source_that_is_not_utf8_is_refused_without_the_codec_text(tmp_path):
+    path = tmp_path / "latin.py"
+    path.write_bytes(b"# caf\xe9\n")
+    with pytest.raises(PluginError) as caught:
+        plugin_install.inspect_file(path)
+    assert str(caught.value) == f"could not read {path}: it is not UTF-8 text."
+
+
+def test_an_install_that_cannot_write_says_why_in_the_system_s_words(
+    tmp_path, plugin_root, monkeypatch
+):
+    source = _write(tmp_path / "my_filter.py", IMAGE_PLUGIN)
+    plan = plugin_install.plan_install(source)
+
+    def refuse(*_args, **_kwargs):
+        raise PermissionError(13, "test-detail", "/home/me/test-elsewhere")
+
+    monkeypatch.setattr(plugin_install.shutil, "copy2", refuse)
+    with pytest.raises(PluginError) as caught:
+        plugin_install.install(plan)
+    assert str(caught.value) == (
+        f"could not install to {plan.destination}: {os.strerror(13)}."
+    )
+
+
+def test_an_unreadable_pip_report_is_a_fixed_refusal(tmp_path, monkeypatch):
+    def fake_run(command, **_kwargs):
+        index = command.index("--report")
+        Path(command[index + 1]).write_text("{test-not-json", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(plugin_install.subprocess, "run", fake_run)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("flask\n", encoding="utf-8")
+    with pytest.raises(PluginError) as caught:
+        plugin_install.resolve_requirements(requirements)
+    assert str(caught.value) == (
+        "pip did not report what it would install. Nothing was installed."
+    )
+
+
+def test_an_unreadable_installed_plugin_is_listed_with_the_system_s_words(
+    tmp_path, monkeypatch
+):
+    folder = tmp_path / "test_plugin"
+    _write(folder / "__init__.py", "")
+
+    def refuse(_root):
+        raise PermissionError(13, "test-detail", "/home/me/test-elsewhere")
+
+    monkeypatch.setattr(plugin_install, "_python_files", refuse)
+    entry = plugin_install._describe(IMAGE, folder, set())
+    assert entry.problem == f"could not be read: {os.strerror(13)}"
+    published = plugin_install._catalogue_entry(folder, set())
+    assert published.problem == f"could not be read: {os.strerror(13)}"
+
+
+def test_a_plugin_folder_that_cannot_be_found_is_a_fixed_refusal(monkeypatch):
+    def refuse(_kind):
+        raise PermissionError(13, "test-detail", "/home/me/test-elsewhere")
+
+    monkeypatch.setattr(plugin_install, "user_dir", refuse)
+    with pytest.raises(PluginError) as caught:
+        plugin_install.resolve_removal("test_plugin", IMAGE)
+    assert str(caught.value) == (
+        f"the {IMAGE} plugin folder could not be found: {os.strerror(13)}."
+    )
+
+
+# ----------------------------------------------------------------------
+# Every address pip reads is judged before pip runs
+# ----------------------------------------------------------------------
+
+_HIDES = "which can hide where pip downloads from. Nothing was installed."
+
+
+@pytest.mark.parametrize(
+    "text,line,reason",
+    [
+        (
+            "flask\nzz @ https://evil.example\\@files.pythonhosted.org/x.whl\n",
+            2,
+            "an address with a backslash in it",
+        ),
+        (
+            "zz @ https://files.pythonhosted.org@evil.example/x.whl\n",
+            1,
+            "an address with a user name in it",
+        ),
+        ("zz@https://u@evil.example/x.whl\n", 1, "an address with a user name in it"),
+        (
+            "--index-url https://u:p@pypi.org/simple\nflask\n",
+            1,
+            "an address with a user name in it",
+        ),
+        ("-i https://u@pypi.org/simple\n", 1, "an address with a user name in it"),
+        # optparse takes any unambiguous abbreviation, and so does pip.
+        ("--extra https://u@pypi.org/simple\n", 1, "an address with a user name in it"),
+        (
+            # Quoted: pip shlex-splits an option line, so unquoted the backslash
+            # is gone before pip sees the address.
+            "--find-links='https://evil.example\\.pypi.org/w'\n",
+            1,
+            "an address with a backslash in it",
+        ),
+        (
+            "-e git+ssh://git@example.invalid/o/r.git#egg=r\n",
+            1,
+            "an address with a user name in it",
+        ),
+        # Joined to the line it continues, and named by that line, as pip does.
+        (
+            "flask\n--index-url \\\nhttps://u@evil.example/simple\n",
+            2,
+            "an address with a user name in it",
+        ),
+        (
+            "zz @ https://bücher.example/x.whl\n",
+            1,
+            "an address whose host reads differently to different parsers",
+        ),
+        (
+            "zz @ https://pypi.org:99999/x.whl\n",
+            1,
+            "an address that cannot be read as one host",
+        ),
+    ],
+    ids=[
+        "backslash-userinfo",
+        "userinfo",
+        "userinfo-no-space",
+        "index-url",
+        "index-url-short",
+        "extra-index-url-abbreviated",
+        "find-links-backslash",
+        "editable-vcs",
+        "continuation",
+        "differential",
+        "unreadable-port",
+    ],
+)
+def test_an_address_that_hides_its_host_is_refused_before_pip_runs(
+    pip_report, tmp_path, text, line, reason
+):
+    """pip strips a user name before writing its report, so the report would
+    name PyPI's host for a wheel fetched from evil.example. Wrong if pip runs,
+    or if the refusal echoes the address."""
+    calls = pip_report(("zz", "1.0"), installed={})
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text(text, encoding="utf-8")
+
+    with pytest.raises(PluginError) as caught:
+        plugin_install.resolve_requirements(requirements)
+    assert (
+        str(caught.value) == f"line {line} of requirements.txt names {reason}, {_HIDES}"
+    )
+    assert calls == [], "pip must not have been asked"
+
+
+def test_an_address_in_an_included_file_is_refused_naming_that_file(
+    pip_report, tmp_path
+):
+    calls = pip_report(installed={})
+    plugin = tmp_path / "plugin"
+    _write(
+        plugin / "deps" / "base.txt", "flask\n--extra-index-url https://u@x.example/s\n"
+    )
+    requirements = _write(plugin / "requirements.txt", "requests\n-r deps/base.txt\n")
+
+    with pytest.raises(PluginError) as caught:
+        plugin_install.resolve_requirements(requirements)
+    assert str(caught.value) == (
+        f"line 2 of deps/base.txt names an address with a user name in it, {_HIDES}"
+    )
+    assert calls == []
+
+
+def test_an_address_from_the_environment_is_judged_as_pip_expands_it(
+    pip_report, tmp_path, monkeypatch
+):
+    calls = pip_report(installed={})
+    monkeypatch.setenv("TEST_PLUGIN_INDEX", "u@evil.example")
+    requirements = _write(
+        tmp_path / "requirements.txt", "--index-url https://${TEST_PLUGIN_INDEX}/s\n"
+    )
+    with pytest.raises(PluginError) as caught:
+        plugin_install.resolve_requirements(requirements)
+    assert str(caught.value) == (
+        f"line 1 of requirements.txt names an address with a user name in it, {_HIDES}"
+    )
+    assert calls == []
+
+
+def test_an_address_behind_a_byte_order_mark_is_judged(pip_report, tmp_path):
+    """pip decodes a UTF-16 file by its mark; a UTF-8-only reader saw no lines."""
+    calls = pip_report(installed={})
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_bytes("zz @ https://u@evil.example/x.whl\n".encode("utf-16"))
+    with pytest.raises(PluginError) as caught:
+        plugin_install.resolve_requirements(requirements)
+    assert "line 1 of requirements.txt names an address with a user name" in str(
+        caught.value
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "include,sentence",
+    [
+        (
+            "-r https://example.invalid/r.txt",
+            "includes a requirements file from an address, which cannot be "
+            "checked before pip reads it.",
+        ),
+        (
+            "-c file:///home/me/test-constraints.txt",
+            "includes a requirements file from an address, which cannot be "
+            "checked before pip reads it.",
+        ),
+        (
+            "-r ../outside.txt",
+            "includes a file outside the plugin folder, or one that is not "
+            "there, so it cannot be checked.",
+        ),
+        (
+            "--requirement missing.txt",
+            "includes a file outside the plugin folder, or one that is not "
+            "there, so it cannot be checked.",
+        ),
+    ],
+    ids=["url", "file-url", "outside", "missing"],
+)
+def test_an_include_that_cannot_be_judged_is_refused(
+    pip_report, tmp_path, include, sentence
+):
+    calls = pip_report(installed={})
+    _write(tmp_path / "outside.txt", "flask\n")
+    requirements = _write(tmp_path / "plugin" / "requirements.txt", f"{include}\n")
+    with pytest.raises(PluginError) as caught:
+        plugin_install.resolve_requirements(requirements)
+    assert str(caught.value) == (
+        f"line 1 of requirements.txt {sentence} Nothing was installed."
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize("line", ["--test-no-such-option\n", '--hash "abc\n'])
+def test_a_line_pip_cannot_parse_is_refused(pip_report, tmp_path, line):
+    """Unjudged would mean unread: refused, as pip refuses it."""
+    calls = pip_report(installed={})
+    requirements = _write(tmp_path / "requirements.txt", f"flask\n{line}")
+    with pytest.raises(PluginError) as caught:
+        plugin_install.resolve_requirements(requirements)
+    assert str(caught.value) == (
+        "pip cannot read line 2 of requirements.txt. Nothing was installed."
+    )
+    assert calls == []
+
+
+def test_ordinary_requirements_and_comments_pass_the_judge(pip_report, tmp_path):
+    """Over-refusal is its own failure: these are what plugins actually ship."""
+    calls = pip_report(("flask", "3.1.3"), installed={})
+    requirements = _write(
+        tmp_path / "requirements.txt",
+        "flask>=3 # see https://u@evil.example, a comment pip drops\n"
+        'pillow; python_version >= "3.10"\n'
+        "r @ git+https://example.invalid/o/r.git@v1.0\n"
+        "--find-links ./wheels\n",
+    )
+    plugin_install.resolve_requirements(requirements)
+    assert len(calls) == 1
+
+
+def test_the_judge_reads_lines_as_pip_does():
+    """The reader is a copy of pip's; this holds it to the original.
+
+    Wrong if pip and the judge see different lines - a joined continuation, a
+    comment after a backslash, a form feed - since the judge would then pass
+    a line pip never showed it.
+    """
+    from pip._internal.req.req_file import preprocess
+
+    text = (
+        "a \\\n  b\n# c \\\nd\nflask # x\n\n  e\\\\\n\x0cf\ng h\n"
+        "${TEST_UNSET_VARIABLE} ${PATH}\nlast \\"
+    )
+    assert plugin_install._pip_lines(text, expand=True) == list(preprocess(text))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        "﻿flask\n".encode("utf-8"),
+        "flask\n".encode("utf-16"),
+        "flask\n".encode("utf-32"),
+        "# -*- coding: latin-1 -*-\ncaf\xe9\n".encode("latin-1"),
+        b"flask\n",
+    ],
+    ids=["utf8-bom", "utf16", "utf32", "pep263", "plain"],
+)
+def test_the_judge_decodes_as_pip_does(data):
+    from pip._internal.req.req_file import _decode_req_file
+
+    assert plugin_install._decode_like_pip(data) == _decode_req_file(data, "x")
+
+
+def test_the_judge_knows_every_option_pip_does():
+    """An option missing here changes how optparse expands an abbreviation,
+    and refuses a line pip reads; one too many accepts a line pip refuses."""
+    from pip._internal.req.req_file import build_parser
+
+    pip_parser = build_parser()
+    ours = plugin_install._pip_line_parser()
+
+    def table(parser):
+        return sorted(
+            (tuple(sorted(o._short_opts + o._long_opts)), o.takes_value())
+            for o in parser.option_list
+        )
+
+    assert table(ours) == table(pip_parser)
+
+
+def test_every_index_option_is_named_against_every_entry(pip_report, tmp_path, capsys):
+    """pip's report cannot say which index served a wheel, so each option is a
+    possible source of each entry. Wrong if any entry reads as PyPI's alone."""
+    pip_report(("flask", "3.1.3"), ("pillow", "11.0.0"), installed={})
+    plugin = tmp_path / "plugin"
+    _write(
+        plugin / "deps.txt", "--extra-index-url https://packages.example.invalid/s\n"
+    )
+    requirements = _write(
+        plugin / "requirements.txt", "--find-links ./wheels\n-r deps.txt\nflask\n"
+    )
+
+    changes = plugin_install.resolve_requirements(requirements)
+    sources = (
+        "--find-links ./wheels  (line 1 of requirements.txt)",
+        "--extra-index-url https://packages.example.invalid/s  (line 1 of deps.txt)",
+    )
+    assert [change.index_sources for change in changes] == [sources, sources]
+    cli._report_dependencies(changes, force=False)
+    lines = capsys.readouterr().out.splitlines()
+    for name in ("flask", "pillow"):
+        at = next(i for i, text in enumerate(lines) if text.split()[:1] == [name])
+        assert [
+            text.split("may come from ")[-1] for text in lines[at + 1 : at + 3]
+        ] == [*sources]
+
+
+def test_no_index_option_means_no_possible_source_line(pip_report, tmp_path, capsys):
+    pip_report(("flask", "3.1.3"), installed={})
+    requirements = _write(tmp_path / "requirements.txt", "flask\n")
+    changes = plugin_install.resolve_requirements(requirements)
+    cli._report_dependencies(changes, force=False)
+    assert "may come from" not in capsys.readouterr().out
+
+
+def test_the_install_command_refuses_a_hidden_host_before_resolving(
+    tmp_path, plugin_root, pip_report, capsys
+):
+    calls = pip_report(("zz", "1.0"), installed={})
+    folder = tmp_path / "pkg"
+    _write(folder / "__init__.py", CAPTIONER)
+    _write(
+        folder / "requirements.txt",
+        "zz @ https://evil.example\\@files.pythonhosted.org/x.whl\n",
+    )
+    assert _install(folder, "--with-deps") == cli.EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert (
+        "error: line 1 of requirements.txt names an address with a backslash "
+        f"in it, {_HIDES}"
+    ) in err
+    assert "evil.example" not in err
+    assert calls == []
+    assert not plugin_install.user_dir(CAPTIONING).exists()
+
+
+@pytest.mark.parametrize(
+    "info",
+    [
+        {"url": "file:///srv/wheels/zz-1.0-py3-none-any.whl"},
+        {"url": "ftp://files.pythonhosted.org" + _WHEEL_PATH},
+        {"url": "http://files.pythonhosted.org" + _WHEEL_PATH},
+        {
+            "url": "https://pypi.org/o/r.git",
+            "vcs_info": {"vcs": "git", "commit_id": "0" * 40},
+        },
+    ],
+    ids=["file", "ftp", "plain-http", "vcs-on-index-host"],
+)
+def test_only_https_on_an_index_host_without_vcs_goes_unnamed(info):
+    """Every other entry is named, so "anything else is named" is true."""
+    change = plugin_install.DependencyChange("zz", "1.0", download_info=info)
+    assert change.url == info["url"]

@@ -6,6 +6,7 @@ a day, and must never raise into the caller no matter what the network does.
 """
 
 import json
+import logging
 import os
 import threading
 import time
@@ -14,6 +15,8 @@ from datetime import datetime, timezone
 import pytest
 
 from pixlstash.telemetry import install_id, sender
+from pixlstash.utils.bounded_http import BoundedResponse
+from tests.test_bounded_http import _Peer, _trickle, _within
 
 
 @pytest.fixture
@@ -179,60 +182,65 @@ def test_corrupt_send_state_is_treated_as_never_sent(config_path):
 # ---------------------------------------------------------------------------
 
 
-class _FakeResponse:
-    def __init__(self, status):
-        self.status = status
+def _answering(status, captured=None):
+    """A stand-in for ``bounded_request`` answering every ping with *status*.
 
-    def __enter__(self):
-        return self
+    *captured*, when given, records what the sender asked for.
+    """
 
-    def __exit__(self, *exc):
-        return False
+    def fake_request(method, url, **kwargs):
+        if captured is not None:
+            captured.update(kwargs, method=method, url=url)
+        return BoundedResponse(url, status, b"")
+
+    return fake_request
 
 
 def test_sends_exactly_the_three_accepted_keys(config_path, monkeypatch):
     captured = {}
-
-    def _fake_urlopen(request, timeout=None):
-        captured["url"] = request.full_url
-        captured["method"] = request.method
-        captured["body"] = json.loads(request.data.decode("utf-8"))
-        captured["user_agent"] = request.get_header("User-agent")
-        return _FakeResponse(204)
-
-    monkeypatch.setattr(sender.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(sender, "bounded_request", _answering(204, captured))
 
     assert sender.send_install_ping(config_path, "docker") is True
+    body = json.loads(captured["data"].decode("utf-8"))
     # The Worker rejects any unrecognised key outright, so an extra field here
     # would turn every ping into a 400.
-    assert sorted(captured["body"]) == [
+    assert sorted(body) == [
         "install_id",
         "install_type",
         "is_new_install",
     ]
-    assert captured["body"]["install_type"] == "docker"
+    assert body["install_type"] == "docker"
     assert captured["method"] == "POST"
-    assert captured["user_agent"] == "pixlstash-telemetry/1.0"
+    assert captured["url"] == sender.TELEMETRY_ENDPOINT
+    assert captured["headers"]["User-Agent"] == "pixlstash-telemetry/1.0"
+
+
+def test_the_ping_is_bounded_and_follows_no_redirect(config_path, monkeypatch):
+    """A deadline on the whole exchange, a small cap on the answer, and the
+    client's default of following no redirect, all reaching the call."""
+    captured = {}
+    monkeypatch.setattr(sender, "bounded_request", _answering(204, captured))
+
+    sender.send_install_ping(config_path, "pip")
+
+    assert captured["deadline_s"] == sender.REQUEST_DEADLINE_SECONDS
+    assert captured["max_bytes"] == sender.RESPONSE_MAX_BYTES
+    assert captured["timeout"] == sender.REQUEST_TIMEOUT_SECONDS
+    assert captured.get("redirects", 0) == 0
 
 
 def test_sends_no_version_timestamp_or_machine_detail(config_path, monkeypatch):
     captured = {}
-
-    def _fake_urlopen(request, timeout=None):
-        captured["raw"] = request.data.decode("utf-8")
-        return _FakeResponse(204)
-
-    monkeypatch.setattr(sender.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(sender, "bounded_request", _answering(204, captured))
     sender.send_install_ping(config_path, "pip")
 
-    assert "T" not in captured["raw"].replace("install_type", "")
-    assert "version" not in captured["raw"]
+    raw = captured["data"].decode("utf-8")
+    assert "T" not in raw.replace("install_type", "")
+    assert "version" not in raw
 
 
 def test_records_the_attempt_so_the_next_start_stays_quiet(config_path, monkeypatch):
-    monkeypatch.setattr(
-        sender.urllib.request, "urlopen", lambda *a, **k: _FakeResponse(204)
-    )
+    monkeypatch.setattr(sender, "bounded_request", _answering(204))
 
     assert sender.is_due(config_path) is True
     sender.send_install_ping(config_path, "pip")
@@ -240,36 +248,38 @@ def test_records_the_attempt_so_the_next_start_stays_quiet(config_path, monkeypa
 
 
 def test_a_refused_ping_is_not_retried_until_the_next_day(config_path, monkeypatch):
-    monkeypatch.setattr(
-        sender.urllib.request, "urlopen", lambda *a, **k: _FakeResponse(500)
-    )
+    monkeypatch.setattr(sender, "bounded_request", _answering(500))
 
     assert sender.send_install_ping(config_path, "pip") is False
     assert sender.is_due(config_path) is False
 
 
-def test_network_failure_never_raises(config_path, monkeypatch):
+def test_network_failure_never_raises(config_path, monkeypatch, caplog):
     def _boom(*args, **kwargs):
         raise OSError("no route to host")
 
-    monkeypatch.setattr(sender.urllib.request, "urlopen", _boom)
+    monkeypatch.setattr(sender, "bounded_request", _boom)
 
     # Offline is normal for many self-hosted installs. It costs one datapoint,
-    # never an hourly retry loop.
-    assert sender.send_install_ping(config_path, "pip") is False
+    # never an hourly retry loop, and is not worth a warning.
+    with caplog.at_level(logging.DEBUG, logger=sender.logger.name):
+        assert sender.send_install_ping(config_path, "pip") is False
     assert sender.is_due(config_path) is False
+    assert [r.levelno for r in caplog.records if "did not complete" in r.message] == [
+        logging.DEBUG
+    ]
 
 
-def test_http_error_never_raises(config_path, monkeypatch):
-    def _http_error(*args, **kwargs):
-        raise sender.urllib.error.HTTPError(
-            sender.TELEMETRY_ENDPOINT, 400, "Bad Request", {}, None
-        )
+def test_http_error_never_raises(config_path, monkeypatch, caplog):
+    monkeypatch.setattr(sender, "bounded_request", _answering(400))
 
-    monkeypatch.setattr(sender.urllib.request, "urlopen", _http_error)
-
-    assert sender.send_install_ping(config_path, "pip") is False
+    # A 4xx is a bug on our side, so it is said at warning level.
+    with caplog.at_level(logging.DEBUG, logger=sender.logger.name):
+        assert sender.send_install_ping(config_path, "pip") is False
     assert sender.is_due(config_path) is False
+    assert [r.levelno for r in caplog.records if "HTTP 400" in r.message] == [
+        logging.WARNING
+    ]
 
 
 def test_unwritable_send_state_refuses_before_opening_the_network(
@@ -282,7 +292,7 @@ def test_unwritable_send_state_refuses_before_opening_the_network(
         raise AssertionError("network opened without a durable daily marker")
 
     monkeypatch.setattr(sender, "write_json_atomic", _refuse_state)
-    monkeypatch.setattr(sender.urllib.request, "urlopen", _fail_if_sent)
+    monkeypatch.setattr(sender, "bounded_request", _fail_if_sent)
 
     assert sender.send_install_ping(config_path, "pip") is False
 
@@ -295,9 +305,74 @@ def test_missing_install_id_skips_rather_than_inventing_one(tmp_path, monkeypatc
     def _fail(*args, **kwargs):
         raise AssertionError("sent with no stored identity")
 
-    monkeypatch.setattr(sender.urllib.request, "urlopen", _fail)
+    monkeypatch.setattr(sender, "bounded_request", _fail)
 
     assert sender.send_install_ping(path, "pip") is False
+
+
+# ---------------------------------------------------------------------------
+# On the wire: local peers that misbehave as an endpoint could
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _no_proxy(monkeypatch):
+    """Keep the local peers off any proxy the environment names."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+
+
+def test_a_redirected_ping_is_not_followed(config_path, _no_proxy):
+    with _Peer(
+        lambda conn, _: conn.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+    ) as target:
+
+        def handler(conn, _):
+            conn.sendall(
+                b"HTTP/1.1 302 Found\r\nLocation: %s/v1/ping\r\n"
+                b"Content-Length: 0\r\n\r\n" % target.url.encode()
+            )
+
+        with _Peer(handler) as peer:
+            sent = sender.send_install_ping(
+                config_path, "pip", endpoint=f"{peer.url}/v1/ping"
+            )
+    assert sent is False
+    assert peer.asked == 1
+    assert target.asked == 0
+    assert sender.is_due(config_path) is False
+
+
+def test_an_oversized_answer_is_not_read(config_path, _no_proxy):
+    size = sender.RESPONSE_MAX_BYTES + 1
+
+    def handler(conn, _):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n" + b"x" * size)
+
+    with _Peer(handler) as peer:
+        sent = sender.send_install_ping(config_path, "pip", endpoint=peer.url)
+    assert sent is False
+    assert sender.is_due(config_path) is False
+
+
+def test_a_stalled_answer_is_cut_at_the_deadline(config_path, monkeypatch, _no_proxy):
+    """Each byte arrives inside the socket timeout, so only the deadline on
+    the whole exchange can end it."""
+    monkeypatch.setattr(sender, "REQUEST_DEADLINE_SECONDS", 0.5)
+
+    def handler(conn, _):
+        _trickle(conn, b"HTTP/1.1 204 No Content\r\n\r\n", gap=0.1, hold=4.0)
+
+    with _Peer(handler) as peer:
+        with _within(2.5):
+            sent = sender.send_install_ping(
+                config_path, "pip", endpoint=peer.url, timeout=5.0
+            )
+    assert sent is False
+    assert sender.is_due(config_path) is False
 
 
 def test_state_file_sits_beside_the_config_not_in_the_library(config_path):

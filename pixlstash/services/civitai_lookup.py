@@ -8,7 +8,8 @@ Redirects are refused, so the hash goes to civitai.com and nowhere else.
 
 A miss (404, or a version with no ``baseModel``) is an answer. Anything that
 says Civitai could not be asked - a timeout, a refused connection, 429, a 5xx,
-a redirect, a body that is not JSON - raises :class:`LookupUnavailable`, so the
+a redirect, a body that is not JSON, an answer larger than
+:data:`ANSWER_MAX_BYTES` or not read within :data:`DEADLINE_SECONDS` - raises :class:`LookupUnavailable`, so the
 caller stops the batch instead of waiting out the same failure once per file.
 """
 
@@ -21,13 +22,22 @@ from typing import Optional
 import requests
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.bounded_http import bounded_get
 
 logger = get_logger(__name__)
 
 CIVITAI_BY_HASH = "https://civitai.com/api/v1/model-versions/by-hash/{sha256}"
 
-#: Seconds per request. Short: the owner is waiting on the answer.
+#: Seconds per connect or receive. Short: the owner is waiting on the answer.
 TIMEOUT_SECONDS = 10
+
+#: Seconds for the whole answer, body included, so a host that trickles its
+#: body cannot hold the batch past this.
+DEADLINE_SECONDS = 20
+
+#: The most of one answer read. A model version's JSON is tens of kilobytes;
+#: anything past this is not the answer the lookup asked for.
+ANSWER_MAX_BYTES = 4 * 1024 * 1024
 
 #: Longer than any base model's name; a longer answer is not stored.
 MAX_LABEL_LENGTH = 100
@@ -52,10 +62,11 @@ def lookup_base_model(sha256: str) -> Optional[str]:
     prefix = sha256[:12]
     started = time.monotonic()
     try:
-        response = requests.get(
+        response = bounded_get(
             CIVITAI_BY_HASH.format(sha256=sha256),
             timeout=TIMEOUT_SECONDS,
-            allow_redirects=False,
+            deadline_s=DEADLINE_SECONDS,
+            max_bytes=ANSWER_MAX_BYTES,
             headers={"User-Agent": "PixlStash", "Accept": "application/json"},
         )
     except requests.RequestException as exc:

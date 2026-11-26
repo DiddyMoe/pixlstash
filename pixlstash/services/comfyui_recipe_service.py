@@ -24,6 +24,7 @@ import json
 import math
 import random
 import re
+import sys
 import threading
 from concurrent.futures import Future
 from copy import deepcopy
@@ -40,14 +41,21 @@ from pixlstash.services.workflow_hash import (
     normalized_filename,
     reduce_api_graph,
 )
+from pixlstash.utils.bounded_http import bounded_get
 
 logger = get_logger(__name__)
 
 OBJECT_INFO_TIMEOUT_S = 15.0
+# The whole ``/object_info`` read, body included: ComfyUI builds it once per
+# start and serves it in well under this.
+OBJECT_INFO_DEADLINE_S = 60.0
 # The /object_info GETs in flight, by URL: a request arriving while one is out
 # waits for that answer instead of asking ComfyUI again (see fetch_object_info).
 _object_info_inflight: dict[str, Future] = {}
 _object_info_inflight_lock = threading.Lock()
+# What a request sharing a /object_info GET is told when the thread making it
+# was stopped (a shutdown signal), in place of that signal's own text.
+OBJECT_INFO_INTERRUPTED = "The request to ComfyUI for /object_info was interrupted"
 
 # ComfyUI's own seed ceiling for the core sampler nodes. Note this is 64-bit,
 # NOT the 32-bit limit the t2i endpoint validates against: the shipped
@@ -134,6 +142,8 @@ PIXLSTASH_MULTI_ADAPTER_LOADER = "PixlStashMultiAdapterLoader"
 # model-only loaders' single widget, so it fills ``model`` when the two-widget
 # spelling is absent rather than becoming a third key nobody reads.
 _LORA_STRENGTH_FIELDS = (("model", "strength_model"), ("clip", "strength_clip"))
+# The largest finite float. An int beyond it cannot become a strength.
+_FLOAT_MAX = sys.float_info.max
 
 # The ComfyUI-PixlStash loader: LoraLoader's signature with the file named by
 # digest, so it can go where ComfyUI does not have the file by name (#1376).
@@ -290,10 +300,15 @@ def fetch_object_info(base_url: str) -> dict:
             text = _get_object_info_text(base_url)
         except BaseException as exc:
             # Every waiter is released, but a shutdown signal is this thread's
-            # own: the others are told the fetch failed, not interrupted.
-            mine.set_exception(
-                exc if isinstance(exc, Exception) else RuntimeError(repr(exc))
-            )
+            # own: the others are told the fetch failed, not interrupted, in a
+            # sentence of the server's, since a waiter hands it on as a reason.
+            if isinstance(exc, Exception):
+                mine.set_exception(exc)
+            else:
+                logger.warning(
+                    "The /object_info request to %s was interrupted: %r", base_url, exc
+                )
+                mine.set_exception(RuntimeError(OBJECT_INFO_INTERRUPTED))
             raise
         else:
             mine.set_result(text)
@@ -302,8 +317,15 @@ def fetch_object_info(base_url: str) -> dict:
                 _object_info_inflight.pop(base_url, None)
     try:
         payload = json.loads(text)
-    except ValueError as exc:
-        logger.warning("ComfyUI object_info returned invalid JSON from %s", base_url)
+    except (ValueError, RecursionError) as exc:
+        # RecursionError is the decoder's answer to a body nested past the
+        # interpreter's depth: not JSON this server can read either, and a
+        # RuntimeError whose own words would otherwise become the reason.
+        logger.warning(
+            "ComfyUI object_info returned invalid JSON from %s",
+            base_url,
+            exc_info=True,
+        )
         raise RuntimeError("ComfyUI returned invalid JSON for /object_info") from exc
     if not isinstance(payload, dict):
         logger.warning(
@@ -321,14 +343,15 @@ def _get_object_info_text(base_url: str) -> str:
     but fails like any other answer from 300 up.
     """
     # Local: comfyui_service imports this module.
-    from pixlstash.services.comfyui_service import NO_PROXY
+    from pixlstash.services.comfyui_service import COMFYUI_ANSWER_MAX_BYTES, NO_PROXY
 
     url = f"{base_url}/object_info"
     try:
-        response = requests.get(
+        response = bounded_get(
             url,
             timeout=OBJECT_INFO_TIMEOUT_S,
-            allow_redirects=False,
+            deadline_s=OBJECT_INFO_DEADLINE_S,
+            max_bytes=COMFYUI_ANSWER_MAX_BYTES,
             proxies=NO_PROXY,
         )
     except requests.RequestException as exc:
@@ -911,8 +934,10 @@ def apply_filename_swap(
 
     Returns:
         ``(substitutions, unswapped)``. One ``{node_id, class_type, field, was,
-        now, verified}`` per field rewritten, and one ``{was, now, reason}`` per
-        swap that did not land: ``not_in_graph`` when no field names it,
+        now, verified, swap}`` per field rewritten, and one ``{was, now, reason,
+        swap}`` per swap that did not land, *swap* being the position in
+        *swaps* of the swap the row is for, so a caller can name it without
+        repeating either filename: ``not_in_graph`` when no field names it,
         ``not_on_comfyui`` when ComfyUI does not list the replacement, and
         ``several_on_comfyui`` when it lists that name in more than one folder.
     """
@@ -923,6 +948,7 @@ def apply_filename_swap(
     substitutions: list[dict] = []
     unswapped: list[dict] = []
     matched: set[str] = set()
+    position = {was: index for index, was in enumerate(swaps)}
     # Listed first, then written: the walk reads the inputs it rewrites.
     for node_id, class_type, field, value in list(iter_model_fields_api(prompt_graph)):
         if fields is not None and not fields(class_type, field):
@@ -950,6 +976,7 @@ def apply_filename_swap(
                         "was": value,
                         "now": now,
                         "reason": "several_on_comfyui" if several else "not_on_comfyui",
+                        "swap": position[key],
                     }
                 )
                 continue
@@ -966,10 +993,11 @@ def apply_filename_swap(
                 "was": value,
                 "now": now,
                 "verified": verified,
+                "swap": position[key],
             }
         )
     unswapped.extend(
-        {"was": was, "now": now, "reason": "not_in_graph"}
+        {"was": was, "now": now, "reason": "not_in_graph", "swap": position[was]}
         for was, now in swaps.items()
         if was not in matched
     )
@@ -1401,7 +1429,11 @@ def _lora_strengths(inputs: dict, field: str) -> dict:
         # attacker-authorable file metadata, `json.loads` accepts the `NaN` and
         # `Infinity` literals, and every route that hands these dicts back
         # renders with `allow_nan=False` - so reporting one is a 500 on a read
-        # a share-token holder can make.
+        # a share-token holder can make. An int past the float range (10**400,
+        # which `json.loads` reads exactly) is refused the same way, by
+        # comparison: converting it to test it is what overflows.
+        if isinstance(value, int) and not -_FLOAT_MAX <= value <= _FLOAT_MAX:
+            continue
         if math.isfinite(value):
             strengths[key] = float(value)
     return strengths
@@ -2589,14 +2621,18 @@ def bypass_node(prompt_graph: dict, node_id: str, object_info: dict) -> None:
     """
     node = (prompt_graph or {}).get(node_id)
     if not isinstance(node, dict):
-        raise LookupError(f"Node {node_id} is not in this graph.")
+        raise LookupError(
+            f"PixlStash cannot take out {_node_named(node_id)}: it is not in "
+            "this graph."
+        )
     class_type = node.get("class_type")
     spec = object_info.get(class_type)
     outputs = spec.get("output") if isinstance(spec, dict) else None
     if not isinstance(outputs, list):
         raise LookupError(
-            f"This ComfyUI does not say what {class_type} (node {node_id}) hands "
-            "on, so PixlStash cannot tell what would take its place."
+            "This ComfyUI does not say what "
+            f"{_node_named(node_id, class_type, object_info)} hands on, so "
+            "PixlStash cannot tell what would take its place."
         )
     inputs = node.get("inputs")
     inputs = inputs if isinstance(inputs, dict) else {}
@@ -2620,10 +2656,12 @@ def bypass_node(prompt_graph: dict, node_id: str, object_info: dict) -> None:
             if not is_link(value) or value[0] != node_id:
                 continue
             if value[1] not in passthrough:
+                reader = _node_named(other_id)
                 raise LookupError(
-                    f"Node {other_id} reads output {value[1]} of {class_type} "
-                    f"(node {node_id}), which takes no input of the same kind, "
-                    "so there is nothing to put in its place."
+                    f"{reader[0].upper()}{reader[1:]} reads output {value[1]} of "
+                    f"{_node_named(node_id, class_type, object_info)}, which "
+                    "takes no input of the same kind, so there is nothing to put "
+                    "in its place."
                 )
             rewires.append((other_inputs, field, passthrough[value[1]]))
     for other_inputs, field, link in rewires:
@@ -2747,11 +2785,12 @@ def bypass_stage(prompt_graph: dict, group: str, object_info: dict) -> list[dict
         if not samplers(reach(node_id, reads)):
             in_stage.discard(node_id)
             continue
+        named = _node_named(node_id, graph[node_id].get("class_type"), object_info)
         raise LookupError(
-            f"The {group.replace('_', ' ')} stage cannot be switched off: node "
-            f"{node_id} ({graph[node_id].get('class_type')}) feeds another "
-            f"sampling pass (node {min(feeds, key=_node_order_key)}), which "
-            "would still run."
+            f"The {group.replace('_', ' ')} stage cannot be switched off: "
+            f"{named} feeds another sampling pass "
+            f"({_node_named(min(feeds, key=_node_order_key))}), which would "
+            "still run."
         )
     if not in_stage:
         return []
@@ -2772,7 +2811,8 @@ def bypass_stage(prompt_graph: dict, group: str, object_info: dict) -> list[dict
         except LookupError as exc:
             raise LookupError(
                 f"The {group.replace('_', ' ')} stage cannot be switched off: "
-                f"node {node_id} ({class_type}) cannot be bypassed. {exc}"
+                f"{_node_named(node_id, class_type, object_info)} cannot be "
+                f"bypassed. {exc}"
             ) from exc
         changes.append(
             {"node_id": node_id, "class_type": class_type, "action": "bypassed"}
@@ -2858,9 +2898,38 @@ def lora_display_name(value: str) -> str:
 
 
 def _node_order_key(node_id: str) -> tuple:
-    """Numeric ids in number order, a subgraph id (``75:83``) after them."""
+    """Numeric ids in number order, a subgraph id (``75:83``) after them.
+
+    Numeric means ASCII digits a node id is written in (:data:`_NODE_ID_RE`):
+    ``str.isdigit`` also takes a superscript two, which ``int`` refuses, and an
+    id of thousands of digits, past what ``int`` will parse.
+    """
     text = str(node_id)
-    return (0, int(text), text) if text.isdigit() else (1, 0, text)
+    plain = _NODE_ID_RE.match(text) is not None and ":" not in text
+    return (0, int(text), text) if plain else (1, 0, text)
+
+
+_NODE_ID_RE = re.compile(r"[0-9]{1,9}(?::[0-9]{1,9})*\Z")
+
+
+def _node_named(
+    node_id: object, class_type: object = None, object_info: dict | None = None
+) -> str:
+    """A graph node as a refusal names it, never in the caller's own words.
+
+    The id is named only once it reads as a ComfyUI node id - numbers, a
+    subgraph's joined by colons - and then rewritten from those numbers; the
+    class only when this ComfyUI lists it. Anything else in a caller's graph
+    is text the caller chose, and a refusal does not hand it back.
+    """
+    text = str(node_id)
+    if _NODE_ID_RE.match(text):
+        named = "node " + ":".join(str(int(part)) for part in text.split(":"))
+    else:
+        named = "a node"
+    if isinstance(class_type, str) and object_info and class_type in object_info:
+        named += f" ({class_type})"
+    return named
 
 
 def _input_of_type(node_spec: dict, kind: str) -> str | None:
@@ -3134,6 +3203,15 @@ def _model_downstream(links: list[dict], node_id: str) -> set[str]:
     return found
 
 
+# The refusal where reading the chain trips over the graph (a lookup that
+# fails, as opposed to one of the chain reader's own refusals): the lookup's
+# text is a key of the graph, not a reason, so callers answer this instead.
+LORA_CHAIN_UNREADABLE = (
+    "PixlStash could not read this workflow's graph well enough to tell how "
+    "its LoRAs are wired."
+)
+
+
 def read_lora_chain(prompt_graph: dict, object_info: dict) -> dict:
     """The graph's LoRA loaders in the order a run applies them, typed by ComfyUI.
 
@@ -3208,6 +3286,14 @@ def read_lora_chain(prompt_graph: dict, object_info: dict) -> dict:
         readers.setdefault((str(link["source"][0]), link["source"][1]), []).append(link)
 
     def link_of(end: tuple) -> dict:
+        if not isinstance(graph.get(end[0]), dict):
+            # A loader wired to a node the graph does not have: a refusal in
+            # the server's words rather than the lookup's own.
+            raise LookupError(
+                f"A LoRA loader in this workflow reads {_node_named(end[0])}, "
+                "which the workflow does not have, so there is no chain of "
+                "LoRAs to edit. Change it in ComfyUI."
+            )
         return {
             "node_id": end[0],
             "class_type": graph[end[0]].get("class_type"),
@@ -3889,13 +3975,17 @@ def plan_lora_chain(
     for index, segment in enumerate(segments):
         order: list[str] = []
         segment["order"] = order
-        for entry in segment["entries"]:
+        for place, entry in enumerate(segment["entries"]):
             node_id = entry.get("node_id")
             strength = entry.get("strength")
             if node_id is not None:
                 node_id = str(node_id)
                 if node_id not in loaders:
-                    raise LookupError(f"This workflow has no LoRA loader #{node_id}.")
+                    where = f" of pass {index}" if index else ""
+                    raise LookupError(
+                        f"Entry {place + 1}{where} names a LoRA loader this "
+                        "workflow does not have. Open Edit LoRAs again."
+                    )
                 if node_id in placed:
                     raise LookupError(
                         f"Loader #{node_id} is listed twice, and one loader can "

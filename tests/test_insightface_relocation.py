@@ -38,14 +38,16 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
+from pixlstash.routes import model_downloads as model_downloads_routes
 from pixlstash.routes import model_moves
 from pixlstash.server import Server
-from pixlstash.services import builtin_caches
+from pixlstash.services import builtin_caches, model_downloads
 from pixlstash.services.model_mover import PARTIAL_SUFFIX, move_directory
 from pixlstash.utils import insightface_model_utils as model_utils
 
@@ -512,8 +514,54 @@ def test_a_destination_already_holding_a_pack_is_refused_before_anything_moves(
     assert model_utils.insightface_root() == str(face_env.root)
 
 
+def test_a_destination_that_cannot_be_made_names_the_reason_and_not_the_path(
+    face_env, tmp_path
+):
+    """The path is the one the caller typed, so the 409 gives the OS's reason
+    and leaves the path out."""
+    blocker = tmp_path / "test-a-file"
+    blocker.write_bytes(b"not a directory")
+
+    r = face_env.owner.post(
+        f"{API}/model-folders/{face_env.folder_id}/relocate",
+        json={"path": str(blocker / ".insightface")},
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail.startswith("Could not create the destination folder: "), detail
+    assert str(blocker) not in detail, detail
+    assert (face_env.models_dir / "buffalo_l").is_dir(), "nothing was moved"
+
+
+def test_a_pack_that_cannot_move_reports_a_fixed_sentence(
+    face_env, monkeypatch, caplog
+):
+    """The OS's text names paths on this machine: it goes to the log, and the
+    status a client polls carries the server's sentence."""
+    secret = "/home/me/test-pack-cause"
+
+    def refuse(source, destination):
+        raise PermissionError(13, "Permission denied", secret)
+
+    monkeypatch.setattr(model_moves, "move_directory", refuse)
+    with caplog.at_level("ERROR"):
+        r = face_env.owner.post(
+            f"{API}/model-folders/{face_env.folder_id}/relocate",
+            json={"path": str(face_env.target)},
+        )
+        assert r.status_code == 202, r.text
+        body = _await_move(face_env)
+
+    assert [(item["status"], item["detail"]) for item in body["results"]] == [
+        ("failed", model_moves.PACK_MOVE_FAILED_DETAIL)
+    ], body
+    assert secret in caplog.text, "the cause did not reach the log"
+    assert (face_env.models_dir / "buffalo_l").is_dir(), "the pack left its root"
+
+
 def test_a_destination_inside_a_registered_folder_is_refused(face_env, tmp_path):
-    """The overlap a hand-registered folder is refused for (#2665 item 3)."""
+    """The overlap a hand-registered folder is refused for (#2665 item 3), in
+    the server's sentence: the registered folder's path goes to the log."""
     user_dir = tmp_path / "my-loras"
     user_dir.mkdir()
     face_env.register_folder(str(user_dir), kind="user", movable="per_item")
@@ -522,8 +570,11 @@ def test_a_destination_inside_a_registered_folder_is_refused(face_env, tmp_path)
         f"{API}/model-folders/{face_env.folder_id}/relocate",
         json={"path": str(user_dir / "faces")},
     )
-    assert r.status_code == 409, r.text
-    assert str(user_dir) in r.json()["detail"]
+    assert (r.status_code, r.json()["detail"]) == (
+        409,
+        "This path is inside a registered model folder.",
+    ), r.text
+    assert str(user_dir) not in r.text
     assert not (user_dir / "faces").exists(), "refused before anything was made"
     assert (face_env.models_dir / "buffalo_l").is_dir(), "nothing was moved"
     assert face_env.folder_path(face_env.folder_id) == str(face_env.models_dir)
@@ -536,8 +587,11 @@ def test_a_destination_inside_a_registered_folder_is_refused(face_env, tmp_path)
         f"{API}/model-folders/{store['id']}/relocate",
         json={"path": str(user_dir / "store")},
     )
-    assert r.status_code == 409, r.text
-    assert str(user_dir) in r.json()["detail"]
+    assert (r.status_code, r.json()["detail"]) == (
+        409,
+        "This path is inside a registered model folder.",
+    ), r.text
+    assert str(user_dir) not in r.text
     assert not (user_dir / "store").exists()
     assert face_env.folder_path(store["id"]) == store["path"]
 
@@ -592,3 +646,95 @@ def test_an_unknown_folder_is_still_a_404(face_env, tmp_path):
         json={"path": str(tmp_path / "somewhere-else")},
     )
     assert r.status_code == 404, r.text
+
+
+# --------------------------------------------------------------------------- #
+# Downloads and the packs' folder
+# --------------------------------------------------------------------------- #
+
+
+def test_the_packs_are_not_relocated_while_a_download_writes_in_their_folder(
+    face_env, monkeypatch
+):
+    """A download that has not finished, into the packs' folder, refuses the
+    relocation with the busy-folder sentence; once its thread has ended it goes."""
+    entry = {
+        "id": "test-pack-download",
+        "file": "test-pack.safetensors",
+        "folder_path": str(face_env.models_dir),
+        "status": "running",
+        "ended_at": None,
+        "_target": str(face_env.models_dir / "test-pack.safetensors"),
+        "_done": threading.Event(),
+    }
+    monkeypatch.setitem(model_downloads._downloads, entry["id"], entry)
+    url = f"{API}/model-folders/{face_env.folder_id}/relocate"
+    r = face_env.owner.post(url, json={"path": str(face_env.target)})
+    assert (r.status_code, r.json().get("detail")) == (
+        409,
+        "A model is downloading, or waiting to download, into this folder. "
+        "Try again when it is done.",
+    )
+    assert (face_env.models_dir / "buffalo_l").is_dir()
+    assert model_downloads._reserved == {}
+
+    entry["_done"].set()
+    r = face_env.owner.post(url, json={"path": str(face_env.target)})
+    assert r.status_code == 202, r.text
+    assert [i["status"] for i in _await_move(face_env)["results"]] == ["moved"]
+    assert model_downloads._reserved == {}
+
+
+def test_a_download_into_the_packs_folder_is_refused_while_they_move(
+    face_env, monkeypatch
+):
+    """The packs' folder is reserved for the whole job: a download into it
+    that starts while a pack is being moved is refused and registers
+    nothing."""
+    started, release = threading.Event(), threading.Event()
+    original = model_moves.move_directory
+
+    def held(source, destination):
+        started.set()
+        assert release.wait(30)
+        return original(source, destination)
+
+    monkeypatch.setattr(model_moves, "move_directory", held)
+    source = {
+        "url": "https://example.com/test-model.safetensors",
+        "directory": None,
+        "sha256": None,
+        "live": False,
+    }
+    monkeypatch.setattr(model_downloads, "download_source", lambda f: dict(source))
+    monkeypatch.setattr(
+        model_downloads_routes, "download_source", lambda f: dict(source)
+    )
+    folder = {"id": face_env.folder_id, "path": str(face_env.models_dir)}
+    monkeypatch.setattr(model_downloads, "find_download_folder", lambda hub: folder)
+    monkeypatch.setattr(
+        model_downloads, "_run", lambda hub, entry, *a: entry["_done"].set()
+    )
+    before = set(model_downloads._downloads)
+    try:
+        r = face_env.owner.post(
+            f"{API}/model-folders/{face_env.folder_id}/relocate",
+            json={"path": str(face_env.target)},
+        )
+        assert r.status_code == 202, r.text
+        assert started.wait(30)
+        d = face_env.owner.post(
+            f"{API}/model-downloads", json={"file": "test-model.safetensors"}
+        )
+        assert (d.status_code, d.json().get("detail")) == (
+            409,
+            model_downloads.FOLDER_BEING_MOVED,
+        )
+        assert set(model_downloads._downloads) == before, "it was registered"
+    finally:
+        release.set()
+        moved = _await_move(face_env)
+        for key in set(model_downloads._downloads) - before:
+            del model_downloads._downloads[key]
+    assert [i["status"] for i in moved["results"]] == ["moved"]
+    assert model_downloads._reserved == {}

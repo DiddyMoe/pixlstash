@@ -1,6 +1,6 @@
 """Installing a known node pack through ComfyUI-Manager (#2054).
 
-ComfyUI and its Manager are faked over ``requests``: no live HTTP. Every case
+ComfyUI and its Manager are faked at ``bounded_request``: no live HTTP. Every case
 reads the calls the fake recorded, so a refusal is also proven to have queued
 nothing, and the restart to have happened only on an empty ComfyUI queue.
 """
@@ -13,7 +13,11 @@ from urllib.parse import urlsplit
 import pytest
 import requests
 
-from pixlstash.services import comfyui_link_service, node_pack_install_service
+from pixlstash.services import (
+    comfyui_link_service,
+    comfyui_pack_service,
+    node_pack_install_service,
+)
 from pixlstash.services import node_packs
 from pixlstash.services.workflow_run_service import MISSING_NODES, judge
 from tests.network_vectors import LAN_IPV4
@@ -67,9 +71,12 @@ class _FakeManager:
         return 200
 
     def request(self, method, url, json=None, **kwargs):
+        """``bounded_request``: never through a proxy, never a redirect
+        followed, always a deadline and a cap."""
         assert kwargs.get("proxies") == comfyui_link_service.NO_PROXY
-        assert kwargs.get("allow_redirects") is False
+        assert kwargs.get("redirects", 0) == 0
         assert kwargs.get("timeout")
+        assert kwargs.get("deadline_s") and kwargs.get("max_bytes")
         path = urlsplit(url).path.lstrip("/")
         self.calls.append((method, path, json))
         answer = self.routes.get(f"{method} {path}", 404)
@@ -106,7 +113,8 @@ def _timed_out():
 def comfy(monkeypatch):
     def at(manager="v3", **kwargs):
         fake = _FakeManager(manager, **kwargs)
-        monkeypatch.setattr(node_pack_install_service.requests, "request", fake.request)
+        monkeypatch.setattr(node_pack_install_service, "bounded_request", fake.request)
+        monkeypatch.setattr(comfyui_pack_service, "bounded_request", fake.request)
         return fake
 
     monkeypatch.setattr(node_pack_install_service.time, "sleep", lambda s: None)
@@ -281,14 +289,18 @@ def test_a_queue_status_manager_never_answers_is_not_read_as_busy(comfy, monkeyp
         f"../{PACK}",
         PACK.upper(),
         "",
+        "example-leak-marker",
     ],
 )
 def test_only_a_listed_id_installs_and_nothing_else_reaches_comfyui(comfy, pack_id):
     fake = comfy("v3")
-    with pytest.raises(node_pack_install_service.UnknownPack):
+    # The id is the caller's text: the refusal is the server's one sentence.
+    with pytest.raises(node_pack_install_service.UnknownPack) as refused:
         node_pack_install_service.install(URL, pack_id)
-    with pytest.raises(node_pack_install_service.UnknownPack):
+    assert str(refused.value) == node_pack_install_service.UNKNOWN_PACK
+    with pytest.raises(node_pack_install_service.UnknownPack) as refused:
         node_pack_install_service.loaded(URL, pack_id)
+    assert str(refused.value) == node_pack_install_service.UNKNOWN_PACK
     assert fake.calls == []
 
 

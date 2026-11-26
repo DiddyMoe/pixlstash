@@ -51,7 +51,12 @@ class ModelDownloadResponse(BaseModel):
     file: str
     host: str = Field(description="The host the file is fetched from.")
     folder_path: str = Field(description="The model folder it goes into.")
-    status: str = Field(description="`running`, `done`, `failed` or `cancelled`.")
+    status: str = Field(
+        description=(
+            "`queued` (waiting while three others download), `running`, "
+            "`done`, `failed` or `cancelled`."
+        )
+    )
     received: int = 0
     total: int = Field(default=0, description="0 while the size is not known.")
     percent: float = 0
@@ -80,7 +85,14 @@ class ModelDownloadResponse(BaseModel):
 class ModelDownloadCancelResponse(BaseModel):
     """Body of the cancel's answer."""
 
-    cancelled: bool
+    cancelled: bool = Field(
+        description=(
+            "True when the cancel was taken: the download reads `cancelled` "
+            "at once and nothing it fetched is kept. False when no such "
+            "download is queued or running, or it is already being saved and "
+            "will land."
+        )
+    )
 
 
 def create_router(server) -> APIRouter:
@@ -111,7 +123,9 @@ def create_router(server) -> APIRouter:
             "is registered on the shelf and `models_arrived` is announced. "
             "Refused before any byte is fetched when no link is known for the "
             "name (404), the name is not a model file, or the file is already "
-            "there or already being downloaded (409)."
+            "there, already being downloaded, or still stopping after a cancel "
+            "(409; a retry a few seconds later starts it), and while a move, "
+            "removal or rename of the folder it would go into runs (409)."
         ),
         tags=["model_shelf"],
         response_model=ModelDownloadResponse,
@@ -140,8 +154,12 @@ def create_router(server) -> APIRouter:
         "/model-downloads/{download_id}/cancel",
         summary="Cancel a model download",
         description=(
-            "Stops a running download and discards what it had fetched. "
-            "`cancelled: false` when no such download is running."
+            "Stops a queued or running download and discards what it had "
+            "fetched. `cancelled: true` means the cancel was taken: the "
+            "download reads `cancelled` at once, and its fetch stops within "
+            "one connect attempt (at most 15 s) without keeping anything. "
+            "`cancelled: false` when no such download is queued or running, "
+            "or it is already being saved and will land."
         ),
         tags=["model_shelf"],
         response_model=ModelDownloadCancelResponse,

@@ -63,6 +63,7 @@ RUN pip install --no-cache-dir \
     httpx \
     python-multipart \
     requests \
+    "urllib3>=2.8.0,<3" \
     transformers \
     insightface \
     rapidfuzz \

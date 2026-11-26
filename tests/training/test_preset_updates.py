@@ -54,6 +54,12 @@ def _newer(**changes):
         lambda p: p.__setitem__("effort", []),
         lambda p: p["hardware_profiles"]["q8"].__setitem__("vram_mb", "16000"),
         lambda p: p["effort"]["gentle"].__setitem__("max_steps", float("inf")),
+        # An int past the float range: JSON reads it exactly, and testing it
+        # by converting it overflowed into an error no recipe read catches.
+        lambda p: p["effort"]["gentle"].__setitem__("max_steps", 10**400),
+        lambda p: p["effort"]["standard"].__setitem__("train.lr", 10**400),
+        # More steps than a run may be given.
+        lambda p: p["effort"]["strong"].__setitem__("max_steps", 100_001),
         lambda p: p.__setitem__("version", "2"),
     ],
 )

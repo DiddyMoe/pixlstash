@@ -20,7 +20,9 @@ whoever can write to the plugin directory can already install a plugin by hand.
 from __future__ import annotations
 
 import ast
+import codecs
 import json
+import optparse
 import os
 import re
 import shlex
@@ -28,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError
@@ -35,12 +38,19 @@ from importlib.metadata import version as metadata_version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterator
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 import requests
 from platformdirs import user_data_dir
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.bounded_http import (
+    ReadDeadlineExceeded,
+    ResponseTooLarge,
+    bounded_get,
+    wire_split,
+)
+from pixlstash.utils.links import is_link_or_missing
 
 logger = get_logger(__name__)
 
@@ -84,6 +94,34 @@ _REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 
 PLUGINS_REPO = "Pikselkroken/PixlStash-plugins"
 DEFAULT_REF = "main"
+#: Where the repository's zip is downloaded from. A fixed https host, asked with
+#: certificate checking on and no redirect followed, so the download checks no
+#: address (``utils/bounded_http``'s module docstring);
+#: ``test_architecture_guardrails.py`` holds it to https.
+CODELOAD_ZIP_URL = "https://codeload.github.com/{repo}/zip/{ref}"
+
+#: The repository download (`_download_repository`): the longest one connect or
+#: receive may wait, the longest the whole answer may take however slowly it
+#: arrives, and the most it may send. The repository is source and READMEs,
+#: a few megabytes; the cap stops a hostile or broken answer filling the disk.
+REPOSITORY_TIMEOUT_S = 60
+REPOSITORY_DEADLINE_S = 600.0
+REPOSITORY_MAX_BYTES = 256 * 1024 * 1024
+
+#: Unpacking a zip (`_extract_zip`), whether it was downloaded or given on the
+#: command line: the most it may write in all, counted as it is written; the
+#: most entries it may hold; and the largest list of entries (the central
+#: directory) it may carry, checked before Python's zipfile reads that list
+#: into memory. The published repository is 47 entries, 223 KiB unpacked and a
+#: central directory of about 5 KB (measured 2026-11-25), so each cap leaves a
+#: margin of hundreds of times. The byte cap is twice the download cap, since
+#: source compresses about 2.5:1; the directory cap keeps the parse under about
+#: 60 MB of memory, where 500,000 empty entries cost 284 MB.
+EXTRACT_MAX_BYTES = 512 * 1024 * 1024
+EXTRACT_MAX_MEMBERS = 10_000
+EXTRACT_MAX_DIRECTORY_BYTES = 4 * 1024 * 1024
+_EXTRACT_CHUNK_BYTES = 1024 * 1024
+_MIB = 1024 * 1024
 
 #: Hosts that mean "this came from the ordinary Python package index".  An
 #: artefact resolved from anywhere else is named in the dependency listing; see
@@ -324,7 +362,12 @@ def _analyse(source: str, path: Path, *, strict: bool) -> list[PluginClass]:
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
-        raise PluginError(f"{path.name} is not valid Python: {exc}") from exc
+        # Not str(exc): it carries the whole path. The compiler's own words
+        # about the author's file and the line are what the author can act on.
+        where = f" (line {exc.lineno})" if exc.lineno else ""
+        raise PluginError(
+            f"{path.name} is not valid Python: {exc.msg}{where}."
+        ) from exc
 
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
     class_alias, module_alias = _import_bindings(tree)
@@ -423,8 +466,22 @@ def read_source(path: Path) -> str:
     """
     try:
         return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        logger.warning("Plugin source %s is not UTF-8.", path, exc_info=True)
+        raise PluginError(f"could not read {path}: it is not UTF-8 text.") from exc
     except (OSError, ValueError) as exc:
-        raise PluginError(f"could not read {path}: {exc}") from exc
+        logger.warning("Could not read plugin source %s.", path, exc_info=True)
+        raise PluginError(f"could not read {path}: {_os_reason(exc)}.") from exc
+
+
+def _os_reason(exc: Exception) -> str:
+    """The system's own words for *exc*'s errno, for a sentence naming a path.
+
+    Never ``str(exc)``, which repeats the path and can name a second one; the
+    caller has logged the exception itself.
+    """
+    errno = getattr(exc, "errno", None)
+    return os.strerror(errno) if errno else "the system refused"
 
 
 def inspect_file(path: Path, *, strict: bool = False) -> list[PluginClass]:
@@ -455,27 +512,57 @@ def _python_files(root: Path) -> list[Path]:
     return sorted(files, key=lambda path: (path.name != "__init__.py", path))
 
 
-def _extract_zip(archive: Path, target: Path) -> Path:
-    """Extract *archive* into *target*, refusing entries that escape it."""
-    root = target.resolve()
+def _directory_bytes(archive: Path) -> int | None:
+    """Return the size of *archive*'s central directory, or None if not a zip.
+
+    This is the size ``zipfile.ZipFile`` reads into memory and parses entry by
+    entry before any member can be counted, so it has to be checked first.
+    It is read with the same private reader ``ZipFile`` calls
+    (``zipfile._EndRecData``), so the size checked is the size it will read,
+    zip64 records and prepended data included, on whatever Python runs this.
+    """
+    with archive.open("rb") as handle:
+        record = zipfile._EndRecData(handle)
+    if record is None:
+        return None
+    return record[zipfile._ECD_SIZE]
+
+
+def _remove_partial(root: Path) -> None:
+    """Remove what a refused extraction wrote, so none of it is left behind."""
     try:
-        with zipfile.ZipFile(archive) as bundle:
-            for member in bundle.infolist():
-                destination = (root / member.filename).resolve()
-                if destination != root and not destination.is_relative_to(root):
-                    raise PluginError(
-                        f"{archive.name} contains {member.filename!r}, which "
-                        "would be written outside the plugin directory. "
-                        "Refusing the whole archive."
-                    )
-                if (member.external_attr >> 16) & 0o170000 == 0o120000:
-                    raise PluginError(
-                        f"{archive.name} contains a symlink ({member.filename!r}). "
-                        "Refusing the whole archive."
-                    )
-            bundle.extractall(root)
-    except zipfile.BadZipFile as exc:
-        raise PluginError(f"{archive.name} is not a readable zip: {exc}") from exc
+        shutil.rmtree(root)
+    except OSError as exc:
+        logger.warning("Could not remove the partly unpacked %s: %s", root, exc)
+
+
+def _extract_zip(archive: Path, target: Path) -> Path:
+    """Extract *archive* into *target*, refusing entries that escape it.
+
+    *target* must not exist yet; it is created here, and removed again if the
+    archive is refused part way. Writing stops at EXTRACT_MAX_BYTES counted
+    as written, and an archive with more than EXTRACT_MAX_MEMBERS entries, or
+    a larger central directory than EXTRACT_MAX_DIRECTORY_BYTES, is refused
+    before anything is written.
+    """
+    refusal = "Refusing the whole archive."
+    try:
+        directory_bytes = _directory_bytes(archive)
+    except (OSError, zipfile.BadZipFile) as exc:
+        logger.warning("Could not read the plugin archive %s: %s", archive.name, exc)
+        raise PluginError(f"{archive.name} is not a readable zip. {refusal}") from exc
+    if directory_bytes is not None and directory_bytes > EXTRACT_MAX_DIRECTORY_BYTES:
+        raise PluginError(
+            f"{archive.name} has a list of entries larger than "
+            f"{EXTRACT_MAX_DIRECTORY_BYTES // _MIB} MB. {refusal}"
+        )
+    root = target.resolve()
+    root.mkdir(parents=True)
+    try:
+        _unpack(archive, root, refusal)
+    except PluginError:
+        _remove_partial(root)
+        raise
 
     # A zip made from a folder (or downloaded from GitHub) has one directory at
     # the top; unwrap it so the plugin folder itself is what gets installed.
@@ -483,6 +570,91 @@ def _extract_zip(archive: Path, target: Path) -> Path:
     if len(entries) == 1 and entries[0].is_dir():
         return entries[0]
     return root
+
+
+def _unpack(archive: Path, root: Path, refusal: str) -> None:
+    """Write every member of *archive* under *root*, within the caps."""
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            members = bundle.infolist()
+            if len(members) > EXTRACT_MAX_MEMBERS:
+                raise PluginError(
+                    f"{archive.name} holds {len(members)} entries, more than "
+                    f"the {EXTRACT_MAX_MEMBERS} a plugin may have. {refusal}"
+                )
+            for member in members:
+                destination = (root / member.filename).resolve()
+                if destination != root and not destination.is_relative_to(root):
+                    raise PluginError(
+                        f"{archive.name} contains {member.filename!r}, which "
+                        f"would be written outside the plugin directory. {refusal}"
+                    )
+                if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise PluginError(
+                        f"{archive.name} contains a symlink ({member.filename!r}). "
+                        f"{refusal}"
+                    )
+                if member.flag_bits & 0x1:
+                    raise PluginError(
+                        f"{archive.name} contains an encrypted entry "
+                        f"({member.filename!r}). {refusal}"
+                    )
+            written = 0
+            for member in members:
+                destination = (root / member.filename).resolve()
+                if member.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                # Counted from what comes out of the stream, not from the
+                # sizes the archive declares: the cap holds whatever the
+                # headers say.
+                with bundle.open(member) as source, destination.open("wb") as sink:
+                    while chunk := source.read(_EXTRACT_CHUNK_BYTES):
+                        written += len(chunk)
+                        if written > EXTRACT_MAX_BYTES:
+                            raise PluginError(
+                                f"{archive.name} unpacks to more than "
+                                f"{EXTRACT_MAX_BYTES // _MIB} MB. {refusal}"
+                            )
+                        sink.write(chunk)
+    except (zipfile.BadZipFile, EOFError, zlib.error, NotImplementedError) as exc:
+        # A bad CRC, a stream that ends early, damaged compressed data or a
+        # compression method this Python cannot read.
+        logger.warning("Could not unpack the plugin archive %s: %s", archive.name, exc)
+        raise PluginError(f"{archive.name} is not a readable zip. {refusal}") from exc
+    except OSError as exc:
+        logger.warning("Could not unpack the plugin archive %s: %s", archive.name, exc)
+        raise PluginError(
+            f"{archive.name} could not be unpacked into a temporary folder. {refusal}"
+        ) from exc
+
+
+def _download_failure(exc: requests.RequestException) -> str:
+    """Return the fixed sentence for a failed repository download.
+
+    Checked most specific first: a proxy failure and a TLS failure are both
+    ``requests.ConnectionError`` too, and so is a connect timeout.
+    """
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return (
+            "the proxy this computer is set to use did not pass the request on. "
+            "Check the proxy setting (HTTPS_PROXY, or the system's own)."
+        )
+    if isinstance(exc, requests.exceptions.SSLError):
+        return (
+            "the secure connection to codeload.github.com could not be "
+            "verified, so nothing was downloaded. A network that intercepts "
+            "HTTPS can cause this."
+        )
+    if isinstance(exc, requests.ConnectionError):
+        return (
+            "could not connect to codeload.github.com. Check that this "
+            "computer is online."
+        )
+    if isinstance(exc, requests.Timeout):
+        return f"codeload.github.com stopped answering for {REPOSITORY_TIMEOUT_S} s."
+    return "the answer from codeload.github.com could not be read."
 
 
 def _download_repository(ref: str, workdir: Path) -> Path:
@@ -500,17 +672,45 @@ def _download_repository(ref: str, workdir: Path) -> Path:
             "contain '..'."
         )
 
-    url = f"https://codeload.github.com/{PLUGINS_REPO}/zip/{ref}"
-    try:
-        response = requests.get(url, timeout=60)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise PluginError(
-            f"could not download {PLUGINS_REPO} at ref {ref!r}: {exc}"
-        ) from exc
-
+    # codeload serves the zip itself, so a redirect is not followed: it would
+    # be the one way the download could leave the fixed host. The answer is
+    # written to the work directory as it arrives, never held whole in memory,
+    # within REPOSITORY_DEADLINE_S and REPOSITORY_MAX_BYTES.
+    url = CODELOAD_ZIP_URL.format(repo=PLUGINS_REPO, ref=ref)
     archive = workdir / "repository.zip"
-    archive.write_bytes(response.content)
+    failure = f"could not download {PLUGINS_REPO} at ref {ref!r}"
+    try:
+        with archive.open("wb") as handle:
+            response = bounded_get(
+                url,
+                deadline_s=REPOSITORY_DEADLINE_S,
+                max_bytes=REPOSITORY_MAX_BYTES,
+                timeout=REPOSITORY_TIMEOUT_S,
+                sink=handle.write,
+            )
+    except ResponseTooLarge as exc:
+        logger.warning("Plugin repository download refused: %s", exc)
+        raise PluginError(
+            f"{failure}: it is larger than {REPOSITORY_MAX_BYTES // (1024 * 1024)} MB."
+        ) from exc
+    except ReadDeadlineExceeded as exc:
+        logger.warning("Plugin repository download timed out: %s", exc)
+        raise PluginError(
+            f"{failure}: it did not finish within {REPOSITORY_DEADLINE_S:g} s."
+        ) from exc
+    except requests.RequestException as exc:
+        # requests' own text names pool internals and addresses, so the
+        # terminal gets a fixed sentence for the kind of failure and the log
+        # gets the exception.
+        logger.warning("Plugin repository download from %s failed.", url, exc_info=True)
+        raise PluginError(f"{failure}: {_download_failure(exc)}") from exc
+    if response.status_code != 200:
+        logger.warning(
+            "Plugin repository download answered HTTP %s: %s",
+            response.status_code,
+            response.excerpt(),
+        )
+        raise PluginError(f"{failure}: GitHub answered HTTP {response.status_code}.")
     return _extract_zip(archive, workdir / "repository")
 
 
@@ -770,7 +970,10 @@ def install(plan: InstallPlan, *, force: bool = False) -> None:
             shutil.rmtree(staged, ignore_errors=True) if staged.is_dir() else (
                 staged.unlink(missing_ok=True)
             )
-        raise PluginError(f"could not install to {plan.destination}: {exc}") from exc
+        logger.warning("Could not install to %s.", plan.destination, exc_info=True)
+        raise PluginError(
+            f"could not install to {plan.destination}: {_os_reason(exc)}."
+        ) from exc
 
 
 @dataclass
@@ -787,6 +990,11 @@ class DependencyChange:
     #: pip's ``is_direct``: True when the *requirement* named a URL rather than
     #: a name.  Display only; the pin uses ``download_info`` either way.
     direct: bool = False
+    #: The ``--index-url``, ``--extra-index-url`` and ``--find-links`` options
+    #: the requirements carry, each with where it is written.  pip's report
+    #: cannot say which index served an artefact, so each of these is a
+    #: possible source of every entry, and the listing says so.
+    index_sources: tuple[str, ...] = ()
 
     @property
     def url(self) -> str | None:
@@ -803,14 +1011,40 @@ class DependencyChange:
         *reliable* rather than preventing it: the user consents to a name and
         receives something else.
 
-        An entry served from PyPI's own file host is not named, because a URL
-        on every line is noise that trains people to skip the one line that
-        matters.  Anything else is named, including ``file://``.
+        An entry goes unnamed only when its URL is ``https`` on one of PyPI's
+        own hosts and it is not a VCS checkout, because a URL on every line is
+        noise that trains people to skip the one line that matters.  Anything
+        else is named: ``file://``, ``ftp://``, plain ``http`` (even to PyPI's
+        host) and a VCS URL.
+
+        The host is the one pip's ``requests`` sends to (:func:`wire_split`),
+        not ``urlparse``'s: ``https://evil.example\\@files.pythonhosted.org/``
+        reads as PyPI's file host to ``urlparse`` but is fetched from
+        ``evil.example``.  A URL ``requests`` would not send is named.
+
+        pip strips a user name from a URL before writing its report, so the
+        report alone cannot show such a host; :func:`resolve_requirements`
+        refuses those before pip runs (:func:`_judge_requirement_sources`).
         """
-        url = (self.download_info or {}).get("url")
+        info = self.download_info or {}
+        url = info.get("url")
         if not url:
             return None
-        return None if (urlparse(url).hostname or "") in _INDEX_HOSTS else url
+        if info.get("vcs_info"):
+            return url
+        try:
+            wire = wire_split(url)
+        except requests.RequestException as exc:
+            logger.warning(
+                "plugin_install: dependency %s resolved to a URL requests "
+                "would not send (%s); naming it",
+                self.name,
+                type(exc).__name__,
+            )
+            return url
+        if wire.scheme == "https" and wire.hostname in _INDEX_HOSTS:
+            return None
+        return url
 
     @property
     def pin(self) -> str:
@@ -915,7 +1149,13 @@ def resolve_requirements(requirements: Path) -> list[DependencyChange]:
 
     Nothing here decides whether the answer is acceptable; it says what would
     happen, and the caller shows it to the person who has to agree to it.
+
+    One thing is refused before pip runs: an address pip and the listing
+    would read as different hosts (:func:`_judge_requirement_sources`).  pip
+    strips a user name before writing its report, so the report cannot be
+    the evidence of where an artefact came from.
     """
+    index_sources = _judge_requirement_sources(requirements)
     with TemporaryDirectory(prefix="pixlstash-deps-") as scratch:
         report = Path(scratch) / "report.json"
         result = subprocess.run(
@@ -946,9 +1186,9 @@ def resolve_requirements(requirements: Path) -> list[DependencyChange]:
         try:
             entries = json.loads(report.read_text(encoding="utf-8"))["install"]
         except (OSError, ValueError, KeyError) as exc:
+            logger.warning("pip's install report could not be read.", exc_info=True)
             raise PluginError(
-                f"pip did not report what it would install: {exc}. "
-                "Nothing was installed."
+                "pip did not report what it would install. Nothing was installed."
             ) from exc
 
     changes = []
@@ -969,31 +1209,361 @@ def resolve_requirements(requirements: Path) -> list[DependencyChange]:
                 installed,
                 entry.get("download_info"),
                 bool(entry.get("is_direct")),
+                index_sources=index_sources,
             )
         )
     return sorted(changes, key=lambda change: change.name.lower())
 
 
-#: A trailing backslash and the whitespace either side of it: one option to
-#: pip, so one line here.  The surrounding whitespace goes with it, or the
-#: joined line carries the indent of the continuation into the middle of it.
-_CONTINUATION_RE = re.compile(r"[^\S\n]*\\\n[^\S\n]*")
+# ----------------------------------------------------------------------
+# pip's requirements-file reader, mirrored so a line is judged as pip reads it
+# ----------------------------------------------------------------------
+#
+# Each piece below copies pip 26.3's own reader,
+# https://github.com/pypa/pip/blob/26.3/src/pip/_internal/req/req_file.py :
+# decoding (``_decode_req_file``), lines (``preprocess``: ``join_lines``,
+# ``ignore_comments``, ``expand_env_variables``) and options
+# (``break_args_options``, ``shlex``, then ``build_parser``'s optparse).  A
+# reader that differs from pip's in any of these judges a line pip never reads.
+
+#: Checked in this order, as pip does: the UTF-16 LE mark starts the UTF-32
+#: LE one.
+_PIP_BOMS = (
+    (codecs.BOM_UTF8, "utf-8"),
+    (codecs.BOM_UTF32, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32-be"),
+    (codecs.BOM_UTF32_LE, "utf-32-le"),
+    (codecs.BOM_UTF16, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+)
+_PIP_PEP263_RE = re.compile(rb"coding[:=]\s*([-\w.]+)")
+_PIP_COMMENT_RE = re.compile(r"(^|\s+)#.*$")
+_PIP_ENV_VAR_RE = re.compile(r"\$\{([A-Z0-9_]+)\}")
+#: An include pip fetches as a URL rather than opening as a file.
+_PIP_SCHEME_RE = re.compile(r"^(http|https|file):", re.I)
+
+#: Every option pip accepts in a requirements file, as ``build_parser`` lists
+#: them.  Options that take a value are all collected (pip keeps the last
+#: ``--index-url``; every one is judged here), and flags are flags.  The same
+#: set matters as much as the same reading: optparse accepts any unambiguous
+#: abbreviation, so ``--find`` is ``--find-links`` to pip and must be here.
+_PIP_VALUE_OPTIONS = (
+    (("-i", "--index-url", "--pypi-url"), "index_url"),
+    (("--extra-index-url",), "extra_index_urls"),
+    (("-c", "--constraint"), "constraints"),
+    (("-r", "--requirement"), "requirements"),
+    (("-e", "--editable"), "editables"),
+    (("-f", "--find-links"), "find_links"),
+    (("--no-binary",), "no_binary"),
+    (("--only-binary",), "only_binary"),
+    (("--all-releases",), "all_releases"),
+    (("--only-final",), "only_final"),
+    (("--trusted-host",), "trusted_hosts"),
+    (("--use-feature",), "features_enabled"),
+    (("--hash",), "hashes"),
+    (("-C", "--config-settings"), "config_settings"),
+)
+_PIP_FLAG_OPTIONS = (
+    "--no-index",
+    "--prefer-binary",
+    "--require-hashes",
+    "--no-require-hashes",
+    "--pre",
+)
+
+#: The options that name where packages come from, under the name the
+#: listing shows them by.
+_INDEX_OPTIONS = (
+    ("--index-url", "index_url"),
+    ("--extra-index-url", "extra_index_urls"),
+    ("--find-links", "find_links"),
+)
+
+#: Something pip may read as a URL: a scheme of two or more characters and a
+#: colon, wherever it starts a word or follows ``@`` (``name @ url`` and
+#: ``name@url``).  One letter is a Windows drive, not a scheme.  Matching too
+#: much costs a judged string that passes; matching too little lets a URL by.
+_URL_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9+.\-])[A-Za-z][A-Za-z0-9+.\-]+:\S*")
+
+
+class _PipLineError(Exception):
+    """A line pip's option parser would refuse."""
+
+
+class _PipLineParser(optparse.OptionParser):
+    """pip's line parser, raising where optparse would print and exit."""
+
+    def error(self, msg: str) -> None:  # type: ignore[override]
+        raise _PipLineError(msg)
+
+
+def _pip_line_parser() -> optparse.OptionParser:
+    """A parser for one line, built fresh because ``append`` accumulates."""
+    parser = _PipLineParser(add_help_option=False)
+    for names, dest in _PIP_VALUE_OPTIONS:
+        parser.add_option(*names, dest=dest, action="append", default=[])
+    for name in _PIP_FLAG_OPTIONS:
+        parser.add_option(name, action="store_true")
+    return parser
+
+
+def _parse_pip_line(line: str) -> tuple[str, optparse.Values]:
+    """Split *line* into its requirement and its options, as pip does.
+
+    Raises:
+        _PipLineError: pip would refuse the line.
+    """
+    tokens = line.split(" ")
+    args: list[str] = []
+    for token in tokens:
+        if token.startswith("-"):
+            break
+        args.append(token)
+    options = " ".join(tokens[len(args) :])
+    try:
+        words = shlex.split(options)
+    except ValueError as exc:
+        raise _PipLineError("unbalanced quotes") from exc
+    values, _ = _pip_line_parser().parse_args(words)
+    return " ".join(args), values
+
+
+def _decode_like_pip(data: bytes) -> str:
+    """Decode a requirements file as pip does, short of its last guess.
+
+    pip falls back to the locale's encoding when UTF-8 fails.  That guess is
+    not repeated here: a file read one way here and another way by pip is the
+    differential the reader exists to rule out, so it is refused instead.
+
+    Raises:
+        UnicodeDecodeError, LookupError: the text cannot be read as pip would
+            read it without guessing.
+    """
+    for bom, encoding in _PIP_BOMS:
+        if data.startswith(bom):
+            return data[len(bom) :].decode(encoding)
+    for line in data.split(b"\n")[:2]:
+        if line[:1] == b"#":
+            declared = _PIP_PEP263_RE.search(line)
+            if declared is not None:
+                return data.decode(declared.group(1).decode("ascii"))
+    return data.decode("utf-8")
+
+
+def _read_like_pip(path: Path) -> str:
+    """The text of the requirements file *path*, decoded as pip decodes it.
+
+    Raises:
+        PluginError: carrying the reason alone, for the caller's sentence.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        logger.warning("Could not read requirements file %s.", path, exc_info=True)
+        raise PluginError(_os_reason(exc)) from exc
+    try:
+        return _decode_like_pip(data)
+    except (UnicodeDecodeError, LookupError) as exc:
+        logger.warning(
+            "Requirements file %s is not readable text.", path, exc_info=True
+        )
+        raise PluginError(
+            "it is not UTF-8 text, nor text in an encoding its first lines name"
+        ) from exc
+
+
+def _pip_lines(text: str, *, expand: bool) -> list[tuple[int, str]]:
+    """``(line number, line)`` for each line pip parses in *text*.
+
+    Joined, stripped of comments and blank lines, and with ``${NAME}``
+    replaced from the environment when *expand* is true, exactly as pip 26.3's
+    ``preprocess`` does.  ``str.splitlines`` is pip's own split, so a form
+    feed or a U+2028 ends a line here as it does there.
+    """
+    joined: list[tuple[int, str]] = []
+    pending: list[str] = []
+    first = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line.endswith("\\") or _PIP_COMMENT_RE.match(line):
+            if _PIP_COMMENT_RE.match(line):
+                line = " " + line
+            if pending:
+                pending.append(line)
+                joined.append((first, "".join(pending)))
+                pending = []
+            else:
+                joined.append((number, line))
+        else:
+            if not pending:
+                first = number
+            pending.append(line.strip("\\"))
+    if pending:
+        joined.append((first, "".join(pending)))
+
+    lines = []
+    for number, line in joined:
+        line = _PIP_COMMENT_RE.sub("", line).strip()
+        if not line:
+            continue
+        if expand:
+            for name in _PIP_ENV_VAR_RE.findall(line):
+                value = os.getenv(name)
+                if value:
+                    line = line.replace(f"${{{name}}}", value)
+        lines.append((number, line))
+    return lines
 
 
 def read_requirements(requirements: Path) -> list[str]:
     """Return the requirement lines, so the CLI can show them before running pip.
 
-    A line ending in a backslash is joined to the next one first, because pip
-    does the same: ``--index-url \\`` on its own line and the URL on the next is
-    ONE option to pip, and reading them as two showed the option without what
-    it points at (#1206 item 8).
+    Read as pip reads them (:func:`_pip_lines`): a line ending in a backslash
+    is joined to the next one, because ``--index-url \\`` on its own line and
+    the URL on the next is ONE option to pip, and reading them as two showed
+    the option without what it points at (#1206 item 8).  ``${NAME}`` is left
+    as written: the listing shows the file, and the environment's values are
+    judged, not printed (:func:`_judge_requirement_sources`).
+
+    Raises:
+        PluginError: the file cannot be read; the message is the reason alone.
     """
-    source = _CONTINUATION_RE.sub(" ", read_source(requirements).replace("\r\n", "\n"))
-    return [
-        line.strip()
-        for line in source.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    return [line for _, line in _pip_lines(_read_like_pip(requirements), expand=False)]
+
+
+def _url_problem(url: str) -> str | None:
+    """What makes *url* read as two different hosts, or None when nothing does.
+
+    Judged on the URL pip's ``requests`` sends (:func:`wire_split`) against
+    ``urlsplit``'s reading of it.  A VCS URL is judged on the part after
+    ``git+``, which is what the VCS is given.
+    """
+    if "\\" in url:
+        return "an address with a backslash in it"
+    scheme = url.partition(":")[0]
+    target = url.split("+", 1)[1] if "+" in scheme else url
+    try:
+        seen = urlsplit(target)
+        wire = wire_split(target)
+        seen_at = (seen.hostname, seen.port)
+        wire_at = (wire.hostname, wire.port)
+    except (ValueError, requests.RequestException):
+        logger.warning("A requirement address could not be split.", exc_info=True)
+        return "an address that cannot be read as one host"
+    if "@" in seen.netloc or "@" in wire.netloc:
+        return "an address with a user name in it"
+    if seen_at != wire_at:
+        return "an address whose host reads differently to different parsers"
+    return None
+
+
+def _judge_requirement_sources(requirements: Path) -> tuple[str, ...]:
+    """Refuse an address pip would read differently from the listing.
+
+    Every URL pip reads from the plugin's requirements is judged before pip
+    runs: on requirement lines, in ``-i``/``--index-url``/
+    ``--extra-index-url``/``-f``/``--find-links``/``-e``, and in every file a
+    ``-r``/``-c`` includes.  Read with pip's own reader (:func:`_pip_lines`,
+    :func:`_parse_pip_line`), environment variables expanded as pip expands
+    them, so the line judged is the line pip acts on.
+
+    SECURITY: pip strips a user name from a URL before writing its report, so
+    ``http://evil.example\\@files.pythonhosted.org/x.whl`` is fetched from
+    ``evil.example`` and reported as PyPI's file host (pip's
+    ``redact_auth_from_url``).  The report cannot be the evidence, so the
+    address is refused before it is fetched: one with a user name, one with a
+    backslash, and one whose host ``urlsplit`` and ``requests`` read
+    differently (a parser differential, OWASP's SSRF prevention cheat sheet).
+    An include that pip would fetch from an address, or that leaves the
+    plugin folder, cannot be judged and is refused too.  The refusal names
+    the file and the line, never the address.
+
+    Returns the index options found, each with where it is written, for
+    :attr:`DependencyChange.index_sources`.
+
+    Raises:
+        PluginError: a fixed sentence naming the file and line.
+    """
+    root = requirements.parent.resolve()
+    sources: list[str] = []
+    seen: set[object] = set()
+    pending: list[Path] = [Path(os.path.abspath(requirements))]
+    while pending:
+        current = pending.pop(0)
+        resolved = current.resolve()
+        info = resolved.stat() if resolved.is_file() else None
+        key: object = (info.st_dev, info.st_ino) if info else resolved
+        if key in seen:
+            continue
+        seen.add(key)
+        # Named relative to the plugin folder; an include is inside it by now.
+        name = (
+            resolved.relative_to(root).as_posix()
+            if resolved.is_relative_to(root)
+            else current.name
+        )
+        try:
+            text = _read_like_pip(current)
+        except PluginError as exc:
+            raise PluginError(
+                f"could not read {name}: {exc}. Nothing was installed."
+            ) from exc
+        for number, line in _pip_lines(text, expand=True):
+            where = f"line {number} of {name}"
+            try:
+                args, options = _parse_pip_line(line)
+            except _PipLineError as exc:
+                logger.warning("pip would refuse %s: %s", where, exc)
+                raise PluginError(
+                    f"pip cannot read {where}. Nothing was installed."
+                ) from exc
+            for value in (
+                args,
+                *options.index_url,
+                *options.extra_index_urls,
+                *options.find_links,
+                *options.editables,
+            ):
+                for match in _URL_CANDIDATE_RE.finditer(value):
+                    problem = _url_problem(match.group())
+                    if problem is not None:
+                        raise PluginError(
+                            f"{where} names {problem}, which can hide where pip "
+                            "downloads from. Nothing was installed."
+                        )
+            for flag, dest in _INDEX_OPTIONS:
+                sources.extend(
+                    f"{flag} {value}  ({where})" for value in getattr(options, dest)
+                )
+            for target in (*options.requirements, *options.constraints):
+                pending.append(_judged_include(target, current, root, where))
+    return tuple(sources)
+
+
+def _judged_include(target: str, parent: Path, root: Path, where: str) -> Path:
+    """The file an include names, resolved as pip resolves it, or a refusal.
+
+    pip joins the target to the including file's folder (``os.path.abspath``
+    of the two, symlinks unresolved), and fetches a target that starts
+    ``http:``, ``https:`` or ``file:`` instead of opening it.
+
+    Raises:
+        PluginError: the include is an address, leaves the plugin folder, or
+            names no file.
+    """
+    if _PIP_SCHEME_RE.search(target):
+        raise PluginError(
+            f"{where} includes a requirements file from an address, which "
+            "cannot be checked before pip reads it. Nothing was installed."
+        )
+    path = Path(os.path.abspath(os.path.join(os.path.dirname(parent), target)))
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise PluginError(
+            f"{where} includes a file outside the plugin folder, or one that "
+            "is not there, so it cannot be checked. Nothing was installed."
+        )
+    return path
 
 
 #: ``-r``/``-c`` and their long forms, with the file they name.  pip accepts
@@ -1214,13 +1784,22 @@ def _describe(kind: str, path: Path, builtins: set[str]) -> InstalledPlugin:
                 found.extend(_analyse(read_source(source), source, strict=False))
         else:
             found = inspect_file(path)
-    except (PluginError, OSError) as exc:
+    except PluginError as exc:
         return InstalledPlugin(
             kind=kind,
             entry=path.name,
             name=path.stem,
             display_name="-",
             problem=str(exc),
+        )
+    except OSError as exc:
+        logger.warning("Could not read installed plugin %s.", path, exc_info=True)
+        return InstalledPlugin(
+            kind=kind,
+            entry=path.name,
+            name=path.stem,
+            display_name="-",
+            problem=f"could not be read: {_os_reason(exc)}",
         )
 
     if not found:
@@ -1317,13 +1896,22 @@ def _catalogue_entry(folder: Path, installed: set[str]) -> CataloguePlugin:
         found: list[PluginClass] = []
         for source in _python_files(folder):
             found.extend(_analyse(read_source(source), source, strict=False))
-    except (PluginError, OSError) as exc:
+    except PluginError as exc:
         return CataloguePlugin(
             kind=kind,
             name=folder.name,
             display_name="-",
             installed=folder.name in installed,
             problem=str(exc),
+        )
+    except OSError as exc:
+        logger.warning("Could not read published plugin %s.", folder, exc_info=True)
+        return CataloguePlugin(
+            kind=kind,
+            name=folder.name,
+            display_name="-",
+            installed=folder.name in installed,
+            problem=f"could not be read: {_os_reason(exc)}",
         )
     if not found:
         return CataloguePlugin(
@@ -1395,16 +1983,23 @@ def resolve_removal(name: str, kind: str | None = None) -> tuple[str, Path]:
         try:
             directory = Path(os.path.realpath(user_dir(candidate_kind)))
         except (OSError, ValueError) as exc:
-            raise PluginError(f"{name!r} is not a plugin name: {exc}") from exc
+            logger.warning(
+                "Could not find the %s plugin folder.", candidate_kind, exc_info=True
+            )
+            raise PluginError(
+                f"the {candidate_kind} plugin folder could not be found: "
+                f"{_os_reason(exc)}."
+            ) from exc
         for candidate in (directory / name, directory / f"{name}.py"):
             if candidate.parent != directory:
                 # Unreachable while the name has no separator; kept because the
                 # cost of being wrong here is a deleted file somewhere else.
                 raise PluginError(f"{name!r} would leave {directory}. Refused.")
-            if candidate.is_symlink():
+            if is_link_or_missing(candidate):
                 raise PluginError(
-                    f"{candidate} is a symlink. Refusing to delete what it "
-                    "points at; remove the link yourself if that is what you want."
+                    f"{candidate} is a link (a symlink or junction). Refusing "
+                    "to delete what it points at; remove the link yourself if "
+                    "that is what you want."
                 )
             if candidate.exists():
                 matches.append((candidate_kind, candidate))
