@@ -32,6 +32,7 @@ import gc
 import json
 import os
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -476,6 +477,45 @@ def test_the_whole_scrapheap_is_the_one_there_when_the_run_starts(env, captured)
     assert _get(client, run["id"])["deleted_count"] == 2
     assert _states(server, ids) == [None, None]
     assert _states(server, late) == ["heap"]
+
+
+def test_the_delete_preview_answers_while_the_writer_is_held(env):
+    """A long write on the DB writer (a purge, a restore) must not stall the preview."""
+    client, server = env
+    ids = _heap(server, 3)
+    started, release = threading.Event(), threading.Event()
+
+    def hold(_session):
+        started.set()
+        release.wait(30)
+
+    holder = threading.Thread(
+        target=server.vault.db.run_task,
+        args=(hold,),
+        kwargs={"priority": DBPriority.IMMEDIATE},
+        daemon=True,
+    )
+    holder.start()
+    assert started.wait(5), "the holding task never got the writer"
+    answer = {}
+    caller = threading.Thread(
+        target=lambda: answer.update(
+            response=client.post(PREVIEW_URL, json={"ids": ids})
+        ),
+        daemon=True,
+    )
+    try:
+        caller.start()
+        caller.join(5)
+        assert not caller.is_alive(), "the preview waited behind the writer"
+    finally:
+        release.set()
+        holder.join(10)
+        caller.join(10)
+
+    response = answer["response"]
+    assert response.status_code == 200, response.text
+    assert response.json()["total_count"] == 3
 
 
 def test_delete_forever_spares_a_picture_binned_after_the_preview(env):

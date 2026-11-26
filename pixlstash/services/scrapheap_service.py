@@ -1748,17 +1748,21 @@ def remove_picture_files_and_reconcile_ledger(
 
 
 def fetch_scrapheap_rows(vault, ids: Optional[list[int]]) -> list[ScrapheapRow]:
-    """Vault wrapper for :func:`fetch_scrapheap_rows_in_session`."""
-    return vault.db.run_task(
-        fetch_scrapheap_rows_in_session, ids, priority=DBPriority.IMMEDIATE
-    )
+    """Vault wrapper for :func:`fetch_scrapheap_rows_in_session`.
+
+    Off the writer queue, so the delete preview and the heap listing answer
+    while a long purge or restore holds the writer. The purge re-reads its rows
+    in its own writer transaction, so nothing relies on serialising this read.
+    """
+    return vault.db.run_immediate_read_task(fetch_scrapheap_rows_in_session, ids)
 
 
 def fetch_no_delete_folder_ids(vault) -> set[int]:
-    """Vault wrapper for :func:`fetch_no_delete_folder_ids_in_session`."""
-    return vault.db.run_task(
-        fetch_no_delete_folder_ids_in_session, priority=DBPriority.IMMEDIATE
-    )
+    """Vault wrapper for :func:`fetch_no_delete_folder_ids_in_session`.
+
+    Off the writer queue, as :func:`fetch_scrapheap_rows`.
+    """
+    return vault.db.run_immediate_read_task(fetch_no_delete_folder_ids_in_session)
 
 
 def find_due_retention_picture_ids(
