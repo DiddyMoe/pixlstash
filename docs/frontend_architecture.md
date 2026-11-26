@@ -430,6 +430,7 @@ Presentational "PixlStash" brand wordmark in the Tiny5 pixel font (replaced the 
 #### `ImageGrid.vue` (7933 lines)
 The core image display engine. Responsibilities:
 - Virtualised grid scroll with dynamic thumbnail sizes (via `useVirtualScroll`). The Images/Videos filter is one computed, `mediaFilteredGridImages`, read by both the render window and `filteredGridCount`: "All" passes the grid through, and the other two keep placeholder rows (`id == null`), so while the stream fills, each row in the window sits at its own `idx`, the index the card layout places it by.
+- **A finished thumbnail batch counts a slot as loaded only when it held a picture and still holds it** (`loadedSlotRuns` in `utils/thumbnailWriteback.js`). A placeholder slot was never asked for, and a removal above can move the rows while the batch is out, so counting either would leave the picture that lands there blank for good. A thumbnail-size change re-measures the row and lets `recalculateVisibleRange` derive the window, so the range has one author. Pinned by `ImageGridThumbnailWriteback.test.js` and `ImageGridThumbnailVersion.test.js`.
 - Fetches images from `GET /pictures` with all filter params as query args.
 - Manages stacks: collapsing/expanding, leader-map calculation, inline stack drag-sort (via `useStackOrdering`).
 - Multi-selection (shift-click, keyboard navigation with arrow keys) (via `useMultiSelect`).
@@ -441,6 +442,15 @@ The core image display engine. Responsibilities:
 - Integrates `Lightbox`, `ImageImporter`, `Toolbar`, `ImageGridContextMenu`, `EmptyScrapHeap`, `LibraryEmptyState`. The lightbox's part of a ComfyUI run is `useGridComfyuiRuns` (below, under `useGridComfyuiRuns.js`).
 - Emits: `open-lightbox`, `refresh-sidebar`, `clear-search`, `reset-to-all`, `search-all`, `update:selected-sort`, `update:stack-stats`, `import-started`, `import-ended`, `clear-multi-selection`, `update:character-multi-mode`, `update:set-multi-mode`, `update:set-difference-base-id`, `update:embed-watermark`, `update:visible-range-label`, `load-pending-imports`
 - Key props: `thumbnailSize`, `columns`, `selectedCharacter`, `selectedSet`, `searchQuery`, `selectedSort`, `wsTagUpdate`, `wsPluginProgress`, `gridVersion`, `wsUpdateKey`, `publicUrl`, `embedWatermark`, + all filter props.
+
+##### The virtual scroll window: spacers that equal the rows they replace
+
+`useVirtualScroll` mounts only the rows near the viewport and puts a spacer above and below them. **A card must not move when the window moves**, so each spacer is exactly as tall as the rows it stands for, gaps included: the top spacer is the first rendered row's exact offset, the bottom spacer is the exact height left below the last rendered row, and each spacer leaves out the one row gap the layout itself puts next to it.
+
+- **Square and compact.** The row pitch is measured once a card is laid out: the first card's `getBoundingClientRect().height` plus the grid's computed `row-gap` (`measureSquareRowPitch`). Cards stretch to their track, so this is the real pitch, usually fractional; the rounded `estimateRowHeight` seeds it only until a card has been measured. The 1px top spacer is always rendered, so card row `r` sits at `squareRowTop(r) = 1 + gap + r × pitch` whichever rows are mounted. The top spacer is `1 + rowsAbove × pitch` and the bottom spacer is `rowsBelow × pitch − gap`. The visible range, the cursor scroll and `ImageGrid.gridItemTopOffset` all measure from that origin. The pitch is re-measured after every patch that can change it (the render window, `columns`, `compactMode`, `thumbnailMode`), in a `flush: 'post'` watcher, because a pre-flush watcher reads the old DOM.
+- **Justified.** Rows are packed to known heights (`useJustifiedLayout`), and the spacers are exact sums from `rowOffsets` minus the one `JUSTIFIED_ROW_GAP`.
+
+`useVirtualScroll.test.js` checks that every square row keeps one offset whatever the render window; `e2e/specs/grid.spec.js` checks in a browser that no card moves while the window does.
 
 ##### The empty library is a different question from an empty grid
 

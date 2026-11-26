@@ -14,6 +14,8 @@ const MIN_THUMBNAIL_SIZE = 96;
 const MAX_THUMBNAIL_SIZE = 288;
 const THUMBNAIL_INFO_ROW_HEIGHT = 24;
 const VIEW_WINDOW = 100;
+// Square mode always renders the top spacer, at least this tall.
+const SQUARE_TOP_SPACER_MIN = 1;
 
 /**
  * Manages viewport geometry, row height, and scroll position for the virtual
@@ -129,6 +131,48 @@ export function useVirtualScroll(
     ),
   );
 
+  // Square mode: rowHeight is the row pitch (track plus CSS row-gap), measured
+  // from a rendered card once there is one, so row r sits at squareRowTop(r)
+  // whichever rows are rendered.
+  const squareRowGap = ref(0);
+  let squarePitchMeasured = false;
+
+  function squareRowTop(row) {
+    return SQUARE_TOP_SPACER_MIN + squareRowGap.value + row * rowHeight.value;
+  }
+
+  function measureSquareRowPitch() {
+    const grid = gridContainer.value;
+    if (!grid) return null;
+    const card = grid.querySelector(":scope > .image-card");
+    if (!card) return null;
+    const trackHeight = card.getBoundingClientRect().height;
+    if (!(trackHeight > 0)) return null;
+    const gridStyle = getComputedStyle(grid);
+    // Right after leaving justified mode the DOM can still be the flex layout.
+    if (gridStyle.display !== "grid") return null;
+    const rowGap = parseFloat(gridStyle.rowGap) || 0;
+    return { pitch: trackHeight + rowGap, gap: rowGap };
+  }
+
+  // Returns whether a measurement was available.
+  function syncSquarePitch() {
+    const measured = measureSquareRowPitch();
+    if (!measured) return false;
+    if (
+      squarePitchMeasured &&
+      measured.pitch === rowHeight.value &&
+      measured.gap === squareRowGap.value
+    ) {
+      return true;
+    }
+    rowHeight.value = measured.pitch;
+    squareRowGap.value = measured.gap;
+    squarePitchMeasured = true;
+    recalculateVisibleRange();
+    return true;
+  }
+
   function getGridColumnWidth() {
     const cols = Math.max(1, gridStore.columns || 1);
     const gridWidth =
@@ -150,12 +194,19 @@ export function useVirtualScroll(
     );
   }
 
-  function updateRowHeightFromGrid() {
+  function estimateRowHeight() {
     const columnWidth = getGridColumnWidth();
     const infoHeight = gridStore.compactMode ? 0 : THUMBNAIL_INFO_ROW_HEIGHT;
-    rowHeight.value = Math.round(columnWidth + infoHeight);
+    return Math.round(columnWidth + infoHeight);
+  }
+
+  function updateRowHeightFromGrid() {
     if (isJustifiedMode.value) {
+      rowHeight.value = estimateRowHeight();
+      squarePitchMeasured = false;
       remeasureJustifiedWidth();
+    } else if (!syncSquarePitch() && !squarePitchMeasured) {
+      rowHeight.value = estimateRowHeight();
     }
     afterRowHeightUpdate?.();
   }
@@ -224,11 +275,14 @@ export function useVirtualScroll(
         end: layout.rowStarts[lastRow + 1],
       };
     }
-    const cardHeight = rowHeight.value;
-    const scrollTop = el.scrollTop;
+    const pitch = rowHeight.value;
+    const intoGrid = el.scrollTop - squareRowTop(0);
     const cols = gridStore.columns;
-    const firstVisibleRow = scrollTop / cardHeight;
-    const lastVisibleRow = (scrollTop + el.clientHeight - 1) / cardHeight;
+    const firstVisibleRow = Math.max(0, intoGrid / pitch);
+    const lastVisibleRow = Math.max(
+      0,
+      (intoGrid + el.clientHeight - 1) / pitch,
+    );
     return {
       start: Math.floor(firstVisibleRow) * cols,
       end: Math.ceil(lastVisibleRow) * cols,
@@ -298,7 +352,7 @@ export function useVirtualScroll(
     }
     const cols = gridStore.columns;
     const rowsAbove = Math.floor(renderStart.value / cols);
-    return rowsAbove > 0 ? rowsAbove * rowHeight.value : 1;
+    return SQUARE_TOP_SPACER_MIN + rowsAbove * rowHeight.value;
   });
 
   const bottomSpacerHeight = computed(() => {
@@ -319,7 +373,10 @@ export function useVirtualScroll(
     const lastRenderedRow = Math.floor((renderEnd.value - 1) / cols) + 1;
     const totalRows = Math.ceil(allGridImagesLength.value / cols);
     const rowsBelow = totalRows - lastRenderedRow;
-    return rowsBelow > 0 ? rowsBelow * rowHeight.value : 0;
+    // The row-gap before the spacer supplies squareRowGap px of it.
+    return rowsBelow > 0
+      ? Math.max(0, rowsBelow * rowHeight.value - squareRowGap.value)
+      : 0;
   });
 
   // ── Scroll handler ────────────────────────────────────────────────────────
@@ -373,6 +430,23 @@ export function useVirtualScroll(
     recalculateVisibleRange();
   });
 
+  // Measures the square pitch after Vue has patched the DOM for a new render
+  // window or layout; ImageGrid's own layout watchers run before the patch.
+  watch(
+    [
+      renderStart,
+      renderEnd,
+      () => gridStore.columns,
+      () => gridStore.compactMode,
+      () => gridStore.thumbnailMode,
+    ],
+    () => {
+      if (isJustifiedMode.value) return;
+      syncSquarePitch();
+    },
+    { flush: "post" },
+  );
+
   // ── Cursor scroll-into-view ───────────────────────────────────────────────
   function scrollCursorIntoView(idx) {
     if (!scrollWrapper.value) return;
@@ -393,8 +467,8 @@ export function useVirtualScroll(
     } else {
       const cols = Math.max(1, gridStore.columns || 1);
       const row = Math.floor(idx / cols);
-      itemTop = row * rowHeight.value;
-      itemBottom = itemTop + rowHeight.value;
+      itemTop = squareRowTop(row);
+      itemBottom = itemTop + rowHeight.value - squareRowGap.value;
     }
     const scrollTop = scrollWrapper.value.scrollTop;
     const clientHeight = scrollWrapper.value.clientHeight;
@@ -421,6 +495,7 @@ export function useVirtualScroll(
     recalculateVisibleRange,
     onGridScroll,
     scrollCursorIntoView,
+    squareRowTop,
     // Justified-mode additions (null / false when thumbnailMode is 'square').
     isJustifiedMode,
     justifiedLayout,

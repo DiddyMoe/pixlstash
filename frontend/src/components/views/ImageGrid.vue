@@ -1349,7 +1349,10 @@ import { useScopedNotice } from "../../composables/useScopedNotice";
 import { buildPurgeBadge } from "../../utils/retention.js";
 import { buildLockedDeleteMessage } from "../../utils/lockedDelete.js";
 import { buildLibraryMoveMessage } from "../../utils/libraryMove.js";
-import { writeThumbnailBatch } from "../../utils/thumbnailWriteback.js";
+import {
+  loadedSlotRuns,
+  writeThumbnailBatch,
+} from "../../utils/thumbnailWriteback.js";
 import {
   cutFaceSuggestions,
   referenceFaceCount,
@@ -6496,6 +6499,7 @@ const {
   visibleStart,
   visibleEnd,
   rowHeight,
+  squareRowTop,
   renderStart,
   renderEnd,
   topSpacerHeight,
@@ -8457,7 +8461,10 @@ async function fetchThumbnailsBatch(start, end, meta = {}) {
         scheduleThumbnailRetry(row.id, slot, requestEpoch);
       }
     }
-    loadedRanges.value.push([start, end]);
+    // Only the slots that held a picture and still hold it count as loaded.
+    for (const run of loadedSlotRuns(allGridImages.value, gridImages, start)) {
+      loadedRanges.value.push(run);
+    }
     if (overlayNeedsRedraw) {
       triggerFaceOverlayRedraw();
     }
@@ -8948,29 +8955,10 @@ function updateDescriptionForImage(imageId, description) {
 watch(
   () => gridStore.thumbnailSize,
   () => {
-    // Recalculate visibleStart and visibleEnd after rowHeight update
+    // The virtualizer owns the row origin and calls updateVisibleThumbnails.
     nextTick(() => {
       updateRowHeightFromGrid();
-      if (isJustifiedMode.value) {
-        // Justified rows don't follow the uniform cols/rowHeight arithmetic
-        // below - let the virtualizer derive the range from the packed model.
-        recalculateVisibleRange();
-        return;
-      }
-      const el = scrollWrapper.value;
-      if (!el) return;
-      let cardHeight = rowHeight.value;
-      const scrollTop = el.scrollTop;
-      const cols = gridStore.columns;
-      // First visible row (may be partially visible)
-      const firstVisibleRow = scrollTop / cardHeight;
-      // Last visible row (may be partially visible)
-      const lastVisibleRow = (scrollTop + el.clientHeight - 1) / cardHeight;
-      const newVisibleStart = Math.floor(firstVisibleRow) * cols;
-      const newVisibleEnd = Math.ceil(lastVisibleRow) * cols;
-      visibleStart.value = newVisibleStart;
-      visibleEnd.value = newVisibleEnd;
-      updateVisibleThumbnails();
+      recalculateVisibleRange();
     });
   },
 );
@@ -9183,7 +9171,7 @@ function gridItemTopOffset(index) {
     return typeof top === "number" ? top : null;
   }
   const cols = Math.max(1, gridStore.columns || 1);
-  return Math.floor(index / cols) * rowHeight.value;
+  return squareRowTop(Math.floor(index / cols));
 }
 
 /**

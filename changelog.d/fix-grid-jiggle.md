@@ -1,0 +1,1 @@
+- Fixed: thumbnails no longer jiggle up and down while you scroll the grid.

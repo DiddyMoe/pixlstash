@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { ref, reactive, computed, nextTick } from "vue";
 import { setActivePinia, createPinia } from "pinia";
 import { useGridStore } from "../stores/useGridStore.js";
@@ -169,6 +169,8 @@ describe("useVirtualScroll render window (square mode)", () => {
     const gridContainer = ref({
       clientWidth: CONTAINER_W,
       getBoundingClientRect: () => ({ width: CONTAINER_W }),
+      // No cards laid out: the row pitch stays at its estimate.
+      querySelector: () => null,
     });
     const length = computed(() => itemCount);
     return useVirtualScroll(
@@ -210,5 +212,95 @@ describe("useVirtualScroll render window (square mode)", () => {
     vs.visibleEnd.value = 0;
 
     expect(vs.renderEnd.value).toBe(0);
+  });
+});
+
+// The browser lays square rows out at their real pitch (a fractional column,
+// the card chrome and the row-gap), so the spacers have to use that pitch, or
+// every render-window move shifts the rendered rows by the difference.
+describe("useVirtualScroll square row pitch", () => {
+  // Not a multiple of the column count, so the columns are fractional.
+  const GRID_W = 1003;
+  const N = 8000;
+
+  // Chrome's square grid: `cols` equal columns with a 4px gap, and a card of
+  // column width plus 26px of chrome (padding, margin and the info row).
+  function squareGeometry(cols) {
+    const gap = 4;
+    const colW = (GRID_W - gap * (cols - 1)) / cols;
+    const track = colW + 26;
+    return { cols, gap, track, pitch: track + gap };
+  }
+
+  function harness() {
+    const store = useGridStore();
+    store.sizeLevel = 3;
+    store.thumbnailMode = "square";
+    store.thumbnailSize = 256;
+    store.compactMode = false;
+    const geom = squareGeometry(store.columns);
+    const card = { getBoundingClientRect: () => ({ height: geom.track }) };
+    const grid = {
+      clientWidth: GRID_W,
+      getBoundingClientRect: () => ({ width: GRID_W }),
+      querySelector: (selector) =>
+        selector === ":scope > .image-card" ? card : null,
+      computedStyle: () => ({ display: "grid", rowGap: `${geom.gap}px` }),
+    };
+    vi.stubGlobal("getComputedStyle", (el) => el.computedStyle());
+    const vs = useVirtualScroll(
+      ref({ scrollTop: 0, clientHeight: VIEWPORT_H, clientWidth: GRID_W }),
+      ref(grid),
+      reactive({}),
+      computed(() => N),
+      {
+        onVisibleRangeChange: vi.fn(),
+        afterRowHeightUpdate: vi.fn(),
+        getAspectRatios: () => [],
+      },
+    );
+    vs.initialRender.value = false;
+    vs.updateRowHeightFromGrid();
+    return { vs, geom };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // Lays out [top spacer, rendered rows, bottom spacer] as a CSS grid does:
+  // one row-gap between consecutive tracks, a zero-height spacer not rendered.
+  function layOut(vs, { cols, gap, track }) {
+    const top = vs.topSpacerHeight.value;
+    const bottom = vs.bottomSpacerHeight.value;
+    const renderedRows = Math.ceil(
+      (vs.renderEnd.value - vs.renderStart.value) / cols,
+    );
+    const tracks = [
+      ...(top > 0 ? [top] : []),
+      ...Array(renderedRows).fill(track),
+      ...(bottom > 0 ? [bottom] : []),
+    ];
+    return {
+      firstRow: Math.floor(vs.renderStart.value / cols),
+      firstRowTop: top > 0 ? top + gap : 0,
+      total: tracks.reduce((a, b) => a + b, 0) + gap * (tracks.length - 1),
+    };
+  }
+
+  it("keeps every square row at one offset whatever the render window", () => {
+    const { vs, geom } = harness();
+    const { cols, gap, pitch } = geom;
+    const total = 1 + gap + Math.ceil(N / cols) * pitch - gap;
+    for (const row of [0, 1, 380, 390, Math.ceil(N / cols) - 2]) {
+      vs.visibleStart.value = row * cols;
+      vs.visibleEnd.value = (row + 4) * cols;
+      const laid = layOut(vs, geom);
+      // Row r sits at 1 + gap + r * pitch wherever the window starts; Chrome
+      // positions boxes in 1/64 px units.
+      const rowTop = 1 + gap + laid.firstRow * pitch;
+      expect(Math.abs(laid.firstRowTop - rowTop)).toBeLessThan(1 / 64);
+      expect(Math.abs(laid.total - total)).toBeLessThan(1 / 64);
+    }
   });
 });
