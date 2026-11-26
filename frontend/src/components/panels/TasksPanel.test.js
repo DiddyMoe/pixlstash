@@ -49,11 +49,20 @@ vi.mock("../../utils/apiClient", async (original) => {
 import TasksPanel from "./TasksPanel.vue";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useRunDialogStore } from "../../stores/useRunDialogStore";
+import { useScrapheapRunStore } from "../../stores/useScrapheapRunStore";
 import { useTasksStore } from "../../stores/useTasksStore";
 import { useEntityListsStore } from "../../stores/useEntityListsStore";
 import { useWorkflowsStore } from "../../stores/useWorkflowsStore";
 import { abortRun } from "../../api/comfyui";
+import {
+  activeConfirm,
+  registerConfirmHost,
+  resolveConfirm,
+  unregisterConfirmHost,
+} from "../../composables/useConfirm";
+import { stopTrainingQuestion } from "../../stores/useTrainingRunsStore";
 import RunAnywayDialog from "./RunAnywayDialog.vue";
+import { formatCount } from "../../utils/filterChips";
 
 vi.mock("../../api/comfyui", () => ({ abortRun: vi.fn(async () => ({})) }));
 const runLeaseAnyway = vi.fn(async () => ({ status: "success" }));
@@ -80,6 +89,12 @@ function textOf(wrapper) {
 
 // Every panel a test mounts is taken down again, its watchers with it.
 enableAutoUnmount(afterEach);
+
+// A test that stands in for the app's confirm dialog takes it down again, so a
+// question left open never answers the next test's.
+afterEach(() => {
+  unregisterConfirmHost();
+});
 
 beforeEach(() => {
   setActivePinia(createPinia());
@@ -246,6 +261,31 @@ describe("what the task manager shows", () => {
     expect(row.find(".tm-name").text()).toBe("Night market");
     expect(row.find(".tm-mark").classes("tm-mark--running")).toBe(false);
     expect(row.find(".tm-fig-text").text()).toBe("");
+  });
+
+  // The server fetches a few models at once and queues the rest; a queued one
+  // can be cancelled while it waits.
+  it("shows a queued download as its own row reading Queued, with no pulse, and a Cancel", async () => {
+    const tasksStore = useTasksStore();
+    const cancel = vi.spyOn(tasksStore, "cancelDownload").mockResolvedValue();
+    tasksStore.modelDownloads = [
+      { id: "d-1", file: "a.safetensors", status: "running", received: 0, total: 0, percent: 0 },
+      { id: "d-2", file: "b.safetensors", status: "queued", received: 0, total: 0, percent: 0 },
+    ];
+    const wrapper = mount(TasksPanel, globalOpts);
+    const rows = wrapper.findAll('[data-testid="tm-download-row"]');
+    expect(rows).toHaveLength(2);
+    const queued = rows[1];
+    expect(queued.find(".tm-worker-label").text()).toBe("b.safetensors");
+    expect(queued.find(".tm-comfy-message").text()).toBe("Queued");
+    expect(
+      queued.find(".tm-status-dot").classes("tm-status-dot--running"),
+    ).toBe(false);
+    expect(
+      rows[0].find(".tm-status-dot").classes("tm-status-dot--running"),
+    ).toBe(true);
+    await queued.find('[data-testid="tm-download-cancel"]').trigger("click");
+    expect(cancel).toHaveBeenCalledWith("d-2");
   });
 
   it("links every Character sheet row to the set it is building, running or finished", async () => {
@@ -1264,9 +1304,21 @@ function gpuAnswer(over = {}) {
   };
 }
 
+// `task_labels` as a poll brings them: the backend's TASK_LABELS, the entries
+// these fixtures name (FaceTask stands in for a worker of the test's own).
+const TASK_LABELS = {
+  DedupAutoStackTask: "Auto-stack",
+  FaceTask: "Faces",
+  ImageEmbeddingTask: "Image embeddings",
+  ScrapheapRunTask: "Scrapheap",
+  TagTask: "Tagging",
+  TextEmbeddingTask: "Text embeddings",
+};
+
 /** Put the store in the state a poll would, without the poll. */
 function setGpu(resources, runs = []) {
   const tasksStore = useTasksStore();
+  tasksStore.taskLabels = TASK_LABELS;
   tasksStore.resources = resources;
   tasksStore.comfyuiRuns = runs;
   return tasksStore;
@@ -1298,6 +1350,28 @@ describe("the GPU queue in the task manager", () => {
     // ComfyUI's 9.8 GB is its own segment, and a spare margin is drawn.
     expect(bar.find(".tm-vram-seg--comfyui").exists()).toBe(true);
     expect(bar.find(".tm-vram-seg--spare").exists()).toBe(true);
+  });
+
+  // `resources.stale`: the cards did not answer in time, so the figures are
+  // the last reading. One quiet line says so; a fresh reading has none.
+  it("says the figures may be out of date while the reading is stale", () => {
+    setGpu(gpuAnswer({ stale: true }));
+    const wrapper = mount(TasksPanel, globalOpts);
+    const bar = wrapper.find('[data-testid="tm-gpu"]');
+    const line = bar.find('[data-testid="tm-gpu-stale"]');
+    expect(line.exists()).toBe(true);
+    expect(line.text()).toBe(
+      "These figures may be out of date: the GPU did not answer in time.",
+    );
+    // Still the figures, beside the line: stale is not the same as gone.
+    expect(bar.find(".tm-gpu-figs").text()).toContain("11.3 GB free");
+  });
+
+  it("says nothing about age on a fresh reading", () => {
+    setGpu(gpuAnswer({ stale: false }));
+    const wrapper = mount(TasksPanel, globalOpts);
+    expect(wrapper.find('[data-testid="tm-gpu"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="tm-gpu-stale"]').exists()).toBe(false);
   });
 
   it("draws no bar and no fold on a server that sends no resources", () => {
@@ -1362,8 +1436,8 @@ describe("the GPU queue in the task manager", () => {
     // One line each, inside the fold's own card, with its progress by its name.
     const rows = fold.findAll('[data-testid="tm-pixl-child"]');
     expect(rows.map((row) => row.find(".tm-child-name").text())).toEqual([
-      "Image Embeddings 5 / 9",
-      "Tags 1 / 9",
+      "Image embeddings 5 / 9",
+      "Tagging 1 / 9",
     ]);
     expect(rows.every((row) => row.find("canvas.tm-sparkline").exists())).toBe(true);
     // The tagger's lease shows on the tagger's row, and is not a line of its own.
@@ -1398,8 +1472,8 @@ describe("the GPU queue in the task manager", () => {
     localStorage.setItem("pixlstash:tasks:pixlstash-fold", "1");
     const wrapper = mount(TasksPanel, globalOpts);
     const rows = wrapper.findAll('[data-testid="tm-pixl-child"]');
-    const done = rows.find((row) => row.text().includes("Text Embeddings"));
-    const working = rows.find((row) => row.text().includes("Image Embeddings"));
+    const done = rows.find((row) => row.text().includes("Text embeddings"));
+    const working = rows.find((row) => row.text().includes("Image embeddings"));
     expect(done.find(".tm-mark").attributes("data-state")).toBe("done");
     expect(done.find("canvas.tm-sparkline").exists()).toBe(false);
     expect(done.find(".tm-fig-text").text()).toBe("");
@@ -1410,8 +1484,8 @@ describe("the GPU queue in the task manager", () => {
   });
 
   it("names a background Auto-stack run by the action the user started", () => {
-    // The worker's counter is `duplicate_auto_stack`; spelled out word by word
-    // it would read "Duplicate Auto Stack", which is nothing the user clicked.
+    // The worker's counter is `duplicate_auto_stack`; the row is named from
+    // task_labels by its task type, never from the counter.
     const tasksStore = setGpu(gpuAnswer({ leases: [] }));
     tasksStore.workerSnapshots = {
       DedupAutoStackTask: {
@@ -1431,8 +1505,8 @@ describe("the GPU queue in the task manager", () => {
   });
 
   it("names a background Scrapheap run by the place it works on", () => {
-    // The worker's counter is `scrapheap_run`; spelled out it would read
-    // "Scrapheap Run", and no control the user pressed is called a run.
+    // The worker's counter is `scrapheap_run`; the row is named from
+    // task_labels by its task type, never from the counter.
     const tasksStore = setGpu(gpuAnswer({ leases: [] }));
     tasksStore.workerSnapshots = {
       ScrapheapRunTask: {
@@ -1461,6 +1535,9 @@ describe("the GPU queue in the task manager", () => {
     localStorage.setItem("pixlstash:tasks:pixlstash-fold", "1");
     const wrapper = mount(TasksPanel, globalOpts);
     const children = wrapper.findAll('[data-testid="tm-pixl-child"]');
+    // The lease with no task type keeps its own label; the stopped task is
+    // named from task_labels by its type.
+    expect(children.map((child) => child.find(".tm-child-name").text())).toEqual(["Tagging", "Faces"]);
     expect(children.map((child) => child.find(".tm-fig-text").text())).toEqual(["1.2 GB", "stopped"]);
     expect(children[1].find(".tm-mark").attributes("data-state")).toBe("stopped");
   });
@@ -1553,6 +1630,9 @@ describe("the GPU queue in the task manager", () => {
 
   it("asks before cancelling a waiting AI Toolkit run, and cancels nothing on no", async () => {
     cancelLease.mockClear();
+    // The app's confirm dialog asks, with the runs page's own question.
+    registerConfirmHost();
+    const nativeConfirm = vi.spyOn(window, "confirm");
     setGpu(
       gpuAnswer({
         leases: [
@@ -1578,19 +1658,24 @@ describe("the GPU queue in the task manager", () => {
         ],
       }),
     );
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     const wrapper = mount(TasksPanel, globalOpts);
     await wrapper.find('[data-testid="tm-cancel-wait"]').trigger("click");
     await flushPromises();
-    expect(confirm).toHaveBeenCalledWith(
-      'Stop training "Clementine"? The checkpoints it saved are kept.',
+    expect(activeConfirm.value.options).toMatchObject(
+      stopTrainingQuestion("Clementine"),
     );
     expect(cancelLease).not.toHaveBeenCalled();
+    resolveConfirm(false);
+    await flushPromises();
+    expect(cancelLease).not.toHaveBeenCalled();
 
-    confirm.mockReturnValue(true);
     await wrapper.find('[data-testid="tm-cancel-wait"]').trigger("click");
     await flushPromises();
+    expect(cancelLease).not.toHaveBeenCalled();
+    resolveConfirm(true);
+    await flushPromises();
     expect(cancelLease).toHaveBeenCalledWith("lease-t");
+    expect(nativeConfirm).not.toHaveBeenCalled();
   });
 
   it("asks before Run anyway, and starts the lease only when the dialog is confirmed", async () => {
@@ -1630,6 +1715,35 @@ describe("the GPU queue in the task manager", () => {
     await flushPromises();
     expect(runLeaseAnyway).toHaveBeenCalledWith("lease-b");
   });
+
+  it.each([true, false])(
+    "tells the Run anyway dialog whether the GPU reading is stale (%s)",
+    async (stale) => {
+      setGpu(
+        gpuAnswer({
+          stale,
+          leases: [
+            gpuLease({
+              id: "lease-b",
+              tenant: "comfyui",
+              label: "ComfyUI 'Klein inpaint'",
+              kind: "heavy",
+              state: "waiting",
+              device: null,
+              need_mb: 14600,
+              run_id: "run-b",
+              waiting_reason: { code: "vram", text: "Needs 14.6 GB", need_mb: 14600, free_mb: 11500, short_by_mb: 3100, position: 1, blocked_by: [], actions: ["run_anyway"] },
+            }),
+          ],
+        }),
+      );
+      const wrapper = mount(TasksPanel, {
+        global: { stubs: { ...globalOpts.global.stubs, AppDialog: true } },
+      });
+      await wrapper.find('[data-testid="tm-run-anyway"]').trigger("click");
+      expect(wrapper.findComponent(RunAnywayDialog).props("stale")).toBe(stale);
+    },
+  );
 
   it("hands focus back to Run anyway when its dialog closes", async () => {
     setGpu(
@@ -2053,4 +2167,229 @@ describe("a task worker that stopped", () => {
     expect(noticeOf(stopped).exists()).toBe(false);
     expect(noticeOf(null).exists()).toBe(false);
   });
+});
+
+// ── A Scrapheap run ──────────────────────────────────────────────────────────
+//
+// Delete forever, a restore and the undo of one run on the server in slices.
+// The bar over the grid shows one only on the Scrapheap screen; the task
+// manager is where it shows from anywhere, named for what it does, as far as
+// it has got in its own units, with the same Stop.
+
+function scrapheapRun(over = {}) {
+  return {
+    id: "run-1",
+    kind: "purge",
+    status: "running",
+    active: true,
+    total: 5000,
+    processed: 1250,
+    slice_max_pictures: 500,
+    cancel_requested: false,
+    ...over,
+  };
+}
+
+function followRun(over) {
+  const store = useScrapheapRunStore();
+  store.run = scrapheapRun(over);
+  return store;
+}
+
+describe("a Scrapheap run in the task manager", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("draws the run as a row of its own, named for what it does, with how far it has got", () => {
+    followRun();
+    const wrapper = mount(TasksPanel, globalOpts);
+    expect(textOf(wrapper)).not.toContain("No active tasks");
+    const row = wrapper.find('[data-testid="tm-scrapheap-row"]');
+    expect(row.find(".tm-name").text()).toContain(
+      "Deleting forever from the Scrapheap",
+    );
+    expect(row.find('[data-testid="tm-scrapheap-count"]').text()).toBe(
+      `${formatCount(1250)} / ${formatCount(5000)}`,
+    );
+    expect(row.find(".tm-mark").classes("tm-mark--running")).toBe(true);
+    const line = row.find('[data-testid="tm-scrapheap-progress"]');
+    expect(line.attributes("aria-valuenow")).toBe("25");
+    expect(line.attributes("aria-valuetext")).toBe(
+      `${formatCount(1250)} of ${formatCount(5000)} pictures done`,
+    );
+    expect(line.find(".tm-run-line-fill").attributes("style")).toContain(
+      "width: 25%",
+    );
+    const tips = row.findAll("tooltip-stub");
+    expect(tips[tips.length - 1].attributes("text")).toBe(
+      `Deleting forever from the Scrapheap: ${formatCount(1250)} of ${formatCount(5000)} pictures, 25%`,
+    );
+  });
+
+  it.each([
+    ["restore", "Restoring from the Scrapheap"],
+    ["undo", "Undoing a restore"],
+  ])("names a %s run for what it does", (kind, name) => {
+    followRun({ kind });
+    const wrapper = mount(TasksPanel, globalOpts);
+    expect(
+      wrapper.find('[data-testid="tm-scrapheap-row"] .tm-name').text(),
+    ).toContain(name);
+  });
+
+  // An undo's total is History steps, not pictures.
+  it("counts an undo in History steps", () => {
+    followRun({ kind: "undo", total: 5, processed: 2 });
+    const wrapper = mount(TasksPanel, globalOpts);
+    const row = wrapper.find('[data-testid="tm-scrapheap-row"]');
+    expect(row.find('[data-testid="tm-scrapheap-count"]').text()).toBe("2 / 5");
+    const line = row.find('[data-testid="tm-scrapheap-progress"]');
+    expect(line.attributes("aria-valuenow")).toBe("40");
+    expect(line.attributes("aria-valuetext")).toBe("step 2 of 5 done");
+  });
+
+  it("shows a queued run with no count and no pulse, and the panel is not idle", () => {
+    followRun({ status: "pending", processed: 0 });
+    const wrapper = mount(TasksPanel, globalOpts);
+    expect(textOf(wrapper)).not.toContain("No active tasks");
+    const row = wrapper.find('[data-testid="tm-scrapheap-row"]');
+    expect(row.find('[data-testid="tm-scrapheap-count"]').exists()).toBe(false);
+    expect(row.find(".tm-mark").classes("tm-mark--running")).toBe(false);
+    const line = row.find('[data-testid="tm-scrapheap-progress"]');
+    expect(line.attributes("aria-valuenow")).toBeUndefined();
+    const tips = row.findAll("tooltip-stub");
+    expect(tips[tips.length - 1].attributes("text")).toBe(
+      "Deleting forever from the Scrapheap: queued",
+    );
+  });
+
+  it("draws no row for a run that has ended", () => {
+    followRun({ status: "completed", active: false, processed: 5000 });
+    const wrapper = mount(TasksPanel, globalOpts);
+    expect(wrapper.find('[data-testid="tm-scrapheap-row"]').exists()).toBe(
+      false,
+    );
+    expect(textOf(wrapper)).toContain("No active tasks");
+  });
+
+  // The poll's "Scrapheap" task is the same run; two rows would count it twice.
+  it("takes the run's task out of the PixlStash fold, ahead of which it shows, and drops a fold left empty", async () => {
+    const tasksStore = setGpu(gpuAnswer({ leases: [] }));
+    tasksStore.workerSnapshots = {
+      ScrapheapRunTask: {
+        label: "scrapheap_run",
+        current: 1250,
+        total: 5000,
+        running: true,
+        active: true,
+      },
+      TagTask: {
+        label: "Tags",
+        current: 1,
+        total: 9,
+        running: true,
+        active: true,
+      },
+    };
+    localStorage.setItem("pixlstash:tasks:pixlstash-fold", "1");
+    followRun();
+    const wrapper = mount(TasksPanel, globalOpts);
+    const fold = wrapper.find('[data-testid="tm-pixlstash"]');
+    expect(fold.find('[data-testid="tm-pixl-count"]').text()).toBe("1");
+    expect(
+      wrapper
+        .findAll('[data-testid="tm-pixl-child"]')
+        .map((row) => row.find(".tm-child-name").text()),
+    ).toEqual(["Tagging 1 / 9"]);
+    const order = wrapper
+      .findAll('[data-testid="tm-scrapheap-row"], [data-testid="tm-pixlstash"]')
+      .map((el) => el.attributes("data-testid"));
+    expect(order).toEqual(["tm-scrapheap-row", "tm-pixlstash"]);
+
+    tasksStore.workerSnapshots = {
+      ScrapheapRunTask: tasksStore.workerSnapshots.ScrapheapRunTask,
+    };
+    await flushPromises();
+    expect(wrapper.find('[data-testid="tm-pixlstash"]').exists()).toBe(false);
+    expect(wrapper.findAll('[data-testid="tm-scrapheap-row"]')).toHaveLength(1);
+  });
+
+  it("stops the run as the bar over the grid does, with its words for what stopping keeps", async () => {
+    const store = followRun();
+    const cancel = vi.spyOn(store, "cancel").mockResolvedValue({ ok: true });
+    const error = vi.spyOn(useNoticeStore(), "error");
+    const wrapper = mount(TasksPanel, globalOpts);
+    const stop = wrapper.find('[data-testid="tm-scrapheap-stop"]');
+    expect(stop.find("tooltip-stub").attributes("text")).toBe(
+      "Stops after the current batch of up to 500 pictures. Pictures already deleted forever cannot be restored.",
+    );
+    await stop.trigger("click");
+    await flushPromises();
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it("says why when the stop is not answered", async () => {
+    const store = followRun();
+    vi.spyOn(store, "cancel").mockResolvedValue({
+      ok: false,
+      error: { kind: "network", code: null, detail: "", run: null },
+    });
+    const error = vi.spyOn(useNoticeStore(), "error");
+    const wrapper = mount(TasksPanel, globalOpts);
+    await wrapper.find('[data-testid="tm-scrapheap-stop"]').trigger("click");
+    await flushPromises();
+    expect(error).toHaveBeenCalledWith(
+      "No answer came from the server, so it is not known whether the run is stopping. Press Stop again to retry; a repeated stop is harmless.",
+      { key: "scrapheap-run-stop" },
+    );
+  });
+
+  it("offers no Stop once one is asked for, nor in a read-only session, and holds it while a stop is out", async () => {
+    const store = followRun({ cancel_requested: true });
+    const wrapper = mount(TasksPanel, globalOpts);
+    expect(wrapper.find('[data-testid="tm-scrapheap-row"]').exists()).toBe(
+      true,
+    );
+    expect(wrapper.find('[data-testid="tm-scrapheap-stop"]').exists()).toBe(
+      false,
+    );
+    const tips = wrapper
+      .find('[data-testid="tm-scrapheap-row"]')
+      .findAll("tooltip-stub");
+    expect(tips[tips.length - 1].attributes("text")).toBe(
+      "Deleting forever from the Scrapheap: stopping",
+    );
+
+    store.run = scrapheapRun();
+    store.action = "cancel";
+    await flushPromises();
+    expect(
+      wrapper.find('[data-testid="tm-scrapheap-stop"]').attributes("disabled"),
+    ).toBeDefined();
+
+    readOnly.ref.value = true;
+    await flushPromises();
+    expect(wrapper.find('[data-testid="tm-scrapheap-stop"]').exists()).toBe(
+      false,
+    );
+  });
+
+  // A start or an undo still being sent again does not hold the Stop of
+  // the run the row shows; only a stop already out does.
+  it.each(["start", "undo"])(
+    "offers Stop while an unanswered %s is still out, and stops the run",
+    async (pending) => {
+      const store = followRun();
+      store.action = pending;
+      const cancel = vi.spyOn(store, "cancel").mockResolvedValue({ ok: true });
+      const wrapper = mount(TasksPanel, globalOpts);
+      const stop = wrapper.find('[data-testid="tm-scrapheap-stop"]');
+      expect(stop.attributes("disabled")).toBeUndefined();
+      await stop.trigger("click");
+      await flushPromises();
+      expect(cancel).toHaveBeenCalledTimes(1);
+    },
+  );
 });

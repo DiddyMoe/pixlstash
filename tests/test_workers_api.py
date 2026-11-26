@@ -13,6 +13,7 @@ from pixlstash.db_models import Picture
 from pixlstash.server import Server
 from pixlstash.resources.ledger import Ledger
 from pixlstash.services import config_service
+from pixlstash.services.restore._models import TASK_LABELS
 from pixlstash.tasks.dedup_auto_stack_task import DedupAutoStackTask
 from pixlstash.tasks.dedup_scan_task import DedupScanTask
 from pixlstash.tasks.scrapheap_run_task import ScrapheapRunTask
@@ -49,6 +50,14 @@ def test_workers_progress_has_expected_keys():
         process = data["process"]
         assert "ram_used_gb" in process
         assert "ram_total_gb" in process
+        # Each row names its task as a person calls it, from the backend's one
+        # table, so the panel needs no copy of its own.
+        assert data["workers"][TaskType.PICTURE_IMPORT.value]["task_label"] == (
+            "Import"
+        )
+        assert {key: row["task_label"] for key, row in data["workers"].items()} == {
+            t.value: TASK_LABELS[t.value] for t in TaskType
+        }
         # Whether the task runner's workers are there: the owner's alone.
         lanes = data["lanes"]
         assert lanes is not None, "the owner was not told of the task workers"
@@ -76,7 +85,7 @@ def test_workers_progress_has_expected_keys():
         assert resp.status_code == 200, resp.text
         assert resp.json()["lanes"] is None, "a READ token was told of the workers"
         # The database writer's health is the owner's: it names internal
-        # task callables and carries raw error text.
+        # task callables.
         writer = data["database_writer"]
         assert (writer["state"], writer["alive"]) == ("open", True)
         path = f"{API_PREFIX}/workers/progress"
@@ -84,8 +93,29 @@ def test_workers_progress_has_expected_keys():
         reader = bearer_client(server, mint_read_token(client, "test-read-token"))
         resp = reader.get(path)
         assert resp.status_code == 200, resp.text
-        assert "workers" in resp.json()
+        # A library-wide READ token sees the rows (counts only); a share
+        # token, scoped to one resource, is told of none.
+        assert resp.json()["workers"], "a READ token was told of no workers"
         assert resp.json()["database_writer"] is None
+        share = bearer_client(
+            server,
+            mint_read_token(
+                client,
+                "test-share-token",
+                resource_type="picture",
+                resource_id=4242,
+            ),
+        )
+        resp = share.get(path)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["workers"] == {}, "a share token was told of the workers"
+        # Every task type's name, including those with no workers row (a
+        # lease's or a paused task's worker_type), so the Tasks tab names a
+        # lease row from the same table. A fixed vocabulary: every token gets
+        # it, the share token included.
+        assert data["task_labels"] == TASK_LABELS
+        assert data["task_labels"]["FaceDetectionTask"] == "Face detection"
+        assert resp.json()["task_labels"] == TASK_LABELS
         # Asserted on a warm server rather than in a file of its own: the GPU
         # out-of-memory retry announces itself through this notifier, and
         # without the wiring the toast never leaves the machine
@@ -114,6 +144,7 @@ def test_an_active_dedup_scan_never_reports_terminal_task_progress(monkeypatch):
         )
         snapshot = server.vault.get_worker_progress()[TaskType.DEDUP_SCAN.value]
         assert snapshot["label"] == "duplicate_scan"
+        assert snapshot["task_label"] == "Duplicate scan"
         assert snapshot["active"] is True
         assert snapshot["current"] == 5
         assert snapshot["total"] == 6

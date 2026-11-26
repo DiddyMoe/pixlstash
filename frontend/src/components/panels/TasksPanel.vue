@@ -22,9 +22,14 @@
       </div>
     </div>
     <!-- A finished run is not an active task, and the panel is not empty with
-         one in it either: the idle line gives way. -->
+         one in it either: the idle line gives way. Nor with a Scrapheap run
+         going, which may be queued before any worker shows it. -->
     <div
-      v-if="tasksStore.activeEntries.length === 0 && finished.length === 0"
+      v-if="
+        tasksStore.activeEntries.length === 0 &&
+        !scrapheapEntry &&
+        finished.length === 0
+      "
       class="tm-idle-msg"
     >
       No active tasks
@@ -33,6 +38,15 @@
          with the free part and the spare margin. Drawn only when the backend
          reports `resources`. -->
     <div v-if="tasksStore.vramBars.length" class="tm-gpu" data-testid="tm-gpu">
+      <!-- The cards did not answer in time: every figure below is the last
+           reading, so it says so, quietly. Not a fault to act on. -->
+      <p
+        v-if="tasksStore.resourcesStale"
+        class="tm-gpu-stale"
+        data-testid="tm-gpu-stale"
+      >
+        These figures may be out of date: the GPU did not answer in time.
+      </p>
       <div
         v-for="bar in tasksStore.vramBars"
         :key="bar.device.uuid"
@@ -119,10 +133,11 @@
       </div>
     </div>
 
-    <!-- Running: ComfyUI runs as rows of their own, PixlStash's own background
-         work folded behind one row, and imports as before. -->
+    <!-- Running: ComfyUI runs as rows of their own, a Scrapheap run as one,
+         PixlStash's own background work folded behind one row, and imports as
+         before. -->
     <section
-      v-if="tasksStore.runningEntries.length"
+      v-if="runningRows.length"
       class="tm-group"
       aria-labelledby="tm-running-head"
     >
@@ -131,7 +146,7 @@
         <span class="tm-group-col">VRAM</span>
       </div>
       <div class="tm-worker-list">
-        <template v-for="entry in tasksStore.runningEntries" :key="entry.key">
+        <template v-for="entry in runningRows" :key="entry.key">
           <!-- A ComfyUI run in flight: its own row, named for what it is. The
                stop button takes the figure's place on hover or focus, and stops
                this run alone. -->
@@ -249,6 +264,74 @@
               :describe="false"
             />
           </div>
+          <!-- A Scrapheap run (Delete forever, a restore, or the undo of one):
+               its own row, read from the run store, named for what it does,
+               with its progress and the Stop the bar over the grid offers.
+               Its task leaves the PixlStash fold while the row shows. It holds
+               no VRAM, so the figure column is empty but for Stop. -->
+          <div
+            v-else-if="entry.kind === 'scrapheap'"
+            class="tm-row tm-row--run"
+            data-testid="tm-scrapheap-row"
+          >
+            <span
+              class="tm-mark"
+              :class="entry.run.status === 'running' ? 'tm-mark--running' : ''"
+              aria-hidden="true"
+            ></span>
+            <span class="tm-system-mark tm-app-logo" aria-hidden="true"></span>
+            <span class="tm-name">
+              {{ entry.name }}
+              <span
+                v-if="entry.progress.determinate"
+                class="tm-count"
+                data-testid="tm-scrapheap-count"
+                >{{ entry.figures }}</span
+              >
+            </span>
+            <span
+              class="tm-run-line"
+              role="progressbar"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              :aria-valuenow="
+                entry.progress.determinate ? entry.progress.percent : null
+              "
+              :aria-valuetext="
+                entry.progress.determinate
+                  ? `${entry.progress.counted} done`
+                  : null
+              "
+              :aria-label="`${entry.name} progress`"
+              data-testid="tm-scrapheap-progress"
+            >
+              <span
+                class="tm-run-line-fill"
+                :style="{ width: `${entry.progress.percent}%` }"
+              ></span>
+            </span>
+            <span class="tm-figure">
+              <span class="tm-fig-text"></span>
+              <span v-if="entry.stoppable && !isReadOnly" class="tm-acts">
+                <button
+                  class="tm-act"
+                  type="button"
+                  aria-label="Stop this run"
+                  :disabled="scrapheapRun.action === 'cancel'"
+                  data-testid="tm-scrapheap-stop"
+                  @click="stopScrapheapRun"
+                >
+                  <Tooltip
+                    :text="entry.progress.stopTip"
+                    activator="parent"
+                    :describe="false"
+                  />
+                  <v-icon size="16">mdi-stop</v-icon>
+                </button>
+              </span>
+            </span>
+            <Tooltip :text="entry.tip" activator="parent" :describe="false" />
+          </div>
           <!-- PixlStash's own background work: one card, its row on top and,
                open, one line per task below a hairline, on the same columns:
                the task's mark under the padlock, its name where the parent's
@@ -309,7 +392,7 @@
                   aria-hidden="true"
                 ></span>
                 <span class="tm-name tm-child-name">
-                  {{ childName(child) }}
+                  {{ child.label }}
                   <span v-if="childProgress(child)" class="tm-child-n">{{
                     childProgress(child)
                   }}</span>
@@ -335,14 +418,20 @@
             </div>
           </div>
           <!-- A model downloading for a workflow: its bytes as a bar, and a
-               cancel that discards what it had fetched. -->
+               cancel that discards what it had fetched. One waiting for a
+               download slot reads "Queued", and can be cancelled too. -->
           <div
             v-else-if="entry.kind === 'download'"
             class="tm-worker-row"
             data-testid="tm-download-row"
           >
             <div class="tm-worker-row-top">
-              <span class="tm-status-dot tm-status-dot--running"></span>
+              <span
+                class="tm-status-dot"
+                :class="{
+                  'tm-status-dot--running': entry.run.status === 'running',
+                }"
+              ></span>
               <span class="tm-worker-label">{{ entry.run.label }}</span>
               <button
                 v-if="!isReadOnly"
@@ -527,6 +616,7 @@
       :need-mb="runAnyway?.needMb || 0"
       :device="runAnyway?.device || null"
       :holders="tasksStore.resources?.holders || []"
+      :stale="tasksStore.resourcesStale"
       :busy="busyLease !== ''"
       @close="closeRunAnyway"
       @confirm="confirmRunAnyway"
@@ -691,7 +781,9 @@
                   :readonly="Boolean(busy)"
                   :class="{ 'tm-offer-refused': Boolean(busy) }"
                   @enter="saveAsNew(run.offer)"
-                  @keydown.esc="backFromName(run.offer)"
+                  @keydown.esc="
+                    !isImeComposing($event) && backFromName(run.offer)
+                  "
                   @keydown.stop
                 />
                 <div class="tm-offer-acts">
@@ -820,13 +912,21 @@ import {
   saveWorkflow,
   saveWorkflowAsNew,
 } from "../../api/workflows";
+import { useConfirm } from "../../composables/useConfirm";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useRunDialogStore } from "../../stores/useRunDialogStore";
-import { useTasksStore } from "../../stores/useTasksStore";
+import { useScrapheapRunStore } from "../../stores/useScrapheapRunStore";
+import { isScrapheapRunTask, useTasksStore } from "../../stores/useTasksStore";
+import { stopTrainingQuestion } from "../../stores/useTrainingRunsStore";
 import { useEntityListsStore } from "../../stores/useEntityListsStore";
 import { setOfSheetRun } from "../../utils/trainingSetBuild";
 import { useWorkflowsStore } from "../../stores/useWorkflowsStore";
 import { isReadOnly } from "../../utils/apiClient";
+import { formatCount } from "../../utils/filterChips";
+import {
+  scrapheapRunFailureSentence,
+  scrapheapRunProgress,
+} from "../../utils/scrapheapRun";
 import {
   changesWord,
   describeChanges,
@@ -841,6 +941,7 @@ import AppInput from "../widgets/AppInput.vue";
 import ComfyuiIcon from "../widgets/ComfyuiIcon.vue";
 import Tooltip from "../widgets/Tooltip.vue";
 import RunAnywayDialog from "./RunAnywayDialog.vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 const root = ref(null);
 
@@ -860,6 +961,85 @@ function onFocusOut(event) {
 }
 
 const tasksStore = useTasksStore();
+const { confirm } = useConfirm();
+
+// ── A Scrapheap run ───────────────────────────────────────────────────────────
+//
+// Read from the run store, not the task poll: the store knows what the run is
+// (a purge, a restore, the undo of one), how far it has got in its own units,
+// and how to stop it. The poll knows only that a "Scrapheap" task is on a
+// worker, so that child leaves the PixlStash fold while this row shows.
+
+const scrapheapRun = useScrapheapRunStore();
+
+const SCRAPHEAP_RUN_NAMES = Object.freeze({
+  purge: "Deleting forever from the Scrapheap",
+  restore: "Restoring from the Scrapheap",
+  undo: "Undoing a restore",
+});
+
+/** The followed run as a Running row, or null while none is going. */
+const scrapheapEntry = computed(() => {
+  const run = scrapheapRun.run;
+  if (!run?.active) return null;
+  const name = SCRAPHEAP_RUN_NAMES[run.kind] ?? SCRAPHEAP_RUN_NAMES.purge;
+  const progress = scrapheapRunProgress(run);
+  const figures = `${formatCount(progress.processed)} / ${formatCount(progress.total)}`;
+  let state;
+  if (run.cancel_requested) state = "stopping";
+  else if (run.status === "pending") state = "queued";
+  else if (progress.determinate)
+    state = `${progress.counted}, ${progress.percent}%`;
+  else state = "starting";
+  return {
+    kind: "scrapheap",
+    key: `scrapheap:${run.id}`,
+    run,
+    name,
+    progress,
+    figures,
+    tip: `${name}: ${state}`,
+    stoppable: !run.cancel_requested,
+  };
+});
+
+/**
+ * The Running rows: the store's, with the Scrapheap run's row ahead of the
+ * PixlStash fold and imports, and its task out of that fold. A fold left with
+ * nothing in it is not drawn.
+ */
+const runningRows = computed(() => {
+  const own = scrapheapEntry.value;
+  if (!own) return tasksStore.runningEntries;
+  const rows = [];
+  for (const entry of tasksStore.runningEntries) {
+    if (entry.kind !== "pixlstash") {
+      rows.push(entry);
+      continue;
+    }
+    const children = entry.children.filter((child) => !isScrapheapRunTask(child));
+    if (!children.length) continue;
+    rows.push({
+      ...entry,
+      count: children.length,
+      mb: children.reduce((sum, child) => sum + child.mb, 0),
+      children,
+    });
+  }
+  const at = rows.findIndex(
+    (e) => e.kind === "pixlstash" || e.kind === "import",
+  );
+  rows.splice(at < 0 ? rows.length : at, 0, own);
+  return rows;
+});
+
+/** Stop the run, as the bar over the grid does, and say why if it was refused. */
+async function stopScrapheapRun() {
+  const result = await scrapheapRun.cancel();
+  if (result.ok) return;
+  const message = scrapheapRunFailureSentence("stop", result.error);
+  if (message) useNoticeStore().error(message, { key: "scrapheap-run-stop" });
+}
 
 // ── A task worker that stopped ────────────────────────────────────────────────
 //
@@ -1216,12 +1396,10 @@ async function confirmRunAnyway() {
 async function cancelWait(entry) {
   if (!entry.lease || busyLease.value) return;
   // A waiting AI Toolkit lease is a queued training run: cancelling it is
-  // Stop training, so it asks the same question.
+  // Stop training, so it asks the runs page's question, word for word.
   if (
     entry.lease.tenant === "aitoolkit" &&
-    !window.confirm(
-      `Stop training "${entry.label}"? The checkpoints it saved are kept.`,
-    )
+    !(await confirm(stopTrainingQuestion(entry.label)))
   ) {
     return;
   }
@@ -1232,19 +1410,6 @@ async function cancelWait(entry) {
   } finally {
     busyLease.value = "";
   }
-}
-
-function childLabel(child) {
-  return child.stopped && child.workerKey
-    ? tmFallbackWorkerLabel(child.workerKey)
-    : child.label;
-}
-
-/** A fold child's name: a worker's own label, else the lease's or the task's. */
-function childName(child) {
-  return child.snapshot
-    ? tmFormatLabel(child.workerKey, child.snapshot.label)
-    : childLabel(child);
 }
 
 /** How far a fold child is, "812 / 1190", or "" when it reports nothing. */
@@ -1285,14 +1450,14 @@ function childDetail(child) {
 }
 
 function childTip(child) {
-  return [childName(child), childDetail(child)].filter(Boolean).join(" · ");
+  return [child.label, childDetail(child)].filter(Boolean).join(" · ");
 }
 
 /** The fold's tooltip: its size, and anything unusual about its tasks. */
 function foldTip(entry) {
   const unusual = entry.children
     .filter((child) => child.stopped || child.onCpu)
-    .map((child) => `${childLabel(child)} ${child.stopped ? "stopped" : "on the CPU"}`);
+    .map((child) => `${child.label} ${child.stopped ? "stopped" : "on the CPU"}`);
   return [
     `${entry.count} ${entry.count === 1 ? "task" : "tasks"}, ${formatGb(entry.mb)} of VRAM`,
     ...unusual,
@@ -1762,66 +1927,6 @@ function tmDrawSparkline(canvas, samples) {
   ctx.fill();
 }
 
-const tmLabelMap = {
-  quality_scored: "Quality",
-  pictures_tagged: "Tags",
-  descriptions_generated: "Descriptions",
-  text_embeddings: "Text embeddings",
-  image_embeddings: "Image embeddings",
-  faces_extracted: "Faces extracted",
-  likeness_pairs: "Likeness pairs",
-  likeness_parameters: "Likeness params",
-  watch_folder_import: "Folder import",
-  comfyui_extraction: "ComfyUI backfill",
-  tag_predictions_scored: "Tag Predictions",
-  missing_file_purge: "File cleanup",
-  snapshot_identity_scrub: "Snapshot cleanup",
-  planner_managed: "Planner task",
-  checkpoints_hashed: "Checkpoint Hash",
-  workflows_carded: "Workflow cards",
-  training_previews_scored: "Training preview faces",
-  text_score: "Text score",
-  smart_scored: "Smart score",
-  text_read: "Text in pictures",
-  object_detection: "Object detection",
-  // The background Auto-stack run on the Duplicates screen: its groups, or for
-  // an undo its History steps (`Vault` names the counter).
-  duplicate_auto_stack: "Auto-stack",
-  // Emptying or restoring the Scrapheap in the background, or Delete forever
-  // and Restore on a selection of it: its pictures (`Vault` names the counter).
-  scrapheap_run: "Scrapheap",
-};
-
-const tmWorkerLabelMap = {
-  ReferenceFolderScanTask: "Reference folder scan",
-  SourceFaceLikenessTask: "Source face likeness",
-  SmartScoreTask: "Smart score",
-};
-
-function tmToTitleWords(value) {
-  return String(value || "")
-    .replace(/_/g, " ")
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/\b\w/g, (char) => char.toUpperCase())
-    .trim();
-}
-
-function tmFallbackWorkerLabel(key) {
-  if (tmWorkerLabelMap[key]) return tmWorkerLabelMap[key];
-  return tmToTitleWords(String(key || "").replace(/(Worker|Task)$/, ""));
-}
-
-function tmFormatLabel(key, label) {
-  if (tmLabelMap[label]) {
-    if (label === "planner_managed") return tmFallbackWorkerLabel(key);
-    return tmLabelMap[label];
-  }
-  if (label && label !== "idle" && label !== "uninitialized") {
-    return tmToTitleWords(label);
-  }
-  return tmFallbackWorkerLabel(key);
-}
-
 /** A ComfyUI run, download or import's bar fill, as a CSS width clamped to 0-100%. */
 function barWidth(run) {
   return `${Math.min(100, Math.max(0, Math.round(run.percent)))}%`;
@@ -2229,6 +2334,12 @@ const tmSystemItems = computed(() => {
   flex-direction: column;
   gap: var(--space-4);
   min-width: 0;
+}
+
+.tm-gpu-stale {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
 }
 
 .tm-gpu-dev {

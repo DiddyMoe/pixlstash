@@ -6,12 +6,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { flushPromises } from "@vue/test-utils";
 
-import { useTasksStore } from "./useTasksStore";
+import { isScrapheapRunTask, useTasksStore } from "./useTasksStore";
 import { getWorkerProgress } from "../api/workers";
 import { stopRun } from "../api/workflows";
 import { cancelModelDownload } from "../api/modelDownloads";
 import { cancelLease, freeComfyui, runLeaseAnyway } from "../api/resources";
+import { listTrainingJobs, quitComfyuiForTrainingJob } from "../api/training";
+import { useTrainingRunsStore } from "./useTrainingRunsStore";
 import { useNoticeStore } from "./useNoticeStore";
+import { useScrapheapRunStore } from "./useScrapheapRunStore";
 import { notifySessionReset } from "../utils/apiClient";
 
 vi.mock("../api/workers", () => ({ getWorkerProgress: vi.fn() }));
@@ -20,6 +23,11 @@ vi.mock("../api/workflows", () => ({
 }));
 vi.mock("../api/modelDownloads", () => ({
   cancelModelDownload: vi.fn(async () => ({ cancelled: true })),
+}));
+vi.mock("../api/training", async (importOriginal) => ({
+  ...(await importOriginal()),
+  listTrainingJobs: vi.fn(),
+  quitComfyuiForTrainingJob: vi.fn(async () => ({ status: "allowed" })),
 }));
 vi.mock("../api/resources", () => ({
   runLeaseAnyway: vi.fn(async () => ({ status: "success" })),
@@ -61,13 +69,16 @@ describe("a credential change", () => {
       ...answer([RUN]),
       resources: { devices: [], leases: [] },
       lanes: LANES,
+      task_labels: { TagTask: "Tagging" },
     });
     store.startPolling();
     await flushPromises();
     try {
       expect(store.comfyuiRuns).toEqual([RUN]);
       expect(store.lanes).toEqual(LANES);
+      expect(store.taskLabels).toEqual({ TagTask: "Tagging" });
       notifySessionReset("test");
+      expect(store.taskLabels).toEqual({});
       expect(store.comfyuiRuns).toEqual([]);
       expect(store.resources).toBeNull();
       expect(store.lanes).toBeNull();
@@ -224,7 +235,7 @@ describe("model downloads", () => {
           },
         },
       ]);
-      expect(store.runningDownloadFiles.has("flux1-dev.safetensors")).toBe(true);
+      expect(store.runningDownload({ file: "flux1-dev.safetensors" })?.id).toBe("d-1");
       await store.cancelDownload("d-1");
       expect(cancelModelDownload).toHaveBeenCalledWith("d-1");
     } finally {
@@ -264,6 +275,75 @@ describe("model downloads", () => {
       // A plain failure has nothing to open.
       expect(notices.notices.at(-1).action).toBeNull();
       expect(store.downloadsLanded).toBe(1);
+    } finally {
+      store.stopPolling();
+    }
+  });
+
+  // The server fetches a few at once and queues the rest (`queued`), and
+  // refuses a second start of a queued file as of a running one.
+  it("count a queued one as on its way, a row of its own reading Queued", async () => {
+    const store = useTasksStore();
+    const queued = { ...RUNNING, id: "d-2", file: "b.safetensors", status: "queued", received: 0, total: 0, percent: 0 };
+    getWorkerProgress.mockResolvedValue({ ...answer([]), downloads: [RUNNING, queued] });
+    store.startPolling();
+    await flushPromises();
+    try {
+      expect(store.activeEntries.map((entry) => entry.run)).toEqual([
+        {
+          status: "running",
+          percent: 25,
+          label: "flux1-dev.safetensors",
+          message: "Downloading… 1.0 GB of 4.0 GB",
+        },
+        { status: "queued", percent: 0, label: "b.safetensors", message: "Queued" },
+      ]);
+      expect(store.runningDownloads.map((d) => d.id)).toEqual(["d-1", "d-2"]);
+      expect(store.runningDownload({ file: "loras/B.safetensors" })?.id).toBe("d-2");
+      await store.cancelDownload("d-2");
+      expect(cancelModelDownload).toHaveBeenCalledWith("d-2");
+    } finally {
+      store.stopPolling();
+    }
+  });
+
+  it("tell a queued one that landed, and nothing of one cancelled while it waited", async () => {
+    const store = useTasksStore();
+    const notices = useNoticeStore();
+    const queued = { ...RUNNING, status: "queued", received: 0, total: 0, percent: 0 };
+    const other = { ...queued, id: "d-2", file: "b.safetensors" };
+    getWorkerProgress.mockResolvedValue({ ...answer([]), downloads: [queued, other] });
+    store.startPolling();
+    await flushPromises();
+    try {
+      await poll(store, [
+        { ...RUNNING, status: "done", received: RUNNING.total },
+        { ...other, status: "cancelled" },
+      ]);
+      expect(store.downloadsLanded).toBe(1);
+      expect(notices.notices.map((n) => n.text)).toEqual([
+        "Downloaded flux1-dev.safetensors.",
+      ]);
+      expect(store.runningDownloads).toEqual([]);
+    } finally {
+      store.stopPolling();
+    }
+  });
+
+  // The start answers with the download as it was made, queued.
+  it("tell the ending of one this tab started queued", async () => {
+    const store = useTasksStore();
+    const notices = useNoticeStore();
+    getWorkerProgress.mockResolvedValue({ ...answer([]), downloads: [] });
+    store.startPolling();
+    await flushPromises();
+    try {
+      store.downloadStarted({ ...RUNNING, status: "queued" });
+      await poll(store, [{ ...RUNNING, status: "done", received: RUNNING.total }]);
+      expect(store.downloadsLanded).toBe(1);
+      expect(notices.notices.map((n) => n.text)).toEqual([
+        "Downloaded flux1-dev.safetensors.",
+      ]);
     } finally {
       store.stopPolling();
     }
@@ -346,15 +426,59 @@ function resourcesAnswer(over = {}) {
   };
 }
 
+// `task_labels` on the poll: the backend's TASK_LABELS, the entries these
+// fixtures name (FaceTask stands in for a worker of the test's own).
+const TASK_LABELS = {
+  FaceTask: "Faces",
+  FaceDetectionTask: "Face detection",
+  ImageEmbeddingTask: "Image embeddings",
+  ScrapheapRunTask: "Scrapheap",
+  TagTask: "Tagging",
+};
+
 async function pollWith(progress) {
   const store = useTasksStore();
-  getWorkerProgress.mockResolvedValue({ status: "success", workers: {}, process: {}, ...progress });
+  getWorkerProgress.mockResolvedValue({
+    status: "success",
+    workers: {},
+    process: {},
+    task_labels: TASK_LABELS,
+    ...progress,
+  });
   store.startPolling();
   await flushPromises();
   return store;
 }
 
 describe("the GPU queue", () => {
+  // `resources.stale`: the arbiter answered from its last reading because the
+  // cards did not answer in time, so the figures may be out of date.
+  it("is stale while the poll says its reading is old", async () => {
+    const store = await pollWith({ runs: [], resources: resourcesAnswer({ stale: true }) });
+    try {
+      expect(store.resourcesStale).toBe(true);
+    } finally {
+      store.stopPolling();
+    }
+  });
+
+  it("is not stale on a fresh reading, a server with no flag, or no resources", async () => {
+    for (const progress of [
+      { resources: resourcesAnswer({ stale: false }) },
+      { resources: resourcesAnswer() },
+      {},
+    ]) {
+      setActivePinia(createPinia());
+      const store = await pollWith({ runs: [], ...progress });
+      try {
+        expect(store.resources).toEqual(progress.resources ?? null);
+        expect(store.resourcesStale).toBe(false);
+      } finally {
+        store.stopPolling();
+      }
+    }
+  });
+
   it("is null on a server that sends no resources, and nothing is folded or barred", async () => {
     const store = await pollWith({ runs: [] });
     try {
@@ -568,6 +692,95 @@ describe("the GPU queue", () => {
     }
   });
 
+  // Every PixlStash row is named from the backend's one table, by its task
+  // type: a worker's progress state ("pictures_tagged") and a lease's class
+  // name ("FaceDetectionTask") are never shown.
+  it("names a worker, a lease and a paused task from task_labels by task type", async () => {
+    const store = await pollWith({
+      workers: {
+        TagTask: { label: "pictures_tagged", current: 3, total: 10, running: true, active: true },
+      },
+      resources: resourcesAnswer({
+        leases: [lease({ id: "f", label: "FaceDetectionTask", worker_type: "FaceDetectionTask", held_mb: 900 })],
+        preempted: [{ worker_type: "ImageEmbeddingTask", caused_by: "lease-z", since: "2026-10-22T10:01:00Z", text: "Stopped to make room" }],
+      }),
+    });
+    try {
+      expect(store.pixlstashEntry.children.map((c) => [c.key, c.label])).toEqual([
+        ["worker:TagTask", "Tagging"],
+        ["lease:f", "Face detection"],
+        ["preempted:0", "Image embeddings"],
+      ]);
+    } finally {
+      store.stopPolling();
+    }
+  });
+
+  it("keeps today's text on a lease or a paused task with no task type", async () => {
+    const store = await pollWith({
+      resources: resourcesAnswer({
+        leases: [
+          lease({ id: "b", label: "OCR", held_mb: 600 }),
+          lease({ id: "u", label: "", held_mb: 100 }),
+        ],
+        preempted: [{ worker_type: null, caused_by: "lease-z", since: "2026-10-22T10:01:00Z", text: "Stopped to make room" }],
+      }),
+    });
+    try {
+      expect(store.pixlstashEntry.children.map((c) => [c.key, c.label])).toEqual([
+        ["lease:b", "OCR"],
+        ["lease:u", "PixlStash task"],
+        ["preempted:0", "PixlStash task"],
+      ]);
+    } finally {
+      store.stopPolling();
+    }
+  });
+
+  it("shows a task type task_labels does not name as its id, and says so once per type", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unlabelled = () =>
+      resourcesAnswer({
+        leases: [
+          lease({ id: "n", label: "NewTask", worker_type: "test-NewTask", held_mb: 100 }),
+          lease({ id: "o", label: "OtherTask", worker_type: "test-OtherTask", held_mb: 100 }),
+        ],
+        preempted: [{ worker_type: "test-NewTask", caused_by: "lease-z", since: "2026-10-22T10:01:00Z", text: "Stopped to make room" }],
+      });
+    const store = await pollWith({ resources: unlabelled() });
+    try {
+      expect(store.pixlstashEntry.children.map((c) => c.label)).toEqual([
+        "test-NewTask",
+        "test-OtherTask",
+        "test-NewTask",
+      ]);
+      // A later poll, with a fresh answer, names them again without saying
+      // so again.
+      getWorkerProgress.mockResolvedValue({
+        status: "success",
+        workers: {},
+        process: {},
+        task_labels: { ...TASK_LABELS },
+        resources: unlabelled(),
+      });
+      store.nudge();
+      await vi.waitFor(() => expect(getWorkerProgress).toHaveBeenCalledTimes(2));
+      await flushPromises();
+      expect(store.pixlstashEntry.children.map((c) => c.label)).toEqual([
+        "test-NewTask",
+        "test-OtherTask",
+        "test-NewTask",
+      ]);
+      expect(warn.mock.calls.map(([message]) => message)).toEqual([
+        expect.stringContaining('"test-NewTask"'),
+        expect.stringContaining('"test-OtherTask"'),
+      ]);
+    } finally {
+      store.stopPolling();
+      warn.mockRestore();
+    }
+  });
+
   it("has no PixlStash row when none of its leases is granted", async () => {
     const store = await pollWith({
       resources: resourcesAnswer({ leases: [lease({ tenant: "comfyui", label: "x", run_id: "run-q" })] }),
@@ -741,6 +954,106 @@ describe("a waiting run's ComfyUI clear", () => {
       expect(notices.notices.at(-1).text).toBe(
         "Cleared 16.8 GB from ComfyUI. LoRA training 'Grandad' started.",
       );
+    } finally {
+      store.stopPolling();
+    }
+  });
+});
+
+describe("quitting ComfyUI for a waiting run", () => {
+  it("finds the run in a read started after the click, not one in flight", async () => {
+    let answerOld;
+    listTrainingJobs.mockReturnValueOnce(
+      new Promise((resolve) => {
+        answerOld = resolve;
+      }),
+    );
+    const inFlight = useTrainingRunsStore().loadJobs({ join: true });
+    listTrainingJobs.mockResolvedValueOnce([{ id: 7, uuid: "job-new" }]);
+
+    await useTasksStore().quitComfyuiFor({ id: "lease-t", job_id: "job-new" });
+    answerOld([]);
+    await inFlight;
+
+    expect(listTrainingJobs).toHaveBeenCalledTimes(2);
+    expect(quitComfyuiForTrainingJob).toHaveBeenCalledWith(7);
+  });
+
+  it("says why when the runs cannot be read, and asks nothing", async () => {
+    listTrainingJobs.mockRejectedValueOnce(new Error("Network Error"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const answer = await useTasksStore().quitComfyuiFor({ id: "lease-t", job_id: "job-new" });
+
+    expect(answer).toBeNull();
+    expect(quitComfyuiForTrainingJob).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "tasks: Could not ask PixlStash to quit ComfyUI.",
+      expect.objectContaining({ message: "Could not list the training jobs" }),
+    );
+    warn.mockRestore();
+    expect(useNoticeStore().notices.map((n) => n.text)).toContain(
+      "Could not ask PixlStash to quit ComfyUI.",
+    );
+  });
+});
+
+describe("a Scrapheap run in the task count", () => {
+  const SCRAPHEAP_WORKER = {
+    ScrapheapRunTask: { label: "scrapheap_run", current: 1, total: 4, running: true, active: true },
+  };
+
+  it("counts an active run the workers do not report yet", async () => {
+    useScrapheapRunStore().run = { id: "test-run", active: true };
+    const store = await pollWith({});
+    try {
+      expect(store.activeEntries).toEqual([]);
+      expect(store.activeCount).toBe(1);
+      expect(store.hasActiveTasks).toBe(true);
+    } finally {
+      store.stopPolling();
+    }
+  });
+
+  it("counts a run its worker reports once, not twice", async () => {
+    useScrapheapRunStore().run = { id: "test-run", active: true };
+    const store = await pollWith({ workers: SCRAPHEAP_WORKER });
+    try {
+      expect(store.pixlstashEntry.children.map((c) => c.key)).toEqual([
+        "worker:ScrapheapRunTask",
+      ]);
+      expect(store.activeCount).toBe(1);
+    } finally {
+      store.stopPolling();
+    }
+  });
+
+  // The run's worker can show as a lease or a paused task with no workers
+  // row of its own: still the run's task, read from its task type.
+  it("finds the run's task as a lease or a paused task too", async () => {
+    useScrapheapRunStore().run = { id: "test-run", active: true };
+    for (const resources of [
+      resourcesAnswer({ leases: [lease({ id: "s", label: "ScrapheapRunTask", worker_type: "ScrapheapRunTask" })] }),
+      resourcesAnswer({ preempted: [{ worker_type: "ScrapheapRunTask", caused_by: "lease-z", since: "2026-10-22T10:01:00Z", text: "Stopped to make room" }] }),
+    ]) {
+      const store = await pollWith({ resources });
+      try {
+        expect(store.pixlstashEntry.children).toHaveLength(1);
+        expect(isScrapheapRunTask(store.pixlstashEntry.children[0])).toBe(true);
+        expect(store.activeCount).toBe(1);
+      } finally {
+        store.stopPolling();
+      }
+      setActivePinia(createPinia());
+    }
+  });
+
+  it("adds nothing for a run that has ended", async () => {
+    useScrapheapRunStore().run = { id: "test-run", active: false };
+    const store = await pollWith({});
+    try {
+      expect(store.activeCount).toBe(0);
+      expect(store.hasActiveTasks).toBe(false);
     } finally {
       store.stopPolling();
     }
