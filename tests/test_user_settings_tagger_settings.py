@@ -1,10 +1,13 @@
 """Tests for tagger_settings serialisation and patching in user_settings_utils."""
 
 import json
+import tempfile
 import types
 
 import pytest
+from fastapi.testclient import TestClient
 
+from pixlstash.server import Server
 from pixlstash.utils.service.user_settings_utils import (
     serialize_user_config,
     apply_user_config_patch,
@@ -208,3 +211,60 @@ def test_patch_accepts_json_string_as_tagger_settings():
     apply_user_config_patch(user, {"tagger_settings": patch_value})
     stored = json.loads(user.tagger_settings)
     assert stored["plugins"]["wd14"]["enabled"] is True
+
+
+def test_patch_refuses_malformed_json_string_with_a_fixed_sentence(caplog):
+    # The decoder's message names where the text broke; it is logged for the
+    # owner, and the 400 the settings route returns says only what is wrong.
+    user = _make_user()
+    with caplog.at_level(
+        "WARNING", logger="pixlstash.utils.service.user_settings_utils"
+    ):
+        with pytest.raises(ValueError) as refused:
+            apply_user_config_patch(user, {"tagger_settings": '{"plugins": ['})
+    assert str(refused.value) == "tagger_settings must be a JSON object"
+    assert "char 13" in caplog.text
+    assert user.tagger_settings is None
+
+
+@pytest.fixture(scope="module")
+def owner():
+    """A real server and the owner signed in, for the settings route itself."""
+    with tempfile.TemporaryDirectory() as tmp:
+        config_path = f"{tmp}/server-config.json"
+        with open(config_path, "w") as fh:
+            json.dump({"disable_background_workers": True}, fh)
+        with Server(config_path) as server:
+            client = TestClient(server.api, raise_server_exceptions=False)
+            login = client.post(
+                "/api/v1/login",
+                json={"username": "owner", "password": "example-owner-password"},
+            )
+            assert login.status_code == 200, login.text
+            yield client
+
+
+def test_the_settings_route_refuses_deeply_nested_json_like_any_malformed_json(
+    owner,
+):
+    """CWE-674: CPython's decoder raises RecursionError, not JSONDecodeError,
+    on text nested past the recursion limit. The route answers it as it
+    answers any other malformed tagger_settings string, not with a 500."""
+    before = owner.get("/api/v1/users/me/config")
+    assert before.status_code == 200, before.text
+    accepted = owner.patch(
+        "/api/v1/users/me/config",
+        json={"tagger_settings": json.dumps({"plugins": {"wd14": {"enabled": True}}})},
+    )
+    assert accepted.status_code == 200, accepted.text
+    stored = owner.get("/api/v1/users/me/config").json()["tagger_settings"]
+
+    for malformed in ('{"plugins": [', "[" * 100000):
+        refused = owner.patch(
+            "/api/v1/users/me/config", json={"tagger_settings": malformed}
+        )
+        assert refused.status_code == 400, refused.text[:200]
+        assert refused.json() == {"detail": "tagger_settings must be a JSON object"}
+
+    after = owner.get("/api/v1/users/me/config").json()["tagger_settings"]
+    assert after == stored

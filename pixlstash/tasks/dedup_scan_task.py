@@ -4,9 +4,12 @@ The design's first performance rule is that the queue never blocks on a full
 pass: it opens with whatever has been found so far, behind a "scanned N of M"
 banner. This task is what makes that true.
 
-* **Tier 1** runs first. Its duplicated keys are found by one ``GROUP BY`` that
-  reads every live picture row in the scope, so that read runs once, on a
-  concurrent reader rather than the database writer. The groups are then built
+* **Tier 1** runs first. Its duplicated keys are found by a ``GROUP BY`` that
+  reads every picture row in the scope, so that read runs on a concurrent reader
+  rather than the database writer, one ``pixel_sha`` shard per reader step (one
+  whole read for a small collection scope) so a stop lands between bounded steps
+  (:func:`~pixlstash.services.dedup_tier_service.exact_key_shards`). The
+  groups are then built
   and persisted page by page, one short writer slice each (see
   :func:`~pixlstash.services.dedup_tier_service.page_exact_keys`), so imports
   and edits interleave with a large scan and the queue fills while it runs.
@@ -62,6 +65,16 @@ from pixlstash.tasks.base_task import BaseTask, TaskPriority
 logger = get_logger(__name__)
 
 EMBEDDING_COMPONENTS_PER_SLICE = 100
+
+PROGRESS_READ_BATCH = 5000
+"""Picture ids fetched at a time by the exact tier's progress pass."""
+
+SCAN_FAILED_MESSAGE = (
+    "The scan stopped on an unexpected error; the server log has the details."
+)
+"""What a failed scan records as its ``error``, which the duplicate banner
+shows. The exception text is logged, not stored: it can carry SQL, paths or
+library internals, and the scan progress routes serve this column."""
 
 
 class _DedupScanCancelled(RuntimeError):
@@ -262,14 +275,18 @@ class DedupScanTask(BaseTask):
                 time.time() - start,
             )
             return summary
-        except Exception as exc:
-            logger.error("DedupScanTask failed for scan_id=%s: %s", self._scan_id, exc)
+        except Exception:
+            logger.exception(
+                "DedupScanTask failed for scan_id=%s after %.2fs",
+                self._scan_id,
+                time.time() - start,
+            )
             # Failure bookkeeping must still run if cancellation happened at
             # the same time as a genuine slice error.
             self._db.run_task(
                 DedupScanTask._mark_failed,
                 self._scan_id,
-                str(exc),
+                SCAN_FAILED_MESSAGE,
                 priority=DBPriority.IMMEDIATE,
             )
             raise
@@ -315,11 +332,26 @@ class DedupScanTask(BaseTask):
     ) -> int:
         """Run tier 1: key and progress reads off the writer, a slice per page.
 
+        The keys are discovered one reader step at a time, a ``pixel_sha``
+        shard each or one whole read for a small collection scope
+        (:func:`~pixlstash.services.dedup_tier_service.exact_key_shards`), so a
+        stop waits for one bounded step rather than a read of the whole scope.
+        A key's rows share their hash, so each key is in one shard and read
+        once; the shards, read in their own transactions, can each see a
+        picture imported or rehashed in between, which the page's own member
+        read settles, as it settles anything changed since discovery.
+
         Adds each persisted signature to *signatures* and returns the number of
         unresolved exact groups. Every page publishes the pictures settled so
         far as ``scanned_pictures``, and the last one *total_pictures*.
         """
-        keys = self._run_read_slice(DedupScanTask._exact_keys_read, scope)
+        keys: list[dedup_tier_service.ExactKey] = []
+        for shard in dedup_tier_service.exact_key_shards(scope, total_pictures):
+            keys.extend(
+                self._run_read_slice(DedupScanTask._exact_keys_read, scope, shard)
+            )
+        # Each shard is ordered by its keys' lowest picture id; so is the scan.
+        keys.sort(key=lambda key: key.first_id)
         pages = dedup_tier_service.page_exact_keys(keys)
         scanned_after = (
             self._run_read_slice(
@@ -418,7 +450,9 @@ class DedupScanTask(BaseTask):
         """Count the live pictures in *scope* without loading their ids.
 
         *id_from* and *id_below*, when given, bound the count to the half-open
-        id range ``[id_from, id_below)``, a range read on the primary key.
+        id range ``[id_from, id_below)``. Only the library and a folder are
+        counted by range (:meth:`_exact_progress_read`): a collection scope's
+        ``IN`` list would make each range a read of the whole collection.
         """
         total_query = (
             select(func.count()).select_from(Picture).where(Picture.deleted.is_(False))
@@ -469,10 +503,10 @@ class DedupScanTask(BaseTask):
 
     @staticmethod
     def _exact_keys_read(
-        session: Session, scope: DedupScope
+        session: Session, scope: DedupScope, shard: Optional[int]
     ) -> list[dedup_tier_service.ExactKey]:
-        """Reader step: the scope's duplicated tier-1 keys, as plain tuples."""
-        return dedup_tier_service.find_exact_keys_in_session(session, scope)
+        """Reader step: one shard of the scope's duplicated tier-1 keys, or all."""
+        return dedup_tier_service.find_exact_keys_in_session(session, scope, shard)
 
     @staticmethod
     def _exact_progress_read(
@@ -487,25 +521,56 @@ class DedupScanTask(BaseTask):
         (:attr:`~pixlstash.services.dedup_tier_service.ExactKey.first_id`), so
         once a page is persisted every live picture below the next page's first
         key is settled: it carries a key already persisted, or it has no exact
-        duplicate at all. Those pictures are counted as the id range between
-        one frontier and the next, a single pass over the scope for the whole
-        list rather than one per page. The last page publishes the whole scope.
+        duplicate at all. The scope's live picture ids are read once, in id
+        order, and each page publishes how many fall below the next page's
+        frontier. The last page publishes the whole scope.
+
+        The library and a folder count each page's id range
+        (:meth:`_count_live_pictures`); the library's ranges are covering reads
+        of ``ix_picture_deleted``, together one pass over it. A collection
+        scope cannot be counted that way: SQLite builds its ``IN`` list for
+        every statement and drives the count from it, so each page re-read the
+        whole collection (1.8 s in one reader step for 49 pages of a
+        100,000-picture set on a 200,000-picture library). Its live ids are
+        read once instead, in id order, driven by its membership, and streamed
+        rather than held.
 
         Capped at *total_pictures*, the count taken when the scan started, so a
         picture imported since cannot carry the count past the total.
         """
-        published: list[int] = []
-        settled = 0
-        id_from: Optional[int] = None
-        for page in pages[1:]:
-            id_below = int(page[0].first_id)
-            settled += DedupScanTask._count_live_pictures(
-                session, scope, id_from, id_below
-            )
-            published.append(min(settled, total_pictures))
-            id_from = id_below
-        if pages:
+        if not pages:
+            return []
+        frontiers = [int(page[0].first_id) for page in pages[1:]]
+        if not scope.is_collection:
+            published: list[int] = []
+            settled = 0
+            id_from: Optional[int] = None
+            for frontier in frontiers:
+                settled += DedupScanTask._count_live_pictures(
+                    session, scope, id_from=id_from, id_below=frontier
+                )
+                published.append(min(settled, total_pictures))
+                id_from = frontier
             published.append(total_pictures)
+            return published
+        live_ids = (
+            select(Picture.id)
+            .where(Picture.deleted.is_(False), scope.picture_predicate())
+            .order_by(Picture.id)
+            .execution_options(yield_per=PROGRESS_READ_BATCH)
+        )
+        published = []
+        settled = 0
+        for picture_id in session.exec(live_ids):
+            while (
+                len(published) < len(frontiers)
+                and picture_id >= frontiers[len(published)]
+            ):
+                published.append(min(settled, total_pictures))
+            settled += 1
+        while len(published) < len(frontiers):
+            published.append(min(settled, total_pictures))
+        published.append(total_pictures)
         return published
 
     @staticmethod

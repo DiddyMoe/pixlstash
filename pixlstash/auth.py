@@ -25,7 +25,12 @@ from starlette.routing import compile_path
 from pixlstash.database import DBPriority, VaultDatabase
 from pixlstash.db_models import Character, PictureSet, Project, User, UserToken
 from pixlstash.server_config_io import persist_server_config
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.system_utils import default_max_vram_gb
+from pixlstash.ws.close_reasons import (
+    DATABASE_RESTORE_IN_PROGRESS,
+    WS_CLOSE_SERVICE_RESTART,
+)
 
 
 class LoginRequest(BaseModel):
@@ -197,6 +202,10 @@ READ_SAFE_POST_PATHS: frozenset[str] = frozenset(
         "/api/v1/pictures/likeness-search",
         "/api/v1/pictures/face-search",
         "/api/v1/characters/likeness-search",
+        # ZIP export of named pictures - POST only because a large selection is
+        # too long for the GET's ?id= list. It starts the same export the GET
+        # does (a temporary ZIP, no library write) and scope-filters its ids.
+        "/api/v1/pictures/export",
         # Do NOT add /api/v1/pictures/{id}/text/read: it queues GPU work with no
         # dedupe, and it is safe only because no resource-scoped token can POST.
     }
@@ -821,7 +830,9 @@ class AuthService:
     async def _terminate_authenticated_websocket(websocket, handler_task) -> None:
         """Close one established socket, then cancel its owning handler."""
         try:
-            await websocket.close(code=1012, reason="Database restore in progress")
+            await websocket.close(
+                code=WS_CLOSE_SERVICE_RESTART, reason=DATABASE_RESTORE_IN_PROGRESS
+            )
         finally:
             current = asyncio.current_task()
             if (
@@ -902,13 +913,14 @@ class AuthService:
 
     @staticmethod
     def _restore_unavailable_response() -> JSONResponse:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": "Authentication is temporarily unavailable during restore."
-            },
-            headers={"Retry-After": "5"},
-        )
+        # Answered before any credential is read, so it is admission's busy
+        # answer byte for byte: a caller with no credentials must not tell a
+        # restore from a library switch (CWE-204).
+        # Local import: library_admission imports pixlstash.authz, whose gate
+        # imports this module, so a top-level import here is circular.
+        from pixlstash.middleware.library_admission import busy_response
+
+        return busy_response()
 
     def record_guest_activity(self, session_id: str) -> None:
         """Record or refresh the in-memory last-active timestamp for a guest session.
@@ -2657,15 +2669,20 @@ class AuthService:
 
         def _fetch(session: Session, user_id: int, ids: list[int]) -> list[int]:
             now = datetime.now(timezone.utc)
-            id_set = set(ids)
-            tokens = session.exec(
-                select(UserToken).where(
-                    UserToken.user_id == user_id,
-                    UserToken.resource_type == "picture",
-                    UserToken.scope == "READ",
-                    UserToken.resource_id.in_(list(id_set)),
+            # The grid sends its whole visible window, so the list is not
+            # bounded by anything SQLite's variable limit knows about.
+            tokens = []
+            for batch in chunked(sorted(set(ids))):
+                tokens.extend(
+                    session.exec(
+                        select(UserToken).where(
+                            UserToken.user_id == user_id,
+                            UserToken.resource_type == "picture",
+                            UserToken.scope == "READ",
+                            UserToken.resource_id.in_(batch),
+                        )
+                    ).all()
                 )
-            ).all()
             return [
                 t.resource_id
                 for t in tokens
