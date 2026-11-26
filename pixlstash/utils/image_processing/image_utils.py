@@ -93,7 +93,10 @@ def is_in_progress_file_name(name: str) -> bool:
 
 def _fsync_file(path: str) -> None:
     """Flush a written file's bytes to the disk before it is published."""
-    fd = os.open(path, os.O_RDONLY)
+    # O_RDWR, not O_RDONLY: Windows refuses to fsync a read-only handle with
+    # EBADF, since FlushFileBuffers requires write access (the same rule as
+    # portable_identity._fsync_file_and_parent).
+    fd = os.open(path, os.O_RDWR)
     try:
         os.fsync(fd)
     finally:

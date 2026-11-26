@@ -1747,6 +1747,35 @@ def test_a_published_picture_is_on_disk_before_and_after_it_takes_its_name(
     assert ("fsync", dir_key) in order[publish_at:], order
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows enforces the rule itself")
+def test_a_published_picture_is_fsynced_through_a_writable_handle(
+    watch_server, tmp_path, monkeypatch
+):
+    """Windows refuses to fsync a read-only handle with EBADF, since
+    FlushFileBuffers needs write access. Linux flushes one fine, so a read-only
+    open of the in-progress file passed here and failed every import on
+    Windows CI. A directory's handle is exempt: that flush is POSIX-only."""
+    fcntl = pytest.importorskip("fcntl")
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    _write_picture(file_path)
+    file_modes: list[int] = []
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            file_modes.append(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    assert len(result["imported_picture_ids"]) == 1, result
+    assert file_modes, "the in-progress file was never flushed"
+    assert os.O_RDONLY not in file_modes, file_modes
+
+
 def test_an_import_folder_id_sqlite_cannot_store_is_a_422(watch_server):
     """``2**63`` overflowed the driver while binding (a 500); the largest
     storable id still reaches the handler, which answers 404."""
