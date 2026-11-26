@@ -628,6 +628,29 @@ class TestOrphanedFiles:
         assert "images/stray.png" not in read_archive(str(tmp_path / "out.tar.zst"))
 
 
+class TestInProgressFiles:
+    def test_an_import_in_progress_is_not_backed_up(self, registry, library, tmp_path):
+        """An import's file before it is published is never a picture."""
+        names = [
+            ".0123456789abcdef0123456789abcdef.part.png",
+            os.path.join("sub", ".fedcba9876543210fedcba9876543210.part.webm"),
+        ]
+        for name in names:
+            path = os.path.join(library.path, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(b"half an import")
+
+        result = create_backup(
+            library, str(tmp_path / "out.tar.zst"), registry.hub_path
+        )
+
+        archive = read_archive(result.path)
+        assert [name for name in archive if ".part" in name] == []
+        assert "images/0.png" in archive
+        assert result.orphan_count == 0
+
+
 class TestDestinationHandling:
     def test_a_directory_destination_gets_a_dated_name(
         self, registry, library, tmp_path

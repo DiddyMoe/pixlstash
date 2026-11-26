@@ -18,6 +18,8 @@ from pixlstash import gpu_select
 gpu_select.apply()
 
 from pixlstash.pixl_logging import setup_logging, get_logger, hold_log_output  # noqa: E402
+from pixlstash.routes.pictures._import import _reap_staging_sessions  # noqa: E402
+from pixlstash.database import DBPriority  # noqa: E402
 from pixlstash.server import Server  # noqa: E402
 from pixlstash.startup_checks import StartupCheckError  # noqa: E402
 from pixlstash.telemetry import ensure_install_identity  # noqa: E402
@@ -672,6 +674,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_logging(server_config: dict) -> None:
+    """Send the log to the console and, when one is configured, to ``log_file``.
+
+    The file receives the log at every ``log_level``, the default ``info``
+    included; ``docker-entrypoint.sh`` sets ``log_file`` to null to keep a
+    container's log on stdout only.
+    """
+    log_level = _resolve_log_level(server_config.get("log_level"))
+    log_file = server_config.get("log_file") or None
+    if log_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+    setup_logging(log_file=log_file, log_level=log_level)
+
+
 def main():
     _boot_t0 = time.perf_counter()
     _force_utf8_streams()
@@ -695,15 +713,7 @@ def main():
     server_config = Server.init_server_config(args.server_config)
     _prepare_startup_permissions(args.server_config, server_config)
 
-    log_level = _resolve_log_level(server_config.get("log_level"))
-    log_file = server_config.get("log_file")
-    if log_file and log_level != logging.INFO:
-        log_dir = os.path.dirname(log_file)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        setup_logging(log_file=log_file, log_level=log_level)
-    else:
-        setup_logging(log_level=log_level)
+    _configure_logging(server_config)
     if gpu_select.NOTE is not None:
         logger.log(*gpu_select.NOTE)
 
@@ -771,8 +781,18 @@ def main():
             session.commit()
             logger.info("All text and image embeddings cleared.")
 
-        vault.db.run_task(clear_embeddings, priority=1)
+        # The operator asked for this at start-up and the server waits on it.
+        vault.db.run_task(clear_embeddings, priority=DBPriority.IMMEDIATE)
         return None
+
+    # Staging sessions live in memory, so what a previous run left under
+    # .staging/ belongs to no session of this one. Swept once here, not only
+    # when someone next opens a staging session. Only an entry idle past the
+    # session TTL goes: nothing stops a second PixlStash starting on the same
+    # library, and this runs before the port is bound, so a younger entry may
+    # be a live upload of a process still serving it (backend_architecture.md,
+    # "Staging at boot").
+    _reap_staging_sessions(server)
 
     _t_engine = time.perf_counter()
     server.vault.ensure_ready()

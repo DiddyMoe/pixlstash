@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import tempfile
@@ -5,14 +6,25 @@ import numpy as np
 
 from datetime import datetime, timezone
 from io import BytesIO
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from sqlmodel import Session, select
 
+from pixlstash.db_models import Picture
 from pixlstash.db_models.picture_set import PictureSet, PictureSetMember
+from pixlstash.image_plugins.service import PictureNotFoundError
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.server import Server
+from pixlstash.services import plugin_service
+from tests.test_exif_orientation_loads import (
+    _assert_carried_upright,
+    _orientations_carried,
+    _raw_profile_text,
+    _xmp_packet,
+)
 
 API_PREFIX = "/api/v1"
 
@@ -693,3 +705,284 @@ def test_two_user_plugins_with_one_name_keep_the_first_and_are_not_errors():
         # Sorted order: a_first.py claims the name, b_second.py is the duplicate.
         assert type(manager.get_plugin("twin")).__name__ == "A"
         assert manager.list_errors() == []
+
+
+def test_running_a_plugin_reloads_the_plugins_off_the_event_loop(monkeypatch):
+    """The reload before a run imports every plugin file from disk, so it waits
+    on a worker rather than on the loop every other request shares.
+
+    Wrong if the reload records True: every request then stalls while the
+    plugin folders are read and third-party modules execute.
+    """
+    reloads = []
+
+    class _Manager:
+        def reload(self):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                reloads.append(False)
+            else:
+                reloads.append(True)
+
+        def get_plugin(self, name):
+            return None
+
+    monkeypatch.setattr(plugin_service, "get_image_plugin_manager", _Manager)
+    with pytest.raises(plugin_service.PluginNotFoundError, match="no-such-plugin"):
+        asyncio.run(
+            plugin_service.run_plugin_on_pictures(
+                SimpleNamespace(vault=None), "no-such-plugin", [1], {}
+            )
+        )
+    assert reloads == [False]
+
+
+class _RecordingVault:
+    """Stands in for the vault: keeps every event a plugin run sends."""
+
+    def __init__(self):
+        self.events = []
+
+    def notify(self, event_type, payload):
+        self.events.append((event_type, payload))
+
+
+def _serve_one_plugin(monkeypatch, apply):
+    """Make ``test-plugin`` the only plugin, run by ``apply`` instead of the
+    real importer, so a test drives exactly what the run reports."""
+
+    class _Manager:
+        def reload(self):
+            return None
+
+        def get_plugin(self, name):
+            return SimpleNamespace(name=name) if name == "test-plugin" else None
+
+    monkeypatch.setattr(plugin_service, "get_image_plugin_manager", _Manager)
+    monkeypatch.setattr(plugin_service, "apply_plugin_to_pictures", apply)
+
+
+@pytest.mark.parametrize(
+    ("raised", "answered"),
+    [
+        (ValueError("test-leak decoder refused test-leak/source.png"), RuntimeError),
+        (OSError("test-leak cannot open test-leak/source.png"), RuntimeError),
+    ],
+    ids=["value-error", "other-error"],
+)
+def test_a_failed_plugin_run_tells_the_client_a_fixed_sentence(
+    monkeypatch, caplog, raised, answered
+):
+    """Whatever a plugin run raises (the plugin's own code, PIL, a missing
+    file) used to be the ``failed`` event's message, so its text and the paths
+    in it went to every connected tab.
+
+    Wrong if ``test-leak`` appears in any event, or if the log does not have
+    it: the client then sees the exception, or nobody can find out why.
+    """
+
+    def apply(*_args, **_kwargs):
+        raise raised
+
+    _serve_one_plugin(monkeypatch, apply)
+    vault = _RecordingVault()
+    with caplog.at_level("WARNING", logger=plugin_service.logger.name):
+        with pytest.raises(answered):
+            asyncio.run(
+                plugin_service.run_plugin_on_pictures(
+                    SimpleNamespace(vault=vault), "test-plugin", [7], {}
+                )
+            )
+
+    failed = [payload for _, payload in vault.events if payload["status"] == "failed"]
+    assert [payload["message"] for payload in failed] == [
+        "The plugin failed; the log says why."
+    ]
+    assert "test-leak" not in repr(vault.events)
+    assert any(
+        "test-plugin" in record.getMessage() and "test-leak" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    ("rows", "raised"),
+    [
+        ([], PictureNotFoundError),
+        ([Picture(id=7, file_path="test-gone/source.png")], RuntimeError),
+    ],
+    ids=["no-row", "file-gone"],
+)
+def test_a_missing_picture_is_told_apart_from_a_failed_run(
+    monkeypatch, tmp_path, rows, raised
+):
+    """``POST /pictures/plugins/{name}`` answered every ``ValueError`` out of a
+    run as 404 ``Plugin not found``, so a picture whose file had gone, or a
+    plugin returning too few images, told the user the plugin was missing.
+
+    Through the real loader: an id with no row is the caller's
+    ``PictureNotFoundError`` naming that id; a row whose file is gone is a
+    failed run. Wrong if either comes back as the other, or as a lookup miss
+    for the plugin.
+    """
+    _serve_one_plugin(monkeypatch, plugin_service.apply_plugin_to_pictures)
+    vault = _RecordingVault()
+    vault.image_root = str(tmp_path)
+    vault.db = SimpleNamespace(run_task=lambda fetch, ids: list(rows))
+
+    with pytest.raises(Exception) as caught:
+        asyncio.run(
+            plugin_service.run_plugin_on_pictures(
+                SimpleNamespace(vault=vault), "test-plugin", [7], {}
+            )
+        )
+
+    assert type(caught.value) is raised, repr(caught.value)
+    if raised is PictureNotFoundError:
+        assert caught.value.picture_id == 7
+    failed = [payload for _, payload in vault.events if payload["status"] == "failed"]
+    assert [payload["message"] for payload in failed] == [
+        "The plugin failed; the log says why."
+    ]
+
+
+def test_a_plugin_error_report_keeps_its_details_out_of_the_event_and_answer(
+    monkeypatch, caplog
+):
+    """A per-image error report's ``details`` carry the exception text and the
+    source path (``ImagePlugin.transform_video``), and they went out whole: in
+    the ``error`` event and in the run's ``errors``, the 200 body of
+    ``POST /pictures/plugins/{name}``. A plugin may also hand its callback a
+    bare string, which the answer carried as it was.
+
+    Wrong if ``test-leak`` appears in any event or in the answer, if the
+    plugin's own sentence is gone, or if the log lacks the details.
+    """
+    detailed = {
+        "plugin": "test-plugin",
+        "index": 0,
+        "message": "Failed to process video",
+        "details": {
+            "error": "test-leak codec refused",
+            "source_path": "test-leak/source.mp4",
+        },
+    }
+    bare = "test-leak bare report"
+
+    def apply(server, plugin, picture_ids, parameters, captions, **kwargs):
+        for report in (detailed, bare):
+            kwargs["error_reporter"](report)
+        return {
+            "plugin": plugin.name,
+            "picture_ids": picture_ids,
+            "created_picture_ids": [],
+            "duplicate_picture_ids": [],
+            "output_picture_ids": [],
+            "progress": [],
+            "errors": [detailed, bare],
+        }
+
+    _serve_one_plugin(monkeypatch, apply)
+    vault = _RecordingVault()
+    with caplog.at_level("WARNING", logger=plugin_service.logger.name):
+        answer = asyncio.run(
+            plugin_service.run_plugin_on_pictures(
+                SimpleNamespace(vault=vault), "test-plugin", [7], {}
+            )
+        )
+
+    kept = {"plugin": "test-plugin", "index": 0, "message": "Failed to process video"}
+    errors = [payload for _, payload in vault.events if payload["status"] == "error"]
+    assert [(payload["message"], payload["error"]) for payload in errors] == [
+        ("Failed to process video", kept)
+    ]
+    assert answer["errors"] == [
+        kept,
+        {"plugin": "test-plugin", "index": None, "message": "Plugin error"},
+    ]
+    assert "test-leak" not in repr(vault.events)
+    assert "test-leak" not in repr(answer)
+    logged = [record.getMessage() for record in caplog.records]
+    assert any("test-leak codec refused" in line for line in logged)
+    assert any("test-leak bare report" in line for line in logged)
+
+
+def test_a_plugin_run_on_a_turned_png_carries_no_orientation_to_turn_it_twice():
+    """Plugin output keeps the source's PNG text, but not a chunk that says 6.
+
+    The plugin's pixels come from ``load_image_or_video``, already upright, but
+    the text chunks were read from the source as stored, so the output still
+    carried the orientation (in the raw EXIF profile, or XMP's
+    tiff:Orientation) and a viewer that reads it turned the picture again.
+    An unrelated chunk (``parameters``) is still carried across.
+    """
+    carriers = {
+        "Raw profile type exif": (200, 40, 40),
+        "XML:com.adobe.xmp": (40, 40, 200),
+    }
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server_config_path = os.path.join(temp_dir, "server_config.json")
+        with Server(server_config_path=server_config_path) as server:
+            client = TestClient(server.api)
+            login_resp = client.post(
+                f"{API_PREFIX}/login",
+                json={"username": "testuser", "password": "testpassword"},
+            )
+            assert login_resp.status_code == 200
+
+            sources = {}
+            for carrier, colour in carriers.items():
+                info = PngImagePlugin.PngInfo()
+                if carrier == "Raw profile type exif":
+                    info.add_text(carrier, _raw_profile_text(6))
+                else:
+                    info.add_itxt(carrier, _xmp_packet(6).decode())
+                info.add_text("parameters", f"test-steps {carrier}")
+                buf = BytesIO()
+                # 80x60 stored, orientation 6: shown upright as 60x80.
+                Image.new("RGB", (80, 60), colour).save(buf, "PNG", pnginfo=info)
+                assert _orientations_carried(buf.getvalue())[carrier] == 6
+                sources[carrier] = buf.getvalue()
+
+            def add_pictures(session: Session):
+                ids = []
+                for data in sources.values():
+                    pic = ImageUtils.create_picture_from_bytes(
+                        image_root_path=server.vault.image_root,
+                        image_bytes=data,
+                    )
+                    pic.imported_at = datetime.now(timezone.utc)
+                    session.add(pic)
+                    session.commit()
+                    session.refresh(pic)
+                    ids.append(pic.id)
+                return ids
+
+            source_ids = server.vault.db.run_task(add_pictures)
+            run_resp = client.post(
+                f"{API_PREFIX}/pictures/plugins/colour_filter",
+                json={"picture_ids": source_ids, "parameters": {"mode": "sepia"}},
+            )
+            assert run_resp.status_code == 200, run_resp.text
+            created_ids = run_resp.json().get("created_picture_ids") or []
+            assert len(created_ids) == len(carriers)
+
+            def output_paths(session: Session):
+                return [
+                    ImageUtils.resolve_picture_path(
+                        server.vault.image_root, session.get(Picture, pid).file_path
+                    )
+                    for pid in created_ids
+                ]
+
+            kept = set()
+            for path in server.vault.db.run_task(output_paths):
+                with open(path, "rb") as handle:
+                    data = handle.read()
+                with Image.open(BytesIO(data)) as out:
+                    assert out.size == (60, 80), "orientation 6, made upright"
+                    parameters = out.text.get("parameters")
+                kept.add(parameters)
+                _assert_carried_upright(data, f"plugin output ({parameters})")
+            assert kept == {f"test-steps {carrier}" for carrier in carriers}

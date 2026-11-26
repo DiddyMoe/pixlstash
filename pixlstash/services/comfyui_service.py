@@ -19,18 +19,18 @@ import ntpath
 import os
 import posixpath
 import re
+import socket
 import tempfile
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
 
-from urllib3.util import parse_url
 
 import requests
 from fastapi import HTTPException
 from websockets.sync.client import connect as ws_connect
+from websockets.uri import parse_uri
 from sqlmodel import Session, select
 
 from pixlstash.db_models import (
@@ -69,7 +69,10 @@ from pixlstash.services.comfyui_recipe_service import (
 from pixlstash.services.set_lock_service import drop_locked_set_ids
 from pixlstash.services import vram_history
 from pixlstash.stacking import normalize_stack_positions
+from pixlstash.utils.bounded_http import BoundedResponse, bounded_request
+from pixlstash.utils.comfyui_url import normalize_comfyui_url
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.vram_utils import is_vram_oom
 
 from pixlstash.pixl_logging import get_logger
@@ -112,8 +115,8 @@ VHS_FILES_KEY = "gifs"
 # environment, and a proxy is a host nobody checked. A ``None`` value drops the
 # environment's entry for that key, so ``all`` must be named as well. A
 # redirect names a host nobody checked too, and ``requests`` takes the
-# environment's proxy again for it (a 307 with the body), so each request
-# passes ``allow_redirects=False`` beside this.
+# environment's proxy again for it (a 307 with the body), so each request goes
+# through ``_ask_comfyui``, which follows none (``bounded_http``'s default).
 NO_PROXY = {"http": None, "https": None, "all": None}
 
 # How many followed prompts' endings are kept for GET /workflows/runs/{id}.
@@ -127,8 +130,41 @@ _run_outcomes_lock = threading.Lock()
 MAX_FAILURE_REASON = 300
 
 # Bumped each time PixlStash itself has cleared ComfyUI's queue or taken runs
-# off it, so no waiter goes by a queue read sent before that.
+# off it, so no waiter goes by a queue read sent before that. Under
+# ``_run_outcomes_lock``: a read takes its value under that lock, and an
+# unlocked ``+= 1`` racing another can lose one of the bumps.
 _queue_cleared = 0
+
+# A queue read in all, however slowly ComfyUI sends it: every run waited on at
+# that address waits on this one read. Each receive is bounded on its own by
+# the timeout, so the read ends within the deadline plus one timeout.
+QUEUE_READ_DEADLINE_S = 30.0
+QUEUE_READ_TIMEOUT_S = 10.0
+# The largest queue answer kept. Each entry carries its prompt's whole graph.
+QUEUE_READ_MAX_BYTES = 32 * 1024 * 1024
+# How long a waiter waits for a read another waiter sent before reading the
+# prompt's history instead: the read's whole bound, with room to spare.
+QUEUE_READ_WAIT_S = QUEUE_READ_DEADLINE_S + 2 * QUEUE_READ_TIMEOUT_S
+
+# Every other exchange with a ComfyUI is bounded the same way (``_ask_comfyui``):
+# the address can be anything that answers, and one trickling its answer, or
+# sending one without end, would hold whoever asked. A run's own requests
+# (upload, prompt, history) get the longest connect or receive and the whole
+# exchange below; the larger is room for a big picture going up.
+COMFYUI_ASK_TIMEOUT_S = 30.0
+COMFYUI_ASK_DEADLINE_S = 120.0
+# The largest JSON answer kept: a history carries its prompt's whole graph.
+COMFYUI_ANSWER_MAX_BYTES = 32 * 1024 * 1024
+# A short question (stop a run, list the pack's scripts, read its loader).
+COMFYUI_QUICK_TIMEOUT_S = 5.0
+COMFYUI_QUICK_DEADLINE_S = 20.0
+COMFYUI_QUICK_MAX_BYTES = 4 * 1024 * 1024
+# One output file from ``/view``, a long video included, written to disk as
+# it arrives, and the most time it may take.
+COMFYUI_FILE_MAX_BYTES = 8 * 1024 * 1024 * 1024
+COMFYUI_FILE_DEADLINE_S = 30 * 60.0
+# The most of ComfyUI's structured ``/prompt`` rejection a 502 carries.
+MAX_PROMPT_REJECTION = 1000
 
 # The ComfyUI client every run is submitted under. ComfyUI sends a prompt's
 # ``executing`` and ``progress`` messages to the client the prompt names, so
@@ -142,8 +178,6 @@ LISTEN_POLL_S = 2.0
 LISTEN_RETRY_S = 5.0
 # The largest frame the listener takes off ComfyUI's socket.
 LISTEN_MAX_FRAME = 16 * 1024 * 1024
-# How much of an output file is held in memory at once while it is fetched.
-FETCH_CHUNK_BYTES = 1024 * 1024
 
 # The runs in flight, by prompt id, in the order they were queued: what
 # GET /workers/progress reports. From ``follow_run`` until
@@ -187,11 +221,16 @@ def _hold_in_session(session: Session, picture_ids: list[int]) -> set[int]:
     delete leaves it, and is not held.
     """
     now = datetime.now(timezone.utc)
+    # The lock check reads every id from a temp table; the load binds them a
+    # chunk at a time. A run's output count is the workflow's, with no cap.
     locked = locked_picture_ids(session, picture_ids)
+    pictures = [
+        picture
+        for chunk in chunked(picture_ids)
+        for picture in session.exec(select(Picture).where(Picture.id.in_(chunk))).all()
+    ]
     held = set()
-    for picture in session.exec(
-        select(Picture).where(Picture.id.in_(picture_ids))
-    ).all():
+    for picture in pictures:
         if picture.id in locked:
             continue
         picture.deleted = True
@@ -210,6 +249,16 @@ def new_run_id() -> str:
 class ComfyUIRunStopped(RuntimeError):
     """A run that was stopped (interrupted, or taken off ComfyUI's queue)
     rather than one a node failed in."""
+
+
+class ComfyUIRunFailed(RuntimeError):
+    """A run ComfyUI ended with an error. Its text is ComfyUI's own account,
+    the node that failed and why, and is what the run's ending shows.
+
+    Its own class, not a bare ``RuntimeError``, because the run's ending shows
+    only this text: any other ``RuntimeError`` met while the outputs are
+    imported (``DatabaseUnavailableError`` names the writer's failure) is a
+    fault of the import, logged and answered with ``OUTPUT_IMPORT_FAILED``."""
 
 
 def record_run_outcome(
@@ -393,7 +442,6 @@ def cancel_runs(run_ids: list[str]) -> int:
     flight is skipped: it ended already. A run ComfyUI refused or could not be
     asked about is logged and not counted.
     """
-    global _queue_cleared
     stopped = 0
     in_flight = []
     for rid in dict.fromkeys(str(r) for r in run_ids if r):
@@ -412,12 +460,13 @@ def cancel_runs(run_ids: list[str]) -> int:
                 calls.insert(0, ("/interrupt", {"prompt_id": prompt_id}))
             refused = False
             for path, body in calls:
-                resp = requests.post(
+                resp = _ask_comfyui(
+                    "POST",
                     f"{base_url}{path}",
                     json=body,
-                    timeout=10,
-                    allow_redirects=False,
-                    proxies=NO_PROXY,
+                    timeout=COMFYUI_QUICK_TIMEOUT_S,
+                    deadline_s=COMFYUI_QUICK_DEADLINE_S,
+                    max_bytes=COMFYUI_QUICK_MAX_BYTES,
                 )
                 if resp.status_code >= 300:
                     refused = True
@@ -427,7 +476,7 @@ def cancel_runs(run_ids: list[str]) -> int:
                         path,
                         prompt_id,
                         resp.status_code,
-                        (resp.text or "").strip()[:200],
+                        resp.excerpt(),
                     )
             if not refused:
                 stopped += 1
@@ -441,8 +490,15 @@ def cancel_runs(run_ids: list[str]) -> int:
             )
     if in_flight:
         # Its waiter goes by a queue read sent after this, not one before.
-        _queue_cleared += 1
+        _bump_queue_cleared()
     return stopped
+
+
+def _bump_queue_cleared() -> None:
+    """Note that PixlStash cleared ComfyUI's queue or took runs off it."""
+    global _queue_cleared
+    with _run_outcomes_lock:
+        _queue_cleared += 1
 
 
 def follow_run(
@@ -542,7 +598,7 @@ def _note_run_message(raw: str) -> None:
     """
     try:
         payload = json.loads(raw)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         logger.debug("Unreadable message on ComfyUI's socket: %s (%r)", exc, raw[:200])
         return
     data = payload.get("data") if isinstance(payload, dict) else None
@@ -649,30 +705,37 @@ def _listen_for_progress(base_url: str) -> None:
     try:
         while _still_listening(base_url):
             try:
-                # No pings: a ComfyUI loading a model answers nothing for
-                # minutes. Frames are JSON and previews, far under the cap.
-                # Straight to ComfyUI: ``proxy`` left out is the environment's.
-                with ws_connect(
-                    ws_url,
-                    ping_interval=None,
-                    max_size=LISTEN_MAX_FRAME,
-                    open_timeout=10,
-                    close_timeout=2,
-                    proxy=None,
-                ) as upstream:
-                    warned = False
-                    _note_running_prompts(base_url)
-                    while True:
-                        with _run_outcomes_lock:
-                            if not _runs_on(base_url):
-                                break
-                        try:
-                            message = upstream.recv(timeout=LISTEN_POLL_S)
-                        except TimeoutError:
-                            continue
-                        # Bytes are previews, which nothing here shows.
-                        if isinstance(message, str):
-                            _note_run_message(message)
+                # The socket is opened here and handed over, so it goes
+                # straight to ComfyUI, never through the environment's proxy,
+                # and websockets refuses a redirect on it rather than follow
+                # one to a host nobody checked. Its timeout bounds the
+                # connect; websockets bounds the rest of the opening.
+                uri = parse_uri(ws_url)
+                with socket.create_connection((uri.host, uri.port), timeout=10) as raw:
+                    raw.settimeout(None)
+                    # No pings: a ComfyUI loading a model answers nothing for
+                    # minutes. Frames are JSON and previews, far under the cap.
+                    with ws_connect(
+                        ws_url,
+                        sock=raw,
+                        ping_interval=None,
+                        max_size=LISTEN_MAX_FRAME,
+                        open_timeout=10,
+                        close_timeout=2,
+                    ) as upstream:
+                        warned = False
+                        _note_running_prompts(base_url)
+                        while True:
+                            with _run_outcomes_lock:
+                                if not _runs_on(base_url):
+                                    break
+                            try:
+                                message = upstream.recv(timeout=LISTEN_POLL_S)
+                            except TimeoutError:
+                                continue
+                            # Bytes are previews, which nothing here shows.
+                            if isinstance(message, str):
+                                _note_run_message(message)
                 continue
             except Exception as exc:
                 # Whatever it is, the socket is only the step progress: say so
@@ -853,6 +916,41 @@ def _extract_history_status_and_error(
     return status_str, (error_text or None)
 
 
+def _ask_comfyui(
+    method: str,
+    url: str,
+    *,
+    timeout: float | None = None,
+    deadline_s: float | None = None,
+    max_bytes: int | None = None,
+    **kwargs,
+) -> BoundedResponse:
+    """One exchange with a ComfyUI, every one PixlStash sends but the
+    progress socket.
+
+    Straight to *url*: never through an environment proxy (``NO_PROXY``) and
+    never on to a redirect, which comes back as its status. The whole exchange
+    ends within *deadline_s* and keeps at most *max_bytes*; a non-2xx answer
+    keeps only enough of its body to log (``BoundedResponse.excerpt``).
+    A bound not given is a run's own (``COMFYUI_ASK_TIMEOUT_S``,
+    ``COMFYUI_ASK_DEADLINE_S``, ``COMFYUI_ANSWER_MAX_BYTES``), read when
+    called.
+
+    Raises:
+        requests.RequestException: ComfyUI could not be asked, or its answer
+            was too slow or too large (``bounded_http``).
+    """
+    return bounded_request(
+        method,
+        url,
+        deadline_s=COMFYUI_ASK_DEADLINE_S if deadline_s is None else deadline_s,
+        max_bytes=COMFYUI_ANSWER_MAX_BYTES if max_bytes is None else max_bytes,
+        timeout=COMFYUI_ASK_TIMEOUT_S if timeout is None else timeout,
+        proxies=NO_PROXY,
+        **kwargs,
+    )
+
+
 def _upload_image_to_comfyui(
     base_url: str, file_path: str, upload_name: str | None = None
 ) -> str:
@@ -877,13 +975,8 @@ def _upload_image_to_comfyui(
             "overwrite": "true",
         }
         try:
-            response = requests.post(
-                f"{base_url}/upload/image",
-                files=files,
-                data=data,
-                timeout=30,
-                allow_redirects=False,
-                proxies=NO_PROXY,
+            response = _ask_comfyui(
+                "POST", f"{base_url}/upload/image", files=files, data=data
             )
         except requests.RequestException as exc:
             logger.warning("ComfyUI upload request failed: %s", exc)
@@ -892,21 +985,24 @@ def _upload_image_to_comfyui(
                 detail="ComfyUI upload request failed",
             ) from exc
     if response.status_code >= 300:
-        detail = (response.text or "").strip()
+        # ComfyUI's own words go to the log, cut short; the owner is told the
+        # status, which is a number, and nothing ComfyUI wrote.
         logger.warning(
-            "ComfyUI upload failed: status=%s detail=%s",
+            "ComfyUI upload failed: status=%s body=%s",
             response.status_code,
-            detail,
+            response.excerpt(),
         )
         raise HTTPException(
             status_code=502,
-            detail=f"ComfyUI upload failed: {response.status_code} {detail}",
+            detail=(
+                f"ComfyUI upload failed: {response.status_code}. ComfyUI refused "
+                "the picture; its console says why."
+            ),
         )
     try:
         payload = response.json()
     except ValueError as exc:
-        detail = (response.text or "").strip()
-        logger.warning("ComfyUI upload invalid JSON: %s", detail)
+        logger.warning("ComfyUI upload invalid JSON: %s", response.excerpt())
         raise HTTPException(
             status_code=502,
             detail="ComfyUI upload returned invalid JSON",
@@ -955,13 +1051,7 @@ def _submit_comfyui_prompt(
     if client_id:
         payload["client_id"] = client_id
     try:
-        response = requests.post(
-            f"{base_url}/prompt",
-            json=payload,
-            timeout=30,
-            allow_redirects=False,
-            proxies=NO_PROXY,
-        )
+        response = _ask_comfyui("POST", f"{base_url}/prompt", json=payload)
     except requests.RequestException as exc:
         logger.warning("ComfyUI prompt request failed: %s", exc)
         raise HTTPException(
@@ -969,30 +1059,36 @@ def _submit_comfyui_prompt(
             detail="ComfyUI prompt request failed",
         ) from exc
     if response.status_code >= 300:
-        raw_detail = (response.text or "").strip()
+        logger.warning(
+            "ComfyUI prompt failed: status=%s body=%s",
+            response.status_code,
+            response.excerpt(),
+        )
         # ComfyUI answers a validation failure with a structured body naming the
         # offending node and input. That is the only authoritative account of why
-        # a graph will not run, so surface it rather than a JSON dump.
+        # a graph will not run, so the sentence composed from its fields is
+        # surfaced, cut to a bound. Any other body is never repeated: the owner
+        # gets the status and a fixed sentence, the log gets the excerpt.
         structured = None
-        try:
-            structured = format_prompt_rejection(response.json())
-        except ValueError:
-            logger.debug("ComfyUI prompt error body was not JSON: %s", raw_detail[:200])
-        detail = structured or raw_detail
-        logger.warning(
-            "ComfyUI prompt failed: status=%s detail=%s",
-            response.status_code,
-            detail,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"ComfyUI prompt failed: {response.status_code} {detail}",
-        )
+        if not response.truncated:
+            try:
+                structured = format_prompt_rejection(response.json())
+            except ValueError:
+                logger.debug("ComfyUI prompt error body was not JSON")
+        if structured:
+            if len(structured) > MAX_PROMPT_REJECTION:
+                structured = structured[: MAX_PROMPT_REJECTION - 1] + "\u2026"
+            detail = f"ComfyUI prompt failed: {response.status_code} {structured}"
+        else:
+            detail = (
+                f"ComfyUI prompt failed: {response.status_code}. ComfyUI refused "
+                "the workflow; its console says why."
+            )
+        raise HTTPException(status_code=502, detail=detail)
     try:
         return response.json()
     except ValueError as exc:
-        detail = (response.text or "").strip()
-        logger.warning("ComfyUI prompt invalid JSON: %s", detail)
+        logger.warning("ComfyUI prompt invalid JSON: %s", response.excerpt())
         raise HTTPException(
             status_code=502,
             detail="ComfyUI prompt returned invalid JSON",
@@ -1316,12 +1412,7 @@ def swap_pixlstash_savers(workflow: dict) -> list[str]:
 
 def _fetch_comfyui_history(base_url: str, prompt_id: str) -> dict:
     try:
-        response = requests.get(
-            f"{base_url}/history/{prompt_id}",
-            timeout=30,
-            allow_redirects=False,
-            proxies=NO_PROXY,
-        )
+        response = _ask_comfyui("GET", f"{base_url}/history/{prompt_id}")
     except requests.RequestException as exc:
         logger.warning("ComfyUI history request failed: %s", exc)
         raise HTTPException(
@@ -1329,21 +1420,22 @@ def _fetch_comfyui_history(base_url: str, prompt_id: str) -> dict:
             detail="ComfyUI stopped answering before the run finished",
         ) from exc
     if response.status_code >= 300:
-        detail = (response.text or "").strip()
         logger.warning(
-            "ComfyUI history failed: status=%s detail=%s",
+            "ComfyUI history failed: status=%s body=%s",
             response.status_code,
-            detail,
+            response.excerpt(),
         )
         raise HTTPException(
             status_code=502,
-            detail=f"ComfyUI history failed: {response.status_code} {detail}",
+            detail=(
+                f"ComfyUI history failed: {response.status_code}. ComfyUI did "
+                "not say how the run ended; its console says why."
+            ),
         )
     try:
         return response.json()
     except ValueError as exc:
-        detail = (response.text or "").strip()
-        logger.warning("ComfyUI history invalid JSON: %s", detail)
+        logger.warning("ComfyUI history invalid JSON: %s", response.excerpt())
         raise HTTPException(
             status_code=502,
             detail="ComfyUI history returned invalid JSON",
@@ -1464,6 +1556,15 @@ class _QueueRead:
         or took runs off it."""
         return self.finished and self.number > after and self.cleared == _queue_cleared
 
+    @classmethod
+    def unread(cls, number: int) -> "_QueueRead":
+        """A read that found nothing, as for a queue that cannot be read:
+        its waiter reads the prompt's history instead."""
+        read = cls(number, _queue_cleared)
+        read.finished = True
+        read.done.set()
+        return read
+
 
 def _read_comfyui_queue(
     base_url: str,
@@ -1472,8 +1573,15 @@ def _read_comfyui_queue(
     their turn; None, logged, when its queue cannot be read."""
     url = f"{base_url}/queue"
     try:
-        response = requests.get(
-            url, timeout=30, allow_redirects=False, proxies=NO_PROXY
+        # Under a total deadline and a size cap: every run waited on at this
+        # address waits on this read, and a ComfyUI trickling its answer or
+        # sending one without end would hold all of them.
+        response = _ask_comfyui(
+            "GET",
+            url,
+            deadline_s=QUEUE_READ_DEADLINE_S,
+            max_bytes=QUEUE_READ_MAX_BYTES,
+            timeout=QUEUE_READ_TIMEOUT_S,
         )
         # A redirect is not the queue: it names another host's address.
         if response.status_code != 200:
@@ -1550,8 +1658,16 @@ def _shared_queue_read(base_url: str, after: int) -> _QueueRead:
                     ):
                         del _queue_reads[base_url]
                     read.done.set()
-        else:
-            read.done.wait()
+        elif not read.done.wait(QUEUE_READ_WAIT_S):
+            # The read another waiter sent is past its own bound: do not
+            # wait on it for ever, read the prompt's history instead.
+            logger.warning(
+                "ComfyUI's queue at %s was still being read after %ss, so this "
+                "run reads its own history instead this time",
+                base_url,
+                QUEUE_READ_WAIT_S,
+            )
+            return _QueueRead.unread(after)
         if read.answers(after):
             return read
 
@@ -1580,7 +1696,7 @@ def _wait_for_comfyui_outputs(
     Raises ``ComfyUIRunStopped`` for a prompt that was interrupted, and for one
     ComfyUI holds neither in its queue nor in its history: taken off the queue
     before its turn, or lost to a restart. Any other failure is a
-    ``RuntimeError`` carrying the sentence to show.
+    ``ComfyUIRunFailed`` carrying the sentence to show.
     """
     with _run_outcomes_lock:
         _queue_waits[base_url] = _queue_waits.get(base_url, 0) + 1
@@ -1613,9 +1729,9 @@ def _wait_for_comfyui_outputs(
             if status_str in {"interrupted", "cancelled"}:
                 raise ComfyUIRunStopped(error_text or "Interrupted")
             if status_str in {"error", "failed", "failure"}:
-                raise RuntimeError(error_text or f"ComfyUI status={status_str}")
+                raise ComfyUIRunFailed(error_text or f"ComfyUI status={status_str}")
             if error_text and status_str != "success":
-                raise RuntimeError(error_text)
+                raise ComfyUIRunFailed(error_text)
             if read.listed is not None:
                 # Out of the queue, so ComfyUI is done with it.
                 if not _extract_history_entry(history_payload, prompt_id):
@@ -1717,14 +1833,17 @@ def _download_comfyui_image(
     """Fetch one of ComfyUI's files into *dest_dir*; return its path and
     extension.
 
-    The body is streamed to the file a chunk at a time, so a run's outputs
-    are never held in memory. The file gets a fresh name in *dest_dir*, which
-    belongs to the caller: a fetch that fails part-way leaves its partial file
-    there for the caller's cleanup of the folder.
+    The body is written to the file as it arrives (``_ask_comfyui`` with a
+    sink), so a run's outputs are never held in memory, and is at most
+    ``COMFYUI_FILE_MAX_BYTES`` within ``COMFYUI_FILE_DEADLINE_S``. The file
+    gets a fresh name in *dest_dir*, which belongs to the caller: a fetch that
+    fails part-way leaves its partial file there for the caller's cleanup of
+    the folder.
 
     Raises:
         HTTPException: 502 when ComfyUI cannot be reached, refuses the file,
-            or the connection drops mid-body.
+            the connection drops mid-body, or the file is over the cap or
+            still arriving at the deadline.
     """
     filename = entry.get("filename")
     subfolder = entry.get("subfolder") or ""
@@ -1737,28 +1856,15 @@ def _download_comfyui_image(
     ext = os.path.splitext(filename or "")[1].lower() or ".png"
     path = os.path.join(dest_dir, f"{uuid.uuid4().hex}{ext}")
     try:
-        with requests.get(
-            f"{base_url}/view",
-            params=params,
-            stream=True,
-            timeout=30,
-            allow_redirects=False,
-            proxies=NO_PROXY,
-        ) as response:
-            if response.status_code >= 300:
-                detail = (response.text or "").strip()
-                logger.warning(
-                    "ComfyUI image fetch failed: status=%s detail=%s",
-                    response.status_code,
-                    detail,
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"ComfyUI image fetch failed: {response.status_code} {detail}",
-                )
-            with open(path, "xb") as handle:
-                for chunk in response.iter_content(chunk_size=FETCH_CHUNK_BYTES):
-                    handle.write(chunk)
+        with open(path, "xb") as handle:
+            response = _ask_comfyui(
+                "GET",
+                f"{base_url}/view",
+                params=params,
+                deadline_s=COMFYUI_FILE_DEADLINE_S,
+                max_bytes=COMFYUI_FILE_MAX_BYTES,
+                sink=handle.write,
+            )
     except requests.RequestException as exc:
         logger.warning(
             "ComfyUI image fetch failed for %s (%s, %r): %s",
@@ -1771,6 +1877,20 @@ def _download_comfyui_image(
             status_code=502,
             detail="ComfyUI image fetch failed",
         ) from exc
+    if response.status_code >= 300:
+        logger.warning(
+            "ComfyUI image fetch of %s failed: status=%s body=%s",
+            filename,
+            response.status_code,
+            response.excerpt(),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"ComfyUI image fetch failed: {response.status_code}. ComfyUI "
+                "did not hand over the file the run made."
+            ),
+        )
     return path, ext
 
 
@@ -1784,7 +1904,6 @@ def _unique_edit_filename(output_dir: str, stem: str, ext: str) -> str:
         n += 1
 
 
-@import_dedup_service.serialised_import()
 def _import_comfyui_outputs(
     server,
     image_entries: list[tuple[str, str]],
@@ -1799,6 +1918,20 @@ def _import_comfyui_outputs(
     library from its file, never read whole into memory; the files stay
     where they are, for the caller to remove. The name a file was fetched
     under is not recorded as the picture's own.
+
+    An output whose content is a picture in the Scrapheap brings that picture
+    back (``scrapheap_service.restore_pictures``, recorded and announced as a
+    restore) instead of adding a second row, as every other import does
+    (``import_dedup_service``). Its id is among the duplicate ids: the
+    library already had it. One whose match was purged before the restore is
+    a new picture (``import_publish_service.plan_generated_outputs``), and
+    identical outputs in one run are one picture.
+
+    The outputs are hashed, and the first of each content copied in, before
+    ``import_dedup_service.serialised_import`` is taken. The lock covers the
+    lookup and the insert only, as on every import path, so no import waits
+    on this run's disk reads and writes. A copied output the lookup matches
+    is removed again.
     """
     if not image_entries:
         return [], []
@@ -1812,14 +1945,14 @@ def _import_comfyui_outputs(
         for path, _ext in image_entries
     ]
 
-    candidates = server.vault.db.run_immediate_read_task(
-        import_dedup_service.load_match_candidates_in_session,
-        [(sampled, size) for sampled, size, _full in fingerprints],
-        False,
-    )
-    existing_map, _scrapheaped_map = import_dedup_service.partition_confirmed_matches(
-        candidates, fingerprints, server.vault.image_root
-    )
+    # Local: import_publish_service reaches workflow_io through
+    # scrapheap_service and the hub's workflow cards, and workflow_io imports
+    # this module.
+    from pixlstash.services import import_publish_service
+
+    first_of_content: dict[import_dedup_service.ContentFingerprint, int] = {}
+    for index, fingerprint in enumerate(fingerprints):
+        first_of_content.setdefault(fingerprint, index)
 
     # Placement on write (v1.11 Phase 4b). `None` whenever `output_dir` is set:
     # an edit written beside its original in a reference folder is already where
@@ -1828,46 +1961,68 @@ def _import_comfyui_outputs(
     # assignment below lands.
     subfolder = resolve_placement(server.vault.db, output_dir)
 
-    new_picture_map = {}
-    for (path, ext), fingerprint in zip(image_entries, fingerprints):
-        if fingerprint in existing_map or fingerprint in new_picture_map:
-            continue
-        sampled_sha, _size_bytes, _full_sha = fingerprint
-        if output_dir and source_file_stem:
-            pic_uuid = _unique_edit_filename(output_dir, source_file_stem, ext)
-        else:
-            pic_uuid = f"{uuid.uuid4()}{ext}"
-        new_picture_map[fingerprint] = ImageUtils.create_picture_from_file(
-            server.vault.image_root,
-            path,
-            picture_uuid=pic_uuid,
-            pixel_sha=sampled_sha,
-            subfolder=subfolder,
-            output_dir=output_dir,
-            reference_folder_id=reference_folder_id,
-            record_source_name=False,
-        )
-    new_pictures = list(new_picture_map.values())
+    # A file published here whose row does not commit is removed again: left
+    # behind, the next root scan would index it as a picture of its own.
+    with import_publish_service.PublishedPictures(
+        server.vault.image_root, "ComfyUI output import"
+    ) as published:
+        built = {}
+        for index in sorted(first_of_content.values()):
+            path, ext = image_entries[index]
+            sampled_sha, _size_bytes, _full_sha = fingerprints[index]
+            if output_dir and source_file_stem:
+                pic_uuid = _unique_edit_filename(output_dir, source_file_stem, ext)
+            else:
+                pic_uuid = f"{uuid.uuid4()}{ext}"
+            built[index] = published.add(
+                ImageUtils.create_picture_from_file(
+                    server.vault.image_root,
+                    path,
+                    picture_uuid=pic_uuid,
+                    pixel_sha=sampled_sha,
+                    subfolder=subfolder,
+                    output_dir=output_dir,
+                    reference_folder_id=reference_folder_id,
+                    record_source_name=False,
+                )
+            )
 
-    def import_task(session):
-        if new_pictures:
-            session.add_all(new_pictures)
-            session.flush()
-            for pic in new_pictures:
-                session.add(Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id))
-            session.commit()
-            for pic in new_pictures:
-                session.refresh(pic)
-        return new_pictures
+        with import_dedup_service.serialised_import():
+            plan = import_publish_service.plan_generated_outputs(
+                server.vault,
+                fingerprints,
+                published=published,
+                built=built,
+                label="ComfyUI outputs",
+            )
+            new_pictures = [built[index] for index in plan.new_indexes]
+
+            def import_task(session):
+                session.add_all(new_pictures)
+                session.flush()
+                for pic in new_pictures:
+                    session.add(Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id))
+                session.commit()
+                published.mark_committed()
+                for pic in new_pictures:
+                    session.refresh(pic)
+                return new_pictures
+
+            if new_pictures:
+                new_pictures = server.vault.db.run_task(import_task)
 
     if new_pictures:
-        new_pictures = server.vault.db.run_task(import_task)
 
         def mark_imported(session, ids: list[int]):
-            if not ids:
-                return []
             now = datetime.now(timezone.utc)
-            pics = session.exec(select(Picture).where(Picture.id.in_(ids))).all()
+            # A run's output count is the workflow's, with no cap here.
+            pics = [
+                pic
+                for chunk in chunked(ids)
+                for pic in session.exec(
+                    select(Picture).where(Picture.id.in_(chunk))
+                ).all()
+            ]
             updated = []
             for pic in pics:
                 if pic.imported_at is None:
@@ -1879,20 +2034,18 @@ def _import_comfyui_outputs(
 
         server.vault.db.run_task(mark_imported, [pic.id for pic in new_pictures])
 
-    new_ids = [pic.id for pic in new_pictures if pic.id is not None]
+    new_id_by_index = {
+        index: pic.id
+        for index, pic in zip(plan.new_indexes, new_pictures)
+        if pic.id is not None
+    }
+    new_ids = list(new_id_by_index.values())
     duplicate_ids = []
-    seen_new = set()
-    for fingerprint in fingerprints:
-        pic = existing_map.get(fingerprint)
-        if pic is not None and pic.id is not None:
-            duplicate_ids.append(pic.id)
-            continue
-        if fingerprint in seen_new:
-            pic = new_picture_map.get(fingerprint)
-            if pic is not None and pic.id is not None:
-                duplicate_ids.append(pic.id)
-        else:
-            seen_new.add(fingerprint)
+    for index in range(len(image_entries)):
+        if index in plan.matched_ids:
+            duplicate_ids.append(plan.matched_ids[index])
+        elif index in plan.copy_of:
+            duplicate_ids.append(new_id_by_index[plan.copy_of[index]])
     return new_ids, duplicate_ids
 
 
@@ -2142,7 +2295,12 @@ def _assign_outputs_to_lora_people(
         if not people:
             return 0, 0
         named = deferred = 0
-        for pic in session.exec(select(Picture).where(Picture.id.in_(new_ids))).all():
+        pictures = [
+            pic
+            for chunk in chunked(new_ids)
+            for pic in session.exec(select(Picture).where(Picture.id.in_(chunk))).all()
+        ]
+        for pic in pictures:
             if len(people) == 1:
                 if not add_person(session, pic, people[0]):
                     continue
@@ -2282,6 +2440,13 @@ def _duplicates_notice(added: int, duplicates: int) -> str:
             "added. Change the seed or a setting to get a new one."
         )
     return f"The run also made {made} this library already has, not added again."
+
+
+# A run's ending when importing its outputs failed for a reason only the
+# server log can name (CWE-209: the exception text is logged, never shown).
+OUTPUT_IMPORT_FAILED = (
+    "PixlStash could not import this run's outputs. The server log says why."
+)
 
 
 def _process_comfyui_outputs(
@@ -2700,7 +2865,7 @@ def _process_comfyui_outputs(
         settle_vram("aborted")
         logger.warning("ComfyUI prompt %s was stopped: %s", prompt_id, exc)
         emit_failure(str(exc), stopped=True)
-    except RuntimeError as exc:
+    except ComfyUIRunFailed as exc:
         logger.warning("ComfyUI prompt %s failed before outputs: %s", prompt_id, exc)
         if not released and _is_vram_oom_text(str(exc)):
             settle_vram("oom")
@@ -2708,13 +2873,21 @@ def _process_comfyui_outputs(
         else:
             settle_vram("failed")
             emit_failure(str(exc))
-    except Exception as exc:
+    except HTTPException as exc:
+        # This module's own refusals (ComfyUI unreachable, a status it
+        # answered): the detail is a sentence composed here, never its text.
         settle_vram("failed")
         logger.warning(
-            "Failed to import ComfyUI outputs of prompt %s: %s", prompt_id, exc
+            "Failed to import ComfyUI outputs of prompt %s: %s", prompt_id, exc.detail
         )
-        # An HTTPException's str() is "502: <detail>"; the detail is the sentence.
-        emit_failure(str(getattr(exc, "detail", None) or exc))
+        emit_failure(exc.detail)
+    except Exception:
+        # Anything else is a fault of the import: the cause, which can name
+        # files and paths, goes to the log with its traceback, never into the
+        # run's ending the owner reads.
+        settle_vram("failed")
+        logger.exception("Failed to import ComfyUI outputs of prompt %s", prompt_id)
+        emit_failure(OUTPUT_IMPORT_FAILED)
     finally:
         # Every ending releases the lease: a leaked one keeps the card from
         # every other heavy tenant for the rest of the session.
@@ -2740,39 +2913,40 @@ def _comfyui_abort(base_url: str) -> dict:
     ``POST /queue`` with ``{"clear": true}`` to remove pending items.
     Returns a dict with ``interrupted`` and ``queue_cleared`` booleans.
     """
-    global _queue_cleared
     result = {"interrupted": False, "queue_cleared": False}
     try:
-        resp = requests.post(
+        resp = _ask_comfyui(
+            "POST",
             f"{base_url}/interrupt",
-            timeout=10,
-            allow_redirects=False,
-            proxies=NO_PROXY,
+            timeout=COMFYUI_QUICK_TIMEOUT_S,
+            deadline_s=COMFYUI_QUICK_DEADLINE_S,
+            max_bytes=COMFYUI_QUICK_MAX_BYTES,
         )
         result["interrupted"] = resp.status_code < 300
         if not result["interrupted"]:
             logger.warning(
                 "ComfyUI /interrupt returned %s: %s",
                 resp.status_code,
-                (resp.text or "").strip()[:200],
+                resp.excerpt(),
             )
     except requests.RequestException as exc:
         logger.warning("ComfyUI /interrupt request failed: %s", exc)
 
     try:
-        resp = requests.post(
+        resp = _ask_comfyui(
+            "POST",
             f"{base_url}/queue",
             json={"clear": True},
-            timeout=10,
-            allow_redirects=False,
-            proxies=NO_PROXY,
+            timeout=COMFYUI_QUICK_TIMEOUT_S,
+            deadline_s=COMFYUI_QUICK_DEADLINE_S,
+            max_bytes=COMFYUI_QUICK_MAX_BYTES,
         )
         result["queue_cleared"] = resp.status_code < 300
         if not result["queue_cleared"]:
             logger.warning(
                 "ComfyUI /queue clear returned %s: %s",
                 resp.status_code,
-                (resp.text or "").strip()[:200],
+                resp.excerpt(),
             )
     except requests.RequestException as exc:
         logger.warning("ComfyUI /queue clear request failed: %s", exc)
@@ -2780,7 +2954,7 @@ def _comfyui_abort(base_url: str) -> dict:
     # Only a queue that was really emptied: the waiters go by a read sent after
     # it, and one that still holds their prompts answers nothing new.
     if result["queue_cleared"]:
-        _queue_cleared += 1
+        _bump_queue_cleared()
     # The runs PixlStash is still holding for the GPU are part of "every run
     # in flight" too; they never reach ComfyUI now.
     result["held_cancelled"] = len(cancel_held_runs())
@@ -2798,7 +2972,13 @@ def comfyui_pixlstash_scripts(base_url: str) -> set[str] | None:
     """
     url = f"{base_url}/extensions"
     try:
-        response = requests.get(url, timeout=5, allow_redirects=False, proxies=NO_PROXY)
+        response = _ask_comfyui(
+            "GET",
+            url,
+            timeout=COMFYUI_QUICK_TIMEOUT_S,
+            deadline_s=COMFYUI_QUICK_DEADLINE_S,
+            max_bytes=COMFYUI_QUICK_MAX_BYTES,
+        )
         # A redirect is not ComfyUI answering: it names another host's address.
         if response.status_code != 200:
             raise requests.HTTPError(
@@ -2833,7 +3013,13 @@ def comfyui_shelf_loader_current(base_url: str) -> bool | None:
     """
     url = f"{base_url}/object_info/{PIXLSTASH_CHECKPOINT_LOADER}"
     try:
-        response = requests.get(url, timeout=5, allow_redirects=False, proxies=NO_PROXY)
+        response = _ask_comfyui(
+            "GET",
+            url,
+            timeout=COMFYUI_QUICK_TIMEOUT_S,
+            deadline_s=COMFYUI_QUICK_DEADLINE_S,
+            max_bytes=COMFYUI_QUICK_MAX_BYTES,
+        )
         # A redirect is not ComfyUI answering: it names another host's address.
         if response.status_code != 200:
             raise requests.HTTPError(
@@ -2877,37 +3063,6 @@ def comfyui_can_open_workflows(base_url: str) -> bool | None:
     """
     scripts = comfyui_pixlstash_scripts(base_url)
     return None if scripts is None else PACK_OPENS_WORKFLOWS in scripts
-
-
-def normalize_comfyui_url(url: str) -> str:
-    """``scheme://host[:port][/path]/`` for an http(s) URL, else ``ValueError``.
-
-    The trailing slash is the form ``comfyui_url`` has always been saved in. The
-    scheme's default port (``:80``, ``:443``) is dropped.
-    """
-    text = str(url or "").strip()
-    parts = urlsplit(text)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise ValueError(
-            f"A ComfyUI address needs http:// or https:// and a host, not {url!r}."
-        )
-    # Scheme, host, port and path only. A user part, a backslash, a query or a
-    # fragment is where URL parsers disagree on the host: `urlsplit` reads
-    # ``http://evil.example\\@127.0.0.1/`` as 127.0.0.1 while urllib3, which
-    # sends the request, connects to evil.example. Refused, and the host is
-    # then required to read the same to both.
-    if any(mark in text for mark in "@\\?#") or parts.username is not None:
-        raise ValueError(
-            f"A ComfyUI address is scheme, host, port and path only, not {url!r}."
-        )
-    sent_to = (parse_url(text).host or "").strip("[]").lower()
-    if sent_to != parts.hostname.lower():
-        raise ValueError(f"The host in {url!r} is ambiguous.")
-    netloc = parts.netloc
-    # The scheme's own port is the same address without it; one spelling only.
-    if parts.port == {"http": 80, "https": 443}[parts.scheme]:
-        netloc = netloc.rsplit(":", 1)[0]
-    return f"{parts.scheme}://{netloc}{parts.path.rstrip('/')}/"
 
 
 def comfyui_listens_on_network(argv) -> bool | None:
@@ -2965,7 +3120,8 @@ def probe_comfyui(url: str, timeout: float = 2.0) -> dict:
         ValueError: *url* is not an http(s) URL with a host.
     """
     base = normalize_comfyui_url(url)
-    where = urlsplit(base).netloc
+    # ``detail`` says "that address", never the address: the caller already
+    # has it, and the log beside each answer names it.
     result = {
         "reachable": False,
         "url": base,
@@ -2977,27 +3133,29 @@ def probe_comfyui(url: str, timeout: float = 2.0) -> dict:
     }
     try:
         # A redirect is not ComfyUI answering: it is another host's address.
-        response = requests.get(
+        # The whole probe within *timeout*, as its sentence says.
+        response = _ask_comfyui(
+            "GET",
             f"{base}system_stats",
             timeout=timeout,
-            allow_redirects=False,
-            proxies=NO_PROXY,
+            deadline_s=timeout,
+            max_bytes=COMFYUI_QUICK_MAX_BYTES,
         )
     except requests.exceptions.SSLError as exc:
         logger.info("ComfyUI probe of %s: TLS failed: %s", base, exc)
         result["detail"] = (
-            f"{where} answered, but its HTTPS certificate could not be checked."
+            "That address answered, but its HTTPS certificate could not be checked."
         )
         return result
     except requests.Timeout:
         logger.info("ComfyUI probe of %s: no answer within %ss", base, timeout)
-        result["detail"] = f"{where} did not answer within {timeout:g} seconds."
+        result["detail"] = f"That address did not answer within {timeout:g} seconds."
         return result
     except requests.RequestException as exc:
         logger.info("ComfyUI probe of %s: %s", base, exc)
         result["detail"] = (
-            f"Nothing answered at {where}. Check that ComfyUI is running and "
-            "that the port matches the one in its console."
+            "Nothing answered at that address. Check that ComfyUI is running "
+            "and that the port matches the one in its console."
         )
         return result
     try:
@@ -3011,7 +3169,7 @@ def probe_comfyui(url: str, timeout: float = 2.0) -> dict:
             base,
             response.status_code,
         )
-        result["detail"] = f"Something answered at {where}, but it is not ComfyUI."
+        result["detail"] = "Something answered at that address, but it is not ComfyUI."
         return result
     version = system.get("comfyui_version")
     result["reachable"] = True
@@ -3059,14 +3217,22 @@ def comfyui_folder_paths(base_url: str):
     folders on this machine that PixlStash then scans or writes into.
 
     Raises:
-        requests.RequestException: ComfyUI did not answer with a 200.
+        requests.RequestException: ComfyUI did not answer with a 200. The
+            HTTPError text does not name the address: every caller logs that
+            beside it.
         ValueError: the answer is not JSON.
     """
     url = f"{base_url.rstrip('/')}/internal/folder_paths"
-    response = requests.get(url, timeout=5, allow_redirects=False, proxies=NO_PROXY)
+    response = _ask_comfyui(
+        "GET",
+        url,
+        timeout=COMFYUI_QUICK_TIMEOUT_S,
+        deadline_s=COMFYUI_QUICK_DEADLINE_S,
+        max_bytes=COMFYUI_QUICK_MAX_BYTES,
+    )
     if response.status_code != 200:
         raise requests.HTTPError(
-            f"ComfyUI answered HTTP {response.status_code} at {url}"
+            f"ComfyUI answered HTTP {response.status_code} to the folder-paths read"
         )
     return response.json()
 

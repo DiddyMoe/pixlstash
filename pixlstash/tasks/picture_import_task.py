@@ -15,7 +15,11 @@ from pixlstash.db_models.picture_set import PictureSet, PictureSetMember
 from pixlstash.db_models.tag import Tag, TAG_PENDING_SENTINEL
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
-from pixlstash.services import import_dedup_service, scrapheap_service
+from pixlstash.services import (
+    import_dedup_service,
+    import_publish_service,
+    scrapheap_service,
+)
 from pixlstash.services.import_dedup_service import ContentFingerprint
 from pixlstash.services.layout_move_service import resolve_placement
 from pixlstash.services.project_membership_service import (
@@ -23,7 +27,7 @@ from pixlstash.services.project_membership_service import (
     picture_set_project_ids,
     reconcile_entity_projects_change,
 )
-from pixlstash.tasks.base_task import BaseTask, TaskPriority
+from pixlstash.tasks.base_task import BaseTask, PublicTaskFailure, TaskPriority
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
@@ -84,11 +88,13 @@ class PictureImportTask(BaseTask):
     ``Picture`` rows (each with a pending-tag sentinel so the finders pick it up
     for downstream processing) are inserted together, followed by their
     project, set and character membership, before the next batch is looked up;
-    ``phase`` says which of these steps is running. The lookup and the insert
-    run under ``import_dedup_service.serialised_import``, so an overlapping
-    import of the same content finds this one's pictures instead of adding them
-    again. The staging directory is removed when the task ends, whether it
-    completed or failed.
+    ``phase`` says which of these steps is running. The new pictures are
+    looked up again and inserted under
+    ``import_dedup_service.serialised_import``, so an overlapping import of
+    the same content finds this one's pictures instead of adding them again;
+    the hashing and the copies into the library come before the lock, so no
+    import waits on them. The staging directory is removed when the task ends,
+    whether it completed or failed.
 
     The commit route hands the task a library read lease. It is released
     exactly once, by the task runner's completion callback (see
@@ -319,6 +325,7 @@ class PictureImportTask(BaseTask):
                 len(tally.imported_ids),
                 self._staging_id,
                 exc,
+                exc_info=True,
             )
             # The completion broadcast is not sent for a failed task, so
             # announce the pictures that are in the library from here.
@@ -342,9 +349,12 @@ class PictureImportTask(BaseTask):
                     "change_kind": "added",
                 },
             )
-            raise RuntimeError(
+            # Served as the status ``error``: the count is the server's own,
+            # and the exception's text (paths, library content) stays in the
+            # log above.
+            raise PublicTaskFailure(
                 f"The import stopped after {len(tally.imported_ids)} new "
-                f"picture(s) were added: {exc}"
+                "picture(s) were added."
             ) from exc
 
         if tally.cancelled_count:
@@ -467,18 +477,29 @@ class PictureImportTask(BaseTask):
     ) -> None:
         """Decide one batch of staged files and add its new pictures.
 
-        The lookup, the decisions and the insert hold the import lock, so an
-        overlapping import looks up only after this batch's pictures exist. The
-        batch's outcomes are recorded once its pictures are in the library.
+        The files are looked up, decided and copied into the library before
+        the import lock is taken, so no other import waits on these reads and
+        copies. Under the lock, the new pictures are looked up again
+        (:meth:`_without_imported_meanwhile`) and inserted, so an overlapping
+        import looks up only after this batch's pictures exist. The batch's
+        outcomes are recorded once its pictures are in the library.
         """
         fingerprints = [fp for _entry, fp in batch if fp is not None]
         decided: list[tuple[dict, str, Optional[int]]] = []
         # Each new picture with the staged entry it came from, whose folder
-        # its caption is matched in.
+        # its caption is matched in, and where the entry is in the batch.
         new_pictures: list[tuple[Picture, dict]] = []
-        with import_dedup_service.serialised_import():
+        new_positions: list[int] = []
+        imported_ids: list[int] = []
+        # A copy in the library whose row does not commit is removed again:
+        # left on disk with no row, it would be indexed by the next root scan
+        # as a new picture without its caption tags.
+        with import_publish_service.PublishedPictures(
+            self._db.image_root, f"Staged import {self._staging_id}"
+        ) as published:
             live: dict = {}
             scrapheaped: dict = {}
+            compared: set[int] = set()
             if fingerprints:
                 # Deliberately matches soft-deleted rows too: a scrapheaped
                 # picture used to be invisible to import dedup on the one-shot
@@ -489,15 +510,19 @@ class PictureImportTask(BaseTask):
                 # The service classifies it instead of silently collapsing it.
                 # Every insert an earlier holder of the import lock made, this
                 # import's earlier batches included, committed before the lock
-                # was released, so this lookup sees those pictures.
-                candidates = self._db.run_task(
+                # was released, so this lookup sees those pictures; one that
+                # commits after it is found by the look under the lock. A WAL
+                # read on the read path, which does not queue behind
+                # background writes.
+                candidates = self._db.run_immediate_read_task(
                     import_dedup_service.load_match_candidates_in_session,
                     sorted({(sha, size) for sha, size, _full in fingerprints}),
                 )
                 live, scrapheaped = import_dedup_service.partition_confirmed_matches(
                     candidates, fingerprints, self._db.image_root
                 )
-            for entry, fingerprint in batch:
+                compared = {row.id for rows in candidates.values() for row in rows}
+            for position, (entry, fingerprint) in enumerate(batch):
                 match = None
                 if fingerprint is not None:
                     match = live.get(fingerprint) or scrapheaped.get(fingerprint)
@@ -505,90 +530,203 @@ class PictureImportTask(BaseTask):
                     entry, fingerprint, match, tally, subfolder
                 )
                 if pic is not None:
-                    new_pictures.append((pic, entry))
+                    new_pictures.append((published.add(pic), entry))
+                    new_positions.append(position)
                 decided.append((entry, outcome, picture_id))
                 self._processed_count += 1
 
             self._phase = "persisting"
-            imported_ids: list[int] = []
-            if new_pictures:
-                tally.built_count += len(new_pictures)
-                sidecar_tags_by_key = self._sidecar_tags_by_key
-
-                def insert_pictures(
-                    session: Session, pictures: list[tuple[Picture, dict]]
-                ):
-                    session.add_all([pic for pic, _entry in pictures])
-                    session.flush()
-                    exclusions = session_tag_exclusions(session)
-                    left_out = 0
-                    for pic, entry in pictures:
-                        # Apply sidecar caption tags when a caption in the
-                        # picture's own folder has its basename stem; otherwise
-                        # seed the pending sentinel so the tagger picks it up
-                        # (mirrors WatchFolderImportTask). A sidecar naming
-                        # only tags the owner removed from tagging still
-                        # tagged the picture, so it gets no sentinel either.
-                        tags = sidecar_tags_by_key.get(
-                            (
-                                entry.get("sidecar_folder", ""),
-                                _sidecar_stem(pic.original_file_name or ""),
-                            )
-                        )
-                        if tags:
-                            permitted = filter_tag_names(tags, exclusions)
-                            left_out += len(tags) - len(permitted)
-                            for tag_str in permitted:
-                                session.add(Tag(picture_id=pic.id, tag=tag_str))
-                        else:
-                            session.add(
-                                Tag(picture_id=pic.id, tag=TAG_PENDING_SENTINEL)
-                            )
-                    if left_out:
-                        logger.debug(
-                            "PictureImportTask: left out %d sidecar tag(s) "
-                            "removed from tagging (staging_id=%s).",
-                            left_out,
-                            self._staging_id,
-                        )
-                    # The flush assigned the ids. Read them before the commit
-                    # so nothing after it can fail an insert that is already
-                    # in the library.
-                    ids = [pic.id for pic, _entry in pictures]
-                    session.commit()
-                    return ids
-
-                try:
-                    imported_ids = self._db.run_task(
-                        insert_pictures,
+            with import_dedup_service.serialised_import():
+                if new_pictures:
+                    tally.built_count += len(new_pictures)
+                    new_pictures = self._without_imported_meanwhile(
+                        batch,
+                        decided,
                         new_pictures,
-                        priority=DBPriority.IMMEDIATE,
+                        new_positions,
+                        tally,
+                        published,
+                        compared,
                     )
-                except Exception:
-                    # None of this batch's new files reached the library. A
-                    # duplicate without a picture id matched a file this import
-                    # decided was new: earlier batches are committed before
-                    # this lookup, so their matches carry an id. Here it is a
-                    # copy of a file that was rolled back.
-                    for entry, outcome, picture_id in decided:
-                        self._record_outcome(
-                            entry,
-                            "failed"
-                            if outcome == "new"
-                            or (outcome == "duplicate" and picture_id is None)
-                            else outcome,
-                            picture_id,
-                        )
-                    raise
+                if new_pictures:
+                    imported_ids = self._insert_batch(new_pictures, decided, published)
 
         tally.imported_ids.extend(imported_ids)
         for entry, outcome, picture_id in decided:
             self._record_outcome(entry, outcome, picture_id)
         if imported_ids:
+            # One settle batch (<= _DEDUP_BATCH): the helpers bind it directly.
             self._apply_project(imported_ids)
             self._apply_set(imported_ids)
             self._apply_character(imported_ids)
         self._phase = "processing"
+
+    def _without_imported_meanwhile(
+        self,
+        batch: list[tuple[dict, Optional[ContentFingerprint]]],
+        decided: list[tuple[dict, str, Optional[int]]],
+        new_pictures: list[tuple[Picture, dict]],
+        new_positions: list[int],
+        tally: _ImportTally,
+        published: import_publish_service.PublishedPictures,
+        compared: set[int],
+    ) -> list[tuple[Picture, dict]]:
+        """The batch's new pictures whose content no picture holds now.
+
+        Call under :func:`import_dedup_service.serialised_import`, right before
+        :meth:`_insert_batch`. The batch was looked up before the lock was
+        taken, so an import that inserted the same content since is found
+        here (``import_publish_service.withdraw_imported_meanwhile``) and the
+        copy withdrawn. Its staged file, and each later file of the batch that
+        repeats it, is then counted as that picture's duplicate, or as
+        scrapheaped when it is in the Scrapheap, as if the lookup had found
+        it; *decided* and *tally* are updated in place. The candidates the
+        lookup before the lock compared the files with (*compared*) are not
+        read again.
+        """
+        matches = import_publish_service.withdraw_imported_meanwhile(
+            self._db,
+            published,
+            [
+                (pic, batch[position][1][2])
+                for (pic, _entry), position in zip(new_pictures, new_positions)
+            ],
+            compared,
+        )
+        meanwhile: dict[ContentFingerprint, import_dedup_service.ShaMatch] = {}
+        for position, match in zip(new_positions, matches):
+            if match is not None:
+                meanwhile[batch[position][1]] = match
+        if not meanwhile:
+            return new_pictures
+        for position, (entry, fingerprint) in enumerate(batch):
+            match = meanwhile.get(fingerprint) if fingerprint is not None else None
+            if match is None:
+                continue
+            _entry, outcome, picture_id = decided[position]
+            # The new file, and the files counted as its repeats in this batch
+            # (a duplicate with no picture yet). A duplicate with an id matched
+            # a picture of its own.
+            if outcome != "new" and not (outcome == "duplicate" and picture_id is None):
+                continue
+            if outcome == "duplicate":
+                tally.duplicate_count -= 1
+            if match.deleted:
+                tally.scrapheaped_count += 1
+                if match.id not in tally.seen_scrapheaped_ids:
+                    tally.seen_scrapheaped_ids.add(match.id)
+                    tally.scrapheaped_picture_ids.append(match.id)
+                outcome = "scrapheaped"
+            else:
+                tally.duplicate_count += 1
+                outcome = "duplicate"
+            logger.info(
+                "PictureImportTask: staged file %s: picture %d%s with its "
+                "content was imported while this import read the file; "
+                "counted as %s (staging_id=%s)",
+                entry.get("file_path"),
+                match.id,
+                " (in the Scrapheap)" if match.deleted else "",
+                outcome,
+                self._staging_id,
+            )
+            decided[position] = (entry, outcome, match.id)
+        return [
+            (pic, entry)
+            for (pic, entry), match in zip(new_pictures, matches)
+            if match is None
+        ]
+
+    def _insert_batch(
+        self,
+        new_pictures: list[tuple[Picture, dict]],
+        decided: list[tuple[dict, str, Optional[int]]],
+        published: import_publish_service.PublishedPictures,
+    ) -> list[int]:
+        """Insert the batch's new pictures with their tags; return their ids.
+
+        *published* is told the moment the rows commit. When the insert does
+        not commit, every outcome of the batch is recorded first (a new file
+        as failed), then the exception propagates and *published* removes the
+        copies.
+        """
+        sidecar_tags_by_key = self._sidecar_tags_by_key
+        # Set once the insert has committed, so a failure after it never
+        # removes the file of a picture that is in the library.
+        committed = False
+
+        def insert_pictures(session: Session, pictures: list[tuple[Picture, dict]]):
+            nonlocal committed
+            session.add_all([pic for pic, _entry in pictures])
+            session.flush()
+            exclusions = session_tag_exclusions(session)
+            left_out = 0
+            for pic, entry in pictures:
+                # Apply sidecar caption tags when a caption in the picture's
+                # own folder has its basename stem; otherwise seed the pending
+                # sentinel so the tagger picks it up (mirrors
+                # WatchFolderImportTask). A sidecar naming only tags the owner
+                # removed from tagging still tagged the picture, so it gets no
+                # sentinel either.
+                tags = sidecar_tags_by_key.get(
+                    (
+                        entry.get("sidecar_folder", ""),
+                        _sidecar_stem(pic.original_file_name or ""),
+                    )
+                )
+                if tags:
+                    permitted = filter_tag_names(tags, exclusions)
+                    left_out += len(tags) - len(permitted)
+                    for tag_str in permitted:
+                        session.add(Tag(picture_id=pic.id, tag=tag_str))
+                else:
+                    session.add(Tag(picture_id=pic.id, tag=TAG_PENDING_SENTINEL))
+            if left_out:
+                logger.debug(
+                    "PictureImportTask: left out %d sidecar tag(s) "
+                    "removed from tagging (staging_id=%s).",
+                    left_out,
+                    self._staging_id,
+                )
+            # The flush assigned the ids. Read them before the commit so
+            # nothing after it can fail an insert that is already in the
+            # library.
+            ids = [pic.id for pic, _entry in pictures]
+            session.commit()
+            committed = True
+            published.mark_committed()
+            return ids
+
+        try:
+            return self._db.run_task(
+                insert_pictures,
+                new_pictures,
+                priority=DBPriority.IMMEDIATE,
+            )
+        except Exception as exc:
+            if committed:
+                logger.error(
+                    "PictureImportTask: the insert of %d picture(s) committed "
+                    "and then failed (staging_id=%s); their files are kept: %s",
+                    len(new_pictures),
+                    self._staging_id,
+                    exc,
+                )
+            # None of this batch's new files reached the library. A duplicate
+            # without a picture id matched a file this import decided was new:
+            # earlier batches are committed before this lookup, so their
+            # matches carry an id. Here it is a copy of a file that was rolled
+            # back.
+            for entry, outcome, picture_id in decided:
+                self._record_outcome(
+                    entry,
+                    "failed"
+                    if outcome == "new"
+                    or (outcome == "duplicate" and picture_id is None)
+                    else outcome,
+                    picture_id,
+                )
+            raise
 
     def _decide(
         self,

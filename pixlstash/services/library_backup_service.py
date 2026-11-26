@@ -43,6 +43,8 @@ import zstandard
 from tqdm import tqdm
 
 from pixlstash.hub.registry import VAULT_FILENAME, Library
+from pixlstash.utils.image_processing.image_utils import is_in_progress_file_name
+from pixlstash.utils.links import is_link_stat
 from pixlstash.utils.media_files import is_supported_media_file
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.system_utils import space_shortfall
@@ -279,6 +281,10 @@ def _library_files(library_root: str) -> list[tuple[str, str]]:
                 filename in _DATABASE_FILES
             ):
                 continue
+            if is_in_progress_file_name(filename):
+                # An import's file before it is published: the import renames
+                # or removes it at any moment, and it is never a picture.
+                continue
             absolute = os.path.join(directory, filename)
             _validate_regular_file(absolute, label="library payload")
             relative = os.path.relpath(absolute, library_root)
@@ -287,13 +293,20 @@ def _library_files(library_root: str) -> list[tuple[str, str]]:
 
 
 def _validate_regular_directory(path: str, *, label: str) -> None:
-    """Refuse symlinked or non-directory path components in an archive walk."""
+    """Refuse linked or non-directory path components in an archive walk.
+
+    A Windows junction is refused as a symlink is: ``os.walk`` does not
+    descend a directory symlink but does descend a junction, which would put
+    whatever it points at into the archive.
+    """
     try:
         info = os.lstat(path)
     except OSError as exc:
         raise BackupError(f"Could not inspect {label} {path}: {exc}") from exc
-    if stat.S_ISLNK(info.st_mode):
-        raise BackupError(f"Refusing symlinked {label} {path}.")
+    if is_link_stat(info):
+        raise BackupError(
+            f"Refusing {label} {path}: it is a link (a symlink or junction)."
+        )
     if not stat.S_ISDIR(info.st_mode):
         raise BackupError(f"Refusing non-directory {label} {path}.")
 

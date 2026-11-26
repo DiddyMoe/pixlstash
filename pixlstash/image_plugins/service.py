@@ -9,6 +9,7 @@ from typing import Any
 from PIL import ExifTags, Image, PngImagePlugin
 from sqlmodel import Session, select
 
+from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Picture,
     PictureProjectMember,
@@ -18,8 +19,10 @@ from pixlstash.db_models import (
     TAG_PENDING_SENTINEL,
 )
 from pixlstash.image_plugins.base import ImagePlugin
+from pixlstash.services import import_dedup_service, import_publish_service
 from pixlstash.services.set_lock_service import drop_locked_set_ids
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.layout_move_service import resolve_placement
 from pixlstash.stacking import (
@@ -41,12 +44,34 @@ _EXIF_GEOMETRY_TAGS = (0x0100, 0x0101)  # ImageWidth, ImageLength (IFD0)
 _EXIF_SUBIFD_GEOMETRY_TAGS = (0xA002, 0xA003)  # PixelXDimension, PixelYDimension
 
 
+class PictureNotFoundError(LookupError):
+    """A plugin run named a picture the library has no row for.
+
+    The caller's mistake, not the run's: every other way a run fails (a file
+    gone from disk, a plugin's own error) is still a ``ValueError`` or
+    whatever the plugin raised, so a caller can tell the two apart.
+
+    Attributes:
+        picture_id: The requested id that matched no picture.
+    """
+
+    def __init__(self, picture_id: int):
+        super().__init__(f"Picture not found: {picture_id}")
+        self.picture_id = picture_id
+
+
 def _load_input_images(
     server,
     picture_ids: list[int],
 ) -> list[tuple[Picture, Image.Image, str, str]]:
     def fetch_pictures(session: Session, ids: list[int]):
-        return session.exec(select(Picture).where(Picture.id.in_(ids))).all()
+        # A run's sources are the user's selection, which has no cap.
+        pictures = []
+        for chunk in chunked(ids):
+            pictures.extend(
+                session.exec(select(Picture).where(Picture.id.in_(chunk))).all()
+            )
+        return pictures
 
     pictures = server.vault.db.run_task(fetch_pictures, picture_ids)
     picture_map = {pic.id: pic for pic in pictures if pic.id is not None}
@@ -55,7 +80,7 @@ def _load_input_images(
     for picture_id in picture_ids:
         pic = picture_map.get(picture_id)
         if pic is None:
-            raise ValueError(f"Picture not found: {picture_id}")
+            raise PictureNotFoundError(picture_id)
         if not pic.file_path:
             raise ValueError(f"Picture missing file path: {picture_id}")
         resolved_path = ImageUtils.resolve_picture_path(
@@ -84,12 +109,25 @@ def _source_png_text(source_path: str | None) -> PngImagePlugin.PngInfo | None:
     product recovers in :mod:`pixlstash.utils.comfyui_utilities` - live in those
     chunks and nowhere else, so a plugin run that dropped them destroyed them.
     Returns ``None`` when the source has no text chunks; never fabricates.
+
+    The chunks come from the image :meth:`ImageUtils.apply_exif_orientation`
+    returns, as the share copies and the served PNG take theirs: the plugin's
+    pixels are already upright (``load_image_or_video`` made the same turn),
+    and a chunk read from the source as stored (a raw EXIF profile, XMP's
+    tiff:Orientation) would turn the output a second time on display. The
+    turn loads the source first, so a chunk stored after the pixels is read
+    too, and its info holds the chunks as its ``str`` values.
     """
     if not source_path:
         return None
     try:
         with Image.open(source_path) as src:
-            text = dict(getattr(src, "text", None) or {})
+            upright = ImageUtils.apply_exif_orientation(src)
+            text = {
+                key: value
+                for key, value in upright.info.items()
+                if isinstance(value, str)
+            }
     except Exception as exc:
         logger.warning(
             "Could not read PNG text chunks from %s; plugin output will carry no "
@@ -110,9 +148,9 @@ def _source_exif_bytes(source_path: str | None) -> bytes | None:
     """Return the source's EXIF minus orientation and geometry, or ``None``.
 
     Orientation must go: :meth:`ImageUtils.load_image_or_video` runs
-    ``ImageOps.exif_transpose`` on load, so the pixels a plugin hands back are
-    already upright and re-stamping the source's orientation would rotate the
-    output a second time on display.
+    ``ImageUtils.apply_exif_orientation`` on load, so the pixels a plugin hands
+    back are already upright and re-stamping the source's orientation would
+    rotate the output a second time on display.
     """
     if not source_path:
         return None
@@ -222,6 +260,30 @@ def _unique_edit_filename(output_dir: str, stem: str, ext: str) -> str:
         n += 1
 
 
+def _plan_output_imports(
+    vault,
+    fingerprints: list[import_dedup_service.ContentFingerprint],
+    published: import_publish_service.PublishedPictures,
+    built: dict[int, Picture],
+) -> import_dedup_service.OutputImportPlan:
+    """Look up, confirm and restore the outputs' matches, then decide.
+
+    The shared step every generated-output import takes
+    (:func:`import_publish_service.plan_generated_outputs`): the restore's own
+    transaction decides which matches are in the Scrapheap, so a match binned
+    after the lookup comes back and one purged before the restore makes its
+    output a new picture, and the published copy of a matched output is
+    removed. Call under :func:`import_dedup_service.serialised_import`.
+    """
+    return import_publish_service.plan_generated_outputs(
+        vault,
+        fingerprints,
+        published=published,
+        built=built,
+        label="Plugin outputs",
+    )
+
+
 def _import_output_images(
     server,
     output_entries: list[tuple[bytes, str]],
@@ -229,6 +291,26 @@ def _import_output_images(
     reference_folder_ids: list[int | None] | None = None,
     source_file_names: list[str | None] | None = None,
 ) -> tuple[list[int], list[int], list[int]]:
+    """Insert generated outputs that are new, on the confirmed match.
+
+    The decision is :func:`import_dedup_service.plan_output_imports`, on what
+    :func:`_plan_output_imports` looked up: an output is a duplicate only when
+    a picture has the same sampled hash, size and full SHA-256; a scrapheaped
+    match is brought back; identical outputs in one batch become one picture.
+
+    The outputs are hashed, and the first of each content published, before
+    :func:`import_dedup_service.serialised_import` is taken. The lock covers
+    the lookup and the insert only, as on every import path: an overlapping
+    import of the same output looks up after these rows exist, and no import
+    waits on this one's disk writes. A published output the lookup matches is
+    removed again.
+
+    Returns:
+        ``(new_ids, duplicate_ids, ordered_output_ids)``. ``ordered_output_ids``
+        has one id per entry of ``output_entries``, in order: the picture that
+        holds that output's content. ``duplicate_ids`` has one id per output
+        that did not insert a row (a library match or an in-batch copy).
+    """
     if not output_entries:
         return [], [], []
 
@@ -236,93 +318,109 @@ def _import_output_images(
         ImageUtils.calculate_hash_from_bytes(image_bytes)
         for image_bytes, _ in output_entries
     ]
-
-    existing = server.vault.db.run_immediate_read_task(
-        lambda session: Picture.find(session, pixel_shas=shas, include_unimported=True)
-    )
-    existing_map = {pic.pixel_sha: pic for pic in existing}
-
-    new_entries = [
-        (orig_idx, entry, sha)
-        for orig_idx, (entry, sha) in enumerate(zip(output_entries, shas))
-        if sha not in existing_map
+    fingerprints = [
+        (sha, len(image_bytes), ImageUtils.calculate_full_hash_from_bytes(image_bytes))
+        for sha, (image_bytes, _) in zip(shas, output_entries)
     ]
+    first_of_content: dict[import_dedup_service.ContentFingerprint, int] = {}
+    for index, fingerprint in enumerate(fingerprints):
+        first_of_content.setdefault(fingerprint, index)
 
-    new_pictures = []
-    for orig_idx, (img_bytes, ext), sha in new_entries:
-        out_dir = output_dirs[orig_idx] if output_dirs else None
-        ref_id = reference_folder_ids[orig_idx] if reference_folder_ids else None
-        source_stem = source_file_names[orig_idx] if source_file_names else None
-        if out_dir and source_stem:
-            picture_uuid = _unique_edit_filename(out_dir, source_stem, ext)
-        else:
-            picture_uuid = f"{uuid.uuid4()}{ext}"
-        new_pictures.append(
-            ImageUtils.create_picture_from_bytes(
-                image_root_path=server.vault.image_root,
-                image_bytes=img_bytes,
-                picture_uuid=picture_uuid,
-                pixel_sha=sha,
-                output_dir=out_dir,
-                reference_folder_id=ref_id,
-                # Placement on write (v1.11 Phase 4b). `None` whenever
-                # ``out_dir`` is set - an edit written beside its original in a
-                # reference folder is already where the owner put it. Otherwise
-                # the unfiled folder, and the memberships this service copies
-                # from the source picture file it one debounce later.
-                subfolder=resolve_placement(server.vault.db, out_dir),
+    # A file published here whose row does not commit is removed again: left
+    # behind, the next root scan would index it as a picture of its own.
+    with import_publish_service.PublishedPictures(
+        server.vault.image_root, "Plugin output import"
+    ) as published:
+        built: dict[int, Picture] = {}
+        for orig_idx in sorted(first_of_content.values()):
+            img_bytes, ext = output_entries[orig_idx]
+            out_dir = output_dirs[orig_idx] if output_dirs else None
+            ref_id = reference_folder_ids[orig_idx] if reference_folder_ids else None
+            source_stem = source_file_names[orig_idx] if source_file_names else None
+            if out_dir and source_stem:
+                picture_uuid = _unique_edit_filename(out_dir, source_stem, ext)
+            else:
+                picture_uuid = f"{uuid.uuid4()}{ext}"
+            built[orig_idx] = published.add(
+                ImageUtils.create_picture_from_bytes(
+                    image_root_path=server.vault.image_root,
+                    image_bytes=img_bytes,
+                    picture_uuid=picture_uuid,
+                    pixel_sha=shas[orig_idx],
+                    output_dir=out_dir,
+                    reference_folder_id=ref_id,
+                    # Placement on write (v1.11 Phase 4b). `None` whenever
+                    # ``out_dir`` is set - an edit written beside its
+                    # original in a reference folder is already where the
+                    # owner put it. Otherwise the unfiled folder, and the
+                    # memberships this service copies from the source
+                    # picture file it one debounce later.
+                    subfolder=resolve_placement(server.vault.db, out_dir),
+                )
             )
-        )
 
-    def persist(session: Session):
-        if not new_pictures:
-            return []
-        session.add_all(new_pictures)
-        session.flush()
-        for pic in new_pictures:
-            session.add(Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id))
-        session.commit()
-        for pic in new_pictures:
-            session.refresh(pic)
-        return new_pictures
+        with import_dedup_service.serialised_import():
+            plan = _plan_output_imports(server.vault, fingerprints, published, built)
+            new_pictures = [built[orig_idx] for orig_idx in plan.new_indexes]
+
+            def persist(session: Session):
+                session.add_all(new_pictures)
+                session.flush()
+                for pic in new_pictures:
+                    session.add(Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id))
+                session.commit()
+                published.mark_committed()
+                for pic in new_pictures:
+                    session.refresh(pic)
+                return new_pictures
+
+            if new_pictures:
+                # IMMEDIATE, said rather than left to the default: a plugin run
+                # is background work, but this write runs under the import
+                # lock, which every other import waits on until it commits.
+                new_pictures = server.vault.db.run_task(
+                    persist, priority=DBPriority.IMMEDIATE
+                )
 
     if new_pictures:
-        new_pictures = server.vault.db.run_task(persist)
 
         def mark_imported(session: Session, ids: list[int]):
             now = datetime.now(timezone.utc)
-            pictures = session.exec(select(Picture).where(Picture.id.in_(ids))).all()
-            for pic in pictures:
-                if pic.imported_at is None:
-                    pic.imported_at = now
-                    session.add(pic)
+            # One output per source, and the plugin request has no cap.
+            for chunk in chunked(ids):
+                pictures = session.exec(
+                    select(Picture).where(Picture.id.in_(chunk))
+                ).all()
+                for pic in pictures:
+                    if pic.imported_at is None:
+                        pic.imported_at = now
+                        session.add(pic)
             session.commit()
 
         server.vault.db.run_task(
             mark_imported,
             [pic.id for pic in new_pictures if pic.id is not None],
+            priority=DBPriority.IMMEDIATE,
         )
 
-    new_ids = [pic.id for pic in new_pictures if pic.id is not None]
-    duplicate_ids = [
-        pic.id
-        for sha in shas
-        if (pic := existing_map.get(sha)) is not None and pic.id is not None
-    ]
-
-    new_map: dict[str, int] = {}
-    for (_orig_idx, _entry, sha), pic in zip(new_entries, new_pictures):
-        if pic.id is not None:
-            new_map[sha] = pic.id
-
+    new_id_by_index: dict[int, int] = {
+        orig_idx: pic.id
+        for orig_idx, pic in zip(plan.new_indexes, new_pictures)
+        if pic.id is not None
+    }
+    new_ids = list(new_id_by_index.values())
+    duplicate_ids: list[int] = []
     ordered_output_ids: list[int] = []
-    for sha in shas:
-        if sha in new_map:
-            ordered_output_ids.append(new_map[sha])
-            continue
-        existing_pic = existing_map.get(sha)
-        if existing_pic is not None and existing_pic.id is not None:
-            ordered_output_ids.append(existing_pic.id)
+    for index in range(len(output_entries)):
+        if index in plan.matched_ids:
+            picture_id = plan.matched_ids[index]
+            duplicate_ids.append(picture_id)
+        elif index in plan.copy_of:
+            picture_id = new_id_by_index[plan.copy_of[index]]
+            duplicate_ids.append(picture_id)
+        else:
+            picture_id = new_id_by_index[index]
+        ordered_output_ids.append(picture_id)
 
     return new_ids, duplicate_ids, ordered_output_ids
 
@@ -388,9 +486,13 @@ def _propagate_output_picture_sets(
     output_ids = sorted({oid for ids in source_to_outputs.values() for oid in ids})
 
     def copy_memberships(session: Session):
-        source_memberships = session.exec(
-            select(PictureSetMember).where(PictureSetMember.picture_id.in_(source_ids))
-        ).all()
+        source_memberships = [
+            member
+            for chunk in chunked(source_ids)
+            for member in session.exec(
+                select(PictureSetMember).where(PictureSetMember.picture_id.in_(chunk))
+            ).all()
+        ]
 
         source_set_ids: dict[int, set[int]] = {}
         for member in source_memberships:
@@ -430,16 +532,15 @@ def _propagate_output_picture_sets(
         if not desired_pairs:
             return
 
-        desired_set_ids = sorted({set_id for set_id, _ in desired_pairs})
-        existing = session.exec(
-            select(PictureSetMember).where(
-                PictureSetMember.picture_id.in_(output_ids),
-                PictureSetMember.set_id.in_(desired_set_ids),
-            )
-        ).all()
+        # The outputs' memberships, filtered to the wanted sets here: an IN
+        # over the set ids too would add their count to each chunk's binds.
         existing_pairs = {
-            (int(member.set_id), int(member.picture_id)) for member in existing
-        }
+            (int(member.set_id), int(member.picture_id))
+            for chunk in chunked(output_ids)
+            for member in session.exec(
+                select(PictureSetMember).where(PictureSetMember.picture_id.in_(chunk))
+            ).all()
+        } & desired_pairs
 
         inserts = [
             PictureSetMember(set_id=set_id, picture_id=picture_id)
@@ -475,11 +576,15 @@ def _propagate_output_project_memberships(
     output_ids = sorted({oid for ids in source_to_outputs.values() for oid in ids})
 
     def copy_project_memberships(session: Session):
-        source_memberships = session.exec(
-            select(PictureProjectMember).where(
-                PictureProjectMember.picture_id.in_(source_ids)
-            )
-        ).all()
+        source_memberships = [
+            member
+            for chunk in chunked(source_ids)
+            for member in session.exec(
+                select(PictureProjectMember).where(
+                    PictureProjectMember.picture_id.in_(chunk)
+                )
+            ).all()
+        ]
 
         source_project_ids: dict[int, set[int]] = {}
         for member in source_memberships:
@@ -499,16 +604,16 @@ def _propagate_output_project_memberships(
         if not desired_pairs:
             return
 
-        desired_project_ids = sorted({pid for pid, _ in desired_pairs})
-        existing = session.exec(
-            select(PictureProjectMember).where(
-                PictureProjectMember.picture_id.in_(output_ids),
-                PictureProjectMember.project_id.in_(desired_project_ids),
-            )
-        ).all()
+        # Filtered to the wanted projects here, as for sets above.
         existing_pairs = {
-            (int(member.project_id), int(member.picture_id)) for member in existing
-        }
+            (int(member.project_id), int(member.picture_id))
+            for chunk in chunked(output_ids)
+            for member in session.exec(
+                select(PictureProjectMember).where(
+                    PictureProjectMember.picture_id.in_(chunk)
+                )
+            ).all()
+        } & desired_pairs
 
         inserts = [
             PictureProjectMember(project_id=project_id, picture_id=picture_id)
@@ -645,7 +750,13 @@ def import_derived_outputs(
         def _read_source_positions(
             session: Session, src_ids: list[int]
         ) -> dict[int, int]:
-            pics = session.exec(select(Picture).where(Picture.id.in_(src_ids))).all()
+            pics = [
+                pic
+                for chunk in chunked(src_ids)
+                for pic in session.exec(
+                    select(Picture).where(Picture.id.in_(chunk))
+                ).all()
+            ]
             return {
                 int(p.id): (
                     int(p.stack_position) if p.stack_position is not None else 999999

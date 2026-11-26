@@ -32,9 +32,12 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from sqlmodel import select
 
+from pixlstash import app
 from pixlstash.db_models import Character, Picture, PictureSet, PictureSetMember, Tag
 from pixlstash.routes.pictures import _import as import_mod
 from pixlstash.server import Server
+from pixlstash.task_runner import TaskRunnerStopped
+from pixlstash.tasks.base_task import TASK_FAILURE_MESSAGE
 from pixlstash.tasks.picture_import_task import PictureImportTask
 from tests.authz_guard import no_spa_fallback  # noqa: F401
 from tests.utils import wait_for_import_task
@@ -136,6 +139,10 @@ def test_staging_import_happy_path(owner_server):
     assert r.status_code == 200, r.text
     staging_id = r.json()["staging_id"]
     assert r.json()["safe_threshold"] == 1
+    # The session names the library it belongs to, so a client keys
+    # its commit record by the session's library, not by a guess at the
+    # active one.
+    assert r.json()["library_uuid"] == _srv.library_registry.active_library().uuid
 
     r = client.post(
         f"{API}/pictures/import/staging/{staging_id}/files",
@@ -1070,11 +1077,29 @@ def test_a_commit_racing_shutdown_leaves_the_session_open_and_the_library_free(
     baseline = _readers(srv)
 
     def stopped_runner(task):
-        raise RuntimeError("TaskRunner test-runner is stopped.")
+        raise TaskRunnerStopped("TaskRunner test-runner is stopped.")
 
+    def broken_submit(task):
+        raise RuntimeError("test-submit-bug")
+
+    # The runner itself refuses, as a stopped one does: ``Vault.submit_task``
+    # turns its TaskRunnerStopped into None, which is what the route sees.
     with monkeypatch.context() as patch:
-        patch.setattr(srv.vault, "submit_task", stopped_runner)
-        with pytest.raises(RuntimeError, match="test-runner is stopped"):
+        patch.setattr(srv.vault._task_runner, "submit", stopped_runner)
+        r = client.post(commit_url)
+    # A refusal the client can retry, not a 500. The runner's own message is
+    # logged, not returned.
+    assert r.status_code == 503, r.text
+    assert r.json()["detail"] == "Task runner is not available"
+    status = client.get(f"{_STAGING}/{staging_id}/status").json()
+    assert status["stage"] == "staging"
+    _wait_for_readers(srv, baseline, timeout_s=5)
+
+    # Any other error is a fault, not a stopped runner: it is not answered
+    # with "try again", and the session is still given back.
+    with monkeypatch.context() as patch:
+        patch.setattr(srv.vault, "submit_task", broken_submit)
+        with pytest.raises(RuntimeError, match="test-submit-bug"):
             client.post(commit_url)
     status = client.get(f"{_STAGING}/{staging_id}/status").json()
     assert status["stage"] == "staging"
@@ -1286,6 +1311,34 @@ def test_staging_dirs_no_session_owns_are_swept(shared):
     shutil.rmtree(fresh_orphan)
 
 
+def test_the_sweep_keeps_the_spool_of_a_one_shot_import_still_running(shared):
+    """A long one-shot import's spool can outlast the idle TTL; it is the
+    task's until the task ends, then an orphan like any other."""
+    srv, _client = shared
+    task_id = "test-long-import"
+    spool = os.path.join(srv.vault.image_root, ".staging", f"import-{task_id}")
+    os.makedirs(spool)
+    with open(os.path.join(spool, "0.png"), "wb") as fh:
+        fh.write(_png_bytes())
+    stale = time.time() - import_mod._STAGING_SESSION_TTL_S - 60
+    os.utime(spool, (stale, stale))
+    srv.import_tasks[task_id] = {
+        "status": "in_progress",
+        "spool_name": f"import-{task_id}",
+    }
+    try:
+        import_mod._sweep_orphan_staging_dirs(srv, int(time.time() * 1000))
+        assert os.path.isfile(os.path.join(spool, "0.png")), "swept mid-import"
+
+        srv.import_tasks[task_id]["status"] = "completed"
+        import_mod._sweep_orphan_staging_dirs(srv, int(time.time() * 1000))
+        assert not os.path.lexists(spool)
+    finally:
+        srv.import_tasks.pop(task_id, None)
+        if os.path.lexists(spool):
+            shutil.rmtree(spool)
+
+
 @pytest.mark.skipif(
     sys.platform == "win32", reason="creating a symlink needs privileges on Windows"
 )
@@ -1308,8 +1361,144 @@ def test_the_sweep_unlinks_a_symlink_without_following_it(shared):
         assert os.path.isfile(kept)
 
 
-def test_a_failed_import_removes_its_staged_files_and_frees_the_library(
+_JUNCTION_TAG = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+
+def _staging_root_is_a_junction(srv, monkeypatch) -> str:
+    """Give the library's ``.staging`` the ``lstat`` of a Windows junction.
+
+    No junction can exist on Linux, so the reparse tag is simulated, as
+    tests/test_hub_engine.py does: ``islink`` says False for one, and the
+    directory it reaches is a real directory.
+    """
+    staging_root = os.path.join(srv.vault.image_root, ".staging")
+    os.makedirs(staging_root, exist_ok=True)
+    real_lstat = os.lstat
+
+    class _JunctionStat:
+        def __init__(self, info):
+            self._info = info
+            self.st_reparse_tag = _JUNCTION_TAG
+
+        def __getattr__(self, name):
+            return getattr(self._info, name)
+
+    def lstat(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) == staging_root:
+            return _JunctionStat(info)
+        return info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    return staging_root
+
+
+def test_a_staging_folder_that_is_a_junction_is_refused(shared, monkeypatch):
+    """A junction at ``.staging`` would send every upload wherever it points.
+
+    Wrong if either import path accepts it: the session opens, or the one-shot
+    import spools its upload there.
+    """
+    srv, client = shared
+    _staging_root_is_a_junction(srv, monkeypatch)
+
+    opened = client.post(_STAGING, json={})
+    one_shot = client.post(
+        f"{API}/pictures/import",
+        files=[("file", ("test-junction.png", _png_bytes(), "image/png"))],
+    )
+
+    for response in (opened, one_shot):
+        assert response.status_code == 500, response.text
+        assert response.json()["detail"] == (
+            "The library staging path is not a trusted directory."
+        )
+
+
+def test_the_sweep_leaves_a_staging_folder_that_is_a_junction_alone(
     shared, monkeypatch
+):
+    """The reaper deletes old entries under ``.staging``; through a junction
+    they are somebody else's files. Wrong if the stale entry is removed."""
+    srv, _client = shared
+    staging_root = _staging_root_is_a_junction(srv, monkeypatch)
+    entry = os.path.join(staging_root, "test-junction-orphan")
+    os.makedirs(entry)
+    stale = time.time() - import_mod._STAGING_SESSION_TTL_S - 60
+    os.utime(entry, (stale, stale))
+    try:
+        import_mod._sweep_orphan_staging_dirs(srv, int(time.time() * 1000))
+        assert os.path.isdir(entry), "the sweep went through the junction"
+    finally:
+        shutil.rmtree(entry, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("idle_s", "swept"),
+    [(import_mod._STAGING_SESSION_TTL_S + 60, True), (60, False)],
+    ids=["idle-past-the-ttl", "fresh"],
+)
+def test_the_server_sweeps_what_the_last_run_left_in_staging_at_boot(
+    tmp_path, monkeypatch, idle_s, swept
+):
+    """Nothing has to open a staging session for a crashed run's files to go.
+
+    A fresh entry stays, though this process has no session yet: it may be a
+    live upload of another PixlStash serving the same library, which nothing
+    stops, and the sweep runs before the port is bound. Nothing at boot tells
+    it from a crashed run's, so the session TTL is what proves an entry
+    abandoned.
+
+    Runs ``app.main`` with a stand-in server so the boot sequence itself is
+    under test, not the reaper alone.
+    """
+    image_root = tmp_path / "images"
+    left_behind = image_root / ".staging" / "test-last-run-session"
+    left_behind.mkdir(parents=True)
+    (left_behind / "left.png").write_bytes(_png_bytes())
+    stale = time.time() - idle_s
+    os.utime(left_behind, (stale, stale))
+    events: list[str] = []
+
+    class BootServer:
+        DEFAULT_CLEANUP_MISSING_PICTURES = False
+
+        def __init__(self, **_kwargs):
+            self.staging_sessions = {}
+            self.import_tasks = {}
+            self.vault = SimpleNamespace(
+                image_root=str(image_root),
+                ensure_ready=lambda: events.append("engine"),
+            )
+
+        @staticmethod
+        def init_server_config(_path):
+            return {}
+
+        def run(self):
+            events.append("serving")
+            assert left_behind.exists() is not swept, "decided after serving began"
+
+    monkeypatch.setattr(app, "Server", BootServer)
+    monkeypatch.setattr(app, "ensure_install_identity", lambda _path: None)
+    monkeypatch.setattr(app, "_bootstrap_server_config", lambda *_a, **_k: False)
+    monkeypatch.setattr(app, "_prepare_startup_permissions", lambda *_a: None)
+    monkeypatch.setattr(app, "setup_logging", lambda **_k: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["pixlstash", "--server-config", str(tmp_path / "server-config.json")],
+    )
+
+    assert app.main() == 0
+    assert events == ["engine", "serving"]
+    assert left_behind.exists() is not swept
+    if not swept:
+        assert (left_behind / "left.png").read_bytes() == _png_bytes()
+
+
+def test_a_failed_import_removes_its_staged_files_and_frees_the_library(
+    shared, monkeypatch, caplog
 ):
     srv, client = shared
     staging_id = _open_session(client)
@@ -1322,12 +1511,18 @@ def test_a_failed_import_removes_its_staged_files_and_frees_the_library(
         raise RuntimeError("test-import-failure")
 
     monkeypatch.setattr(PictureImportTask, "_import_staged_files", fail)
-    r = client.post(f"{_STAGING}/{staging_id}/commit")
-    assert r.status_code == 200, r.text
-
-    status = _wait_for_stage(client, staging_id)
+    with caplog.at_level("WARNING", logger="pixlstash"):
+        r = client.post(f"{_STAGING}/{staging_id}/commit")
+        assert r.status_code == 200, r.text
+        status = _wait_for_stage(client, staging_id)
     assert status["stage"] == "failed", status
-    assert "test-import-failure" in status["error"]
+    # The status carries the fixed sentence; the cause is in the server log.
+    assert status["error"] == TASK_FAILURE_MESSAGE, status
+    assert [
+        str(r.exc_info[1])
+        for r in caplog.records
+        if r.name == "pixlstash.tasks.base_task" and r.exc_info
+    ] == ["test-import-failure"]
     assert not os.path.lexists(staging_dir)
     _wait_for_readers(srv, baseline)
 
@@ -1468,7 +1663,10 @@ def test_a_corrupt_zip_entry_leaves_no_partial_file(shared):
         client, staging_id, [("file", ("q.zip", bytes(archive), "application/zip"))]
     )
     assert r.status_code == 200, r.text
-    assert r.json()["skipped"] == ["q.zip"]
+    # The bad entry is left out by name and the good one is staged: the zip
+    # used to be reported as skipped whole while its first entry stayed.
+    assert r.json()["skipped"] == ["q.zip/q2.png"]
+    assert _staged_names(srv, staging_id) == ["q1.png"]
     assert _files_on_disk(staging_dir) == set(_staged_paths(srv, staging_id))
 
 
@@ -2062,3 +2260,54 @@ def test_a_relpath_is_only_a_label_for_the_staged_file(shared, relpath, folder):
     assert str(uuid.UUID(stem)) == stem and ext == ".png"
     assert _files_on_disk(staging_dir) == {path}
     assert _staged_folders(srv, staging_id) == [folder]
+
+
+_TOO_BIG = 2**63
+_LARGEST = 2**63 - 1
+
+
+@pytest.mark.parametrize(
+    "field", ["project_id", "set_id", "character_id", "total_files"]
+)
+def test_an_open_with_an_integer_sqlite_cannot_store_is_a_422(shared, field):
+    """Refused by validation, before the id reaches a query that would raise
+    OverflowError; the largest storable id is looked up and not found."""
+    _srv, client = shared
+
+    r = client.post(_STAGING, json={field: _TOO_BIG})
+
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"][0]["loc"] == ["body", field]
+    in_range = client.post(_STAGING, json={field: _LARGEST})
+    assert in_range.status_code == (200 if field == "total_files" else 404), (
+        in_range.text
+    )
+
+
+def test_a_status_poll_from_an_offset_sqlite_cannot_store_is_a_422(shared):
+    _srv, client = shared
+    staging_id = _open_session(client)
+    status = f"{_STAGING}/{staging_id}/status"
+
+    r = client.get(status, params={"outcomes_from": _TOO_BIG})
+
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"][0]["loc"] == ["query", "outcomes_from"]
+    assert client.get(status, params={"outcomes_from": _LARGEST}).status_code == 200
+
+
+def test_a_direct_import_into_a_project_id_sqlite_cannot_store_is_a_422(shared):
+    srv, client = shared
+
+    def post(project_id):
+        return client.post(
+            f"{API}/pictures/import",
+            files=[("file", ("big-id.png", _png_bytes((9, 8, 7)), "image/png"))],
+            data={"project_id": str(project_id)},
+        )
+
+    r = post(_TOO_BIG)
+
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"][0]["loc"] == ["body", "project_id"]
+    assert post(_LARGEST).status_code == 404

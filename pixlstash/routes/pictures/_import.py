@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import zipfile
+import zlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -41,8 +42,14 @@ from pixlstash.db_models import (
 )
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
-from pixlstash.services import operation_log_service, scrapheap_service
+from pixlstash.services import (
+    import_dedup_service,
+    import_publish_service,
+    operation_log_service,
+    scrapheap_service,
+)
 from pixlstash.tasks import TaskType
+from pixlstash.tasks.base_task import PublicTaskFailure, TASK_FAILURE_MESSAGE
 from pixlstash.tasks.picture_import_task import PictureImportTask
 from pixlstash.db_models.tag import (
     TAG_PENDING_SENTINEL,
@@ -55,11 +62,14 @@ from pixlstash.db_models.character import Character
 from pixlstash.db_models.picture_set import PictureSet
 from pixlstash.db_models.project import Project
 from pixlstash.services.set_lock_service import locked_set_ids
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.media_files import SUPPORTED_MEDIA_EXTS
 from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
     session_tag_exclusions,
 )
+from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 from ._helpers import (
     _create_picture_imports,
@@ -69,6 +79,12 @@ from ._helpers import (
 
 
 logger = get_logger(__name__)
+
+#: The 503 detail when the library volume's free space cannot be read; the
+#: OSError itself (which names the path) is logged, not returned.
+_FREE_SPACE_UNREADABLE_DETAIL = (
+    "Cannot import: could not check free space on the library volume."
+)
 
 # Media extensions accepted by both the one-shot upload import and the async
 # streaming-staging import (#459). Kept module-level so both paths agree.
@@ -90,6 +106,31 @@ _MAX_SIDECAR_BYTES = 1024 * 1024
 
 # How much of an upload or zip entry is copied to disk at a time.
 _COPY_CHUNK_BYTES = 1024 * 1024
+
+# What reading one corrupt zip entry raises: a bad local header or CRC
+# (BadZipFile), a damaged deflate stream (zlib.error), a truncated one
+# (EOFError). The entry is left out and reported; the zip's other entries
+# still import.
+_CORRUPT_ZIP_ENTRY_ERRORS = (zipfile.BadZipFile, zlib.error, EOFError)
+
+# What the one-shot import's status says when something fails. An exception's
+# text can carry a path or library content, so it goes to the server log with
+# its traceback; the status carries one of these fixed sentences, chosen by
+# the kind of failure.
+#
+# A file that could not be imported, by what it raised: the reader raises
+# ``ValueError`` for content it cannot decode as a picture or a video, and a
+# write, a read or a publish that fails raises ``OSError``.
+FILE_UNREADABLE_REASON = "Not a picture or video this library can read."
+FILE_NOT_WRITTEN_REASON = "The file could not be written to the library."
+FILE_FAILED_REASON = "The file could not be imported; the server log has the details."
+# A zip entry that raised one of ``_CORRUPT_ZIP_ENTRY_ERRORS``.
+ZIP_ENTRY_DAMAGED_REASON = "This zip entry is damaged and cannot be decompressed."
+# ``engine_error``: the import completed but the model engine did not start.
+ENGINE_START_FAILED_MESSAGE = (
+    "The model engine could not start, so tagging and other model work wait "
+    "until it can; the server log has the details."
+)
 
 # Reaper bounds. An opened-but-never-committed session leaks its .staging/ dir
 # and memory; a finished session is never popped otherwise. The reaper (run
@@ -148,6 +189,25 @@ def _remove_session_dir(server, staging_id: str, session: dict) -> bool:
     return True
 
 
+def _remove_import_spool(spool_dir: str) -> None:
+    """Remove a one-shot import's spool folder, if it was made.
+
+    A folder that cannot be removed is logged and left for the staging
+    reaper, which sweeps it once it is older than the idle TTL.
+    """
+    if not os.path.lexists(spool_dir):
+        return
+    try:
+        shutil.rmtree(spool_dir)
+    except OSError as exc:
+        logger.warning(
+            "Import: could not remove the upload spool %s (the staging reaper "
+            "sweeps it later): %s",
+            spool_dir,
+            exc,
+        )
+
+
 def _sweep_orphan_staging_dirs(server, now_ms: int) -> None:
     """Remove entries under ``.staging/`` that no live session owns.
 
@@ -157,9 +217,15 @@ def _sweep_orphan_staging_dirs(server, now_ms: int) -> None:
     now. A symlink is unlinked, never followed.
     """
     staging_root = os.path.join(server.vault.image_root, ".staging")
-    if os.path.islink(staging_root) or not os.path.isdir(staging_root):
+    if is_link_or_missing(staging_root) or not os.path.isdir(staging_root):
         return
     live_ids = set(server.staging_sessions)
+    # A one-shot import's spool folder lives as long as its task runs.
+    live_ids.update(
+        task["spool_name"]
+        for task in list(server.import_tasks.values())
+        if task.get("status") == "in_progress" and task.get("spool_name")
+    )
     cutoff_s = now_ms / 1000.0 - _STAGING_SESSION_TTL_S
     try:
         names = os.listdir(staging_root)
@@ -495,6 +561,19 @@ def _copy_upload_part(upload: UploadFile, dest_path: str, stop: threading.Event)
     return written
 
 
+def _file_failure_reason(exc: BaseException) -> str:
+    """The sentence an import status gives for a file that raised *exc*.
+
+    Chosen by the exception's class, never built from its text; the caller
+    logs the exception itself.
+    """
+    if isinstance(exc, ValueError):
+        return FILE_UNREADABLE_REASON
+    if isinstance(exc, OSError):
+        return FILE_NOT_WRITTEN_REASON
+    return FILE_FAILED_REASON
+
+
 def _staging_file_limit(staged: int) -> HTTPException:
     """The 413 for a batch that would take the session past its file cap.
 
@@ -553,19 +632,19 @@ class StagingOpenRequest(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    project_id: Optional[int] = None
+    project_id: Optional[SqliteInt] = None
     """Optional project every imported picture is added to on commit."""
 
-    set_id: Optional[int] = None
+    set_id: Optional[SqliteInt] = None
     """Optional picture set every imported picture is added to on commit
     (a drop-to-set target). Independent of ``character_id``."""
 
-    character_id: Optional[int] = None
+    character_id: Optional[SqliteInt] = None
     """Optional character every imported picture is associated with on commit
     (a drop-to-character target; deferred via ``pending_character_id`` until face
     extraction runs). Independent of ``set_id``."""
 
-    total_files: Optional[int] = None
+    total_files: Optional[SqliteInt] = None
     """Client-declared file count (a hint for the progress UI / safe threshold);
     the actual import uses whatever was streamed before commit."""
 
@@ -581,6 +660,12 @@ class StagingOpenResponse(BaseModel):
     safe_threshold: int
     """The declared file count at which the client may hand off to the safe
     (background) window; ``0`` when the client did not declare a total."""
+
+    library_uuid: str
+    """The library the session was opened in, as ``GET /libraries`` names it.
+    The session belongs to it: once another library is active every call on
+    the session answers 404, so a client keys what it keeps about the session
+    by this rather than by whichever library it believes is active."""
 
 
 class StagingFilesResponse(BaseModel):
@@ -722,11 +807,18 @@ class ImportResultEntry(BaseModel):
 
     status: str
     """``success`` (a new picture), ``duplicate`` (content already live in the
-    vault), or ``scrapheaped`` (content matched a picture in the Scrapheap: not
-    imported again, the picture is restored instead)."""
+    vault), ``scrapheaped`` (content matched a picture in the Scrapheap: not
+    imported again, the picture is restored instead), or ``failed`` (the file
+    could not be read as an image or a video and was left out; the rest of the
+    batch still imports)."""
 
     picture_id: Optional[int] = None
     file: Optional[str] = None
+    """The picture's stored path, or for a ``failed`` entry the uploaded file
+    name."""
+
+    error: Optional[str] = None
+    """Why a ``failed`` file could not be imported."""
 
 
 class ImportStatusResponse(BaseModel):
@@ -748,10 +840,15 @@ class ImportStatusResponse(BaseModel):
     """Files whose content matched a picture in the Scrapheap.
 
     Counted per FILE, so ``imported_count + duplicate_count +
-    scrapheaped_count == total``. These files were not imported again (that
-    would double the bytes on disk and refill the duplicate queue); the import
-    restored the matching picture instead.
+    scrapheaped_count + failed_count == total``. These files were not imported
+    again (that would double the bytes on disk and refill the duplicate queue);
+    the import restored the matching picture instead.
     """
+
+    failed_count: Optional[int] = None
+    """Files that could not be read as an image or a video and were left out,
+    each with a ``failed`` entry in ``results``. The rest of the batch imports;
+    when every file fails, the import's ``status`` is ``failed`` instead."""
 
     scrapheaped_picture_ids: Optional[list[int]] = None
     """Distinct pictures behind ``scrapheaped_count`` that the import restored.
@@ -773,7 +870,7 @@ def register_routes(router, server):
     def import_pictures(
         request: Request,
         file: list[UploadFile] = File(None),
-        project_id: int | None = Form(None),
+        project_id: Optional[SqliteInt] = Form(None),
     ):
         # Capture the originating tab's client id synchronously, at request
         # entry. The import runs on a detached executor thread where the origin
@@ -808,21 +905,47 @@ def register_routes(router, server):
         dest_folder = server.vault.image_root
         logger.debug("Importing pictures to folder: " + str(dest_folder))
         os.makedirs(dest_folder, exist_ok=True)
-        uploaded_files = []
+        task_id = str(uuid.uuid4())
+        # Each media upload and zip entry is copied here a chunk at a time,
+        # never read whole into memory, because the upload's own temporary
+        # file is closed once this request returns. On the library volume, so
+        # publishing copies within it. The import task removes the folder; the
+        # staging reaper sweeps one a dead process left.
+        spool_name = f"import-{task_id}"
+        spool_dir = os.path.join(dest_folder, ".staging", spool_name)
+        # (spooled path, ext, upload name) per media file, with its size.
+        uploaded_files: list[tuple[str, str, str]] = []
+        uploaded_sizes: list[int] = []
         # Captions and media are paired by ``(folder, stem)``: a caption only
         # tags media with its stem in the same folder. A plain upload has no
         # folder; a zip member's folder is its directory inside the archive.
         uploaded_file_keys: list[tuple[str, str]] = []
         sidecar_text_by_key: dict[tuple[str, str], str] = {}
+        # Zip entries that could not be decompressed, as (name, reason): each
+        # is reported as a failed file, and the rest of the zip imports.
+        unreadable_entries: list[tuple[str, str]] = []
         allowed_caption_exts = {".txt"}
 
+        def _spool(source, ext: str) -> tuple[str, int]:
+            """Copy *source* from its current position into the spool folder
+            a chunk at a time; return the copy's path and size.
+
+            ``.staging`` is checked the way a staging session's is, so a link
+            or junction there never takes the spool out of the library."""
+            _staging_base_dir()
+            os.makedirs(spool_dir, exist_ok=True)
+            path = os.path.join(spool_dir, f"{len(uploaded_files)}{ext}")
+            with open(path, "xb") as out:
+                shutil.copyfileobj(source, out, _COPY_CHUNK_BYTES)
+            return path, os.path.getsize(path)
+
         def _read_zip(upload: UploadFile) -> None:
-            """Read an uploaded zip's media and caption entries.
+            """Read an uploaded zip's caption entries and spool its media.
 
             Blocking file I/O on the spooled temporary file: the route is a
             plain ``def``, so it runs on a threadpool worker, never on the
-            event loop. Each media entry is read whole, because the
-            import takes the media as bytes.
+            event loop. A media entry is decompressed into the spool folder a
+            chunk at a time; a caption is read whole, as it is bounded.
             """
             upload_file = upload.file
             upload_file.seek(0, 2)
@@ -860,13 +983,40 @@ def register_routes(router, server):
                     is_caption = inner_ext in allowed_caption_exts
                     if not is_caption and inner_ext not in STAGING_ALLOWED_MEDIA_EXTS:
                         continue
-                    with zip_file.open(info) as handle:
-                        data = (
-                            handle.read(_MAX_SIDECAR_BYTES + 1)
-                            if is_caption
-                            else handle.read()
+                    spooled = None
+                    try:
+                        with zip_file.open(info) as handle:
+                            if is_caption:
+                                data = handle.read(_MAX_SIDECAR_BYTES + 1)
+                            else:
+                                spooled = _spool(handle, inner_ext)
+                    except _CORRUPT_ZIP_ENTRY_ERRORS as exc:
+                        partial = os.path.join(
+                            spool_dir, f"{len(uploaded_files)}{inner_ext}"
                         )
-                    if not data:
+                        if not is_caption and os.path.exists(partial):
+                            os.remove(partial)
+                        logger.warning(
+                            "Import task %s: leaving out %s in zip %s: it "
+                            "cannot be decompressed: %s: %s",
+                            task_id,
+                            info.filename,
+                            upload.filename,
+                            type(exc).__name__,
+                            exc,
+                            exc_info=True,
+                        )
+                        unreadable_entries.append(
+                            (
+                                f"{upload.filename}/{info.filename}",
+                                ZIP_ENTRY_DAMAGED_REASON,
+                            )
+                        )
+                        continue
+                    if spooled is not None and spooled[1] == 0:
+                        os.remove(spooled[0])
+                        continue
+                    if is_caption and not data:
                         continue
                     base_name = os.path.basename(info.filename)
                     sidecar_key = (
@@ -888,7 +1038,8 @@ def register_routes(router, server):
                             data.decode("utf-8", errors="ignore"),
                         )
                         continue
-                    uploaded_files.append((data, inner_ext, base_name))
+                    uploaded_files.append((spooled[0], inner_ext, base_name))
+                    uploaded_sizes.append(spooled[1])
                     uploaded_file_keys.append(sidecar_key)
                     added += 1
                 if added == 0:
@@ -897,7 +1048,10 @@ def register_routes(router, server):
                         upload.filename,
                     )
 
-        if file is not None:
+        if file is None:
+            logger.error("No files provided for import")
+            raise HTTPException(status_code=400, detail="No image provided")
+        try:
             for upload in file:
                 if not upload.filename:
                     continue
@@ -914,58 +1068,75 @@ def register_routes(router, server):
                             status_code=400,
                             detail="Invalid zip file",
                         ) from exc
-                else:
-                    if ext in allowed_caption_exts:
-                        contents = upload.file.read(_MAX_SIDECAR_BYTES + 1)
-                        if len(contents) > _MAX_SIDECAR_BYTES:
-                            logger.warning(
-                                "Leaving out caption %s: larger than %d bytes",
-                                upload.filename,
-                                _MAX_SIDECAR_BYTES,
-                            )
-                            continue
-                    else:
-                        # Media is held whole until the import thread writes
-                        # it, because the import takes it as bytes.
-                        contents = upload.file.read()
-                    if not contents:
-                        continue
-                    if len(contents) > _MAX_UPLOAD_BYTES:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(
-                                f"Uploaded file '{upload.filename}' exceeds the "
-                                f"{_MAX_UPLOAD_BYTES // 1024**3} GB limit."
-                            ),
+                    continue
+                if ext in allowed_caption_exts:
+                    contents = upload.file.read(_MAX_SIDECAR_BYTES + 1)
+                    if len(contents) > _MAX_SIDECAR_BYTES:
+                        logger.warning(
+                            "Leaving out caption %s: larger than %d bytes",
+                            upload.filename,
+                            _MAX_SIDECAR_BYTES,
                         )
-                    if ext in allowed_caption_exts:
+                        continue
+                    if contents:
                         sidecar_text_by_key.setdefault(
                             ("", _normalise_sidecar_stem(upload.filename)),
                             contents.decode("utf-8", errors="ignore"),
                         )
-                        continue
-                    if ext not in STAGING_ALLOWED_MEDIA_EXTS:
-                        logger.warning(
-                            "Skipping file with unsupported extension: %s",
-                            upload.filename,
-                        )
-                        continue
-                    uploaded_files.append((contents, ext, upload.filename))
-                    uploaded_file_keys.append(
-                        ("", _normalise_sidecar_stem(upload.filename))
+                    continue
+                if ext not in STAGING_ALLOWED_MEDIA_EXTS:
+                    logger.warning(
+                        "Skipping file with unsupported extension: %s",
+                        upload.filename,
                     )
-        else:
-            logger.error("No files provided for import")
-            raise HTTPException(status_code=400, detail="No image provided")
+                    continue
+                # Sized before anything is copied, so an oversized upload is
+                # refused without writing it.
+                upload.file.seek(0, 2)
+                upload_size = upload.file.tell()
+                upload.file.seek(0)
+                if upload_size == 0:
+                    continue
+                if upload_size > _MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Uploaded file '{upload.filename}' exceeds the "
+                            f"{_MAX_UPLOAD_BYTES // 1024**3} GB limit."
+                        ),
+                    )
+                path, size = _spool(upload.file, ext)
+                uploaded_files.append((path, ext, upload.filename))
+                uploaded_sizes.append(size)
+                uploaded_file_keys.append(
+                    ("", _normalise_sidecar_stem(upload.filename))
+                )
+        except OSError as exc:
+            _remove_import_spool(spool_dir)
+            if exc.errno in _DISK_FULL_ERRNOS:
+                raise _staging_disk_full(task_id, spool_dir, exc) from exc
+            raise
+        except BaseException:
+            _remove_import_spool(spool_dir)
+            raise
 
         if not uploaded_files:
             logger.error("No valid media files found for import")
+            _remove_import_spool(spool_dir)
+            if unreadable_entries:
+                reasons = "; ".join(
+                    f"{name}: {reason}" for name, reason in unreadable_entries[:5]
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No valid media files found for import ({reasons})",
+                )
             raise HTTPException(
                 status_code=400,
                 detail="No valid media files found for import",
             )
 
-        total_import_bytes_log = sum(len(data) for data, *_ in uploaded_files)
+        total_import_bytes_log = sum(uploaded_sizes)
         logger.info(
             "Import request received: files=%d, sidecar_txt=%d, project_id=%s, total_bytes=%d",
             len(uploaded_files),
@@ -986,12 +1157,29 @@ def register_routes(router, server):
                 if parsed_tags:
                     sidecar_tags_by_key[sidecar_key] = parsed_tags
 
-        total_import_bytes = sum(len(data) for data, *_ in uploaded_files)
-        free_bytes = shutil.disk_usage(dest_folder).free
+        total_import_bytes = sum(uploaded_sizes)
+        # An unreadable volume is refused, as the staged commit refuses it:
+        # importing without knowing the free space could fill the disk.
+        try:
+            free_bytes = shutil.disk_usage(dest_folder).free
+        except OSError as exc:
+            logger.error(
+                "Import request: cannot check free space on %s before import: %s",
+                dest_folder,
+                exc,
+                exc_info=True,
+            )
+            _remove_import_spool(spool_dir)
+            raise HTTPException(
+                status_code=503, detail=_FREE_SPACE_UNREADABLE_DETAIL
+            ) from exc
+        # The spooled copies already hold their space; this is what publishing
+        # them takes on top.
         required_bytes = int(total_import_bytes * 1.1)  # 10% headroom
         if required_bytes > free_bytes:
             free_gb = free_bytes / 1024**3
             needed_gb = required_bytes / 1024**3
+            _remove_import_spool(spool_dir)
             raise HTTPException(
                 status_code=507,
                 detail=(
@@ -1001,12 +1189,12 @@ def register_routes(router, server):
                 ),
             )
 
-        task_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
         server.import_tasks[task_id] = {
+            "spool_name": spool_name,
             "status": "in_progress",
             "stage": "queued",
-            "total": len(uploaded_files),
+            "total": len(uploaded_files) + len(unreadable_entries),
             "processed": 0,
             "results": None,
             "error": None,
@@ -1044,81 +1232,164 @@ def register_routes(router, server):
                     task["processed"] = task.get("processed", 0) + 1
                     task["last_update_epoch_ms"] = int(time.time() * 1000)
 
-                fingerprints, existing_map, scrapheaped_map, new_picture_map = (
-                    _create_picture_imports(
-                        SimpleNamespace(vault=vault),
-                        uploaded_files,
-                        dest_folder,
-                        progress_callback=_on_picture_written,
+                # Upload index -> why that file could not be imported. One bad
+                # file is counted and the rest of the batch still imports, as
+                # the staging path does with its failed bucket.
+                failed_errors: dict[int, str] = {}
+
+                def _on_file_failed(index: int, exc: Exception):
+                    # ``_create_picture_imports`` has logged the exception,
+                    # with the file's name and its traceback.
+                    failed_errors[index] = _file_failure_reason(exc)
+                    _on_picture_written()
+
+                # The files are hashed, looked up and copied into the library
+                # before the import lock is taken, so no other import waits on
+                # them. The look again and the insert hold the lock, as on
+                # every import path: an overlapping import of the same new
+                # file looks up only after this one's rows exist. A
+                # copy whose row does not commit is removed again: left
+                # behind, the next root scan indexes it as a new picture
+                # without the upload's caption tags.
+                with import_publish_service.PublishedPictures(
+                    dest_folder, f"Import task {task_id}"
+                ) as published:
+                    # The candidates the lookup compared: the look again
+                    # under the lock reads no file for them.
+                    compared: set[int] = set()
+                    fingerprints, existing_map, scrapheaped_map, new_picture_map = (
+                        _create_picture_imports(
+                            SimpleNamespace(vault=vault),
+                            uploaded_files,
+                            dest_folder,
+                            progress_callback=_on_picture_written,
+                            on_file_failed=_on_file_failed,
+                            compared=compared,
+                        )
                     )
-                )
+                    for pic in new_picture_map.values():
+                        published.add(pic)
+                    # Every spooled file is published or matched by now. The
+                    # ``finally`` below removes the spool on a failure.
+                    _remove_import_spool(spool_dir)
+                    if len(failed_errors) == len(uploaded_files):
+                        # Nothing came in, so the import failed: a caller sending
+                        # one file at a time (the ComfyUI node) is told why. The
+                        # names are the ones the caller uploaded, and each
+                        # reason is one of the fixed sentences.
+                        reasons = "; ".join(
+                            f"{uploaded_files[index][2]}: {reason}"
+                            for index, reason in list(failed_errors.items())[:5]
+                        )
+                        raise PublicTaskFailure(
+                            f"None of the {len(uploaded_files)} file(s) could be "
+                            f"imported: {reasons}"
+                        )
 
-                # Duplicates are instantly "processed" - credit them now so that
-                # the progress bar stays accurate even when most files are dupes.
-                # Scrapheap matches are equally instant and are counted in their
-                # OWN bucket: they are neither imported nor ordinary duplicates.
-                # Both are counted directly (one pass over fingerprints), never derived
-                # by subtracting from the total.
-                fresh_seen = set()
-                duplicate_count_initial = 0
-                for fingerprint in fingerprints:
-                    if fingerprint in existing_map or fingerprint in fresh_seen:
-                        duplicate_count_initial += 1
-                    elif fingerprint not in scrapheaped_map:
-                        fresh_seen.add(fingerprint)
-                scrapheaped_count_initial = sum(
-                    1 for fingerprint in fingerprints if fingerprint in scrapheaped_map
-                )
-                new_pictures = list(new_picture_map.values())
-                task["processed"] = (
-                    len(new_pictures)
-                    + duplicate_count_initial
-                    + scrapheaped_count_initial
-                )
-                task["last_update_epoch_ms"] = int(time.time() * 1000)
-
-                _mark_stage(
-                    "deduplicated",
-                    duplicate_count_initial=duplicate_count_initial,
-                    scrapheaped_count_initial=scrapheaped_count_initial,
-                    new_count=len(new_pictures),
-                )
-
-                logger.debug(
-                    f"Importing {len(new_pictures)} new pictures out of {len(uploaded_files)} uploaded."
-                )
-
-                if new_pictures:
-                    _mark_stage("persisting_new_pictures")
-
-                    def import_task(session):
-                        session.add_all(new_pictures)
-                        session.flush()
-                        for pic in new_pictures:
-                            session.add(
-                                Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id)
+                    with import_dedup_service.serialised_import():
+                        # Another import can have added a new file's content
+                        # since the lookup: the file is then that picture's
+                        # duplicate, or scrapheaped, as if the lookup had
+                        # found it.
+                        built = list(new_picture_map.items())
+                        meanwhile = import_publish_service.withdraw_imported_meanwhile(
+                            vault.db,
+                            published,
+                            [(pic, fingerprint[2]) for fingerprint, pic in built],
+                            compared,
+                        )
+                        for (fingerprint, _pic), match in zip(built, meanwhile):
+                            if match is None:
+                                continue
+                            del new_picture_map[fingerprint]
+                            if match.deleted:
+                                scrapheaped_map[fingerprint] = match
+                            else:
+                                existing_map[fingerprint] = match
+                            logger.info(
+                                "Import task %s: picture %d%s with the content of "
+                                "an upload was imported while this import read "
+                                "it; counted as its %s.",
+                                task_id,
+                                match.id,
+                                " (in the Scrapheap)" if match.deleted else "",
+                                "Scrapheap match" if match.deleted else "duplicate",
                             )
-                        session.commit()
-                        for pic in new_pictures:
-                            session.refresh(pic)
-                        return new_pictures
 
-                    new_pictures = vault.db.run_task(import_task)
-                    logger.debug(
-                        f"Queuing likeness calculation for {len(new_pictures)} new pictures."
-                    )
-                else:
-                    logger.warning(
-                        "No new pictures to import; every file already matches a "
-                        "live or scrapheaped picture."
-                    )
-                    new_pictures = []
+                        # Duplicates are instantly "processed" - credit them now so that
+                        # the progress bar stays accurate even when most files are dupes.
+                        # Scrapheap matches are equally instant and are counted in their
+                        # OWN bucket: they are neither imported nor ordinary duplicates.
+                        # Both are counted directly (one pass over fingerprints), never derived
+                        # by subtracting from the total.
+                        fresh_seen = set()
+                        duplicate_count_initial = 0
+                        for fingerprint in fingerprints:
+                            if fingerprint in existing_map or fingerprint in fresh_seen:
+                                duplicate_count_initial += 1
+                            elif fingerprint not in scrapheaped_map:
+                                fresh_seen.add(fingerprint)
+                        scrapheaped_count_initial = sum(
+                            1
+                            for fingerprint in fingerprints
+                            if fingerprint in scrapheaped_map
+                        )
+                        new_pictures = list(new_picture_map.values())
+                        task["processed"] = (
+                            len(new_pictures)
+                            + duplicate_count_initial
+                            + scrapheaped_count_initial
+                            + len(failed_errors)
+                            + len(unreadable_entries)
+                        )
+                        task["last_update_epoch_ms"] = int(time.time() * 1000)
+
+                        _mark_stage(
+                            "deduplicated",
+                            duplicate_count_initial=duplicate_count_initial,
+                            scrapheaped_count_initial=scrapheaped_count_initial,
+                            new_count=len(new_pictures),
+                        )
+
+                        logger.debug(
+                            f"Importing {len(new_pictures)} new pictures out of {len(uploaded_files)} uploaded."
+                        )
+
+                        if new_pictures:
+                            _mark_stage("persisting_new_pictures")
+
+                            def import_task(session):
+                                session.add_all(new_pictures)
+                                session.flush()
+                                for pic in new_pictures:
+                                    session.add(
+                                        Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id)
+                                    )
+                                session.commit()
+                                # The rows are in the library: their files are theirs
+                                # now, whatever fails after this line.
+                                published.mark_committed()
+                                for pic in new_pictures:
+                                    session.refresh(pic)
+                                return new_pictures
+
+                            new_pictures = vault.db.run_task(import_task)
+                            logger.debug(
+                                f"Queuing likeness calculation for {len(new_pictures)} new pictures."
+                            )
+                        else:
+                            logger.warning(
+                                "No new pictures to import; every file already matches a "
+                                "live or scrapheaped picture."
+                            )
+                            new_pictures = []
 
                 _mark_stage("building_results")
                 results = []
                 imported_count = 0
                 duplicate_count = 0
                 scrapheaped_count = 0
+                failed_count = 0
                 picture_id_sidecar_tags: dict[int, set[str]] = defaultdict(set)
                 duplicate_picture_id_set: set[int] = set()
                 # Distinct scrapheaped pictures this import restores. Several
@@ -1128,13 +1399,25 @@ def register_routes(router, server):
                 scrapheaped_picture_ids: list[int] = []
                 seen_scrapheaped_ids: set[int] = set()
                 seen_new_fingerprints = set()
-                for sidecar_key, _, fingerprint in zip(
-                    uploaded_file_keys, uploaded_files, fingerprints
+                for index, (sidecar_key, file_entry, fingerprint) in enumerate(
+                    zip(uploaded_file_keys, uploaded_files, fingerprints)
                 ):
-                    # Three disjoint outcomes per uploaded file. `existing_map`
+                    # Four disjoint outcomes per uploaded file. `existing_map`
                     # and `scrapheaped_map` are disjoint by construction (a live
-                    # row outranks a soft-deleted one for the same hash), so the
-                    # branches below cannot double-count.
+                    # row outranks a soft-deleted one for the same hash), and a
+                    # failed file is in neither, so the branches below cannot
+                    # double-count.
+                    if index in failed_errors:
+                        results.append(
+                            {
+                                "status": "failed",
+                                "picture_id": None,
+                                "file": file_entry[2],
+                                "error": failed_errors[index],
+                            }
+                        )
+                        failed_count += 1
+                        continue
                     if fingerprint in existing_map:
                         pic = existing_map[fingerprint]
                         results.append(
@@ -1197,6 +1480,19 @@ def register_routes(router, server):
                             sidecar_tags_by_key[sidecar_key]
                         )
 
+                # Zip entries that could not be decompressed never became an
+                # upload; they are failed files of this import all the same.
+                for entry_name, reason in unreadable_entries:
+                    results.append(
+                        {
+                            "status": "failed",
+                            "picture_id": None,
+                            "file": entry_name,
+                            "error": reason,
+                        }
+                    )
+                    failed_count += 1
+
                 if duplicate_count:
                     logger.warning(
                         "Import completed with %d duplicate(s) out of %d file(s).",
@@ -1220,27 +1516,40 @@ def register_routes(router, server):
                         matched_ids,
                         scrapheaped_picture_ids,
                     )
-                bucket_total = imported_count + duplicate_count + scrapheaped_count
-                if bucket_total != len(uploaded_files):
-                    # The three buckets are the whole story of this import; a
+                file_total = len(uploaded_files) + len(unreadable_entries)
+                if failed_count:
+                    logger.warning(
+                        "Import task %s: %d of %d file(s) could not be imported "
+                        "and were left out; the other files were imported.",
+                        task_id,
+                        failed_count,
+                        file_total,
+                    )
+                bucket_total = (
+                    imported_count + duplicate_count + scrapheaped_count + failed_count
+                )
+                if bucket_total != file_total:
+                    # The four buckets are the whole story of this import; a
                     # mismatch means the summary the user reads is wrong, so say
                     # so loudly rather than let a silently-lossy count ship.
                     logger.error(
                         "Import task %s bucket arithmetic is inconsistent: "
-                        "imported=%d + duplicate=%d + scrapheaped=%d = %d, but "
-                        "%d file(s) were uploaded.",
+                        "imported=%d + duplicate=%d + scrapheaped=%d + failed=%d "
+                        "= %d, but %d file(s) were uploaded.",
                         task_id,
                         imported_count,
                         duplicate_count,
                         scrapheaped_count,
+                        failed_count,
                         bucket_total,
-                        len(uploaded_files),
+                        file_total,
                     )
                 server.import_tasks[task_id]["results"] = results
-                server.import_tasks[task_id]["processed"] = len(uploaded_files)
+                server.import_tasks[task_id]["processed"] = file_total
                 server.import_tasks[task_id]["imported_count"] = imported_count
                 server.import_tasks[task_id]["duplicate_count"] = duplicate_count
                 server.import_tasks[task_id]["scrapheaped_count"] = scrapheaped_count
+                server.import_tasks[task_id]["failed_count"] = failed_count
                 server.import_tasks[task_id]["scrapheaped_picture_ids"] = (
                     scrapheaped_picture_ids
                 )
@@ -1270,11 +1579,16 @@ def register_routes(router, server):
                     ):
                         if not mapping:
                             return []
-                        pics = session.exec(
-                            select(Picture)
-                            .where(Picture.id.in_(list(mapping.keys())))
-                            .where(Picture.deleted.is_(False))
-                        ).all()
+                        # One entry per uploaded file with a sidecar: no cap.
+                        pics = [
+                            pic
+                            for chunk in chunked(list(mapping.keys()))
+                            for pic in session.exec(
+                                select(Picture)
+                                .where(Picture.id.in_(chunk))
+                                .where(Picture.deleted.is_(False))
+                            ).all()
+                        ]
                         changed_ids = []
                         replaced_ids = []
                         exclusions = session_tag_exclusions(session)
@@ -1360,9 +1674,26 @@ def register_routes(router, server):
                     # server not readied at start-up, or a library switch whose
                     # engine build failed and kept the library open. Its model
                     # workers stay idle until one is built, so only an import
-                    # that brought new pictures in builds it.
+                    # that brought new pictures in builds it. A build that
+                    # fails does not fail the import: its pictures are already
+                    # in the library. The failure is logged and reported with
+                    # the result, and the next import builds again, since a
+                    # failed build leaves the vault without an engine.
                     if new_pictures:
-                        vault.ensure_ready()
+                        try:
+                            vault.ensure_ready()
+                        except Exception as exc:
+                            logger.error(
+                                "Import task %s saved its %d new picture(s), but "
+                                "the model engine could not start, so their "
+                                "tagging and other model work waits until it "
+                                "can: %s",
+                                task_id,
+                                len(new_pictures),
+                                exc,
+                                exc_info=True,
+                            )
+                            task["engine_error"] = ENGINE_START_FAILED_MESSAGE
 
                     def apply_import_context(
                         session,
@@ -1372,9 +1703,13 @@ def register_routes(router, server):
                         if not ids:
                             return []
                         now = datetime.now(timezone.utc)
-                        pics = session.exec(
-                            select(Picture).where(Picture.id.in_(ids))
-                        ).all()
+                        pics = [
+                            pic
+                            for chunk in chunked(ids)
+                            for pic in session.exec(
+                                select(Picture).where(Picture.id.in_(chunk))
+                            ).all()
+                        ]
                         updated = []
                         for pic in pics:
                             if pic.imported_at is None:
@@ -1455,12 +1790,25 @@ def register_routes(router, server):
             except Exception as exc:
                 server.import_tasks[task_id]["status"] = "failed"
                 server.import_tasks[task_id]["stage"] = "failed"
-                server.import_tasks[task_id]["error"] = str(exc)
+                # Only a message the server composed is served; any other
+                # failure's text stays in the log written below.
+                server.import_tasks[task_id]["error"] = (
+                    exc.public_message
+                    if isinstance(exc, PublicTaskFailure)
+                    else TASK_FAILURE_MESSAGE
+                )
                 server.import_tasks[task_id]["last_update_epoch_ms"] = int(
                     time.time() * 1000
                 )
-                logger.error(f"Import task {task_id} failed: {exc}")
+                logger.error(
+                    "Import task %s failed (%d file(s) uploaded): %s",
+                    task_id,
+                    len(uploaded_files),
+                    exc,
+                    exc_info=True,
+                )
             finally:
+                _remove_import_spool(spool_dir)
                 server.library_coordinator.release_read(background_lease)
 
         # Schedule independently from the ASGI/event-loop lifecycle. Using
@@ -1474,6 +1822,7 @@ def register_routes(router, server):
             server.import_tasks[task_id]["status"] = "failed"
             server.import_tasks[task_id]["stage"] = "failed"
             server.import_tasks[task_id]["error"] = "Library is unavailable."
+            _remove_import_spool(spool_dir)
             raise HTTPException(
                 status_code=503,
                 detail="Library is switching or unavailable. Try again.",
@@ -1488,6 +1837,7 @@ def register_routes(router, server):
             )
             worker.start()
         except Exception:
+            _remove_import_spool(spool_dir)
             server.library_coordinator.release_read(background_lease)
             raise
         return {"task_id": task_id}
@@ -1540,14 +1890,18 @@ def register_routes(router, server):
         }
         if task["status"] == "completed":
             payload["results"] = task.get("results") or []
-            # The three disjoint buckets, each counted directly while the results
+            # The four disjoint buckets, each counted directly while the results
             # were built: never derived from the total by subtraction.
             payload["imported_count"] = task.get("imported_count")
             payload["duplicate_count"] = task.get("duplicate_count")
             payload["scrapheaped_count"] = task.get("scrapheaped_count")
+            payload["failed_count"] = task.get("failed_count")
             payload["scrapheaped_picture_ids"] = (
                 task.get("scrapheaped_picture_ids") or []
             )
+            # Set when the pictures were saved but the model engine could not
+            # start; their model work waits until a later import builds it.
+            payload["engine_error"] = task.get("engine_error")
         if task["status"] == "failed":
             payload["error"] = task.get("error")
         return payload
@@ -1565,7 +1919,14 @@ def register_routes(router, server):
 
     def _staging_base_dir() -> str:
         path = os.path.join(server.vault.image_root, ".staging")
-        if os.path.lexists(path) and (os.path.islink(path) or not os.path.isdir(path)):
+        if os.path.lexists(path) and (
+            is_link_or_missing(path) or not os.path.isdir(path)
+        ):
+            logger.error(
+                "Refusing the library staging path %s: it is a link, a "
+                "junction or not a directory.",
+                path,
+            )
             raise HTTPException(
                 status_code=500,
                 detail="The library staging path is not a trusted directory.",
@@ -1720,7 +2081,11 @@ def register_routes(router, server):
             payload.set_id,
             payload.character_id,
         )
-        return {"staging_id": staging_id, "safe_threshold": declared_total}
+        return {
+            "staging_id": staging_id,
+            "safe_threshold": declared_total,
+            "library_uuid": lease.library_uuid,
+        }
 
     @router.post(
         "/pictures/import/staging/{staging_id}/files",
@@ -1855,10 +2220,16 @@ def register_routes(router, server):
             info: zipfile.ZipInfo,
             ext: str,
             stop: threading.Event,
+            zip_name: str,
         ) -> bool:
             """Copy one media entry of a zip into the staging dir, a chunk at a
             time, raising ``_UploadCopyStopped`` before the next chunk once
-            *stop* is set."""
+            *stop* is set.
+
+            An entry that cannot be decompressed is left out and reported in
+            ``skipped`` as ``<zip>/<entry>``; the entries staged before it stay
+            staged and the rest of the zip goes on.
+            """
             if info.file_size == 0:
                 return False
             _check_file_cap()
@@ -1885,6 +2256,19 @@ def register_routes(router, server):
                     info.filename,
                     exc,
                 )
+                return False
+            except _CORRUPT_ZIP_ENTRY_ERRORS as exc:
+                _remove_batch_files(staging_id, [dest_path])
+                logger.warning(
+                    "Staging %s: leaving out %s in zip %s: it cannot be "
+                    "decompressed: %s: %s",
+                    staging_id,
+                    info.filename,
+                    zip_name,
+                    type(exc).__name__,
+                    exc,
+                )
+                skipped.append(f"{zip_name}/{info.filename}")
                 return False
             except Exception:
                 # A corrupt entry fails part-way through the copy, and a
@@ -1960,8 +2344,21 @@ def register_routes(router, server):
                     inner_ext = os.path.splitext(info.filename)[1].lower()
                     base_name = os.path.basename(info.filename)
                     if inner_ext in STAGING_ALLOWED_CAPTION_EXTS:
-                        with zip_file.open(info) as handle:
-                            data = handle.read(_MAX_SIDECAR_BYTES + 1)
+                        try:
+                            with zip_file.open(info) as handle:
+                                data = handle.read(_MAX_SIDECAR_BYTES + 1)
+                        except _CORRUPT_ZIP_ENTRY_ERRORS as exc:
+                            logger.warning(
+                                "Staging %s: leaving out caption %s in zip %s: "
+                                "it cannot be decompressed: %s: %s",
+                                staging_id,
+                                info.filename,
+                                upload.filename,
+                                type(exc).__name__,
+                                exc,
+                            )
+                            skipped.append(f"{upload.filename}/{info.filename}")
+                            continue
                         if len(data) > _MAX_SIDECAR_BYTES:
                             logger.warning(
                                 "Staging %s: leaving out caption %s in zip %s: "
@@ -1982,7 +2379,9 @@ def register_routes(router, server):
                         continue
                     if inner_ext not in STAGING_ALLOWED_MEDIA_EXTS:
                         continue
-                    if _stage_zip_entry(zip_file, info, inner_ext, stop):
+                    if _stage_zip_entry(
+                        zip_file, info, inner_ext, stop, upload.filename
+                    ):
                         added += 1
                 return added
 
@@ -2302,16 +2701,14 @@ def register_routes(router, server):
                 free_bytes = shutil.disk_usage(server.vault.image_root).free
             except OSError as exc:
                 logger.error(
-                    "Staging %s: cannot check free space before import: %s",
+                    "Staging %s: cannot check free space on %s before import: %s",
                     staging_id,
+                    server.vault.image_root,
                     exc,
+                    exc_info=True,
                 )
                 raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Cannot import: could not check free space on the "
-                        f"library volume ({exc.strerror or exc})."
-                    ),
+                    status_code=503, detail=_FREE_SPACE_UNREADABLE_DETAIL
                 ) from exc
             if int(staged_bytes * 1.1) > free_bytes:
                 raise HTTPException(
@@ -2347,6 +2744,12 @@ def register_routes(router, server):
                     server.library_coordinator.release_read, library_lease
                 ),
             )
+            # A stopped runner (shutdown, library switch) refuses the task:
+            # ``Vault.submit_task`` logs the stop and returns None. While
+            # admission is paused (a library restore) this person's task is
+            # refused before it is touched: ``TaskAdmissionRefused``, which
+            # the server answers with 409. Either way the session goes back
+            # to staging below, so the same commit can be retried.
             task_id = server.vault.submit_task(task)
             if task_id is None:
                 raise HTTPException(
@@ -2444,7 +2847,7 @@ def register_routes(router, server):
         ),
         response_model=StagingStatusResponse,
     )
-    def staging_status(request: Request, staging_id: str, outcomes_from: int = 0):
+    def staging_status(request: Request, staging_id: str, outcomes_from: SqliteInt = 0):
         session = _get_session_or_404(request, staging_id)
         with session["lock"]:
             staged_count = len(session["staged_files"])
