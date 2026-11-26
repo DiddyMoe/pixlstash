@@ -1905,25 +1905,25 @@ onBeforeUnmount(() => {
 }
 
 .trl-notice--err {
-  box-shadow: inset 3px 0 0 rgb(var(--v-theme-surface-error));
+  box-shadow: inset var(--rail-w) 0 0 rgb(var(--v-theme-surface-error));
 }
 .trl-notice--err .trl-notice-glyph {
   color: rgb(var(--v-theme-surface-error));
 }
 .trl-notice--warn {
-  box-shadow: inset 3px 0 0 rgb(var(--v-theme-surface-warning));
+  box-shadow: inset var(--rail-w) 0 0 rgb(var(--v-theme-surface-warning));
 }
 .trl-notice--warn .trl-notice-glyph {
   color: rgb(var(--v-theme-surface-warning));
 }
 .trl-notice--info {
-  box-shadow: inset 3px 0 0 rgb(var(--v-theme-surface-info));
+  box-shadow: inset var(--rail-w) 0 0 rgb(var(--v-theme-surface-info));
 }
 .trl-notice--info .trl-notice-glyph {
   color: rgb(var(--v-theme-surface-info));
 }
 .trl-notice--ok {
-  box-shadow: inset 3px 0 0 rgb(var(--v-theme-surface-success));
+  box-shadow: inset var(--rail-w) 0 0 rgb(var(--v-theme-surface-success));
 }
 .trl-notice--ok .trl-notice-glyph {
   color: rgb(var(--v-theme-surface-success));

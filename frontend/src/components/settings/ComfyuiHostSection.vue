@@ -538,13 +538,13 @@ watch(
   margin-top: var(--space-4);
 }
 
-/* The DS info notice: a 3px info rule down its left edge. */
+/* The DS info notice: a `--rail-w` info rule down its left edge. */
 .cf-keys {
   display: flex;
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
   border: 1px solid rgb(var(--v-theme-border));
-  border-left: 3px solid rgb(var(--v-theme-surface-info));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-surface-info));
   border-radius: var(--radius-sm);
   background: rgb(var(--v-theme-surface));
 }

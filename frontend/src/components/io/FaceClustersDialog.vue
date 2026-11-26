@@ -1062,7 +1062,7 @@ function close() {
   left: 0;
   top: 0;
   bottom: 0;
-  width: 3px;
+  width: var(--rail-w);
   background: var(--active-bar);
 }
 /* The fixed-box thumbnails (rail, strip, picked, pair, rim, zoom aside) show

@@ -504,11 +504,11 @@ onMounted(() => {
 }
 
 .mv-card--clear {
-  border-left: 3px solid rgb(var(--v-theme-surface-success));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-surface-success));
 }
 
 .mv-card--warn {
-  border-left: 3px solid rgb(var(--v-theme-surface-warning));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-surface-warning));
 }
 
 .mv-card-head {
@@ -628,7 +628,7 @@ onMounted(() => {
 .mv-note {
   margin: var(--space-4) 0 0;
   padding: var(--space-2) var(--space-4);
-  border-left: 3px solid rgb(var(--v-theme-accent));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-accent));
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   /* A resting callout tint, not a hover: it borrowed the hover token back when
      that was amber at 0.14, and keeps that look. */

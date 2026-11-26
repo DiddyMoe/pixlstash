@@ -578,7 +578,7 @@ a margin and a border that sum to an off-grid step.
 changes on `.active`:
 
 ```css
-border-left: 3px solid transparent;   /* base — always */
+border-left: var(--rail-w) solid transparent;   /* base — always */
 .active { border-left-color: var(--active-bar); }
 ```
 

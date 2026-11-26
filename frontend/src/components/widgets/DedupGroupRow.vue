@@ -1000,7 +1000,7 @@ function onDblClick(event) {
   content: "";
   position: absolute;
   inset: 0 auto 0 0;
-  width: 3px;
+  width: var(--rail-w);
   border-radius: var(--radius-md) 0 0 var(--radius-md);
   background: var(--active-bar);
 }

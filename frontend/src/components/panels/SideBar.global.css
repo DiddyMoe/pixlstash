@@ -38,7 +38,7 @@
      by a container that insets its rows (the sidebar's tree group, #2124),
      which takes its own inset off so the rows keep the outer column. */
   padding-right: var(--sidebar-right-edge, var(--space-3));
-  border-left: 3px solid transparent;
+  border-left: var(--rail-w) solid transparent;
 }
 
 /* A leading glyph slot: a disclosure chevron, a folder icon, anything optional

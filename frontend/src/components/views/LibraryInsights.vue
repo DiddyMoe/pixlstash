@@ -396,7 +396,7 @@ onMounted(load);
   margin: var(--space-6) 0 0;
   max-width: 72ch;
   padding: var(--space-3) var(--space-5);
-  border-left: 3px solid rgb(var(--v-theme-accent));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-accent));
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   /* A resting callout tint, not a hover: it borrowed the hover token back when
      that was amber at 0.14, and keeps that look. */

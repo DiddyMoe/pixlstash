@@ -401,7 +401,7 @@ async function onClear() {
   display: flex;
   align-items: center;
   border-radius: var(--radius-sm);
-  border-left: 3px solid transparent;
+  border-left: var(--rail-w) solid transparent;
 }
 .rvi-row-wrap:hover,
 .rvi-row-wrap:focus-within {

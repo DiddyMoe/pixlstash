@@ -320,8 +320,8 @@
      the app, and the rail carries the consequence instead. A rendered width
      rather than a gap, so it cannot borrow from the spacing scale, the same
      reasoning as `--countdown-h`, whose comment says naming it "is what stops
-     the next surface picking 3px". Three components already carry a raw 3px
-     rail. */
+     the next surface picking 3px". Every rail in the app spells it, and
+     `designDrift.test.js` refuses a raw 3px one. */
   --rail-w: 3px;
 
   /* Contextual action bar / toolbar band - the full-width bar that holds a count

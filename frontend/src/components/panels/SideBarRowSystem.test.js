@@ -144,12 +144,14 @@ describe("the selection rail is reserved, never added on select", () => {
     const shared = code(globalCss)
       .split("}")
       .find((r) => r.includes("var(--depth, 0) * var(--indent-step)"));
-    expect(shared).toContain("border-left: 3px solid transparent");
+    expect(shared).toContain("border-left: var(--rail-w) solid transparent");
   });
 
   it("no .active rule sets border-left width, only its colour", () => {
-    // `border-left: 3px solid <colour>` on `.active` widens the box by 3px and
-    // moves the label. Recolouring an already-reserved rail does not.
+    // `border-left: var(--rail-w) solid <colour>` on `.active` widens the box
+    // by the rail and moves the label. Recolouring an already-reserved rail
+    // does not. Any `border-left` shorthand re-declares the width, so none is
+    // allowed here, whatever its value starts with.
     for (const css of [globalCss, scopedCss]) {
       for (const rule of code(css).split("}")) {
         const [selector, body = ""] = rule.split("{");
@@ -159,7 +161,7 @@ describe("the selection rail is reserved, never added on select", () => {
         expect(
           body,
           `${selector.trim()} must recolour the rail, not re-declare it`,
-        ).not.toMatch(/border-left\s*:\s*\d/);
+        ).not.toMatch(/border-left\s*:/);
       }
     }
   });

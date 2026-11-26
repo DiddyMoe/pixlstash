@@ -5308,7 +5308,7 @@ button.shelf-head-cell:hover {
    named `--z-sticky` rung, and one hairline. No elevation: a shadow is for an
    object floating above a surface, and this band is part of the list.
 
-   The 3px inset rail is the TIER, and it is a shadow rather than a border so a
+   The inset rail is the TIER, and it is a shadow rather than a border so a
    header that gains one does not move a pixel. */
 .shelf-group-btn {
   position: sticky;
@@ -5330,7 +5330,7 @@ button.shelf-head-cell:hover {
   text-align: left;
   font: inherit;
   cursor: pointer;
-  box-shadow: inset 3px 0 0 var(--shelf-rail, transparent);
+  box-shadow: inset var(--rail-w) 0 0 var(--shelf-rail, transparent);
   transition: background var(--dur-1) var(--ease-standard);
 }
 
@@ -5393,7 +5393,7 @@ button.shelf-head-cell:hover {
   padding: var(--space-3) var(--space-4) var(--space-3) var(--space-6);
   /* Always present, always transparent: only its colour and style change, so a
      row that flips into an absence state does not move a pixel (§5.1). */
-  border-left: 3px solid transparent;
+  border-left: var(--rail-w) solid transparent;
   border-bottom: 1px solid rgb(var(--v-theme-divider));
   cursor: pointer;
   transition: background var(--dur-1) var(--ease-standard);

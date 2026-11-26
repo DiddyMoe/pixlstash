@@ -929,7 +929,7 @@ function onMenuKey(event, row) {
 .cct-problem {
   margin: 0;
   padding: var(--space-2) var(--space-3);
-  border-left: 3px solid rgb(var(--v-theme-surface-warning));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-surface-warning));
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
 }

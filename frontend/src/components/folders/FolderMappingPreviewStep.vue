@@ -598,7 +598,7 @@ onUnmounted(() => {
   padding: var(--space-1) var(--space-3);
   border-radius: var(--radius-pill);
   background: rgb(var(--v-theme-panel));
-  box-shadow: inset 3px 0 0 rgb(var(--kind));
+  box-shadow: inset var(--rail-w) 0 0 rgb(var(--kind));
   font-size: var(--text-xs);
 }
 

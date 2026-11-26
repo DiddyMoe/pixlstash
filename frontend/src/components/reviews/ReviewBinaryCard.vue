@@ -421,7 +421,7 @@ function zoomToRegion(box) {
     rgb(var(--v-theme-dark-surface-error)) 11%,
     rgb(var(--v-theme-dark-surface))
   );
-  border-left: 3px solid rgb(var(--v-theme-dark-surface-error));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-dark-surface-error));
 }
 .rs-bin-banner--remove .rs-bin-banner-icon {
   color: rgb(var(--v-theme-dark-surface-error));
@@ -432,7 +432,7 @@ function zoomToRegion(box) {
     rgb(var(--v-theme-primary)) 11%,
     rgb(var(--v-theme-dark-surface))
   );
-  border-left: 3px solid rgb(var(--v-theme-primary));
+  border-left: var(--rail-w) solid rgb(var(--v-theme-primary));
 }
 .rs-bin-banner--add .rs-bin-banner-icon {
   color: rgb(var(--v-theme-primary));

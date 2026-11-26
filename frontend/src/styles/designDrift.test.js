@@ -185,6 +185,18 @@ describe("design drift", () => {
     ).toEqual([]);
   });
 
+  // A leading rail is `--rail-w` wide (design-tokens.css), whichever way it is
+  // drawn: a left border, an inset shadow, or a pseudo-element's width. Every
+  // vertical stripe of 3px in the app is one, so a raw 3px in those places is
+  // a rail that will not follow the token.
+  it("spells a rail's width as the token", () => {
+    expect(
+      hits(
+        /(?:border-(?:left|inline-start)(?:-width)?:\s*3px|inset\s+3px\s+0\s+0|(?<![-\w])width:\s*3px)\b/g,
+      ),
+    ).toEqual([]);
+  });
+
   // The dialog body owns the 16px gutter and spaces its children with `gap`
   // (buttons.md, "Dialogs"). Nothing outside AppDialog restyles either.
   it("leaves the dialog gutter to AppDialog", () => {

@@ -6055,7 +6055,7 @@ fault teaches the reader to ignore the fault as well.
 **They are told apart in greyscale**, which is what makes this a treatment
 rather than a hue: solid rail, dashed rail, no rail, plus two different glyphs.
 The colours only reinforce what the shapes already say. Both ride the row's own
-rail — `border-left: 3px solid transparent`, always present, always transparent
+rail — `border-left: var(--rail-w) solid transparent`, always present, always transparent
 (§5.1) — so only its colour and style change and a row that flips state does not
 move a pixel. **Selection uses an inset box-shadow rather than that border**, so
 a selected broken row still shows both; the glyph itself leads the NAME line

@@ -2070,7 +2070,7 @@ function goToSettings() {
 }
 
 .tld-row--pinned > th {
-  box-shadow: inset 3px 0 0 var(--active-bar);
+  box-shadow: inset var(--rail-w) 0 0 var(--active-bar);
 }
 
 .tld-from {

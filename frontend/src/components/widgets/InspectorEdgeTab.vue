@@ -131,7 +131,7 @@ onBeforeUnmount(() => clearTimeout(hideTimer));
   max-height: 260px;
   padding: var(--space-3) 0;
   justify-content: flex-start;
-  border-left: 3px solid var(--active-bar);
+  border-left: var(--rail-w) solid var(--active-bar);
 }
 
 /* A label that names no selection keeps the tab's own border on that edge. */
