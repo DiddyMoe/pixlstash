@@ -694,7 +694,9 @@ Rules neither side may drift from:
    "problem"|"not_problem"}`), cleared by `DELETE` on the same paths, all
    owner-only. Each answers `{combo_key, [model_id,] verdict, previous}`;
    writing `previous` back (or `DELETE` when it is null) is the undo. A
-   non-canonical key or a wrong verdict word is a 422; a `model_id` not in the
+   non-canonical key or a wrong verdict word is a 422; so is a key naming more
+   than `MAX_MODELS_PER_EDIT` (5,000) models, refused with one fixed sentence
+   before it is parsed; a `model_id` not in the
    key is a 404, and so is an id not on the shelf when recording (clearing
    skips that check, so an answer naming a model that left can still go). A verdict belongs to its exact key:
    members change, no verdict, and the server clears nothing. The model's own
@@ -917,10 +919,12 @@ Seven rules the client must not re-derive:
    failure notice offers as *Open page*);
    `POST /api/v1/model-downloads/{id}/cancel` stops one; backend
    §25.12),
-   `models_downloading: {models: [{file, folder, sha256?, percent}]}` (a model
-   the graph names that a running download will deliver, matched by name or
-   digest; moved out of `missing_models`, it blocks the batch, and a LoRA on
-   its way keeps its loader rather than being bypassed),
+   `models_downloading: {models: [{file, folder, sha256?, percent, status}]}`
+   (a model the graph names that a queued or running download will deliver,
+   matched by name or digest; `status` is that download's, `queued` while it
+   waits for a slot and `running` once it fetches; moved out of
+   `missing_models`, it blocks the batch, and a LoRA on its way keeps its
+   loader rather than being bypassed),
    `pack_outdated: {models: [{file, folder}], can_update}` (a checkpoint or
    diffusion model ComfyUI lacks and the shelf holds, which the run would load
    through `PixlStashCheckpointLoader` but for a running pack from before its
@@ -1199,7 +1203,7 @@ exports and duplicates like any other:
 | `PUT /api/v1/workflows/{workflow_id}/lora-chain` | A copy with the chain as the owner left it: `{entries: [{node_id?, sha256?, strength?}], lanes?: [[entry…]…], name?, dry_run, overwrite?}`, `lanes` one list per lane of the read, in its order. `overwrite: true` saves over this workflow instead of as a copy (`name` is not read): it gets a new version, which is its graph from then on, and the versions before are kept (an automatic workflow's first overwrite keeps the graph read off its pictures as version 1). The card's `versions`, `version` and `version_at` say so | `201 {dry_run, name, workflow_id, overwritten, changes: [{kind, node_id, text}]}`; a dry run is `200` with `name` and `workflow_id` null; an overwrite is `200` with this workflow's id, `overwritten: true` and `name` null |
 | `GET /api/v1/workflows/{workflow_id}/model-swap[?checkpoint_id=][&replacing=&slot_kind=[&cached=true][&grouped=true]]` | The graph's model files (each resolved to one shelf row or `null`), the shelf's checkpoints, VAEs and text encoders; with `checkpoint_id`, the companions recipes, and the ComfyUI runs already recorded (`history_runs`; nothing reads ComfyUI's history since #1854, so they no longer grow), have run beside it (or, when none has, the files whose layout its family declares, `via: "declared"`) and the LoRAs/ControlNets trained on another family **With `replacing`** (the Workflow tab's "Replace with…" for `PUT …/model-fix`, #1596, and the Run popup's model rows, its missing-checkpoint offer among them: one read per row, shared within one popup, #1850), `replacements: [{id, filename, display_name, via, loader, likely}]` answers instead (`likely`: the one shelf file of the kind whose name reads as the missing one's, renamed, by `SequenceMatcher` over the names without extensions, not where two do or the precisions differ; offered first, past the go-with and base-model filters but not the loader one), and `replacements_narrowed` says whether a checkpoint's offer was held to a base model, and `replacements_reason` (`no_checkpoint` \| `none_go_with_it` \| `none_loadable` \| `needs_pixlstash_nodes`) says why it is empty. With a `slot_kind` of `vae` or `text_encoder` and no `likely` replacement, `refile: {id, filename, display_name, file_kind}` (#1962) names the one shelf model whose name reads that way but which the shelf files as a checkpoint or Unclassified, so the offer cannot see it: only where both names carry a word for that kind (`vae`; `t5`, `clip`, `encoder`, …), nobody has decided its kind and no recorded workflow loads it as anything else. Filed as `slot_kind`, it is the `likely` replacement wherever the loader can load it; the read never re-files it. Every filter is required, a checkpoint's base model only while a loadable one has it: a VAE or text encoder must go with the graph's base model (`propose_companions`: the owner's workflow sets, then recipes and ComfyUI runs; `declared` is the untested cold case), a checkpoint must share the missing one's base model (its shelf row's, else the one base model the graph's LoRAs and ControlNets agree on; unnarrowed when neither says, or when no loadable checkpoint has it, so a guessed base model never leaves nothing to pick), and every kind must be loadable by every loader naming the file, checked with the rewrite's own rule (`listed_as`) when ComfyUI answers and by file type when it does not, so a core loader is never offered GGUF. Read off the graph with the owner's fixes applied; 409 when it loads the file in no slot a fix can fill (of `slot_kind`, when given), or in slots of two kinds and `slot_kind` does not say which. A file the loader does not list is offered anyway when a run can load it through a PixlStash loader (`PUT …/model-fix`'s swap rule, `plan_pixlstash_swap`; a checkpoint by shelf row through `PixlStashCheckpointLoader`, only with ComfyUI on this computer, `swap_in_pack_nodes`), with `loader` naming that node; `needs_pixlstash_nodes` says that is the only thing missing. Every candidate carries a `verdict` (`likely` \| `maybe` \| `unknown` \| `unlikely`, or null): a checkpoint's against `replacing_base_model`, the base model it is narrowed by (same base model, same family, base model never read, another), null when nothing says; a VAE's or text encoder's from its `via` (`grouped`/`checkpoint`/`base_model` likely, `family` maybe, `declared` unknown). A checkpoint also carries its `base_model`. With `&grouped=true` (the Workflow tab, for a missing checkpoint) nothing is held to the base model: every loadable checkpoint is offered, and `replacements_narrowed` says whether the ungrouped answer would have been narrowed. With `&cached=true` (the Workflow tab, which asks once per model row of every workflow selected) what each loader lists is read from the one-minute `/object_info` cache instead of from ComfyUI; the Run popup asks without it, and a run checks its picks against a fresh read either way | `{slots: [{filename, kind, model}], checkpoints, vaes, text_encoders, checkpoint_family, checkpoint_modality, proposals: {vae, text_encoder: [{id, filename, display_name, family, via, recipes, history_runs}]}, flags: [{filename, kind, base_model, family, modality}]}`, and with `replacing`, `replacements: [{id, filename, display_name, via, loader, likely, base_model, verdict}]`, `replacements_narrowed`, `replacing_base_model`, `replacements_reason` and `refile: {id, filename, display_name, file_kind} \| null`. `modality` is `image`, `video` or null (the base model does not fold to a known one); a LoRA or ControlNet is flagged when its family OR its modality differs from the checkpoint's, the flags name both modalities when they differ, and the `family` proposal step never crosses modalities. `checkpoints` is filled on the call without `checkpoint_id` only, narrowed to what the workflow's first base loader could load |
 | `POST /api/v1/workflows/{workflow_id}/set-clone-plans` | What the Workflow tab's *Change model set…* reads (#1850; it turns a plan's `swaps` into unsaved model picks and writes nothing), and before it what Clone onto a workflow set drew: per set asked, the files the clone takes from it and the graph's model loaders before and after, run through the clone's own rewrite on a copy (nothing is written). **Read off the graph a run submits**, with the owner's replacements for models this machine lacks applied (`PUT …/model-fix`), so every file the plan names for the graph (`swaps` keys, `takes` keys, `loaders[].was`, `base_filename`, `unpaired_bases`) is the one its loader loads, the replacement where there is one, as the fix names it; and a set holding the original a replacement stands in for is no swap, since naming that file on this workflow loads the replacement. Body `{sets: [{key, checkpoint_ids, model_ids, picks?}]}`, the client's set keys, each set's checkpoints (or diffusion files; a two-model graph takes one per base loader) and its other shelf models; `picks` is the owner's own pairing, a VAE or text-encoder file of the graph -> the model of `model_ids` its loaders take (422 when it names another model, or one model twice) | `{base_filename, base_model, plans: [{key, fit, reason, warning, base_model, keeps_loras, swaps, unpaired_bases, takes, choices, maps_cleanly, loaders: [{node_id, kind, was_class, now_class, was, now, pack, installed, was_type, now_type}]}]}`. `fit` is `same_base_model` \| `same_family` \| `other` \| `wont_load` (with `reason`: no checkpoint, "Needs a <loader>", or a file ComfyUI does not list and a run would not load off the shelf); `warning` is "Used for <types>, not <type>" on a set that is **not** refused but whose checkpoints' recipes are all of another kind of workflow than this one, the kind being the workflow type with a video workflow told apart by whether its graph loads a picture, `Text to Video` or `Image to Video` (a checkpoint no recipe names is warned about nothing; null on a `wont_load` plan); `keeps_loras` is false whenever either base model is unknown; `takes` is each VAE or text-encoder file of the graph -> the set's model id its loaders take (changed or not: a file the graph already loads is kept, the rest are paired by name) and `choices` the set's model ids by loader kind (`vae`, `clip`), which together are what a re-plan's `picks` is built from; `maps_cleanly` is true when the set's checkpoints, VAEs and text encoders fill the graph's loaders of those kinds one for one and, onto another family, every CLIP loader takes the type the new model loads as (never for `wont_load`); `was_type`/`now_type` are a CLIP loader's `type` before and in the clone (null for other loaders); `pack` names the node pack a changed `now_class` comes from, `installed` whether ComfyUI has it (null when not asked) |
-| `POST /api/v1/workflows/{workflow_id}/clone-with-models` | No frontend caller since #1850, when the clone dialogs went (a model is changed on the Workflow tab and saved). A copy of the base graph with model files replaced, named as asked, as a **new manual workflow** made from this one (`from_name`), never folded into it. A file of another type swaps its loader's class too (a `.gguf` into `UNETLoader` makes it `UnetLoaderGGUF`), and a class ComfyUI lacks gets its file unchecked rather than a refusal, as does a file ComfyUI does not list that a run loads off the shelf through the pack's loader (`_loads_off_the_shelf`, #2009). Body `{name, swaps: {graph filename: new filename}, loras?}`; `loras`, in `PUT …/lora-chain`'s `{entries, lanes}` shape and read against the original's chain, rewires the LoRAs (`{entries: []}` removes them) and needs ComfyUI (503). All or nothing: 409, and no file, when any swap could not be written (`not_in_graph`, `not_on_comfyui`, `several_on_comfyui`) or when every swap names the file already loaded. `verified` is false when any name went in unchecked | `201 {name, workflow_id, swapped, unswapped: [{was, now, reason}], loaders: [{node_id, was, now, pack, installed}], verified}` |
+| `POST /api/v1/workflows/{workflow_id}/clone-with-models` | No frontend caller since #1850, when the clone dialogs went (a model is changed on the Workflow tab and saved). A copy of the base graph with model files replaced, named as asked, as a **new manual workflow** made from this one (`from_name`), never folded into it. A file of another type swaps its loader's class too (a `.gguf` into `UNETLoader` makes it `UnetLoaderGGUF`), and a class ComfyUI lacks gets its file unchecked rather than a refusal, as does a file ComfyUI does not list that a run loads off the shelf through the pack's loader (`_loads_off_the_shelf`, #2009). Body `{name, swaps: {graph filename: new filename}, loras?}`; `loras`, in `PUT …/lora-chain`'s `{entries, lanes}` shape and read against the original's chain, rewires the LoRAs (`{entries: []}` removes them) and needs ComfyUI (503). All or nothing: 409, and no file, when any swap could not be written (`not_in_graph`, `not_on_comfyui`, `several_on_comfyui`) or when every swap names the file already loaded. The 409 names each refused swap by its position in `swaps` and its reason (`swaps[0] (not_in_graph)`), never by the filenames sent; `swap` on each `swapped` and `unswapped` row is that position. `verified` is false when any name went in unchecked | `201 {name, workflow_id, swapped, unswapped: [{was, now, reason, swap}], loaders: [{node_id, was, now, pack, installed}], verified}` |
 | `DELETE /api/v1/workflows/{workflow_id}` | Delete a **manual** workflow: its document goes to the trash by way of the watched inbox, its pictures return to the automatic workflow their graph is in and its saved recipes become unfiled | `{deleted, workflow_id}`, `deleted` the workflow's name; **409 on an automatic id** (hide it instead) |
 | `POST /api/v1/recipes/{recipe_id}/extract-workflow` | Make a saved recipe a manual workflow: the graph Run would build for it (the run planner's own), seeds and picture inputs left for a run, ComfyUI not asked. Works for a recipe whose workflow is gone, on the graph it was saved from | `201 {workflow_id, name}`, the new manual workflow and the recipe's name; 404 no such recipe; 409 no graph left to build on |
 | `GET /api/v1/recipes?unfiled=true` | The saved recipes on no workflow this machine holds (NULL, deleted or moved): the Workflows view's "Unfiled recipes", each offering Extract workflow and Delete. Extract is disabled, with its reason, on a row whose `extractable` is false: the card it was saved from is gone too (a deleted manual workflow's), so extraction would 409 | `[SavedRecipeOut]`, the list route's own shape, `pictures` always 0 (no credit), plus `extractable` (null in every other listing); 400 with a `workflow_id` |
@@ -1669,7 +1673,7 @@ and Settings' radio both send.
 
 | Route | Policy | Answers |
 |---|---|---|
-| `GET /comfyui/connections` | `owner_only` | `{connections: [{id, name, url, status, gpu, vram_mb, nodes, link}], current}`. `status`, `gpu`, `vram_mb` and `nodes` are what the newest probe of that address said (`nodes`: whether the ComfyUI-PixlStash nodes can open a workflow there; null when not known). `link` is that connection's own link in `GET /comfyui/link`'s shape, `{linked: false, …}` when it has none. |
+| `GET /comfyui/connections` | `owner_only` | `{connections: [{id, name, url, address_valid, status, gpu, vram_mb, nodes, link}], current}`. `address_valid` (always present) is false for a saved `url` the address check now refuses: nothing is sent to it until it is set again. `status`, `gpu`, `vram_mb` and `nodes` are what the newest probe of that address said (`nodes`: whether the ComfyUI-PixlStash nodes can open a workflow there; null when not known). `link` is that connection's own link in `GET /comfyui/link`'s shape, `{linked: false, …}` when it has none. |
 | `POST /comfyui/connections` | `owner_only` | Adds `{url, name?}` without switching; the list. |
 | `PATCH /comfyui/connections/{id}` | `local_owner_only` | `{name?, url?}`; the list. A new `url` on a linked connection revokes its key first and leaves it unlinked (the client opens the Link dialog on it next). 400 bad address or blank name, 404 unknown id, 409 address taken. |
 | `DELETE /comfyui/connections/{id}` | `local_owner_only` | Revokes the key first, then removes; the list. A current connection hands Run on to the first one left. 500 with the reason, and the row kept, when the key cannot be revoked. |
@@ -1683,6 +1687,44 @@ and Settings' radio both send.
 or re-address a linked current connection, since its key would be left
 without a connection or bound to the old address; switching to another listed
 address passes.
+
+**One spelling per address.** Every write of an address (`comfyui_url` in
+the config PATCH, `url` on `POST`/`PATCH /comfyui/connections`) is stored as
+`utils/comfyui_url.normalize_comfyui_url` spells it: scheme and host lower
+case, one trailing slash, surrounding space dropped
+(`"  HTTP://LocalHost:8188 "` is stored `http://localhost:8188/`). A value it
+refuses (a user part, a backslash, a query, a fragment, a percent sign, a
+scheme other than http(s), a bad port) is a **400** with a fixed sentence that
+never repeats the value. Connections are compared in that spelling, so two
+spellings of one ComfyUI are one connection.
+
+**A saved address that no longer passes is a 409.** A value an older build
+stored that the normaliser now refuses is never sent a request: the routes that
+read the current or a named connection's address (`routes/comfyui.py`'s
+`_comfyui_url` and `_address`, the ComfyUI `free` in `routes/resources.py`)
+answer **409** with `detail` = `SAVED_ADDRESS_INVALID` ("The saved ComfyUI
+address is not valid, so nothing was sent to it. Set the address again in
+Settings."). The fix is to save the address again. Every other reader goes
+through the same check (`comfyui_connections.current_base`): the model shelf's
+workflow templates, the model folders' ComfyUI reads, the model-copy merge and
+training's resolve and create answer the same 409, and the vault's training
+watcher sends nothing and logs once per change of the saved value.
+`comfyui_connections.is_configured` answers only "is one saved", for callers
+that branch on that before reading. `tests/test_saved_comfyui_address_reads.py`
+fails the build on a new direct read of `comfyui_url` outside the owner.
+
+The frontend recognises this 409 by its exact `detail` in the one API client
+(`frontend/src/utils/apiClient.js`; another 409 is left to the caller) and
+shows one coalesced error notice naming Settings > ComfyUI, with an **Open
+Settings** action once the app shell has registered its settings opener
+(`setSettingsOpener`). The connection list's `address_valid` says which saved
+address is the bad one.
+
+**What ComfyUI answers is bounded.** Every request PixlStash sends to ComfyUI
+follows no redirect and is read within a deadline and a size cap
+(`utils/bounded_http`); one that runs past either, or answers with a status
+PixlStash did not expect, is a **502** whose `detail` is a fixed sentence (the
+ComfyUI status at most, never its body).
 
 ### 2.4 The `/libraries` contract
 
@@ -2248,6 +2290,139 @@ writers that meet a removed tag answer 409 (`TagExcludedError`) for a single
 write or list it in `skipped_excluded` for a bulk one. Backend: *Tags removed
 from tagging* in §9 of the backend document.
 
+### 2.13 The Scrapheap scope, picture stats and the listing id cap
+
+**One spelling of "in the Scrapheap" for every picture read.** `only_deleted=true`
+is the contract; the pseudo-id `character_id=SCRAPHEAP` is still accepted and
+means the same. Both are honoured by `GET /pictures`, `/pictures/stream`,
+`/pictures/count`, `/pictures/search`, `/pictures/stats`,
+`/pictures/likeness-groups` and `/pictures/export` (the ids path and the
+select-all path). Search, stats, likeness and export used to honour only the
+pseudo-id, so a client that sent `only_deleted=true` got the live library back
+(search, stats, likeness) or an export that failed with nothing packaged. The
+scope picks deleted rows instead of live ones and changes nothing about what a
+token may see: the token's scope narrows them as before. Backend: *One Scrapheap
+scope, read by one parser* in §5 of the backend document.
+
+**The Scrapheap is one bin, so its three numbers agree.** Under
+`only_deleted=true` the grid lists the whole Scrapheap whatever set, project or
+person the view had open, and `/pictures/count` counts it. `/pictures/stats`
+now does the same: it sets aside `set_id`, `set_ids`, `project_id`, a numeric
+`character_id` and `character_ids` there, so the panel's total is the grid's
+row count and the header's number. A token's own scope still narrows all three.
+A digits `character_id` past SQLite's range is still the **400** the listing
+answers. `tests/test_counts_scrapheap_scope.py`.
+
+**`GET /pictures/stats` explains its `untagged`.** The response carries
+`untagged_breakdown: {pending, unprocessable, none}`, which sums to `untagged`:
+
+| Key | The picture | Filter value |
+|---|---|---|
+| `pending` | is queued for the tagger and readable | `tag_state=pending` |
+| `unprocessable` | is a file the tagger could not read | `tag_state=unprocessable` |
+| `none` | was tagged and nothing applied, or its tags were removed | `tag_state=none` |
+
+`tag_state` narrows every figure of the stats response to that set; any other
+value is **422**. The client is `frontend/src/api/pictures.js`'s
+`getPictureStats` with `tag_state` in its query string, written by
+`StatsSidebar.vue` from `useFilterStore.tagStateFilter`. `GET /pictures`,
+`/pictures/stream` and `/pictures/count` take the same `tag_state` and list
+exactly the pictures the breakdown counts under it, Scrapheap,
+`character_id=UNASSIGNED` and `inbox` included. The grid does not send it yet,
+so it does not narrow when the rail's untagged row is on.
+
+**At most 1000 `id` params per listing read.** `GET /pictures`,
+`/pictures/stream` and `/pictures/count` answer **400** (`Too many id params
+(N); the maximum is 1000 per request`) above 1000 repeated `id` params. A client
+holding more ids splits the read. `/pictures/export` reads its ids itself, in
+the order sent, and is not capped; a large selection goes in the body of `POST
+/pictures/export` (a ZIP) or `POST /pictures/export/folder/selection` (a
+folder, `destination` in the body beside `picture_ids` and `only_deleted`)
+rather than the URL. `POST /pictures/export/folder` keeps its query string for
+a view, as `GET /pictures/export` does.
+
+**At most 62 values in each term list.** `tag`, `rejected_tag`,
+`tag_confidence_above`, `tag_confidence_below`, `comfyui_model` and
+`comfyui_lora` each take at most 62 values (`MAX_FILTER_TERMS`) on the grid,
+the stream, `/pictures/count`, `/pictures/stats`, `/pictures/search`,
+`/picture_sets/{id}` and `/pictures/likeness-groups`. One more is **422**
+`Too many <name> values: at most 62`, naming the list and never echoing a
+value. Every other list a view sends (`set_ids`, `format`, the owner's hidden
+tags, the project list) has no cap: the server reads it in batches or as one
+bound value, so a long one answers what a short one would.
+`tests/test_id_lists_routes.py`.
+
+**A stored value the column cannot hold is served as null.** A picture row
+whose stored `score`, `width`, `format` or any other column holds a value of
+the wrong kind (text or bytes in an integer column, an infinite or fractional
+score, bytes in a text column) used to fail the whole grid page, stream batch,
+metadata read or search with a 500. The grid, the stream (the likeness sort
+included), `GET /pictures/{id}/metadata`, `GET /pictures/{id}/{field}`, the
+likeness groups, the search, a stack's pictures, the likeness sort of `GET
+/picture_sets/{id}`, the geometry in `POST /pictures/thumbnails` and the
+`PATCH /pictures/{id}` echo now answer that one value as `null`, the row and
+every other row as stored. The server logs a warning naming the picture and
+the column once per row and column until the library is switched, so a
+damaged row the grid reads on every page does not flood the log. The PATCH
+echo is the picture's metadata fields as committed, the same fields as `GET
+/pictures/{id}/metadata` (it was `{}` after an edit); the app does not read
+it. `tests/test_stored_picture_values.py`.
+
+**`id=` narrows the likeness sort like every other sort.** A filter admits the
+same rows under every sort; the sort only orders them. With
+`sort=CHARACTER_LIKENESS`, repeated `id=` params on `GET /pictures`,
+`/pictures/stream` and `/pictures/count` now narrow the candidates before the
+count and the page, as they do under the other sorts. Shared-only (which
+narrows through the same list) now applies there too, and in the unassigned
+view an `id` list narrowed to nothing lists nothing rather than everything. An
+`id` that is not an integer SQLite can store names no picture.
+`tests/test_likeness_sort_id_filter.py`.
+
+**`fields` as a comma list answers only those fields.** On `GET /pictures` and
+`/pictures/stream`, `fields=id,stack_id` returns rows holding exactly the
+listed keys the grid row model declares; a key it does not declare is left
+out, so `project_id` stays dropped (§16.6). Keys the server used to add on its
+own (`stack_count` on a leader, the `smartScore` alias) come only when listed.
+`fields=grid` (with or without `grid_lite`) and no `fields` are unchanged,
+and the `X-PixlStash-Library` header still comes with the list.
+`tests/test_listing_field_projection.py`.
+
+**`text_match_only` on `GET /pictures/search`.** `text_match_only=true` keeps
+only the rows whose `text_match` is true, narrowed before `offset` and `limit`
+cut the page. It is a view param, so an export of a search view carries it
+from the view's query string to the export's search. The SPA sends it from the
+result pill's *In text* switch (`useGridFetch.searchViewQueryParams`), for both
+the grid's search and the export. `tests/test_search_export_parity.py`.
+
+**An integer past SQLite's range is a 4xx, never a 500.** SQLite stores a
+signed 64-bit integer, and the driver raised `OverflowError` on a larger one.
+On the picture listing, search, stats and likeness-groups routes and on
+`/characters*`, a declared integer (`offset`, `limit`, `face_cluster`, a path
+id, a body `picture_ids[]`) is a `SqliteInt`, so it fails validation with
+**422**. `min_score` and `max_score` are read by
+`PredicateFilter.from_query_params`, which answers **422** `Invalid min_score:
+must be an integer` (or `max_score`). An id a handler parses itself (a
+`character_id` that may be `UNASSIGNED`, `project_id`,
+`reference_character_id`, a plugin run's `picture_ids`) goes through
+`parse_sqlite_int` and gets the route's existing **400**. A refusal names the
+parameter but never echoes the rejected value: an unknown `sort` is `Invalid
+sort mechanism`, and an unknown character combine mode names the accepted modes
+only. A plugin run that fails unexpectedly answers 500 with a fixed sentence,
+and the plugin name and error go to the server log.
+`tests/test_listing_and_character_int_bounds.py`.
+The same holds on `/stacks*`, the one-shot and staged import routes,
+`PATCH` / `DELETE /import-folders/{folder_id}` and `POST
+/pictures/move-to-library`: path ids, body id lists and the staging open's
+integers are `SqliteInt` (**422**), and a stack route that reads a `dict` body
+answers its existing **400**. Their 5xx answers are fixed sentences (the
+keep-cover-only preview, the import's free-space check, a task runner that is
+not accepting work, which used to escape as a raw 500), and so are two 4xx that
+used to carry an exception or unvalidated input: the move's unknown-library
+**404** (`No attached library has that uuid.`) and its open failure, now
+**409** `The other library could not be opened. Nothing was moved.`
+`tests/test_stacks_api.py`, `tests/test_library_move.py`,
+`tests/test_async_import_staging.py`.
+
 ---
 
 
@@ -2339,10 +2514,11 @@ Configured in [server.py](../pixlstash/server.py) (`CORSMiddleware`):
 - Additional explicit origins can be added through the server config `cors_origins` list.
 - `allow_credentials=True` — required because the SPA uses cookie auth.
 - `allow_methods=["*"]`, `allow_headers=["*"]`.
-- `expose_headers=["Retry-After"]`. `Retry-After` is not a CORS-safelisted
-  response header, so without this a client on another origin (the Vite dev
-  server) reads it as absent: the poll interval of a background run (§11.4)
-  and the backoff on a 429 alike. It grants nothing to an origin the regex
+- `expose_headers=["Retry-After", "Content-Disposition"]`. Neither is a
+  CORS-safelisted response header, so without this a client on another origin
+  (the Vite dev server) reads them as absent: the poll interval of a background
+  run (§11.4) and the backoff on a 429 alike, and the export ZIP's file name,
+  which `downloadExport` reads from `Content-Disposition`. It grants nothing to an origin the regex
   refuses, which still gets no `Access-Control-Allow-Origin`. `Location` needs
   no entry: the client builds a run's status URL from its id.
 
@@ -2361,7 +2537,7 @@ Two endpoints, both under the API prefix:
 ### Lifecycle (`/ws/updates`)
 
 1. Frontend opens the socket after auth succeeds.
-2. On `open`, the SPA sends a `set_filters` message with the current view filters (selected character, set(s), search query). The backend uses these to scope which events the client receives.
+2. On `open`, the SPA sends a `set_filters` message with the current view filters (selected character, set(s), search query). The backend stores them on the client's record but does not use them to choose which events to send (see "Backend filtering" under §8).
 3. The server pushes JSON events as state changes occur.
 4. On `close`, the SPA auto-reconnects after 2 s (`updatesReconnectTimer`).
 
@@ -2400,7 +2576,7 @@ The backend's [EventType](../pixlstash/event_types.py) enum names are **not** se
 | `origin_client_id` | `string` \| `null` | The `X-Client-Id` of the originating tab, or `null` for background/external work. **The primary signal** — a tab recognises the echo of its own change by matching this against its own id. |
 | `picture_ids` | `number[]` | Affected picture ids. |
 | `fields` | `string[]` (optional) | Columns that changed (e.g. `["smart_score"]`); drives the silent-vs-sort-changed decision. Omitted for edits that may affect any view (user edits, imports). Four values are **not** columns and name a routing class instead: `detections` and `faces` (card content; a face redetect's event also carries `new_faces`, the count of faces it added), `pixels` (the picture's own bytes were rewritten — see §8.3) and `stack_count` (the stack's live member count, derived by the listing endpoint and re-read by its own targeted call). See §8.2. |
-| `change_kind` | `"added"` \| `"updated"` \| `"removed"` \| `"restored"` (optional) | Set at the emit site where cheap (`removed` on deletes is free; `added` is implicit for `picture_imported`). **Omitted entirely when unset** — the SPA infers `added` for `picture_imported` and falls back to `updated` otherwise. `"restored"` is a scrapheap comeback (undo of a move, `POST /pictures/scrapheap/restore`, or a restore run, §11.4): the card returns, but the picture is **not** new to the vault, so the sidebar must not raise its NEW marker for it. The value set is a closed allowlist on **both** ends — `WsBroadcasterMixin.CHANGE_KINDS` and `resolveChangeKind` — and each silently degrades an unknown kind (the backend drops the field, the SPA falls back to `updated`), so the two move together or not at all. |
+| `change_kind` | `"added"` \| `"updated"` \| `"removed"` \| `"restored"` (optional) | Set at the emit site where cheap (`removed` on deletes is free; `added` is implicit for `picture_imported`). **Omitted entirely when unset** — the SPA infers `added` for `picture_imported` and falls back to `updated` otherwise. `"restored"` is a scrapheap comeback (undo of a move, `POST /pictures/scrapheap/restore`, or a restore run, §11.4; a run's events also carry top-level `run_id` and `run_kind`, absent on every other event): the card returns, but the picture is **not** new to the vault, so the sidebar must not raise its NEW marker for it. The value set is a closed allowlist on **both** ends — `WsBroadcasterMixin.CHANGE_KINDS` and `resolveChangeKind` — and each silently degrades an unknown kind (the backend drops the field, the SPA falls back to `updated`), so the two move together or not at all. |
 
 Per-type payload specifics (all carry the envelope fields above):
 
@@ -2430,7 +2606,7 @@ Per-type payload specifics (all carry the envelope fields above):
 5. Mutating in-request emits must pass `source`/`origin_client_id` (and `change_kind`) into the event `data` dict — see §8.1.
 6. Handle it via `useGridRealtimeSync` (picture events) or the remaining `App.vue` branches (tags/descriptions/characters/plugin).
 
-**Backend filtering**: the server uses the client's last `set_filters` to decide whether to push an event. Events outside the client's current view are dropped server-side to reduce noise. The stream is **owner-only** — scoped/READ tokens may connect but receive nothing.
+**Backend filtering**: the server filters by event type and by connection, never by view. `_should_send_ws_update` (`ws/broadcaster.py`) is an allowlist of event types, and every owner socket receives every event on it. The last `set_filters` is stored on the client's record but nothing reads its view fields: no event is dropped because it falls outside the client's current character, set or search. Deciding whether an event touches the current view is the SPA's job (`useGridRealtimeSync` and `pictureChangeAffectsView`, §8.2). That has to be so, because an external change outside the view still raises a pill or a silent removal rather than nothing. The stream is **owner-only** — scoped/READ tokens may connect but receive nothing.
 
 ### 8.1 Client id & origin attribution
 
@@ -2589,7 +2765,7 @@ Browser-native `<img>` tags **cannot** use the axios interceptor, so the integra
 | URL | Purpose |
 |-----|---------|
 | `GET /api/v1/pictures/thumbnails/{id}.webp` | Cached WebP thumbnail. Backend uses an async lock + LRU memory cache + on-disk `.pixlstash/` cache. |
-| `POST /api/v1/pictures/thumbnails` | Batch thumbnail metadata (JSON). |
+| `POST /api/v1/pictures/thumbnails` | Batch thumbnail metadata (JSON). A face or detection box that is not four finite numbers (one stored before the models' check, or by a tool outside the app) is logged and left out of that picture's overlay; the rest of the batch is served. |
 | `GET /api/v1/pictures/{id}.{ext}` | Original file (optionally watermarked). |
 
 ### Generated thumbnails: the URL is stable, so the *response* carries the freshness contract
@@ -2669,6 +2845,16 @@ below that concerns ownership is a `409` whose `detail` is an object
 already running instead of reporting a failure. Other refusals keep the string
 `detail` of §13 unless the table shows an object.
 
+**Opening a session: `POST /pictures/import/staging`** takes an optional
+`{project_id, set_id, character_id, total_files}` and answers
+`{staging_id, safe_threshold, library_uuid}`. `library_uuid` is the library the
+session belongs to, as `GET /libraries` names it. Once another library is
+active, every call on the session (upload, commit, cancel, status) answers 404,
+so a client keys what it remembers about the session (a commit record, a
+resume) by this field, never by the library it believes is active. Each id is a
+whole number SQLite can store: one outside the signed 64-bit range is a 422
+naming the field, before any lookup.
+
 **Uploading a batch: `POST /pictures/import/staging/{id}/files`.** An optional
 `Idempotency-Key` request header (IETF httpapi draft *The Idempotency-Key HTTP
 Header Field*) names the batch: a Structured Field string, normally quoted
@@ -2736,7 +2922,8 @@ session.
 
 Every refusal after the session was claimed puts it back to `staging`, so the
 client may upload more or commit again. A commit that races server shutdown,
-after the task runner has stopped, fails with 500 and is put back the same way.
+after the task runner has stopped, is a 503 "Cannot start the import: the task
+runner is not accepting work. Try again." and is put back the same way.
 From commit until the import settles the task holds a library read lease, so
 `POST /libraries/active` waits its bounded time and then answers 409 "This
 library is busy: an import is still running" (backend: Active-library
@@ -2758,8 +2945,8 @@ then their project, set and character membership) or `finalizing` (restoring
 Scrapheap matches, removing the staged files); otherwise `null`. `processing`
 and `persisting` alternate once per batch, so pictures from earlier batches are
 already in the library while a later batch is `processing`. They stay if the
-import then fails, and the failed status's `error` then begins "The import
-stopped after N new picture(s) were added".
+import then fails, and the failed status's `error` is then "The import
+stopped after N new picture(s) were added."
 
 **Lifetime.** The reaper runs each time a staging session is opened. A session
 idle for an hour, or finished and unpolled for five minutes, is reaped with its
@@ -2773,6 +2960,28 @@ The one-shot `POST /pictures/import` (the ComfyUI node's route) has none of the
 above. It shares only the caption limit: a caption over 1 MiB, sent or inside a
 zip, is left out of the import (that route answers with a task id and no
 `skipped[]`).
+
+**What a failure says.** No import status carries an exception's text, which
+can name a path or library content: the exception goes to the server log with
+its traceback and the file or task it concerns, and the status carries a fixed
+sentence the server wrote, chosen by the kind of failure. Clients show these
+verbatim; none parses them.
+
+| Where | When | Sentence |
+|---|---|---|
+| one-shot `results[].error` | the file is not content the reader can decode (`ValueError`) | "Not a picture or video this library can read." |
+| one-shot `results[].error` | a write, read or publish of the file failed (`OSError`) | "The file could not be written to the library." |
+| one-shot `results[].error` | anything else the file raised | "The file could not be imported; the server log has the details." |
+| one-shot `results[].error` | a zip entry that cannot be decompressed | "This zip entry is damaged and cannot be decompressed." |
+| one-shot `error` | every file failed | "None of the N file(s) could be imported: " then up to five `<uploaded name>: <sentence above>`, `; `-joined. The names are the ones the caller uploaded: the ComfyUI node shows this to say which output failed |
+| one-shot `error` | any other failure of the import | "The task failed; the server log has the details." |
+| one-shot `engine_error` | the pictures are in, but the model engine did not start | "The model engine could not start, so tagging and other model work wait until it can; the server log has the details." |
+| staging `error` | a batch failed after earlier batches committed | "The import stopped after N new picture(s) were added." |
+| staging `error` | any other failure of the import | "The task failed; the server log has the details." |
+
+A one-shot request whose zip entries all fail is refused with 400 and the
+detail "No valid media files found for import (…)", naming up to five entries
+with the zip-entry sentence.
 
 
 ---
@@ -2893,7 +3102,7 @@ PixlStash admits the GPU work it starts against the card's measured free memory 
 **The snapshot** (`resources` on `GET /workers/progress`, owner only, `null` for any other token):
 
 ```
-{enforcing, devices: [{uuid, name, total_mb, used_mb, free_mb, reserved_mb, reserved_by: {tenant: mb}, budget_mb, measurable, pixlstash}],
+{enforcing, stale, devices: [{uuid, name, total_mb, used_mb, free_mb, reserved_mb, reserved_by: {tenant: mb}, budget_mb, measurable, pixlstash}],
  ram: {total_mb, available_mb},
  holders: [{device, tenant, label, used_mb, measured_by, lease_id, outside_pixlstash}],
  leases: [{id, tenant, label, kind, state, device, need_mb, ram_mb, reserved_mb, held_mb, peak_mb, since,
@@ -2906,7 +3115,11 @@ PixlStash admits the GPU work it starts against the card's measured free memory 
 
 `reserved_by` splits `reserved_mb` by tenant (reservations not yet grown into); the GPU bars (Tasks tab, Run anyway dialog) draw each in its tenant's colour, paler, and only the rest as spare.
 
+`stale` is true when the cards and tenants did not answer the arbiter in time, so every figure is its last stored reading; the Tasks tab and the Run anyway dialog then say the figures may be out of date. A server that sends no flag reads as fresh.
+
 PixlStash's own tasks appear as `light` leases (one per running GPU task, `worker_type` set; `on_cpu: true` for one that spilled to the CPU) and never wait. `preempted` lists work paused to make room until the lease that caused it is granted.
+
+**Task names** (`task_labels` on `GET /workers/progress`, every token): `{<task type>: <name>}`, the backend's `TASK_LABELS` (`pixlstash/services/restore/_models.py`) whole. A lease's and a `preempted` entry's `worker_type` is a task type (the task's class name), as is every key of `workers`, whose rows also carry their own `task_label`; the Tasks tab names every PixlStash row from this one table and keeps no copy of it. A task type the table does not name is a backend gap: the app shows the type's id and warns in the console. It is a fixed vocabulary of kinds of work, the same for every token, and says nothing of what is running.
 
 `resources` sits beside the response's older `process` block, which it does not replace. `process` is this process's usage (`vram_used_gb`, `vram_total_gb`, `vram_percent`, null without a GPU). The VRAM limit slider in Settings › GPU & compute does **not** read its upper bound here: it takes `vram_total_gb` from `GET /users/me/config`, in the same response as the `max_vram_gb` it bounds. Waiting on this poll, the heaviest the server answers, held the slider at its 2 GB floor for as long as the poll took on a large library under load. The card total behind the config field is read once per process (`vram_utils.query_total_vram_mb`).
 
@@ -2960,9 +3173,12 @@ The pattern is the async request-reply / long-running-operation one
   changes (§8), coalesced; the run resource is what the client trusts for
   progress and outcome.
 
-The task's slices are LOW-priority writer callbacks of about a second each, so
-interactive writes get the single SQLite writer
-([WAL: one writer at a time](https://www.sqlite.org/wal.html)) between them. A
+The task's slices are short LOW-priority writer callbacks, so interactive
+writes get the single SQLite writer
+([WAL: one writer at a time](https://www.sqlite.org/wal.html)) between them.
+A Scrapheap run sizes each slice to a writer-time budget from the measured cost
+of the last (backend §5) and shows its bounds, `slice_max_pictures` and
+`slice_budget_s`, so a client can say how much a Stop still does. A
 run left `pending` or `running` by a server that stopped is closed
 `interrupted` at start-up.
 
@@ -2970,45 +3186,82 @@ run left `pending` or `running` by a server that stopped is closed
 forever on a selection, Restore all and Restore on a selection. A purge at about
 0.7 ms a picture held the writer past the 60 s timeout on a 50,000-picture heap.
 The body is `{kind: "purge" | "restore", picture_ids?, include_protected,
-confirm_token}` (unknown fields are 422). An omitted `picture_ids` means the
+confirm_token, request_id?}` (unknown fields are 422). An omitted `picture_ids` means the
 whole heap **as it is when the run starts**, so a picture scrapheaped after the
 confirm is not destroyed by it. A purge requires the `confirm_token` that
 `POST /pictures/scrapheap/delete-preview` minted for the same selection, with the
 same refusals as `DELETE /pictures/scrapheap`: 400 when it is missing, and 409
-when it is spent, expired or for another selection. The token is spent even if
-the start is then refused, so a retry re-runs the preview. Status, latest and
+when it is spent, expired or for another selection. A start refused with 409
+`scrapheap_run_active` or 503 leaves the token unspent, so the same confirmation
+can be sent again once the other run ends. Status, latest and
 cancel are `GET …/runs/{id}`, `GET …/runs/latest` and `POST …/runs/{id}/cancel`
 under `/pictures/scrapheap`. `Retry-After` is 1 s. The counters are `total`,
 `processed`, `deleted_count`, `restored_count`, `skipped_count` (protected
 kept), `skipped_locked_count` / `skipped_locked` (locked-set members kept, ids
 included so the grid can select them), `skipped_restored` (left the heap before
-their slice) and, on a finished purge, `snapshots_with_deleted`. A restore
-reports `segment_batch_ids`: it records History in segments of at most 5,000
-pictures, each one Ctrl+Z (backend §5). Refusals follow the shape above:
+their slice) and, on a finished purge, `snapshots_with_deleted`. Its Stop
+bound is `slice_max_pictures` (the most pictures one slice takes, so the most
+a Stop can still handle) and `slice_budget_s` (the writer time a slice aims
+for, so how soon a Stop normally lands). A restore
+reports `segment_batch_ids`: it records History in segments of at most 1,000
+pictures, each one Ctrl+Z (backend §5), and `can_undo` once it has ended with a
+segment still applied. Refusals follow the shape above:
 `scrapheap_run_active` (409, one run of either kind at a time),
 `scrapheap_run_not_found` (404) and `scrapheap_runs_unavailable` (503, a server
 with no background workers; nothing is reserved). Each is
 `{ "detail": { "code", "message", "run" } }`.
 
-It differs from auto-stack in two places, both on purpose:
+**`request_id` works as above.** The server mints `srv-<32 hex>` when the
+client sends none, and every run shows its id. A replay is found before a
+purge's `confirm_token` is looked at, so a retried purge gets its run back
+(200) without spending a second token; a replay with another
+`include_protected`, selection or kind is 422 `request_id_reused`. The id and a
+hash of the parameters are stored on the run's row, so a replay works across a
+restart for as long as the run is kept (the active one and the last 20 ended).
 
-- **No `request_id`.** The client does not resend an unanswered start. It reads
-  `GET …/runs/latest` and follows the run it finds, so a start that reached the
-  server shows its progress and is never doubled. A purge cannot be doubled in
-  any case, because its `confirm_token` is single-use.
-- **In memory, not a row.** A purge leaves nothing to revert and a restore's
-  undo is History's, so nothing needs a run once it ends. A restart therefore
-  forgets every run (an old id is 404 and `latest` is `run: null`), rather than
-  closing them `interrupted` at start-up. A stopping server still closes the
-  active run `interrupted` at its next slice boundary. What committed stays
-  committed and the rest is still in the Scrapheap, so starting again finishes
-  the job.
+**`Prefer: wait=N`** (RFC 7240 §4.3) on either start route waits up to
+min(N, 2) s for the run to end. If it does, the answer is **200** with the
+ended run (`active: false`) and `Preference-Applied: wait=<applied>`;
+otherwise it is the 202. A malformed or zero `wait` is ignored. Every answer
+carries `Vary: Prefer` (read `Vary` as a list; CORS may add `Origin`). A 200 is
+either a finished run or a replay that may still be running, so the client
+reads `active`, never the status code.
+
+**Undo of a restore run: `POST …/runs/{run_id}/undo`**, owner only, body
+`{request_id?}` (unknown fields 422), `Prefer: wait` as above. It starts a run
+of `kind: "undo"` with `target_run_id`, `segment_batch_ids` (the target's, in
+the same order; it works through them newest first, one writer slice each) and
+`undone_count` (pictures put back in the Scrapheap). Refusals: 404
+`scrapheap_run_not_found`; 409 `not_a_restore_run` (a purge, or an undo); 409
+`scrapheap_run_active`; 503 `scrapheap_runs_unavailable`; 409
+`nothing_to_undo` (every segment was undone already); 422 `request_id_reused`.
+It ends `complete`, `cancelled`, `interrupted`, `failed`, or **`blocked`**:
+`history_moved_on` when an unrelated History entry sits above the next segment
+(the `error` names that entry), or `undo_refused` when a locked picture set
+holds one of the segment's pictures or one was deleted forever. What it undid
+stays undone; once the blocker is undone, a second undo of the same target
+finishes the job. Ctrl+Z on a single segment works as before.
+
+Like an auto-stack run, a Scrapheap run is a row (`scrapheaprun`), written
+before the 202 and after every slice. A stopping server closes the active run
+`interrupted` at its next slice boundary; one that died without closing it
+leaves the row active, and start-up marks it `interrupted` (`server_stopped`).
+Either way a client polling across the restart reads the run's end state, not
+404, and `latest` still names it. Nothing resumes. What committed stays
+committed and the rest is still in the Scrapheap, so starting again finishes
+the job. After a hard crash the counts can trail what committed by at most one
+slice.
 
 Its events are the ordinary ones (§8): `pictures_changed` with `removed` for a
-purge and `restored` for a restore, coalesced to at most one every 2 s, carrying
-the starting request's `origin_client_id`. `DELETE /pictures/scrapheap` and
-`POST /pictures/scrapheap/restore` remain for a single picture and for API
-clients.
+purge or an undo and `restored` for a restore, coalesced to at most one every
+2 s, carrying the starting request's `origin_client_id`, plus top-level
+`run_id` and `run_kind` (`purge`, `restore` or `undo`). An undo also sends
+`updated` for pictures it touched without moving. `DELETE /pictures/scrapheap` and
+`POST /pictures/scrapheap/restore` remain for a small explicit selection: with
+no ids, or more than `SCRAPHEAP_SYNC_MAX_IDS` (1,000), they answer **422**
+`{"detail": {"code": "use_scrapheap_runs", "message", "runs_url", "max_ids"}}`
+and do nothing, checked before a delete's confirm token is redeemed, so the
+same token can start the run instead.
 
 ## 12. Configuration Sync
 
@@ -3034,7 +3287,7 @@ clients.
 
 Backend rule: errors must use FastAPI's `HTTPException(status_code, detail=...)` with a human-readable `detail`. Never return a `500` for an expected validation failure.
 
-A request refused before its route runs (a body, query, path or header value of the wrong type or shape, or a validator's `ValueError`) is answered by `validation_exception_handler` in `pixlstash/server.py` as `422 {"detail": [{type, loc, msg}]}`. Pydantic's `input`, `ctx` and `url` are never sent, and each text value of the refused input is written as `*` in `msg` where it appears as sent or in a `repr` spelling (`Value error, '*' is not a model file`). That starring is a backstop, not a guarantee: a value a validator reshaped first (its case changed, a slice of it, two values joined with nothing between them) is not recognised, so a validator never reshapes a submitted value it puts in its message. `loc` is the field's address and keeps a mapping entry's key, which the caller chose. A password shorter than 8 characters is the one string `detail`. `errorDetail` (`frontend/src/utils/apiError.js`) shows nothing for a list `detail`, so the toast carries the caller's own copy; the ComfyUI pack shows the `msg` texts.
+A request refused before its route runs (a body, query, path or header value of the wrong type or shape, or a validator's `ValueError`) is answered by `validation_exception_handler` in `pixlstash/server.py` as `422 {"detail": [{type, loc, msg, ctx?}]}`. Pydantic's `input` and `url` are never sent. `ctx` is sent only when the field declares a bound, and holds only that bound (`gt`, `ge`, `lt`, `le`, `multiple_of`, `min_length`, `max_length`, `pattern`, `expected`, `max_digits`, `decimal_places`, `whole_digits`), and only when the bound is text or a finite number: a date bound arrives as its ISO text, and a `Decimal` or infinite bound is left out (its `msg` states it). Every other ctx key is dropped (`server.py` `_DECLARED_BOUNDS`), because it can carry what was sent: a validator's exception, a discriminator value or a measured length. Each text value of the refused input is written as `*` in `msg` where it appears as sent or in a `repr` spelling (`Value error, '*' is not a model file`). That starring is a backstop, not a guarantee: a value a validator reshaped first (its case changed, a slice of it, two values joined with nothing between them) is not recognised, so a validator never reshapes a submitted value it puts in its message. `loc` is the field's address and keeps a mapping entry's key, which the caller chose. A password shorter than 8 characters is the one string `detail`. `errorDetail` (`frontend/src/utils/apiError.js`) shows nothing for a list `detail`, so the toast carries the caller's own copy; the ComfyUI pack shows the `msg` texts.
 
 ---
 
@@ -3152,7 +3405,7 @@ sequenceDiagram
     par Background pipeline
         V->>DB: write Picture, Quality, Tags, Embeddings
         V-->>API: emit events (snake_case type)
-        API-->>WS: filter by client's set_filters
+        API-->>WS: every owner socket (event-type allowlist)
         WS-->>SPA: { type: pictures_changed, picture_ids: [...] }
         SPA->>SPA: refresh grid / sidebar
     end
@@ -3292,6 +3545,9 @@ verdicts use `decided_at` (2026-07-30; the open queue keeps its
 confidence-descending order). `next_cursor` encodes that same effective
 timestamp. Both pages mint **distinct cursor families** that reject each other
 with a 400 — never reuse a queue cursor on the decided page or across the flip.
+That 400, like the one for any cursor the server cannot read, has one fixed
+`detail`: "That cursor is not one this page gave out. Start again from the
+first page." The cursor itself is not repeated; the server log has it.
 
 **`decided_at` is display-ready.** It means "when this decision last became
 live" (a redo re-stamps it), even though a stacked row may sort by the newer
@@ -3387,13 +3643,18 @@ Read-only despite the verb (a scope list does not fit a URL). Body:
   "unresolved_groups": 128,                              // the sidebar badge
   "by_tier": { "exact": 96, "near": 30, "embedding": 2 },// INCLUDING disabled tiers
   "scopes": [{ "scope_type": "set", "scope_id": "9", "key": "set:9",
-               "unresolved_groups": 4 }],
+               "unresolved_groups": 4,
+               "by_tier": { "exact": 3, "near": 1, "embedding": 0 } }],
   "policy": { … }, "scan": { … }
 }
 ```
 
 `by_tier` deliberately reports tiers that are switched off, so a tier switch can
-be labelled with what enabling it would add. A non-global scope without a
+be labelled with what enabling it would add. Each scope row carries its own
+`by_tier` as well: a scoped queue's tier menu and Auto-stack button
+count what *that scope* holds, so they never show the vault's figures over a
+two-group set. The top-level figures stay vault-wide; they feed the sidebar
+badge. A non-global scope without a
 `scope_id` is a **400**, and the `scopes` list is capped at **200** entries (each
 is a separate correlated `COUNT`) — over that is a **422**.
 
@@ -3605,6 +3866,7 @@ first one created.
   "total": 0, "processed": 0, "applied": 0, "superseded": 0, "blocked": 0,
   "failed": 0, "pictures": 0, "failures": [], "segment_batch_ids": [],
   "cancel_requested": false, "can_revert": false,
+  "target_can_revert": false,
   "error_code": null, "error": null,
   "created_at": "…", "started_at": "…", "updated_at": "…", "finished_at": null }
 ```
@@ -3640,7 +3902,9 @@ receipt (frontend §13.3, "Auto-stack runs in the background").
 ### Run status, cancel and revert
 
 - **`GET /dedup/auto-stack/runs/{run_id}`**: the run, with `Retry-After` while
-  active; **404** `auto_stack_run_not_found` for an unknown id.
+  active; **404** `auto_stack_run_not_found` for an unknown id. The server
+  keeps the newest 20 ended runs; an older one is 404 too, and its
+  `request_id` starts a new run.
 - **`GET /dedup/auto-stack/runs/latest`**: `{ "run": … }`, the newest run of
   either kind, or `null` before the first. The Duplicates screen reads it on
   arrival so a run started before a reload, or in another tab, is followed.
@@ -3659,10 +3923,13 @@ receipt (frontend §13.3, "Auto-stack runs in the background").
   `not_an_apply_run`, `nothing_to_revert` or `auto_stack_run_active`.
 
 `can_revert` is true for an ended apply run with a segment that still has
-something to undo. A server that stops mid-run closes the run `interrupted` with
-`error_code: "server_restarted"` (at the slice boundary, or at the next
-start-up if even that could not run); it is never resumed, and whatever it
-committed stays stacked and revertable.
+something to undo. `target_can_revert` is true for an ended revert run whose
+`target_run_id` still has something to undo: sending the revert for that run
+again would act. It is false for an apply run, while the revert is active, and
+once the target is undone or no longer kept. A server that stops mid-run closes
+the run `interrupted` with `error_code: "server_restarted"` (at the slice
+boundary, or at the next start-up if even that could not run); it is never
+resumed, and whatever it committed stays stacked and revertable.
 
 ### Not in this API
 
@@ -4611,7 +4878,7 @@ Text read out of a picture is its own data: never `description`, never tags.
 - `pending` means the picture is not in the scrapheap, its `text_score` qualifies and it has not been read yet; `none` covers both "not worth reading" and "read, nothing found".
 - A finished read emits `pictures_changed` with `fields: ["ocr_text"]`. The field affects no sort or filter, so the grid ignores it; the open lightbox refetches.
 - Ranking: a text match adds `OCR_TEXT_MATCH_WEIGHT` (0.35) to the combined score and nothing otherwise, so a page of words gains nothing on a search its words do not answer. The SPA searches with `threshold=0.1`; at the route's own default of 0.5 a picture matched by its text alone (0.35) is filtered out, so an API caller wanting text-only matches must pass a lower threshold. `text_match` is computed only for the rows a search returns. `tests/test_ocr_text.py` holds the queries that must not match known text-heavy pictures.
-- The result pill's *All · In text* switch filters on `text_match` client-side; nothing is refetched and nothing is remembered.
+- The result pill's *All · In text* switch searches again with `text_match_only=true` (§2.13), which keeps only the `text_match` rows before the page is cut; the export of that view sends the same param, so it packages the same pictures. Nothing is remembered.
 
 ---
 
