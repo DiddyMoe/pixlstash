@@ -65,6 +65,13 @@ from pixlstash.tasks import TaskType
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.orientation import read_orientation
 from pixlstash.utils.insightface_model_utils import DEFAULT_MODEL_PACK
+from tests.test_exif_orientation_loads import (
+    _assert_carried_upright,
+    _orientations_carried,
+    _raw_profile_text,
+    _unwritable_exif,
+    _xmp_packet,
+)
 from tests.utils import upload_pictures_and_wait
 
 API = "/api/v1"
@@ -959,6 +966,32 @@ def test_a_served_rotated_png_keeps_its_comfyui_provenance(client, server):
         )
 
 
+def test_a_png_whose_exif_cannot_be_written_back_is_still_served_turned(client, server):
+    """EXIF Pillow reads but cannot write back: the response still turns it.
+
+    A LONG8 tag beside orientation 6. `ImageOps.exif_transpose` raised while
+    writing the EXIF back, so the media route answered 500 for the picture.
+    The turn writes no EXIF back now.
+    """
+    picture_id = _upload(client, fmt="PNG", size=(64, 48))
+    Image.new("RGB", (64, 48), (90, 120, 40)).save(
+        _file_path(server, picture_id),
+        "PNG",
+        exif=b"Exif\x00\x00" + _unwritable_exif(6),
+    )
+
+    def _turned(session):
+        session.get(Picture, picture_id).orientation = 6
+        session.commit()
+
+    server.vault.db.run_task(_turned)
+
+    resp = client.get(f"{API}/pictures/{picture_id}.png")
+    assert resp.status_code == 200, resp.text
+    with Image.open(io.BytesIO(resp.content)) as served:
+        assert served.size == (48, 64), "orientation 6, served upright"
+
+
 def test_the_grid_projection_carries_the_orientation(client, server):
     """The lightbox's cache-buster is built from a grid row, so it has to be in one.
 
@@ -1348,3 +1381,47 @@ def test_the_rotate_itself_announces_a_turn(client, server):
         assert _rotate(client, [picture_id], "cw").status_code == 200
 
     _assert_announced_a_turn(emitted, picture_id, "rotate")
+
+
+def _png_text_carrying_6(carrier: str) -> PngInfo:
+    info = PngInfo()
+    if carrier == "Raw profile type exif":
+        info.add_text(carrier, _raw_profile_text(6))
+    else:
+        info.add_itxt(carrier, _xmp_packet(6).decode())
+    info.add_text("parameters", "test-steps 20")
+    return info
+
+
+@pytest.mark.parametrize("carrier", ["Raw profile type exif", "XML:com.adobe.xmp"])
+def test_a_served_turned_png_carries_no_orientation_to_turn_it_twice(
+    client, server, carrier
+):
+    """The served PNG keeps its text chunks, but not one that says 6.
+
+    The chunks were read before the turn, so the upright response still
+    carried the orientation (in the raw EXIF profile, or XMP's
+    tiff:Orientation) and a viewer that reads it turned the picture again.
+    An unrelated chunk (``parameters``) is still carried across.
+    """
+    picture_id = _upload(client, fmt="PNG", size=(64, 48))
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), (90, 120, 40)).save(
+        buf, "PNG", pnginfo=_png_text_carrying_6(carrier)
+    )
+    assert _orientations_carried(buf.getvalue())[carrier] == 6
+    with open(_file_path(server, picture_id), "wb") as handle:
+        handle.write(buf.getvalue())
+
+    def _turned(session):
+        session.get(Picture, picture_id).orientation = 6
+        session.commit()
+
+    server.vault.db.run_task(_turned)
+
+    resp = client.get(f"{API}/pictures/{picture_id}.png")
+    assert resp.status_code == 200, resp.text
+    with Image.open(io.BytesIO(resp.content)) as served:
+        assert served.size == (48, 64), "orientation 6, served upright"
+        assert served.text.get("parameters") == "test-steps 20"
+    _assert_carried_upright(resp.content, f"served PNG ({carrier})")

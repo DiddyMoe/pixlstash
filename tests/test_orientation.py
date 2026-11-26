@@ -530,7 +530,8 @@ def test_supports_in_place_rotation(name, expected):
 def test_webp_is_not_offered_in_place(tmp_path):
     """WebP writes cleanly but no browser reads it back - verified 2026-08-15.
 
-    piexif handles WebP and the backend's ``exif_transpose`` honours the result,
+    piexif handles WebP and the backend's ``ImageUtils.apply_exif_orientation``
+    turns by the result,
     so this looks like an oversight from inside Python. It is not: Chromium 148
     and Firefox 150 both ignore WebP EXIF orientation, so rotating one in place
     would give a rotated thumbnail beside an unrotated full-size view. Removing

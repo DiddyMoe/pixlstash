@@ -26,6 +26,7 @@ from pixlstash.services.edit_copies import (
 )
 from pixlstash.utils import open_with
 from pixlstash.utils.image_processing.generation_data import strip_generation_data
+from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.service.share_copies import (
     METADATA_KEPT,
     METADATA_REMOVED,
@@ -36,6 +37,13 @@ from pixlstash.utils.service.share_copies import (
     sweep_share_copies,
 )
 from pixlstash.utils.service.export_utils import ExportUtils
+from tests.test_exif_orientation_loads import (
+    _assert_carried_upright,
+    _orientations_carried,
+    _raw_profile_text,
+    _unwritable_exif,
+    _xmp_packet,
+)
 from tests.utils import API_PREFIX, upload_pictures_and_wait
 
 COMFY_PROMPT = json.dumps({"3": {"class_type": "KSampler", "inputs": {"seed": 1}}})
@@ -428,6 +436,103 @@ def test_a_resized_copy_is_turned_upright_rather_than_tagged(library):
         # 48x32 shown a quarter turn round is 32x48, so 16x24 at this cap.
         assert img.size == (16, 24)
         assert img.getexif().get(0x0112) is None
+
+
+def test_a_resized_copy_of_a_photo_whose_exif_cannot_be_written_back_is_made(
+    library,
+):
+    """EXIF Pillow reads but cannot write back no longer skips the picture.
+
+    A LONG8 tag beside orientation 6: `ImageOps.exif_transpose` raised while
+    writing the EXIF back, so the resized copy was skipped as unreadable. The
+    turn writes no EXIF back now, and a stripped copy carries none.
+    """
+    buf = BytesIO()
+    _pattern().save(buf, format="PNG", exif=b"Exif\x00\x00" + _unwritable_exif(6))
+    library["add"](buf.getvalue(), "unwritable-exif.png")
+
+    result = _copy(library, max_long_edge=24)
+
+    assert result["skipped"] == []
+    (entry,) = result["files"]
+    assert entry["resized"] is True
+    with Image.open(entry["path"]) as img:
+        # 48x32 shown a quarter turn round is 32x48, so 16x24 at this cap.
+        assert img.size == (16, 24)
+        assert img.getexif().get(0x0112) is None
+
+
+def test_a_kept_copy_of_a_photo_whose_exif_cannot_be_written_back_keeps_its_text(
+    library,
+):
+    """Only the EXIF block that cannot be written back is left out.
+
+    Writing the EXIF into the re-encoded copy raised, so a resized copy that
+    kept its generation data was skipped as unreadable. It is made now,
+    upright, with its generation text and without that EXIF block.
+    """
+    info = PngImagePlugin.PngInfo()
+    info.add_text("parameters", A1111_PARAMETERS)
+    buf = BytesIO()
+    _pattern().save(
+        buf, format="PNG", pnginfo=info, exif=b"Exif\x00\x00" + _unwritable_exif(6)
+    )
+    library["add"](buf.getvalue(), "unwritable-exif.png")
+
+    result = _copy(library, max_long_edge=24, keep_generation_data=True)
+
+    assert result["skipped"] == []
+    (entry,) = result["files"]
+    assert entry["metadata"] == METADATA_KEPT
+    with Image.open(entry["path"]) as img:
+        assert img.size == (16, 24)
+        assert img.text["parameters"] == A1111_PARAMETERS
+        assert dict(img.getexif()) == {}
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_a_resized_copy_of_a_photo_whose_exif_header_does_not_parse_is_made(
+    library, keep
+):
+    """An EXIF header that does not parse holds nothing to keep or to turn by."""
+    info = PngImagePlugin.PngInfo()
+    info.add_text("parameters", A1111_PARAMETERS)
+    buf = BytesIO()
+    _pattern().save(
+        buf, format="PNG", pnginfo=info, exif=b"Exif\x00\x00" + b"XX" + b"\x00" * 30
+    )
+    library["add"](buf.getvalue(), "unparseable-exif.png")
+
+    result = _copy(library, max_long_edge=24, keep_generation_data=keep)
+
+    assert result["skipped"] == []
+    (entry,) = result["files"]
+    with Image.open(entry["path"]) as img:
+        # 48x32 as stored, so 24x16 at this cap.
+        assert img.size == (24, 16)
+        assert img.text.get("parameters") == (A1111_PARAMETERS if keep else None)
+
+
+def test_a_resized_copy_leaves_the_upright_source_image_as_it_was(library, monkeypatch):
+    """The turn answers the source image itself when it is already upright.
+
+    Resizing that answer in place would shrink the image the caller opened.
+    """
+    library["add"](_a1111_png(), "upright.png")
+    turned = []
+    turn = ImageUtils.apply_exif_orientation
+
+    def recording_turn(img):
+        turned.append(turn(img))
+        return turned[-1]
+
+    monkeypatch.setattr(ImageUtils, "apply_exif_orientation", recording_turn)
+
+    (entry,) = _copy(library, max_long_edge=24)["files"]
+
+    assert entry["resized"] is True
+    (answer,) = turned
+    assert answer.size == (48, 32), "resized in place"
 
 
 def test_max_long_edge_never_enlarges_and_keeps_a_small_picture_untouched(library):
@@ -888,3 +993,52 @@ def test_a_picture_that_cannot_be_stripped_is_left_out_not_sent(library):
 
     assert "image_00001.png" not in members
     _assert_no_generation_data(members["image_00002.png"])
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "WEBP"])
+def test_a_kept_resized_copy_carries_no_xmp_orientation_to_turn_it_twice(library, fmt):
+    """The copy is turned upright, so its XMP must not say 6 either.
+
+    Its XMP was taken from the source as read before the turn, so a viewer that
+    reads XMP's tiff:Orientation turned the upright copy a second time.
+    """
+    buf = BytesIO()
+    _pattern().save(
+        buf, format=fmt, exif=_exif(6).tobytes(), xmp=_xmp_packet(6), quality=95
+    )
+    assert _orientations_carried(buf.getvalue()) == {"exif": 6, "xmp": 6}
+    library["add"](buf.getvalue(), f"xmp-turned.{fmt.lower()}")
+
+    (entry,) = _copy(library, max_long_edge=24, keep_generation_data=True)["files"]
+
+    with open(entry["path"], "rb") as handle:
+        copy = handle.read()
+    with Image.open(BytesIO(copy)) as img:
+        assert img.size == (16, 24), "turned upright"
+        assert b"test-kept" in img.info["xmp"], "the rest of the XMP is kept"
+    _assert_carried_upright(copy, f"kept {fmt} copy")
+
+
+def test_a_kept_resized_png_carries_no_raw_profile_orientation(library):
+    """PNG's "Raw profile type exif" chunk is an orientation carrier too.
+
+    The copy kept every text chunk as read before the turn, this one included,
+    so the upright copy said 6 and was turned again. An unrelated text chunk
+    (A1111's ``parameters``) is still kept.
+    """
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Raw profile type exif", _raw_profile_text(6))
+    info.add_text("parameters", A1111_PARAMETERS)
+    buf = BytesIO()
+    _pattern().save(buf, format="PNG", pnginfo=info)
+    assert _orientations_carried(buf.getvalue()) == {"Raw profile type exif": 6}
+    library["add"](buf.getvalue(), "raw-profile-turned.png")
+
+    (entry,) = _copy(library, max_long_edge=24, keep_generation_data=True)["files"]
+
+    with open(entry["path"], "rb") as handle:
+        copy = handle.read()
+    with Image.open(BytesIO(copy)) as img:
+        assert img.size == (16, 24), "turned upright"
+        assert img.text.get("parameters") == A1111_PARAMETERS
+    _assert_carried_upright(copy, "kept PNG copy")

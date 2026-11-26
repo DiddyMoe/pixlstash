@@ -13,7 +13,8 @@ from sqlmodel import Session, delete
 from pixlstash.db_models import Picture
 from pixlstash.image_plugins.registry import get_image_plugin_manager
 from pixlstash.server import Server
-from pixlstash.services.edit_selection import Selection, render_mask
+from pixlstash.services.edit_selection import Selection, load_upright, render_mask
+from tests.test_exif_orientation_loads import _unwritable_exif
 
 # Left half red, right half blue, 40 x 20.
 PICTURE = np.zeros((20, 40, 3), dtype=np.uint8)
@@ -129,6 +130,28 @@ def test_the_crop_plugin_cuts_the_box_given_as_fractions():
     # Out of range and nonsense clamp to the picture rather than failing.
     [clamped] = plugin.run([Image.fromarray(PICTURE)], {"left": -1, "width": 9})
     assert clamped.size[0] == 40
+
+
+def test_a_photo_whose_exif_cannot_be_written_back_opens_upright(tmp_path):
+    """The Edit tab draws on the picture as shown, even with such EXIF.
+
+    A LONG8 tag beside orientation 6: `ImageOps.exif_transpose` raised on it
+    while writing the EXIF back, so the picture could not be masked at all.
+    The turn writes no EXIF back now.
+    """
+    path = tmp_path / "unwritable-exif.png"
+    Image.fromarray(PICTURE).save(
+        path, "PNG", exif=b"Exif\x00\x00" + _unwritable_exif(6)
+    )
+
+    upright = load_upright(str(path))
+
+    assert upright.shape == (40, 20, 3), "orientation 6, upright"
+    # A quarter turn clockwise: the red left half is on top, the blue below.
+    assert (upright[0, 0].tolist(), upright[-1, 0].tolist()) == (
+        [220, 30, 30],
+        [30, 30, 220],
+    ), "turned the wrong way"
 
 
 # ── the route: POST /pictures/{id}/mask ──────────────────────────────────────

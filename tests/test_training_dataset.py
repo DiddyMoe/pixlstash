@@ -22,7 +22,8 @@ from sqlmodel import select
 
 from pixlstash.db_models import Face, Picture, Tag
 from pixlstash.server import Server
-from pixlstash.utils.service.export_utils import ExportUtils
+from pixlstash.utils.service.export_utils import ExportUtils, _FolderSink
+from tests.test_exif_orientation_loads import _unwritable_exif
 from tests.utils import quiesce_background_work, upload_pictures_and_wait
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
@@ -535,3 +536,28 @@ def test_a_stack_trains_its_cover():
     kept = {p.id for p in ExportUtils._deduplicate_stacks(pics)}
     # The cover, not the newest; with no positions, the newest.
     assert kept == {2, 4, 5}
+
+
+def test_a_cutout_whose_exif_cannot_be_written_back_is_trained_upright(tmp_path):
+    """EXIF Pillow reads but cannot write back no longer leaves it out.
+
+    A transparent PNG is converted for the trainer. With a LONG8 tag beside
+    orientation 6, `ImageOps.exif_transpose` raised while writing the EXIF
+    back, so the conversion failed and the picture was left out. The turn
+    writes no EXIF back now.
+    """
+    source = tmp_path / "unwritable-exif.png"
+    Image.new("RGBA", (40, 30), (200, 10, 10, 255)).save(
+        source, "PNG", exif=b"Exif\x00\x00" + _unwritable_exif(6)
+    )
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+
+    written = ExportUtils._write_trainer_png(
+        str(source), "unwritable-exif.png", _FolderSink(str(dataset)), 1.0
+    )
+
+    assert written is True, "the picture was left out of the dataset"
+    with Image.open(dataset / "unwritable-exif.png") as img:
+        assert img.size == (30, 40), "orientation 6, upright"
+        assert img.getexif().get(0x0112) is None

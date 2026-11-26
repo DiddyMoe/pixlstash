@@ -9,7 +9,7 @@ import time
 import traceback
 from typing import TYPE_CHECKING, Callable, Optional
 
-from PIL import Image, ImageOps
+from PIL import Image
 
 if TYPE_CHECKING:  # annotations only - see the function-local import note below
     import torch
@@ -17,8 +17,9 @@ if TYPE_CHECKING:  # annotations only - see the function-local import note below
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tagger_plugins.base import TaggerPlugin
 from pixlstash.utils.accelerator import is_accelerated, is_device_error
-from pixlstash.utils.model_utils import from_pretrained_local_first
+from pixlstash.utils.model_utils import from_pretrained_local_first, ml_imports
 from pixlstash.utils.vram_utils import empty_device_cache, is_vram_oom
+from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 
 # ML imports (torch / torchvision) are deliberately FUNCTION-LOCAL throughout
@@ -153,7 +154,8 @@ def _words_from_ocr_regions(quad_boxes, labels, image_size) -> list:
 
 def _move_inputs_to_device(inputs: dict, device, dtype) -> dict:
     """Move a HuggingFace processor output dict to *device*/*dtype*."""
-    import torch
+    with ml_imports():
+        import torch
 
     return {
         k: (
@@ -412,7 +414,8 @@ class Florence2Service:
         Returns:
             Dict mapping file path → caption string (or None on failure).
         """
-        import torch
+        with ml_imports():
+            import torch
 
         logger.debug(
             "_generate_florence_captions_batch called: %d images", len(image_paths)
@@ -628,7 +631,8 @@ class Florence2Service:
         path that fails to load is omitted, and a failed batch is ``{}`` after
         one retry on CPU when the failure was the GPU's.
         """
-        import torch
+        with ml_imports():
+            import torch
 
         retry_on_cpu = True
         while True:
@@ -643,7 +647,10 @@ class Florence2Service:
                     try:
                         image = Image.open(image_path)
                         if exif_transpose:
-                            image = ImageOps.exif_transpose(image)
+                            # Turned as every loader turns it, writing no
+                            # EXIF back: EXIF Pillow reads but cannot write
+                            # does not cost the picture its text.
+                            image = ImageUtils.apply_exif_orientation(image)
                         image = image.convert("RGB")
                         fed = _resize_to_max_dim(image, max_dim)
                         valid_items.append((image_path, image.size, fed))
@@ -708,10 +715,12 @@ class Florence2Service:
 
     def _init(self) -> None:
         """Load Florence-2 onto the best available device."""
-        import torch
+        with ml_imports():
+            import torch
 
         try:
-            import transformers
+            with ml_imports():
+                import transformers
 
             logger.debug("Loading Florence-2 model for captioning...")
             logger.debug("Transformers version: %s", transformers.__version__)
@@ -778,9 +787,13 @@ class Florence2Service:
             logger.error("Try: pip install --upgrade transformers")
 
     def _load_model(self, device: torch.device, dtype) -> None:
-        import torch
+        with ml_imports():
+            import torch
 
-        from transformers import Florence2Processor, Florence2ForConditionalGeneration
+            from transformers import (
+                Florence2Processor,
+                Florence2ForConditionalGeneration,
+            )
 
         if not isinstance(device, torch.device):
             device = torch.device(device)
@@ -832,7 +845,8 @@ class Florence2Service:
         logger.warning("[FLORENCE_FALLBACK] %s", reason)
 
     def _reload_on_cpu(self, cause: Optional[Exception] = None) -> bool:
-        import torch
+        with ml_imports():
+            import torch
 
         logger.warning(
             "Florence-2 GPU inference failed; attempting to reload on CPU..."
@@ -857,7 +871,8 @@ class Florence2Service:
 
     def _infer_single(self, image: Image.Image) -> Optional[str]:
         """Run inference on a single PIL image and return the caption."""
-        import torch
+        with ml_imports():
+            import torch
 
         inputs = self._processor(
             text="<MORE_DETAILED_CAPTION>",
@@ -950,7 +965,8 @@ class Florence2Service:
 
     @staticmethod
     def _accelerator_available(device) -> bool:
-        import torch
+        with ml_imports():
+            import torch
 
         if device.type == "cuda":
             return torch.cuda.is_available()

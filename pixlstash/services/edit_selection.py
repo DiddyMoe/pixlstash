@@ -35,8 +35,10 @@ from typing import Annotated, Literal
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image
 from pydantic import BaseModel, Field, model_validator
+
+from pixlstash.utils.image_processing.image_utils import ImageUtils
 
 MAX_STEPS = 200
 MAX_POINTS = 20000
@@ -218,9 +220,11 @@ UNREADABLE_PICTURE = (OSError, Image.DecompressionBombError)
 @lru_cache(maxsize=1)
 def _load_upright(path: str, mtime_ns: int) -> np.ndarray:
     """The picture as the browser shows it: EXIF-rotated RGB. Cached because
-    the Edit tab asks again after every gesture."""
+    the Edit tab asks again after every gesture. Turned as every loader turns
+    it, writing no EXIF back, so EXIF Pillow reads but cannot write does not
+    stop the Edit tab."""
     with Image.open(path) as image:
-        return np.array(ImageOps.exif_transpose(image).convert("RGB"))
+        return np.array(ImageUtils.apply_exif_orientation(image).convert("RGB"))
 
 
 def load_upright(path: str) -> np.ndarray:

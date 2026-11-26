@@ -21,7 +21,6 @@ tell no one, so the repair reached the disk and the database while the open grid
 kept showing the wrong picture until a full reload. See :meth:`_announce`.
 """
 
-import ast
 import os
 
 from PIL import Image
@@ -29,9 +28,13 @@ from sqlmodel import Session
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.pixl_logging import get_logger
+from pixlstash.services.scrapheap_service import file_location_is_unreachable
 from pixlstash.tasks.base_task import BaseTask
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.image_processing.media_load import LoadFailure
+from pixlstash.utils.unprocessable_image_registry import SignedLoad, load_signed
 
 logger = get_logger(__name__)
 
@@ -40,6 +43,11 @@ class ThumbnailGenerationTask(BaseTask):
     """Generate thumbnails for one batch of pictures (CPU queue)."""
 
     BATCH_SIZE = 64
+    #: The result key listing, as ``(picture_id, path, mtime_ns, size)``, each
+    #: picture whose file decodes but whose EXIF turn raises (see
+    #: :meth:`_note_orientation_failure`). Present only when there is one;
+    #: ``MissingThumbnailFinder`` holds those until the file changes.
+    ORIENTATION_FAILED = "orientation_failed"
 
     def __init__(self, database, pictures: list, notifier=None):
         picture_ids = [pic.id for pic in (pictures or []) if getattr(pic, "id", None)]
@@ -53,19 +61,29 @@ class ThumbnailGenerationTask(BaseTask):
         self._db = database
         self._pictures = pictures or []
         self._notifier = notifier
+        # (picture_id, path, mtime_ns, size) per ORIENTATION_FAILED picture.
+        self._orientation_failures: list[tuple[int, str, int, int]] = []
 
     # ── helpers ───────────────────────────────────────────────────────────────
     @staticmethod
     def _face_bboxes(pic) -> list:
+        """The picture's stored face boxes that weight its square crop.
+
+        Read from each face row's ``bbox_`` text. A box that is not four
+        finite numbers is logged once and left out, so the thumbnail is still
+        made from the rest: a box that raised here left the picture without a
+        thumbnail, and ``MissingThumbnailFinder`` (``thumbnail_width IS
+        NULL``) selected it again on every sweep.
+        """
         bboxes = []
         for face in getattr(pic, "faces", []) or []:
-            bbox = getattr(face, "bbox", None)
-            if isinstance(bbox, str):
-                try:
-                    bbox = ast.literal_eval(bbox)
-                except Exception:
-                    bbox = None
-            if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            bbox = read_stored_bbox(
+                face.bbox_,
+                owner="Face",
+                row_id=face.id,
+                picture_id=getattr(pic, "id", None),
+            )
+            if bbox is not None:
                 bboxes.append([float(v) for v in bbox])
         return bboxes
 
@@ -84,28 +102,7 @@ class ThumbnailGenerationTask(BaseTask):
 
         img = ImageUtils.load_image_or_video(resolved)
         if img is None:
-            # The file exists but cannot be loaded. Returning None leaves
-            # thumbnail_width NULL, which is exactly what MissingThumbnailFinder
-            # selects on - without marking, the same picture is re-selected on
-            # every sweep forever (#585). The registry logs one warning per
-            # file version and _filter_and_claim skips it. A file that cannot
-            # be read is marked too: MissingThumbnailFinder has no retry hold,
-            # so a read failure that persists (no permission, a bad sector)
-            # would be re-selected on every sweep. The mark lifts when the file
-            # changes, and on restart.
-            registry = getattr(self._db, "unprocessable_images", None)
-            if registry is not None:
-                registry.mark_unprocessable(
-                    getattr(pic, "id", None),
-                    str(resolved),
-                    reason="thumbnail source could not be loaded",
-                )
-            else:
-                logger.warning(
-                    "ThumbnailGenerationTask: failed to load source for picture %s (%s)",
-                    getattr(pic, "id", None),
-                    resolved,
-                )
+            self._hold_unloadable(getattr(pic, "id", None), str(resolved))
             return None
         if not isinstance(img, Image.Image):
             img = Image.fromarray(img)
@@ -131,7 +128,142 @@ class ThumbnailGenerationTask(BaseTask):
             "square_crop_side": crop["side"],
         }
 
+    def _hold_unloadable(self, pic_id, resolved: str) -> None:
+        """Keep a source that would not load from being re-selected, by cause.
+
+        Returning ``None`` leaves ``thumbnail_width`` NULL, which is exactly
+        what ``MissingThumbnailFinder`` selects on: whatever is not held is
+        selected again on the next sweep (#585). ``load_image_or_video``
+        answers ``None`` for every failure, so the file is loaded once more
+        with the classifying loader (:func:`load_signed`) to learn why, and
+        each cause gets the hold that ends with it:
+
+        - bytes that do not decode: ``mark_unprocessable``, pinned to the
+          file's signature, lifted when the file changes;
+        - a location that is not mounted: ``mark_unreachable``, lifted when
+          it is back;
+        - any other read failure (no permission, a bad sector, a dropped
+          share): ``hold_unreadable``, lifted the moment the file reads again;
+        - bytes that decode but whose EXIF turn raises: reported to the
+          finder, which holds the picture until the file changes
+          (:meth:`_note_orientation_failure`).
+
+        A load that runs out of memory, an unclassified failure, or a file that
+        loads on the second try is only logged, and is retried.
+        """
+        registry = getattr(self._db, "unprocessable_images", None)
+        loaded = load_signed(resolved, multiframe_count=1)
+        failure = loaded.result
+        if failure.failure is None:
+            self._note_orientation_failure(pic_id, loaded)
+            return
+        if registry is None:
+            logger.warning(
+                "ThumbnailGenerationTask: failed to load source for picture %s "
+                "(%s); %s: %s.",
+                pic_id,
+                resolved,
+                failure.failure.value,
+                failure.error,
+            )
+            return
+        if failure.failure.permanent:
+            # The load is the gate's evidence: the file is not decoded again.
+            registry.mark_unprocessable(
+                pic_id,
+                resolved,
+                reason=f"thumbnail source could not be decoded ({failure.failure.value})",
+                load=loaded,
+            )
+        elif failure.failure is LoadFailure.IO_ERROR:
+            if file_location_is_unreachable(resolved):
+                registry.mark_unreachable(
+                    pic_id, resolved, reason="thumbnail source location is not mounted"
+                )
+            else:
+                registry.hold_unreadable(
+                    pic_id, resolved, reason=f"thumbnail source: {failure.error}"
+                )
+        else:
+            logger.warning(
+                "ThumbnailGenerationTask: failed to load source for picture %s "
+                "(%s): %s (%s); not held, it will be retried.",
+                pic_id,
+                resolved,
+                failure.failure.value,
+                failure.error,
+            )
+
+    def _note_orientation_failure(self, pic_id, loaded: SignedLoad) -> None:
+        """Report a source that decodes but cannot be turned by its EXIF orientation.
+
+        ``load_image_or_video`` orients through
+        :meth:`ImageUtils.apply_exif_orientation`. When that raises and its
+        video fallback cannot read the file either, the loader answers
+        ``None`` while the bytes still decode. No known file does this any
+        more: EXIF too damaged to read (a header that does not parse, one cut
+        short, a PNG raw profile that is not hex) is shown as stored
+        (``exif_orientation`` answers 1 for every error in
+        ``EXIF_PARSE_ERRORS``), and EXIF that reads but cannot be written
+        back is turned without writing it. A file that does not
+        decode (a truncated one) is not this case either: the registry marks
+        it. The hold stays for anything else that makes the turn raise on a
+        decoded frame, which would otherwise be selected on every sweep.
+        Nothing in the file changes between sweeps, so the picture is
+        reported under :attr:`ORIENTATION_FAILED` with the signature taken
+        before the decode, and ``MissingThumbnailFinder`` holds it until that
+        signature moves.
+
+        The probe is the loader's own orientation step, so the two agree.
+        Every exception it raises on a decoded frame is this case, except
+        running out of memory, which is the machine's and is retried. A frame
+        that orients here loaded on a second attempt, and is retried.
+        """
+        try:
+            ImageUtils.apply_exif_orientation(loaded.result.frames[0])
+        except MemoryError as exc:
+            logger.warning(
+                "ThumbnailGenerationTask: picture %s (%s) ran out of memory "
+                "applying its EXIF orientation (%s); not held, it will be retried.",
+                pic_id,
+                loaded.file_path,
+                exc,
+            )
+            return
+        except Exception as exc:
+            if loaded.signature is None:
+                logger.warning(
+                    "ThumbnailGenerationTask: picture %s (%s) decodes but its EXIF "
+                    "orientation cannot be read (%s: %s), and the file could "
+                    "not be stat'd to hold it; it will be retried.",
+                    pic_id,
+                    loaded.file_path,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+            self._orientation_failures.append(
+                (int(pic_id), loaded.file_path, *loaded.signature)
+            )
+            logger.warning(
+                "ThumbnailGenerationTask: picture %s (%s) decodes but its EXIF "
+                "orientation cannot be read (%s: %s); it is held until the "
+                "file changes.",
+                pic_id,
+                loaded.file_path,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        logger.warning(
+            "ThumbnailGenerationTask: failed to load source for picture %s (%s); "
+            "it loaded on a second attempt, so it will be retried.",
+            pic_id,
+            loaded.file_path,
+        )
+
     def _run_task(self):
+        self._orientation_failures = []
         updates: dict[int, dict] = {}
         for pic in self._pictures:
             pic_id = getattr(pic, "id", None)
@@ -150,7 +282,7 @@ class ThumbnailGenerationTask(BaseTask):
                 updates[pic_id] = columns
 
         if not updates:
-            return {"changed_count": 0}
+            return self._result(0)
 
         def _persist(session: Session, updates: dict[int, dict]):
             changed = 0
@@ -168,7 +300,14 @@ class ThumbnailGenerationTask(BaseTask):
         changed = self._db.run_task(_persist, updates, priority=DBPriority.LOW)
         logger.debug("ThumbnailGenerationTask updated %s pictures.", changed)
         self._announce(list(updates.keys()))
-        return {"changed_count": changed or 0}
+        return self._result(changed or 0)
+
+    def _result(self, changed: int) -> dict:
+        """The task result: the changed count, and any :attr:`ORIENTATION_FAILED`."""
+        result = {"changed_count": changed}
+        if self._orientation_failures:
+            result[self.ORIENTATION_FAILED] = list(self._orientation_failures)
+        return result
 
     def _announce(self, picture_ids: list[int]) -> None:
         """Tell open clients their tiles have a new bitmap to fetch.

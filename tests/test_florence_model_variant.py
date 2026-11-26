@@ -21,6 +21,7 @@ from pixlstash.tagger_plugins.florence2 import (
     Florence2Plugin,
     Florence2Service,
 )
+from tests.test_exif_orientation_loads import _unwritable_exif
 
 
 def _service(**kwargs) -> Florence2Service:
@@ -251,6 +252,50 @@ class TestDeviceFallback:
         svc = Florence2Service(device="mps", vram_cap_fn=vram_cap)
         assert svc.description_batch_size() == 3
         assert seen == [FLORENCE_BASE_VRAM_MB]
+
+
+class TestTheTextReadingLoad:
+    def test_a_photo_whose_exif_cannot_be_written_back_is_read_upright(self, tmp_path):
+        """EXIF Pillow reads but cannot write back no longer costs the text.
+
+        A LONG8 tag beside orientation 6: `ImageOps.exif_transpose` raised on
+        it, so the load failed and the picture was left out of the result. The
+        turn writes no EXIF back now, so the reader gets the picture upright.
+        """
+        path = tmp_path / "unwritable-exif.png"
+        Image.new("RGB", (40, 30), "blue").save(
+            path, "PNG", exif=b"Exif\x00\x00" + _unwritable_exif(6)
+        )
+        fed_sizes = []
+
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token_id=0)
+
+            def __call__(self, text, images, return_tensors, padding):
+                fed_sizes.extend(image.size for image in images)
+                return {
+                    "input_ids": torch.zeros((len(images), 1), dtype=torch.long),
+                    "pixel_values": torch.zeros((len(images), 3, 1, 1)),
+                }
+
+            def batch_decode(self, generated_ids, skip_special_tokens):
+                return ["no text"] * len(generated_ids)
+
+            def post_process_generation(self, text, task, image_size):
+                return {task: {"quad_boxes": [], "labels": []}}
+
+        class Model:
+            def generate(self, **kwargs):
+                return kwargs["input_ids"]
+
+        svc = _service()
+        svc._processor = Processor()
+        svc._model = Model()
+        svc._model_device = torch.device("cpu")
+        svc._dtype = torch.float32
+
+        assert svc.read_text([str(path)]) == {str(path): []}, "the picture was left out"
+        assert fed_sizes == [(30, 40)], "orientation 6, upright"
 
 
 class TestPluginSchema:

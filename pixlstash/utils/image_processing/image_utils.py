@@ -7,7 +7,10 @@ import hashlib
 import os
 import piexif
 import piexif.helper
+import re
 import shutil
+import stat
+import struct
 import tempfile
 import uuid
 
@@ -16,10 +19,10 @@ from fractions import Fraction
 import json
 
 from io import BytesIO
-from typing import Callable, Optional
+from typing import BinaryIO, Callable, Optional
 
 import numpy as np
-from PIL import ExifTags, Image, ImageOps
+from PIL import ExifTags, Image, TiffImagePlugin
 
 try:
     from PIL.TiffImagePlugin import IFDRational
@@ -51,6 +54,65 @@ THUMBNAIL_WEBP_METHOD = 2
 # cap (extreme panoramas). The bitmap is never upscaled beyond the source.
 THUMBNAIL_SHORT_EDGE = 384
 THUMBNAIL_LONG_EDGE_CAP = 1024
+
+#: The turn that shows a picture stored with each EXIF orientation (tag 274)
+#: upright, as in Pillow's ``ImageOps.exif_transpose``. 1 is upright as stored.
+_ORIENTATION_TRANSPOSE = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
+#: The XMP spellings of the orientation, which Pillow's ``getexif()`` reads
+#: when the EXIF carries none.
+_XMP_ORIENTATION_PATTERNS = (
+    r'tiff:Orientation="([0-9])"',
+    r"<tiff:Orientation>([0-9])</tiff:Orientation>",
+)
+#: What Pillow's ``getexif()`` raises for an EXIF block too damaged to read:
+#: ``SyntaxError`` for a TIFF header that does not parse, ``struct.error`` for
+#: one cut short, and ``ValueError`` for a PNG ``Raw profile type exif`` that
+#: is not hex. Pillow's own JPEG DPI read catches the first two for the same
+#: reason. Such a block holds no orientation: the picture is shown as stored.
+EXIF_PARSE_ERRORS = (SyntaxError, struct.error, ValueError)
+
+#: The name ``ImageUtils._publish_picture`` gives a picture's in-progress file:
+#: hidden, a random hex id, ``.part`` and the content's own extension. One left
+#: behind by a process that died mid-write is swept by the folder scans; it is
+#: never a picture and never backed up.
+_IN_PROGRESS_NAME = re.compile(r"\.[0-9a-f]{32}\.part(\.[^/\\]*)?")
+
+
+def is_in_progress_file_name(name: str) -> bool:
+    """Whether *name* is a picture's in-progress file, never a picture itself."""
+    return _IN_PROGRESS_NAME.fullmatch(name) is not None
+
+
+def _fsync_file(path: str) -> None:
+    """Flush a written file's bytes to the disk before it is published."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_directory(path: str) -> None:
+    """Flush a directory's entries, so a name just published survives a power loss.
+
+    POSIX only: Windows cannot open a directory as a file, and NTFS journals
+    the rename itself.
+    """
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class ImageUtils:
@@ -400,6 +462,112 @@ class ImageUtils:
             return None
 
     @staticmethod
+    def exif_orientation(img: Image.Image) -> int:
+        """The EXIF orientation (tag 274) *img* is stored with, 1-8.
+
+        Read through ``getexif()``, which also reads an XMP
+        ``tiff:Orientation`` when the EXIF has none, as
+        ``ImageOps.exif_transpose`` reads it. A value the EXIF spec reserves
+        (some cameras write 0) means upright, as it does to every decoder.
+
+        Before ``img.load()`` this is the orientation as stored; after it, the
+        turn still to make. Pillow turns a TIFF itself as it loads it and
+        drops the tag, so a TIFF reads 6 before its load and 1 after.
+
+        An EXIF block too damaged to read (a header that does not parse or is
+        cut short, a raw profile that is not hex: :data:`EXIF_PARSE_ERRORS`)
+        holds no orientation either, so the picture is shown as stored, as a
+        browser shows it. Pillow raises for one in a PNG or WebP, and in a
+        JPEG that carries a JFIF resolution (without one, the JPEG reader has
+        already read the EXIF for its DPI and swallowed the error). Only those
+        errors are caught: anything else is a failure to read the picture, not
+        its orientation.
+        """
+        try:
+            exif = img.getexif()
+        except EXIF_PARSE_ERRORS as exc:
+            # Warning, not debug: the picture may really be sideways, and this
+            # is the only trace of why it is not turned.
+            logger.warning(
+                "EXIF in %s does not parse (%s: %s); shown as stored",
+                getattr(img, "filename", "") or "an in-memory image",
+                type(exc).__name__,
+                exc,
+            )
+            return 1
+        value = exif.get(ORIENTATION_TAG, 1)
+        if value != 1 and value not in _ORIENTATION_TRANSPOSE:
+            # Debug, not warning: this runs on every load by every stage, and
+            # the orientation task's `read_orientation` already warns once
+            # per picture about the same value.
+            logger.debug(
+                "Reserved EXIF orientation %r in %s; shown upright as stored",
+                value,
+                getattr(img, "filename", "") or "an in-memory image",
+            )
+            return 1
+        return int(value)
+
+    @staticmethod
+    def stored_size(img: Image.Image) -> "tuple[int, int]":
+        """*img*'s (width, height) as stored, before any EXIF turn.
+
+        The size a picture's ``width`` and ``height`` record, which the
+        frontend swaps itself for orientations 5-8. ``img.size`` is that size
+        for a JPEG, PNG or WebP, but Pillow swaps a TIFF's size on open when
+        its orientation is 5-8 (it turns the TIFF as it loads it), so a
+        TIFF's comes from its ImageWidth and ImageLength tags instead.
+        """
+        if isinstance(img, TiffImagePlugin.TiffImageFile):
+            width = img.tag_v2.get(256)
+            height = img.tag_v2.get(257)
+            if width and height:
+                return int(width), int(height)
+        return img.size
+
+    @staticmethod
+    def apply_exif_orientation(img: Image.Image) -> Image.Image:
+        """*img* turned upright by its EXIF orientation: how every loader orients.
+
+        ``ImageOps.exif_transpose`` makes the same turn and then writes the
+        EXIF back without the orientation. That write raises for EXIF Pillow
+        reads but cannot write (a LONG8 tag, a value out of its type's range:
+        ``struct.error`` in Pillow 13.0.0), so a picture whose orientation
+        reads fine came out without a thumbnail. Nothing here writes EXIF:
+        the turned image carries none (``info["exif"]`` and PNG's ``Raw
+        profile type exif`` are dropped, the loaders return pixels) and its
+        XMP orientation is removed as Pillow removes it, so its orientation
+        reads 1 and nothing turns it twice. A writer that keeps the picture's
+        text or XMP (share copies, the served PNG) takes it from the image
+        returned here, never from *img*'s info read before the turn, so this
+        is the one place those carriers are cleared.
+
+        Returns *img* itself when it is upright as stored (do not change the
+        result in place), otherwise a new image.
+        """
+        # Load first, as exif_transpose does: a TIFF turns itself as it loads,
+        # and its orientation must then read 1 here or it is turned twice.
+        img.load()
+        orientation = ImageUtils.exif_orientation(img)
+        if orientation == 1:
+            return img
+        upright = img.transpose(_ORIENTATION_TRANSPOSE[orientation])
+        upright.info.pop("exif", None)
+        upright.info.pop("Raw profile type exif", None)
+        for key in ("XML:com.adobe.xmp", "xmp"):
+            value = upright.info.get(key)
+            if value is None:
+                continue
+            for pattern in _XMP_ORIENTATION_PATTERNS:
+                value = (
+                    re.sub(pattern, "", value)
+                    if isinstance(value, str)
+                    else re.sub(pattern.encode(), b"", value)
+                )
+            upright.info[key] = value
+        return upright
+
+    @staticmethod
     def load_image_or_video_bgr(file_path: str) -> Optional[np.ndarray]:
         """Load an image or the first video frame as a BGR numpy array."""
         if not file_path or not os.path.exists(file_path):
@@ -412,7 +580,7 @@ class ImageUtils:
             return img
         try:
             with Image.open(file_path) as pil_img:
-                pil_img = ImageOps.exif_transpose(pil_img)
+                pil_img = ImageUtils.apply_exif_orientation(pil_img)
                 if pil_img.mode not in ("RGB", "L"):
                     pil_img = pil_img.convert("RGB")
                 rgb = np.array(pil_img)
@@ -616,7 +784,7 @@ class ImageUtils:
         try:
             try:
                 with Image.open(file_path) as img:
-                    img = ImageOps.exif_transpose(img)
+                    img = ImageUtils.apply_exif_orientation(img)
                     return np.array(img.convert("RGB"))
             except Exception as exc:
                 logger.debug(
@@ -649,7 +817,7 @@ class ImageUtils:
                 with Image.open(file_path) as img:
                     # Must be called before load()/convert(); no-op for non-JPEG.
                     img.draft("RGB", (max_side, max_side))
-                    img = ImageOps.exif_transpose(img)
+                    img = ImageUtils.apply_exif_orientation(img)
                     arr = np.array(img.convert("RGB"))
             except Exception as exc:
                 logger.debug(
@@ -728,8 +896,7 @@ class ImageUtils:
 
         try:
             if isinstance(img, Image.Image):
-                pil_img = img.copy()
-                pil_img = ImageOps.exif_transpose(pil_img)
+                pil_img = ImageUtils.apply_exif_orientation(img.copy())
             else:
                 pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
             if pil_img.mode not in ("RGB", "L"):
@@ -825,18 +992,30 @@ class ImageUtils:
     @staticmethod
     def calculate_hash_from_file_path(file_path: str) -> str:
         """Compute a content hash for a file on disk."""
-        file_size = os.path.getsize(file_path)
         with open(file_path, "rb") as f:
+            return ImageUtils.calculate_hash_from_open_file(f, source_label=file_path)
 
-            def _read_chunk(offset, size):
-                f.seek(offset)
-                return f.read(size)
+    @staticmethod
+    def calculate_hash_from_open_file(
+        handle: BinaryIO, source_label: Optional[str] = None
+    ) -> str:
+        """:meth:`calculate_hash_from_file_path` for a file already open.
 
-            return ImageUtils._calculate_sha256_digest(
-                file_size=file_size,
-                read_chunk=_read_chunk,
-                source_label=file_path,
-            )
+        The size is the open file's own (``fstat``), so a caller that checked
+        a file before opening it hashes exactly the file it opened, whatever
+        its name leads to by now.
+        """
+        file_size = os.fstat(handle.fileno()).st_size
+
+        def _read_chunk(offset, size):
+            handle.seek(offset)
+            return handle.read(size)
+
+        return ImageUtils._calculate_sha256_digest(
+            file_size=file_size,
+            read_chunk=_read_chunk,
+            source_label=source_label,
+        )
 
     @staticmethod
     def calculate_full_hash_from_file_path(file_path: str) -> str:
@@ -847,10 +1026,17 @@ class ImageUtils:
         Import de-duplication calls this method only after ``(sampled hash,
         size)`` has selected a small candidate set.
         """
-        sha256 = hashlib.sha256()
         with open(file_path, "rb") as file_handle:
-            while chunk := file_handle.read(1024 * 1024):
-                sha256.update(chunk)
+            return ImageUtils.calculate_full_hash_from_open_file(file_handle)
+
+    @staticmethod
+    def calculate_full_hash_from_open_file(handle: BinaryIO) -> str:
+        """:meth:`calculate_full_hash_from_file_path` for a file already open,
+        read from its start."""
+        sha256 = hashlib.sha256()
+        handle.seek(0)
+        while chunk := handle.read(1024 * 1024):
+            sha256.update(chunk)
         return sha256.hexdigest()
 
     @staticmethod
@@ -948,6 +1134,7 @@ class ImageUtils:
         output_dir: Optional[str] = None,
         reference_folder_id: Optional[int] = None,
         record_source_name: bool = True,
+        source_file: Optional[BinaryIO] = None,
     ) -> Picture:
         """Create a Picture from a file on disk, copying it into the library.
 
@@ -969,12 +1156,29 @@ class ImageUtils:
                 the picture's ``original_file_name``. False for a file named
                 only for the fetch that brought it, such as a ComfyUI output:
                 that name is not the picture's own.
+            source_file: The source, already open for reading. The copy is
+                made from it, from its start, rather than by opening
+                *source_file_path* again: a caller that checked the file it
+                opened (the watch folder, which opens it without following a
+                link) copies exactly that file, whatever the name leads to by
+                now. *source_file_path* still names it, and its mtime is the
+                ``created_at`` fallback.
         """
-        if not os.path.exists(source_file_path):
+        if source_file is None and not os.path.exists(source_file_path):
             raise ValueError(f"Source file path does not exist: {source_file_path}")
+
+        def _copy_open_source(part_path: str) -> None:
+            source_file.seek(0)
+            with open(part_path, "wb") as out:
+                shutil.copyfileobj(source_file, out, 1024 * 1024)
+
         return ImageUtils._publish_picture(
             image_root_path,
-            lambda part_path: shutil.copyfile(source_file_path, part_path),
+            (
+                _copy_open_source
+                if source_file is not None
+                else lambda part_path: shutil.copyfile(source_file_path, part_path)
+            ),
             source_label=source_file_path,
             part_suffix=os.path.splitext(source_file_path)[1].lower(),
             mtime_source=source_file_path,
@@ -1077,12 +1281,14 @@ class ImageUtils:
         *write_part* writes the content to the path it is handed: a hidden
         in-progress file in the destination folder, hidden so no folder walk
         indexes it. Hash, format, dimensions, orientation, thumbnail and date
-        are all derived from that file; only then is it renamed onto its final
-        name with ``os.replace``, which is atomic on one filesystem. A reader
-        never sees a partial file at that name, and a full disk or a process
-        that dies mid-write leaves none there; on any failure the process sees,
-        the in-progress file is removed. Nothing is fsynced, so a power loss
-        straight after the rename can still leave the name holding fewer bytes.
+        are all derived from that file; only then is it fsynced and published
+        at its final name by :meth:`_move_into_place`, which never replaces
+        anything already there. A reader never sees a partial file at that
+        name, and a full disk or a process that dies mid-write leaves none
+        there; on any failure the process sees, the in-progress file is
+        removed, and one a dead process left is swept by the next folder scan.
+        The folder is fsynced after the publish, so a power loss straight after
+        it leaves either the whole file at the name or no file.
 
         The parameters are those of :meth:`create_picture_from_bytes`, plus:
 
@@ -1091,10 +1297,17 @@ class ImageUtils:
             part_suffix: Extension (with its dot) for the in-progress file, so
                 OpenCV picks the demuxer for the video's own container. Empty
                 for content with no name, which OpenCV is handed as ``.mp4``.
+                With no *picture_uuid*, it is also the extension a video is
+                published under and the format it is recorded as, so a
+                ``.webm``, ``.mov`` or ``.mkv`` keeps its own container.
             mtime_source: The file whose mtime is the ``created_at`` fallback,
                 when that is not the in-progress file.
         """
-        inferred_ext = ImageUtils._extension_of(picture_uuid)
+        # ``part_suffix`` is a bare extension (".webm"), which splitext reads
+        # as a dot-file name with no extension, so its dot is stripped here.
+        inferred_ext = ImageUtils._extension_of(picture_uuid) or (
+            part_suffix.lower().lstrip(".")
+        )
         if output_dir:
             dest_dir = output_dir
         elif subfolder:
@@ -1125,7 +1338,9 @@ class ImageUtils:
             try:
                 with Image.open(part_path) as img:
                     img_format = img.format or "PNG"
-                    width, height = img.size
+                    # As stored, not turned: what a JPEG records, and what
+                    # the frontend swaps for orientations 5-8.
+                    width, height = ImageUtils.stored_size(img)
                     # Read here, from the image that is already open, rather
                     # than left to `MissingOrientationFinder`. That finder
                     # exists to fill rows that predate the column; a NEW
@@ -1134,14 +1349,10 @@ class ImageUtils:
                     # races - and the operation log records it as a facet, so a
                     # rotate landing in that window would snapshot `None` as
                     # the prior state and its undo would have nothing to write
-                    # back.
-                    try:
-                        raw_orientation = int(
-                            (img.getexif() or {}).get(ORIENTATION_TAG, 1)
-                        )
-                    except (TypeError, ValueError):
-                        raw_orientation = 1
-                    orientation = raw_orientation if 1 <= raw_orientation <= 8 else 1
+                    # back. Read as every loader reads it: an EXIF header that
+                    # does not parse is shown as stored, not taken for a sign
+                    # that the file is a video.
+                    orientation = ImageUtils.exif_orientation(img)
                     rendered = ImageUtils.render_thumbnail(img)
                     if rendered is not None:
                         thumbnail_bytes, bmp_w, bmp_h, crop = rendered
@@ -1214,8 +1425,10 @@ class ImageUtils:
                 picture_file_path = file_name
             size_bytes = os.path.getsize(part_path)
 
+            _fsync_file(part_path)
             ImageUtils._move_into_place(part_path, full_path)
             published = True
+            _fsync_directory(dest_dir)
         finally:
             if not published:
                 ImageUtils._discard_part(part_path, source_label, full_path or dest_dir)
@@ -1275,23 +1488,26 @@ class ImageUtils:
 
     @staticmethod
     def _move_into_place(part_path: str, full_path: str) -> None:
-        """Rename a finished in-progress file onto its final name.
+        """Publish a finished in-progress file at its final name.
 
-        A file already at that name when it is checked is never overwritten,
-        and never taken as the new picture unless it is a regular file holding
+        The name is taken with a hard link, which the filesystem creates only
+        when nothing has that name, in the same step that checks it: whatever
+        is there, even if it arrived a moment ago, is never replaced. It is
+        taken as the new picture only when it is a regular file holding
         exactly the same bytes (same size and SHA-256); then it is kept and the
-        in-progress copy dropped. A link there is never followed. Two imports
-        racing to the same name are not guarded against: one that takes the
-        name between the check and the rename is replaced by the other.
+        in-progress copy dropped. A link there is never followed.
 
         Raises:
             FileExistsError: Something else already has that name.
+            OSError: The filesystem cannot hard-link (FAT, exFAT); the import
+                fails rather than publish with a check a rival can slip past.
         """
-        if os.path.lexists(full_path):
-            same = (
-                not os.path.islink(full_path)
-                and os.path.isfile(full_path)
-                and os.path.getsize(full_path) == os.path.getsize(part_path)
+        try:
+            os.link(part_path, full_path)
+        except FileExistsError:
+            existing = os.lstat(full_path)
+            same = stat.S_ISREG(existing.st_mode) and existing.st_size == (
+                os.path.getsize(part_path)
             )
             if same:
                 same = ImageUtils.calculate_full_hash_from_file_path(
@@ -1302,9 +1518,17 @@ class ImageUtils:
                     errno.EEXIST, "A different file already has this name", full_path
                 )
             logger.debug("%s already holds these bytes; keeping it.", full_path)
+        try:
             os.remove(part_path)
-            return
-        os.replace(part_path, full_path)
+        except OSError as exc:
+            # The picture is at its name either way; the next folder scan
+            # sweeps the in-progress name left beside it.
+            logger.warning(
+                "Published %s but could not remove its in-progress name %s: %s",
+                full_path,
+                part_path,
+                exc,
+            )
 
     @staticmethod
     def _discard_part(part_path: str, source_label: str, destination: str) -> None:
@@ -1325,6 +1549,43 @@ class ImageUtils:
                 source_label,
                 exc,
             )
+
+    @staticmethod
+    def unpublish_picture(image_root_path: str, picture: Picture) -> bool:
+        """Remove the file and thumbnail published for a picture never saved.
+
+        For an import whose insert did not commit. A published file with no
+        row is an orphan the next root scan indexes as a new picture: a second
+        copy of content the library may already hold, without the tags an
+        uploaded caption would have given it. Only for a picture the caller
+        published itself, under a fresh name, in this run: whatever is at that
+        path is removed.
+
+        Failures are logged, not raised: the caller is already handling the
+        error that left the file without a row.
+
+        Returns:
+            True when nothing is left at the picture's path.
+        """
+        full_path = ImageUtils.resolve_picture_path(image_root_path, picture.file_path)
+        removed = True
+        try:
+            os.remove(full_path)
+        except FileNotFoundError:
+            logger.info(
+                "%s, published for a picture that was never saved, is already gone.",
+                full_path,
+            )
+        except OSError as exc:
+            logger.error(
+                "Could not remove %s, published for a picture that was never "
+                "saved; the next root scan will index it: %s",
+                full_path,
+                exc,
+            )
+            removed = False
+        ImageUtils.remove_thumbnail(image_root_path, picture.file_path)
+        return removed
 
     @staticmethod
     def cosine_similarity(a: bytes, b: bytes) -> float:
@@ -1371,23 +1632,16 @@ class ImageUtils:
         """
         try:
             with Image.open(file_path) as img:
-                # Read stored dimensions from the file header (lazy, no pixel decode).
-                stored_w, stored_h = img.size
-                # Determine the logical (exif-corrected) original dimensions cheaply.
-                # Orientations 5-8 rotate 90° or 270°, which swaps width and height.
-                try:
-                    orientation = (img.getexif() or {}).get(274, 1)
-                except Exception:
-                    orientation = 1
-                if orientation in (5, 6, 7, 8):
-                    orig_w, _ = stored_h, stored_w
-                else:
-                    orig_w, _ = stored_w, stored_h
+                # The full-size long edge, from the header (no pixel decode). A
+                # turn keeps the long edge, so this needs no orientation: a
+                # TIFF's size already reads upright before its load, others'
+                # as stored.
+                orig_long = max(img.size)
 
                 # draft() tells the JPEG decoder to use DCT subsampling - a no-op
                 # for other formats.  Must be called before load()/convert().
                 img.draft("RGB", (max_side, max_side))
-                img = ImageOps.exif_transpose(img)
+                img = ImageUtils.apply_exif_orientation(img)
                 arr = np.array(img.convert("RGB"))
 
             h, w = arr.shape[:2]
@@ -1401,7 +1655,7 @@ class ImageUtils:
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
             # inv_scale: multiply loaded-space coords by this to recover original-space
             # coords.  Both axes have the same factor because the resize is proportional.
-            inv_scale = orig_w / w if w > 0 else 1.0
+            inv_scale = orig_long / max(h, w) if w > 0 else 1.0
             return bgr, inv_scale
         except Exception as exc:
             logger.debug("load_image_bgr_reduced failed for %s: %s", file_path, exc)
