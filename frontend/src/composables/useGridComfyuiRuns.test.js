@@ -13,7 +13,16 @@ import { getPictureMetadata } from "../api/pictures";
 import { listStackPictures } from "../api/stacks";
 import { getRunOutcome } from "../api/workflows";
 
-vi.mock("../api/pictures", () => ({ getPictureMetadata: vi.fn() }));
+vi.mock("../api/pictures", () => ({
+  getPictureMetadata: vi.fn(),
+  // The tasks store follows the Scrapheap run (useScrapheapRunStore), whose
+  // setup hands these to its follower: a mock without them fails every mount.
+  cancelScrapheapRun: vi.fn(),
+  getLatestScrapheapRun: vi.fn(),
+  getScrapheapRun: vi.fn(),
+  startScrapheapRun: vi.fn(),
+  undoScrapheapRun: vi.fn(),
+}));
 vi.mock("../api/stacks", () => ({ listStackPictures: vi.fn() }));
 vi.mock("../api/workflows", () => ({ getRunOutcome: vi.fn() }));
 vi.mock("../api/workers", () => ({ getWorkerProgress: vi.fn() }));

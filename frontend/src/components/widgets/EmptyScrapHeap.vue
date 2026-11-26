@@ -4,20 +4,22 @@
       <!-- ── A run under way: its progress and its Stop take the bar ──── -->
       <template v-if="running">
         <p class="run-note" data-testid="scrapheap-run-progress">
-          <v-icon size="14" class="run-note__icon">{{
-            restoring ? "mdi-restore" : "mdi-delete-forever-outline"
-          }}</v-icon>
+          <v-icon size="14" class="run-note__icon">{{ words.icon }}</v-icon>
           <span v-if="stopping" class="run-note__line">
-            Stopping after the current step: <b>{{ counts.done }}</b>
-            {{ restoring ? "restored" : "deleted" }} so far.
+            Stopping after {{ words.stopAfter }}: <b>{{ counts.done }}</b>
+            {{ words.doneSoFar }}.
           </span>
           <span v-else-if="pending" class="run-note__line">
-            {{ restoring ? "Restore" : "Delete forever" }} is queued and starts
-            when the server gets to it.
+            {{ words.gesture }} is queued and starts when the server gets to it.
+          </span>
+          <!-- An undo counts the restore's History steps, not pictures. -->
+          <span v-else-if="progress.steps" class="run-note__line">
+            {{ words.doing }}: History step <b>{{ counts.processed }}</b> of
+            <b>{{ counts.total }}</b>, <b>{{ counts.done }}</b> pictures so far.
           </span>
           <span v-else class="run-note__line">
-            {{ restoring ? "Restoring" : "Deleting forever" }}:
-            <b>{{ counts.processed }}</b> of <b>{{ counts.total }}</b> pictures.
+            {{ words.doing }}: <b>{{ counts.processed }}</b> of
+            <b>{{ counts.total }}</b> pictures.
           </span>
           <span
             v-if="runUnreachable"
@@ -36,7 +38,8 @@
             v-if="showStop"
             size="sm"
             :loading="runAction === 'cancel'"
-            :disabled="runAction != null && runAction !== 'cancel'"
+            :disabled="runAction === 'cancel'"
+            :tooltip="stopTip"
             data-testid="scrapheap-run-stop"
             @click="$emit('stop-run')"
           >
@@ -75,10 +78,20 @@
           </p>
         </div>
         <div class="selection-bar-actions">
+          <!-- The delete preview is on the wire: Delete forever waits for it
+               before it can show what would be destroyed. -->
+          <span
+            v-if="checking"
+            class="run-meta"
+            data-testid="scrapheap-delete-checking"
+          >
+            Checking what would be destroyed…
+          </span>
           <AppButton
             variant="danger"
             size="sm"
-            :disabled="disabled"
+            :disabled="disabled || checking != null"
+            :loading="checking === 'all'"
             @click="$emit('empty-scrapheap')"
           >
             Empty scrapheap
@@ -92,11 +105,11 @@
       v-if="running"
       class="run-track"
       role="progressbar"
-      :aria-label="restoring ? 'Restore progress' : 'Delete forever progress'"
+      :aria-label="words.progress"
       :aria-valuenow="determinate ? percent : null"
       :aria-valuetext="
         determinate
-          ? `${counts.processed} of ${counts.total} pictures done`
+          ? `${progress.steps ? 'History ' : ''}${progress.counted} done`
           : null
       "
       aria-valuemin="0"
@@ -134,6 +147,7 @@
  */
 import { computed } from "vue";
 import { VIcon } from "vuetify/components";
+import { scrapheapRunProgress } from "../../utils/scrapheapRun";
 import AppButton from "./AppButton.vue";
 
 const props = defineProps({
@@ -147,14 +161,20 @@ const props = defineProps({
   retentionLabel: { type: String, default: "" },
   /**
    * The Scrapheap run the store follows, as the server serializes it, or null.
-   * Shown only while `active`; `kind` is "purge" or "restore", `total` and
-   * `processed` count pictures.
+   * Shown only while `active`; `kind` is "purge", "restore" or "undo" (of a
+   * restore run). `total` and `processed` count pictures, or for an undo the
+   * restore's History steps (`scrapheapRunProgress`).
    */
   run: { type: Object, default: null },
   /** The last poll failed, so the figures are the last ones read. */
   runUnreachable: { type: Boolean, default: false },
-  /** The run request on the wire: "start", "cancel" or null. */
+  /** The run request on the wire: "start", "undo", "cancel" or null. */
   runAction: { type: String, default: null },
+  /**
+   * The Delete forever preview on the wire, by what it was asked about: "all"
+   * (Empty scrapheap) or "selection", or null when none is.
+   */
+  checking: { type: String, default: null },
 });
 
 defineEmits([
@@ -169,8 +189,51 @@ function figure(value) {
   return Math.max(0, Number(value) || 0).toLocaleString();
 }
 
+/**
+ * How the bar names each kind of run, and the count of what it has done. An
+ * undo puts a restore's pictures back in the Scrapheap, so it is worded as
+ * that, never as a deletion.
+ */
+const RUN_WORDS = Object.freeze({
+  purge: {
+    icon: "mdi-delete-forever-outline",
+    gesture: "Delete forever",
+    doing: "Deleting forever",
+    doneSoFar: "deleted so far, and they cannot be restored",
+    doneField: "deleted_count",
+    progress: "Delete forever progress",
+    stopAfter: "the current batch",
+    stopping:
+      "Stopping after the current batch. Pictures already deleted cannot be restored.",
+    background: "Deleting pictures forever in the background.",
+  },
+  restore: {
+    icon: "mdi-restore",
+    gesture: "Restore",
+    doing: "Restoring",
+    doneSoFar: "restored so far",
+    doneField: "restored_count",
+    progress: "Restore progress",
+    stopAfter: "the current batch",
+    stopping: "Stopping after the current batch.",
+    background: "Restoring pictures from the Scrapheap in the background.",
+  },
+  undo: {
+    icon: "mdi-undo",
+    gesture: "Undo restore",
+    doing: "Putting back in the Scrapheap",
+    doneSoFar: "put back so far",
+    doneField: "undone_count",
+    progress: "Undo restore progress",
+    stopAfter: "the History step it is on",
+    stopping: "Stopping after the History step it is on.",
+    background:
+      "Putting restored pictures back in the Scrapheap in the background.",
+  },
+});
+
 const running = computed(() => Boolean(props.run?.active));
-const restoring = computed(() => props.run?.kind === "restore");
+const words = computed(() => RUN_WORDS[props.run?.kind] ?? RUN_WORDS.purge);
 const stopping = computed(
   () => running.value && Boolean(props.run?.cancel_requested),
 );
@@ -178,41 +241,29 @@ const pending = computed(
   () => running.value && props.run?.status === "pending",
 );
 
-const total = computed(() => Math.max(0, Number(props.run?.total) || 0));
-const processed = computed(() =>
-  Math.max(0, Number(props.run?.processed) || 0),
-);
+const progress = computed(() => scrapheapRunProgress(props.run));
 const counts = computed(() => ({
-  total: figure(total.value),
-  processed: figure(processed.value),
-  done: figure(
-    restoring.value ? props.run?.restored_count : props.run?.deleted_count,
-  ),
+  total: figure(progress.value.total),
+  processed: figure(progress.value.processed),
+  done: figure(props.run?.[words.value.doneField]),
 }));
-
-/** Progress as a whole number in 0 to 100, known only once a total is. */
-const determinate = computed(
-  () => running.value && !pending.value && total.value > 0,
-);
-const percent = computed(() => {
-  if (!determinate.value) return 0;
-  return Math.min(
-    100,
-    Math.max(0, Math.round((processed.value / total.value) * 100)),
-  );
-});
+const determinate = computed(() => progress.value.determinate);
+const percent = computed(() => progress.value.percent);
 
 /** Stop while the run goes on and has not been asked to already. */
 const showStop = computed(
   () => running.value && !props.run?.cancel_requested,
 );
 
+/** What Stop does, said before it is pressed (`scrapheapRunProgress`). */
+const stopTip = computed(() => progress.value.stopTip);
+
 const announcement = computed(() => {
-  if (!running.value) return "";
-  if (stopping.value) return "Stopping after the current step.";
-  return restoring.value
-    ? "Restoring pictures from the Scrapheap in the background."
-    : "Deleting pictures forever in the background.";
+  if (!running.value) {
+    return props.checking ? "Checking what Delete forever would destroy." : "";
+  }
+  if (stopping.value) return words.value.stopping;
+  return words.value.background;
 });
 </script>
 
@@ -261,7 +312,7 @@ const announcement = computed(() => {
   min-width: 0;
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
-  color: rgba(var(--v-theme-on-background), 0.7);
+  color: rgba(var(--v-theme-on-background), var(--opacity-text-secondary));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

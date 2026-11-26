@@ -1059,6 +1059,9 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
         "GET",
         "/api/v1/pictures/export",
     ): _LIST_AWARE,  # generate_zip scope-filters via fetch_scope_allowed
+    # The same export with its ids in a JSON body (a long ?id= list is a URL a
+    # proxy may refuse). Same generate_zip, so the same scope filter; READ_SAFE.
+    ("POST", "/api/v1/pictures/export"): _LIST_AWARE,
     (
         "POST",
         "/api/v1/pictures/thumbnails",
@@ -1137,6 +1140,10 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
     ("POST", "/api/v1/pictures/export/folder"): RoutePolicy(
         _LOOPBACK,
         justification="§16.3 RED LINE (#291): writes exported pictures straight onto the host disk and, once done, opens the destination in the host file manager (same host-GUI spawn as pictures/open-location, via pixlstash/utils/host_open.py); loopback-only, allow_remote_host_ops can NOT loosen it",
+    ),
+    ("POST", "/api/v1/pictures/export/folder/selection"): RoutePolicy(
+        _LOOPBACK,
+        justification="§16.3 RED LINE (#291): the folder export of POST /pictures/export/folder with its selection and destination in a JSON body, so it writes onto the host disk and opens the host file manager exactly as that route does; same policy, loopback-only, allow_remote_host_ops can NOT loosen it",
     ),
     ("POST", "/api/v1/pictures/share-copies"): RoutePolicy(
         _LOOPBACK,
@@ -1223,6 +1230,14 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
         _OWNER,
         justification=(
             "Stops a library-wide Scrapheap run. POST is also blocked for READ tokens"
+        ),
+    ),
+    ("POST", "/api/v1/pictures/scrapheap/runs/{run_id}/undo"): RoutePolicy(
+        _OWNER,
+        justification=(
+            "Undoes a library-wide restore run, putting every picture it "
+            "brought back into the Scrapheap again through the History log. "
+            "POST is also blocked for READ tokens"
         ),
     ),
     # PICTURE_SCOPED, like every other per-picture mutation on this surface, and

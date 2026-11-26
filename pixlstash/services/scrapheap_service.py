@@ -103,6 +103,7 @@ Retention policy (settled with the maintainer, do not redesign):
   ``auto_purge_exempt_reason`` names which exemption applies.
 """
 
+import heapq
 import math
 import os
 import secrets
@@ -170,6 +171,12 @@ _DUE_SCAN_PAGE: int = 500
 # reference-folder protection is the stronger, permanent one and wins.
 EXEMPT_PROTECTED = "protected"
 EXEMPT_LOCKED = "locked"
+
+# The most ``protected`` paths and ``locked`` ids one delete preview lists. The
+# counts stay exact over the whole selection; the dialog shows the first 200
+# and says how many more. A 50,000-picture reference Scrapheap otherwise sent
+# every absolute path in one response, megabytes the dialog never rendered.
+DELETE_PREVIEW_LIST_CAP: int = 200
 
 # Server-config keys.
 RETENTION_DAYS_KEY = "scrapheap_retention_days"
@@ -494,9 +501,15 @@ def apply_retention_config(
 
 
 def fetch_scrapheap_rows_in_session(
-    session: Session, ids: Optional[list[int]]
+    session: Session,
+    ids: Optional[list[int]],
+    deleted_before: Optional[datetime] = None,
 ) -> list[ScrapheapRow]:
-    """Return the soft-deleted pictures in ``ids`` (all of them when ``None``)."""
+    """Return the soft-deleted pictures in ``ids`` (all of them when ``None``).
+
+    ``deleted_before`` keeps only pictures binned at or before it (see
+    :func:`binned_by`); ``None`` keeps them all.
+    """
     query = select(
         Picture.id,
         Picture.file_path,
@@ -507,7 +520,22 @@ def fetch_scrapheap_rows_in_session(
     if ids is not None:
         scope = scope_id_subquery(session, ids, name="_pixlstash_scrapheap_row_ids")
         query = query.where(Picture.id.in_(scope))
+    if deleted_before is not None:
+        query = query.where(binned_by(deleted_before))
     return [ScrapheapRow(*row) for row in session.exec(query).all()]
+
+
+def binned_by(deleted_before: datetime):
+    """SQL: the picture was binned at or before ``deleted_before``.
+
+    The consent bound of a delete-forever: a confirmation covers what its
+    preview could have shown, so a picture binned after the preview is not
+    destroyed by it. A soft-deleted row with no ``deleted_at`` predates the
+    stamp (every soft-delete path sets it), so it was in the preview and is
+    kept in scope. ``deleted_before`` must be aware, as for any
+    ``UTCDateTime`` bind.
+    """
+    return or_(Picture.deleted_at.is_(None), Picture.deleted_at <= deleted_before)
 
 
 def fetch_no_delete_folder_ids_in_session(session: Session) -> set[int]:
@@ -576,7 +604,11 @@ def restore_pictures(
     def restore(session: Session, ids: Optional[list[int]]):
         query = select(Picture).where(Picture.deleted.is_(True))
         if ids is not None:
-            query = query.where(Picture.id.in_(ids))
+            query = query.where(
+                Picture.id.in_(
+                    scope_id_subquery(session, ids, name="_pixlstash_restore_ids")
+                )
+            )
         pics = session.exec(query).all()
         affected_stack_ids: set[int] = set()
         for pic in pics:
@@ -603,7 +635,13 @@ def restore_pictures(
         # session so the snapshot covers exactly what the write touches.
         query = select(Picture.id).where(Picture.deleted.is_(True))
         if picture_ids is not None:
-            query = query.where(Picture.id.in_(picture_ids))
+            query = query.where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, picture_ids, name="_pixlstash_restore_target_ids"
+                    )
+                )
+            )
         return list(session.exec(query).all())
 
     restored_ids, _operation = operation_log_service.run_recorded_metadata_task(
@@ -1149,6 +1187,7 @@ def plan_and_purge_in_session(
     ids: Optional[list[int]],
     include_protected: bool,
     retention_guard: Optional["RetentionGuard"],
+    deleted_before: Optional[datetime] = None,
 ) -> tuple[ScrapheapPurgePlan, int, set[str], set[int]]:
     """Select, plan and destroy in ONE DB-queue submission.
 
@@ -1174,11 +1213,15 @@ def plan_and_purge_in_session(
     covered" is only true once the DELETE has committed. Doing either outside
     this submission would reintroduce the gap the rest of this function closes.
 
+    ``deleted_before`` is the manual path's consent bound (the confirming
+    preview's time; see :func:`binned_by`): pictures binned after it are not
+    selected at all, so they stay in the Scrapheap untouched.
+
     Returns:
         ``(plan, deleted_count, owned_path_shas, skipped_restored_ids,
         ghost_context)``.
     """
-    rows = fetch_scrapheap_rows_in_session(session, ids)
+    rows = fetch_scrapheap_rows_in_session(session, ids, deleted_before)
     if not rows:
         return (
             ScrapheapPurgePlan(),
@@ -1221,6 +1264,7 @@ def classify_delete_preview(
     rows: list[ScrapheapRow],
     no_delete_folder_ids: set[int],
     locked_ids: set[int],
+    image_root: Optional[str],
 ) -> dict:
     """Partition a delete-forever selection into three DISJOINT buckets.
 
@@ -1247,9 +1291,14 @@ def classify_delete_preview(
     overridden but the lock still holds, so counting it as protected would tell
     the user "Delete all" destroys it when it does not.
 
-    ``protected`` lists the locked-free protected originals with their resolved
-    on-disk paths (the files genuinely at risk from "Delete all"); ``locked``
-    lists the frozen ids so the dialog can name them.
+    ``protected`` lists the locked-free protected originals with their
+    absolute on-disk paths (the files genuinely at risk from "Delete all"),
+    sorted by that path and then id; ``locked`` lists the frozen ids,
+    ascending, so the dialog can name them. Each list holds at most
+    :data:`DELETE_PREVIEW_LIST_CAP` entries, the first ones in that order, so
+    the same selection always lists the same files; the counts are over the
+    whole selection, and the dialog shows ``protected_count`` minus what is
+    listed as "more".
     """
     protected_items: list[dict] = []
     locked_items: list[int] = []
@@ -1258,16 +1307,30 @@ def classify_delete_preview(
         if row.id is not None and int(row.id) in locked_ids:
             locked_items.append(int(row.id))
         elif row.is_protected(no_delete_folder_ids):
-            protected_items.append({"id": row.id, "file_path": row.file_path or ""})
+            protected_items.append(
+                {
+                    "id": row.id,
+                    "file_path": (
+                        ImageUtils.resolve_picture_path(image_root, row.file_path) or ""
+                    ),
+                }
+            )
         else:
             unprotected_count += 1
+    # Sorted on the path the dialog shows, so the cut falls in the same place
+    # for the same selection whatever order the rows were read in.
+    listed_protected = heapq.nsmallest(
+        DELETE_PREVIEW_LIST_CAP,
+        protected_items,
+        key=lambda item: (item["file_path"], item["id"]),
+    )
     return {
         "total_count": len(rows),
         "protected_count": len(protected_items),
         "locked_count": len(locked_items),
         "unprotected_count": unprotected_count,
-        "protected": protected_items,
-        "locked": sorted(locked_items),
+        "protected": listed_protected,
+        "locked": heapq.nsmallest(DELETE_PREVIEW_LIST_CAP, locked_items),
     }
 
 
@@ -1338,11 +1401,17 @@ class DeleteConfirmation:
         fingerprint: The selection the preview was computed over.
         total_count: What the preview reported, for the audit log.
         expires_at: ``time.monotonic()`` deadline.
+        deleted_before: When the preview read the Scrapheap (aware UTC). The
+            delete it confirms destroys only pictures binned by then, so one
+            binned while the dialog was open is never destroyed unseen.
+        library_uuid: The library the preview read.
+        generation: That library's open generation.
     """
 
     fingerprint: str
     total_count: int
     expires_at: float
+    deleted_before: datetime
     library_uuid: Optional[str] = None
     generation: Optional[int] = None
 
@@ -1379,33 +1448,29 @@ class ScrapheapDeleteConfirmations:
         ids: Optional[list[int]],
         total_count: int,
         *,
+        deleted_before: datetime,
         library_uuid: Optional[str] = None,
         generation: Optional[int] = None,
     ) -> str:
-        """Mint a confirmation for ``ids`` and return the opaque token."""
+        """Mint a confirmation for ``ids`` and return the opaque token.
+
+        ``deleted_before`` is required and must be aware: taken just before
+        the preview read the Scrapheap, it bounds what the delete may destroy.
+        """
+        if deleted_before.tzinfo is None:
+            raise ValueError("deleted_before must be timezone-aware")
         token = secrets.token_urlsafe(32)
         record = DeleteConfirmation(
             fingerprint=selection_fingerprint(ids),
             total_count=int(total_count),
             expires_at=time.monotonic() + self._ttl_seconds,
+            deleted_before=deleted_before,
             library_uuid=library_uuid,
             generation=generation,
         )
         with self._lock:
             self._prune_locked()
-            while len(self._outstanding) >= self._max_outstanding:
-                oldest = min(
-                    self._outstanding,
-                    key=lambda key: self._outstanding[key].expires_at,
-                )
-                del self._outstanding[oldest]
-                logger.info(
-                    "Delete-forever: evicted the oldest unspent confirmation "
-                    "(more than %d outstanding); that preview must be re-run "
-                    "before it can be confirmed",
-                    self._max_outstanding,
-                )
-            self._outstanding[token] = record
+            self._insert_locked(token, record)
         return token
 
     def redeem(
@@ -1426,13 +1491,35 @@ class ScrapheapDeleteConfirmations:
             token is consumed on a fingerprint mismatch too: a confirmation the
             user did not mean to spend this way is not spendable at all.
         """
+        record, reason = self.spend(
+            token, ids, library_uuid=library_uuid, generation=generation
+        )
+        return record is not None, reason
+
+    def spend(
+        self,
+        token: Optional[str],
+        ids: Optional[list[int]],
+        *,
+        library_uuid: Optional[str] = None,
+        generation: Optional[int] = None,
+    ) -> tuple[Optional[DeleteConfirmation], str]:
+        """Spend ``token`` as :meth:`redeem` does, returning what was spent.
+
+        The record is what :meth:`refund` needs to give the token back when the
+        work it was spent on could not start.
+
+        Returns:
+            ``(record, "")`` when the confirmation was valid and is now spent,
+            or ``(None, reason)`` with :meth:`redeem`'s reasons.
+        """
         if not token or not isinstance(token, str):
             logger.warning(
                 "Delete-forever: REFUSED - no confirm_token. This endpoint "
                 "permanently destroys pictures and their files, so it requires "
                 "a confirmation minted by POST /pictures/scrapheap/delete-preview."
             )
-            return False, CONFIRM_MISSING
+            return None, CONFIRM_MISSING
         wanted = selection_fingerprint(ids)
         with self._lock:
             self._prune_locked()
@@ -1444,7 +1531,7 @@ class ScrapheapDeleteConfirmations:
                 "delete preview.",
                 self._ttl_seconds,
             )
-            return False, CONFIRM_UNKNOWN
+            return None, CONFIRM_UNKNOWN
         if (
             record.fingerprint != wanted
             or record.library_uuid != library_uuid
@@ -1457,13 +1544,58 @@ class ScrapheapDeleteConfirmations:
                 "confirmation has been discarded.",
                 record.total_count,
             )
-            return False, CONFIRM_MISMATCH
+            return None, CONFIRM_MISMATCH
         logger.info(
             "Delete-forever: confirmation accepted for a selection previewed as "
             "%d picture(s)",
             record.total_count,
         )
-        return True, ""
+        return record, ""
+
+    def refund(self, token: str, record: DeleteConfirmation) -> bool:
+        """Give back a token whose work was refused before anything started.
+
+        Only for a token :meth:`spend` just accepted and returned ``record``
+        for: the caller has destroyed nothing and is about to answer a refusal
+        (a run already active, a server that cannot run it). The record goes
+        back unchanged, so the token keeps its selection, its library binding
+        and its ORIGINAL deadline - a refund never extends a confirmation's
+        life, and one that expired meanwhile stays dead.
+
+        Returns:
+            Whether the token is spendable again.
+        """
+        if record.expires_at <= time.monotonic():
+            logger.info(
+                "Delete-forever: not refunding a confirmation that expired "
+                "while its run was being refused; re-run the delete preview"
+            )
+            return False
+        with self._lock:
+            self._prune_locked()
+            self._insert_locked(token, record)
+        logger.info(
+            "Delete-forever: refunded the confirmation for a selection "
+            "previewed as %d picture(s); nothing was started",
+            record.total_count,
+        )
+        return True
+
+    def _insert_locked(self, token: str, record: DeleteConfirmation) -> None:
+        """Store ``record``, evicting the oldest past the cap. Hold the lock."""
+        while len(self._outstanding) >= self._max_outstanding:
+            oldest = min(
+                self._outstanding,
+                key=lambda key: self._outstanding[key].expires_at,
+            )
+            del self._outstanding[oldest]
+            logger.info(
+                "Delete-forever: evicted the oldest unspent confirmation "
+                "(more than %d outstanding); that preview must be re-run "
+                "before it can be confirmed",
+                self._max_outstanding,
+            )
+        self._outstanding[token] = record
 
     def _prune_locked(self) -> None:
         """Drop expired confirmations. Caller must hold ``self._lock``."""
@@ -1719,17 +1851,24 @@ def remove_picture_files_and_reconcile_ledger(
 
 
 def fetch_scrapheap_rows(vault, ids: Optional[list[int]]) -> list[ScrapheapRow]:
-    """Vault wrapper for :func:`fetch_scrapheap_rows_in_session`."""
-    return vault.db.run_task(
-        fetch_scrapheap_rows_in_session, ids, priority=DBPriority.IMMEDIATE
-    )
+    """Vault wrapper for :func:`fetch_scrapheap_rows_in_session`.
+
+    A read off the writer queue (a WAL snapshot), so the delete preview and the
+    Scrapheap listing answer while a long write holds the writer. Nothing
+    relies on it being serialised with writes: the purge re-reads its rows,
+    protected folders and locks inside its own writer transaction
+    (:func:`plan_and_purge_in_session`), and the confirm token binds the
+    selection, not the rows this returned.
+    """
+    return vault.db.run_immediate_read_task(fetch_scrapheap_rows_in_session, ids)
 
 
 def fetch_no_delete_folder_ids(vault) -> set[int]:
-    """Vault wrapper for :func:`fetch_no_delete_folder_ids_in_session`."""
-    return vault.db.run_task(
-        fetch_no_delete_folder_ids_in_session, priority=DBPriority.IMMEDIATE
-    )
+    """Vault wrapper for :func:`fetch_no_delete_folder_ids_in_session`.
+
+    Off the writer queue, for the same reason as :func:`fetch_scrapheap_rows`.
+    """
+    return vault.db.run_immediate_read_task(fetch_no_delete_folder_ids_in_session)
 
 
 def find_due_retention_picture_ids(
@@ -1765,6 +1904,7 @@ def purge_scrapheap_pictures(
     schedule_file_removal: Optional[Callable[..., None]] = None,
     retention_guard: Optional[RetentionGuard] = None,
     priority: DBPriority = DBPriority.IMMEDIATE,
+    deleted_before: Optional[datetime] = None,
 ) -> ScrapheapPurgeOutcome:
     """Permanently destroy a scrapheap selection. THE destruction path.
 
@@ -1791,6 +1931,10 @@ def purge_scrapheap_pictures(
             handler keeps ``IMMEDIATE``; a background run's slice passes
             ``DBPriority.LOW`` so interactive writes get the writer between
             slices. It changes only when a step runs, never what it checks.
+        deleted_before: The manual path's consent bound, the confirming
+            preview's time (``DeleteConfirmation.deleted_before``): a picture
+            binned after it is left in the Scrapheap. ``None`` on the
+            automatic path, whose bound is ``retention_guard``.
 
     Returns:
         A :class:`ScrapheapPurgeOutcome`.
@@ -1805,6 +1949,7 @@ def purge_scrapheap_pictures(
             ids,
             include_protected,
             retention_guard,
+            deleted_before,
             priority=priority,
         )
     )

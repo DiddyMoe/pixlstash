@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from sqlmodel import Session, select
 
+from pixlstash.database import DBPriority
 from pixlstash.db_models import Snapshot
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.portable_identity import (
@@ -74,7 +75,7 @@ class SnapshotIdentityScrubTask(BaseTask):
                 self._relative_path,
                 exc,
             )
-            self._db.run_task(self._record_scrubbed, None)
+            self._db.run_task(self._record_scrubbed, None, priority=DBPriority.LOW)
             return
 
         if not os.path.exists(archive):
@@ -90,7 +91,7 @@ class SnapshotIdentityScrubTask(BaseTask):
                 self._snapshot_id,
                 self._relative_path,
             )
-            self._db.run_task(self._record_scrubbed, None)
+            self._db.run_task(self._record_scrubbed, None, priority=DBPriority.LOW)
             return
 
         try:
@@ -110,7 +111,7 @@ class SnapshotIdentityScrubTask(BaseTask):
             )
             raise
 
-        self._db.run_task(self._record_scrubbed, byte_size)
+        self._db.run_task(self._record_scrubbed, byte_size, priority=DBPriority.LOW)
         logger.info(
             "SnapshotIdentityScrubTask: scrubbed legacy snapshot %s (%s), %d bytes.",
             self._snapshot_id,

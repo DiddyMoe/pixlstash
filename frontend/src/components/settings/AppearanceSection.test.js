@@ -17,6 +17,13 @@ vi.mock("../../utils/apiClient", () => ({
 }));
 vi.mock("../../api/pictures", () => ({
   clearGuestScoreSession: vi.fn(),
+  // The tasks store follows the Scrapheap run (useScrapheapRunStore), whose
+  // setup hands these to its follower: a mock without them fails every mount.
+  cancelScrapheapRun: vi.fn(),
+  getLatestScrapheapRun: vi.fn(),
+  getScrapheapRun: vi.fn(),
+  startScrapheapRun: vi.fn(),
+  undoScrapheapRun: vi.fn(),
 }));
 vi.mock("../../api/config", () => ({
   patchUserConfig: vi.fn().mockResolvedValue({}),

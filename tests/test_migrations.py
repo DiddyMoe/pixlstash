@@ -1889,6 +1889,145 @@ def test_0150_creates_the_auto_stack_run_table_on_a_fresh_and_an_existing_vault(
             ).fetchall() == [("example-1",)]
 
 
+def _scrapheap_run_shape(conn):
+    """Columns (name, type, NOT NULL, primary key) and named indexes (unique)."""
+    columns = {
+        (name, col_type, notnull, pk)
+        for _cid, name, col_type, notnull, _default, pk in conn.execute(
+            "PRAGMA table_info(scrapheaprun)"
+        )
+    }
+    indexes = {
+        (row[1], row[2])
+        for row in conn.execute("PRAGMA index_list(scrapheaprun)")
+        if row[1].startswith("ix_")
+    }
+    return columns, indexes
+
+
+def test_0152_creates_the_scrapheap_run_table_on_a_fresh_and_an_existing_vault():
+    """The migration builds the same table the model does, and a re-run is a no-op.
+
+    Same shape as the 0150 check: a fresh vault takes ``scrapheaprun`` from the
+    baseline's ``create_all()`` and one upgraded from 0151 from the migration,
+    so the two are compared against each other. The unique ``request_id`` index
+    is what turns a replayed start into the run it already made, so it is
+    checked by behaviour as well as by name, and a row written before a re-run
+    survives it.
+    """
+    previous = "0151_add_dedup_scan_phase"
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "vault.db")
+        db_url = f"sqlite:///{db_path}"
+        up = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert up.returncode == 0, up.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            from_model = _scrapheap_run_shape(conn)
+        assert from_model[1] == {
+            ("ix_scrapheaprun_request_id", 1),
+            ("ix_scrapheaprun_status", 0),
+        }, "a fresh vault at head"
+        # What a replayed request_id is compared against, so a reused id with
+        # other parameters is refused rather than answered with the old run.
+        assert ("request_fingerprint", "VARCHAR", 0, 0) in from_model[0]
+
+        down = _run_alembic(["downgrade", previous], db_url, _MIGRATIONS_DIR)
+        assert down.returncode == 0, down.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert not _has_table(conn, "scrapheaprun")
+
+        up = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert up.returncode == 0, up.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert _scrapheap_run_shape(conn) == from_model, "migration 0152"
+            _insert_minimal_row(
+                conn, "scrapheaprun", id="example-run-1", request_id="example-1"
+            )
+            conn.commit()
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_minimal_row(
+                    conn, "scrapheaprun", id="example-run-2", request_id="example-1"
+                )
+            conn.rollback()
+            conn.execute("UPDATE alembic_version SET version_num = ?", (previous,))
+            conn.commit()
+
+        again = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert again.returncode == 0, again.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert conn.execute(
+                "SELECT id, request_id FROM scrapheaprun"
+            ).fetchall() == [("example-run-1", "example-1")]
+
+
+def _unprocessable_image_shape(conn):
+    """Columns (name, type, NOT NULL, primary key) and foreign keys (on delete)."""
+    columns = {
+        (name, col_type, notnull, pk)
+        for _cid, name, col_type, notnull, _default, pk in conn.execute(
+            "PRAGMA table_info(unprocessableimage)"
+        )
+    }
+    foreign_keys = {
+        (row[2], row[3], row[4], row[6])
+        for row in conn.execute("PRAGMA foreign_key_list(unprocessableimage)")
+    }
+    return columns, foreign_keys
+
+
+def test_0153_creates_the_unprocessable_image_table_on_a_fresh_and_an_existing_vault():
+    """The migration builds the same table the model does, and a re-run is a no-op.
+
+    Same shape as the 0152 check: the baseline's table and the migration's are
+    compared against each other. The cascade is what removes a held picture's
+    row when the picture is deleted, so it is checked by behaviour as well as
+    in ``foreign_key_list``, and a row written before a re-run survives it.
+    """
+    previous = "0152_add_scrapheap_run"
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "vault.db")
+        db_url = f"sqlite:///{db_path}"
+        up = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert up.returncode == 0, up.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            from_model = _unprocessable_image_shape(conn)
+        assert from_model[1] == {("picture", "picture_id", "id", "CASCADE")}
+        assert ("mtime_ns", "INTEGER", 0, 0) in from_model[0], "a fresh vault"
+
+        down = _run_alembic(["downgrade", previous], db_url, _MIGRATIONS_DIR)
+        assert down.returncode == 0, down.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert not _has_table(conn, "unprocessableimage")
+
+        up = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert up.returncode == 0, up.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert _unprocessable_image_shape(conn) == from_model, "migration 0153"
+            conn.execute("PRAGMA foreign_keys = ON")
+            for picture_id in (1, 2):
+                _insert_minimal_row(conn, "picture", id=picture_id)
+                _insert_minimal_row(
+                    conn,
+                    "unprocessableimage",
+                    picture_id=picture_id,
+                    kind="undecodable",
+                    file_path=f"example-{picture_id}.png",
+                )
+            conn.execute("DELETE FROM picture WHERE id = 2")
+            conn.execute("UPDATE alembic_version SET version_num = ?", (previous,))
+            conn.commit()
+            assert conn.execute(
+                "SELECT picture_id FROM unprocessableimage"
+            ).fetchall() == [(1,)]
+
+        again = _run_alembic(["upgrade", "head"], db_url, _MIGRATIONS_DIR)
+        assert again.returncode == 0, again.stderr
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            assert conn.execute(
+                "SELECT picture_id, file_path FROM unprocessableimage"
+            ).fetchall() == [(1, "example-1.png")]
+
+
 def test_0128_adds_prompt_match_once_on_a_fresh_and_a_populated_vault():
     """Column and probe index arrive either way, existing pictures read NULL
     (not scored), and a second upgrade over a vault that has both is a no-op."""

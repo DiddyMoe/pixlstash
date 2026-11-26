@@ -30,6 +30,13 @@ vi.mock("../../api/pictureSets", () => ({
 }));
 vi.mock("../../api/pictures", () => ({
   pictureThumbnailUrl: (id) => `/thumb/${id}.webp`,
+  // The tasks store follows the Scrapheap run (useScrapheapRunStore), whose
+  // setup hands these to its follower: a mock without them fails every mount.
+  cancelScrapheapRun: vi.fn(),
+  getLatestScrapheapRun: vi.fn(),
+  getScrapheapRun: vi.fn(),
+  startScrapheapRun: vi.fn(),
+  undoScrapheapRun: vi.fn(),
 }));
 
 // The Sheets step (CharacterSheetStep): what it reads and what it runs.
@@ -1326,6 +1333,26 @@ describe("TrainingSetBuild: generating the pictures", () => {
     const wrapper = mountDialog();
     await flushPromises();
     expect(localStorage.getItem("pixlstash:sheetWorkflowCards:v1")).toBeNull();
+    wrapper.unmount();
+  });
+
+  it("a check refused for the saved ComfyUI address says it did not finish, not undefined", async () => {
+    api.fetchCharacterSetSuggestion.mockResolvedValue(
+      suggestion({ stillsGroup: emptyGroup() }),
+    );
+    sheetsWorld({ description: "Adult woman, copper bob" });
+    // As the apiClient interceptor leaves it once its notice has shown the reason.
+    gen.preflightWorkflowRun.mockRejectedValue({
+      message: "Request failed with status code 409",
+      response: { status: 409, data: { detail: "The saved ComfyUI address is not valid." } },
+      savedAddressNoticed: true,
+    });
+    const wrapper = mountDialog();
+    await flushPromises();
+    const problem = wrapper.find('[data-testid="cs-workflow-problem"]').text();
+    expect(problem).toContain("Couldn't check MOSS sheet: the check did not finish");
+    expect(problem).not.toContain("undefined");
+    expect(problem).not.toContain("saved ComfyUI address");
     wrapper.unmount();
   });
 

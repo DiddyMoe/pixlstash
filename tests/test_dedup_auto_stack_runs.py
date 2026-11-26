@@ -12,6 +12,8 @@ through the same HTTP routes a second tab would use:
 * cancel before it starts, and while it is running;
 * an unrelated edit landing between slices, and the revert that has to stop at
   it rather than undo through it;
+* a revert that stopped short saying whether its run still has anything left
+  to undo, so a client offers to send it again only when that would act;
 * the segment cap, which bounds what one Ctrl+Z (and one undo transaction) has
   to do;
 * a slice that fails, the server stopping mid-run, and a restart finding a run
@@ -21,7 +23,9 @@ through the same HTTP routes a second tab would use:
 One server serves the module. Each test works in its own folder scope, so a
 run only ever plans that test's pictures, and the run rows are wiped before
 each test because only one run may be active at a time. Background workers are
-off, so nothing runs a slice except the test.
+off, so nothing runs a slice except the test; the server is told it has a
+planner (:func:`_works_runs_by_hand`), since a server that really has none
+refuses to record a run at all (tested on its own below).
 """
 
 import gc
@@ -32,10 +36,11 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 from sqlmodel import select
 
 from pixlstash.database import DBPriority
-from pixlstash.db_models import Operation, Picture
+from pixlstash.db_models import Operation, Picture, PictureStack
 from pixlstash.db_models.dedup import DedupAutoStackRun
 from pixlstash.db_models.operation import STATUS_APPLIED, STATUS_UNDONE
 from pixlstash.server import Server
@@ -55,6 +60,9 @@ STACK_URL = f"{API}/dedup/verdicts/stack"
 UNDO_URL = f"{API}/operations/undo"
 RUNS_URL = f"{API}/dedup/auto-stack/runs"
 OWNER = {"username": "owner", "password": "example-owner-password"}
+# What a failed run records, and an exception text it must never echo.
+GENERIC_ERROR = "The server hit an unexpected error; the server log has the details."
+LEAK = "example-injected failure at /home/me/library/a.png in SELECT picture"
 
 # The SPA catch-all answers unmatched GETs with 200; see tests/authz_guard.py.
 pytestmark = pytest.mark.usefixtures("no_spa_fallback")
@@ -63,6 +71,16 @@ pytestmark = pytest.mark.usefixtures("no_spa_fallback")
 def _run_url(run_id, action=None) -> str:
     url = f"{RUNS_URL}/{run_id}"
     return f"{url}/{action}" if action else url
+
+
+def _works_runs_by_hand(server) -> None:
+    """Let a no-worker server record runs; the tests work them by hand.
+
+    Without a planner a recorded run would never start, so the service refuses
+    one (503). These tests stand in for the planner, so they answer its
+    question for it on this vault only.
+    """
+    server.vault.runs_background_work = lambda: True
 
 
 def _write_config(config_path: str, **overrides) -> None:
@@ -85,6 +103,7 @@ def env():
     force_cpu = Server.DEFAULT_FORCE_CPU
     Server.DEFAULT_FORCE_CPU = True
     server = Server(config_path)
+    _works_runs_by_hand(server)
     try:
         client = TestClient(server.api)
         assert client.post(f"{API}/login", json=OWNER).status_code == 200
@@ -318,6 +337,103 @@ def test_only_one_run_may_be_active(env):
     assert client.post(RUNS_URL, json={"scope": scope}).status_code == 202
 
 
+def test_a_server_with_no_background_work_records_no_run(env, monkeypatch):
+    """Recorded anyway, a run would stay pending and refuse every later one.
+
+    No planner works it on such a server, and the start-up reconcile that
+    would close it never runs there either. The real predicate answers here.
+    """
+    client, server = env
+    monkeypatch.delattr(server.vault, "runs_background_work")
+    assert server.vault.runs_background_work() is False
+    scope, pairs = _pairs(server, 1)
+
+    refused = client.post(RUNS_URL, json={"scope": scope})
+    assert refused.status_code == 503, refused.text
+    assert refused.json()["detail"]["code"] == "auto_stack_runs_unavailable"
+    assert refused.json()["detail"]["run"] is None
+    assert "Retry-After" not in refused.headers
+    assert _run(server, dedup_auto_stack_service.latest_run_in_session) is None
+
+    monkeypatch.undo()
+    run = _start(client, scope)
+    _work(server)
+    assert _get(client, run["id"])["status"] == "complete"
+    monkeypatch.delattr(server.vault, "runs_background_work")
+
+    reverted = client.post(_run_url(run["id"], "revert"), json={})
+    assert reverted.status_code == 503, reverted.text
+    assert reverted.json()["detail"]["code"] == "auto_stack_runs_unavailable"
+    assert (
+        _run(server, dedup_auto_stack_service.latest_run_in_session)["id"]
+        == (run["id"])
+    )
+    assert _stacked(server, pairs) == [True]
+
+
+def _seed_ended_runs(server, count: int) -> list[int]:
+    """Insert *count* finished whole-vault runs; their ids, oldest first."""
+
+    def insert(session):
+        rows = [
+            DedupAutoStackRun(request_id=f"test-seed-{index}", status="complete")
+            for index in range(count)
+        ]
+        session.add_all(rows)
+        session.commit()
+        return [int(row.id) for row in rows]
+
+    return _run(server, insert)
+
+
+def _run_ids(server) -> list[int]:
+    return _run(
+        server,
+        lambda s: s.exec(
+            select(DedupAutoStackRun.id).order_by(DedupAutoStackRun.id)
+        ).all(),
+    )
+
+
+def test_a_new_run_keeps_only_the_newest_ended_rows(env):
+    """Run rows were never deleted, so the table grew by a row a click for ever.
+
+    Each new run prunes the ended rows past the newest HISTORY_KEPT in its own
+    insert. A refused request prunes nothing, the apply run a revert names is
+    kept however old it is, and a pruned run's request_id may be used again.
+    """
+    client, server = env
+    kept = dedup_auto_stack_service.HISTORY_KEPT
+    scope, pairs = _pairs(server, 1)
+    applied = _start(client, scope)["id"]
+    _work(server)
+    assert _stacked(server, pairs) == [True]
+    seeded = _seed_ended_runs(server, kept + 3)
+
+    reused = client.post(RUNS_URL, json={"scope": scope, "request_id": "test-seed-0"})
+    assert reused.status_code == 422, reused.text
+    assert reused.json()["detail"]["code"] == "request_id_reused"
+    assert _run_ids(server) == [applied, *seeded]
+
+    # The apply run is now the oldest of kept + 4 ended rows, and still revertable.
+    reverted = _revert(client, server, applied)
+    assert reverted["status"] == "complete", reverted
+    assert _stacked(server, pairs) == [False]
+    assert _run_ids(server) == [applied, *seeded[-kept:], reverted["id"]]
+
+    # Pruned, the id is free: the same request starts a new run, and this time
+    # nothing keeps the apply run.
+    again = client.post(RUNS_URL, json={"scope": scope, "request_id": "test-seed-0"})
+    assert again.status_code == 202, again.text
+    assert _run_ids(server) == [
+        *seeded[-(kept - 1) :],
+        reverted["id"],
+        again.json()["id"],
+    ]
+    assert client.get(_run_url(applied)).status_code == 404
+    _work(server)
+
+
 # ── cancel ───────────────────────────────────────────────────────────────────
 
 
@@ -413,6 +529,8 @@ def test_an_edit_between_slices_starts_a_new_segment_and_blocks_the_revert(
     assert blocked["error_code"] == "history_moved_on"
     assert (blocked["total"], blocked["processed"], blocked["applied"]) == (2, 1, 2)
     assert _get(client, run["id"])["can_revert"] is True
+    # Blocked, the undo can be sent again (it says so before the edit is undone).
+    assert blocked["target_can_revert"] is True
     # The verdict and the run's first segment are untouched.
     assert _stack_ops(server, segments[0], STATUS_APPLIED) == 1
     assert _stacked(server, other_pairs) == [True]
@@ -426,6 +544,7 @@ def test_an_edit_between_slices_starts_a_new_segment_and_blocks_the_revert(
     assert (finished["superseded"], finished["applied"]) == (1, 1)
     assert _stacked(server, pairs) == [False, False, False]
     assert _get(client, run["id"])["can_revert"] is False
+    assert _get(client, blocked["id"])["target_can_revert"] is False
 
 
 @pytest.mark.parametrize(
@@ -472,6 +591,116 @@ def test_no_segment_holds_more_groups_than_the_cap(
     assert _stacked(server, pairs) == [False] * 5
 
 
+def _stack_together(server, picture_ids) -> None:
+    """Put *picture_ids* into one stack of their own, before any run."""
+
+    def build(session):
+        stack = PictureStack(name="example-shared")
+        session.add(stack)
+        session.flush()
+        for position, picture_id in enumerate(picture_ids):
+            picture = session.get(Picture, picture_id)
+            picture.stack_id = int(stack.id)
+            picture.stack_position = position
+            session.add(picture)
+        session.commit()
+
+    _run(server, build)
+
+
+def test_a_stack_shared_by_groups_in_two_slices_is_counted_once(env, monkeypatch):
+    """Two groups, one per slice, both fold one stack: four pictures, not 3 + 4.
+
+    Each slice counts its own pictures distinctly; the run counts them across
+    slices, and its revert across segments.
+    """
+    client, server = env
+    monkeypatch.setattr(DedupAutoStackTask, "SLICE_GROUPS", 1)
+    # One segment per group, so the revert undoes the shared stack twice.
+    monkeypatch.setattr(dedup_auto_stack_service, "SEGMENT_GROUP_CAP", 1)
+    scope, pairs = _pairs(server, 2)
+    _stack_together(server, [pairs[0][0], pairs[1][0]])
+    run = _start(client, scope)
+    _work(server)
+
+    ended = _get(client, run["id"])
+    assert (ended["status"], ended["processed"], ended["applied"]) == (
+        "complete",
+        2,
+        2,
+    )
+    assert len(ended["segment_batch_ids"]) == 2
+    assert ended["pictures"] == 4
+
+    reverted = _revert(client, server, run["id"])
+    assert (reverted["status"], reverted["applied"]) == ("complete", 2)
+    assert reverted["pictures"] == 4
+
+
+def _announcements(monkeypatch) -> list[list[int]]:
+    announced: list[list[int]] = []
+    monkeypatch.setattr(
+        dedup_auto_stack_task,
+        "notify_pictures_changed",
+        lambda _vault, picture_ids, *_rest: announced.append(sorted(picture_ids)),
+    )
+    return announced
+
+
+@pytest.mark.parametrize("where", ["group", "task"])
+def test_a_run_failing_mid_way_announces_what_committed(env, monkeypatch, where):
+    """A run that fails in its second slice still sends its change event.
+
+    A failed run ends like a finished or interrupted one: the pictures its
+    committed slices stacked go out in a ``pictures_changed`` event, so other
+    tabs show them. ``group``: a group fails inside the slice (the service
+    closes the row). ``task``: the slice call itself raises (the task closes it).
+    """
+    client, server = env
+    monkeypatch.setattr(DedupAutoStackTask, "SLICE_GROUPS", 1)
+    # Never on the interval: only the closing flush announces.
+    monkeypatch.setattr(DedupAutoStackTask, "NOTIFY_INTERVAL_S", 1e9)
+    announced = _announcements(monkeypatch)
+    scope, pairs = _pairs(server, 3)
+    calls = []
+    if where == "group":
+        original = dedup_verdict_service.apply_stack_verdict_in_session
+
+        def second_group_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError(LEAK)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dedup_verdict_service, "apply_stack_verdict_in_session", second_group_fails
+        )
+    else:
+        original = dedup_auto_stack_service.apply_slice_in_session
+
+        def second_slice_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError(LEAK)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dedup_auto_stack_service, "apply_slice_in_session", second_slice_fails
+        )
+    run = _start(client, scope)
+    if where == "group":
+        _work(server)
+    else:
+        with pytest.raises(RuntimeError, match="example-injected"):
+            _work(server)
+
+    ended = _get(client, run["id"])
+    assert (ended["status"], ended["applied"]) == ("failed", 1)
+    stacked = _stacked(server, pairs)
+    assert sum(stacked) == 1
+    assert announced == [pairs[stacked.index(True)]]
+
+
 # ── revert ───────────────────────────────────────────────────────────────────
 
 
@@ -489,6 +718,8 @@ def test_a_revert_undoes_the_whole_run_and_only_once(env):
     assert revert["applied"] == 3
     assert _stacked(server, pairs) == [False, False, False]
     assert _get(client, run["id"])["can_revert"] is False
+    # Finished, the undo has nothing left to send again.
+    assert revert["target_can_revert"] is False
 
     nothing = client.post(_run_url(run["id"], "revert"), json={})
     assert nothing.status_code == 409, nothing.text
@@ -497,6 +728,119 @@ def test_a_revert_undoes_the_whole_run_and_only_once(env):
     of_a_revert = client.post(_run_url(revert["id"], "revert"), json={})
     assert of_a_revert.status_code == 409, of_a_revert.text
     assert of_a_revert.json()["detail"]["code"] == "not_an_apply_run"
+
+
+def _stopped_short_revert(client, server, monkeypatch) -> tuple[dict, dict, list]:
+    """An apply run of three one-group segments, and an undo stopped after one.
+
+    Returns the apply run, the revert as its ``202`` answered (still pending)
+    and the pairs. The revert undoes the newest segment, then is cancelled
+    between slices, so the two older segments stay stacked.
+    """
+    monkeypatch.setattr(DedupAutoStackTask, "SLICE_GROUPS", 1)
+    monkeypatch.setattr(dedup_auto_stack_service, "SEGMENT_GROUP_CAP", 1)
+    scope, pairs = _pairs(server, 3)
+    run = _start(client, scope)
+    _work(server)
+    assert len(_get(client, run["id"])["segment_batch_ids"]) == 3
+
+    response = client.post(_run_url(run["id"], "revert"), json={})
+    assert response.status_code == 202, response.text
+    revert = response.json()
+
+    def cancel_once(_task, processed):
+        if processed == 1:
+            cancelled = client.post(_run_url(revert["id"], "cancel"))
+            assert cancelled.status_code == 200, cancelled.text
+
+    _between_slices(monkeypatch, revert["id"], cancel_once)
+    _work(server)
+    return run, revert, pairs
+
+
+def test_a_stopped_short_revert_says_whether_its_run_has_anything_left(
+    env, monkeypatch
+):
+    """``target_can_revert``: would sending this undo again undo anything?
+
+    The banner holding a revert that stopped short offers to finish it. The
+    revert's own ``can_revert`` cannot say so (a revert is not revertable), so
+    the revert carries its target's answer, read the same way, on every read.
+    """
+    client, server = env
+    run, pending, pairs = _stopped_short_revert(client, server, monkeypatch)
+    # Going, it offers nothing: the run is still undoing.
+    assert pending["active"] is True
+    assert pending["target_can_revert"] is False
+
+    stopped = _get(client, pending["id"])
+    assert (stopped["status"], stopped["processed"]) == ("cancelled", 1)
+    assert _stacked(server, pairs) == [True, True, False]
+    assert stopped["target_can_revert"] is True
+    assert stopped["can_revert"] is False
+    assert _get(client, run["id"])["can_revert"] is True
+
+    # The rest undone by hand: nothing is left, and the revert route agrees.
+    for _segment in range(2):
+        undo = client.post(UNDO_URL)
+        assert undo.status_code == 200, undo.text
+    assert _stacked(server, pairs) == [False, False, False]
+    assert _get(client, pending["id"])["target_can_revert"] is False
+    nothing = client.post(_run_url(run["id"], "revert"), json={})
+    assert nothing.status_code == 409, nothing.text
+    assert nothing.json()["detail"]["code"] == "nothing_to_revert"
+
+
+def test_a_revert_whose_run_was_pruned_has_nothing_left(env, monkeypatch):
+    """Its apply run's row gone, the undo cannot be sent again (404)."""
+    client, server = env
+    kept = dedup_auto_stack_service.HISTORY_KEPT
+    run, pending, _pairs_left = _stopped_short_revert(client, server, monkeypatch)
+    assert _get(client, pending["id"])["target_can_revert"] is True
+
+    # kept - 1 newer rows, then a new run's insert prunes past the newest kept:
+    # the revert is the oldest row kept, its apply run the newest one pruned.
+    _seed_ended_runs(server, kept - 1)
+    scope, _pairs_new = _pairs(server, 1)
+    _start(client, scope)
+    assert client.get(_run_url(run["id"])).status_code == 404
+
+    assert _get(client, pending["id"])["target_can_revert"] is False
+    gone = client.post(_run_url(run["id"], "revert"), json={})
+    assert gone.status_code == 404, gone.text
+    _work(server)
+
+
+def _statements(server, run_id: int) -> int:
+    """SQL statements ``serialize_run`` issues for run *run_id*, read fresh."""
+
+    def count(session):
+        run = session.get(DedupAutoStackRun, run_id)
+        bind = session.get_bind()
+        statements = []
+
+        def record(_conn, _cursor, statement, *_rest):
+            statements.append(statement)
+
+        event.listen(bind, "before_cursor_execute", record)
+        try:
+            dedup_auto_stack_service.serialize_run(session, run)
+        finally:
+            event.remove(bind, "before_cursor_execute", record)
+        return len(statements)
+
+    return _run(server, count)
+
+
+def test_a_reverts_flag_costs_one_lookup_more_than_its_runs(env, monkeypatch):
+    """The revert's answer is its target's, plus one primary-key read.
+
+    Not a query per segment or per run: the target's flag is the same bounded
+    probe an apply run makes, and the revert adds the read of the target row.
+    """
+    client, server = env
+    run, pending, _pairs_left = _stopped_short_revert(client, server, monkeypatch)
+    assert _statements(server, pending["id"]) == _statements(server, run["id"]) + 1
 
 
 def test_an_unknown_run_is_a_404_on_every_run_route(env):
@@ -514,7 +858,20 @@ def test_an_unknown_run_is_a_404_on_every_run_route(env):
 # ── failure, shutdown and restart ────────────────────────────────────────────
 
 
-def test_a_failing_group_fails_the_run_and_keeps_what_committed(env, monkeypatch):
+def _leaks(view: dict) -> bool:
+    """Whether a run view carries any part of :data:`LEAK`."""
+    text = json.dumps(view)
+    return "example-injected" in text or "/home/me" in text or "SELECT" in text
+
+
+def test_a_failing_group_fails_the_run_and_keeps_what_committed(
+    env, monkeypatch, caplog
+):
+    """The row and its failure sample record a generic message; the log the cause.
+
+    The exception text can carry a file path or SQL, and the run view is served
+    to every owner session, so neither ``error`` nor ``failures`` may echo it.
+    """
     client, server = env
     scope, pairs = _pairs(server, 3)
     original = dedup_verdict_service.apply_stack_verdict_in_session
@@ -523,7 +880,7 @@ def test_a_failing_group_fails_the_run_and_keeps_what_committed(env, monkeypatch
     def fail_second(*args, **kwargs):
         calls.append(args[1])
         if len(calls) == 2:
-            raise RuntimeError("example-injected failure")
+            raise RuntimeError(LEAK)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -535,12 +892,45 @@ def test_a_failing_group_fails_the_run_and_keeps_what_committed(env, monkeypatch
     ended = _get(client, run["id"])
     assert ended["status"] == "failed"
     assert ended["error_code"] == "unexpected_error"
-    assert "example-injected failure" in ended["error"]
+    assert ended["error"] == GENERIC_ERROR
     assert (ended["processed"], ended["applied"], ended["failed"]) == (2, 1, 1)
     assert ended["failures"][0]["outcome"] == "failed"
     assert ended["failures"][0]["signature"] == calls[1]
+    assert ended["failures"][0]["error"] == GENERIC_ERROR
+    assert not _leaks(ended)
+    assert any(LEAK in record.getMessage() for record in caplog.records)
     assert ended["can_revert"] is True
     assert sum(_stacked(server, pairs)) == 1
+
+
+def test_a_task_failing_outside_a_slice_records_a_generic_error(
+    env, monkeypatch, caplog
+):
+    """A defect outside the group loop (here the plan) closes the row the same way.
+
+    That is the task's own failure path rather than the slice's, and it records
+    the same generic message, with the cause in the log only.
+    """
+    client, server = env
+    scope, _pairs_ = _pairs(server, 2)
+
+    def plan_fails(*_args, **_kwargs):
+        raise RuntimeError(LEAK)
+
+    monkeypatch.setattr(dedup_auto_stack_task, "plan_auto_stack_in_session", plan_fails)
+    run = _start(client, scope)
+    with pytest.raises(RuntimeError, match="example-injected"):
+        _work(server)
+
+    ended = _get(client, run["id"])
+    assert (ended["status"], ended["error_code"]) == ("failed", "unexpected_error")
+    assert ended["error"] == GENERIC_ERROR
+    assert not _leaks(ended)
+    assert any(
+        record.exc_info and LEAK in str(record.exc_info[1])
+        for record in caplog.records
+        if f"run {run['id']} failed" in record.getMessage()
+    )
 
 
 def test_a_server_stopping_mid_run_closes_it_interrupted(env, monkeypatch):
@@ -607,6 +997,7 @@ def test_a_restart_closes_a_run_the_previous_process_was_working():
     Server.DEFAULT_FORCE_CPU = True
     try:
         before = Server(config_path)
+        _works_runs_by_hand(before)
         try:
             client = TestClient(before.api)
             assert client.post(f"{API}/login", json=OWNER).status_code == 200

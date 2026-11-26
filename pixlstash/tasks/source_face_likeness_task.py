@@ -121,7 +121,7 @@ class SourceFaceLikenessTask(BaseTask):
                         session.add(face)
                 session.commit()
 
-            self._db.run_task(apply_assignments)
+            self._db.run_task(apply_assignments, priority=DBPriority.LOW)
             logger.info(
                 "SourceFaceLikenessTask: assigned %s character(s) to picture %s from source %s",
                 len(assignments),

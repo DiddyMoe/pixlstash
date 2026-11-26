@@ -13,6 +13,7 @@ import { describe, it, expect } from "vitest";
 import { mount } from "@vue/test-utils";
 
 import EmptyScrapHeap from "./EmptyScrapHeap.vue";
+import Tooltip from "./Tooltip.vue";
 
 const globalOpts = { global: { stubs: { "v-icon": true } } };
 
@@ -213,11 +214,19 @@ describe("EmptyScrapHeap: stopping a run", () => {
     expect(w.emitted("stop-run")).toBeUndefined();
   });
 
-  it("holds Stop, without a spinner, while a start is on the wire", () => {
-    const stop = stopButton(mountBar({ run: run(), runAction: "start" }));
-    expect(stop.attributes("disabled")).toBeDefined();
-    expect(stop.attributes("aria-busy")).toBeUndefined();
-  });
+  // A start's or an undo's request still on the wire (a resend after a lost
+  // answer) is not the run's Stop: the run on screen can be stopped.
+  it.each(["start", "undo"])(
+    "offers Stop while a %s request is on the wire",
+    async (runAction) => {
+      const w = mountBar({ run: run(), runAction });
+      const stop = stopButton(w);
+      expect(stop.attributes("disabled")).toBeUndefined();
+      expect(stop.attributes("aria-busy")).toBeUndefined();
+      await stop.trigger("click");
+      expect(w.emitted("stop-run")).toHaveLength(1);
+    },
+  );
 
   it("offers Stop when nothing is on the wire", () => {
     const stop = stopButton(mountBar({ run: run() }));
@@ -228,7 +237,7 @@ describe("EmptyScrapHeap: stopping a run", () => {
   it("says what a stopping run has done so far, and offers no second Stop", () => {
     const purge = mountBar({ run: run({ cancel_requested: true }) });
     expect(textOf(progressLine(purge))).toBe(
-      `Stopping after the current step: ${n(12000)} deleted so far. You can keep working.`,
+      `Stopping after the current batch: ${n(12000)} deleted so far, and they cannot be restored. You can keep working.`,
     );
     expect(stopButton(purge).exists()).toBe(false);
     expect(purge.find(".run-meta").exists()).toBe(false);
@@ -237,7 +246,68 @@ describe("EmptyScrapHeap: stopping a run", () => {
       run: run({ kind: "restore", cancel_requested: true, restored_count: 7 }),
     });
     expect(textOf(progressLine(restore))).toBe(
-      "Stopping after the current step: 7 restored so far. You can keep working.",
+      "Stopping after the current batch: 7 restored so far. You can keep working.",
+    );
+  });
+
+  // Said before the press, where the choice is made: how far a run goes after
+  // Stop, and that a purge's deletions do not come back.
+  const stopTip = (w) => stopButton(w).findComponent(Tooltip).props("text");
+
+  it("tells before Stop that a purge's deletions are final, and how far it goes", () => {
+    expect(stopTip(mountBar({ run: run({ slice_max_pictures: 1500 }) }))).toBe(
+      `Stops after the current batch of up to ${n(1500)} pictures. Pictures already deleted forever cannot be restored.`,
+    );
+    expect(
+      stopTip(
+        mountBar({ run: run({ kind: "restore", slice_max_pictures: 500 }) }),
+      ),
+    ).toBe(
+      "Stops after the current batch of up to 500 pictures. Pictures already restored stay restored.",
+    );
+  });
+
+  // An undo puts a restore's pictures back in the Scrapheap. Worded as
+  // a deletion it would read as data loss; worded as a restore, backwards.
+  // An undo works through the restore's History steps: its total and
+  // processed count those, and its pictures are `undone_count`.
+  it("words an undo of a restore as putting pictures back, in every state", () => {
+    const undo = (over = {}) =>
+      run({ kind: "undo", processed: 2, total: 5, undone_count: 290, ...over });
+    const going = mountBar({ run: undo() });
+    expect(textOf(progressLine(going))).toBe(
+      "Putting back in the Scrapheap: History step 2 of 5, 290 pictures so far. You can keep working.",
+    );
+    expect(progressbar(going).attributes("aria-label")).toBe(
+      "Undo restore progress",
+    );
+    expect(progressbar(going).attributes("aria-valuenow")).toBe("40");
+    expect(progressbar(going).attributes("aria-valuetext")).toBe(
+      "History step 2 of 5 done",
+    );
+    expect(announcement(going).text()).toBe(
+      "Putting restored pictures back in the Scrapheap in the background.",
+    );
+    expect(stopTip(mountBar({ run: undo({ slice_max_pictures: 250 }) }))).toBe(
+      "Stops after the History step it is on. Pictures already put back stay in the Scrapheap.",
+    );
+    expect(
+      textOf(progressLine(mountBar({ run: undo({ status: "pending" }) }))),
+    ).toBe(
+      "Undo restore is queued and starts when the server gets to it. You can keep working.",
+    );
+    const stopping = mountBar({ run: undo({ cancel_requested: true }) });
+    expect(textOf(progressLine(stopping))).toBe(
+      "Stopping after the History step it is on: 290 put back so far. You can keep working.",
+    );
+    expect(announcement(stopping).text()).toBe(
+      "Stopping after the History step it is on.",
+    );
+  });
+
+  it("still says what Stop does when the run view names no batch size", () => {
+    expect(stopTip(mountBar({ run: run() }))).toBe(
+      "Stops after the current batch. Pictures already deleted forever cannot be restored.",
     );
   });
 });
@@ -262,7 +332,9 @@ describe("EmptyScrapHeap: the live region", () => {
       "Deleting pictures forever in the background.",
     );
     await w.setProps({ run: run({ cancel_requested: true }) });
-    expect(announcement(w).text()).toBe("Stopping after the current step.");
+    expect(announcement(w).text()).toBe(
+      "Stopping after the current batch. Pictures already deleted cannot be restored.",
+    );
     await w.setProps({ run: run({ active: false, status: "cancelled" }) });
     expect(announcement(w).text()).toBe("");
 
@@ -270,5 +342,47 @@ describe("EmptyScrapHeap: the live region", () => {
     expect(announcement(w).text()).toBe(
       "Restoring pictures from the Scrapheap in the background.",
     );
+    await w.setProps({ run: run({ kind: "restore", cancel_requested: true }) });
+    expect(announcement(w).text()).toBe("Stopping after the current batch.");
+  });
+});
+
+describe("EmptyScrapHeap: Delete forever's check is under way", () => {
+  // The grid asks the server what Delete forever would destroy before it
+  // opens the confirm. Until the answer lands the bar says so, and holds
+  // Empty, so a second gesture is not taken for nothing.
+  const checkingLine = (w) => byTestId(w, "scrapheap-delete-checking");
+
+  it("says nothing of a check when none is out", () => {
+    const w = mountBar();
+    expect(checkingLine(w).exists()).toBe(false);
+    const empty = buttonNamed(w, "Empty scrapheap");
+    expect(empty.attributes("disabled")).toBeUndefined();
+    expect(empty.attributes("aria-busy")).toBeUndefined();
+  });
+
+  it("spins Empty while the whole heap is being checked", () => {
+    const w = mountBar({ checking: "all" });
+    expect(checkingLine(w).text()).toBe("Checking what would be destroyed…");
+    const empty = buttonNamed(w, "Empty scrapheap");
+    expect(empty.attributes("disabled")).toBeDefined();
+    expect(empty.attributes("aria-busy")).toBe("true");
+  });
+
+  it("holds Empty, without its spinner, while a selection is being checked", () => {
+    const w = mountBar({ checking: "selection" });
+    expect(checkingLine(w).text()).toBe("Checking what would be destroyed…");
+    const empty = buttonNamed(w, "Empty scrapheap");
+    expect(empty.attributes("disabled")).toBeDefined();
+    expect(empty.attributes("aria-busy")).toBeUndefined();
+  });
+
+  it("announces the check, and falls quiet when it ends", async () => {
+    const w = mountBar({ checking: "selection" });
+    expect(announcement(w).text()).toBe(
+      "Checking what Delete forever would destroy.",
+    );
+    await w.setProps({ checking: null });
+    expect(announcement(w).text()).toBe("");
   });
 });

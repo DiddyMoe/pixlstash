@@ -1,4 +1,5 @@
 import base64
+import re
 import threading
 from datetime import datetime, timezone
 
@@ -29,8 +30,10 @@ from pixlstash.db_models import (
     Project,
     Tag,
 )
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
+from pixlstash.routes._helpers import read_json_object
 from pixlstash.scoring.prompt_match import looks_like_prompt
 from pixlstash.scoring.smart_score import is_anchor_score
 from pixlstash.services import (
@@ -40,8 +43,12 @@ from pixlstash.services import (
 )
 from pixlstash.services.scrapheap_run_service import (
     ERROR_ACTIVE as SCRAPHEAP_RUN_ACTIVE,
+    ERROR_NOT_A_RESTORE_RUN as SCRAPHEAP_RUN_NOT_A_RESTORE_RUN,
     ERROR_NOT_FOUND as SCRAPHEAP_RUN_NOT_FOUND,
+    ERROR_NOTHING_TO_UNDO as SCRAPHEAP_RUN_NOTHING_TO_UNDO,
+    ERROR_REQUEST_ID_REUSED as SCRAPHEAP_RUN_REQUEST_ID_REUSED,
     ERROR_UNAVAILABLE as SCRAPHEAP_RUNS_UNAVAILABLE,
+    REQUEST_ID_MAX_LENGTH as SCRAPHEAP_RUN_REQUEST_ID_MAX_LENGTH,
     SEGMENT_PICTURE_CAP,
     ScrapheapRunError,
 )
@@ -52,6 +59,7 @@ from pixlstash.services.set_lock_service import (
 )
 from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
 from pixlstash.stacking import normalize_stack_positions
+from pixlstash.task_runner import TaskAdmissionRefused
 from pixlstash.tasks.face_model_refresh_task import FaceModelRefreshTask
 from pixlstash.utils.field_allowlist import (
     PICTURE_EXTRA_SERVABLE_FIELDS,
@@ -83,10 +91,14 @@ from pixlstash.utils.service.filter_helpers import (
     narrow_picture_project_ids,
 )
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK, chunked
 from pixlstash.utils.service.smart_score_invalidation import (
     note_anchor_inputs_changing,
 )
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sqlite_ints import SqliteInt
+
+from ._listing import StoredPictureRow, stored_picture_dict, stored_picture_value
 
 
 logger = get_logger(__name__)
@@ -111,6 +123,25 @@ BULK_DELETE_MAX_IDS = 1000
 # re-hash, all of it on the single DB writer thread, so this is the cap where the
 # per-id work is file I/O rather than a row fetch.
 ROTATE_MAX_IDS = 200
+
+
+# Upper bound on an explicit Scrapheap selection: the delete preview, the
+# synchronous delete and a background run. Far higher than the caps above
+# because a run handles any size a slice at a time; this bounds only what one
+# request body can make the server hold (200,000 ids is about 1.4 MB of JSON and
+# a few MB as a Python list, held for the life of the run). The whole Scrapheap
+# is the omitted selection, resolved server-side, so it is never capped.
+SCRAPHEAP_MAX_IDS = 200_000
+
+
+# Upper bound on the synchronous Scrapheap routes (DELETE /pictures/scrapheap and
+# POST /pictures/scrapheap/restore), which do all their work inside the request.
+# The whole Scrapheap, or any selection above this, is a background run instead:
+# one request emptying 50,000 pictures held the single writer past the client's
+# timeout. 1000 matches BULK_DELETE_MAX_IDS, the cap on binning in one request,
+# so whatever one request can bin, one request can also restore or destroy.
+SCRAPHEAP_SYNC_MAX_IDS = 1000
+SCRAPHEAP_RUNS_URL = "/api/v1/pictures/scrapheap/runs"
 
 
 # picture belongs to a locked set. Organisation fields (e.g. project_id) are not
@@ -157,7 +188,7 @@ class SetFavouriteResponse(BaseModel):
     updated_count: int
 
 
-class PictureFullMetadataResponse(BaseModel):
+class PictureFullMetadataResponse(StoredPictureRow):
     """Single picture's full metadata, tags, optional smart score, and any
     embedded file metadata. The picture model is large/dynamic so common
     fields are enumerated and ``extra="allow"`` preserves the rest."""
@@ -247,7 +278,12 @@ class PicturePatchResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     status: str
-    picture: dict
+    picture: dict = Field(
+        description=(
+            "The picture's metadata fields as committed, read through the "
+            "column types like `GET /pictures/{id}/metadata` (no tags)."
+        ),
+    )
     skipped_excluded: list[str] = Field(
         default_factory=list,
         description=(
@@ -324,6 +360,8 @@ class ScrapheapDeletePreviewResponse(BaseModel):
     protected_count: int
     locked_count: int = 0
     unprotected_count: int
+    # At most ``DELETE_PREVIEW_LIST_CAP`` (200) of each, sorted: ``protected``
+    # by path then id, ``locked`` ascending. The counts above are exact.
     protected: list[ScrapheapProtectedItem]
     # Ids frozen by a locked picture-set, so the dialog can name them.
     locked: list[int] = []
@@ -332,6 +370,11 @@ class ScrapheapDeletePreviewResponse(BaseModel):
     # endpoint cannot be driven blind from another origin. Bound to THIS
     # selection and spent by the first delete that presents it; re-run the
     # preview to get another.
+    #
+    # It confirms the SELECTION, not the ``include_protected`` choice: the
+    # preview reports what each button destroys, so the token is good for
+    # either, and the delete carries the flag itself. It also records when the
+    # preview read the Scrapheap: a picture binned after that is left alone.
     confirm_token: str = ""
 
 
@@ -341,12 +384,55 @@ SCRAPHEAP_RUN_POLL_AFTER_S = 1
 A run commits a 500-picture slice in about a third of a second, so a one-second
 poll moves the progress line visibly without reading the same counters twice."""
 
+SCRAPHEAP_RUN_MAX_WAIT_S = 2
+"""The longest ``Prefer: wait`` a run start honours, in seconds.
+
+Long enough for a run of a few pictures to end, so a small gesture gets its
+final result in one answer; short enough that the request thread it holds is
+never held for long. A larger ``wait`` is treated as this."""
+
+_DELTA_SECONDS = re.compile(r"[0-9]+")
+
+
+def _preferred_wait(header_values: list[str]) -> Optional[int]:
+    """The seconds a ``Prefer: wait=N`` asks for, capped; ``None`` to not wait.
+
+    RFC 7240 §2 and §4.3: preferences are comma-separated across any number of
+    ``Prefer`` headers, names are case-insensitive, a value may be quoted, and
+    parameters after ``;`` belong to the preference. The first ``wait`` decides.
+    A malformed or zero value is ignored, as the RFC asks of a preference the
+    server cannot apply.
+    """
+    for header in header_values:
+        for preference in header.split(","):
+            name, _, value = preference.split(";", 1)[0].partition("=")
+            if name.strip().lower() != "wait":
+                continue
+            value = value.strip().strip('"')
+            if not _DELTA_SECONDS.fullmatch(value) or int(value) == 0:
+                return None
+            return min(int(value), SCRAPHEAP_RUN_MAX_WAIT_S)
+    return None
+
+
 SCRAPHEAP_RUN_ERROR_STATUS = {
     SCRAPHEAP_RUN_ACTIVE: 409,
     SCRAPHEAP_RUN_NOT_FOUND: 404,
     SCRAPHEAP_RUNS_UNAVAILABLE: 503,
+    SCRAPHEAP_RUN_REQUEST_ID_REUSED: 422,
+    SCRAPHEAP_RUN_NOT_A_RESTORE_RUN: 409,
+    SCRAPHEAP_RUN_NOTHING_TO_UNDO: 409,
 }
 """HTTP status per refused run request; the body carries the code itself."""
+
+_SCRAPHEAP_RUN_REQUEST_ID_DESCRIPTION = (
+    "Idempotency key the client mints per gesture (a UUID). Sending the same "
+    "id again returns the run it already started (200) instead of starting "
+    "another, so a retry after a lost response is safe; for a purge the "
+    "confirm token is not redeemed again. The same id with different "
+    "parameters is refused with 422 `request_id_reused`, naming the original "
+    "run. Omit and the server mints one."
+)
 
 
 class ScrapheapRunRequest(BaseModel):
@@ -360,12 +446,14 @@ class ScrapheapRunRequest(BaseModel):
             "brings them back to the library."
         )
     )
-    picture_ids: Optional[list[int]] = Field(
+    picture_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         min_length=1,
+        max_length=SCRAPHEAP_MAX_IDS,
         description=(
             "The selection; omitted or null means the whole Scrapheap, resolved "
-            "to the pictures in it when the run starts."
+            "to the pictures in it when the run starts. At most "
+            f"{SCRAPHEAP_MAX_IDS} ids."
         ),
     )
     include_protected: bool = Field(
@@ -380,8 +468,33 @@ class ScrapheapRunRequest(BaseModel):
         description=(
             "Purge only, and required there: the token "
             "`POST /pictures/scrapheap/delete-preview` minted for exactly this "
-            "selection. Single-use; ignored for a restore."
+            "selection. It confirms the selection, not `include_protected`: "
+            "the preview reported what either value destroys, and this request "
+            "chooses. Pictures binned after that preview are left in the "
+            "Scrapheap. Single-use; a run refused with 409 or 503 leaves it "
+            "unspent. Ignored for a restore."
         ),
+    )
+    request_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=SCRAPHEAP_RUN_REQUEST_ID_MAX_LENGTH,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description=_SCRAPHEAP_RUN_REQUEST_ID_DESCRIPTION,
+    )
+
+
+class ScrapheapRunUndoRequest(BaseModel):
+    """Undo a restore run; the body is optional."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=SCRAPHEAP_RUN_REQUEST_ID_MAX_LENGTH,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description=_SCRAPHEAP_RUN_REQUEST_ID_DESCRIPTION,
     )
 
 
@@ -391,14 +504,31 @@ class ScrapheapRunView(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     id: str = Field(description="The run id; its status is `GET .../runs/{id}`.")
-    kind: str = Field(description="`purge` or `restore`.")
+    kind: str = Field(
+        description=(
+            "`purge`, `restore`, or `undo` (undoing a restore run, see "
+            "`target_run_id`)."
+        )
+    )
+    request_id: str = Field(
+        description=(
+            "The idempotency key the run was started with: the client's, or "
+            "one the server minted (`srv-` and 32 hex digits)."
+        )
+    )
+    target_run_id: Optional[str] = Field(
+        default=None,
+        description="The restore run an undo works on; null for other kinds.",
+    )
     status: str = Field(
         description=(
             "`pending` (queued), `running`, then one of `complete`, `cancelled` "
             "(stopped on request), `interrupted` (the server stopped; never "
-            "resumed) or `failed` (an unexpected error; see `error`). Whatever "
-            "committed before a run stopped stays committed; the pictures it "
-            "had not reached are still in the Scrapheap."
+            "resumed), `failed` (an unexpected error; see `error`) or, for an "
+            "undo only, `blocked` (History moved on or refused the next "
+            "segment; see `error_code`). Whatever committed before a run "
+            "stopped stays committed; the pictures it had not reached are "
+            "still where they were."
         )
     )
     active: bool = Field(description="True while `pending` or `running`.")
@@ -424,11 +554,28 @@ class ScrapheapRunView(BaseModel):
     skipped_restored: int = Field(
         description="Pictures that left the Scrapheap before their slice (purge)."
     )
+    arrived_since: Optional[int] = Field(
+        default=None,
+        description=(
+            "Once a purge has ended: pictures in its selection binned after "
+            "the confirming preview, which it therefore left in the Scrapheap "
+            "(0 when none). Null while it runs, and for a restore."
+        ),
+    )
     ghosts_kept: int = Field(description="Picture ghosts the hub kept (purge).")
     ghosts_cascaded: int = Field(
         description="Picture ghosts the hub destroyed (purge)."
     )
     restored_count: int = Field(description="Pictures brought back (restore).")
+    undone_count: int = Field(
+        description="Pictures an undo put back in the Scrapheap (undo)."
+    )
+    can_undo: bool = Field(
+        description=(
+            "A restore run that has ended with something left to undo: "
+            "`POST .../runs/{id}/undo` would start. False for other kinds."
+        )
+    )
     snapshots_with_deleted: Optional[list[dict[str, Any]]] = Field(
         default=None,
         description=(
@@ -440,14 +587,36 @@ class ScrapheapRunView(BaseModel):
     segment_batch_ids: list[str] = Field(
         description=(
             "The History batches a restore recorded into, oldest first, each at "
-            f"most {SEGMENT_PICTURE_CAP} pictures and one Ctrl+Z."
+            f"most {SEGMENT_PICTURE_CAP} pictures and one Ctrl+Z. For an undo, "
+            "the target's segments, in the same order; it works through them "
+            "newest first."
         )
     )
     error_code: Optional[str] = Field(
         default=None,
-        description="Why it ended early: `server_stopped` or `unexpected_error`.",
+        description=(
+            "Why it ended early: `server_stopped`, `unexpected_error`, or for "
+            "a blocked undo `history_moved_on` (a later History entry sits "
+            "above the next segment; undo that first, then undo this restore "
+            "again) or `undo_refused` (History refused the segment: a locked "
+            "picture set, or a picture purged since)."
+        ),
     )
     error: Optional[str] = Field(default=None, description="The detail, if any.")
+    slice_max_pictures: int = Field(
+        description=(
+            "The most pictures one slice of this run takes. A Stop takes "
+            "effect at the next slice boundary, so the run handles at most "
+            "this many more pictures after it."
+        )
+    )
+    slice_budget_s: float = Field(
+        description=(
+            "The writer time one slice aims for, in seconds: the run sizes "
+            "each slice from the measured cost of the last, so a Stop "
+            "normally lands within about this long of writer work."
+        )
+    )
     created_at: Optional[str] = Field(default=None)
     started_at: Optional[str] = Field(default=None)
     updated_at: Optional[str] = Field(default=None)
@@ -495,7 +664,8 @@ def _parse_scrapheap_ids(payload: dict | None) -> list[int] | None:
 
     Accepts either ``ids`` (the delete-preview field) or ``picture_ids`` (the
     delete field); ``None``/absent means "the entire scrapheap". A present but
-    empty or non-integer list is a 400.
+    empty or non-integer list is a 400; one over :data:`SCRAPHEAP_MAX_IDS` is a
+    422, like the other per-request id caps.
     """
     if not isinstance(payload, dict):
         return None
@@ -506,10 +676,50 @@ def _parse_scrapheap_ids(payload: dict | None) -> list[int] | None:
         return None
     if not isinstance(maybe_ids, list) or not maybe_ids:
         raise HTTPException(status_code=400, detail="ids must be a non-empty list")
+    if len(maybe_ids) > SCRAPHEAP_MAX_IDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"ids exceeds the maximum of {SCRAPHEAP_MAX_IDS} ids per request",
+        )
     try:
         return [int(pid) for pid in maybe_ids]
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="ids must contain valid integers")
+
+
+def _require_sync_selection(ids: list[int] | None, action: str) -> None:
+    """Refuse a synchronous Scrapheap request too large to do inside it.
+
+    The whole Scrapheap (*ids* ``None``) and any selection over
+    :data:`SCRAPHEAP_SYNC_MAX_IDS` belong to a background run. Called before a
+    confirm token is spent, so the refusal costs the client nothing.
+
+    Raises:
+        HTTPException: 422 with code ``use_scrapheap_runs``, the runs URL and
+            the cap.
+    """
+    if ids is not None and len(ids) <= SCRAPHEAP_SYNC_MAX_IDS:
+        return
+    if ids is None:
+        message = (
+            f"To {action} the whole Scrapheap, start a background run with "
+            f"POST {SCRAPHEAP_RUNS_URL}. Nothing was changed."
+        )
+    else:
+        message = (
+            f"This request names {len(ids)} pictures; one request can {action} at "
+            f"most {SCRAPHEAP_SYNC_MAX_IDS}. Start a background run with "
+            f"POST {SCRAPHEAP_RUNS_URL} instead. Nothing was changed."
+        )
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": "use_scrapheap_runs",
+            "message": message,
+            "runs_url": SCRAPHEAP_RUNS_URL,
+            "max_ids": SCRAPHEAP_SYNC_MAX_IDS,
+        },
+    )
 
 
 class PictureDeleteResponse(BaseModel):
@@ -549,6 +759,21 @@ class PictureRotateResponse(BaseModel):
     # The operation-log batch this rotate was recorded under, so the client can
     # offer one Undo for the whole gesture. Null when nothing changed.
     batch_id: Optional[str] = None
+
+
+def _picture_patch_echo(pic: Picture) -> dict:
+    """The metadata fields of a loaded picture, read through the column types.
+
+    Called while the row is still loaded: once its session commits, the
+    instance is expired and serialises as ``{}``. The blobs are left out, as
+    ``GET /pictures/{id}/metadata`` leaves them out.
+    """
+    metadata_fields = Picture.metadata_fields()
+    return {
+        field: value
+        for field, value in stored_picture_dict(pic).items()
+        if field in metadata_fields
+    }
 
 
 def scrapheap_pictures(server, request: Request, pic_ids: list[int]):
@@ -923,15 +1148,22 @@ def register_routes(router, server):
             # Read only id+score to avoid loading heavy blob columns on Picture.
             # Loading full ORM rows here can be very expensive for large batches.
             # Whether a picture has an embedding decides if it can be an anchor.
-            score_rows = session.exec(
-                select(
-                    Picture.id,
-                    Picture.score,
-                    Picture.image_embedding.is_not(None),
-                )
-                .where(Picture.id.in_(picture_ids))
-                .where(Picture.deleted.is_(False))
-            ).all()
+            # The ``scores`` object has no cap (a select-all rating reaches
+            # it), so the rows are read in chunks under SQLite's
+            # bound-parameter limit; each row stands alone.
+            score_rows = [
+                row
+                for id_chunk in chunked(picture_ids)
+                for row in session.exec(
+                    select(
+                        Picture.id,
+                        Picture.score,
+                        Picture.image_embedding.is_not(None),
+                    )
+                    .where(Picture.id.in_(id_chunk))
+                    .where(Picture.deleted.is_(False))
+                ).all()
+            ]
 
             found_ids: set[int] = set()
             updated_ids: list[int] = []
@@ -969,13 +1201,16 @@ def register_routes(router, server):
                 # say so before writing: the watch snapshots the anchors first.
                 note_anchor_inputs_changing(session)
 
-            if score_updates:
+            # Each id binds three parameters here (its ``IN`` entry and its
+            # ``WHEN ... THEN`` pair), so the chunk is a third of the id chunk.
+            for id_chunk in chunked(sorted(score_updates), SQLITE_ID_CHUNK // 3):
+                chunk_scores = {pid: score_updates[pid] for pid in id_chunk}
                 session.exec(
                     update(Picture)
-                    .where(Picture.id.in_(score_updates.keys()))
+                    .where(Picture.id.in_(id_chunk))
                     .values(
                         score=case(
-                            score_updates,
+                            chunk_scores,
                             value=Picture.id,
                             else_=Picture.score,
                         ),
@@ -1185,12 +1420,18 @@ def register_routes(router, server):
             )
 
         def fetch_pictures(session: Session, ids: list[int]):
-            return session.exec(
-                select(Picture).where(
-                    Picture.id.in_(ids),
-                    Picture.deleted.is_(False),
-                )
-            ).all()
+            # DETECT_MAX_IDS is above SQLite's historical 999-parameter limit,
+            # so the pictures are read in chunks; the ids are unique and sorted.
+            return [
+                pic
+                for id_chunk in chunked(ids)
+                for pic in session.exec(
+                    select(Picture).where(
+                        Picture.id.in_(id_chunk),
+                        Picture.deleted.is_(False),
+                    )
+                ).all()
+            ]
 
         pics = server.vault.db.run_immediate_read_task(fetch_pictures, picture_ids)
         if not pics:
@@ -1254,7 +1495,7 @@ def register_routes(router, server):
         pic_tags = server.vault.db.run_immediate_read_task(
             fetch_image_only_tags, pic.id
         )
-        pic_dict = safe_model_dict(pic)
+        pic_dict = stored_picture_dict(pic)
         # `metadata_fields()` is every scalar column minus the blobs, so the raw
         # `Picture.project_id` rides along; re-derive it from the narrowed
         # membership before it is serialised (issue #719, §16.6).
@@ -1324,7 +1565,8 @@ def register_routes(router, server):
         description=(
             "Returns the stored object-detection bounding boxes for a picture, "
             "as produced by the Segment action. Boxes are pixel `xyxy` in the "
-            "original picture's coordinate space."
+            "original picture's coordinate space. `bbox` is null when the "
+            "stored box is not four finite numbers."
         ),
         response_model=list[PictureDetectionResponse],
     )
@@ -1345,7 +1587,14 @@ def register_routes(router, server):
                 "frame_index": det.frame_index,
                 "detection_index": det.detection_index,
                 "label": det.label,
-                "bbox": det.bbox,
+                # A stored box that is not four finite numbers is served as
+                # null (logged once) rather than failing the whole list.
+                "bbox": read_stored_bbox(
+                    det.bbox_,
+                    owner="Detection",
+                    row_id=det.id,
+                    picture_id=det.picture_id,
+                ),
                 "score": det.score,
                 "source": det.source,
             }
@@ -1404,7 +1653,13 @@ def register_routes(router, server):
             payload = {"id": int(pic.id), "project_id": pic.project_id}
             narrow_picture_project_ids(server, request, [payload])
             return {"project_id": payload["project_id"]}
-        return {field: safe_model_dict(getattr(pic, field))}
+        # A stored value its column does not declare (a REAL ``inf``, a BLOB
+        # in an INTEGER column) is null, as the listing answers it: JSON
+        # cannot carry ``inf`` and the dict walk has no case for bytes.
+        value = stored_picture_value(
+            getattr(pic, field), picture_id=pic.id, column=field
+        )
+        return {field: safe_model_dict(value)}
 
     @router.patch(
         "/pictures/{id}",
@@ -1419,12 +1674,13 @@ def register_routes(router, server):
 
         content_type = request.headers.get("content-type", "")
 
+        # A JSON content type with no body is a query-parameter PATCH from a
+        # client that sends the header anyway. A body must be a JSON object:
+        # one that is not used to be dropped here and the PATCH answered 200
+        # having changed nothing it was sent.
         json_body = None
-        if "application/json" in content_type:
-            try:
-                json_body = await request.json()
-            except Exception:
-                json_body = None
+        if "application/json" in content_type and await request.body():
+            json_body = await read_json_object(request)
 
         return await run_in_threadpool(
             _finish_patch_picture_in_turn, id, request, params, json_body
@@ -1459,7 +1715,7 @@ def register_routes(router, server):
 
         picture_id = pic.id
         logger.debug(f"Updating picture id={id}")
-        if json_body and isinstance(json_body, dict):
+        if json_body:
             params.update(json_body)
 
         logger.debug(
@@ -1566,10 +1822,11 @@ def register_routes(router, server):
                 session.add(pic_db)
                 session.flush()
                 session.refresh(pic_db)
-                return pic_db
+                # Serialised here: the commit after this callback expires it.
+                return _picture_patch_echo(pic_db)
 
             try:
-                pic, _operation = operation_log_service.run_recorded_metadata_task(
+                echo, _operation = operation_log_service.run_recorded_metadata_task(
                     server.vault,
                     apply_picture_updates,
                     picture_id,
@@ -1595,13 +1852,18 @@ def register_routes(router, server):
                     "change_kind": "updated",
                 },
             )
+        else:
+            echo = _picture_patch_echo(pic)
+        # The raw `Picture.project_id` rides in the metadata fields; re-derive
+        # it from the narrowed membership (issue #719, §16.6).
+        narrow_picture_project_ids(server, request, [echo])
 
         # Write back description to caption sidecar when enabled.
         sync_picture_sidecar(server, picture_id)
 
         return {
             "status": "success",
-            "picture": safe_model_dict(pic),
+            "picture": echo,
             "skipped_excluded": skipped_excluded,
         }
 
@@ -1609,16 +1871,28 @@ def register_routes(router, server):
         "/pictures/scrapheap/restore",
         summary="Restore deleted pictures",
         description=(
-            "Restores deleted pictures from scrapheap, either all deleted "
-            "pictures or a provided picture id subset.\n\n"
+            "Restores the given Scrapheap pictures (`picture_ids`, at most "
+            f"{SCRAPHEAP_SYNC_MAX_IDS}) inside the request. Restoring the whole "
+            "Scrapheap, or more pictures than that, is a background run: "
+            "`POST /pictures/scrapheap/runs` with `kind: restore`. Either is a "
+            "422 with code `use_scrapheap_runs`, `runs_url` and `max_ids`.\n\n"
             "Recorded in the operation log as a single "
             "`pictures.scrapheap.restore` operation with a `batch_id`, and it is "
             "the symmetric partner of `pictures.scrapheap.move`: undoing a "
-            "restore puts the pictures back in the Scrapheap with the retention "
-            "stamp they had, so the history stack stays coherent in both "
-            "directions."
+            "restore puts the pictures back in the Scrapheap, so the history "
+            "stack stays coherent in both directions. They come back stamped "
+            "with the time of the undo, as any other binning is, so a "
+            "delete-forever confirmed before the undo does not cover them."
         ),
         response_model=ScrapheapRestoreResponse,
+        responses={
+            422: {
+                "description": (
+                    "`use_scrapheap_runs`: the whole Scrapheap, or more than "
+                    f"{SCRAPHEAP_SYNC_MAX_IDS} pictures; start a run instead."
+                )
+            },
+        },
     )
     def restore_scrapheap(request: Request, payload: dict | None = Body(None)):
         picture_ids = None
@@ -1631,6 +1905,7 @@ def register_routes(router, server):
                         detail="picture_ids must be a non-empty list",
                     )
                 picture_ids = ids
+        _require_sync_selection(picture_ids, "restore")
 
         restored_count = len(
             scrapheap_service.restore_pictures(
@@ -1654,11 +1929,12 @@ def register_routes(router, server):
             "destruction:\n\n"
             "- `locked_count` - frozen by a locked picture set; destroyed by "
             "NEITHER option. A lock overrides `include_protected`, so a row that "
-            "is locked AND protected counts here, not under `protected_count`.\n"
+            "is locked AND protected counts here, not under `protected_count`. "
+            "`locked` lists their ids, ascending, at most 200 of them.\n"
             "- `protected_count` - protected reference-folder originals "
             "(`allow_delete_file=false`) that are not locked; destroyed only by "
-            "`include_protected=true`. `protected` lists each one's absolute "
-            "on-disk path.\n"
+            "`include_protected=true`. `protected` lists their absolute "
+            "on-disk paths, sorted, at most 200 of them.\n"
             "- `unprotected_count` - neither; destroyed by both options.\n\n"
             'So "Delete unprotected only" destroys exactly `unprotected_count` '
             'and "Delete all" destroys exactly '
@@ -1669,6 +1945,10 @@ def register_routes(router, server):
     def preview_scrapheap_delete(request: Request, payload: dict | None = Body(None)):
         lease = request.state.library_lease
         ids = _parse_scrapheap_ids(payload)
+        # Taken BEFORE the read, so any picture binned after it is outside the
+        # confirmation even if this read happened to see it: the error falls
+        # on the side of destroying less.
+        as_of = datetime.now(timezone.utc)
         rows = scrapheap_service.fetch_scrapheap_rows(server.vault, ids)
         if not rows:
             return {
@@ -1681,6 +1961,7 @@ def register_routes(router, server):
                 "confirm_token": scrapheap_confirmations.issue(
                     ids,
                     0,
+                    deleted_before=as_of,
                     library_uuid=lease.library_uuid,
                     generation=lease.generation,
                 ),
@@ -1693,23 +1974,18 @@ def register_routes(router, server):
         locked_ids = scrapheap_service.locked_scrapheap_picture_ids(
             server.vault, [row.id for row in rows if row.id is not None]
         )
+        # The at-risk originals come back as absolute on-disk paths, so the
+        # confirm dialog can name each file "Delete all" would os.remove.
         preview = scrapheap_service.classify_delete_preview(
-            rows, no_delete_folder_ids, locked_ids
+            rows, no_delete_folder_ids, locked_ids, server.vault.image_root
         )
-        # Resolve the at-risk originals to absolute on-disk paths so the confirm
-        # dialog can name each file "Delete all" would os.remove.
-        image_root = server.vault.image_root
-        for item in preview["protected"]:
-            item["file_path"] = (
-                ImageUtils.resolve_picture_path(image_root, item["file_path"])
-                or item["file_path"]
-            )
         # The confirmation the destructive call must echo back. Minted here, and
         # only here, so a delete can never run without these counts having been
         # computed for exactly this selection first.
         preview["confirm_token"] = scrapheap_confirmations.issue(
             ids,
             preview["total_count"],
+            deleted_before=as_of,
             library_uuid=lease.library_uuid,
             generation=lease.generation,
         )
@@ -1717,7 +1993,7 @@ def register_routes(router, server):
 
     def _redeem_delete_confirmation(
         request: Request, token: Optional[str], ids: Optional[list[int]]
-    ) -> None:
+    ) -> scrapheap_service.DeleteConfirmation:
         """Spend a delete-forever confirmation, or refuse the request.
 
         A server-side intent check, NOT an authorization check (the AuthzGate
@@ -1727,18 +2003,22 @@ def register_routes(router, server):
         ``DELETE /pictures/scrapheap`` and a purge run, so neither can destroy
         anything the preview was not fetched for.
 
+        Returns:
+            The spent confirmation, which a caller refused before it started
+            anything hands back to ``scrapheap_confirmations.refund``.
+
         Raises:
             HTTPException: 400 when the token is missing; 409 when it is
                 unknown, spent, expired or minted for another selection.
         """
-        confirmed, reason = scrapheap_confirmations.redeem(
+        spent, reason = scrapheap_confirmations.spend(
             token,
             ids,
             library_uuid=request.state.library_lease.library_uuid,
             generation=request.state.library_lease.generation,
         )
-        if confirmed:
-            return
+        if spent is not None:
+            return spent
         if reason == scrapheap_service.CONFIRM_MISSING:
             raise HTTPException(
                 status_code=400,
@@ -1762,7 +2042,11 @@ def register_routes(router, server):
         summary="Permanently delete scrapheap pictures",
         description=(
             "Permanently removes deleted pictures from database and disk for the "
-            "provided ids (or all scrapheap items when omitted). Body may carry "
+            f"provided ids (`ids` or `picture_ids`, at most {SCRAPHEAP_SYNC_MAX_IDS}). "
+            "Emptying the whole Scrapheap, or more pictures than that, is a "
+            "background run: `POST /pictures/scrapheap/runs` with `kind: purge`. "
+            "Either is a 422 with code `use_scrapheap_runs`, `runs_url` and "
+            "`max_ids`, checked before the token is spent. Body may carry "
             "include_protected (default false): when false, protected "
             "reference-folder originals in the selection are SKIPPED ENTIRELY "
             "(row kept, file untouched, still in the scrapheap) and only "
@@ -1782,7 +2066,11 @@ def register_routes(router, server):
             "irreversible endpoint cannot be driven without the destruction "
             "preview having been fetched for exactly these pictures. A missing "
             "token is a 400; an unknown, spent, expired or wrong-selection "
-            "token is a 409 and destroys nothing."
+            "token is a 409 and destroys nothing. The token confirms the "
+            "selection, not `include_protected`, which this body chooses.\n\n"
+            "A picture binned after the preview (by another tab, an import, "
+            "a sweep) is not destroyed: the delete covers what the preview "
+            "could have shown, and leaves later arrivals in the Scrapheap."
         ),
         response_model=ScrapheapDeleteResponse,
         responses={
@@ -1791,6 +2079,13 @@ def register_routes(router, server):
                 "description": (
                     "confirm_token is unknown, already spent, expired, or was "
                     "minted for a different selection. Nothing was destroyed."
+                )
+            },
+            422: {
+                "description": (
+                    "`use_scrapheap_runs`: the whole Scrapheap, or more than "
+                    f"{SCRAPHEAP_SYNC_MAX_IDS} pictures; start a run instead. The "
+                    "token is not spent."
                 )
             },
         },
@@ -1802,13 +2097,15 @@ def register_routes(router, server):
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         ids = _parse_scrapheap_ids(payload)
-        _redeem_delete_confirmation(
+        # Before the token is spent, so a refused request can be sent as a run.
+        _require_sync_selection(ids, "delete")
+        confirmation = _redeem_delete_confirmation(
             request,
             payload.get("confirm_token") if isinstance(payload, dict) else None,
             ids,
         )
-        # Default false: absent body (delete-all) never destroys protected
-        # originals - that requires an explicit include_protected=true.
+        # Default false: protected originals are destroyed only on an
+        # explicit include_protected=true.
         include_protected = bool(
             payload.get("include_protected", False)
             if isinstance(payload, dict)
@@ -1822,6 +2119,9 @@ def register_routes(router, server):
             # Files are removed after the response is sent so a large purge never
             # blocks the request; the DB rows + ledger are already committed.
             schedule_file_removal=background_tasks.add_task,
+            # Only what the preview could have shown: a picture binned since
+            # stays in the Scrapheap.
+            deleted_before=confirmation.deleted_before,
         )
         picture_ids = outcome.purged_ids
         if picture_ids:
@@ -1873,6 +2173,31 @@ def register_routes(router, server):
         if run["active"]:
             response.headers["Retry-After"] = str(SCRAPHEAP_RUN_POLL_AFTER_S)
 
+    def _answer_run(
+        request: Request, response: Response, run: dict[str, Any], created: bool
+    ) -> dict[str, Any]:
+        """Set the async request-reply headers on a run a POST started.
+
+        202 for a new run that is still active; 200 for a replayed
+        ``request_id`` (the run it already started, in whatever state it has
+        reached) and for a run that ``Prefer: wait`` saw end (RFC 7240 §4.3,
+        with ``Preference-Applied``). Either answer depends on ``Prefer``, hence
+        ``Vary``. ``Location`` names the status resource either way.
+        """
+        wait_s = _preferred_wait(request.headers.getlist("prefer"))
+        if wait_s is not None and run["active"]:
+            run = scrapheap_run_service.wait_for_run(server.vault, run["id"], wait_s)
+        waited = wait_s is not None and not run["active"]
+        if waited:
+            response.headers["Preference-Applied"] = f"wait={wait_s}"
+        response.status_code = 200 if waited or not created else 202
+        response.headers.add_vary_header("Prefer")
+        response.headers["Location"] = request.url_for(
+            "get_scrapheap_run", run_id=run["id"]
+        ).path
+        _set_poll_hint(response, run)
+        return run
+
     @router.post(
         "/pictures/scrapheap/runs",
         summary="Empty, delete or restore Scrapheap pictures in the background",
@@ -1890,17 +2215,42 @@ def register_routes(router, server):
             "**requires the `confirm_token`** "
             "`POST /pictures/scrapheap/delete-preview` minted for the same "
             "selection: missing is 400, spent, expired or for another "
-            "selection is 409, and nothing starts. `kind: restore` brings the "
+            "selection is 409, and nothing starts. A purge refused because a "
+            "run is active (409) or the server cannot run it (503) leaves its "
+            "token unspent, so the same confirmation can be sent again once "
+            "the other run ends. `kind: restore` brings the "
             "selection back, recorded in History in segments of at most "
             f"{SEGMENT_PICTURE_CAP} pictures, each one Ctrl+Z.\n\n"
             "Omitting `picture_ids` means the whole Scrapheap as it is when "
-            "the run starts. One run at a time: while one is active this is "
-            "409 `scrapheap_run_active`, naming it. A server that runs no "
-            "background tasks answers 503 `scrapheap_runs_unavailable`."
+            "the run starts; a purge keeps only the pictures binned by the "
+            "time of its preview, and once it ends `arrived_since` counts "
+            "the later ones it left in the Scrapheap. One run at a time: "
+            "while one is active this is 409 `scrapheap_run_active`, naming "
+            "it. A server that runs no background work, or is stopping, "
+            "answers 503 `scrapheap_runs_unavailable` and starts nothing.\n\n"
+            "`request_id` makes the start idempotent: the same id again "
+            "answers 200 with the run it already started, before any token "
+            "check, so a retry after a lost answer neither starts a second "
+            "run nor needs a fresh confirmation; the same id with other "
+            "parameters (kind, selection, `include_protected`) is 422 "
+            "`request_id_reused`. Runs and their ids are kept on disk for the "
+            "last 20 ended runs.\n\n"
+            "`Prefer: wait=N` (RFC 7240) waits up to N seconds, at most "
+            f"{SCRAPHEAP_RUN_MAX_WAIT_S}, for the run to end: if it does, the "
+            "answer is 200 with the ended run and `Preference-Applied`, "
+            "otherwise the usual 202. Every answer carries `Vary: Prefer`."
         ),
         status_code=202,
         response_model=ScrapheapRunView,
         responses={
+            200: {
+                "model": ScrapheapRunView,
+                "description": (
+                    "`Prefer: wait` was applied and the run ended in time, or "
+                    "`request_id` replayed a run already started (which may "
+                    "still be active: read `active`)."
+                ),
+            },
             400: {"description": "A purge without its confirm_token."},
             409: {
                 "description": (
@@ -1909,15 +2259,47 @@ def register_routes(router, server):
                     "expired or for a different selection."
                 )
             },
-            503: {"description": "This server runs no background tasks."},
+            422: {
+                "description": (
+                    "Validation, or `request_id_reused`: the id started a run "
+                    "with other parameters (the body names that run)."
+                )
+            },
+            503: {
+                "description": (
+                    "This server runs no background work, or is stopping "
+                    "(`scrapheap_runs_unavailable`); nothing was started."
+                )
+            },
         },
     )
     def post_scrapheap_run(
         request: Request, response: Response, payload: ScrapheapRunRequest
     ):
+        # A replay comes first: the run it names may be the active one (which
+        # check_can_start would refuse) and its token is already spent.
+        try:
+            replay = scrapheap_run_service.find_replay(
+                server.vault,
+                payload.request_id,
+                payload.kind,
+                payload.picture_ids,
+                payload.include_protected,
+            )
+        except ScrapheapRunError as exc:
+            raise _run_refused(exc) from exc
+        if replay is not None:
+            return _answer_run(request, response, replay, False)
         include_protected = False
+        spent = None
         if payload.kind == scrapheap_run_service.KIND_PURGE:
-            _redeem_delete_confirmation(
+            # Refuse what cannot start BEFORE spending the single-use token,
+            # so a 409 (another run) or 503 (no runner) costs the user nothing.
+            try:
+                scrapheap_run_service.check_can_start(server.vault)
+            except ScrapheapRunError as exc:
+                raise _run_refused(exc) from exc
+            spent = _redeem_delete_confirmation(
                 request, payload.confirm_token, payload.picture_ids
             )
             include_protected = payload.include_protected
@@ -1927,20 +2309,33 @@ def register_routes(router, server):
         context = operation_log_service.request_context(request)
         context.pop("batch_id", None)
         try:
-            run = scrapheap_run_service.start_run(
+            run, created = scrapheap_run_service.start_run(
                 server.vault,
                 payload.kind,
                 picture_ids=payload.picture_ids,
                 include_protected=include_protected,
+                deleted_before=spent.deleted_before if spent is not None else None,
+                request_id=payload.request_id,
                 **context,
             )
         except ScrapheapRunError as exc:
+            # Another request won the race since the pre-check, or the runner
+            # began stopping: nothing started, so the token goes back.
+            if spent is not None:
+                scrapheap_confirmations.refund(payload.confirm_token, spent)
             raise _run_refused(exc) from exc
-        response.headers["Location"] = request.url_for(
-            "get_scrapheap_run", run_id=run["id"]
-        ).path
-        _set_poll_hint(response, run)
-        return run
+        except TaskAdmissionRefused:
+            # A library restore paused task admission after the pre-check.
+            # start_run has already removed its run row; the token is all
+            # that is left, so it goes back and the 409 costs nothing.
+            if spent is not None:
+                scrapheap_confirmations.refund(payload.confirm_token, spent)
+            raise
+        if not created and spent is not None:
+            # The same request_id started its run between the replay check and
+            # here: this request started nothing, so its token goes back.
+            scrapheap_confirmations.refund(payload.confirm_token, spent)
+        return _answer_run(request, response, run, created)
 
     # Declared before ``/runs/{run_id}`` so ``latest`` is never read as an id.
     @router.get(
@@ -1962,9 +2357,10 @@ def register_routes(router, server):
         summary="A Scrapheap run's status and progress",
         description=(
             "The run's status and counters. While it is active the response "
-            "carries `Retry-After`, the interval to poll at. Runs live in "
-            "memory, so after a restart an old id is 404. A read: it never "
-            "takes the writer."
+            "carries `Retry-After`, the interval to poll at. The active run and "
+            "the last 20 ended ones are kept on disk, so an id reads back "
+            "after a restart; an older one is 404. A read: it never takes the "
+            "writer."
         ),
         response_model=ScrapheapRunView,
     )
@@ -1995,6 +2391,77 @@ def register_routes(router, server):
             raise _run_refused(exc) from exc
         _set_poll_hint(response, run)
         return run
+
+    @router.post(
+        "/pictures/scrapheap/runs/{run_id}/undo",
+        summary="Undo a Scrapheap restore run",
+        description=(
+            "Starts a run of `kind: undo` that puts what a restore run brought "
+            "back into the Scrapheap again. It undoes the restore's History "
+            "segments newest first, one writer slice each, exactly as Ctrl+Z "
+            "on each segment would; a segment already undone is skipped. "
+            "Returns 202 with the undo run, `Location` and `Retry-After`, "
+            "like `POST .../runs`, and honours `Prefer: wait` and "
+            "`request_id` the same way.\n\n"
+            "Only a restore can be undone: a purge or an undo is 409 "
+            "`not_a_restore_run`, and a restore with nothing left to undo is "
+            "409 `nothing_to_undo`, both naming the target. While any run is "
+            "active (the target included) this is 409 `scrapheap_run_active`. "
+            "If a later edit sits above the next segment in History the run "
+            "ends `blocked` with `history_moved_on`; what it undid stays "
+            "undone, and undoing the restore again after that edit is undone "
+            "finishes it."
+        ),
+        status_code=202,
+        response_model=ScrapheapRunView,
+        responses={
+            200: {
+                "model": ScrapheapRunView,
+                "description": (
+                    "`Prefer: wait` was applied and the run ended in time, or "
+                    "`request_id` replayed a run already started."
+                ),
+            },
+            404: {"description": "No such run (`scrapheap_run_not_found`)."},
+            409: {
+                "description": (
+                    "`not_a_restore_run`, `nothing_to_undo` (both with the "
+                    "target), or `scrapheap_run_active` (with the active run)."
+                )
+            },
+            422: {
+                "description": (
+                    "Validation, or `request_id_reused` (with the original run)."
+                )
+            },
+            503: {
+                "description": (
+                    "This server runs no background work, or is stopping "
+                    "(`scrapheap_runs_unavailable`); nothing was started."
+                )
+            },
+        },
+    )
+    def post_undo_scrapheap_run(
+        run_id: str,
+        request: Request,
+        response: Response,
+        payload: Optional[ScrapheapRunUndoRequest] = None,
+    ):
+        # The undo run mints its own History work per segment; the ambient
+        # gesture batch is not used.
+        context = operation_log_service.request_context(request)
+        context.pop("batch_id", None)
+        try:
+            run, created = scrapheap_run_service.start_undo_run(
+                server.vault,
+                run_id,
+                request_id=payload.request_id if payload is not None else None,
+                **context,
+            )
+        except ScrapheapRunError as exc:
+            raise _run_refused(exc) from exc
+        return _answer_run(request, response, run, created)
 
     @router.delete(
         "/pictures/{id}",
@@ -2039,11 +2506,11 @@ def register_routes(router, server):
             return True
 
         # The soft-delete is a recorded, reversible operation: the `deleted`
-        # facet carries the flag and the retention stamp, so undo puts the
-        # picture back with the purge deadline it had. The snapshot expands to
-        # the whole stack INCLUDING its scrapheaped members, because
-        # normalize_stack_positions renumbers every member and an unsnapshotted
-        # renumber is a change undo could not reverse.
+        # facet carries the flag, so undo puts the picture back. (A redo bins
+        # it again stamped now, not with this stamp: see _apply_deleted.) The
+        # snapshot expands to the whole stack INCLUDING its scrapheaped members,
+        # because normalize_stack_positions renumbers every member and an
+        # unsnapshotted renumber is a change undo could not reverse.
         success, _operation = operation_log_service.run_recorded_metadata_task(
             server.vault,
             delete_pic,

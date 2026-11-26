@@ -39,6 +39,7 @@ vi.mock("./utils/apiClient", async () => {
     newOperationBatchId: () => "cli-test",
     operationBatchHeaders: () => undefined,
     setRequestClientId: vi.fn(),
+    setSettingsOpener: vi.fn(),
     notifySessionReset: vi.fn(),
     activateShareToken: vi.fn(),
     checkLoginStatus: vi.fn(),

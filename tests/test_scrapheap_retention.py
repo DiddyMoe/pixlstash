@@ -11,6 +11,7 @@ purge that ever runs is the one a test drives explicitly.
 """
 
 import contextlib
+import dataclasses
 import json
 import os
 import shutil
@@ -60,6 +61,10 @@ _MIGRATIONS_DIR = os.path.join(_PROJECT_ROOT, "pixlstash")
 # at the shortest window - that is what makes the "what the sweep destroys"
 # tests meaningful. The off-by-default behaviour has its own section below.
 _ENABLED_RETENTION_DAYS = 30
+
+# A confirmation's consent bound for the unit tests of the token store, which
+# never compare it against a picture.
+PREVIEWED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 _RESET_TABLES = [
     DeletedFileLog,
@@ -1037,11 +1042,27 @@ def _confirm_token(client, ids=None):
     return token
 
 
-def _delete_forever(client, include_protected, ids=None, confirm_token=None):
-    """The real preview -> confirm flow: DELETE refuses without a confirmation."""
-    body = {"include_protected": include_protected}
-    if ids is not None:
-        body["picture_ids"] = ids
+def _heap_ids(server):
+    """Every picture in the Scrapheap now, as the ids a request must name."""
+
+    def _fetch(session: Session):
+        return sorted(
+            session.exec(select(Picture.id).where(Picture.deleted.is_(True))).all()
+        )
+
+    return server.vault.db.run_task(_fetch)
+
+
+def _delete_forever(server, client, include_protected, ids=None, confirm_token=None):
+    """The real preview -> confirm flow: DELETE refuses without a confirmation.
+
+    *ids* ``None`` names every picture in the Scrapheap now: the synchronous
+    DELETE refuses the whole heap (that is a purge run), so the selection is
+    always explicit.
+    """
+    if ids is None:
+        ids = _heap_ids(server)
+    body = {"include_protected": include_protected, "picture_ids": ids}
     body["confirm_token"] = (
         confirm_token if confirm_token is not None else _confirm_token(client, ids)
     )
@@ -1074,7 +1095,7 @@ def test_delete_forever_never_destroys_a_locked_member(
         assert delete_resp.status_code == 200, delete_resp.text
     _lock_picture_in_set(server, locked_id)
 
-    body = _delete_forever(client, include_protected)
+    body = _delete_forever(server, client, include_protected)
     assert body["skipped_locked"] == [locked_id], body
     assert body["deleted_count"] == 1, body
 
@@ -1106,7 +1127,7 @@ def test_delete_forever_of_a_locked_protected_picture_keeps_it(
     assert delete_resp.status_code == 200, delete_resp.text
     _lock_picture_in_set(server, pic_id)
 
-    body = _delete_forever(client, include_protected)
+    body = _delete_forever(server, client, include_protected)
     assert body["skipped_locked"] == [pic_id], body
     assert body["deleted_count"] == 0, body
     assert body["skipped_count"] == 0, (
@@ -1127,7 +1148,7 @@ def test_delete_forever_destroys_the_member_once_the_set_is_unlocked(server, tmp
     assert delete_resp.status_code == 200, delete_resp.text
     set_id = _lock_picture_in_set(server, pic_id)
 
-    body = _delete_forever(client, False)
+    body = _delete_forever(server, client, False)
     assert body["skipped_locked"] == [pic_id]
     assert _get_picture(server, pic_id) is not None
 
@@ -1139,7 +1160,7 @@ def test_delete_forever_destroys_the_member_once_the_set_is_unlocked(server, tmp
 
     server.vault.db.run_task(_unlock)
 
-    body = _delete_forever(client, False)
+    body = _delete_forever(server, client, False)
     assert body["skipped_locked"] == [], body
     assert body["deleted_count"] == 1, body
     assert _get_picture(server, pic_id) is None
@@ -1175,7 +1196,7 @@ def test_delete_forever_skips_a_locked_stack_sibling(server, tmp_path):
         assert delete_resp.status_code == 200, delete_resp.text
     _lock_picture_in_set(server, member_id)
 
-    body = _delete_forever(client, True)
+    body = _delete_forever(server, client, True)
     assert sorted(body["skipped_locked"]) == sorted([member_id, sibling_id]), body
     assert body["deleted_count"] == 0
     assert os.path.isfile(sibling_path)
@@ -1195,7 +1216,7 @@ def test_delete_forever_still_destroys_everything_it_should(server, tmp_path):
         delete_resp = client.delete(f"/pictures/{pid}")
         assert delete_resp.status_code == 200, delete_resp.text
 
-    body = _delete_forever(client, False)
+    body = _delete_forever(server, client, False)
     assert body == {
         **body,
         "deleted_count": 1,
@@ -1207,7 +1228,7 @@ def test_delete_forever_still_destroys_everything_it_should(server, tmp_path):
     assert _get_picture(server, prot_id) is not None
     assert os.path.isfile(prot_path)
 
-    body = _delete_forever(client, True)
+    body = _delete_forever(server, client, True)
     assert body["deleted_count"] == 1, body
     assert body["skipped_locked"] == []
     assert _get_picture(server, prot_id) is None
@@ -1238,26 +1259,34 @@ def test_delete_forever_refuses_without_a_confirmation(server, tmp_path):
     CORS admits any localhost/LAN-IP port with credentials, so a page on another
     local port could drive it. Every unconfirmed shape must now be refused with
     nothing destroyed.
+
+    The whole heap is no longer a synchronous request at all (it is a purge
+    run), so the bodyless shape is refused before any token is looked at; the
+    token checks are driven with a named selection.
     """
     client = _client(server)
     made = _scrapheap_two(server, tmp_path, client)
+    ids = [pic_id for pic_id, _path in made]
 
     # No body at all - the exact shape that emptied the whole scrapheap.
     resp = client.request("DELETE", "/api/v1/pictures/scrapheap")
-    assert resp.status_code == 400, resp.text
-    assert "confirm_token" in resp.json()["detail"]
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["code"] == "use_scrapheap_runs"
 
-    # A body, but no confirmation.
+    # A named selection, but no confirmation.
     resp = client.request(
-        "DELETE", "/api/v1/pictures/scrapheap", json={"include_protected": True}
+        "DELETE",
+        "/api/v1/pictures/scrapheap",
+        json={"picture_ids": ids, "include_protected": True},
     )
     assert resp.status_code == 400, resp.text
+    assert "confirm_token" in resp.json()["detail"]
 
     # A made-up confirmation.
     resp = client.request(
         "DELETE",
         "/api/v1/pictures/scrapheap",
-        json={"confirm_token": "not-a-real-token"},
+        json={"picture_ids": ids, "confirm_token": "not-a-real-token"},
     )
     assert resp.status_code == 409, resp.text
 
@@ -1269,12 +1298,13 @@ def test_delete_forever_refuses_without_a_confirmation(server, tmp_path):
         assert _ledger_flags_for(server, path) == []
 
 
-def test_preview_then_confirm_still_empties_the_scrapheap(server, tmp_path):
+def test_preview_then_confirm_still_purges_the_selection(server, tmp_path):
     """Over-blocking regression guard: the legitimate flow must still work."""
     client = _client(server)
     made = _scrapheap_two(server, tmp_path, client)
+    ids = [pic_id for pic_id, _path in made]
 
-    preview = client.post("/pictures/scrapheap/delete-preview", json={"ids": None})
+    preview = client.post("/pictures/scrapheap/delete-preview", json={"ids": ids})
     assert preview.status_code == 200, preview.text
     token = preview.json()["confirm_token"]
     assert token
@@ -1282,7 +1312,7 @@ def test_preview_then_confirm_still_empties_the_scrapheap(server, tmp_path):
     resp = client.request(
         "DELETE",
         "/api/v1/pictures/scrapheap",
-        json={"include_protected": False, "confirm_token": token},
+        json={"picture_ids": ids, "include_protected": False, "confirm_token": token},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["deleted_count"] == 2, resp.text
@@ -1318,7 +1348,7 @@ def test_a_confirmation_cannot_be_spent_twice(server, tmp_path):
 
 
 def test_a_confirmation_is_bound_to_the_selection_it_previewed(server, tmp_path):
-    """A confirmation for one picture must not be spendable on the whole heap."""
+    """A confirmation for one picture must not be spendable on a wider selection."""
     client = _client(server)
     (first_id, first_path), (second_id, second_path) = _scrapheap_two(
         server, tmp_path, client
@@ -1326,7 +1356,9 @@ def test_a_confirmation_is_bound_to_the_selection_it_previewed(server, tmp_path)
 
     token = _confirm_token(client, [first_id])
     resp = client.request(
-        "DELETE", "/api/v1/pictures/scrapheap", json={"confirm_token": token}
+        "DELETE",
+        "/api/v1/pictures/scrapheap",
+        json={"picture_ids": [first_id, second_id], "confirm_token": token},
     )
     assert resp.status_code == 409, resp.text
     for pic_id, path in ((first_id, first_path), (second_id, second_path)):
@@ -1338,7 +1370,8 @@ def test_a_confirmation_expires(server, tmp_path, monkeypatch):
     """A stale confirmation left in a closed tab is not a standing capability."""
     client = _client(server)
     made = _scrapheap_two(server, tmp_path, client)
-    token = _confirm_token(client, None)
+    ids = [pic_id for pic_id, _path in made]
+    token = _confirm_token(client, ids)
 
     real_monotonic = scrapheap_service.time.monotonic
     monkeypatch.setattr(
@@ -1347,7 +1380,9 @@ def test_a_confirmation_expires(server, tmp_path, monkeypatch):
         lambda: real_monotonic() + scrapheap_service.CONFIRM_TOKEN_TTL_SECONDS + 1,
     )
     resp = client.request(
-        "DELETE", "/api/v1/pictures/scrapheap", json={"confirm_token": token}
+        "DELETE",
+        "/api/v1/pictures/scrapheap",
+        json={"picture_ids": ids, "confirm_token": token},
     )
     assert resp.status_code == 409, resp.text
     for pic_id, path in made:
@@ -1355,16 +1390,93 @@ def test_a_confirmation_expires(server, tmp_path, monkeypatch):
         assert os.path.isfile(path)
 
 
+def test_a_confirmation_needs_an_aware_preview_time():
+    """A naive time would compare wrongly against the UTC ``deleted_at``."""
+    confirmations = scrapheap_service.ScrapheapDeleteConfirmations()
+    with pytest.raises(ValueError, match="timezone-aware"):
+        confirmations.issue([1], 1, deleted_before=datetime(2026, 1, 1))
+
+
 def test_a_confirmation_is_bound_to_library_generation():
     """The same numeric picture id in another vault is never authorised."""
     confirmations = scrapheap_service.ScrapheapDeleteConfirmations()
-    token = confirmations.issue([1], 1, library_uuid="library-a", generation=7)
+    token = confirmations.issue(
+        [1], 1, deleted_before=PREVIEWED_AT, library_uuid="library-a", generation=7
+    )
 
     accepted, _reason = confirmations.redeem(
         token, [1], library_uuid="library-b", generation=8
     )
 
     assert accepted is False
+
+
+def test_a_refunded_confirmation_keeps_its_binding_and_its_deadline(monkeypatch):
+    """A refund gives back the same token, bound as before, with its old deadline."""
+    ttl = scrapheap_service.CONFIRM_TOKEN_TTL_SECONDS
+    clock = [1000.0]
+    monkeypatch.setattr(scrapheap_service.time, "monotonic", lambda: clock[0])
+    confirmations = scrapheap_service.ScrapheapDeleteConfirmations()
+    token = confirmations.issue(
+        [1, 2], 2, deleted_before=PREVIEWED_AT, library_uuid="library-a", generation=7
+    )
+    record, reason = confirmations.spend(
+        token, [1, 2], library_uuid="library-a", generation=7
+    )
+    assert record is not None, reason
+    assert confirmations.redeem(
+        token, [1, 2], library_uuid="library-a", generation=7
+    ) == (False, scrapheap_service.CONFIRM_UNKNOWN)
+
+    # Refunded late in its life: it must still die at the ORIGINAL deadline.
+    clock[0] += ttl * 2 / 3
+    assert confirmations.refund(token, record) is True
+    # Still bound to its library and generation: the refund changed nothing.
+    other = scrapheap_service.ScrapheapDeleteConfirmations()
+    assert other.refund(token, record) is True
+    assert other.redeem(token, [1, 2], library_uuid="library-b", generation=7) == (
+        False,
+        scrapheap_service.CONFIRM_MISMATCH,
+    )
+    clock[0] = 1000.0 + ttl + 1
+    assert confirmations.redeem(
+        token, [1, 2], library_uuid="library-a", generation=7
+    ) == (False, scrapheap_service.CONFIRM_UNKNOWN)
+
+
+def test_a_refunded_confirmation_spends_normally():
+    confirmations = scrapheap_service.ScrapheapDeleteConfirmations()
+    token = confirmations.issue(
+        [1], 1, deleted_before=PREVIEWED_AT, library_uuid="library-a", generation=7
+    )
+    record, _reason = confirmations.spend(
+        token, [1], library_uuid="library-a", generation=7
+    )
+    assert confirmations.refund(token, record) is True
+    assert confirmations.redeem(token, [1], library_uuid="library-a", generation=7) == (
+        True,
+        "",
+    )
+    assert confirmations.redeem(token, [1], library_uuid="library-a", generation=7) == (
+        False,
+        scrapheap_service.CONFIRM_UNKNOWN,
+    )
+
+
+def test_a_confirmation_that_expired_is_not_refunded():
+    """A refund never revives a token whose deadline passed meanwhile."""
+    confirmations = scrapheap_service.ScrapheapDeleteConfirmations()
+    token = confirmations.issue([1], 1, deleted_before=PREVIEWED_AT)
+    record, _reason = confirmations.spend(token, [1])
+    expired = dataclasses.replace(
+        record, expires_at=scrapheap_service.time.monotonic() - 1
+    )
+
+    assert confirmations.refund(token, expired) is False
+    assert confirmations.redeem(token, [1]) == (
+        False,
+        scrapheap_service.CONFIRM_UNKNOWN,
+    )
 
 
 def test_the_auto_purge_needs_no_confirmation(server, tmp_path):
@@ -1436,7 +1548,7 @@ def test_delete_forever_does_not_destroy_a_picture_restored_mid_purge(
 
     _restore_between_planning_and_purge(monkeypatch, restored_id)
 
-    body = _delete_forever(client, False)
+    body = _delete_forever(server, client, False)
 
     # Negative: the restored picture is live again and must be untouched.
     rescued = _get_picture(server, restored_id)
@@ -1578,7 +1690,7 @@ def test_a_row_the_delete_spares_keeps_its_file_and_gets_no_ledger_row(
         _restore_after_the_recheck,
     )
 
-    body = _delete_forever(client, False)
+    body = _delete_forever(server, client, False)
 
     # Negative: the spared row keeps its file, and the ledger must not claim a
     # permanent deletion that never happened.
@@ -1601,7 +1713,7 @@ def test_a_row_the_delete_spares_keeps_its_file_and_gets_no_ledger_row(
     monkeypatch.setattr(
         scrapheap_service, "still_scrapheaped_ids_in_session", original_recheck
     )
-    body = _delete_forever(client, False)
+    body = _delete_forever(server, client, False)
     assert body["deleted_count"] == 1, body
     assert _get_picture(server, doomed_id) is None
     assert not os.path.isfile(doomed_path)
@@ -1642,7 +1754,7 @@ def test_a_removal_target_with_no_picture_id_is_refused_not_unlinked(
 
     monkeypatch.setattr(scrapheap_service, "build_purge_plan", _anonymise_the_targets)
 
-    body = _delete_forever(client, False)
+    body = _delete_forever(server, client, False)
 
     # The row is still purged - this guards the FILE, not the row.
     assert body["deleted_count"] == 1, body
@@ -1659,7 +1771,7 @@ def test_a_removal_target_with_no_picture_id_is_refused_not_unlinked(
     )
     delete_resp = client.delete(f"/pictures/{other_id}")
     assert delete_resp.status_code == 200, delete_resp.text
-    assert _delete_forever(client, False)["deleted_count"] == 1
+    assert _delete_forever(server, client, False)["deleted_count"] == 1
     assert _get_picture(server, other_id) is None
     assert not os.path.isfile(other_path)
 
@@ -1737,9 +1849,9 @@ def test_delete_preview_counts_match_what_each_action_destroys(server, tmp_path)
     protected_count = body["protected_count"]
 
     # "Delete unprotected only" destroys exactly unprotected_count.
-    assert _delete_forever(client, False)["deleted_count"] == unprotected_count
+    assert _delete_forever(server, client, False)["deleted_count"] == unprotected_count
     # "Delete all" then destroys exactly the protected remainder.
-    assert _delete_forever(client, True)["deleted_count"] == protected_count
+    assert _delete_forever(server, client, True)["deleted_count"] == protected_count
     # ...and the locked one survived both, as the preview implied.
     assert _get_picture(server, locked_id) is not None
 
@@ -1752,6 +1864,107 @@ def test_delete_preview_empty_scrapheap(server):
     assert body["unprotected_count"] == 0
     assert body["locked"] == []
     assert body["protected"] == []
+
+
+def test_delete_preview_lists_at_most_the_cap_in_a_stable_order(tmp_path):
+    """Exact counts, and the first 200 of each list in the order the dialog uses.
+
+    The rows arrive in reverse, so a list cut before sorting would name other
+    files. ``protected`` sorts on the absolute path the dialog shows, then id:
+    a relative path is resolved against the image root before it is compared,
+    and two rows on one path keep id order.
+    """
+    cap = scrapheap_service.DELETE_PREVIEW_LIST_CAP
+    assert cap == 200  # the documented contract
+    image_root = str(tmp_path / "images")
+    elsewhere = tmp_path / "zz-ref"
+    protected_folder, other_folder = 1, 2
+    rows = [
+        scrapheap_service.ScrapheapRow(
+            id=pid,
+            file_path=(
+                f"p/{pid:04d}.png" if pid % 2 else str(elsewhere / f"{pid:04d}.png")
+            ),
+            reference_folder_id=protected_folder,
+            pixel_sha=None,
+            deleted_at=None,
+        )
+        for pid in range(1, cap + 6)
+    ]
+    # Two rows on one path: the id breaks the tie.
+    rows.append(dataclasses.replace(rows[0], id=9001))
+    locked = [
+        scrapheap_service.ScrapheapRow(
+            id=pid,
+            file_path=f"l/{pid}.png",
+            reference_folder_id=other_folder,
+            pixel_sha=None,
+            deleted_at=None,
+        )
+        for pid in range(5000, 5000 + cap + 3)
+    ]
+    unprotected = dataclasses.replace(locked[0], id=7000, file_path="u.png")
+    every_row = list(reversed(rows + locked)) + [unprotected]
+
+    body = scrapheap_service.classify_delete_preview(
+        every_row, {protected_folder}, {row.id for row in locked}, image_root
+    )
+
+    assert (
+        body["total_count"],
+        body["protected_count"],
+        body["locked_count"],
+        body["unprotected_count"],
+    ) == (len(every_row), cap + 6, cap + 3, 1)
+    expected = sorted(
+        (
+            ImageUtils.resolve_picture_path(image_root, row.file_path),
+            row.id,
+        )
+        for row in rows
+    )[:cap]
+    assert [(item["file_path"], item["id"]) for item in body["protected"]] == expected
+    # Sorted on the resolved path. Stored, the absolute ".../zz-ref/..." sorts
+    # before "p/..."; resolved, it sorts after ".../images/p/...".
+    first_relative = ImageUtils.resolve_picture_path(image_root, "p/0001.png")
+    assert expected[:2] == [(first_relative, 1), (first_relative, 9001)]
+    assert body["locked"] == [row.id for row in locked][:cap]
+
+
+def test_the_preview_list_cap_only_shortens_the_list(server, tmp_path, monkeypatch):
+    """The route lists the capped head; the token still covers everything.
+
+    With the cap at one, the preview names one protected original and one
+    locked id, its counts stay exact, and "Delete all" through its token still
+    destroys both protected originals.
+    """
+    monkeypatch.setattr(scrapheap_service, "DELETE_PREVIEW_LIST_CAP", 1)
+    client = _client(server)
+    # Made second, so it has the larger id but the first path.
+    second, _ = _make_reference_picture(
+        server, str(tmp_path / "b"), "b.png", allow_delete=False
+    )
+    first, first_path = _make_reference_picture(
+        server, str(tmp_path / "a"), "a.png", allow_delete=False
+    )
+    locked = [
+        _make_reference_picture(
+            server, str(tmp_path / name), f"{name}.png", allow_delete=True
+        )[0]
+        for name in ("c", "d")
+    ]
+    for pid in (second, first, *locked):
+        assert client.delete(f"/pictures/{pid}").status_code == 200
+    for pid in locked:
+        _lock_picture_in_set(server, pid)
+
+    body = _preview(client)
+    assert (body["protected_count"], body["locked_count"]) == (2, 2), body
+    assert body["protected"] == [{"id": first, "file_path": first_path}]
+    assert body["locked"] == [min(locked)]
+
+    assert _delete_forever(server, client, True)["deleted_count"] == 2
+    assert _get_picture(server, first) is None and _get_picture(server, second) is None
 
 
 def test_manual_delete_forever_is_not_subject_to_the_retention_guard(server, tmp_path):
@@ -1769,8 +1982,9 @@ def test_manual_delete_forever_is_not_subject_to_the_retention_guard(server, tmp
         "DELETE",
         "/api/v1/pictures/scrapheap",
         json={
+            "picture_ids": [pic_id],
             "include_protected": False,
-            "confirm_token": _confirm_token(client, None),
+            "confirm_token": _confirm_token(client, [pic_id]),
         },
     )
     assert resp.status_code == 200, resp.text
@@ -1791,7 +2005,7 @@ def test_successful_removal_keeps_file_removed_true(server, tmp_path):
     delete_resp = client.delete(f"/pictures/{pic_id}")
     assert delete_resp.status_code == 200, delete_resp.text
 
-    assert _delete_forever(client, False)["deleted_count"] == 1
+    assert _delete_forever(server, client, False)["deleted_count"] == 1
     assert not os.path.isfile(path)
     assert _ledger_flags_for(server, path) == [True], (
         "a genuinely destroyed file must stay file_removed=True so restore never "
@@ -1825,7 +2039,7 @@ def test_failed_removal_corrects_the_ledger_to_file_kept(server, tmp_path, monke
         return real_remove(target, *a, **kw)
 
     monkeypatch.setattr(os, "remove", _boom)
-    assert _delete_forever(client, False)["deleted_count"] == 1
+    assert _delete_forever(server, client, False)["deleted_count"] == 1
     monkeypatch.undo()
 
     assert os.path.isfile(path), "the file survived, which is the whole premise"
@@ -1864,7 +2078,7 @@ def test_failed_removal_never_downgrades_another_purges_ledger_row(
     )
     delete_resp = client.delete(f"/pictures/{pic_a}")
     assert delete_resp.status_code == 200, delete_resp.text
-    assert _delete_forever(client, False)["deleted_count"] == 1
+    assert _delete_forever(server, client, False)["deleted_count"] == 1
     assert not os.path.isfile(path_p)
     assert _ledger_flags_for(server, path_p) == [True], "purge A must log a real kill"
 
@@ -1885,7 +2099,7 @@ def test_failed_removal_never_downgrades_another_purges_ledger_row(
         return real_remove(target, *a, **kw)
 
     monkeypatch.setattr(os, "remove", _boom)
-    assert _delete_forever(client, False)["deleted_count"] == 1
+    assert _delete_forever(server, client, False)["deleted_count"] == 1
     monkeypatch.undo()
 
     assert os.path.isfile(path_p), "C2's file survived, which is the premise"
@@ -1920,7 +2134,7 @@ def test_failed_removal_still_downgrades_the_row_this_purge_wrote(
         return real_remove(target, *a, **kw)
 
     monkeypatch.setattr(os, "remove", _boom)
-    assert _delete_forever(client, False)["deleted_count"] == 1
+    assert _delete_forever(server, client, False)["deleted_count"] == 1
     monkeypatch.undo()
 
     assert os.path.isfile(path)
@@ -1968,7 +2182,7 @@ def test_failed_removal_downgrades_a_row_this_purge_raised_from_false(
         return real_remove(target, *a, **kw)
 
     monkeypatch.setattr(os, "remove", _boom)
-    assert _delete_forever(client, False)["deleted_count"] == 1
+    assert _delete_forever(server, client, False)["deleted_count"] == 1
     monkeypatch.undo()
 
     assert os.path.isfile(path)
@@ -1996,7 +2210,7 @@ def test_unreachable_location_corrects_the_ledger_to_file_kept(server, tmp_path)
     shutil.move(str(folder), str(tmp_path / "unmounted"))
     assert not os.path.isdir(folder)
 
-    assert _delete_forever(client, False)["deleted_count"] == 1
+    assert _delete_forever(server, client, False)["deleted_count"] == 1
     assert _ledger_flags_for(server, path) == [False], (
         "an unreachable location must never be recorded as a confirmed deletion"
     )

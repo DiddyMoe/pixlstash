@@ -35,6 +35,13 @@ vi.mock("../../api/pictures", () => ({
   searchPictures: (...a) => searchPictures(...a),
   getPictureCount: (...a) => getPictureCount(...a),
   pictureThumbnailUrl: (id) => `/api/v1/pictures/thumbnails/${id}.webp`,
+  // The tasks store follows the Scrapheap run (useScrapheapRunStore), whose
+  // setup hands these to its follower: a mock without them fails every mount.
+  cancelScrapheapRun: vi.fn(),
+  getLatestScrapheapRun: vi.fn(),
+  getScrapheapRun: vi.fn(),
+  startScrapheapRun: vi.fn(),
+  undoScrapheapRun: vi.fn(),
 }));
 
 // The picker reads the shared entity lists rather than inventing its own

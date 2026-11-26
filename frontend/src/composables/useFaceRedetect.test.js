@@ -2,7 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { effectScope, nextTick } from "vue";
 
-vi.mock("../api/pictures", () => ({ detectFaces: vi.fn(async () => ({})) }));
+vi.mock("../api/pictures", () => ({
+  detectFaces: vi.fn(async () => ({})),
+  // The tasks store follows the Scrapheap run (useScrapheapRunStore), whose
+  // setup hands these to its follower: a mock without them fails every mount.
+  cancelScrapheapRun: vi.fn(),
+  getLatestScrapheapRun: vi.fn(),
+  getScrapheapRun: vi.fn(),
+  startScrapheapRun: vi.fn(),
+  undoScrapheapRun: vi.fn(),
+}));
 
 import { detectFaces } from "../api/pictures";
 import { useNoticeStore } from "../stores/useNoticeStore";
@@ -50,6 +59,25 @@ describe("useFaceRedetect", () => {
     const last = notices.notices.at(-1);
     expect(last.text).toContain("even on the more sensitive setting");
     expect(last.action).toBeNull();
+  });
+
+  it("shows a restore's refusal where the run was asked for", async () => {
+    // The 409 server.py answers when TaskRunner.submit refuses a person's
+    // task during a restore; nothing was queued.
+    detectFaces.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: {
+          detail:
+            "Not started: a library restore is in progress. Try again once it has finished.",
+        },
+      },
+    });
+    const { api, notices } = setup();
+    await api.detectFacesAgain([1]);
+    expect(notices.notices.at(-1).text).toBe(
+      "Couldn't start face detection. Not started: a library restore is in progress. Try again once it has finished.",
+    );
   });
 
   it("stays quiet when new faces were found, or the run was another tab's", async () => {

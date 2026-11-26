@@ -5,6 +5,7 @@ import {
   picturesPhrase,
   scrapheapRunFailureSentence,
   scrapheapRunOutcomeNotice,
+  scrapheapRunProgress,
 } from "./scrapheapRun";
 
 const G = SCRAPHEAP_GESTURES;
@@ -48,6 +49,23 @@ describe("utils/scrapheapRun - scrapheapRunFailureSentence", () => {
     );
   });
 
+  it("passes on a restore's refusal of a start where the start was made", () => {
+    // TaskRunner.submit's refusal while a restore holds the TaskRunner,
+    // answered as a 409 by server.py; nothing was created.
+    const refused = {
+      kind: "conflict",
+      status: 409,
+      code: null,
+      detail:
+        "Not started: a library restore is in progress. Try again once it has finished.",
+      run: null,
+    };
+    expect(scrapheapRunFailureSentence("start", refused, G.EMPTY)).toBe(
+      "Couldn't empty the scrapheap. Not started: a library restore is in " +
+        "progress. Try again once it has finished.",
+    );
+  });
+
   it("does not claim a start failed when no answer came", () => {
     expect(
       scrapheapRunFailureSentence("start", { kind: "timeout" }, G.EMPTY),
@@ -57,16 +75,24 @@ describe("utils/scrapheapRun - scrapheapRunFailureSentence", () => {
     );
   });
 
-  it("says a run is going when the follow-up read found one", () => {
-    expect(
+  // An undo's own refusals say what the code means, not "Couldn't undo the
+  // restore." and the server's message.
+  it("says why an undo was refused", () => {
+    const undo = (code) =>
       scrapheapRunFailureSentence(
-        "start",
-        { kind: "network", run: { id: "run-1", active: true } },
-        G.EMPTY,
-      ),
-    ).toBe(
-      "No answer came from the server, but a Scrapheap run is going, and " +
-        "its progress shows above the grid.",
+        "undo",
+        { kind: "conflict", code, detail: "fake-server-message", run: null },
+        G.UNDO_RESTORE,
+      );
+    expect(undo("nothing_to_undo")).toBe(
+      "That restore has already been undone.",
+    );
+    expect(undo("not_a_restore_run")).toBe("Only a restore can be undone.");
+    expect(undo("scrapheap_run_not_found")).toBe(
+      "That restore is no longer on record; undo its steps in History instead.",
+    );
+    expect(undo("some_other_code")).toBe(
+      "Couldn't undo the restore. fake-server-message.",
     );
   });
 
@@ -184,6 +210,78 @@ describe("utils/scrapheapRun - scrapheapRunOutcomeNotice", () => {
     );
   });
 
+  // A purge destroys only what its confirmation showed, so what
+  // was binned while the dialog was open is still there, and is said so.
+  it("says what was binned after the confirmation is still in the heap", () => {
+    expect(
+      scrapheapRunOutcomeNotice(
+        purge({
+          status: "complete",
+          total: 3,
+          deleted_count: 3,
+          skipped_count: 1,
+          arrived_since: 1,
+        }),
+        G.EMPTY,
+      ).message,
+    ).toBe(
+      "Emptied the Scrapheap: 3 pictures deleted forever. " +
+        "1 reference-folder original was kept. " +
+        "1 picture binned since you confirmed is still in the Scrapheap.",
+    );
+    expect(
+      scrapheapRunOutcomeNotice(
+        purge({
+          status: "cancelled",
+          total: 50000,
+          deleted_count: 1500,
+          arrived_since: 2000,
+        }),
+        G.EMPTY,
+      ).message,
+    ).toBe(
+      `Deleting stopped. Deleted ${(1500).toLocaleString()} of ` +
+        `${(50000).toLocaleString()} pictures forever; the rest are still ` +
+        `in the Scrapheap. ${(2000).toLocaleString()} pictures binned since ` +
+        "you confirmed are still in the Scrapheap.",
+    );
+    expect(
+      scrapheapRunOutcomeNotice(
+        purge({
+          status: "error",
+          total: 2,
+          deleted_count: 2,
+          error: "Disk full",
+          arrived_since: 2,
+        }),
+        G.EMPTY,
+      ).message,
+    ).toBe(
+      "Deleting stopped on an error. Deleted 2 of 2 pictures forever. " +
+        "Disk full. 2 pictures binned since you confirmed are still in the " +
+        "Scrapheap.",
+    );
+  });
+
+  it("says nothing of late arrivals when there were none", () => {
+    for (const arrived_since of [0, null, undefined]) {
+      expect(
+        scrapheapRunOutcomeNotice(
+          purge({
+            status: "interrupted",
+            total: 4,
+            deleted_count: 1,
+            arrived_since,
+          }),
+          G.EMPTY,
+        ).message,
+      ).toBe(
+        "Deleting was interrupted when the server restarted. Deleted 1 of " +
+          "4 pictures forever; the rest are still in the Scrapheap.",
+      );
+    }
+  });
+
   it("reports a restore, what it found gone, and its History steps", () => {
     expect(
       scrapheapRunOutcomeNotice(
@@ -257,6 +355,26 @@ describe("utils/scrapheapRun - scrapheapRunOutcomeNotice", () => {
     });
   });
 
+  it("says a restore, not a restart, interrupted a run the snapshot held", () => {
+    expect(
+      scrapheapRunOutcomeNotice(
+        restore({
+          status: "interrupted",
+          error_code: "library_restored",
+          total: 10,
+          restored_count: 3,
+        }),
+        G.RESTORE_ALL,
+      ),
+    ).toEqual({
+      level: "warning",
+      message:
+        "Restoring was interrupted when the library was restored to a " +
+        "snapshot taken before it finished. Restored 3 of 10 pictures; the " +
+        "rest are still in the Scrapheap.",
+    });
+  });
+
   it("reports a failed run with the server's reason", () => {
     expect(
       scrapheapRunOutcomeNotice(
@@ -286,5 +404,177 @@ describe("utils/scrapheapRun - scrapheapRunOutcomeNotice", () => {
       "Deleting stopped on an error. Deleted 0 of 2 pictures forever; the " +
         "rest are still in the Scrapheap.",
     );
+  });
+});
+
+describe("utils/scrapheapRun - an undo of a restore", () => {
+  // An undo's total and processed count the restore's History steps.
+  const undo = (fields) => ({
+    kind: "undo",
+    total: 5,
+    processed: 2,
+    undone_count: 0,
+    target_run_id: "run-1",
+    ...fields,
+  });
+
+  it("says the pictures went back in the Scrapheap, never that they were restored", () => {
+    expect(
+      scrapheapRunOutcomeNotice(
+        undo({ status: "complete", processed: 5, undone_count: 1200 }),
+        G.UNDO_RESTORE,
+      ),
+    ).toEqual({
+      level: "success",
+      message: "Put 1,200 pictures back in the Scrapheap.",
+    });
+  });
+
+  it("names the History entry that blocked it, in the server's words", () => {
+    const blockedBy =
+      "Undo stopped: a later change in History (\u201ctest-label\u201d, entry 7) must be undone first.";
+    expect(
+      scrapheapRunOutcomeNotice(
+        undo({
+          status: "blocked",
+          undone_count: 400,
+          error_code: "history_moved_on",
+          error: blockedBy,
+        }),
+        G.UNDO_RESTORE,
+      ),
+    ).toEqual({ level: "warning", message: blockedBy });
+  });
+
+  it("says why the undo refused a part, and what it put back", () => {
+    expect(
+      scrapheapRunOutcomeNotice(
+        undo({
+          status: "blocked",
+          undone_count: 400,
+          error_code: "undo_refused",
+          error: "fake-server-sentence",
+        }),
+        G.UNDO_RESTORE,
+      ),
+    ).toEqual({
+      level: "warning",
+      message:
+        "Undo stopped: a picture of this restore is now in a locked set or " +
+        "was deleted forever. Put 400 pictures back in the Scrapheap; the " +
+        "rest stay restored.",
+    });
+  });
+
+  it("says a restore interrupted an undo the snapshot held", () => {
+    expect(
+      scrapheapRunOutcomeNotice(
+        undo({
+          status: "interrupted",
+          error_code: "library_restored",
+          undone_count: 300,
+        }),
+        null,
+      ).message,
+    ).toBe(
+      "Undo was interrupted when the library was restored to a snapshot " +
+        "taken before it finished. Put 300 pictures back in the Scrapheap; " +
+        "the rest stay restored.",
+    );
+  });
+
+  it("reports a stopped, interrupted or failed undo with its tally", () => {
+    const tally =
+      "Put 300 pictures back in the Scrapheap; the rest stay restored.";
+    expect(
+      scrapheapRunOutcomeNotice(
+        undo({ status: "cancelled", undone_count: 300 }),
+        G.UNDO_RESTORE,
+      ),
+    ).toEqual({ level: "info", message: `Undo stopped. ${tally}` });
+    expect(
+      scrapheapRunOutcomeNotice(
+        undo({ status: "interrupted", undone_count: 300 }),
+        null,
+      ),
+    ).toEqual({
+      level: "warning",
+      message: `Undo was interrupted when the server restarted. ${tally}`,
+    });
+    expect(
+      scrapheapRunOutcomeNotice(
+        undo({ status: "failed", undone_count: 300, error: "fake-reason" }),
+        null,
+      ),
+    ).toEqual({
+      level: "error",
+      message: `Undo stopped on an error. ${tally} fake-reason.`,
+    });
+  });
+
+  it("says nothing stays restored when the undo stopped after its last step", () => {
+    expect(
+      scrapheapRunOutcomeNotice(
+        undo({ status: "cancelled", processed: 5, undone_count: 1200 }),
+        G.UNDO_RESTORE,
+      ),
+    ).toEqual({
+      level: "info",
+      message: "Undo stopped. Put 1,200 pictures back in the Scrapheap.",
+    });
+  });
+});
+
+describe("utils/scrapheapRun - a run's progress", () => {
+  const going = (fields) => ({
+    kind: "purge",
+    status: "running",
+    active: true,
+    total: 1200,
+    processed: 300,
+    ...fields,
+  });
+
+  it("counts a purge or a restore in pictures, and says what Stop keeps", () => {
+    expect(scrapheapRunProgress(going({ slice_max_pictures: 250 }))).toEqual({
+      processed: 300,
+      total: 1200,
+      steps: false,
+      determinate: true,
+      percent: 25,
+      counted: "300 of 1,200 pictures",
+      stopTip:
+        "Stops after the current batch of up to 250 pictures. Pictures " +
+        "already deleted forever cannot be restored.",
+    });
+    expect(scrapheapRunProgress(going({ kind: "restore" })).stopTip).toBe(
+      "Stops after the current batch. Pictures already restored stay restored.",
+    );
+  });
+
+  it("counts an undo in the History steps it works through", () => {
+    const undo = scrapheapRunProgress(
+      going({ kind: "undo", total: 5, processed: 2, slice_max_pictures: 250 }),
+    );
+    expect(undo.steps).toBe(true);
+    expect(undo.counted).toBe("step 2 of 5");
+    expect(undo.percent).toBe(40);
+    expect(undo.stopTip).toBe(
+      "Stops after the History step it is on. Pictures already put back " +
+        "stay in the Scrapheap.",
+    );
+  });
+
+  it("has no percent while the run is queued, ended or has no total", () => {
+    for (const fields of [
+      { status: "pending" },
+      { active: false, status: "complete" },
+      { total: 0 },
+    ]) {
+      const progress = scrapheapRunProgress(going(fields));
+      expect(progress.determinate).toBe(false);
+      expect(progress.percent).toBe(0);
+    }
+    expect(scrapheapRunProgress(going({ processed: 1300 })).percent).toBe(100);
   });
 });
