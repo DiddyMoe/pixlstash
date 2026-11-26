@@ -6020,13 +6020,16 @@ async function stopScrapheapRun() {
   if (message) noticeStore.error(message, { key: "scrapheap-run-stop" });
 }
 
-/** Clear the grid and read the heap again from the top. */
+/**
+ * Clear the selection and read the heap again. The cards stay until the
+ * re-read answers, so a run that left pictures behind (locked ones, protected
+ * originals, a Stop) never blanks the heap in between.
+ */
 function reloadScrapheapGrid() {
-  allGridImages.value = [];
   selectedImageIds.value = [];
   selectedFaceIds.value = [];
   lastSelectedImageId.value = null;
-  updateVisibleThumbnails();
+  preserveScrollOnNextFetch.value = true;
   fetchAllGridImages().then(() => {
     updateVisibleThumbnails();
   });

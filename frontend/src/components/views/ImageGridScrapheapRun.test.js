@@ -289,6 +289,41 @@ describe("a Scrapheap run this tab started", () => {
     wrapper.unmount();
   });
 
+  it("keeps the heap's cards up until the re-read after an Empty answers", async () => {
+    startAnswers(
+      endedRun({ total: 2, processed: 2, deleted_count: 1, skipped_count: 1 }),
+    );
+    const wrapper = mountGrid();
+    await vi.waitFor(() => expect(wrapper.vm.imagesLoading).toBe(false));
+    wrapper.vm.allGridImages = [
+      { id: 1, idx: 0 },
+      { id: 2, idx: 1 },
+    ];
+    let answerCount;
+    apiGet.mockImplementation((url) =>
+      String(url).startsWith("/pictures/count")
+        ? new Promise((resolve) => {
+            answerCount = () => resolve({ data: { count: 1 } });
+          })
+        : Promise.resolve({
+            data: { pictures: [{ id: 2 }], count: 1, total: 1 },
+          }),
+    );
+    wrapper.vm.deleteForeverMode = "all";
+    wrapper.vm.deleteForeverConfirmToken = "test-confirmation";
+
+    await wrapper.vm.confirmDeleteForever({ includeProtected: false });
+
+    await vi.waitFor(() => expect(answerCount).toBeTypeOf("function"));
+    expect(wrapper.vm.allGridImages.map((card) => card.id)).toEqual([1, 2]);
+    answerCount();
+    await vi.waitFor(() =>
+      expect(wrapper.vm.allGridImages.map((card) => card.id)).toEqual([2]),
+    );
+
+    wrapper.unmount();
+  });
+
   it("warns, not errs, when the start is refused for a run already going", async () => {
     const going = endedRun({ status: "running", active: true, total: 10 });
     apiPost.mockImplementation((url) =>
