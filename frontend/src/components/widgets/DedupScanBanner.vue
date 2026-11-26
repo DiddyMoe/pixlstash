@@ -130,11 +130,14 @@ const totalText = computed(() =>
     <v-icon class="scan-banner__ico" size="18">mdi-radar</v-icon>
     <p v-if="partial" class="scan-banner__line">
       Duplicate scan incomplete. Some comparisons were omitted, so the queue
-      cannot be marked clear.<span v-if="warningDetail"> {{ warningDetail }}</span>
+      cannot be marked clear.<span v-if="warningDetail">{{
+        " " + warningDetail
+      }}</span>
     </p>
     <p v-else-if="failed" class="scan-banner__line">
-      Duplicate scan failed. The queue may be incomplete.<span v-if="warningDetail">
-        {{ warningDetail }}</span
+      Duplicate scan failed. The queue may be incomplete.<span
+        v-if="warningDetail"
+        >{{ " " + warningDetail }}</span
       >
     </p>
     <p v-else-if="pending" class="scan-banner__line">

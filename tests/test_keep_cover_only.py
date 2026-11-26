@@ -45,6 +45,7 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Character,
     Face,
+    Operation,
     Picture,
     PictureProjectMember,
     PictureSet,
@@ -64,6 +65,7 @@ from pixlstash.services import (
     set_lock_service,
     workflow_ghost_service,
 )
+from pixlstash.services.dedup_verdict_service import apply_metadata_union_in_session
 from tests.authz_guard import no_spa_fallback  # noqa: F401
 
 API = "/api/v1"
@@ -877,6 +879,157 @@ def test_the_whole_call_is_one_operation_under_one_batch():
         assert client.post(UNDO_URL, json={"batch_id": batch_id}).status_code == 200
         rows = _picture_rows(server, first_pics + second_pics)
         assert not any(row[0] for row in rows.values())
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_a_collapse_commits_once():
+    """The operation row committed on its own, then the collapse again.
+
+    The union, the soft-deletes and the operation row land in one commit, which
+    still carries the operation under the call's batch id.
+    """
+    temp_dir, _client, server = _env()
+    try:
+        stack_ids = [
+            stack_id for stack_id, _pics in _make_many_stacks(server, 3, members=2)
+        ]
+        commits: list[int] = []
+
+        def on_commit(_session) -> None:
+            commits.append(1)
+
+        def collapse(session):
+            event.listen(session, "after_commit", on_commit)
+            try:
+                return keep_cover_only_service.keep_cover_only_in_session(
+                    session, stack_ids=stack_ids
+                )
+            finally:
+                event.remove(session, "after_commit", on_commit)
+
+        result = _run(server, collapse)
+        assert result["stacks_collapsed"] == 3
+        assert len(commits) == 1
+        batch_ids = _run(
+            server,
+            lambda session: [
+                op.batch_id
+                for op in session.exec(
+                    select(Operation).where(
+                        Operation.op_type
+                        == operation_log_service.OP_STACK_KEEP_COVER_ONLY
+                    )
+                ).all()
+            ],
+        )
+        assert batch_ids == [result["batch_id"]]
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_each_stack_is_unioned_over_its_own_members_only():
+    """One union call covers every stack, and nothing crosses between them.
+
+    The two stacks carry different tags and scores. Each cover gains its own
+    copy's tag and best score, never the other stack's.
+    """
+    temp_dir, client, server = _env()
+    try:
+        first_id, (first_cover, _first_copy) = _make_stack(
+            server,
+            [
+                {"tags": ["first_cover"], "score": 1},
+                {"tags": ["first_copy"], "score": 3},
+            ],
+        )
+        second_id, (second_cover, _second_copy) = _make_stack(
+            server,
+            [
+                {"tags": ["second_cover"], "score": 2},
+                {"tags": ["second_copy"], "score": 5},
+            ],
+        )
+
+        response = client.post(COLLAPSE_URL, json={"stack_ids": [first_id, second_id]})
+        assert response.status_code == 200, response.text
+        assert response.json()["stacks_collapsed"] == 2
+
+        assert _tags_of(server, first_cover) == {"first_cover", "first_copy"}
+        assert _tags_of(server, second_cover) == {"second_cover", "second_copy"}
+        rows = _picture_rows(server, [first_cover, second_cover])
+        assert rows[first_cover][3] == 3
+        assert rows[second_cover][3] == 5
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_a_collapse_flushes_as_often_for_six_stacks_as_for_two():
+    """The collapse flushed several times per stack.
+
+    Every vault flush runs the metadata-hash updater, so a per-stack flush made a
+    500-stack collapse take seconds. The union, the soft deletes and the
+    renumber each cover every stack before the next step starts, so the flush
+    count does not grow with the selection.
+
+    Each stack is built so every step writes in it: the copy carries a tag the
+    cover lacks (the union adds one), the copy leaves (the soft delete), and the
+    position-0 member is already in the Scrapheap, so the renumber moves the
+    live cover up. A step that writes nothing would flush nothing, and could not
+    show a per-stack flush.
+    """
+    temp_dir, _client, server = _env()
+    try:
+        counts = []
+        for count in (2, 6):
+            stack_ids = [
+                _make_stack(
+                    server,
+                    [{"deleted": True}, {"tags": ["cover"]}, {"tags": ["copy"]}],
+                )[0]
+                for _ in range(count)
+            ]
+            with _counting_vault_flushes(server) as flushes:
+                result = _run(
+                    server,
+                    lambda session, ids=stack_ids: (
+                        keep_cover_only_service.keep_cover_only_in_session(
+                            session, stack_ids=ids
+                        )
+                    ),
+                )
+            assert result["stacks_collapsed"] == count
+            assert result["tags_added"] == 2 * count
+            counts.append(len(flushes))
+        assert counts[0] > 0
+        assert counts[0] == counts[1], counts
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_a_picture_under_two_stacks_is_refused_before_any_union():
+    """One union call serves several stacks, so they must not overlap.
+
+    A picture listed under two stacks would gain one stack's union or both,
+    depending on the order. The call refuses before it writes anything.
+    """
+    temp_dir, _client, server = _env()
+    try:
+        first_id, (cover, shared) = _make_stack(
+            server, [{"tags": ["a"]}, {"tags": ["b"]}]
+        )
+        second_id, (other,) = _make_stack(server, [{"tags": ["c"]}])
+
+        def union(session):
+            with pytest.raises(ValueError, match="under two stacks"):
+                apply_metadata_union_in_session(
+                    session, [([cover, shared], first_id), ([shared, other], second_id)]
+                )
+            session.rollback()
+
+        _run(server, union)
+        assert _tags_of(server, cover) == {"a"}
+        assert _tags_of(server, other) == {"c"}
     finally:
         _teardown(temp_dir, server)
 

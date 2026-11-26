@@ -38,6 +38,12 @@ const props = defineProps({
   unreachable: { type: Boolean, default: false },
   /** The run request on the wire: "start", "cancel", "revert" or null. */
   action: { type: String, default: null },
+  /**
+   * An undo is on the wire, a Stop beside it or not: see `autoStackRevertOut`
+   * in the store. `action` reads "cancel" while a Stop is out, so it cannot
+   * say this.
+   */
+  revertOut: { type: Boolean, default: false },
   /** Undo run is available: see `autoStackCanRevert` in the store. */
   canRevert: { type: Boolean, default: false },
 });
@@ -120,7 +126,11 @@ const showStop = computed(() => active.value && !props.run?.cancel_requested);
 const showRevert = computed(() => !active.value && props.canRevert);
 const showDismiss = computed(() => !active.value);
 
-/** While one request is on the wire, the other controls wait for it. */
+/**
+ * While one request is on the wire, the other controls wait for it. Stop does
+ * not: the store sends it for the run shown here even while a start or an undo
+ * is still out, so it waits only for an earlier Stop.
+ */
 const otherActionPending = (own) =>
   props.action != null && props.action !== own;
 </script>
@@ -247,7 +257,7 @@ const otherActionPending = (own) =>
         v-if="showStop"
         size="sm"
         :loading="action === 'cancel'"
-        :disabled="otherActionPending('cancel')"
+        :disabled="action === 'cancel'"
         data-testid="auto-stack-stop"
         @click="emit('stop')"
         >Stop</AppButton
@@ -258,7 +268,7 @@ const otherActionPending = (own) =>
         size="sm"
         icon-left="undo-variant"
         :tooltip="revertTip"
-        :loading="action === 'revert'"
+        :loading="revertOut"
         :disabled="otherActionPending('revert')"
         data-testid="auto-stack-revert"
         @click="emit('revert')"

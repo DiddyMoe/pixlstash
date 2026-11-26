@@ -95,12 +95,16 @@ describe("DedupScanBanner", () => {
   });
 
   it.each([
-    ["partial", "Duplicate scan incomplete.", "pair limit reached"],
-    ["failed", "Duplicate scan failed.", "worker stopped"],
-  ])("keeps a %s scan visible as an incomplete warning", (status, copy, error) => {
+    ["partial", "Duplicate scan incomplete.", "marked clear.", "pair limit reached"],
+    ["failed", "Duplicate scan failed.", "may be incomplete.", "worker stopped"],
+  ])("keeps a %s scan visible as an incomplete warning", (status, copy, before, error) => {
     const wrapper = mountBanner({ status, error });
     expect(textOf(wrapper)).toContain(copy);
-    expect(textOf(wrapper)).toContain(error);
+    // The detail is its own sentence: the template's whitespace condensing once
+    // dropped the space before it, gluing it to the full stop.
+    expect(wrapper.find(".scan-banner__line").text()).toContain(
+      `${before} ${error}`,
+    );
     expect(wrapper.find(".scan-banner").attributes("role")).toBe("alert");
     expect(wrapper.find(".scan-banner__track").exists()).toBe(false);
   });

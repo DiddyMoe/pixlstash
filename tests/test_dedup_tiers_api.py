@@ -61,6 +61,10 @@ REOPEN_URL = f"{API}/dedup/verdicts/reopen"
 AUTO_STACK_URL = f"{API}/dedup/auto-stack"
 AUTO_STACK_RUNS_URL = f"{API}/dedup/auto-stack/runs"
 AUTO_STACK_LATEST_URL = f"{AUTO_STACK_RUNS_URL}/latest"
+# The fixed 400 for a cursor the server cannot read (routes/dedup.py).
+CURSOR_REFUSED = (
+    "That cursor is not one this page gave out. Start again from the first page."
+)
 
 
 def _stack_members_url(stack_id) -> str:
@@ -118,6 +122,9 @@ def _env():
         fh.write(json.dumps({"port": 8000, "disable_background_workers": True}))
     Server.DEFAULT_FORCE_CPU = True
     server = Server(config_path)
+    # No workers here: _work_auto_stack_runs stands in for the planner, so the
+    # vault reports one, or the run routes would refuse to record a run (503).
+    server.vault.runs_background_work = lambda: True
     client = TestClient(server.api)
     assert (
         client.post(
@@ -502,6 +509,42 @@ def test_counts_report_the_badge_the_tiers_and_the_scopes():
         _teardown(temp_dir, server)
 
 
+def test_every_counted_scope_row_carries_its_own_tier_split():
+    """Each scope row's ``by_tier`` is that scope's, not the badge's copy.
+
+    The tier menu reads the split per scope, so an empty set must say
+    zero for every tier while the set holding the pair says one exact group.
+    """
+    temp_dir, client, server, _ids, _token, set_id = _env()
+    try:
+        empty_set_id = client.post(
+            f"{API}/picture_sets", json={"name": "Set B"}
+        ).json()["picture_set"]["id"]
+        response = client.post(
+            COUNTS_URL,
+            json={
+                "scopes": [
+                    {"scope_type": "set", "scope_id": str(set_id)},
+                    {"scope_type": "set", "scope_id": str(empty_set_id)},
+                ]
+            },
+        )
+        assert response.status_code == 200, response.text
+        rows = {row["key"]: row for row in response.json()["scopes"]}
+        assert rows[f"set:{set_id}"]["by_tier"] == {
+            "exact": 1,
+            "near": 0,
+            "embedding": 0,
+        }
+        assert rows[f"set:{empty_set_id}"]["by_tier"] == {
+            "exact": 0,
+            "near": 0,
+            "embedding": 0,
+        }
+    finally:
+        _teardown(temp_dir, server)
+
+
 def test_a_scope_without_an_id_is_rejected():
     temp_dir, client, server, _ids, _token, _set_id = _env()
     try:
@@ -595,6 +638,7 @@ def test_stacking_through_the_api_applies_the_union_and_clears_the_badge():
         assert body["stack_id"] is not None
         assert body["metadata_union"]["tags_added"] == 1
         assert body["metadata_union"]["scores_lifted"] == 1
+        assert body["stacked_picture_ids"] == sorted(ids[:2])
         assert client.post(COUNTS_URL, json={}).json()["unresolved_groups"] == 0
         # Nothing was deleted: a stack is a grouping row plus a cover pointer.
         live = _run(
@@ -604,6 +648,23 @@ def test_stacking_through_the_api_applies_the_union_and_clears_the_badge():
             ],
         )
         assert sorted(live) == sorted(ids)
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_the_verdict_schema_declares_the_stacked_pictures():
+    """``stacked_picture_ids`` is contract, so the reference documents it.
+
+    The model allows extra keys, so the field reached the wire undeclared and
+    the generated reference never listed it.
+    """
+    temp_dir, _client, server, _ids, _token, _set_id = _env()
+    try:
+        schema = server.api.openapi()["components"]["schemas"]["VerdictResponse"]
+        field = schema["properties"]["stacked_picture_ids"]
+        assert field["type"] == "array"
+        assert field["items"] == {"type": "integer"}
+        assert "stack" in field["description"]
     finally:
         _teardown(temp_dir, server)
 
@@ -1136,18 +1197,26 @@ def test_decided_page_paging_is_stable_across_seams():
             GROUPS_URL, params={"decided": True, "cursor": queue_cursor}
         )
         assert rejected.status_code == 400, rejected.text
+        assert rejected.json() == {"detail": CURSOR_REFUSED}
         rejected = client.get(GROUPS_URL, params={"cursor": decided_cursor})
         assert rejected.status_code == 400, rejected.text
+        assert rejected.json() == {"detail": CURSOR_REFUSED}
     finally:
         _teardown(temp_dir, server)
 
 
 def test_an_unknown_signature_is_a_400_not_a_500():
+    """The answer is the server's sentence: the signature is the caller's."""
     temp_dir, client, server, _ids, _token, _set_id = _env()
     try:
-        for url in (STACK_URL, KEEP_SEPARATE_URL, REOPEN_URL):
-            response = client.post(url, json={"signature": "0" * 64})
+        for url, detail in (
+            (STACK_URL, "No duplicate group has that signature."),
+            (KEEP_SEPARATE_URL, "No duplicate group has that signature."),
+            (REOPEN_URL, "No verdict is recorded for that signature."),
+        ):
+            response = client.post(url, json={"signature": "example-leak-sig"})
             assert response.status_code == 400, (url, response.text)
+            assert response.json() == {"detail": detail}, url
     finally:
         _teardown(temp_dir, server)
 
@@ -1292,8 +1361,9 @@ def test_a_non_numeric_scope_id_is_a_400_on_every_route():
 def test_a_folder_scope_does_not_treat_wildcards_as_wildcards():
     """A "Find duplicates in this folder" entry must not silently mean everywhere.
 
-    The folder predicate is a LIKE prefix match; unescaped, a scope_id of "%"
-    matches every path in the vault.
+    The folder predicate is a range compare on the path (FolderPrefix), so a
+    scope_id of "%" is an ordinary character, never a wildcard that would
+    match every path in the vault.
     """
     temp_dir, client, server, ids, _token, _set_id = _env()
     try:
@@ -2156,6 +2226,47 @@ def test_cursor_and_offset_together_are_rejected():
         _teardown(temp_dir, server)
 
 
+@pytest.mark.parametrize(
+    ("decode", "said"),
+    [
+        (tiers.decode_queue_cursor, "malformed queue cursor"),
+        (tiers.decode_decided_cursor, "malformed decided cursor"),
+    ],
+)
+def test_a_refused_cursor_names_neither_the_cursor_nor_the_decoder(decode, said):
+    """At the raise: the text is fixed, and why it failed is the chained cause,
+    so a caller that answers ``str(exc)`` repeats nothing the caller sent."""
+    with pytest.raises(tiers.DedupCursorError) as refused:
+        decode("example-leak-cursor")
+    assert str(refused.value) == said
+    assert refused.value.__cause__ is not None
+
+
+def test_a_refused_scope_answers_without_the_callers_id():
+    """The scope refusals name the server's scope type, never the id sent."""
+    temp_dir, client, server, _ids, _token, _set_id = _env()
+    try:
+        numeric = {"scope_type": "set", "scope_id": "example-leak-scope"}
+        for response in (
+            client.get(GROUPS_URL, params=numeric),
+            client.post(SCAN_URL, json={"scope": numeric}),
+        ):
+            assert response.status_code == 400, response.text
+            assert response.json() == {
+                "detail": "scope_id for scope_type=set must be an integer id"
+            }
+        response = client.get(
+            GROUPS_URL, params={"scope_type": "folder", "scope_id": "///"}
+        )
+        assert response.status_code == 400, response.text
+        assert response.json() == {
+            "detail": "scope_id for scope_type=folder must name a folder; this one "
+            "normalises to an empty prefix, which would match the whole vault"
+        }
+    finally:
+        _teardown(temp_dir, server)
+
+
 def test_a_malformed_cursor_is_a_400_not_a_silent_restart():
     """Silently paging from the top would hand the client page 1 forever."""
     temp_dir, client, server, _ids, _token, _set_id = _env()
@@ -2172,6 +2283,9 @@ def test_a_malformed_cursor_is_a_400_not_a_silent_restart():
         for bad in ("not-base64!!", "AAAA", "MXwxLjB8", *non_finite):
             response = client.get(GROUPS_URL, params={"cursor": bad})
             assert response.status_code == 400, (bad, response.text)
+            # The answer is one fixed sentence: the cursor and the decoder's
+            # error are the caller's text and stay in the log.
+            assert response.json() == {"detail": CURSOR_REFUSED}, bad
     finally:
         _teardown(temp_dir, server)
 

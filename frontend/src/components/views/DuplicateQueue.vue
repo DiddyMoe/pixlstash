@@ -233,7 +233,7 @@
             v-else-if="tierMenuOpen"
             class="dq-tier-menu"
             :tiers="store.tierRows"
-            :group-count="store.openCount"
+            :group-count="store.reviewCount"
             :threshold="store.threshold"
             :min-threshold="store.bounds?.min_threshold ?? null"
             :max-threshold="store.bounds?.max_threshold ?? null"
@@ -298,10 +298,10 @@
         >
           <span class="dq-auto-full">{{ autoStackLabel }}</span>
           <span class="dq-auto-short" aria-hidden="true"
-            >Auto-stack {{ store.exactCount.toLocaleString() }}</span
+            >Auto-stack {{ formatCount(store.exactCount) }}</span
           >
           <span class="dq-auto-count" aria-hidden="true">{{
-            store.exactCount.toLocaleString()
+            formatCount(store.exactCount)
           }}</span>
         </AppButton>
 
@@ -333,6 +333,7 @@
       :run="store.autoStackRun"
       :unreachable="store.autoStackRunUnreachable"
       :action="store.autoStackAction"
+      :revert-out="store.autoStackRevertOut"
       :can-revert="store.autoStackCanRevert"
       @stop="onStopAutoStack"
       @revert="onRevertAutoStack"
@@ -758,7 +759,7 @@
       :preview="autoStackPreview"
       :loading="autoStackLoading"
       :preview-error="autoStackError"
-      :busy="store.autoStackAction === 'start'"
+      :busy="store.autoStackStartOut"
       :start-error="autoStackStartError"
       :queue-remaining="store.queueOnlyCount"
       @close="closeAutoStack"
@@ -820,6 +821,7 @@ import {
   mixedStackPrimary,
 } from "../../utils/dedup";
 import { pictureCount } from "../../utils/workflowSets";
+import { formatCount } from "../../utils/filterChips";
 import { createDedupKeyHandler } from "../../composables/useDedupQueueKeyboard";
 import { useDedupRowExpansion } from "../../composables/useDedupRowExpansion";
 import { useMixedStackQueue } from "../../composables/useMixedStackQueue";
@@ -1232,7 +1234,7 @@ const decidedToggleLabel = computed(() =>
  * the tooltip and accessible name always. */
 const autoStackLabel = computed(
   () =>
-    `Auto-stack ${store.exactCount.toLocaleString()} exact ${
+    `Auto-stack ${formatCount(store.exactCount)} exact ${
       store.exactCount === 1 ? "match" : "matches"
     }`,
 );
@@ -1260,7 +1262,7 @@ const headline = computed(() => {
   }
   return store.showingDecided
     ? `${store.total.toLocaleString()} decided ${store.total === 1 ? "group" : "groups"}`
-    : `${store.openCount.toLocaleString()} ${store.openCount === 1 ? "group" : "groups"} to review`;
+    : `${formatCount(store.reviewCount)} ${store.reviewCount === 1 ? "group" : "groups"} to review`;
 });
 
 // ── The Mixed stacks queue (design D5) ────────────────────────────────────
@@ -1406,6 +1408,14 @@ function estimatedPitch() {
 
 /** The real row pitch, measured once two rows exist; the estimate until then. */
 const rowPitchPx = ref(estimatedPitch());
+/**
+ * The list's row gap, measured with the pitch. The spacers are flex items
+ * too, so the list puts this gap after the top spacer and before the bottom
+ * one, and each spacer is this much shorter than the rows it replaces. 0
+ * until the first measurement, which runs on mount, before the window can
+ * leave the top.
+ */
+const rowGapPx = ref(0);
 /** First row index the scroll position implies, and how many rows fit. */
 const scrollIndex = ref(0);
 const viewportRows = ref(WINDOW_AFTER);
@@ -1420,10 +1430,17 @@ function measureRowPitch() {
   // track: from a state one row is in. The row AFTER the sample may be the
   // expanded one: the pitch is the first row's own height plus the gap, so
   // only the first of the pair has to be collapsed.
+  // Rects, not offsetTop: offsetTop is a whole number, and a row of 220.5px
+  // read as a 228px pitch puts the spacers out by 0.5px per row scrolled.
   for (let i = 0; i + 1 < rows.length; i += 1) {
     if (rows[i].querySelector(".gexp")) continue;
-    const pitch = rows[i + 1].offsetTop - rows[i].offsetTop;
-    if (pitch > 0) rowPitchPx.value = pitch;
+    const first = rows[i].getBoundingClientRect();
+    const next = rows[i + 1].getBoundingClientRect();
+    const pitch = next.top - first.top;
+    if (pitch > 0) {
+      rowPitchPx.value = pitch;
+      rowGapPx.value = next.top - first.bottom;
+    }
     break;
   }
   if (list.clientHeight > 0) {
@@ -1564,10 +1581,24 @@ const totalRows = computed(() => {
 // keeps its full height (and the thumb its position) across a tail jump and
 // the upward backfill - a prepended page fills spacer, it never moves the
 // scroll.
-const topSpacer = computed(() => renderStart.value * rowPitchPx.value);
-const bottomSpacer = computed(() =>
-  Math.max(0, (totalRows.value - renderEnd.value) * rowPitchPx.value),
+//
+// Each spacer is exactly as tall as the rows it stands for, so row k sits at
+// k × pitch whatever the window: a spacer that mounts or resizes moves no row
+// on screen. A mounted spacer brings its own flex gap, which is why each one
+// is a gap shorter than its rows. Both are v-if, so a spacer of zero rows is
+// absent rather than 0px tall and still taking a gap. Counting the gap twice
+// was an 8px jump the moment the window first left the top. Chrome's scroll
+// anchoring hid it by moving the scroll; Safari has no anchoring, so it
+// showed there.
+const topSpacer = computed(() =>
+  renderStart.value > 0
+    ? renderStart.value * rowPitchPx.value - rowGapPx.value
+    : 0,
 );
+const bottomSpacer = computed(() => {
+  const below = totalRows.value - renderEnd.value;
+  return below > 0 ? below * rowPitchPx.value - rowGapPx.value : 0;
+});
 
 /**
  * The rows that are actually mounted, each carrying its true (absolute)
@@ -1843,7 +1874,7 @@ async function onStack(group) {
     const result = await store.stack(group);
     if (result?.failed) {
       const sentence = result.uncertain
-        ? `The server outcome became uncertain after ${result.completed} of ${result.requested} confirmed stacks. The queue was reloaded from the server before you retry.`
+        ? `The server outcome became uncertain after ${result.completed} of ${result.requested} confirmed stacks. ${uncertainReloadSentence()}`
         : `Stacked ${result.completed} of ${result.requested} groups. The remaining groups stayed in the queue.`;
       announcement.value = sentence;
       noticeStore.error(sentence);
@@ -1951,7 +1982,7 @@ async function onKeepSeparate(group) {
   }
   if (result.failed) {
     const sentence = result.uncertain
-      ? `The server outcome became uncertain after ${result.completed} of ${result.requested} confirmed decisions. The queue was reloaded from the server before you retry.`
+      ? `The server outcome became uncertain after ${result.completed} of ${result.requested} confirmed decisions. ${uncertainReloadSentence()}`
       : `Kept ${result.completed} of ${result.requested} groups separate. The remaining groups stayed selected in the queue.`;
     announcement.value = sentence;
     noticeStore.error(sentence);
@@ -2004,6 +2035,21 @@ async function onClearDecision(group) {
 }
 
 /**
+ * What happened to the queue after a verdict's outcome became uncertain.
+ *
+ * The store re-reads the queue after a 5xx so a retry never lands on a stale
+ * row. That read can fail too, and then saying the queue was reloaded is
+ * false: the rows are gone and nothing on screen reflects the server.
+ *
+ * @returns {string}
+ */
+function uncertainReloadSentence() {
+  return store.uncertainReloadFailed
+    ? "The queue could not be reloaded either, so reload the page before you retry."
+    : "The queue was reloaded from the server; check the current row before you retry.";
+}
+
+/**
  * Say so when a verdict did not land.
  *
  * A failed verdict leaves the row exactly where it was, which on a queue whose
@@ -2017,10 +2063,9 @@ async function onClearDecision(group) {
  */
 function reportVerdictFailure(what, err, group = null) {
   if (Number(err?.response?.status) >= 500) {
-    announcement.value = `Could not confirm whether the server completed the request. The queue was reloaded before retry is offered.`;
-    noticeStore.error(
-      `The outcome is uncertain. The queue was reloaded from the server; check the current row before retrying.`,
-    );
+    const sentence = `Could not confirm whether the server completed the request. ${uncertainReloadSentence()}`;
+    announcement.value = sentence;
+    noticeStore.error(sentence);
     return;
   }
   const detail = serverDetail(err);
@@ -2925,11 +2970,19 @@ async function onSelectAll() {
  * auto-stack dialog are the queue's own and are exempt: the model has branches
  * for both.
  *
+ * A key pressed inside an open menu or popover (the title bar's, the Undo
+ * menu, the sidebar's) is that overlay's too, under the WAI-ARIA menu pattern:
+ * a menu has no scrim, so the dialog signals miss it. Without this, S or
+ * Enter on a menu item would stack the focused group, and `claim()` would keep
+ * Escape from ever reaching the menu to close it.
+ *
+ * @param {KeyboardEvent} event
  * @returns {boolean}
  */
-function foreignDialogOpen() {
+function foreignDialogOpen(event) {
   if (typeof document === "undefined") return false;
   if (compareOpen.value || autoStackOpen.value) return false;
+  if (event.target?.closest?.(".v-overlay__content")) return true;
   // Two signals, because the app has two kinds of modal: Vuetify's scrim (every
   // AppDialog) and the review overlay, which paints its own. Both are stated on
   // the DOM rather than on listener order, for the reason App.vue records at
@@ -3101,7 +3154,7 @@ const handleMixedKeydown = createDedupKeyHandler({
  * reaches the shell's Ctrl+Z or its Home/End scrolling.
  */
 function onKeydown(event) {
-  if (foreignDialogOpen()) return;
+  if (foreignDialogOpen(event)) return;
   // Two queues, one key owner each, and exactly one of them is on screen. The
   // review queue's handler still declines the Mixed page through its own
   // `isBlocked` as a belt: a verdict key resolving a group the user cannot see

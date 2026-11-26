@@ -7,14 +7,37 @@ over the CLIP-nearest opposite-labelled neighbour.
 """
 
 import tracemalloc
+from datetime import datetime
 
 import numpy as np
+import pytest
 
+from pixlstash.db_models.picture import LIKENESS_PARAMETER_SENTINEL, LikenessParameter
+from pixlstash.services.review_service import derive_kind
+from pixlstash.utils.likeness.likeness_parameter_utils import LikenessParameterUtils
+from pixlstash.utils.likeness.likeness_utils import LikenessUtils
 from pixlstash.utils.near_neighbor import (
+    DHASH_MAX,
     hamming_distance,
     knn_disagreement_with_neighbors,
     nearest_opposite_by_hamming,
+    parse_dhash,
 )
+
+# What ``int(text, 16)`` accepts and a stored dhash is not: a sign, a
+# ``0x`` prefix, ``_`` separators, surrounding whitespace, non-ASCII digits,
+# and more than 64 bits.
+_NOT_A_DHASH = [
+    "-" + "0" * 15 + "1",
+    "+" + "0" * 15 + "1",
+    "0x" + "f" * 14,
+    "ff_ff_ff_ff",
+    " " + "f" * 15,
+    "f" * 16 + "\n",
+    "\uff11" * 16,
+    "1" + "0" * 16,
+    "not hex",
+]
 
 
 def test_hamming_distance_basic():
@@ -350,3 +373,83 @@ def test_scratch_memory_stays_near_one_block():
     finally:
         tracemalloc.stop()
     assert (peak - base) / (rows * n) < 14
+
+
+def test_parse_dhash_reads_every_64_bit_value():
+    assert parse_dhash("0" * 16) == 0
+    assert parse_dhash("f" * 16) == DHASH_MAX
+    assert parse_dhash("F" * 16) == DHASH_MAX
+    assert parse_dhash("00000000000000a7") == 0xA7
+    assert parse_dhash(None) is None
+    assert parse_dhash("") is None
+
+
+@pytest.mark.parametrize("text", _NOT_A_DHASH)
+def test_parse_dhash_refuses_what_int_accepts(text):
+    assert parse_dhash(text) is None
+
+
+def test_a_signed_hash_no_longer_pairs_a_review():
+    """``-...01`` against ``...01`` parsed to -1 and 1, one bit apart: a "pair"."""
+    signed, plain = "-" + "0" * 15 + "1", "0" * 15 + "1"
+    assert derive_kind((None, plain), (None, plain)) == "pair"
+    assert derive_kind((None, signed), (None, plain)) == "binary"
+
+
+def test_a_prefixed_hash_no_longer_scores_as_identical():
+    """``0xff..`` and ``00ff..`` were the same number to ``int(text, 16)``."""
+    assert LikenessUtils._phash_similarity("00" + "f" * 14, "00" + "f" * 14) == 1.0
+    assert LikenessUtils._phash_similarity("0x" + "f" * 14, "00" + "f" * 14) == 0.0
+
+
+def test_one_overwide_hash_does_not_drop_every_bulk_candidate():
+    """A 65-bit value parsed, then the uint64 pack raised for the whole batch."""
+    params = np.zeros(len(LikenessParameter), dtype=np.float32).tobytes()
+    embedding = np.ones(4, dtype=np.float32).tobytes()
+    rows = [
+        (1, params, embedding, "f" * 16),
+        (2, params, embedding, "1" + "0" * 16),
+        (3, params, embedding, "0" * 15 + "1"),
+    ]
+    arrays = LikenessUtils.decode_bulk_rows(rows)
+    assert arrays.ids.tolist() == [1, 3]
+    assert arrays.phash_vec.tolist() == [DHASH_MAX, 1]
+
+
+class _RowsSession:
+    """Answers the one picture read ``fetch_picture_params_for_ids`` issues."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def exec(self, _statement):
+        return self
+
+    def all(self):
+        return self._rows
+
+    def connection(self):
+        """The id scope goes into a temp table first; the canned rows ignore it."""
+        return self
+
+    def exec_driver_sql(self, _sql, _params=None):
+        return None
+
+
+def test_a_malformed_hash_gets_no_phash_prefix_parameter():
+    """``-...1`` parsed to -1, a negative phash_prefix a likeness pass compared."""
+    taken = datetime(2026, 1, 1)
+    rows = [
+        (1, 4, 2, taken, "f" * 16, None),
+        (2, 4, 2, taken, "-" + "0" * 15 + "1", None),
+        (3, 4, 2, taken, "0x" + "0" * 13 + "1", None),
+    ]
+    params, updates = LikenessParameterUtils.fetch_picture_params_for_ids(
+        _RowsSession(rows), [1, 2, 3], image_root="/nonexistent"
+    )
+    assert updates == {}
+    assert {pid: p["phash_prefix"] for pid, p in params.items()} == {
+        1: 1.0,
+        2: LIKENESS_PARAMETER_SENTINEL,
+        3: LIKENESS_PARAMETER_SENTINEL,
+    }

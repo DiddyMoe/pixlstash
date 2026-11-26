@@ -26,15 +26,18 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlalchemy import event, insert
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Picture,
+    PictureProjectMember,
     PictureSet,
     PictureSetMember,
     PictureStack,
+    Project,
 )
 from pixlstash.db_models.dedup import (
     DedupGroup,
@@ -53,6 +56,7 @@ from pixlstash.services import dedup_tier_service as tiers
 from pixlstash.services import dedup_verdict_service as verdicts
 from pixlstash.services import operation_log_service
 from pixlstash.services import set_lock_service as set_locks
+from pixlstash.services import stack_membership
 from pixlstash.services.dedup_tier_service import TierPolicy
 from pixlstash.services.dedup_verdict_service import DedupVerdictError
 
@@ -294,8 +298,17 @@ def test_a_cover_outside_the_group_is_rejected(server):
 
 
 def test_an_unknown_signature_is_rejected(server):
-    with pytest.raises(DedupVerdictError, match="No duplicate group"):
-        _run(server, verdicts.apply_stack_verdict_in_session, "0" * 64, None, [], None)
+    # The routes answer the text as it is: the caller's signature is not in it.
+    with pytest.raises(DedupVerdictError) as refused:
+        _run(
+            server,
+            verdicts.apply_stack_verdict_in_session,
+            "example-leak-signature",
+            None,
+            [],
+            None,
+        )
+    assert str(refused.value) == "No duplicate group has that signature."
 
 
 # ── the metadata union ────────────────────────────────────────────────────────
@@ -576,8 +589,9 @@ def test_reopening_returns_the_group_and_keeps_the_history(server):
         ).first(),
     )
     assert row is not None and row.reopened_at is not None
-    with pytest.raises(DedupVerdictError, match="already reopened"):
+    with pytest.raises(DedupVerdictError) as refused:
         _run(server, verdicts.reopen_verdict_in_session, signature)
+    assert str(refused.value) == "That verdict is already reopened."
 
 
 def test_reopening_a_stack_verdict_dissolves_the_verdicts_stack(server):
@@ -605,8 +619,9 @@ def test_reopening_a_stack_verdict_dissolves_the_verdicts_stack(server):
 
 
 def test_reopening_an_unknown_signature_is_rejected(server):
-    with pytest.raises(DedupVerdictError, match="No verdict recorded"):
-        _run(server, verdicts.reopen_verdict_in_session, "0" * 64)
+    with pytest.raises(DedupVerdictError) as refused:
+        _run(server, verdicts.reopen_verdict_in_session, "example-leak-signature")
+    assert str(refused.value) == "No verdict is recorded for that signature."
 
 
 # ── bulk auto-stack ───────────────────────────────────────────────────────────
@@ -2141,6 +2156,83 @@ def test_clearing_a_stacked_decision_records_one_operation(server):
     assert row.batch_id == rows[0].batch_id
 
 
+def test_an_unreadable_before_state_is_refused_without_the_parser_text(server, caplog):
+    """``POST /dedup/verdicts/reopen`` answers a fixed sentence when the
+    verdict's recorded before-state no longer parses; the parser's text goes to
+    the log with its traceback and the operation id."""
+    _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},
+            {"pixel_sha": "aaa", "size_bytes": 100},
+        ],
+    )
+    _scan(server)
+    signature = _one_signature(server)
+    _run(server, verdicts.apply_stack_verdict_in_session, signature, None, [], None)
+    (stack_op,) = _operations(server)
+
+    def corrupt(session):
+        row = session.get(Operation, stack_op.id)
+        row.before_state = "{example-not-json"
+        session.add(row)
+        session.commit()
+
+    _run(server, corrupt)
+    client = TestClient(server.api)
+    assert (
+        client.post(
+            "/api/v1/login",
+            json={"username": "owner", "password": "example-owner-password"},
+        ).status_code
+        == 200
+    )
+    with caplog.at_level(logging.WARNING, logger=verdicts.logger.name):
+        response = client.post(
+            "/api/v1/dedup/verdicts/reopen", json={"signature": signature}
+        )
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert detail == (
+        f"cannot revert the stack for verdict {signature!r}: the recorded "
+        f"before-state of operation {stack_op.id} is unreadable. The server "
+        "log says why."
+    )
+    assert "Expecting" not in detail
+    assert "char 1" not in detail
+    (record,) = [
+        record
+        for record in caplog.records
+        if record.name == verdicts.logger.name
+        and "does not parse" in record.getMessage()
+    ]
+    assert f"operation {stack_op.id} " in record.getMessage()
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], ValueError)
+    assert "Expecting" in str(record.exc_info[1])
+
+
+def test_an_unknown_verdict_in_a_batch_is_refused_without_repeating_it(server, caplog):
+    """Defence in depth: the HTTP model only admits the two verdicts, so this
+    refusal is reached by a direct caller; its text still never repeats the
+    value, which goes to the log."""
+    planted = "example-planted-verdict"
+    with caplog.at_level(logging.INFO, logger=verdicts.logger.name):
+        with pytest.raises(DedupVerdictError) as refused:
+            _run(
+                server,
+                verdicts.apply_verdict_batch_in_session,
+                [{"verdict": planted, "signature": "example-signature"}],
+            )
+    assert str(refused.value) == "unknown verdict"
+    assert planted not in str(refused.value)
+    assert f"[dedup-verdict] unknown verdict {planted!r} refused" in [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == verdicts.logger.name
+    ]
+
+
 def test_undo_of_a_clear_restacks_and_re_decides_and_redo_clears_again(server):
     """Both directions of the clear operation itself.
 
@@ -2319,8 +2411,9 @@ def test_a_clear_may_not_reuse_the_verdicts_own_batch_id(server):
         [],
         gesture,
     )
-    with pytest.raises(DedupVerdictError, match="own batch"):
+    with pytest.raises(DedupVerdictError, match="own batch") as refused:
         _run(server, verdicts.reopen_verdict_in_session, signature, gesture)
+    assert gesture not in str(refused.value), "the caller's batch id came back"
 
 
 # ── withholding a group with no stackable decision left ───────────────────────
@@ -2928,6 +3021,94 @@ def test_the_dry_run_counts_a_shared_stack_once(server):
     assert report["dry_run_summary"]["pictures"] == 4
 
 
+def test_the_verdict_names_the_folded_stacks_siblings_it_stacked(server):
+    """The response listed the group's members, not what it stacked.
+
+    The group names two pictures; one of them leads a deck of three, so the
+    verdict moves four, and the response says which four. A plain group's
+    stacked set is exactly its members.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},  # 0, the loose duplicate
+            {"pixel_sha": "aaa", "size_bytes": 100},  # 1, in the deck
+            {"pixel_sha": "yyy", "size_bytes": 800},  # 2, deck member, not matched
+            {"pixel_sha": "zzz", "size_bytes": 900},  # 3, deck member, not matched
+            {"pixel_sha": "ccc", "size_bytes": 300},  # 4, plain pair
+            {"pixel_sha": "ccc", "size_bytes": 300},  # 5, plain pair
+        ],
+    )
+    _stack_pictures(server, [ids[1], ids[2], ids[3]], name="deck")
+    _scan(server)
+    signatures = {
+        tuple(sorted(c["picture_id"] for c in row["candidates"])): row["signature"]
+        for row in _run(server, tiers.page_queue_in_session, None, None, 0, 10)[0]
+    }
+
+    folded = _run(
+        server,
+        verdicts.apply_stack_verdict_in_session,
+        signatures[(ids[0], ids[1])],
+        ids[0],
+        [],
+        None,
+    ).as_dict()
+    assert folded["picture_ids"] == [ids[0], ids[1]]
+    assert folded["stacked_picture_ids"] == sorted(ids[:4])
+
+    plain = _run(
+        server,
+        verdicts.apply_stack_verdict_in_session,
+        signatures[(ids[4], ids[5])],
+        None,
+        [],
+        None,
+    ).as_dict()
+    assert plain["stacked_picture_ids"] == [ids[4], ids[5]]
+
+
+def test_the_run_counts_the_pictures_it_stacked_as_the_preview_did(server):
+    """A run's `pictures` summed the groups' members (2 here).
+
+    The preview counts the folded deck's sibling (3), so the run must too.
+    """
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},  # 0
+            {"pixel_sha": "aaa", "size_bytes": 100},  # 1, in the deck
+            {"pixel_sha": "yyy", "size_bytes": 800},  # 2, deck member
+        ],
+    )
+    _stack_pictures(server, [ids[1], ids[2]], name="deck")
+    _scan(server)
+    preview = _run(server, _auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
+    assert report["failed"] == 0, report["failures"]
+    assert report["pictures"] == preview["pictures"] == 3
+
+
+def test_the_run_counts_a_shared_stack_once(server):
+    """Two groups folding one shared stack count each picture once (4),
+    not the sum of the two stacks they built (3 + 4)."""
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},  # 0, in the shared stack
+            {"pixel_sha": "aaa", "size_bytes": 100},  # 1, loose twin of 0
+            {"pixel_sha": "bbb", "size_bytes": 200},  # 2, in the shared stack
+            {"pixel_sha": "bbb", "size_bytes": 200},  # 3, loose twin of 2
+        ],
+    )
+    _stack_pictures(server, [ids[0], ids[2]], name="shared")
+    _scan(server)
+    preview = _run(server, _auto_stack_in_session, None, None, True, None)
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
+    assert report["groups"] == 2
+    assert report["pictures"] == preview["pictures"] == 4
+
+
 def _force_variable_limit(server, limit=999):
     """Lower every new vault connection to SQLite's historical bind limit.
 
@@ -3148,6 +3329,53 @@ def test_the_dry_run_moves_a_frozen_cover_where_the_run_moves_it(server):
     assert _picture(server, ids[1]).stack_position != 0
 
 
+def test_the_run_stacks_a_group_whose_preselected_cover_was_scrapheaped(server):
+    """Preview == run when the stored preselection left after the scan.
+
+    The scan preselects ids[0], then it goes to the Scrapheap. The preview has
+    always fallen back to the first live member in ranking order (ids[2]) and
+    counted the group; the run took the stored id as the cover, found it outside
+    the stack it was building and failed the group, so the consent dialog
+    promised a group the run never stacked.
+    """
+    ids = _seed(
+        server,
+        [
+            # Ranked first, so the scan preselects it; then scrapheaped.
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 4.9},
+            # Ranked last, the only starred one.
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 1.0, "score": 5},
+            # Ranked second: the fallback cover.
+            {"pixel_sha": "aaa", "size_bytes": 100, "smart_score": 3.0},
+        ],
+    )
+    _scan(server)
+    signature = _only_signature(server)
+    assert _preselected_cover(server, signature) == ids[0]
+
+    def scrapheap(session):
+        picture = session.get(Picture, ids[0])
+        picture.deleted = True
+        session.add(picture)
+        session.commit()
+
+    _run(server, scrapheap)
+
+    summary = _run(server, _auto_stack_in_session, None, None, True, None)[
+        "dry_run_summary"
+    ]
+    assert summary["groups"] == 1
+    assert summary["pictures"] == 2
+    assert summary["covers_gaining_score"] == 1
+
+    report = _run(server, _auto_stack_in_session, None, None, False, None)
+    assert report["failed"] == 0, report["failures"]
+    assert report["groups"] == 1
+    assert report["results"][0]["cover_picture_id"] == ids[2]
+    assert _picture(server, ids[2]).stack_position == 0
+    assert _picture(server, ids[1]).stack_id == _picture(server, ids[2]).stack_id
+
+
 # ── one commit per verdict, and a bulk run that scales ───────────────────────
 
 
@@ -3228,6 +3456,34 @@ def test_a_keep_separate_verdict_commits_once(server):
         ).one(),
     )
     assert verdict.verdict == VERDICT_KEEP_SEPARATE
+
+
+def test_clearing_a_stacked_decision_commits_once(server):
+    """The clear's operation row committed on its own, then the reopen.
+
+    The unstack, the reopen stamp and the operation row land in one commit, and
+    that commit still carries the operation under the clear's batch id.
+    """
+    _seed(
+        server,
+        [
+            {"pixel_sha": "aaa", "size_bytes": 100},
+            {"pixel_sha": "aaa", "size_bytes": 100},
+        ],
+    )
+    _scan(server)
+    signature = _one_signature(server)
+    _run(server, verdicts.apply_stack_verdict_in_session, signature, None, [], None)
+
+    cleared, commits = _commits_during(
+        server, verdicts.reopen_verdict_in_session, signature
+    )
+    assert commits == 1
+    assert cleared["batch_id"] is not None
+    reopen_rows = [
+        row for row in _operations(server) if row.op_type == verdicts.OP_TYPE_REOPEN
+    ]
+    assert [row.batch_id for row in reopen_rows] == [cleared["batch_id"]]
 
 
 def test_an_auto_stack_run_commits_once_per_group_and_holds_no_group_rows(server):
@@ -3572,3 +3828,184 @@ def test_an_error_in_the_recheck_is_logged_with_its_batch_and_raised(
     assert stopped.value.report["groups"] == 1
     # The first group committed under the supplied batch, and nothing else did.
     assert [row.batch_id for row in _operations(server)] == [batch_id]
+
+
+# ── membership reconcile over many stacks ─────────────────────────────────────
+
+
+def _seed_membership_stacks(server):
+    """Four stacks whose memberships disagree in every way a reconcile handles.
+
+    * ``spread``: three live members holding two projects and a set between
+      them, plus a Scrapheaped member in a set of its own;
+    * ``settled``: two members already in the same set;
+    * ``lonely``: one live member and one Scrapheaped;
+    * ``partial``: two members, only one of them in a set.
+    """
+
+    def insert(session):
+        projects = [Project(name="Alpha"), Project(name="Beta")]
+        sets = [PictureSet(name=name) for name in ("X", "Y", "Z")]
+        session.add_all([*projects, *sets])
+        session.flush()
+        alpha, beta = (int(project.id) for project in projects)
+        x, y, z = (int(picture_set.id) for picture_set in sets)
+        layout = {
+            "spread": [(False, [beta], [x]), (False, [alpha], []), (False, [], [])]
+            + [(True, [], [y])],
+            "settled": [(False, [], [x]), (False, [], [x])],
+            "lonely": [(False, [], [z]), (True, [], [])],
+            "partial": [(False, [], []), (False, [], [z])],
+        }
+        stack_ids, picture_ids = {}, {}
+        for name, members in layout.items():
+            stack = PictureStack(name=None)
+            session.add(stack)
+            session.flush()
+            stack_ids[name] = int(stack.id)
+            picture_ids[name] = []
+            for position, (deleted, project_ids, set_ids) in enumerate(members):
+                pic = Picture(
+                    file_path=f"/vault/reconcile_{name}_{position}.png",
+                    format="png",
+                    width=100,
+                    height=100,
+                    size_bytes=100,
+                    stack_id=int(stack.id),
+                    stack_position=position,
+                    deleted=deleted,
+                    project_id=project_ids[0] if project_ids else None,
+                )
+                session.add(pic)
+                session.flush()
+                picture_ids[name].append(int(pic.id))
+                for project_id in project_ids:
+                    session.add(
+                        PictureProjectMember(
+                            picture_id=int(pic.id), project_id=project_id
+                        )
+                    )
+                for set_id in set_ids:
+                    session.add(PictureSetMember(set_id=set_id, picture_id=int(pic.id)))
+        session.commit()
+        return stack_ids, picture_ids, (alpha, beta), (x, y, z)
+
+    return _run(server, insert)
+
+
+def _membership_snapshot(session):
+    return (
+        sorted(
+            (int(row.picture_id), int(row.project_id))
+            for row in session.exec(select(PictureProjectMember)).all()
+        ),
+        sorted(
+            (int(row.set_id), int(row.picture_id))
+            for row in session.exec(select(PictureSetMember)).all()
+        ),
+        sorted(
+            (int(pic.id), pic.project_id) for pic in session.exec(select(Picture)).all()
+        ),
+    )
+
+
+def test_reconciling_many_stacks_matches_reconciling_each(server):
+    stack_ids, ids, (alpha, beta), (x, y, z) = _seed_membership_stacks(server)
+    order = list(stack_ids.values())
+
+    def both_ways(session):
+        one_by_one = {
+            stack_id: stack_membership.reconcile_stack_membership(session, stack_id)
+            for stack_id in order
+        }
+        session.flush()
+        after_each = _membership_snapshot(session)
+        session.rollback()
+        batched = stack_membership.reconcile_stacks_membership(
+            session, [*order, order[0], None]
+        )
+        session.flush()
+        after_batch = _membership_snapshot(session)
+        session.rollback()
+        return one_by_one, after_each, batched, after_batch
+
+    one_by_one, after_each, batched, after_batch = _run(server, both_ways)
+    assert (
+        batched
+        == one_by_one
+        == {
+            stack_ids["spread"]: True,
+            stack_ids["settled"]: False,
+            stack_ids["lonely"]: False,
+            stack_ids["partial"]: True,
+        }
+    )
+    assert after_batch == after_each
+    projects, sets, scalars = after_batch
+    spread_live = ids["spread"][:3]
+    for pid in spread_live:
+        assert (pid, alpha) in projects and (pid, beta) in projects
+        assert (x, pid) in sets
+        # The Scrapheaped member's set is not a live member's, so nothing gains it.
+        assert (y, pid) not in sets
+    assert {pid: project for pid, project in scalars if pid in spread_live} == {
+        pid: min(alpha, beta) for pid in spread_live
+    }
+    assert (z, ids["partial"][0]) in sets
+    assert (z, ids["lonely"][1]) not in sets
+
+
+def test_reconciling_more_stacks_issues_no_more_statements(server):
+    stack_ids, _ids, _projects, _sets = _seed_membership_stacks(server)
+    few = list(stack_ids.values())[:2]
+    every = list(stack_ids.values())
+
+    def count(session, chosen):
+        statements = []
+
+        def record(_conn, _cursor, statement, *_args):
+            statements.append(statement)
+
+        bind = session.get_bind()
+        event.listen(bind, "before_cursor_execute", record)
+        try:
+            stack_membership.reconcile_stacks_membership(session, chosen)
+        finally:
+            event.remove(bind, "before_cursor_execute", record)
+        session.rollback()
+        return sum(1 for s in statements if s.lstrip().upper().startswith("SELECT"))
+
+    assert _run(server, count, few) == _run(server, count, every)
+
+
+def test_a_locked_set_refuses_the_whole_batch_before_any_write(server):
+    stack_ids, ids, _projects, (x, _y, _z) = _seed_membership_stacks(server)
+
+    def lock_x(session):
+        session.get(PictureSet, x).locked = True
+        session.commit()
+
+    _run(server, lock_x)
+
+    def reconcile(session):
+        before = _membership_snapshot(session)
+        with pytest.raises(HTTPException) as refused:
+            stack_membership.reconcile_stacks_membership(
+                session, [stack_ids["partial"], stack_ids["spread"]]
+            )
+        session.flush()
+        return before, _membership_snapshot(session), refused.value
+
+    before, after, refused = _run(server, reconcile)
+    assert refused.status_code == 423
+    assert refused.detail["sets"] == [{"id": x, "name": "X"}]
+    assert sorted(refused.detail["picture_ids"]) == sorted(ids["spread"][1:3])
+    # ``partial`` came first and is not locked, yet it gained nothing either.
+    assert after == before
+
+    # A locked set that already holds the whole stack gains nothing: no refusal.
+    assert _run(
+        server,
+        stack_membership.reconcile_stacks_membership,
+        [stack_ids["settled"]],
+    ) == {stack_ids["settled"]: False}

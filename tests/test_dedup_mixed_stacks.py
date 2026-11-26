@@ -522,6 +522,32 @@ def test_a_member_without_a_perceptual_hash_is_reported_not_stranded():
         _teardown(temp_dir, server)
 
 
+@pytest.mark.parametrize("malformed", ["-" + "f" * 15, "0x" + "f" * 14, "f_" * 8])
+def test_a_malformed_perceptual_hash_is_not_yet_comparable(malformed):
+    """``int(text, 16)`` takes a sign, a ``0x`` and ``_``; a stored hash may not.
+
+    Each of these parses to some number, so it used to be compared as a hash
+    it never was.
+    """
+    temp_dir, client, server, stacks, _token = _env()
+    try:
+        stack_id, picture_ids = stacks["mixed"]
+
+        def corrupt_hash(session):
+            picture = session.get(Picture, picture_ids[2])
+            picture.perceptual_hash = malformed
+            session.add(picture)
+            session.commit()
+
+        _run(server, corrupt_hash)
+        row = _rows_by_stack(client.get(MIXED_URL, params={"threshold": 0.90}).json())[
+            stack_id
+        ]
+        assert row["unhashed_picture_ids"] == [picture_ids[2]]
+    finally:
+        _teardown(temp_dir, server)
+
+
 # ── per-member evidence, and the row's why-pills ─────────────────────────────
 
 

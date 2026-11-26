@@ -6,10 +6,16 @@ it and never drift. Given unit-norm CLIP embeddings and a boolean "has the tag" 
 scores how much each image's nearest neighbours disagree with its own label.
 """
 
+import re
+
 import numpy as np
 
 EMBEDDING_DIM = 512  # CLIP ViT-B-32 image_embedding blobs are 512 float32 = 2048 bytes.
 EMBEDDING_BYTES = EMBEDDING_DIM * 4
+
+# The largest stored dhash: 64 bits (an 8x8 difference hash), the uint64 ceiling.
+DHASH_MAX = (1 << 64) - 1
+_HEX_DIGITS = re.compile(r"[0-9a-fA-F]+")
 
 
 def dedupe_by_pair(rows: list[dict]) -> list[dict]:
@@ -154,6 +160,31 @@ def _popcount_u64(values: np.ndarray) -> np.ndarray:
     """
     as_bytes = values.astype(np.uint64).view(np.uint8).reshape(values.shape[0], 8)
     return np.unpackbits(as_bytes, axis=1).sum(axis=1).astype(np.int64)
+
+
+def parse_dhash(text: str | None) -> int | None:
+    """The 64-bit dhash *text* spells, or ``None`` when it spells none.
+
+    The embedding worker stores a dhash as 16 lowercase hex digits.
+    ``int(text, 16)`` is not a check on that: it also takes a sign, a ``0x``
+    prefix, ``_`` separators, surrounding whitespace, non-ASCII digits and any
+    length. So a malformed value parses to a negative or wider-than-64-bit
+    number, which a uint64 pack rejects with ``OverflowError`` and a Hamming
+    distance turns into nonsense, or to a different hash altogether. Only ASCII
+    hex digits whose value fits 64 bits come back as a number.
+
+    A caller that reads a fixed-width prefix slices it before calling.
+
+    Args:
+        text: The stored hash, or ``None``.
+
+    Returns:
+        The hash as an int in ``0 .. DHASH_MAX``, or ``None``.
+    """
+    if not text or not _HEX_DIGITS.fullmatch(text):
+        return None
+    value = int(text, 16)
+    return value if value <= DHASH_MAX else None
 
 
 def hamming_distance(a: int, b: int) -> int:

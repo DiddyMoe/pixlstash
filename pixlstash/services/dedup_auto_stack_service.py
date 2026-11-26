@@ -35,6 +35,11 @@ parameters is refused (Google AIP-155, IETF Idempotency-Key draft).
 **A restart interrupts.** A run is not resumed after the server stops; it is
 marked ``interrupted`` at start-up and the user decides whether to run again.
 Everything it committed stays committed and revertable.
+
+**Rows are kept for a while, not for ever.** Each new run deletes the ended
+rows past the newest :data:`HISTORY_KEPT`, in the transaction that inserts it.
+A pruned run's stacks stay in History, so Ctrl+Z still undoes them; only the
+run's own revert, and a replay of its ``request_id``, are gone with the row.
 """
 
 from __future__ import annotations
@@ -42,8 +47,9 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
+from sqlalchemy import delete
 from sqlmodel import Session, select
 
 from pixlstash.db_models.dedup import (
@@ -90,6 +96,11 @@ FAILURES_KEPT = 50
 """Per-group failures kept on the run row. The counters stay exact; the list is
 for showing the user a sample of why, not an audit log (the log has every one)."""
 
+HISTORY_KEPT = 20
+"""Ended run rows kept; each new run deletes the older ones. The same count as
+Scrapheap runs keep (``scrapheap_run_service.HISTORY_KEPT``). The client reads
+the latest run, so twenty leaves room to revert a recent one by id."""
+
 REQUEST_ID_MAX_LENGTH = 128
 
 ERROR_ACTIVE = "auto_stack_run_active"
@@ -99,7 +110,29 @@ ERROR_NOT_AN_APPLY_RUN = "not_an_apply_run"
 ERROR_NOTHING_TO_REVERT = "nothing_to_revert"
 ERROR_HISTORY_MOVED_ON = "history_moved_on"
 ERROR_SERVER_RESTARTED = "server_restarted"
+ERROR_LIBRARY_RESTORED = "library_restored"
+"""A run's ``error_code`` when a full restore brought its row back active: the
+snapshot was taken while it ran, and no task of this process owns it."""
+LIBRARY_RESTORED_MESSAGE = (
+    "The library was restored to a snapshot taken before this run finished."
+)
 ERROR_UNEXPECTED = "unexpected_error"
+ERROR_UNAVAILABLE = "auto_stack_runs_unavailable"
+
+UNAVAILABLE_MESSAGE = (
+    "This server runs no background work, so auto-stacking cannot run here."
+)
+"""Why a run was refused on a server started with ``disable_background_workers``.
+The planner that picks a recorded run up is absent there, so a run recorded
+anyway would stay ``pending`` forever and refuse every later one as active."""
+
+UNEXPECTED_ERROR_MESSAGE = (
+    "The server hit an unexpected error; the server log has the details."
+)
+"""What a failed run, and a group that failed on a defect, record as ``error``.
+The exception text is logged, not stored: it can carry file paths or SQL, and
+the run view is served to every owner session (OWASP Logging Cheat Sheet, "Data
+to exclude")."""
 
 
 class AutoStackRunError(Exception):
@@ -163,6 +196,33 @@ def _has_applied_operations(session: Session, batch_ids: list[str]) -> bool:
     return False
 
 
+def _apply_run_can_revert(session: Session, run: DedupAutoStackRun) -> bool:
+    """Whether *run* is a finished apply run with something left to undo.
+
+    True when a revert of it would have work to do: one of its segments still
+    has an applied, undoable operation. A revert run is never the target of a
+    revert, so it is always false for one, without a query.
+    """
+    if run.kind != AUTO_STACK_KIND_APPLY or run.status in AUTO_STACK_ACTIVE_STATUSES:
+        return False
+    segments = _segments(run)
+    return bool(segments) and _has_applied_operations(session, segments)
+
+
+def _target_can_revert(session: Session, run: DedupAutoStackRun) -> bool:
+    """Whether *run* is a finished revert whose apply run has something left.
+
+    The same answer :func:`_apply_run_can_revert` gives for the target, at the
+    cost of one primary-key lookup of the target row. A target pruned past
+    :data:`HISTORY_KEPT` cannot be reverted (404), so it has nothing left
+    either.
+    """
+    if run.kind != AUTO_STACK_KIND_REVERT or run.status in AUTO_STACK_ACTIVE_STATUSES:
+        return False
+    target = session.get(DedupAutoStackRun, run.target_run_id)
+    return target is not None and _apply_run_can_revert(session, target)
+
+
 def serialize_run(session: Session, run: DedupAutoStackRun) -> dict[str, Any]:
     """Shape a run for the API.
 
@@ -173,17 +233,19 @@ def serialize_run(session: Session, run: DedupAutoStackRun) -> dict[str, Any]:
     unstacked so far and ``superseded`` the segments that had nothing left to
     undo. ``pictures`` is pictures stacked, or restored, so far.
 
-    ``can_revert`` is true for a finished apply run with a segment that still
-    has something to undo.
+    Two flags say whether a revert would do anything, each about the run whose
+    revert route it names. ``can_revert``: this run is a finished apply run
+    with a segment that still has something to undo, so
+    ``POST .../runs/{id}/revert`` would start a revert. ``target_can_revert``:
+    this run is a finished revert and its ``target_run_id`` would answer
+    ``can_revert`` true, so sending the revert again would undo something (a
+    revert that stopped short, or one blocked by a later edit). Kept apart
+    rather than giving ``can_revert`` a second meaning on a revert run: a
+    client acting on ``can_revert`` reverts the run it read, and a revert of a
+    revert is refused.
     """
     segments = _segments(run)
     active = run.status in AUTO_STACK_ACTIVE_STATUSES
-    can_revert = (
-        run.kind == AUTO_STACK_KIND_APPLY
-        and not active
-        and bool(segments)
-        and _has_applied_operations(session, segments)
-    )
     scope = _scope(run)
     return {
         "id": int(run.id),
@@ -204,7 +266,8 @@ def serialize_run(session: Session, run: DedupAutoStackRun) -> dict[str, Any]:
         "failures": _failures(run),
         "segment_batch_ids": segments,
         "cancel_requested": bool(run.cancel_requested),
-        "can_revert": can_revert,
+        "can_revert": _apply_run_can_revert(session, run),
+        "target_can_revert": _target_can_revert(session, run),
         "error_code": run.error_code,
         "error": run.error,
         "created_at": _iso(run.created_at),
@@ -267,6 +330,28 @@ def _replay(
     return serialize_run(session, existing)
 
 
+def _prune_ended_runs(session: Session, keep_id: Optional[int]) -> int:
+    """Delete the ended rows past the newest :data:`HISTORY_KEPT`.
+
+    Called after the one-active check, in its transaction, so every row it
+    sees has ended. *keep_id* is never deleted: the apply run a new revert
+    names can be the oldest row at the moment its revert is asked for. Ids
+    only grow, so the order by id is the order runs were requested in.
+    """
+    query = select(DedupAutoStackRun.id)
+    if keep_id is not None:
+        query = query.where(DedupAutoStackRun.id != keep_id)
+    stale = session.exec(
+        query.order_by(DedupAutoStackRun.id.desc()).offset(HISTORY_KEPT)
+    ).all()
+    if stale:
+        session.exec(
+            delete(DedupAutoStackRun).where(DedupAutoStackRun.id.in_(list(stale)))
+        )
+        logger.info("[auto-stack] pruned %d ended run rows", len(stale))
+    return len(stale)
+
+
 def _insert_run(
     session: Session,
     params: dict[str, Any],
@@ -277,7 +362,11 @@ def _insert_run(
     total: int = 0,
     segment_batch_ids: Optional[list[str]] = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Insert a pending run after the replay and one-active checks."""
+    """Insert a pending run after the replay and one-active checks.
+
+    Ended rows past :data:`HISTORY_KEPT` are deleted in the same commit,
+    after both checks, so a refused request deletes nothing.
+    """
     if request_id:
         replayed = _replay(session, request_id, params)
         if replayed is not None:
@@ -302,6 +391,7 @@ def _insert_run(
         updated_at=now,
         **params,
     )
+    _prune_ended_runs(session, params["target_run_id"])
     session.add(run)
     session.commit()
     session.refresh(run)
@@ -464,6 +554,17 @@ def cancel_run_in_session(session: Session, run_id: int) -> dict[str, Any]:
     return serialize_run(session, run)
 
 
+def active_run_id(session: Session) -> Optional[int]:
+    """Return the oldest pending or running run's id, or ``None``.
+
+    For a restore: such a run is one a person asked for. A pending one has no
+    task yet (the finder submits it), and cancelling a running one ends it
+    ``interrupted``, so a restore refuses while either exists.
+    """
+    run = _active_run(session)
+    return int(run.id) if run is not None else None
+
+
 def find_pending_run_id(session: Session) -> Optional[int]:
     """Return the oldest pending run's id, for the finder."""
     row = session.exec(
@@ -481,6 +582,25 @@ def interrupt_orphaned_runs_in_session(session: Session) -> int:
     Called once at start-up, before the planner starts: no task of this process
     can own such a run yet. A run is not resumed; what it committed stays.
     """
+    return _interrupt_active_runs(
+        session,
+        ERROR_SERVER_RESTARTED,
+        "The server stopped before the run finished.",
+    )
+
+
+def interrupt_restored_runs_in_session(session: Session) -> int:
+    """Mark every run a full restore brought back pending or running interrupted.
+
+    Called after the swap, with every task drained: the snapshot was taken
+    while the run went, and no task of this process owns it.
+    """
+    return _interrupt_active_runs(
+        session, ERROR_LIBRARY_RESTORED, LIBRARY_RESTORED_MESSAGE
+    )
+
+
+def _interrupt_active_runs(session: Session, error_code: str, error: str) -> int:
     rows = session.exec(
         select(DedupAutoStackRun).where(
             DedupAutoStackRun.status.in_(AUTO_STACK_ACTIVE_STATUSES)
@@ -489,16 +609,17 @@ def interrupt_orphaned_runs_in_session(session: Session) -> int:
     now = _now()
     for run in rows:
         run.status = AUTO_STACK_INTERRUPTED
-        run.error_code = ERROR_SERVER_RESTARTED
-        run.error = "The server stopped before the run finished."
+        run.error_code = error_code
+        run.error = error
         run.finished_at = now
         run.updated_at = now
         session.add(run)
     if rows:
         session.commit()
         logger.warning(
-            "[auto-stack] marked %d run(s) interrupted at start-up: %s",
+            "[auto-stack] marked %d run(s) interrupted (%s): %s",
             len(rows),
+            error_code,
             [int(run.id) for run in rows],
         )
     return len(rows)
@@ -591,15 +712,39 @@ def _segment_for_slice(
     return segment
 
 
+def _newly_counted(picture_ids: Iterable[int], counted: set[int]) -> set[int]:
+    """The pictures in *picture_ids* the run has not counted yet.
+
+    ``run.pictures`` counts distinct pictures over the whole run. A slice's own
+    figure is distinct within the slice only: a stack shared by groups in two
+    slices (the second group folds the stack the first built) would be counted
+    once per slice. The caller adds the result to *counted* once its commit
+    has landed.
+    """
+    return {int(pid) for pid in picture_ids} - counted
+
+
 def _absorb(
-    run: DedupAutoStackRun, report: dict[str, Any], extra_failures: list[dict]
-) -> None:
-    """Add one slice report's counts to the run row (not committed)."""
+    run: DedupAutoStackRun,
+    report: dict[str, Any],
+    extra_failures: list[dict],
+    counted_picture_ids: set[int],
+) -> set[int]:
+    """Add one slice report's counts to the run row (not committed).
+
+    Returns:
+        The pictures this slice added to ``run.pictures``, for the caller to
+        add to *counted_picture_ids* after the commit.
+    """
     run.applied += int(report["groups"])
     run.superseded += int(report["superseded"])
     run.blocked += int(report["blocked"])
     run.failed += int(report["failed"]) + len(extra_failures)
-    run.pictures += int(report["pictures"])
+    new_ids = _newly_counted(
+        (pid for item in report["results"] for pid in item["stacked_picture_ids"]),
+        counted_picture_ids,
+    )
+    run.pictures += len(new_ids)
     run.segment_groups += int(report["groups"])
     failures = _failures(run)
     room = FAILURES_KEPT - len(failures)
@@ -607,12 +752,20 @@ def _absorb(
         failures.extend((list(report["failures"]) + extra_failures)[:room])
         run.failures = json.dumps(failures, default=str)
     run.updated_at = _now()
+    return new_ids
 
 
 def apply_slice_in_session(
-    session: Session, run_id: int, group_ids: list[int]
+    session: Session,
+    run_id: int,
+    group_ids: list[int],
+    counted_picture_ids: set[int],
 ) -> dict[str, Any]:
     """Stack one slice of planned groups for a running apply run.
+
+    *counted_picture_ids* is the run's pictures counted so far, held by the
+    task that works the run from start to end (a run is never resumed; a
+    restart interrupts it). The slice adds what it counted once it commits.
 
     Returns:
         ``status`` (``running``, or ``cancelled`` when a cancel was requested
@@ -640,7 +793,7 @@ def apply_slice_in_session(
             "signature": exc.signature,
             "outcome": BULK_REASON_FAILED,
             "status_code": None,
-            "error": f"{type(cause).__name__}: {cause}",
+            "error": UNEXPECTED_ERROR_MESSAGE,
         }
         report = exc.report
         handled = (
@@ -650,7 +803,7 @@ def apply_slice_in_session(
             + int(report["failed"])
             + 1
         )
-        _absorb(run, report, [failure])
+        new_ids = _absorb(run, report, [failure], counted_picture_ids)
         run.processed += handled
         run.status = AUTO_STACK_FAILED
         run.error_code = ERROR_UNEXPECTED
@@ -658,13 +811,15 @@ def apply_slice_in_session(
         run.finished_at = _now()
         session.add(run)
         session.commit()
+        counted_picture_ids.update(new_ids)
         logger.error(
-            "[auto-stack] run %s failed at group %s after %d of %d group(s): %s",
+            "[auto-stack] run %s failed at group %s after %d of %d group(s): %s: %s",
             run_id,
             exc.signature,
             run.processed,
             run.total,
-            run.error,
+            type(cause).__name__,
+            cause,
         )
         return {
             "status": AUTO_STACK_FAILED,
@@ -673,10 +828,11 @@ def apply_slice_in_session(
             "event_picture_ids": list(report["event_picture_ids"]),
         }
     run = session.get(DedupAutoStackRun, int(run_id))
-    _absorb(run, report, [])
+    new_ids = _absorb(run, report, [], counted_picture_ids)
     run.processed += len(group_ids)
     session.add(run)
     session.commit()
+    counted_picture_ids.update(new_ids)
     return {
         "status": AUTO_STACK_RUNNING,
         "processed": int(run.processed),
@@ -689,10 +845,15 @@ def revert_segment_in_session(
     session: Session,
     run_id: int,
     batch_id: str,
+    counted_picture_ids: set[int],
     registry: Optional[InteractiveRescoreRegistry] = None,
     image_root: Optional[str] = None,
 ) -> dict[str, Any]:
     """Undo one segment of the target run for a running revert run.
+
+    *counted_picture_ids* is as for :func:`apply_slice_in_session`: a picture
+    two segments both touched (a stack one segment built and the next grew) is
+    counted once.
 
     Returns:
         ``status``: ``running`` after undoing or skipping the segment,
@@ -740,10 +901,12 @@ def revert_segment_in_session(
     run = session.get(DedupAutoStackRun, int(run_id))
     run.processed += 1
     run.applied += len(members)
-    run.pictures += len(touched)
+    new_ids = _newly_counted(touched, counted_picture_ids)
+    run.pictures += len(new_ids)
     run.updated_at = _now()
     session.add(run)
     session.commit()
+    counted_picture_ids.update(new_ids)
     return {
         "status": AUTO_STACK_RUNNING,
         "restore": {
@@ -823,6 +986,20 @@ def close_run_in_session(
 # --- Vault wrappers -----------------------------------------------------------
 
 
+def _check_can_start(vault: "Vault") -> None:
+    """Refuse a run before recording it when no planner would ever work it.
+
+    Raises:
+        AutoStackRunError: :data:`ERROR_UNAVAILABLE`.
+    """
+    if not vault.runs_background_work():
+        logger.warning(
+            "[auto-stack] run not recorded: this server runs no background "
+            "tasks (disable_background_workers)"
+        )
+        raise AutoStackRunError(ERROR_UNAVAILABLE, UNAVAILABLE_MESSAGE)
+
+
 def start_apply_run(
     vault: "Vault",
     scope: Optional[DedupScope] = None,
@@ -832,7 +1009,14 @@ def start_apply_run(
     source: Optional[str] = None,
     origin_client_id: Optional[str] = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Record an apply run and wake the planner so it starts promptly."""
+    """Record an apply run and wake the planner so it starts promptly.
+
+    Raises:
+        AutoStackRunError: :data:`ERROR_UNAVAILABLE` on a server with no
+            background work (nothing is recorded), or what
+            :func:`create_apply_run_in_session` raises.
+    """
+    _check_can_start(vault)
     run, created = vault.db.run_task(
         create_apply_run_in_session,
         scope,
@@ -855,7 +1039,14 @@ def start_revert_run(
     source: Optional[str] = None,
     origin_client_id: Optional[str] = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Record a revert run and wake the planner so it starts promptly."""
+    """Record a revert run and wake the planner so it starts promptly.
+
+    Raises:
+        AutoStackRunError: :data:`ERROR_UNAVAILABLE` on a server with no
+            background work (nothing is recorded), or what
+            :func:`create_revert_run_in_session` raises.
+    """
+    _check_can_start(vault)
     run, created = vault.db.run_task(
         create_revert_run_in_session,
         target_run_id,
@@ -887,16 +1078,23 @@ def cancel_run(vault: "Vault", run_id: int) -> dict[str, Any]:
 __all__ = [
     "ERROR_ACTIVE",
     "ERROR_HISTORY_MOVED_ON",
+    "ERROR_LIBRARY_RESTORED",
     "ERROR_NOTHING_TO_REVERT",
     "ERROR_NOT_AN_APPLY_RUN",
     "ERROR_NOT_FOUND",
     "ERROR_REQUEST_ID_REUSED",
     "ERROR_SERVER_RESTARTED",
+    "ERROR_UNAVAILABLE",
     "ERROR_UNEXPECTED",
     "FAILURES_KEPT",
+    "HISTORY_KEPT",
+    "LIBRARY_RESTORED_MESSAGE",
     "REQUEST_ID_MAX_LENGTH",
     "SEGMENT_GROUP_CAP",
+    "UNAVAILABLE_MESSAGE",
+    "UNEXPECTED_ERROR_MESSAGE",
     "AutoStackRunError",
+    "active_run_id",
     "apply_slice_in_session",
     "cancel_run",
     "cancel_run_in_session",
@@ -908,6 +1106,7 @@ __all__ = [
     "get_run",
     "get_run_in_session",
     "interrupt_orphaned_runs_in_session",
+    "interrupt_restored_runs_in_session",
     "latest_run",
     "latest_run_in_session",
     "record_plan_in_session",

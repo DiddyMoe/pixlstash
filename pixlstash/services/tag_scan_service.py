@@ -83,6 +83,7 @@ from pixlstash.utils.near_neighbor import (
     hamming_distance,
     knn_disagreement_with_neighbors,
     nearest_opposite_by_hamming,
+    parse_dhash,
 )
 
 if TYPE_CHECKING:
@@ -624,15 +625,16 @@ def _vote_arrays(
     phash_values: list[int] = []
     phash_valid: list[bool] = []
     for pic_id, phash in zip(ids, phashes):
-        # dhash is stored as a 16-char lowercase hex string (8x8 = 64 bits). Parse to an
-        # int; mark missing/malformed values invalid rather than raising.
+        # A missing or malformed dhash marks the row invalid rather than raising:
+        # one bad row must not abort the scan (parse_dhash says what malformed is).
         value = 0
         valid = False
         if phash:
-            try:
-                value = int(phash, 16)
+            parsed = parse_dhash(phash)
+            if parsed is not None:
+                value = parsed
                 valid = True
-            except (ValueError, TypeError):
+            else:
                 logger.warning(
                     "scan_tag: unparseable perceptual_hash %r for picture %s; "
                     "excluding from near-duplicate twin selection",

@@ -454,14 +454,18 @@ function asSentence(text) {
  *     away, and the rest is still selected to run again;
  *   * the answer was lost (a timeout, a dropped connection): the request may
  *     have committed, so the grid is re-read and the message cannot claim
- *     either way. Rerunning is still safe: a collapsed stack has one live
- *     member left, and the server skips a stack of one without writing.
+ *     either way. It says the grid was reloaded only when the re-read landed;
+ *     when that failed too, reloading the page is the way to see where things
+ *     stand. Rerunning is still safe: a collapsed stack has one live member
+ *     left, and the server skips a stack of one without writing.
  *
  * @param {Object} details
  * @param {number} details.stacksDone - stacks in the requests that answered.
  * @param {number} details.stacksTotal - stacks in the whole selection.
  * @param {string} [details.detail] - the server's or the transport's reason.
  * @param {boolean} [details.outcomeUnknown] - the failed request got no answer.
+ * @param {boolean} [details.reloaded] - with `outcomeUnknown`: whether the
+ *   grid's re-read after it landed.
  * @returns {string}
  */
 export function keepCoverOnlyIncompleteMessage({
@@ -469,6 +473,7 @@ export function keepCoverOnlyIncompleteMessage({
   stacksTotal,
   detail,
   outcomeUnknown = false,
+  reloaded = false,
 }) {
   const done = Number(stacksDone) || 0;
   const total = Number(stacksTotal) || 0;
@@ -481,7 +486,10 @@ export function keepCoverOnlyIncompleteMessage({
     return [
       lead,
       reason,
-      "The grid has been reloaded to show where things stand. Running Keep cover only again is safe: a stack already collapsed is skipped.",
+      reloaded
+        ? "The grid has been reloaded to show where things stand."
+        : "The grid could not be reloaded either, so reload the page to see where things stand.",
+      "Running Keep cover only again is safe: a stack already collapsed is skipped.",
     ]
       .filter(Boolean)
       .join(" ");

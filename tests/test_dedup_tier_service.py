@@ -22,16 +22,26 @@ Covers, per tier and per rule:
 import gc
 import json
 import os
+import re
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlmodel import select
 
 from pixlstash.database import DBPriority
-from pixlstash.db_models import Picture, PictureSet, PictureSetMember, PictureStack
+from pixlstash.db_models import (
+    Character,
+    Face,
+    Picture,
+    PictureProjectMember,
+    PictureSet,
+    PictureSetMember,
+    PictureStack,
+    Project,
+)
 from pixlstash.db_models.dedup import (
     SCAN_PENDING,
     SCAN_RUNNING,
@@ -59,6 +69,7 @@ from pixlstash.tasks.dedup_scan_task import DedupScanTask
 from pixlstash.tasks.dedup_scan_finder import DedupScanFinder
 from pixlstash.tasks.task_type import TaskType
 from pixlstash.task_runner import TaskRunner
+from pixlstash.utils.query.folder_prefix import PATHS_FOLD_CASE
 
 _BASE_TIME = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -558,18 +569,22 @@ def test_the_exact_member_lookup_is_planned_on_the_pixel_sha_index(server):
 
     PixlStash never runs ``ANALYZE``, and without statistics SQLite prefers a
     ``deleted`` equality to the ``pixel_sha IN (...)`` list, which made every
-    lookup one full pass over the library. The statement is captured as it is
-    executed and explained against the same database.
+    lookup one full pass over the library. A scoped lookup checks each row's
+    membership as a probe: as ``Picture.id IN (members)`` SQLite built the
+    whole scope's list for every page and drove the read from it. The
+    statement is captured as it is executed and explained against the same
+    database.
     """
-    _seed(
+    ids = _seed(
         server,
         [
             {"pixel_sha": "aaa", "size_bytes": 100},
             {"pixel_sha": "aaa", "size_bytes": 100},
         ],
     )
+    set_scope = _collection_scopes(server, ids)[ScopeType.SET]
 
-    def explain_member_lookup(session):
+    def explain_member_lookup(session, scope):
         executed = []
 
         def capture(_conn, _cursor, statement, parameters, _context, _many):
@@ -580,7 +595,7 @@ def test_the_exact_member_lookup_is_planned_on_the_pixel_sha_index(server):
         event.listen(engine, "before_cursor_execute", capture)
         try:
             groups = tiers.build_exact_groups_for_keys_in_session(
-                session, [("aaa", 100)]
+                session, [("aaa", 100)], scope
             )
         finally:
             event.remove(engine, "before_cursor_execute", capture)
@@ -595,11 +610,526 @@ def test_the_exact_member_lookup_is_planned_on_the_pixel_sha_index(server):
         ]
         return len(groups), plans
 
-    group_count, plans = _run(server, explain_member_lookup)
+    group_count, plans = _run(server, explain_member_lookup, None)
     assert group_count == 1
     assert len(plans) == 1, plans
     assert "ix_picture_pixel_sha" in plans[0], plans
     assert "ix_picture_deleted" not in plans[0], plans
+
+    group_count, plans = _run(server, explain_member_lookup, set_scope)
+    assert group_count == 1
+    assert len(plans) == 1, plans
+    assert (
+        "SEARCH picture USING INDEX ix_picture_pixel_sha (pixel_sha=?)" in (plans[0])
+    ), plans
+    assert "(set_id=? AND picture_id=?)" in plans[0], plans
+    assert_scope_probed_per_row(plans[0], "picturesetmember")
+    assert "rowid" not in plans[0], plans
+    assert "ix_picture_deleted" not in plans[0], plans
+
+
+SCOPE_TABLES = {
+    ScopeType.SET: "picturesetmember",
+    ScopeType.PROJECT: "pictureprojectmember",
+    ScopeType.CHARACTER: "face",
+}
+"""The membership table each collection scope probes."""
+
+_INDEX_READ = re.compile(
+    r"^SEARCH (?P<table>\w+)\b[^(]*\bINDEX (?P<index>\w+) \((?P<key>[^)]*)\)$"
+)
+
+
+def assert_scope_probed_per_row(plan: str, table: str) -> None:
+    """Assert *plan* reads *table* only as an index probe keyed on ``picture_id``.
+
+    That is the property the scoped reads rely on: membership is checked for
+    each row the hash index selects, never built once and walked. It is
+    asserted on the shape of the line that reads the table, not on a label:
+    SQLite up to 3.50 prints the probe under a ``CORRELATED SCALAR SUBQUERY``
+    line and 3.53 prints it as ``SEARCH <table> EXISTS USING INDEX ...``. The
+    ``IN (members)`` form this guards against reads the table keyed on the
+    scope id alone (``(set_id=?)``), so it fails here on every version.
+    *plan* is the ``" | "``-joined detail column of ``EXPLAIN QUERY PLAN``.
+    """
+    lines = [
+        line
+        for line in plan.split(" | ")
+        if re.match(rf"^(SEARCH|SCAN) {table}\b", line)
+    ]
+    assert lines, (table, plan)
+    for line in lines:
+        read = _INDEX_READ.match(line)
+        assert read is not None, (table, line, plan)
+        assert "picture_id=?" in read["key"].split(" AND "), (table, line, plan)
+
+
+def _explain_exact_key_reads(server, scope, shards):
+    """Run the key discovery for each of *shards* and explain what it sent.
+
+    Returns ``(keys per shard, plan per statement)``, the plans explained on
+    the connection that ran the statement.
+    """
+
+    def explain(session):
+        executed = []
+
+        def capture(_conn, _cursor, statement, parameters, _context, _many):
+            if "GROUP BY picture.pixel_sha" in statement:
+                executed.append((statement, parameters))
+
+        engine = session.get_bind()
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            keys = [
+                tiers.find_exact_keys_in_session(session, scope, shard)
+                for shard in shards
+            ]
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        plans = [
+            " | ".join(
+                str(row[-1])
+                for row in session.connection()
+                .exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)
+                .all()
+            )
+            for statement, parameters in executed
+        ]
+        return keys, plans
+
+    return _run(server, explain)
+
+
+def test_an_exact_key_shard_reads_only_its_slice_of_the_pixel_sha_index(server):
+    """Each shard of the key discovery is a covering range of ``ix_picture_pixel_sha``.
+
+    The shards exist so a stop can land between them; that is only worth it if
+    a shard reads its sixteenth of the index. PixlStash never runs ``ANALYZE``,
+    and without statistics SQLite rates the ``deleted`` equality above a range,
+    walking ``ix_picture_deleted`` and the whole live table once per shard: 16
+    full reads where there was one. The slice is grouped on the index alone
+    (covering, no table row) and only the shared hashes' rows are then read,
+    each by an equality on the same index. The first and last shards (one bound
+    each) and a middle one (two bounds) are each pinned; the scoped shards are
+    pinned by :func:`test_a_scoped_exact_key_shard_is_not_driven_by_the_scope`.
+    """
+    _seed(
+        server,
+        [
+            {"pixel_sha": "0aa", "size_bytes": 100},
+            {"pixel_sha": "0aa", "size_bytes": 100},
+            {"pixel_sha": "5bb", "size_bytes": 100},
+            {"pixel_sha": "5bb", "size_bytes": 100},
+            {"pixel_sha": "fcc", "size_bytes": 100},
+            {"pixel_sha": "fcc", "size_bytes": 100},
+        ],
+    )
+    last = tiers.EXACT_KEY_SHARD_COUNT - 1
+    keys, plans = _explain_exact_key_reads(server, None, [0, 5, last])
+
+    assert [[key.pixel_sha for key in shard] for shard in keys] == [
+        ["0aa"],
+        ["5bb"],
+        ["fcc"],
+    ]
+    assert len(plans) == 3, plans
+    first, middle, final = plans
+    # ``pixel_sha IS NOT NULL`` is the lower bound of the first shard.
+    slice_read = (
+        "USING COVERING INDEX ix_picture_pixel_sha (pixel_sha>? AND pixel_sha<?)"
+    )
+    assert slice_read in first, plans
+    assert slice_read in middle, plans
+    assert "USING COVERING INDEX ix_picture_pixel_sha (pixel_sha>?)" in final, plans
+    for plan in plans:
+        assert "SEARCH picture USING INDEX ix_picture_pixel_sha (pixel_sha=?)" in plan
+        assert "ix_picture_deleted" not in plan, plans
+
+
+def test_every_exact_key_is_in_exactly_one_shard(server):
+    """The shards partition the keys: merged, they are the whole read, in order.
+
+    Hashes sit on each side of a bound (``0f`` / ``1``), on the first and
+    last shards' open ends (empty, ``ff``, ``zz``), and outside lowercase hex
+    (``A1``, ``9z``), so a bound that drops or doubles a key shows. A key whose
+    second copy is scrapheaped is no duplicate, and its lowest live id is the
+    one a key is ordered by.
+    """
+    shas = ["1", "0f", "", "ff", "A1", "9z", "zz", "a"]
+    specs = [
+        {"pixel_sha": "gone", "size_bytes": 100, "deleted": True},
+        {"pixel_sha": "gone", "size_bytes": 100},
+        {"pixel_sha": "gone", "size_bytes": 100},
+        {"pixel_sha": "half", "size_bytes": 100},
+        {"pixel_sha": "half", "size_bytes": 100, "deleted": True},
+    ]
+    for sha in shas:
+        specs += [{"pixel_sha": sha, "size_bytes": 7}] * 2
+    ids = _seed(server, specs)
+
+    whole = _run(server, tiers.find_exact_keys_in_session, None)
+    shards = [
+        _run(server, tiers.find_exact_keys_in_session, None, shard)
+        for shard in range(tiers.EXACT_KEY_SHARD_COUNT)
+    ]
+    merged = sorted(
+        (key for shard in shards for key in shard), key=lambda key: key.first_id
+    )
+
+    assert [key.pixel_sha for key in whole] == ["gone", *shas]
+    assert whole[0] == tiers.ExactKey("gone", 100, 2, ids[1])
+    assert merged == whole
+    assert sum(len(shard) for shard in shards) == len(whole)
+    with pytest.raises(ValueError, match="outside"):
+        _run(
+            server, tiers.find_exact_keys_in_session, None, tiers.EXACT_KEY_SHARD_COUNT
+        )
+
+
+def test_a_stop_during_the_key_discovery_lands_between_shards(server, monkeypatch):
+    """A stop asked for while one shard is read stops the scan before the next.
+
+    The discovery used to be one read of the whole scope, so a stop waited for
+    all of it. Nothing is persisted and the scan is left restartable.
+    """
+    _seed(
+        server,
+        [
+            {"pixel_sha": "0aa", "size_bytes": 100},
+            {"pixel_sha": "0aa", "size_bytes": 100},
+            {"pixel_sha": "9bb", "size_bytes": 100},
+            {"pixel_sha": "9bb", "size_bytes": 100},
+        ],
+    )
+    progress = _run(server, tiers.request_scan_in_session, TierPolicy(), None)
+    task = DedupScanTask(server.vault.db, progress["scan_id"])
+    read_shards: list[int] = []
+    original_find = tiers.find_exact_keys_in_session
+
+    def find_then_stop(session, scope=None, shard=None):
+        read_shards.append(shard)
+        if shard == 2:
+            task.on_cancel()
+        return original_find(session, scope, shard)
+
+    monkeypatch.setattr(tiers, "find_exact_keys_in_session", find_then_stop)
+    summary = task._run_task()
+
+    assert summary == {
+        "scan_id": progress["scan_id"],
+        "status": SCAN_PENDING,
+        "cancelled": True,
+    }
+    assert read_shards == [0, 1, 2]
+    assert _run(server, lambda s: s.exec(select(DedupGroup)).all()) == []
+    assert _run(server, tiers.scan_progress_in_session, None)["status"] == SCAN_PENDING
+
+
+def test_a_failed_scan_stores_a_fixed_sentence_and_logs_the_error(
+    server, monkeypatch, caplog
+):
+    """The scan row keeps a fixed sentence; the exception text goes to the log.
+
+    The row's error is served to the UI, and an exception's text can carry
+    paths or SQL (OWASP Error Handling Cheat Sheet).
+    """
+    _seed(server, [{"pixel_sha": "0aa", "size_bytes": 100}])
+    progress = _run(server, tiers.request_scan_in_session, TierPolicy(), None)
+    scan_id = progress["scan_id"]
+
+    def fail_exact(_session, _scope=None, _shard=None):
+        raise RuntimeError("example-secret-path/vault.db is locked")
+
+    monkeypatch.setattr(tiers, "find_exact_keys_in_session", fail_exact)
+    with caplog.at_level("ERROR", logger=dedup_scan_task_module.logger.name):
+        with pytest.raises(RuntimeError, match="example-secret-path"):
+            DedupScanTask(server.vault.db, scan_id)._run_task()
+
+    served = _run(server, tiers.scan_progress_in_session, None)
+    assert served["status"] == "failed"
+    assert served["error"] == dedup_scan_task_module.SCAN_FAILED_MESSAGE
+    assert "example-secret-path" not in repr(served)
+    assert _run(server, lambda s: s.get(DedupScan, scan_id)).error == (
+        dedup_scan_task_module.SCAN_FAILED_MESSAGE
+    )
+    logged = [r for r in caplog.records if f"scan_id={scan_id}" in r.getMessage()]
+    assert logged, caplog.text
+    assert "example-secret-path" in caplog.text
+
+
+def test_the_sharded_discovery_pages_keys_in_the_unsharded_order(server, monkeypatch):
+    """Shards split on the hash, so the merge restores lowest-picture-first.
+
+    A hash late in the alphabet whose copies were imported first must still
+    lead the pages, exactly as one unsharded read orders them.
+    """
+    _seed(
+        server,
+        [
+            {"pixel_sha": sha, "size_bytes": 100}
+            for sha in ("f1", "f1", "01", "01", "a7", "a7")
+        ],
+    )
+    paged = []
+    original_page_exact_keys = tiers.page_exact_keys
+
+    def record(keys, *args, **kwargs):
+        paged.append(list(keys))
+        return original_page_exact_keys(keys, *args, **kwargs)
+
+    monkeypatch.setattr(tiers, "page_exact_keys", record)
+    assert _run_requested_scan(server)["status"] == "complete"
+
+    assert [key.pixel_sha for key in paged[0]] == ["f1", "01", "a7"]
+    assert paged == [_run(server, tiers.find_exact_keys_in_session)]
+
+
+SCOPED_FOLDER = "/scoped"
+
+
+def _collection_scopes(server, picture_ids):
+    """A set, a project and a character holding exactly *picture_ids*.
+
+    Returned with the folder scope of the pictures seeded with
+    ``import_source_folder=SCOPED_FOLDER``, keyed by scope type.
+    """
+
+    def add(session):
+        picture_set = PictureSet(name="Scoped")
+        project = Project(name="Scoped")
+        character = Character(name="Scoped")
+        session.add_all([picture_set, project, character])
+        session.flush()
+        for picture_id in picture_ids:
+            session.add(
+                PictureSetMember(set_id=int(picture_set.id), picture_id=picture_id)
+            )
+            session.add(
+                PictureProjectMember(project_id=int(project.id), picture_id=picture_id)
+            )
+            session.add(Face(picture_id=picture_id, character_id=int(character.id)))
+        session.commit()
+        return int(picture_set.id), int(project.id), int(character.id)
+
+    set_id, project_id, character_id = _run(server, add)
+    return {
+        ScopeType.SET: DedupScope(ScopeType.SET, str(set_id)),
+        ScopeType.PROJECT: DedupScope(ScopeType.PROJECT, str(project_id)),
+        ScopeType.CHARACTER: DedupScope(ScopeType.CHARACTER, str(character_id)),
+        ScopeType.FOLDER: DedupScope(ScopeType.FOLDER, SCOPED_FOLDER),
+    }
+
+
+def _create_index_last(server, name):
+    """Drop index *name* and create it again, so it is the newest index.
+
+    Asserts the newest index on its table really is *name* afterwards.
+    """
+
+    def recreate(session):
+        found = session.execute(
+            text("SELECT tbl_name, sql FROM sqlite_master WHERE name = :name"),
+            {"name": name},
+        ).one()
+        session.execute(text(f"DROP INDEX {name}"))
+        session.execute(text(found.sql))
+        session.commit()
+        return session.execute(
+            text(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+                " AND tbl_name = :table ORDER BY rowid DESC LIMIT 1"
+            ),
+            {"table": found.tbl_name},
+        ).scalar()
+
+    assert _run(server, recreate) == name
+
+
+def test_a_scoped_exact_key_shard_is_not_driven_by_the_scope(server):
+    """A scoped shard reads its slice of the hash index, not the whole scope.
+
+    The scope used to be ``Picture.id IN (members)``, which SQLite builds once
+    per statement and drives the read from by ``rowid``, the hash range only
+    filtering: each of the sixteen shards then read the whole scope, 3-9x the
+    one unsharded read. Every scope type is pinned to the hash-driven plan, the
+    membership checked per candidate row (a correlated probe), and its keys
+    must be the whole scoped read's: copies outside the scope, a scrapheaped
+    copy and a copy at another size are no duplicate.
+    """
+    inside = {"import_source_folder": SCOPED_FOLDER}
+    ids = _seed(
+        server,
+        [
+            {"pixel_sha": "0zz", "size_bytes": 100},
+            {"pixel_sha": "0zz", "size_bytes": 100},
+            {"pixel_sha": "5bb", "size_bytes": 100},
+            {"pixel_sha": "5bb", "size_bytes": 100, **inside},
+            {"pixel_sha": "0aa", "size_bytes": 100, **inside},
+            {"pixel_sha": "0aa", "size_bytes": 100, **inside},
+            {"pixel_sha": "5bb", "size_bytes": 100, **inside},
+            {"pixel_sha": "fcc", "size_bytes": 100, **inside},
+            {"pixel_sha": "fcc", "size_bytes": 100, **inside},
+            {"pixel_sha": "5dd", "size_bytes": 100, **inside},
+            {"pixel_sha": "5dd", "size_bytes": 100},
+            {"pixel_sha": "5ee", "size_bytes": 100, **inside},
+            {"pixel_sha": "5ee", "size_bytes": 100, "deleted": True, **inside},
+            {"pixel_sha": "5ff", "size_bytes": 100, **inside},
+            {"pixel_sha": "5ff", "size_bytes": 200, **inside},
+        ],
+    )
+    member_ids = [ids[3], *ids[4:10], ids[11], ids[12], ids[13], ids[14]]
+    scopes = _collection_scopes(server, member_ids)
+    last = tiers.EXACT_KEY_SHARD_COUNT - 1
+    expected = [
+        tiers.ExactKey("5bb", 100, 2, ids[3]),
+        tiers.ExactKey("0aa", 100, 2, ids[4]),
+        tiers.ExactKey("fcc", 100, 2, ids[7]),
+    ]
+
+    for scope_type, scope in scopes.items():
+        whole = _run(server, tiers.find_exact_keys_in_session, scope)
+        merged = sorted(
+            (
+                key
+                for shard in range(tiers.EXACT_KEY_SHARD_COUNT)
+                for key in _run(server, tiers.find_exact_keys_in_session, scope, shard)
+            ),
+            key=lambda key: key.first_id,
+        )
+        assert whole == expected, scope_type
+        assert merged == expected, scope_type
+
+        keys, plans = _explain_exact_key_reads(server, scope, [0, 5, last])
+        assert [[key.pixel_sha for key in shard] for shard in keys] == [
+            ["0aa"],
+            ["5bb"],
+            ["fcc"],
+        ], scope_type
+        assert len(plans) == 3, (scope_type, plans)
+        slice_read = (
+            "USING COVERING INDEX ix_picture_pixel_sha (pixel_sha>? AND pixel_sha<?)"
+        )
+        assert slice_read in plans[0], (scope_type, plans)
+        assert slice_read in plans[1], (scope_type, plans)
+        assert "USING COVERING INDEX ix_picture_pixel_sha (pixel_sha>?)" in plans[2]
+        for plan in plans:
+            assert "SEARCH picture USING INDEX ix_picture_pixel_sha (pixel_sha=?)" in (
+                plan
+            ), (scope_type, plans)
+            assert "rowid" not in plan, (scope_type, plans)
+            assert "INTEGER PRIMARY KEY" not in plan, (scope_type, plans)
+            assert "ix_picture_deleted" not in plan, (scope_type, plans)
+            if scope_type is not ScopeType.FOLDER:
+                assert_scope_probed_per_row(plan, SCOPE_TABLES[scope_type])
+        if scope_type is ScopeType.CHARACTER:
+            # face has an index on picture_id and one on character_id. Without
+            # ANALYZE the two tie, the one created last wins, and create_all
+            # creates them in set order. Recreate the character's index so it
+            # is the newer one: the probe must still take the picture's faces,
+            # not every face of the character.
+            _create_index_last(server, "ix_face_character_id")
+            _, plans = _explain_exact_key_reads(server, scope, [5])
+            assert "ix_face_picture_id (picture_id=?)" in plans[0], plans
+            assert "ix_face_character_id" not in plans[0], plans
+
+
+def test_a_small_collection_scope_reads_its_keys_in_one_step():
+    """The shard plan costs a walk of the library's hash index, however small
+    the scope, so a collection scope up to the limit is read whole, driven by
+    its membership; the library and a folder always shard."""
+    limit = tiers.EXACT_KEY_WHOLE_READ_MAX_PICTURES
+    every_shard = tuple(range(tiers.EXACT_KEY_SHARD_COUNT))
+    for scope_type in (ScopeType.SET, ScopeType.PROJECT, ScopeType.CHARACTER):
+        scope = DedupScope(scope_type, "1")
+        assert tiers.exact_key_shards(scope, 0) == (None,)
+        assert tiers.exact_key_shards(scope, limit) == (None,)
+        assert tiers.exact_key_shards(scope, limit + 1) == every_shard
+    assert tiers.exact_key_shards(DedupScope(), 2) == every_shard
+    folder = DedupScope(ScopeType.FOLDER, SCOPED_FOLDER)
+    assert tiers.exact_key_shards(folder, 2) == every_shard
+
+
+def test_a_small_scoped_scan_reads_keys_once_and_progress_in_one_pass(
+    server, monkeypatch
+):
+    """A set scan: one whole key read, then progress in one pass of the set.
+
+    The progress read used to count each page's id range with the scope's
+    ``IN`` list, which SQLite drives from the list: every page re-read the
+    whole scope in one reader step (1.8 s for 49 pages of a 100,000-picture
+    set). It is now one statement whatever the number of pages, driven by the
+    set's members, and pictures outside the set are not counted. The library
+    keeps its count per page: each is a covering range of
+    ``ix_picture_deleted``, together one pass over it.
+    """
+    outside = {"pixel_sha": "outside", "perceptual_hash": PHASH_FAR}
+    specs = [outside, *_SETTLED_SPECS[:4], outside, *_SETTLED_SPECS[4:]]
+    ids = _seed(server, specs)
+    member_ids = [ids[1], *ids[2:5], *ids[6:]]
+    scope = _collection_scopes(server, member_ids)[ScopeType.SET]
+
+    keys = _run(server, tiers.find_exact_keys_in_session, scope)
+    pages = tiers.page_exact_keys(keys, max_keys=1)
+    assert [page[0].pixel_sha for page in pages] == ["a", "b", "c"]
+
+    def explain_progress(session, scope, pages, total):
+        executed = []
+
+        def capture(_conn, _cursor, statement, parameters, _context, _many):
+            if "FROM picture" in statement:
+                executed.append((statement, parameters))
+
+        engine = session.get_bind()
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            published = DedupScanTask._exact_progress_read(session, scope, pages, total)
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        plans = [
+            " | ".join(
+                str(row[-1])
+                for row in session.connection()
+                .exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)
+                .all()
+            )
+            for statement, parameters in executed
+        ]
+        return published, plans
+
+    published, plans = _run(server, explain_progress, scope, pages, 9)
+    assert published == _SETTLED_AFTER_PAGES
+    assert len(plans) == 1, plans
+    assert "ix_picture_deleted (deleted=? AND rowid=?)" in plans[0], plans
+    assert "picturesetmember" in plans[0], plans
+
+    # The library: the two outside pictures are a key and count, 11 live.
+    library_keys = _run(server, tiers.find_exact_keys_in_session)
+    library_pages = tiers.page_exact_keys(library_keys, max_keys=1)
+    assert [page[0].pixel_sha for page in library_pages] == [
+        "outside",
+        "a",
+        "b",
+        "c",
+    ]
+    published, plans = _run(server, explain_progress, DedupScope(), library_pages, 11)
+    assert published == [1, 5, 8, 11]
+    assert len(plans) == 3, plans
+    for plan in plans:
+        assert "USING COVERING INDEX ix_picture_deleted (deleted=? AND rowid" in (
+            plan
+        ), plans
+
+    read_shards: list[int | None] = []
+    original_find = tiers.find_exact_keys_in_session
+
+    def record(session, scope=None, shard=None):
+        read_shards.append(shard)
+        return original_find(session, scope, shard)
+
+    monkeypatch.setattr(tiers, "find_exact_keys_in_session", record)
+    assert _run_requested_scan(server, scope=scope)["status"] == "complete"
+    assert read_shards == [None]
 
 
 # ── tier 2: bucketed near ─────────────────────────────────────────────────────
@@ -753,6 +1283,22 @@ def test_unparseable_perceptual_hashes_are_excluded_not_crashed(server):
         )
         == []
     )
+
+
+def test_a_signed_perceptual_hash_is_excluded_and_the_rest_still_group(server):
+    """``int(..., 16)`` accepts a sign; the negative must not reach the uint64 pack."""
+    ids = _seed(
+        server,
+        [
+            {"perceptual_hash": PHASH_ZERO, "width": 100, "height": 100},
+            {"perceptual_hash": PHASH_ONE_BIT, "width": 100, "height": 100},
+            {"perceptual_hash": "-000000000000001", "width": 100, "height": 100},
+        ],
+    )
+    groups = _run(
+        server, tiers.find_near_groups_in_session, TierPolicy(near_enabled=True), None
+    )
+    assert [sorted(group.picture_ids) for group in groups] == [sorted(ids[:2])]
 
 
 # ── tier 3: embedding ─────────────────────────────────────────────────────────
@@ -1198,6 +1744,248 @@ def test_a_thinned_group_still_lists_on_the_decided_page(server):
     assert page[0]["member_count"] == 1, "live members only, even here"
 
 
+# ── decisions outlive prune and retirement ───────────────────────────────────
+
+
+def _decide_the_only_group(server):
+    """Keep the one open group's pictures separate; return its signature."""
+    signature = _run(server, tiers.page_queue_in_session)[0][0]["signature"]
+    _run(server, verdicts.apply_keep_separate_in_session, signature, None)
+    return signature
+
+
+def _stored_groups(server):
+    """``{signature: (resolved, sorted member ids)}`` for every stored group."""
+
+    def read(session):
+        return {
+            row.signature: (row.resolved, _stored_members(session, row.id))
+            for row in session.exec(select(DedupGroup)).all()
+        }
+
+    return _run(server, read)
+
+
+def _decided_signatures(server):
+    page, total, _cursor = _run(
+        server, tiers.page_queue_in_session, None, None, 0, 20, None, True
+    )
+    assert total == len(page)
+    return [group["signature"] for group in page]
+
+
+def test_a_decided_group_thinned_to_one_keeps_its_decision(server):
+    """Keep-cover-only leaves one live copy; the decision must stay clearable.
+
+    Both deleters used to drop it: the prune (fewer than two live members) and
+    the completed scan's retirement (its signature is no longer found).
+    """
+    ids = _seed(server, [{"pixel_sha": "ddd", "size_bytes": 100}] * 3)
+    _run_requested_scan(server)
+    signature = _decide_the_only_group(server)
+    _soft_delete(server, ids[1])
+    _soft_delete(server, ids[2])
+
+    assert _run(server, tiers.prune_stale_groups_in_session) == 0
+    rescan = _run_requested_scan(server)
+
+    assert rescan["status"] == "complete"
+    assert rescan["retired_groups"] == 0
+    assert _stored_groups(server) == {signature: (True, sorted(ids))}
+    assert _decided_signatures(server) == [signature]
+    assert _run(server, tiers.count_unresolved_in_session, None, None) == 0
+
+
+def test_a_decided_group_goes_once_a_purge_leaves_it_one_member(server):
+    """The decided exemption ends where the pictures do."""
+    ids = _seed(server, [{"pixel_sha": "ddd", "size_bytes": 100}] * 2)
+    _scan(server)
+    _decide_the_only_group(server)
+
+    def purge(session):
+        session.delete(session.get(Picture, ids[1]))
+        session.commit()
+
+    _run(server, purge)
+    assert _run(server, tiers.prune_stale_groups_in_session) == 1
+    assert _stored_groups(server) == {}
+
+
+def test_a_decision_covers_its_pictures_when_some_of_them_leave(server):
+    """A subset of a decided group is not a new question.
+
+    The Scrapheap takes one copy, so the global rescan finds the other three
+    under a new signature; a scoped scan sees only the scope's two. Neither is
+    asked again, and the decided group keeps its place.
+    """
+    ids = _seed(server, [{"pixel_sha": "eee", "size_bytes": 100}] * 4)
+    _run_requested_scan(server)
+    signature = _decide_the_only_group(server)
+    _soft_delete(server, ids[3])
+
+    _run_requested_scan(server)
+    assert _stored_groups(server) == {signature: (True, sorted(ids))}
+
+    def add_set(session):
+        picture_set = PictureSet(name="Part of the group")
+        session.add(picture_set)
+        session.flush()
+        for picture_id in ids[:2]:
+            session.add(
+                PictureSetMember(set_id=int(picture_set.id), picture_id=picture_id)
+            )
+        session.commit()
+        return int(picture_set.id)
+
+    scope = DedupScope(scope_type=ScopeType.SET, scope_id=str(_run(server, add_set)))
+    _run_requested_scan(server, None, scope)
+
+    assert _stored_groups(server) == {signature: (True, sorted(ids))}
+    assert _decided_signatures(server) == [signature]
+    assert _run(server, tiers.count_unresolved_in_session, None, None) == 0
+
+
+def test_a_new_copy_asks_a_decided_group_again(server):
+    """Members changed: a copy the decision never saw joins the group."""
+    ids = _seed(server, [{"pixel_sha": "fff", "size_bytes": 100}] * 2)
+    _run_requested_scan(server)
+    signature = _decide_the_only_group(server)
+    ids += _seed(server, [{"pixel_sha": "fff", "size_bytes": 100}])
+
+    _run_requested_scan(server)
+
+    stored = _stored_groups(server)
+    assert signature not in stored
+    assert list(stored.values()) == [(False, sorted(ids))]
+    assert _decided_signatures(server) == []
+    assert _run(server, tiers.count_unresolved_in_session, None, None) == 1
+
+
+def test_retirement_never_takes_a_decided_group(server):
+    """Not when the reader sees the decision, nor when it lands after the read."""
+    ids = _seed(server, [{"pixel_sha": "ggg", "size_bytes": 100}] * 2)
+    _run_requested_scan(server)
+    scan_id = _run(server, tiers.scan_progress_in_session, None)["scan_id"]
+    every_tier = {"exact", "near", "embedding"}
+    nothing_found = {tier: set() for tier in every_tier}
+    [group_id] = _run(
+        server,
+        tiers.obsolete_scan_group_ids_in_session,
+        scan_id,
+        nothing_found,
+        every_tier,
+    )
+
+    signature = _decide_the_only_group(server)
+    assert (
+        _run(
+            server,
+            tiers.obsolete_scan_group_ids_in_session,
+            scan_id,
+            nothing_found,
+            every_tier,
+        )
+        == []
+    )
+
+    def delete_and_commit(session):
+        removed = tiers.delete_scan_groups_in_session(session, scan_id, [group_id])
+        session.commit()
+        return removed
+
+    assert _run(server, delete_and_commit) == 0
+    assert _stored_groups(server) == {signature: (True, sorted(ids))}
+
+
+def _persist_exact(session, member_lists, scan_id=None, pill=None):
+    """Persist one exact group per id list; return the count and the signatures.
+
+    ``pill`` is appended to the first group's evidence, so a test can tell a
+    refreshed row's evidence from the one it was created with.
+    """
+    groups = []
+    for picture_ids in member_lists:
+        members = tiers.load_candidates(session, picture_ids)
+        groups.append(
+            tiers.assemble_group(
+                DedupTier.EXACT, 1.0, [members[pid] for pid in picture_ids]
+            )
+        )
+    if pill is not None:
+        groups[0].evidence.append(pill)
+    unresolved = tiers.persist_groups_in_session(session, groups, scan_id)
+    return unresolved, [group.signature for group in groups]
+
+
+def _group_state(server, signature):
+    """``(resolved, scan_id, evidence, member ids)`` of one stored group, or None."""
+
+    def read(session):
+        row = session.exec(
+            select(DedupGroup).where(DedupGroup.signature == signature)
+        ).first()
+        if row is None:
+            return None
+        return (
+            row.resolved,
+            row.scan_id,
+            json.loads(row.evidence),
+            _stored_members(session, row.id),
+        )
+
+    return _run(server, read)
+
+
+def test_a_stored_group_inside_a_decision_keeps_being_refreshed(server):
+    """A decision holds back the groups it would create, not the rows that exist.
+
+    The part's row was stored before the decision covering it was made. A
+    rescan that finds the part again must refresh it (members, evidence and
+    scan id) like any other row, or it keeps the members and evidence of the
+    scan that created it and retirement reads it as an older scan's group.
+    """
+    ids = _seed(server, [{"pixel_sha": "hhh", "size_bytes": 100}] * 4)
+    _unresolved, [whole, part] = _run(server, _persist_exact, [ids, ids[:2]])
+    _run(server, verdicts.apply_keep_separate_in_session, whole, None)
+
+    pill = {"text": "Refreshed by scan 7", "against": False}
+    unresolved, [again] = _run(server, _persist_exact, [ids[2:]], 7, pill)
+
+    # Same content keys, so the same signature, with today's member ids.
+    assert again == part
+    assert unresolved == 1
+    resolved, scan_id, evidence, members = _group_state(server, part)
+    assert (resolved, scan_id, members) == (False, 7, ids[2:])
+    assert evidence[-1] == pill
+    assert _stored_groups(server)[whole] == (True, ids)
+
+
+def test_a_batch_that_refreshes_a_decision_does_not_delete_it(server):
+    """A decided group found again under its own signature survives its batch.
+
+    Another group of the same tier in the same batch adds a picture to it,
+    which on its own would supersede the decision. The batch also refreshes
+    the decision itself, so it must stay. No shipped scan builds such a batch:
+    every batch is one tier's groups, and a tier's groups never share a
+    picture (exact groups are one content key each, near and embedding groups
+    are the components of one forest). The rule is pinned through a direct
+    persist call so a change to either side cannot delete a decision silently.
+    """
+    ids = _seed(server, [{"pixel_sha": "iii", "size_bytes": 100}] * 3)
+    _unresolved, [decided] = _run(server, _persist_exact, [ids[:2]])
+    _run(server, verdicts.apply_keep_separate_in_session, decided, None)
+
+    unresolved, [same, grown] = _run(server, _persist_exact, [ids[:2], ids], 9)
+
+    assert same == decided
+    assert unresolved == 1
+    assert _group_state(server, decided)[0:2] == (True, 9)
+    assert _stored_groups(server) == {
+        decided: (True, ids[:2]),
+        grown: (False, ids),
+    }
+
+
 def test_a_decks_depth_in_the_queue_follows_a_scrapheaped_stack_member(server):
     """A deleted member must not leave a hole in the deck's depth.
 
@@ -1334,6 +2122,14 @@ def test_scoped_counts_are_reported_per_scope(server):
     assert counts[0]["unresolved_groups"] == 2
     assert counts[1]["key"] == f"set:{set_id}"
     assert counts[1]["unresolved_groups"] == 1
+    # Each scope carries its own tier split, and its exact figure is what an
+    # Auto-stack run started in that scope would plan: the scoped queue's
+    # button offers it, so it must not be the vault's.
+    assert counts[0]["by_tier"]["exact"] == 2
+    assert counts[1]["by_tier"] == {"exact": 1, "near": 0, "embedding": 0}
+    for row, scope in zip(counts, scopes):
+        planned = _run(server, verdicts.plan_auto_stack_in_session, scope)
+        assert row["by_tier"]["exact"] == len(planned)
 
 
 def test_a_scope_id_is_required_for_a_non_global_scope():
@@ -2291,6 +3087,66 @@ def test_a_folder_scope_is_normalised_to_one_scope_key():
     assert trailing.scope_id == "/photos/2026"
 
 
+def test_a_folder_scope_is_its_folder_and_below_never_a_prefix_sibling(server):
+    """A folder scope holds the folder and its sub-folders, nothing else.
+
+    It used to be ``file_path LIKE '<folder>%'``: no separator, so
+    ``/lib/photos`` took ``/lib/photos-old`` and ``/lib/photosX``, and SQLite's
+    LIKE folds ASCII case, so on Linux and macOS it also took ``/lib/PHOTOS``,
+    a different folder there. Both the predicate and the per-row probe are
+    checked, through the exact tier the scan runs.
+    """
+    same = {"pixel_sha": "aaa", "size_bytes": 100}
+    paths = [
+        "/lib/photos/a.png",
+        "/lib/photos/2020/b.png",
+        "/lib/photos-old/c.png",
+        "/lib/photosX/d.png",
+        "/lib/photos0/e.png",
+        "/lib/photos.png",
+        "/lib/PHOTOS/f.png",
+    ]
+    ids = _seed(server, [{**same, "file_path": path} for path in paths])
+    # Imported from the folder: in it by the import arm, wherever it is stored.
+    (imported,) = _seed(
+        server, [{**same, "file_path": "g.png", "import_source_folder": "/lib/photos"}]
+    )
+    expected = {ids[0], ids[1], imported}
+    if PATHS_FOLD_CASE:
+        expected.add(ids[6])
+
+    scope = DedupScope(ScopeType.FOLDER, "/lib/photos/")
+
+    def selected(session, clause):
+        return set(session.exec(select(Picture.id).where(clause)).all())
+
+    assert _run(server, selected, scope.picture_predicate()) == expected
+    assert _run(server, selected, scope.picture_probe()) == expected
+    groups = _run(server, tiers.find_exact_groups_in_session, scope)
+    assert [set(group.picture_ids) for group in groups] == [expected]
+
+
+def test_a_folder_scope_takes_like_wildcards_literally(server):
+    """``%`` and ``_`` in a folder name are the characters, not wildcards."""
+    ids = _seed(
+        server,
+        [
+            {"file_path": "/lib/pho_os/a.png"},
+            {"file_path": "/lib/photos/b.png"},
+            {"file_path": "/lib/pho%os/c.png"},
+            {"file_path": "/lib/phXtos/d.png"},
+        ],
+    )
+
+    def selected(session, clause):
+        return set(session.exec(select(Picture.id).where(clause)).all())
+
+    underscore = DedupScope(ScopeType.FOLDER, "/lib/pho_os")
+    percent = DedupScope(ScopeType.FOLDER, "/lib/pho%os")
+    assert _run(server, selected, underscore.picture_predicate()) == {ids[0]}
+    assert _run(server, selected, percent.picture_predicate()) == {ids[2]}
+
+
 # ── stack units: the deck's depth is the STACK's, not the group's ─────────────
 
 
@@ -2681,7 +3537,7 @@ def test_failed_and_cancelled_rescans_preserve_prior_complete_evidence(
     failed = _run(server, tiers.request_scan_in_session, TierPolicy(), None)
     assert failed["phase"] is None
 
-    def fail_exact(_session, _scope):
+    def fail_exact(_session, _scope, _shard=None):
         raise RuntimeError("forced exact scan failure")
 
     monkeypatch.setattr(tiers, "find_exact_keys_in_session", fail_exact)
@@ -2903,9 +3759,9 @@ def test_the_exact_tier_holds_the_writer_one_page_at_a_time(server, monkeypatch)
 
     assert summary["status"] == "complete"
     assert summary["groups_found"] == 7
-    assert order[:3] == [
+    assert order[: tiers.EXACT_KEY_SHARD_COUNT + 2] == [
         "writer:_start_scan_slice",
-        "reader:_exact_keys_read",
+        *["reader:_exact_keys_read"] * tiers.EXACT_KEY_SHARD_COUNT,
         "reader:_exact_progress_read",
     ], order
     persists = [i for i, item in enumerate(order) if item.startswith("persist:")]

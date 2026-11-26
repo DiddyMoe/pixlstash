@@ -47,7 +47,7 @@
 // user's `1`-`9` and `X` choices.
 
 import { defineStore } from "pinia";
-import { ref, computed, onScopeDispose } from "vue";
+import { ref, computed, onScopeDispose, watch } from "vue";
 import {
   getPolicy,
   listGroups,
@@ -87,6 +87,7 @@ import {
   mixedStackEngineMarks,
 } from "../utils/dedup";
 import { newOperationBatchId, onSessionReset } from "../utils/apiClient";
+import { createRunFollower } from "../utils/runFollower";
 import { requestFailure } from "../utils/apiError";
 import { useOperationStore } from "./useOperationStore";
 
@@ -410,17 +411,6 @@ function groupWithoutPictures(group, removed) {
 // --- Auto-stack runs ---------------------------------------------------------
 
 /**
- * The poll interval when an active run's answer names none, and the bounds a
- * named one is held to. The server's `Retry-After` is the interval; a value
- * outside these bounds is read as a mistake rather than as a reason to spin or
- * to fall silent for minutes. Failed reads back off from the default up to the
- * ceiling.
- */
-const AUTO_STACK_POLL_MS = 2000;
-const AUTO_STACK_POLL_MIN_MS = 500;
-const AUTO_STACK_POLL_MAX_MS = 30000;
-
-/**
  * A start or an undo whose answer never arrived is sent again under the same
  * request id, which the server answers with the run it already has rather
  * than a second one. These are the waits before the second and third attempt;
@@ -499,11 +489,20 @@ export const useDedupStore = defineStore("dedup", () => {
   const policyDefaults = ref(null);
   const bounds = ref(null);
   const policyLoaded = ref(false);
+  // Bumped by a session reset, so a policy read from before it is dropped.
+  let policyGeneration = 0;
 
   // --- The sidebar's live count -------------------------------------------
   const openCount = ref(0);
   const byTier = ref({});
   const scan = ref({ ...IDLE_SCAN });
+  // Seven reads publish `scan` (the count read, four page reads, the End
+  // jump, a scan start), each on its own clock. Every read takes a ticket when
+  // it leaves and an answer older than the one already shown is dropped, so a
+  // slow read from before a scan started cannot put the banner back to idle
+  // (and stop the poll) after the start's answer said it was running.
+  let scanTicketsIssued = 0;
+  let scanTicketShown = 0;
   const countsLoaded = ref(false);
   // One count read on the wire at a time. A caller arriving while one is in
   // flight waits for ONE trailing read (`countsQueued`, carrying the union of
@@ -519,6 +518,9 @@ export const useDedupStore = defineStore("dedup", () => {
 
   // --- Per-scope counts, for the context menus ----------------------------
   const scopeCounts = ref({});
+  // Each scope's own tier split, keyed like `scopeCounts`: a scoped queue's
+  // Auto-stack button and tier menu read the scope's, not the vault's.
+  const scopeByTier = ref({});
   const scopeCountsInFlight = new Map();
   // Bumped by `invalidateScopeCounts()`: a read asked for before the change
   // must not refill the cache with the numbers from before it.
@@ -568,6 +570,10 @@ export const useDedupStore = defineStore("dedup", () => {
   const loadingMore = ref(false);
   const error = ref(null);
   const busy = ref(false);
+  // Whether the re-read after an uncertain (5xx) verdict failed too. The view
+  // tells the user the queue was reloaded before a retry; when this is true it
+  // was not, and the rows on screen are the ones from before the verdict.
+  const uncertainReloadFailed = ref(false);
   const stackedCount = ref(0);
   const separatedCount = ref(0);
 
@@ -645,12 +651,33 @@ export const useDedupStore = defineStore("dedup", () => {
   );
   const doneCount = computed(() => stackedCount.value + separatedCount.value);
 
+  /**
+   * The tier split of the queue on screen: the scope's own when the queue is
+   * scoped, the vault's otherwise. Auto-stack runs in the scope it was started
+   * from, so a scoped button offering the vault's exact count offered groups
+   * the run would never reach. Empty until the scope's row has been read.
+   */
+  const queueByTier = computed(() =>
+    isScoped.value
+      ? (scopeByTier.value[scopeKey(scopeType.value, scopeId.value)] ?? {})
+      : byTier.value,
+  );
+
+  /**
+   * Groups the review queue on screen holds: the vault's unresolved count, or,
+   * when scoped, the scoped page's own total. The vault figure in a scoped
+   * queue's headline counted groups the list could never show.
+   */
+  const reviewCount = computed(() =>
+    isScoped.value ? total.value : openCount.value,
+  );
+
   /** Unresolved exact groups: what the auto-stack button offers to clear. */
-  const exactCount = computed(() => Number(byTier.value.exact) || 0);
+  const exactCount = computed(() => Number(queueByTier.value.exact) || 0);
 
   /** Unresolved groups in every tier the queue does not stack in bulk. */
   const queueOnlyCount = computed(() =>
-    Object.entries(byTier.value).reduce(
+    Object.entries(queueByTier.value).reduce(
       (sum, [tier, count]) =>
         tier === "exact" ? sum : sum + (Number(count) || 0),
       0,
@@ -679,7 +706,7 @@ export const useDedupStore = defineStore("dedup", () => {
       id,
       label: TIER_LABELS[id]?.label ?? id,
       hint: TIER_LABELS[id]?.hint ?? "",
-      count: Number(byTier.value[id]) || 0,
+      count: Number(queueByTier.value[id]) || 0,
       locked: alwaysOn.has(id),
       requires: requires[id] ?? null,
       enabled: isTierEnabled(id),
@@ -1025,8 +1052,11 @@ export const useDedupStore = defineStore("dedup", () => {
    */
   async function loadPolicy({ force = false } = {}) {
     if (policyLoaded.value && !force) return;
+    const generation = policyGeneration;
     try {
       const data = await getPolicy();
+      // A session reset since it left: the answer is the previous session's.
+      if (generation !== policyGeneration) return;
       policyDefaults.value = data?.defaults ?? null;
       bounds.value = data?.bounds ?? null;
       if (!Number.isFinite(threshold.value)) {
@@ -1035,11 +1065,30 @@ export const useDedupStore = defineStore("dedup", () => {
       }
       policyLoaded.value = true;
     } catch (err) {
+      if (generation !== policyGeneration) return;
       console.warn(
         "[dedup] failed to read the duplicate detection policy",
         err,
       );
     }
+  }
+
+  /** A ticket for a read that will publish `scan`, taken before it leaves. */
+  function nextScanTicket() {
+    scanTicketsIssued += 1;
+    return scanTicketsIssued;
+  }
+
+  /**
+   * Publish a read's scan progress unless a read that left later already did.
+   *
+   * @param {number} ticket - from {@link nextScanTicket}, taken at request time.
+   * @param {Object} [raw] - a `ScanProgressModel`.
+   */
+  function adoptScan(ticket, raw) {
+    if (ticket < scanTicketShown) return;
+    scanTicketShown = ticket;
+    scan.value = normalizeScan(raw);
   }
 
   /**
@@ -1105,10 +1154,23 @@ export const useDedupStore = defineStore("dedup", () => {
     const epoch = countsEpoch;
     const writeSeq = countsWriteSeq;
     const scopeEpoch = scopeCountsEpoch;
+    const scanTicket = nextScanTicket();
     const policy = policyArgs.value;
     const policyKey = JSON.stringify(policy);
+    // A scoped queue always asks for its own scope too: its Auto-stack figure
+    // and tier menu come from that row.
+    const asked = isScoped.value
+      ? [
+          ...new Map(
+            [...scopes, currentScope()].map((s) => [
+              scopeKey(s.scopeType, s.scopeId),
+              s,
+            ]),
+          ).values(),
+        ]
+      : scopes;
     try {
-      const data = await getCounts({ policy, scopes });
+      const data = await getCounts({ policy, scopes: asked });
       if (
         epoch !== countsEpoch ||
         policyKey !== JSON.stringify(policyArgs.value)
@@ -1119,7 +1181,7 @@ export const useDedupStore = defineStore("dedup", () => {
         openCount.value = Number(data?.unresolved_groups) || 0;
       }
       byTier.value = data?.by_tier ?? {};
-      scan.value = normalizeScan(data?.scan);
+      adoptScan(scanTicket, data?.scan);
       if (scopeEpoch === scopeCountsEpoch) {
         // This read counted under the current tier gate and threshold; rows
         // cached under another one are not true of it.
@@ -1133,6 +1195,7 @@ export const useDedupStore = defineStore("dedup", () => {
             ...scopeCounts.value,
             [key]: Number(row.unresolved_groups) || 0,
           };
+          scopeByTier.value = { ...scopeByTier.value, [key]: row.by_tier ?? {} };
         }
       }
       countsLoaded.value = true;
@@ -1200,6 +1263,7 @@ export const useDedupStore = defineStore("dedup", () => {
     scopeCountsEpoch += 1;
     scopeCountsInFlight.clear();
     scopeCounts.value = {};
+    scopeByTier.value = {};
   }
 
   /**
@@ -1462,13 +1526,30 @@ export const useDedupStore = defineStore("dedup", () => {
   }
 
   /**
+   * Start a new window: bump the epoch and let go of the paging slots.
+   *
+   * A page still on the wire belongs to the old window and discards itself on
+   * landing. Left holding `pageInFlight`, it made the next `loadMore` join it
+   * and resolve with nothing appended, and it kept the spinner up meanwhile;
+   * its own finalizer leaves the slot alone once it is no longer the holder.
+   */
+  function claimWindow() {
+    windowEpoch += 1;
+    pageInFlight = null;
+    prevInFlight = null;
+    loadingMore.value = false;
+  }
+
+  /**
    * Load the first page of the queue, replacing whatever was there.
    *
    * Always an offset-0 request: a cursor is a position inside one ordering, so
    * the only honest way to start a queue whose policy or scope may just have
    * changed is from the top. The response decides which path pages it.
    *
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} false when this load failed and blanked the
+   *   rows; true when it landed, or when a newer rebuild superseded it (that
+   *   rebuild owns the rows and reports its own failure).
    */
   async function loadFirstPage() {
     loading.value = true;
@@ -1477,7 +1558,7 @@ export const useDedupStore = defineStore("dedup", () => {
     // after an End jump), so a selection over the old rows would silently
     // point at different groups - and so would a jump-to-end still chasing
     // the old list's tail, or a page request still in flight from it.
-    windowEpoch += 1;
+    claimWindow();
     // This rebuild's own claim on the window. Two first-page loads CAN be in
     // flight at once - the scan poll reloads an empty list on its own clock,
     // and the user can flip to Decided (or change scope/tier) meanwhile -
@@ -1485,6 +1566,7 @@ export const useDedupStore = defineStore("dedup", () => {
     // stale open-queue response landed after the Decided flip's rows and
     // wrote its empty page over them: "Still scanning…", then nothing.
     const epoch = windowEpoch;
+    const scanTicket = nextScanTicket();
     cancelEndChase();
     clearSelection();
     try {
@@ -1497,7 +1579,7 @@ export const useDedupStore = defineStore("dedup", () => {
         offset: 0,
         limit: QUEUE_PAGE_SIZE,
       });
-      if (epoch !== windowEpoch) return;
+      if (epoch !== windowEpoch) return true;
       adoptVerdictCounts(data);
       groups.value = Array.isArray(data?.groups) ? data.groups : [];
       windowStart.value = 0;
@@ -1508,8 +1590,9 @@ export const useDedupStore = defineStore("dedup", () => {
       // the offset arithmetic: `total` is a live count under a running scan.
       hasMore.value =
         nextCursor.value !== null || nextOffset.value < total.value;
-      scan.value = normalizeScan(data?.scan);
+      adoptScan(scanTicket, data?.scan);
       focusIndex.value = groups.value.length ? 0 : -1;
+      return true;
     } catch (err) {
       // A stale rebuild's failure must not blank the fresh rebuild's rows
       // either - logged (never swallowed), then discarded like its success.
@@ -1518,7 +1601,7 @@ export const useDedupStore = defineStore("dedup", () => {
           "[dedup] discarding a superseded first-page load's failure",
           err,
         );
-        return;
+        return true;
       }
       error.value = err;
       groups.value = [];
@@ -1529,6 +1612,7 @@ export const useDedupStore = defineStore("dedup", () => {
       hasMore.value = false;
       focusIndex.value = -1;
       console.warn("[dedup] failed to load the duplicate queue", err);
+      return false;
     } finally {
       // Only the CURRENT rebuild owns the loading flag: a superseded one
       // finishing late must not clear (or appear to clear) the fresh one's.
@@ -1546,19 +1630,30 @@ export const useDedupStore = defineStore("dedup", () => {
    * anchor; this store owns replacing the server window while retaining the
    * focused group and any still-present multi-selection.
    *
+   * It is also how an Auto-stack run's stacks leave the queue as they land,
+   * and how a scan's late finds join it when the scan ends (see
+   * {@link rereadQueueInPlace}).
+   *
    * @param {number} anchorIndex - absolute row currently at the viewport edge.
    * @param {Object} [options]
    * @param {string|null} [options.focusSignature] - focused group before reload.
-   * @returns {Promise<void>}
+   * @param {boolean} [options.yieldToVerdicts] - discard the answer when a
+   *   verdict was sent while it was on the wire. The server may have read the
+   *   queue before that verdict committed, and writing the answer would put
+   *   the group just decided back on screen, focused.
+   * @returns {Promise<boolean>} false only when the answer yielded to a
+   *   verdict; a superseded or failed read is not retried by its caller.
    */
   async function reloadWindowAround(
     anchorIndex,
-    { focusSignature = null } = {},
+    { focusSignature = null, yieldToVerdicts = false } = {},
   ) {
     loading.value = true;
     error.value = null;
-    windowEpoch += 1;
+    claimWindow();
     const epoch = windowEpoch;
+    const scanTicket = nextScanTicket();
+    const verdictClaim = busyClaim;
     cancelEndChase();
 
     // Use the server's largest legal page. A bulk verdict can restore many
@@ -1584,7 +1679,8 @@ export const useDedupStore = defineStore("dedup", () => {
         offset,
         limit: pageSize,
       });
-      if (epoch !== windowEpoch) return;
+      if (epoch !== windowEpoch) return true;
+      if (yieldToVerdicts && verdictClaim !== busyClaim) return false;
 
       adoptVerdictCounts(data);
       groups.value = Array.isArray(data?.groups) ? data.groups : [];
@@ -1594,7 +1690,7 @@ export const useDedupStore = defineStore("dedup", () => {
       nextCursor.value = cursorFrom(data);
       hasMore.value =
         nextCursor.value !== null || nextOffset.value < total.value;
-      scan.value = normalizeScan(data?.scan);
+      adoptScan(scanTicket, data?.scan);
 
       const heldSignatures = new Set(groups.value.map((g) => g.signature));
       selectedSignatures.value = new Set(
@@ -1617,6 +1713,7 @@ export const useDedupStore = defineStore("dedup", () => {
       } else {
         focusIndex.value = -1;
       }
+      return true;
     } catch (err) {
       // The undo itself has already succeeded. A failed reconciliation must
       // leave the still-usable local window, focus and selection in place;
@@ -1627,10 +1724,11 @@ export const useDedupStore = defineStore("dedup", () => {
           "[dedup] discarding a superseded anchored reload's failure",
           err,
         );
-        return;
+        return true;
       }
       error.value = err;
       console.warn("[dedup] failed to reload the duplicate queue in place", err);
+      return true;
     } finally {
       if (epoch === windowEpoch) loading.value = false;
     }
@@ -1679,6 +1777,7 @@ export const useDedupStore = defineStore("dedup", () => {
   async function fetchNextPage({ limit } = {}) {
     loadingMore.value = true;
     const epoch = windowEpoch;
+    const scanTicket = nextScanTicket();
     try {
       const cursor = nextCursor.value;
       const ceiling = Number(bounds.value?.max_page_size) || QUEUE_PAGE_SIZE;
@@ -1714,7 +1813,7 @@ export const useDedupStore = defineStore("dedup", () => {
       hasMore.value =
         page.length > 0 &&
         (nextCursor.value !== null || nextOffset.value < total.value);
-      scan.value = normalizeScan(data?.scan);
+      adoptScan(scanTicket, data?.scan);
       // A page that lands into an emptied queue has to be given the cursor, or
       // the rows arrive with nothing focused and the keyboard model is dead
       // until the user clicks.
@@ -1754,6 +1853,7 @@ export const useDedupStore = defineStore("dedup", () => {
   /** The upward page itself. Never called directly - go through loadPrevious. */
   async function fetchPreviousPage({ limit } = {}) {
     const epoch = windowEpoch;
+    const scanTicket = nextScanTicket();
     try {
       const ceiling = Number(bounds.value?.max_page_size) || QUEUE_PAGE_SIZE;
       const pageSize = Math.min(
@@ -1792,7 +1892,7 @@ export const useDedupStore = defineStore("dedup", () => {
         focusIndex.value = windowStart.value + groups.value.length - 1;
       }
       total.value = Number(data?.total) || total.value;
-      scan.value = normalizeScan(data?.scan);
+      adoptScan(scanTicket, data?.scan);
     } catch (err) {
       console.warn("[dedup] failed to page the duplicate queue upwards", err);
     }
@@ -1891,6 +1991,7 @@ export const useDedupStore = defineStore("dedup", () => {
    */
   async function jumpToTail(token) {
     let tailOffset = Math.max(0, total.value - QUEUE_PAGE_SIZE);
+    let scanTicket = nextScanTicket();
     let data = await requestTailPage(tailOffset);
     if (token !== endChaseToken) return;
     let page = Array.isArray(data?.groups) ? data.groups : [];
@@ -1898,6 +1999,7 @@ export const useDedupStore = defineStore("dedup", () => {
     if (!page.length && servedTotal > 0) {
       const retryOffset = Math.max(0, servedTotal - QUEUE_PAGE_SIZE);
       if (retryOffset < tailOffset) {
+        scanTicket = nextScanTicket();
         data = await requestTailPage(retryOffset);
         if (token !== endChaseToken) return;
         page = Array.isArray(data?.groups) ? data.groups : [];
@@ -1905,13 +2007,13 @@ export const useDedupStore = defineStore("dedup", () => {
       }
     }
     if (Number(data?.total)) total.value = Number(data.total);
-    scan.value = normalizeScan(data?.scan);
+    adoptScan(scanTicket, data?.scan);
     if (!page.length) return;
     // REBASE. The old window's rows are dropped, so a selection over them
     // cannot survive (same rationale as loadFirstPage: a verdict must never
     // silently act on rows the client no longer holds). The epoch bump makes
     // any normal page still in flight discard itself on landing.
-    windowEpoch += 1;
+    claimWindow();
     clearSelection();
     const seen = new Set();
     groups.value = page.filter(
@@ -2417,7 +2519,9 @@ export const useDedupStore = defineStore("dedup", () => {
     const gestureId = batchId || newOperationBatchId();
     rememberOwnStackGesture(gestureId);
     if (targets.length > 1) {
-      busy.value = true;
+      // One verdict at a time, as for a single group (stackOne).
+      if (busy.value) return null;
+      const claim = claimBusy();
       try {
         const result = await applyVerdictBatch(
           targets.map((target) => ({
@@ -2450,7 +2554,7 @@ export const useDedupStore = defineStore("dedup", () => {
           requested: targets.length,
         };
       } finally {
-        busy.value = false;
+        releaseBusy(claim);
       }
     }
     const result = await stackOne(group, { batchId: gestureId });
@@ -2462,7 +2566,7 @@ export const useDedupStore = defineStore("dedup", () => {
 
   async function stackOne(group, { batchId } = {}) {
     if (!group || busy.value) return null;
-    busy.value = true;
+    const claim = claimBusy();
     try {
       const result = await stackGroup(group.signature, {
         coverPictureId: coverIdFor(group),
@@ -2483,7 +2587,7 @@ export const useDedupStore = defineStore("dedup", () => {
       }
       return null;
     } finally {
-      busy.value = false;
+      releaseBusy(claim);
     }
   }
 
@@ -2563,7 +2667,8 @@ export const useDedupStore = defineStore("dedup", () => {
     const targets = verdictTargets(group);
     if (targets.length > 1) {
       const gestureId = batchId || newOperationBatchId();
-      busy.value = true;
+      if (busy.value) return null;
+      const claim = claimBusy();
       try {
         const result = await applyVerdictBatch(
           targets.map((target) => ({
@@ -2596,7 +2701,7 @@ export const useDedupStore = defineStore("dedup", () => {
           requested: targets.length,
         };
       } finally {
-        busy.value = false;
+        releaseBusy(claim);
       }
     }
     const result = await keepSeparateOne(group, { batchId });
@@ -2606,7 +2711,7 @@ export const useDedupStore = defineStore("dedup", () => {
 
   async function keepSeparateOne(group, { batchId } = {}) {
     if (!group || busy.value) return null;
-    busy.value = true;
+    const claim = claimBusy();
     try {
       const result = await keepGroupSeparate(group.signature, { batchId });
       commitSeparatedGroups([group]);
@@ -2622,7 +2727,7 @@ export const useDedupStore = defineStore("dedup", () => {
       }
       return null;
     } finally {
-      busy.value = false;
+      releaseBusy(claim);
     }
   }
 
@@ -2661,14 +2766,33 @@ export const useDedupStore = defineStore("dedup", () => {
     }
   }
 
+  // Which verdict holds `busy`. A session reset clears `busy` while a verdict
+  // may still be on the wire; without the claim, that old verdict's finalizer
+  // cleared it again under a verdict the new session had just sent, and a
+  // second verdict could then go out beside it.
+  let busyClaim = 0;
+
+  /** Take `busy` for one verdict. @returns {number} the claim to release. */
+  function claimBusy() {
+    busyClaim += 1;
+    busy.value = true;
+    return busyClaim;
+  }
+
+  /** Let go of `busy`, unless a reset or a newer verdict has taken it since. */
+  function releaseBusy(claim) {
+    if (claim === busyClaim) busy.value = false;
+  }
+
   function isAmbiguousMutationError(err) {
     return Number(err?.response?.status) >= 500;
   }
 
   async function reconcileAfterUncertainMutation(mutationError) {
     // A 5xx can arrive after the transaction committed. Re-read before a retry
-    // so the user never submits the same verdict against a stale row.
-    await loadFirstPage();
+    // so the user never submits the same verdict against a stale row. The view
+    // says the queue was reloaded, so it has to know when that read failed.
+    uncertainReloadFailed.value = !(await loadFirstPage());
     await refreshCounts();
     error.value = mutationError;
   }
@@ -2885,16 +3009,17 @@ export const useDedupStore = defineStore("dedup", () => {
     const joined = scanRequestInFlight.get(key);
     if (joined) return joined;
     const pending = (async () => {
+      const scanTicket = nextScanTicket();
       try {
         const data = await startScan(request);
         error.value = null;
-        scan.value = normalizeScan(data);
+        adoptScan(scanTicket, data);
         startScanPoll();
         return data;
       } catch (err) {
         const active = busyScanFrom(err);
         if (active) {
-          scan.value = normalizeScan(active);
+          adoptScan(scanTicket, active);
           if (deferOnBusy) deferScanUntilCurrentCompletes(request);
           startScanPoll();
           return active;
@@ -2915,10 +3040,12 @@ export const useDedupStore = defineStore("dedup", () => {
   // --- Scan progress polling ----------------------------------------------
   // The banner and the counts are only honest while someone re-reads them:
   // tier-2 groups commit after every bucket, but nothing pushes that to the
-  // client. The poll runs only while a scan is pending/running, and reloads
-  // the group list only while the queue is still EMPTY - so the first finds
-  // surface on their own, and a triage already in progress is never yanked
-  // back to the top.
+  // client. The poll runs only while a scan is pending/running. It reads the
+  // first page only while the queue is still EMPTY, so the first finds surface
+  // on their own. When the scan ends with a list showing, the list is re-read
+  // in place (see {@link rereadQueueInPlace}): its late finds join where they
+  // sort, and a triage already in progress keeps its focus, its selection and
+  // its place instead of being yanked back to the top.
   let scanPollTimer = null;
   let scanPollGeneration = 0;
   let scanPollTickGeneration = null;
@@ -2942,8 +3069,10 @@ export const useDedupStore = defineStore("dedup", () => {
         const wasScanning = isScanning.value;
         await refreshCounts();
         if (generation !== scanPollGeneration) return;
-        if (!groups.value.length || (wasScanning && !isScanning.value)) {
+        if (!groups.value.length) {
           await loadFirstPage();
+        } else if (wasScanning && !isScanning.value) {
+          await wantQueueReread("the scan ended");
         }
         if (generation !== scanPollGeneration) return;
         if (!isScanning.value) {
@@ -3019,17 +3148,49 @@ export const useDedupStore = defineStore("dedup", () => {
   // follows it by polling at the interval the server names until it ends. The
   // run does not depend on this tab. A reload, another tab or a later visit
   // finds it again through the newest run, and History holds its stacks as
-  // steps of a bounded size, so nothing here is the run's only record.
-  const autoStackRun = ref(null);
-  const autoStackRunActive = computed(() =>
-    Boolean(autoStackRun.value?.active),
-  );
-  // True while the run cannot be read. The poll keeps trying, more slowly, and
-  // the banner says that the progress it shows is the last known.
-  const autoStackRunUnreachable = ref(false);
+  // steps of a bounded size, so nothing here is the run's only record. The
+  // poll, its bounds and the guards every answer meets are
+  // `utils/runFollower.js`, shared with the Scrapheap's runs. While the run
+  // cannot be read, `autoStackRunUnreachable` is true and the banner says that
+  // the progress it shows is the last known.
+  const autoStackFollower = createRunFollower({
+    logPrefix: "[dedup]",
+    runName: "auto-stack run",
+    read: getAutoStackRun,
+    readLatest: getLatestAutoStackRun,
+    // A run's id is its row id, which only grows: the server's order, and
+    // what it reads the newest run by.
+    order: (r) => Number(r.id),
+    onAdopt: takeAutoStackRun,
+  });
+  const {
+    run: autoStackRun,
+    active: autoStackRunActive,
+    unreachable: autoStackRunUnreachable,
+  } = autoStackFollower;
   // The request on the wire for the run ("start", "cancel" or "revert"), so
-  // the control that sent it can show it pending; null when there is none.
+  // the control that sent it can show it pending; null when there is none. A
+  // stop may leave while a start or an undo is still out (the banner's Stop is
+  // for the run the banner shows), and then this is "cancel" until the stop is
+  // answered.
   const autoStackAction = ref(null);
+  // What `autoStackAction` is made of: the start or the undo out, and whether
+  // a stop is. Kept apart because each request clears only its own when it
+  // settles.
+  const autoStackGestureOut = ref(null);
+  let autoStackStopOut = false;
+  /**
+   * A start is on the wire, a Stop beside it or not, so the dialog that sent
+   * it keeps showing it pending. `autoStackAction` reads "cancel" while a Stop
+   * is out, and would hide it.
+   */
+  const autoStackStartOut = computed(
+    () => autoStackGestureOut.value === "start",
+  );
+  /** An undo is on the wire, a Stop beside it or not: the banner's Undo spins. */
+  const autoStackRevertOut = computed(
+    () => autoStackGestureOut.value === "revert",
+  );
   const autoStackDismissedKey = ref(storedDismissedAutoStackRun());
   const autoStackRunDismissed = computed(() => {
     const run = autoStackRun.value;
@@ -3041,33 +3202,22 @@ export const useDedupStore = defineStore("dedup", () => {
   });
   /**
    * The apply run that Undo run would revert, or null when there is none to
-   * offer. A finished apply run is its own target while it has something left
-   * to undo. A revert that stopped short (stopped, interrupted, blocked by a
-   * later edit, or failed) points back at its apply run, so the undo can be
-   * sent again once whatever stopped it is dealt with; the server undoes only
-   * what is still stacked.
+   * offer. Both answers are the server's, as of the last read of the run. A
+   * finished apply run is its own target while it has something left to undo
+   * (`can_revert`). A finished revert points back at its apply run while that
+   * run still has something left (`target_can_revert`): one that stopped
+   * short, or was blocked by a later edit, can be sent again; one whose
+   * remaining steps were undone some other way offers nothing.
    */
   const autoStackRevertTargetId = computed(() => {
     const run = autoStackRun.value;
     if (!run || run.active) return null;
     if (run.kind === "apply") return run.can_revert ? run.id : null;
-    return run.status === "complete" ? null : (run.target_run_id ?? null);
+    return run.target_can_revert ? run.target_run_id : null;
   });
   const autoStackCanRevert = computed(
     () => autoStackRevertTargetId.value != null,
   );
-  let autoStackPollTimer = null;
-  let autoStackPollFailures = 0;
-  // Bumped when the store forgets the run (a session reset): an answer still
-  // on the wire from before then writes nothing.
-  let autoStackEpoch = 0;
-  // Every read or write of the run takes a ticket as it leaves, and an answer
-  // older than the newest one applied is dropped: a poll sent before a Stop
-  // must not land after it and show the run as never asked to stop.
-  let autoStackTicket = 0;
-  let autoStackAppliedTicket = 0;
-  let autoStackResumeAttempted = false;
-  let autoStackResumeInFlight = null;
   // Every History step a followed run has recorded. Kept after the run ends,
   // because the operation log can be re-read after the last poll.
   const autoStackSegmentBatches = new Set();
@@ -3120,138 +3270,95 @@ export const useDedupStore = defineStore("dedup", () => {
     narrationFilterInstalled = true;
   }
 
-  function stopAutoStackPoll() {
-    if (autoStackPollTimer) {
-      clearTimeout(autoStackPollTimer);
-      autoStackPollTimer = null;
-    }
-  }
-
   /**
-   * Read the run again after `delayMs`, held to the poll bounds. One timer at
-   * most: scheduling replaces any read already waiting.
-   *
-   * @param {number|null} delayMs - the server's hint, or null for the default.
-   */
-  function scheduleAutoStackPoll(delayMs) {
-    stopAutoStackPoll();
-    const hinted = Number.isFinite(delayMs) ? delayMs : AUTO_STACK_POLL_MS;
-    const delay = Math.min(
-      AUTO_STACK_POLL_MAX_MS,
-      Math.max(AUTO_STACK_POLL_MIN_MS, hinted),
-    );
-    const epoch = autoStackEpoch;
-    autoStackPollTimer = setTimeout(() => {
-      autoStackPollTimer = null;
-      if (epoch === autoStackEpoch) pollAutoStackRun();
-    }, delay);
-  }
-
-  async function pollAutoStackRun() {
-    const run = autoStackRun.value;
-    if (!run?.active) return;
-    const epoch = autoStackEpoch;
-    const ticket = ++autoStackTicket;
-    try {
-      const reply = await getAutoStackRun(run.id);
-      adoptAutoStackRun(reply.run, reply.retryAfterMs, { epoch, ticket });
-    } catch (err) {
-      if (epoch !== autoStackEpoch || ticket < autoStackAppliedTicket) return;
-      if (autoStackRun.value?.id !== run.id) return;
-      if (Number(err?.response?.status) === 404) {
-        // The run is gone: another library is open, or its row was removed.
-        // There is nothing left to follow, so its banner goes with it.
-        console.warn(
-          `[dedup] auto-stack run ${run.id} no longer exists; no longer following it`,
-          err,
-        );
-        autoStackAppliedTicket = ticket;
-        stopAutoStackPoll();
-        autoStackRun.value = null;
-        autoStackRunUnreachable.value = false;
-        autoStackPollFailures = 0;
-        return;
-      }
-      autoStackPollFailures += 1;
-      autoStackRunUnreachable.value = true;
-      const backoff = Math.min(
-        AUTO_STACK_POLL_MAX_MS,
-        AUTO_STACK_POLL_MS * 2 ** autoStackPollFailures,
-      );
-      console.warn(
-        `[dedup] could not read auto-stack run ${run.id} ` +
-          `(${autoStackPollFailures} in a row); trying again in ${backoff} ms`,
-        err,
-      );
-      scheduleAutoStackPoll(backoff);
-    }
-  }
-
-  /**
-   * Take a run the server answered with as the one this store follows.
-   *
-   * The single way a run enters the store, so every answer meets the same
-   * guards: one from before a session reset, or older than an answer already
-   * applied, is dropped. While the run goes, the badge follows it without help
-   * from here: every slice announces its pictures, and that refreshes the
-   * counts through the sidebar. A run that ended re-reads the queue, since it
-   * changed the queue under the user: on the poll's word, or on a gesture's
-   * answer when the run had already ended by the time it arrived. A run found
-   * by {@link resumeAutoStackRun} already ended is shown, not re-read.
+   * A run was taken (see `createRunFollower`'s `adopt`). The queue is re-read
+   * whenever the run changed it under the user: when a poll shows more groups
+   * done (`applied` grew), and when the run is seen to end, on the poll's word
+   * or on a gesture's answer when the run had already ended by the time it
+   * arrived. A run found by {@link resumeAutoStackRun} already ended is shown,
+   * not re-read, and so is a poll that found nothing new done.
    *
    * @param {Object} run
-   * @param {number|null} retryAfter - the server's poll hint, in ms.
-   * @param {Object} claim - taken when the request left.
-   * @param {number} claim.epoch
-   * @param {number} claim.ticket
-   * @param {boolean} [claim.fromGesture=false] - the answer to the user's own
-   *   start, stop or undo.
-   * @returns {boolean} whether the run was taken.
+   * @param {{previous: (Object|null), ended: boolean}} how
    */
-  function adoptAutoStackRun(
-    run,
-    retryAfter,
-    { epoch, ticket, fromGesture = false },
-  ) {
-    if (!run || epoch !== autoStackEpoch || ticket < autoStackAppliedTicket) {
-      return false;
-    }
-    autoStackAppliedTicket = ticket;
+  function takeAutoStackRun(run, { previous, ended }) {
     installNarrationFilter();
     for (const batchId of run.segment_batch_ids ?? []) {
       autoStackSegmentBatches.add(batchId);
     }
-    const previous = autoStackRun.value;
-    const sameRun = previous?.id === run.id;
-    autoStackRun.value = run;
-    autoStackRunUnreachable.value = false;
-    autoStackPollFailures = 0;
-    if (run.active) scheduleAutoStackPoll(retryAfter);
-    else stopAutoStackPoll();
-    const ended = !run.active && (sameRun ? previous.active : fromGesture);
-    if (ended) {
-      reloadAfterAutoStackRun().catch((err) => {
-        // Both reads log and swallow their own failures; this only catches a
-        // programming error, which must not become an unhandled rejection.
-        console.warn(
-          `[dedup] could not re-read the queue after auto-stack run ${run.id}`,
-          err,
-        );
-      });
-    }
-    return true;
+    const advanced =
+      previous?.id === run.id &&
+      (Number(run.applied) || 0) > (Number(previous.applied) || 0);
+    if (ended || advanced) wantQueueReread(`auto-stack run ${run.id}`);
+  }
+
+  // A re-read a run or a scan asked for and that has not gone out yet. One
+  // flag, not a count: every poll that lands while one re-read waits or is on
+  // the wire is answered by the single re-read that follows it.
+  let queueRereadWanted = false;
+
+  /** Whether nothing else is writing the window or about to. */
+  function queueIsQuiet() {
+    return !busy.value && !loading.value && !endChaseActive.value;
   }
 
   /**
-   * The run changed the queue under the user: read the counts again, and the
-   * list from the top if one is showing. The queue reads its own first page
-   * when it opens, so a list that was never loaded is left alone.
+   * Ask for an in-place re-read because something other than the user changed
+   * the queue.
+   *
+   * @param {string} cause - what changed it, for the log line.
+   * @returns {Promise<void>} settles when the re-read went out and landed, or
+   *   at once when it waits for the queue to go quiet (the watch sends it).
    */
-  async function reloadAfterAutoStackRun() {
+  function wantQueueReread(cause) {
+    queueRereadWanted = true;
+    return rereadQueueInPlace().catch((err) => {
+      // Both reads log and swallow their own failures; this only catches a
+      // programming error, which must not become an unhandled rejection.
+      console.warn(`[dedup] could not re-read the queue after ${cause}`, err);
+    });
+  }
+
+  /**
+   * An Auto-stack run or a scan changed the queue under the user: read the
+   * counts again, and the window the user is working in, in place, if a list
+   * is showing.
+   *
+   * In place because a run or a scan takes minutes and the user goes on
+   * deciding meanwhile: the focused group, the selection that is still open and
+   * the place in the queue all survive, the groups a run stacked leave, and
+   * the groups a scan found late join where they sort. The re-read
+   * waits while a verdict, a rebuild (its own included) or an End jump is going:
+   * each of those writes the window itself, and a re-read sent beside a verdict
+   * could answer from before it. The watch below sends it once they are done.
+   * The queue reads its own first page when it opens, so a list that was never
+   * loaded is left alone.
+   */
+  async function rereadQueueInPlace() {
+    if (!queueRereadWanted || !queueIsQuiet()) return;
+    queueRereadWanted = false;
     invalidateScopeCounts();
-    if (groups.value.length) await loadFirstPage();
+    if (groups.value.length) {
+      const landed = await reloadWindowAround(Math.max(0, focusIndex.value), {
+        focusSignature: focusedGroup.value?.signature ?? null,
+        yieldToVerdicts: true,
+      });
+      if (!landed) {
+        // A verdict went out beside it: read again once that verdict is done.
+        // Asked here as well as by the watch, which may already have run.
+        queueRereadWanted = true;
+        return rereadQueueInPlace();
+      }
+    }
     await refreshCounts();
   }
+
+  watch(queueIsQuiet, (quiet) => {
+    if (!quiet || !queueRereadWanted) return;
+    rereadQueueInPlace().catch((err) => {
+      console.warn("[dedup] could not re-read the queue once it went quiet", err);
+    });
+  });
 
   /**
    * Send a start, a stop or an undo, retrying only when no answer came.
@@ -3262,33 +3369,51 @@ export const useDedupStore = defineStore("dedup", () => {
    * that names a run (another run already active, nothing left to undo) has
    * that run followed, so the banner shows what the refusal was about.
    *
+   * A stop waits only for another stop. One sent while a start or an undo is
+   * out, or waiting to be sent again, names the run the banner shows
+   * ({@link cancelAutoStack}) and takes its own ticket. Every answer, a
+   * refusal's run included, goes through the follower's one guard, which
+   * keeps the newer word whichever answer came back first: a run the server
+   * started later, or the same run further on. So a start's answer read
+   * before the stop does not show the run going again, and one naming a newer
+   * run than a look that left after it is still taken.
+   *
    * @param {string} action - `start`, `cancel` or `revert`.
    * @param {Function} send - `() => Promise<{run, retryAfterMs}>`.
    * @returns {Promise<{ok: true, run: Object}|{ok: false, error: Object}>}
-   *   `error` as {@link autoStackFailure} words it, plus `busy` when another
-   *   run request is already on the wire.
+   *   `error` as {@link autoStackFailure} words it, plus `busy` when a start
+   *   or an undo is asked for while one of the three is on the wire, or a stop
+   *   while another stop is.
    */
   async function submitAutoStackRequest(action, send) {
-    if (autoStackAction.value) return localAutoStackRefusal("busy");
-    autoStackAction.value = action;
-    const epoch = autoStackEpoch;
+    const stop = action === "cancel";
+    if (stop ? autoStackStopOut : autoStackAction.value) {
+      return localAutoStackRefusal("busy");
+    }
+    if (stop) autoStackStopOut = true;
+    else autoStackGestureOut.value = action;
+    autoStackAction.value = autoStackStopOut
+      ? "cancel"
+      : autoStackGestureOut.value;
+    const epoch = autoStackFollower.epoch();
     try {
       for (let attempt = 0; ; attempt += 1) {
-        const ticket = ++autoStackTicket;
+        const claim = autoStackFollower.claim({ from: epoch });
         try {
           const reply = await send();
-          if (epoch !== autoStackEpoch) {
+          if (epoch !== autoStackFollower.epoch()) {
             return localAutoStackRefusal("cancelled");
           }
-          adoptAutoStackRun(reply.run, reply.retryAfterMs, {
-            epoch,
-            ticket,
+          autoStackFollower.adopt(reply.run, reply.retryAfterMs, {
+            ...claim,
             fromGesture: true,
           });
           return { ok: true, run: reply.run };
         } catch (err) {
           const failure = autoStackFailure(err);
-          if (epoch !== autoStackEpoch) return { ok: false, error: failure };
+          if (epoch !== autoStackFollower.epoch()) {
+            return { ok: false, error: failure };
+          }
           const unanswered =
             failure.kind === "timeout" || failure.kind === "network";
           if (unanswered && attempt < AUTO_STACK_SUBMIT_RETRY_MS.length) {
@@ -3298,11 +3423,26 @@ export const useDedupStore = defineStore("dedup", () => {
               err,
             );
             await wait(AUTO_STACK_SUBMIT_RETRY_MS[attempt]);
-            if (epoch !== autoStackEpoch) return { ok: false, error: failure };
+            if (epoch !== autoStackFollower.epoch()) {
+              return { ok: false, error: failure };
+            }
             continue;
           }
           if (failure.run) {
-            adoptAutoStackRun(failure.run, null, { epoch, ticket });
+            autoStackFollower.adopt(failure.run, null, claim);
+          }
+          // An undo the server refused for want of anything left names the
+          // apply run it was asked to undo. When that is the target of the
+          // revert run held here, the guard drops it as older, so the held
+          // run's `target_can_revert` is still the stale word that offered
+          // Undo: read the newest run again, which carries the fresh one.
+          const held = autoStackRun.value;
+          if (
+            failure.code === "nothing_to_revert" &&
+            held?.kind === "revert" &&
+            failure.run?.id === held.target_run_id
+          ) {
+            await autoStackFollower.resume({ force: true });
           }
           console.warn(
             `[dedup] the auto-stack ${action} did not go through ` +
@@ -3314,7 +3454,14 @@ export const useDedupStore = defineStore("dedup", () => {
         }
       }
     } finally {
-      if (epoch === autoStackEpoch) autoStackAction.value = null;
+      // After a session reset `forgetAutoStackRun` has already cleared both.
+      if (epoch === autoStackFollower.epoch()) {
+        if (stop) autoStackStopOut = false;
+        else autoStackGestureOut.value = null;
+        autoStackAction.value = autoStackStopOut
+          ? "cancel"
+          : autoStackGestureOut.value;
+      }
     }
   }
 
@@ -3350,7 +3497,11 @@ export const useDedupStore = defineStore("dedup", () => {
    * Ask the followed run to stop. It stops at its next slice; what it already
    * stacked stays stacked, and Undo run reverses it.
    *
+   * Always the run the banner shows, even while a start or an undo is still
+   * out: with none showing, or one already ended, nothing is sent.
+   *
    * @returns {Promise<{ok: true, run: Object}|{ok: false, error: Object}>}
+   *   `error.kind` is `busy` only while an earlier stop is still out.
    */
   function cancelAutoStack() {
     const run = autoStackRun.value;
@@ -3397,29 +3548,7 @@ export const useDedupStore = defineStore("dedup", () => {
    * @returns {Promise<Object|null>} the run now followed, or null.
    */
   function resumeAutoStackRun({ force = false } = {}) {
-    if (autoStackResumeInFlight) return autoStackResumeInFlight;
-    if (autoStackRunActive.value || (!force && autoStackResumeAttempted)) {
-      return Promise.resolve(autoStackRun.value);
-    }
-    autoStackResumeAttempted = true;
-    const epoch = autoStackEpoch;
-    const ticket = ++autoStackTicket;
-    const pending = (async () => {
-      try {
-        const run = await getLatestAutoStackRun();
-        if (run) adoptAutoStackRun(run, null, { epoch, ticket });
-      } catch (err) {
-        console.warn(
-          "[dedup] could not look for an auto-stack run to follow",
-          err,
-        );
-      }
-      return autoStackRun.value;
-    })().finally(() => {
-      if (autoStackResumeInFlight === pending) autoStackResumeInFlight = null;
-    });
-    autoStackResumeInFlight = pending;
-    return pending;
+    return autoStackFollower.resume({ force });
   }
 
   /**
@@ -3449,20 +3578,15 @@ export const useDedupStore = defineStore("dedup", () => {
    * the server.
    */
   function forgetAutoStackRun() {
-    autoStackEpoch += 1;
-    stopAutoStackPoll();
-    autoStackAppliedTicket = autoStackTicket;
-    autoStackRun.value = null;
-    autoStackRunUnreachable.value = false;
+    autoStackFollower.forget();
+    autoStackGestureOut.value = null;
+    autoStackStopOut = false;
     autoStackAction.value = null;
-    autoStackPollFailures = 0;
-    autoStackResumeAttempted = false;
-    autoStackResumeInFlight = null;
     autoStackSegmentBatches.clear();
     ownStackGestures.clear();
   }
 
-  onScopeDispose(stopAutoStackPoll);
+  onScopeDispose(autoStackFollower.stopPoll);
 
   // ── Mixed stacks (design D5) ─────────────────────────────────────────────
   // The third page of the Duplicates destination: live stacks whose members do
@@ -3496,6 +3620,11 @@ export const useDedupStore = defineStore("dedup", () => {
 
   /** More rows exist than are held. */
   const hasMoreMixed = computed(() => mixedNextOffset.value !== null);
+  // Bumped by every reload of the list and by a session reset. A read that
+  // left under an older one lands on state it no longer describes: a reload
+  // at a newer threshold, or another session's, has replaced it, so its
+  // answer, its failure and its spinner are all dropped.
+  let mixedGeneration = 0;
 
   /**
    * The stack ids the queue's deck badges flag: the STRONG case only, a member
@@ -3528,6 +3657,7 @@ export const useDedupStore = defineStore("dedup", () => {
    * @returns {Promise<void>}
    */
   async function loadMixedStacks() {
+    const generation = ++mixedGeneration;
     mixedLoading.value = true;
     mixedError.value = null;
     try {
@@ -3538,6 +3668,7 @@ export const useDedupStore = defineStore("dedup", () => {
         offset: 0,
         limit: MIXED_STACK_PAGE_SIZE,
       });
+      if (generation !== mixedGeneration) return;
       mixedStacks.value = Array.isArray(data?.stacks) ? data.stacks : [];
       mixedTotal.value = Number(data?.total) || mixedStacks.value.length;
       mixedKeptTotal.value = Number(data?.kept_total) || 0;
@@ -3550,6 +3681,13 @@ export const useDedupStore = defineStore("dedup", () => {
       mixedNextOffset.value = normalisedNextOffset(data);
       mixedLoaded.value = true;
     } catch (err) {
+      if (generation !== mixedGeneration) {
+        console.warn(
+          "[dedup] a superseded read of the mixed stacks failed; ignored",
+          err,
+        );
+        return;
+      }
       mixedError.value = err;
       mixedStacks.value = [];
       mixedTotal.value = 0;
@@ -3558,7 +3696,7 @@ export const useDedupStore = defineStore("dedup", () => {
       mixedLoaded.value = false;
       console.warn("[dedup] failed to load the mixed stacks", err);
     } finally {
-      mixedLoading.value = false;
+      if (generation === mixedGeneration) mixedLoading.value = false;
     }
   }
 
@@ -3587,6 +3725,7 @@ export const useDedupStore = defineStore("dedup", () => {
    */
   async function loadMoreMixedStacks() {
     if (mixedLoading.value || mixedNextOffset.value === null) return;
+    const generation = mixedGeneration;
     mixedLoading.value = true;
     try {
       const data = await listMixedStacks({
@@ -3596,6 +3735,9 @@ export const useDedupStore = defineStore("dedup", () => {
         offset: mixedNextOffset.value,
         limit: MIXED_STACK_PAGE_SIZE,
       });
+      // A reload since it left owns the list now; this page was cut from the
+      // list it replaced.
+      if (generation !== mixedGeneration) return;
       const page = Array.isArray(data?.stacks) ? data.stacks : [];
       // De-duped by stack id: an offset over a list that a split just shortened
       // can re-serve a row the client already holds.
@@ -3607,10 +3749,17 @@ export const useDedupStore = defineStore("dedup", () => {
       mixedTotal.value = Number(data?.total) || mixedTotal.value;
       mixedNextOffset.value = page.length ? normalisedNextOffset(data) : null;
     } catch (err) {
+      if (generation !== mixedGeneration) {
+        console.warn(
+          "[dedup] a superseded page of the mixed stacks failed; ignored",
+          err,
+        );
+        return;
+      }
       mixedError.value = err;
       console.warn("[dedup] failed to load more mixed stacks", err);
     } finally {
-      mixedLoading.value = false;
+      if (generation === mixedGeneration) mixedLoading.value = false;
     }
   }
 
@@ -3901,6 +4050,8 @@ export const useDedupStore = defineStore("dedup", () => {
    * of appending the previous session's rows into an empty window.
    * `countsEpoch` does the same for a count read, and a caller queued behind
    * that read is answered with null rather than left waiting on it.
+   * `policyGeneration` and `mixedGeneration` drop a policy read and a mixed
+   * stacks read the same way.
    *
    * `sizeLevel` deliberately stays. It is a persisted VIEW preference backed by
    * localStorage (like the review overlay's sticker shelf), not server data.
@@ -3908,11 +4059,11 @@ export const useDedupStore = defineStore("dedup", () => {
   function reset() {
     stopScanPoll();
     forgetAutoStackRun();
+    queueRereadWanted = false;
     cancelEndChase();
-    windowEpoch += 1;
-    pageInFlight = null;
-    prevInFlight = null;
+    claimWindow();
     countsEpoch += 1;
+    policyGeneration += 1;
     countsInFlight = null;
     const waitingForCounts = countsQueued;
     countsQueued = null;
@@ -3928,8 +4079,11 @@ export const useDedupStore = defineStore("dedup", () => {
     openCount.value = 0;
     byTier.value = {};
     scan.value = { ...IDLE_SCAN };
+    // A read from the previous session must not repaint the banner.
+    scanTicketShown = nextScanTicket();
     countsLoaded.value = false;
     scopeCounts.value = {};
+    scopeByTier.value = {};
 
     scopeType.value = GLOBAL_SCOPE;
     scopeId.value = null;
@@ -3944,9 +4098,9 @@ export const useDedupStore = defineStore("dedup", () => {
     hasMore.value = false;
     focusIndex.value = 0;
     loading.value = false;
-    loadingMore.value = false;
     error.value = null;
     busy.value = false;
+    uncertainReloadFailed.value = false;
     stackedCount.value = 0;
     separatedCount.value = 0;
 
@@ -3966,6 +4120,7 @@ export const useDedupStore = defineStore("dedup", () => {
     selectionAnchor = null;
 
     showingMixed.value = false;
+    mixedGeneration += 1;
     mixedStacks.value = [];
     mixedTotal.value = 0;
     mixedKeptTotal.value = 0;
@@ -4004,6 +4159,9 @@ export const useDedupStore = defineStore("dedup", () => {
     countsLoaded,
     isScanning,
     scopeCounts,
+    scopeByTier,
+    queueByTier,
+    reviewCount,
     refreshCounts,
     fetchScopeCount,
     invalidateScopeCounts,
@@ -4024,6 +4182,7 @@ export const useDedupStore = defineStore("dedup", () => {
     loadingMore,
     error,
     busy,
+    uncertainReloadFailed,
     stackedCount,
     separatedCount,
     doneCount,
@@ -4091,6 +4250,8 @@ export const useDedupStore = defineStore("dedup", () => {
     autoStackRunUnreachable,
     autoStackRunDismissed,
     autoStackAction,
+    autoStackStartOut,
+    autoStackRevertOut,
     autoStackCanRevert,
     startAutoStack,
     cancelAutoStack,

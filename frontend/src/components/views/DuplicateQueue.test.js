@@ -244,6 +244,7 @@ function runFixture(over = {}) {
     segment_batch_ids: [],
     cancel_requested: false,
     can_revert: false,
+    target_can_revert: false,
     error_code: null,
     error: null,
     created_at: "2026-05-12T14:22:00Z",
@@ -324,6 +325,13 @@ const globalOpts = {
  * `total` is the server's count of the WHOLE queue, which is larger than the
  * page whenever there is more to page in.
  */
+/**
+ * Every queue `mountQueue` has mounted and the teardown has not yet unmounted.
+ * A queue left on the page keeps its document keydown listener, so a case that
+ * forgot `wrapper.unmount()` would answer the next case's keys.
+ */
+const mountedQueues = [];
+
 async function mountQueue(groups, { byTier = {}, total = null } = {}) {
   getPolicy.mockResolvedValue({
     defaults: { near_enabled: false, embedding_enabled: false, threshold: 0.9 },
@@ -350,6 +358,7 @@ async function mountQueue(groups, { byTier = {}, total = null } = {}) {
     ...globalOpts,
     attachTo: document.body,
   });
+  mountedQueues.push(wrapper);
   await wrapper.vm.$nextTick();
   return { wrapper, store };
 }
@@ -411,6 +420,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // A case that unmounted its own queue is skipped: unmounting twice warns.
+  for (const wrapper of mountedQueues.splice(0)) {
+    if (!wrapper.vm.$.isUnmounted) wrapper.unmount();
+  }
   vi.restoreAllMocks();
 });
 
@@ -694,6 +707,57 @@ describe("DuplicateQueue - when a verdict does not land", () => {
     expect(errorSpy).toHaveBeenCalledTimes(1);
     expect(errorSpy.mock.calls[0][0]).toContain("still in the queue");
     expect(store.hasGroups).toBe(true);
+    wrapper.unmount();
+  });
+
+  // A 5xx can land after the server committed, so the store re-reads the
+  // queue before a retry and the notice says so. When that re-read fails too,
+  // the rows are gone and "the queue was reloaded" would be false.
+  it("says the queue was reloaded after an uncertain verdict only when it was", async () => {
+    const { wrapper } = await mountQueue([group("g1")]);
+    stackGroup.mockRejectedValue(refusal(503));
+
+    wrapper.findComponent({ name: "DedupGroupRow" }).vm.$emit("stack");
+    await flushPromises();
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0][0]).toContain(
+      "The queue was reloaded from the server",
+    );
+    expect(announced(wrapper)).toContain("The queue was reloaded");
+    wrapper.unmount();
+  });
+
+  it("says the queue could not be reloaded when the re-read after an uncertain verdict fails", async () => {
+    const { wrapper } = await mountQueue([group("g1")]);
+    stackGroup.mockRejectedValue(refusal(503));
+    listGroups.mockRejectedValue(refusal(503));
+
+    wrapper.findComponent({ name: "DedupGroupRow" }).vm.$emit("stack");
+    await flushPromises();
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const sentence = errorSpy.mock.calls[0][0];
+    expect(sentence).toContain("could not be reloaded");
+    expect(sentence).not.toContain("was reloaded");
+    expect(announced(wrapper)).toContain("could not be reloaded");
+    wrapper.unmount();
+  });
+
+  it("says the queue could not be reloaded after an uncertain bulk stack whose re-read fails", async () => {
+    const { wrapper, store } = await mountQueue([group("g1"), group("g2")]);
+    applyVerdictBatch.mockRejectedValue(refusal(502));
+    listGroups.mockRejectedValue(refusal(503));
+    store.toggleSelected(0);
+    store.toggleSelected(1);
+
+    wrapper.findComponent({ name: "DedupGroupRow" }).vm.$emit("stack");
+    await flushPromises();
+
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const sentence = errorSpy.mock.calls[0][0];
+    expect(sentence).toContain("confirmed stacks");
+    expect(sentence).toContain("could not be reloaded");
     wrapper.unmount();
   });
 });
@@ -2537,6 +2601,85 @@ describe("DuplicateQueue - the render window", () => {
       expect(entry.loadThumbnails).toBe(true);
     }
   });
+
+  it("keeps every row at one offset whatever the render window", async () => {
+    // The regression this pins: each spacer is a flex item and takes the
+    // list's row gap, so a spacer sized at rows x pitch put every row a gap
+    // lower the moment the window left the top. It was an 8px jump, which
+    // Chrome hid by anchoring and Safari showed. The pitch was also read
+    // from offsetTop, a whole number, so a fractional row put the spacers
+    // out by the fraction per row.
+    //
+    // happy-dom lays nothing out, so this lays the list out as a flex column
+    // does: children in order, each at the previous bottom plus the gap. The
+    // row height is fractional and its pitch differs from the estimate, so
+    // a pitch that is estimated or rounded instead of measured is caught.
+    const ROW_H = 196.4;
+    const GAP = 8;
+    const P = ROW_H + GAP;
+    expect(P).not.toBe(PITCH);
+    const heightOf = (el) =>
+      el.classList.contains("qspacer") ? parseFloat(el.style.height) : ROW_H;
+    const inList = (el) => el.parentElement?.classList.contains("qlist");
+    const layoutTop = (el) => {
+      let y = 0;
+      for (const child of el.parentElement.children) {
+        if (child === el) return y;
+        y += heightOf(child) + GAP;
+      }
+      throw new Error("element is not a child of its parent");
+    };
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(
+      function () {
+        const top = inList(this) ? layoutTop(this) : 0;
+        const height = inList(this) ? heightOf(this) : 0;
+        return { top, bottom: top + height, left: 0, right: 0, width: 0, height, x: 0, y: top };
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "offsetTop", "get").mockImplementation(
+      function () {
+        return inList(this) ? Math.round(layoutTop(this)) : 0;
+      },
+    );
+
+    const N = 60;
+    const { wrapper } = await mountQueue(
+      Array.from({ length: N }, (_, i) => group(`g${i + 1}`)),
+    );
+    await flushPromises();
+    const list = wrapper.find(".qlist");
+    const states = new Set();
+    for (const row of [0, 3, 4, 5, 6, 9, 25, 40, 44, 50, N - 1]) {
+      list.element.scrollTop = row * P;
+      await list.trigger("scroll");
+      await wrapper.vm.$nextTick();
+
+      const children = [...list.element.children];
+      for (const child of children) {
+        expect(["grow", "qspacer"]).toContain(child.classList[0]);
+      }
+      const rows = children.filter((el) => el.classList.contains("grow"));
+      const indices = wrapper.vm.windowedGroups.map((e) => e.index);
+      expect(rows).toHaveLength(indices.length);
+      rows.forEach((el, i) => {
+        expect(layoutTop(el)).toBeCloseTo(indices[i] * P, 6);
+      });
+      // The track ends where N rows end, whichever spacers are mounted.
+      const last = children[children.length - 1];
+      expect(layoutTop(last) + heightOf(last)).toBeCloseTo(N * P - GAP, 6);
+      states.add(
+        `${children[0].classList[0]}|${last.classList[0]}`,
+      );
+    }
+    // Not vacuous: the window started at the top, moved through the middle
+    // and reached the end, so each spacer was both absent and mounted.
+    expect([...states].sort()).toEqual([
+      "grow|qspacer",
+      "qspacer|grow",
+      "qspacer|qspacer",
+    ]);
+    wrapper.unmount();
+  });
 });
 
 describe("DuplicateQueue - the tier gate", () => {
@@ -2554,6 +2697,43 @@ describe("DuplicateQueue - the tier gate", () => {
     expect(rows[0].text()).toContain("always included");
     // Tier 3 is unreachable until tier 2 is on, so it must not be pressable.
     expect(rows[2].attributes("disabled")).toBeDefined();
+    wrapper.unmount();
+  });
+
+  // A queue scoped to one set lists that set's groups and its Auto-stack runs
+  // there, so every figure on its bar is the set's. The vault's showed a 167k
+  // badge over a list of two.
+  it("counts the scope, not the vault, when the queue is scoped", async () => {
+    const { wrapper, store } = await mountQueue([group("g1"), group("g2")], {
+      byTier: { exact: 160000, near: 7000, embedding: 0 },
+      total: 167000,
+    });
+    listGroups.mockResolvedValue({
+      groups: [group("g1"), group("g2")],
+      total: 2,
+      offset: 0,
+      limit: 20,
+      scan: { status: "complete", scanned_pictures: 1, total_pictures: 1 },
+    });
+    getCounts.mockImplementation(async ({ scopes }) => ({
+      unresolved_groups: 167000,
+      by_tier: { exact: 160000, near: 7000, embedding: 0 },
+      scopes: scopes.map((s) => ({
+        key: `${s.scopeType}:${s.scopeId}`,
+        unresolved_groups: 2,
+        by_tier: { exact: 1, near: 1, embedding: 0 },
+      })),
+      scan: { status: "complete" },
+    }));
+    await store.openQueue({ type: "set", id: 12, label: "Set B" });
+    await flushPromises();
+
+    expect(wrapper.find(".qtitle").text()).toContain("2 groups to review");
+    const trigger = wrapper.find('[data-testid="auto-stack-trigger"]');
+    expect(trigger.attributes("aria-label")).toBe("Auto-stack 1 exact match");
+    wrapper.find('[data-testid="dedup-tier-trigger"]').trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(".tm-count").text()).toBe("2 groups");
     wrapper.unmount();
   });
 });
@@ -2923,6 +3103,46 @@ describe("DuplicateQueue - starting the Auto-stack run", () => {
     wrapper.unmount();
   });
 
+  // The banner's Stop goes out beside a start still waiting to be sent again;
+  // the start is no less on the wire for it.
+  it("keeps telling the dialog its start is on the wire while a Stop is out beside it", async () => {
+    const resent = deferred();
+    startAutoStackRun
+      .mockRejectedValueOnce(
+        Object.assign(new Error("timeout of 60000ms exceeded"), {
+          code: "ECONNABORTED",
+        }),
+      )
+      .mockReturnValueOnce(resent.promise);
+    const { wrapper, store } = await openAndPreview();
+    autoStackDialog(wrapper).vm.$emit("confirm");
+    await flushPromises();
+    expect(autoStackDialog(wrapper).props("busy")).toBe(true);
+
+    // The first attempt's run reaches the banner through a forced look.
+    getLatestAutoStackRun.mockResolvedValueOnce(runFixture());
+    await store.resumeAutoStackRun({ force: true });
+    await flushPromises();
+    const stopAnswer = deferred();
+    cancelAutoStackRun.mockReturnValueOnce(stopAnswer.promise);
+    await wrapper.find('[data-testid="auto-stack-stop"]').trigger("click");
+    await flushPromises();
+    expect(store.autoStackAction).toBe("cancel");
+    expect(autoStackDialog(wrapper).props("busy")).toBe(true);
+
+    const asked = runFixture({ cancel_requested: true });
+    stopAnswer.resolve({ run: asked, retryAfterMs: 2000 });
+    await flushPromises();
+    expect(autoStackDialog(wrapper).props("busy")).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(startAutoStackRun).toHaveBeenCalledTimes(2);
+    resent.resolve({ run: asked, retryAfterMs: 2000 });
+    await flushPromises();
+    expect(autoStackDialog(wrapper).props("busy")).toBe(false);
+    wrapper.unmount();
+  });
+
   it("holds the trigger while a run is going, without opening the dialog", async () => {
     getLatestAutoStackRun.mockResolvedValueOnce(runFixture());
     const { wrapper } = await mountQueue([group("g1")], {
@@ -2934,6 +3154,29 @@ describe("DuplicateQueue - starting the Auto-stack run", () => {
     // Held, not disabled: it keeps focus and its tooltip says why.
     expect(trigger.attributes("aria-disabled")).toBe("true");
     expect(trigger.attributes("disabled")).toBeUndefined();
+    expect(tipText(trigger)).toBe(
+      "An Auto-stack run is already going. Its progress shows above the queue.",
+    );
+    await trigger.trigger("click");
+    await flushPromises();
+    expect(previewAutoStackExact).not.toHaveBeenCalled();
+    expect(autoStackDialog(wrapper).props("open")).toBe(false);
+    wrapper.unmount();
+  });
+
+  // A run asked to stop goes on until its slice ends, and the server refuses
+  // a second start until then.
+  it("holds the trigger while a run asked to stop is still going", async () => {
+    getLatestAutoStackRun.mockResolvedValueOnce(
+      runFixture({ cancel_requested: true }),
+    );
+    const { wrapper } = await mountQueue([group("g1")], {
+      byTier: { exact: 3 },
+    });
+    await flushPromises();
+
+    const trigger = autoStackTrigger(wrapper);
+    expect(trigger.attributes("aria-disabled")).toBe("true");
     expect(tipText(trigger)).toBe(
       "An Auto-stack run is already going. Its progress shows above the queue.",
     );
@@ -3090,6 +3333,31 @@ describe("DuplicateQueue - the Auto-stack run banner", () => {
     });
     await flushPromises();
     expect(props()).toMatchObject({ action: null, unreachable: false });
+    wrapper.unmount();
+  });
+
+  it("hands the banner the undo on the wire", async () => {
+    const pending = deferred();
+    revertAutoStackRun.mockReturnValueOnce(pending.promise);
+    const { wrapper } = await mountWithRun(
+      runFixture({ status: "complete", active: false, can_revert: true }),
+    );
+    const props = () =>
+      wrapper.findComponent({ name: "DedupAutoStackBanner" }).props();
+    expect(props().revertOut).toBe(false);
+
+    await press(wrapper, "auto-stack-revert");
+    expect(props().revertOut).toBe(true);
+    expect(
+      wrapper.find('[data-testid="auto-stack-revert"]').attributes("aria-busy"),
+    ).toBe("true");
+
+    pending.resolve({
+      run: runFixture({ id: 8, kind: "revert", target_run_id: 7 }),
+      retryAfterMs: 2000,
+    });
+    await flushPromises();
+    expect(props().revertOut).toBe(false);
     wrapper.unmount();
   });
 
@@ -4574,4 +4842,105 @@ describe("DuplicateQueue: the route to the stacks", () => {
     await stacksButton(wrapper).trigger("click");
     expect(routerReplace).not.toHaveBeenCalled();
   });
+});
+
+// A key pressed on an item of an open menu (the title bar's, the Undo menu,
+// the sidebar's) is the menu's, under the WAI-ARIA APG menu pattern. A menu
+// has no scrim, so the dialog guard missed it: S or Enter on a menu item
+// stacked the focused group, the arrows moved the queue, and the queue's
+// claim() stopped Escape at the document, so the menu never heard it.
+describe("DuplicateQueue - keys pressed inside an open menu", () => {
+  /** An open Vuetify menu holding one list item (a div with no role). */
+  function openMenu() {
+    const menu = document.createElement("div");
+    menu.className = "v-overlay v-overlay--active v-menu";
+    menu.innerHTML =
+      '<div class="v-overlay__content"><div class="v-list">' +
+      '<div class="v-list-item v-list-item--link" tabindex="-2">Settings</div>' +
+      "</div></div>";
+    document.body.appendChild(menu);
+    return menu;
+  }
+
+  // Signatures no other case in this file uses. A queue an earlier case left
+  // mounted still answers the document's keys and calls the same API mocks,
+  // so the calls are read by the groups this case mounted.
+  const OWN = ["g71", "g72"];
+  const ownCalls = (fn) =>
+    fn.mock.calls
+      .map(([signature]) => signature)
+      .filter((s) => OWN.includes(s));
+
+  function pressOn(target, key) {
+    const event = new window.KeyboardEvent("keydown", {
+      key,
+      bubbles: true,
+      cancelable: true,
+    });
+    target.dispatchEvent(event);
+    return event;
+  }
+
+  it.each(["ArrowDown", "s", "Enter", "k", "Escape"])(
+    "leaves %s on a menu item to the menu",
+    async (key) => {
+      const { wrapper, store } = await mountQueue(OWN.map((s) => group(s)));
+      stackGroup.mockResolvedValue({});
+      keepGroupSeparate.mockResolvedValue({});
+      const menu = openMenu();
+      const item = menu.querySelector(".v-list-item");
+      item.focus();
+      const reachedWindow = vi.fn();
+      window.addEventListener("keydown", reachedWindow);
+      try {
+        const event = pressOn(item, key);
+        await flushPromises();
+
+        expect(store.focusIndex).toBe(0);
+        expect(ownCalls(stackGroup)).toEqual([]);
+        expect(ownCalls(keepGroupSeparate)).toEqual([]);
+        expect(event.defaultPrevented).toBe(false);
+        // Vuetify closes a menu from a window listener: Escape must get there.
+        expect(reachedWindow).toHaveBeenCalledTimes(1);
+      } finally {
+        window.removeEventListener("keydown", reachedWindow);
+        menu.remove();
+        wrapper.unmount();
+      }
+    },
+  );
+
+  // The control: the same menu stays open, and the same keys pressed outside
+  // it still act, so the guard reads where the key was pressed, not whether a
+  // menu exists.
+  const QUEUE_EFFECTS = {
+    ArrowDown: (store) => expect(store.focusIndex).toBe(1),
+    s: () => expect(ownCalls(stackGroup)).toEqual(["g71"]),
+    Enter: () => expect(ownCalls(stackGroup)).toEqual(["g71"]),
+    k: () => expect(ownCalls(keepGroupSeparate)).toEqual(["g71"]),
+  };
+
+  it.each(Object.keys(QUEUE_EFFECTS))(
+    "still acts on %s pressed outside an open menu",
+    async (key) => {
+      const { wrapper, store } = await mountQueue(OWN.map((s) => group(s)));
+      stackGroup.mockResolvedValue({});
+      keepGroupSeparate.mockResolvedValue({});
+      const menu = openMenu();
+      const elsewhere = document.createElement("div");
+      elsewhere.tabIndex = 0;
+      document.body.appendChild(elsewhere);
+      elsewhere.focus();
+      try {
+        pressOn(elsewhere, key);
+        await flushPromises();
+
+        QUEUE_EFFECTS[key](store);
+      } finally {
+        elsewhere.remove();
+        menu.remove();
+        wrapper.unmount();
+      }
+    },
+  );
 });

@@ -38,6 +38,9 @@ from pixlstash.services.dedup_verdict_service import (
     notify_pictures_changed,
     plan_auto_stack_in_session,
 )
+from pixlstash.services.folder_structure_commit_service import (
+    resolve_pending_people_with_faces,
+)
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
 from pixlstash.tasks.task_type import TaskType
 
@@ -75,6 +78,9 @@ class DedupAutoStackTask(BaseTask):
         self._processed_count = 0
         self._total_count = 1
         self._pending_picture_ids: set[int] = set()
+        # The pictures the run row has counted, across every slice; the
+        # service adds to it (see apply_slice_in_session).
+        self._counted_picture_ids: set[int] = set()
         self._last_notify = time.monotonic()
         self._origin_client_id: Optional[str] = None
         self._source = "external"
@@ -125,7 +131,7 @@ class DedupAutoStackTask(BaseTask):
                 time.monotonic() - start,
             )
             return {"run_id": self._run_id, "status": AUTO_STACK_INTERRUPTED}
-        except Exception as exc:
+        except Exception:
             logger.exception(
                 "[auto-stack] run %s failed after %.1fs (%d of %d processed)",
                 self._run_id,
@@ -134,12 +140,14 @@ class DedupAutoStackTask(BaseTask):
                 self._total_count,
             )
             # Announce what did commit before the failure, then close the row.
+            # The row records a generic message: the exception, logged above
+            # with its traceback, can carry paths or SQL the view must not serve.
             self._flush_notifications(force=True)
             self._vault.db.run_task(
                 dedup_auto_stack_service.close_run_in_session,
                 self._run_id,
                 AUTO_STACK_FAILED,
-                f"{type(exc).__name__}: {exc}",
+                dedup_auto_stack_service.UNEXPECTED_ERROR_MESSAGE,
                 priority=DBPriority.IMMEDIATE,
             )
             raise
@@ -168,7 +176,15 @@ class DedupAutoStackTask(BaseTask):
         for start in range(0, len(group_ids), self.SLICE_GROUPS):
             chunk = group_ids[start : start + self.SLICE_GROUPS]
             result = self._run_slice(
-                dedup_auto_stack_service.apply_slice_in_session, self._run_id, chunk
+                dedup_auto_stack_service.apply_slice_in_session,
+                self._run_id,
+                chunk,
+                self._counted_picture_ids,
+            )
+            # Each slice commits on its own, and its union may have set a person
+            # pending on a member whose faces already exist (§24).
+            resolve_pending_people_with_faces(
+                self._vault, result["event_picture_ids"], origin="Auto-stack"
             )
             self._pending_picture_ids.update(result["event_picture_ids"])
             self._flush_notifications()
@@ -185,6 +201,7 @@ class DedupAutoStackTask(BaseTask):
                 dedup_auto_stack_service.revert_segment_in_session,
                 self._run_id,
                 batch_id,
+                self._counted_picture_ids,
                 self._vault.interactive_rescore_registry,
                 self._vault.image_root,
             )

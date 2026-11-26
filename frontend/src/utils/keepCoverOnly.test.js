@@ -410,6 +410,7 @@ describe("Selections larger than one request", () => {
       stacksTotal: 1201,
       detail: "",
       outcomeUnknown: true,
+      reloaded: true,
     });
     expect(lost).toBe(
       "Collapsed 500 of 1,201 stacks, then lost the server's answer, so more of them may have collapsed too. The grid has been reloaded to show where things stand. Running Keep cover only again is safe: a stack already collapsed is skipped.",
@@ -423,6 +424,21 @@ describe("Selections larger than one request", () => {
         outcomeUnknown: true,
       }),
     ).toMatch(/^Lost the server's answer while collapsing those stacks/);
+  });
+
+  // Nor a reload nobody saw land.
+  it("says the grid could not be reloaded when its re-read failed", () => {
+    const lost = keepCoverOnlyIncompleteMessage({
+      stacksDone: 500,
+      stacksTotal: 1201,
+      detail: "",
+      outcomeUnknown: true,
+      reloaded: false,
+    });
+    expect(lost).toBe(
+      "Collapsed 500 of 1,201 stacks, then lost the server's answer, so more of them may have collapsed too. The grid could not be reloaded either, so reload the page to see where things stand. Running Keep cover only again is safe: a stack already collapsed is skipped.",
+    );
+    expect(lost).not.toMatch(/has been reloaded/);
   });
 });
 

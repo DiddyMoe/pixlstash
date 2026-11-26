@@ -176,6 +176,7 @@ function autoStackRunFixture(over = {}) {
     segment_batch_ids: [],
     cancel_requested: false,
     can_revert: false,
+    target_can_revert: false,
     error_code: null,
     error: null,
     created_at: "2026-05-12T14:22:00Z",
@@ -1309,6 +1310,89 @@ describe("useDedupStore - verdicts and auto-advance", () => {
     expect(store.coverChoices.g1).toBeUndefined();
     expect(store.exclusions.g1).toBeUndefined();
   });
+
+  // A 5xx can land after the server committed, so the store re-reads the queue
+  // before a retry. The view tells the user it did; it can only be honest if
+  // the store says whether that re-read landed.
+  it("records that the re-read after an uncertain verdict failed", async () => {
+    servePage([group("g1"), group("g2")], { total: 2 });
+    const serverError = Object.assign(new Error("fake-failure"), {
+      response: { status: 503 },
+    });
+    stackGroup.mockRejectedValue(serverError);
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    listGroups.mockRejectedValue(new Error("fake-network-down"));
+
+    expect(await store.stack(store.groups[0])).toBeNull();
+    expect(store.uncertainReloadFailed).toBe(true);
+    // The verdict's error is what the view reports, not the re-read's.
+    expect(store.error).toBe(serverError);
+  });
+
+  it("clears the flag once a later re-read after an uncertain verdict lands", async () => {
+    servePage([group("g1"), group("g2")], { total: 2 });
+    stackGroup.mockRejectedValue(
+      Object.assign(new Error("fake-failure"), { response: { status: 503 } }),
+    );
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    listGroups.mockRejectedValueOnce(new Error("fake-network-down"));
+    await store.stack(store.groups[0]);
+    expect(store.uncertainReloadFailed).toBe(true);
+    // The failed re-read blanked the rows; the user reloads the page.
+    expect(store.groups).toEqual([]);
+    servePage([group("g1"), group("g2")], { total: 2 });
+    await store.loadFirstPage();
+
+    await store.stack(store.groups[0]);
+    expect(store.uncertainReloadFailed).toBe(false);
+    expect(store.groups.map((g) => g.signature)).toEqual(["g1", "g2"]);
+  });
+
+  // A re-read that a newer rebuild superseded did not fail: the newer rebuild
+  // owns the rows and reports its own outcome.
+  it("does not call a superseded re-read a failure", async () => {
+    servePage([group("g1")], { total: 1 });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    const stale = deferred();
+    listGroups.mockReturnValueOnce(stale.promise);
+    const first = store.loadFirstPage();
+    servePage([group("g2")], { total: 1 });
+    expect(await store.loadFirstPage()).toBe(true);
+    stale.reject(new Error("fake-stale-failure"));
+    expect(await first).toBe(true);
+    expect(store.groups.map((g) => g.signature)).toEqual(["g2"]);
+  });
+
+  it("does not call a superseded re-read that landed a failure", async () => {
+    servePage([group("g1")], { total: 1 });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    const stale = deferred();
+    listGroups.mockReturnValueOnce(stale.promise);
+    const first = store.loadFirstPage();
+    servePage([group("g2")], { total: 1 });
+    await store.loadFirstPage();
+    stale.resolve({ groups: [group("g1")], total: 1, scan: {} });
+    expect(await first).toBe(true);
+    expect(store.groups.map((g) => g.signature)).toEqual(["g2"]);
+  });
+
+  it("forgets a failed re-read on a session reset", async () => {
+    servePage([group("g1")], { total: 1 });
+    stackGroup.mockRejectedValue(
+      Object.assign(new Error("fake-failure"), { response: { status: 500 } }),
+    );
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    listGroups.mockRejectedValue(new Error("fake-network-down"));
+    await store.stack(store.groups[0]);
+    expect(store.uncertainReloadFailed).toBe(true);
+    store.reset();
+    expect(store.uncertainReloadFailed).toBe(false);
+  });
 });
 
 describe("useDedupStore - the verdict receipt", () => {
@@ -1738,6 +1822,54 @@ describe("useDedupStore - scope", () => {
     expect(store.isScoped).toBe(false);
     expect(store.scopeLabel).toBe("");
     expect(store.focusIndex).toBe(0);
+  });
+
+  // Auto-stack runs in the scope it was started from, so a scoped queue's
+  // button offering the vault's exact count offered groups the run would never
+  // reach (the 167k badge on a two-group set). The sidebar dot stays the
+  // vault's: it says duplicates exist anywhere.
+  it("reads the scope's own figures for its button, tier menu and headline", async () => {
+    servePage([group("g1"), group("g2")], { total: 2 });
+    getCounts.mockImplementation(async ({ scopes }) => ({
+      unresolved_groups: 167000,
+      by_tier: { exact: 160000, near: 7000, embedding: 0 },
+      scopes: scopes.map((s) => ({
+        key: scopeKey(s.scopeType, s.scopeId),
+        unresolved_groups: 2,
+        by_tier: { exact: 1, near: 1, embedding: 0 },
+      })),
+    }));
+    const store = useDedupStore();
+    await store.openQueue({ type: "set", id: 12, label: "Set B" });
+    await settle();
+    expect(getCounts).toHaveBeenLastCalledWith(
+      expect.objectContaining({ scopes: [{ scopeType: "set", scopeId: 12 }] }),
+    );
+    expect(store.openCount).toBe(167000);
+    expect(store.hasDuplicates).toBe(true);
+    expect(store.exactCount).toBe(1);
+    expect(store.queueOnlyCount).toBe(1);
+    expect(store.reviewCount).toBe(2);
+    expect(store.tierRows.find((row) => row.id === "exact").count).toBe(1);
+
+    await store.clearScope();
+    await settle();
+    expect(store.exactCount).toBe(160000);
+    expect(store.reviewCount).toBe(167000);
+  });
+
+  // A context menu asking for the queue's own scope must not send it twice.
+  it("asks for the queue's own scope once when a menu asks for it too", async () => {
+    servePage([group("g1")], { total: 1 });
+    const store = useDedupStore();
+    await store.openQueue({ type: "set", id: 12, label: "Set B" });
+    await settle();
+    getCounts.mockClear();
+    await store.fetchScopeCount("set", 12);
+    expect(getCounts).toHaveBeenCalledTimes(1);
+    expect(getCounts.mock.calls[0][0].scopes).toEqual([
+      { scopeType: "set", scopeId: 12 },
+    ]);
   });
 });
 
@@ -2285,6 +2417,160 @@ describe("useDedupStore - page requests across a session reset", () => {
   });
 });
 
+describe("useDedupStore - what a rebuilt window or a reset leaves behind", () => {
+  afterEach(() => {
+    // A scan answer starts the progress poll; no timer outlives its test.
+    useDedupStore().reset();
+  });
+
+  it("a loadMore after a rebuild sends its own page, not the old window's", async () => {
+    servePage(groupsFrom(0, 20), { total: 60 });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+
+    const pages = holdCalls(listGroups);
+    const stale = store.loadMore();
+    expect(store.loadingMore).toBe(true);
+    const rebuild = store.loadFirstPage();
+    // The old window's page no longer owns the spinner.
+    expect(store.loadingMore).toBe(false);
+    pages[1].resolve({ groups: groupsFrom(0, 20), total: 60 });
+    await rebuild;
+
+    const fresh = store.loadMore();
+    expect(pages).toHaveLength(3);
+    pages[0].resolve({ groups: [group("g99")], total: 60 });
+    await stale;
+    pages[2].resolve({ groups: groupsFrom(20, 20), total: 60 });
+    await fresh;
+    expect(store.loadingMore).toBe(false);
+    expect(store.groups.map((g) => g.signature)).toEqual(
+      groupsFrom(0, 40).map((g) => g.signature),
+    );
+  });
+
+  it("a loadPrevious after Home and End sends its own page, not the old window's", async () => {
+    const serveByOffset = async ({ offset = 0, limit }) => ({
+      groups: groupsFrom(offset, limit),
+      total: 200,
+      offset,
+      limit,
+    });
+    const upward = [];
+    listGroups.mockImplementation((args) => {
+      if (args.offset !== 160) return serveByOffset(args);
+      const d = deferred();
+      upward.push(d);
+      return d.promise;
+    });
+    const store = useDedupStore();
+    await store.loadPolicy();
+    await store.loadFirstPage();
+    await store.focusEnd();
+    expect(store.windowStart).toBe(180);
+
+    const stale = store.loadPrevious();
+    expect(upward).toHaveLength(1);
+    await store.loadFirstPage();
+    await store.focusEnd();
+    expect(store.windowStart).toBe(180);
+
+    const fresh = store.loadPrevious();
+    expect(upward).toHaveLength(2);
+    upward[0].resolve({ groups: groupsFrom(160, 20), total: 200 });
+    await stale;
+    upward[1].resolve({ groups: groupsFrom(160, 20), total: 200 });
+    await fresh;
+    expect(store.windowStart).toBe(160);
+    expect(store.groups).toHaveLength(40);
+  });
+
+  it("a counts read sent before a scan starts does not end the scan on the banner", async () => {
+    const counts = holdCalls(getCounts);
+    startScan.mockResolvedValue({
+      status: "running",
+      scanned_pictures: 0,
+      total_pictures: 10,
+    });
+    const store = useDedupStore();
+    const read = store.refreshCounts();
+    await store.triggerScan();
+    expect(store.scan.status).toBe("running");
+
+    counts[0].resolve({
+      unresolved_groups: 0,
+      by_tier: {},
+      scopes: [],
+      scan: { status: "complete", scanned_pictures: 10, total_pictures: 10 },
+    });
+    await read;
+    expect(store.scan.status).toBe("running");
+    expect(store.isScanning).toBe(true);
+  });
+
+  it("a scan answer from before a reset leaves the new session's banner idle", async () => {
+    const scans = holdCalls(startScan);
+    const store = useDedupStore();
+    const started = store.triggerScan();
+    store.reset();
+    scans[0].resolve({
+      status: "running",
+      scanned_pictures: 0,
+      total_pictures: 10,
+    });
+    await started;
+    expect(store.scan.status).toBe("idle");
+    expect(store.isScanning).toBe(false);
+  });
+
+  it("an old verdict finishing after a reset keeps the new verdict's busy", async () => {
+    servePage([group("g1"), group("g2"), group("g3")], { total: 3 });
+    const verdicts = holdCalls(stackGroup);
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    const old = store.stack(store.groups[0]);
+    expect(store.busy).toBe(true);
+
+    store.reset();
+    expect(store.busy).toBe(false);
+    await store.loadFirstPage();
+    const fresh = store.stack(store.groups[1]);
+    expect(verdicts).toHaveLength(2);
+
+    verdicts[0].resolve({});
+    await old;
+    await settle();
+    expect(store.busy).toBe(true);
+    // One verdict at a time still holds for the new session.
+    expect(await store.stack(store.groups[2])).toBeNull();
+    expect(verdicts).toHaveLength(2);
+
+    verdicts[1].resolve({});
+    await fresh;
+    expect(store.busy).toBe(false);
+  });
+
+  it("refuses a bulk stack and a bulk keep-separate while a single verdict is on the wire", async () => {
+    servePage([group("g1"), group("g2"), group("g3")], { total: 3 });
+    const verdicts = holdCalls(stackGroup);
+    const store = useDedupStore();
+    await store.loadPolicy();
+    await store.loadFirstPage();
+    const single = store.stack(store.groups[2]);
+    expect(store.busy).toBe(true);
+
+    store.toggleSelected(1);
+    expect(store.verdictTargets(store.groups[1])).toHaveLength(2);
+    expect(await store.stack(store.groups[1])).toBeNull();
+    expect(await store.keepSeparate(store.groups[1])).toBeNull();
+    expect(applyVerdictBatch).not.toHaveBeenCalled();
+
+    verdicts[0].resolve({});
+    await single;
+    expect(store.busy).toBe(false);
+  });
+});
+
 describe("useDedupStore - multi-select", () => {
   async function openWith(groups) {
     servePage(groups);
@@ -2693,6 +2979,132 @@ describe("useDedupStore - scans and bulk auto-stack", () => {
       expect(listGroups).toHaveBeenCalledTimes(2);
       store.stopScanPoll();
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A scan's late finds join a triage already under way in place: the scan
+  // ending must not send the user back to the head of the queue, drop the
+  // groups they selected, or move the cursor off the group it was on.
+  it("a finishing scan keeps the focus, the selection and the place", async () => {
+    vi.useFakeTimers();
+    try {
+      const running = {
+        status: "running",
+        tiers: ["exact"],
+        threshold: 0.9,
+        scanned_pictures: 1,
+        total_pictures: 2,
+      };
+      const complete = {
+        status: "complete",
+        scanned_pictures: 2,
+        total_pictures: 2,
+      };
+      servePage(groupsFrom(0, 5), { total: 5, scan: running });
+      getCounts.mockResolvedValue({
+        unresolved_groups: 5,
+        by_tier: {},
+        scopes: [],
+        scan: running,
+      });
+      const store = useDedupStore();
+      await store.openQueue({});
+      // g1 and g5 selected, the cursor on g4.
+      store.toggleSelected(4);
+      store.setFocus(3);
+      expect(store.selectionCount).toBe(2);
+      listGroups.mockClear();
+
+      getCounts.mockResolvedValue({
+        unresolved_groups: 6,
+        by_tier: {},
+        scopes: [],
+        scan: complete,
+      });
+      // The scan found g2b late; it sorts ahead of the cursor.
+      servePage(
+        [
+          group("g1"),
+          group("g2"),
+          group("g2b"),
+          group("g3"),
+          group("g4"),
+          group("g5"),
+        ],
+        { total: 6, scan: complete },
+      );
+      await vi.advanceTimersByTimeAsync(2100);
+
+      expect(listGroups).toHaveBeenCalledTimes(1);
+      expect(store.groups.map((g) => g.signature)).toEqual([
+        "g1",
+        "g2",
+        "g2b",
+        "g3",
+        "g4",
+        "g5",
+      ]);
+      expect(store.focusedGroup.signature).toBe("g4");
+      expect(store.focusIndex).toBe(4);
+      expect(store.isSelected("g1")).toBe(true);
+      expect(store.isSelected("g5")).toBe(true);
+      expect(store.selectionCount).toBe(2);
+      expect(store.isScanning).toBe(false);
+    } finally {
+      useDedupStore().stopScanPoll();
+      vi.useRealTimers();
+    }
+  });
+
+  // The scan's re-read is the run's: it waits for a verdict on the wire, so
+  // it cannot answer from before that verdict and put the decided group back.
+  it("a finishing scan re-reads only once the verdict on the wire is done", async () => {
+    vi.useFakeTimers();
+    try {
+      const running = {
+        status: "running",
+        tiers: ["exact"],
+        threshold: 0.9,
+        scanned_pictures: 1,
+        total_pictures: 2,
+      };
+      const complete = {
+        status: "complete",
+        scanned_pictures: 2,
+        total_pictures: 2,
+      };
+      servePage(groupsFrom(0, 3), { total: 3, scan: running });
+      getCounts.mockResolvedValue({
+        unresolved_groups: 3,
+        by_tier: {},
+        scopes: [],
+        scan: running,
+      });
+      const store = useDedupStore();
+      await store.openQueue({});
+      const verdicts = holdCalls(stackGroup);
+      const verdict = store.stack(store.groups[0]);
+      listGroups.mockClear();
+
+      getCounts.mockResolvedValue({
+        unresolved_groups: 2,
+        by_tier: {},
+        scopes: [],
+        scan: complete,
+      });
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(store.isScanning).toBe(false);
+      expect(listGroups).not.toHaveBeenCalled();
+
+      servePage([group("g2"), group("g3")], { total: 2, scan: complete });
+      verdicts[0].resolve({});
+      await verdict;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(listGroups).toHaveBeenCalledTimes(1);
+      expect(store.groups.map((g) => g.signature)).toEqual(["g2", "g3"]);
+    } finally {
+      useDedupStore().stopScanPoll();
       vi.useRealTimers();
     }
   });
@@ -3328,6 +3740,16 @@ describe("useDedupStore - the auto-stack run", () => {
     listGroups.mockClear();
     getCounts.mockClear();
 
+    // The run just started is read early once; the rest keep the server's
+    // interval.
+    getAutoStackRun.mockResolvedValueOnce({
+      run: autoStackRunFixture(),
+      retryAfterMs: 5000,
+    });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(getAutoStackRun).toHaveBeenCalledTimes(1);
+    getAutoStackRun.mockClear();
+
     getAutoStackRun.mockResolvedValue({
       run: autoStackRunFixture({ processed: 80 }),
       retryAfterMs: 3000,
@@ -3371,11 +3793,19 @@ describe("useDedupStore - the auto-stack run", () => {
     ["a ten-minute hint, held to the ceiling", 600000, 30000],
     ["no hint, the default", null, 2000],
   ])("polls at a bounded interval: %s", async (_label, hint, expected) => {
+    // The first, early read of the run just started carries the hint.
+    getAutoStackRun.mockResolvedValueOnce({
+      run: autoStackRunFixture(),
+      retryAfterMs: hint,
+    });
     getAutoStackRun.mockResolvedValue({
       run: autoStackRunFixture(),
       retryAfterMs: 2000,
     });
-    await followRun({}, hint);
+    await followRun({}, 2000);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(getAutoStackRun).toHaveBeenCalledTimes(1);
+    getAutoStackRun.mockClear();
     await vi.advanceTimersByTimeAsync(expected - 1);
     expect(getAutoStackRun).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
@@ -3476,6 +3906,274 @@ describe("useDedupStore - the auto-stack run", () => {
     expect(cancelAutoStackRun).toHaveBeenCalledTimes(1);
   });
 
+  /**
+   * A start whose first attempt went unanswered, waiting to be sent again, and
+   * the run that attempt began brought onto the banner by a forced resume.
+   */
+  async function resendingWithRunOnBanner(resent) {
+    startAutoStackRun
+      .mockRejectedValueOnce(Object.assign(new Error("fake-lost"), NO_ANSWER))
+      .mockReturnValueOnce(resent.promise);
+    const store = useDedupStore();
+    const pending = store.startAutoStack({ requestId: "cli-fake-gesture" });
+    await vi.advanceTimersByTimeAsync(0);
+    getLatestAutoStackRun.mockResolvedValue(autoStackRunFixture());
+    await store.resumeAutoStackRun({ force: true });
+    return { store, pending };
+  }
+
+  // A start can wait several seconds to be sent again, and the banner's Stop
+  // is for the run it shows: it goes out at once, beside the start.
+  it("stops the run the banner shows while the start waits to be sent again", async () => {
+    const resent = deferred();
+    const { store, pending } = await resendingWithRunOnBanner(resent);
+    expect(store.autoStackAction).toBe("start");
+
+    const stopAnswer = deferred();
+    cancelAutoStackRun.mockReturnValue(stopAnswer.promise);
+    const stopping = store.cancelAutoStack();
+    expect(cancelAutoStackRun).toHaveBeenCalledWith(7);
+    expect(store.autoStackAction).toBe("cancel");
+
+    const asked = autoStackRunFixture({ cancel_requested: true });
+    stopAnswer.resolve({ run: asked, retryAfterMs: 2000 });
+    expect(await stopping).toEqual({ ok: true, run: asked });
+    expect(store.autoStackRun).toEqual(asked);
+    // The start is still out, and still holds the controls that wait for it.
+    expect(store.autoStackAction).toBe("start");
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(startAutoStackRun).toHaveBeenCalledTimes(2);
+    resent.resolve({ run: asked, retryAfterMs: 2000 });
+    expect(await pending).toEqual({ ok: true, run: asked });
+    expect(store.autoStackAction).toBe(null);
+    expect(store.autoStackRun.cancel_requested).toBe(true);
+  });
+
+  it("holds a second Stop while the first is out", async () => {
+    const resent = deferred();
+    const { store, pending } = await resendingWithRunOnBanner(resent);
+    const stopAnswer = deferred();
+    cancelAutoStackRun.mockReturnValue(stopAnswer.promise);
+    const stopping = store.cancelAutoStack();
+    expect(await store.cancelAutoStack()).toEqual({
+      ok: false,
+      error: { kind: "busy", status: null, detail: "", code: null, run: null },
+    });
+    expect(cancelAutoStackRun).toHaveBeenCalledTimes(1);
+
+    const asked = autoStackRunFixture({ cancel_requested: true });
+    stopAnswer.resolve({ run: asked, retryAfterMs: 2000 });
+    expect((await stopping).ok).toBe(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    resent.resolve({ run: asked, retryAfterMs: 2000 });
+    expect((await pending).ok).toBe(true);
+    expect(store.autoStackAction).toBe(null);
+  });
+
+  // A run asked to stop is still going until its slice ends, and a Stop out
+  // is as much a request on the wire as a start: no new start goes beside it.
+  it("holds a new start while a Stop is out", async () => {
+    const store = await followRun();
+    const stopAnswer = deferred();
+    cancelAutoStackRun.mockReturnValue(stopAnswer.promise);
+    const stopping = store.cancelAutoStack();
+    expect(store.autoStackAction).toBe("cancel");
+
+    expect(await store.startAutoStack()).toEqual({
+      ok: false,
+      error: { kind: "busy", status: null, detail: "", code: null, run: null },
+    });
+    expect(startAutoStackRun).toHaveBeenCalledTimes(1);
+
+    stopAnswer.resolve({
+      run: autoStackRunFixture({ cancel_requested: true }),
+      retryAfterMs: 2000,
+    });
+    expect((await stopping).ok).toBe(true);
+    expect(store.autoStackAction).toBe(null);
+    expect(store.autoStackRunActive).toBe(true);
+  });
+
+  it("sends no Stop for a run that has ended, even while a start is out", async () => {
+    const answer = deferred();
+    startAutoStackRun.mockReturnValueOnce(answer.promise);
+    const store = useDedupStore();
+    const pending = store.startAutoStack();
+    const finished = autoStackRunFixture({ status: "complete", active: false });
+    getLatestAutoStackRun.mockResolvedValue(finished);
+    await store.resumeAutoStackRun({ force: true });
+
+    expect(await store.cancelAutoStack()).toEqual({ ok: true, run: finished });
+    expect(cancelAutoStackRun).not.toHaveBeenCalled();
+    expect(store.autoStackAction).toBe("start");
+
+    const next = autoStackRunFixture({ id: 8 });
+    answer.resolve({ run: next, retryAfterMs: 2000 });
+    expect(await pending).toEqual({ ok: true, run: next });
+    expect(store.autoStackAction).toBe(null);
+  });
+
+  // The resend leaves after the Stop, but the server read the run for it
+  // before it heard the Stop: its answer is newer by ticket, older in fact.
+  it("does not show the run going again for a resend read before the Stop it left after", async () => {
+    const resent = deferred();
+    const { store, pending } = await resendingWithRunOnBanner(resent);
+    const asked = autoStackRunFixture({ cancel_requested: true, processed: 60 });
+    cancelAutoStackRun.mockResolvedValue({ run: asked, retryAfterMs: 2000 });
+    await store.cancelAutoStack();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(startAutoStackRun).toHaveBeenCalledTimes(2);
+
+    resent.resolve({
+      run: autoStackRunFixture({ processed: 50 }),
+      retryAfterMs: 2000,
+    });
+    expect((await pending).ok).toBe(true);
+    expect(store.autoStackRun).toEqual(asked);
+    expect(store.autoStackAction).toBe(null);
+  });
+
+  // An answer that says the run has ended is never older than the banner: the
+  // run finished before the server heard the Stop still out from here.
+  it("takes a resend's answer that the run has ended while a Stop is still out", async () => {
+    const resent = deferred();
+    const { store, pending } = await resendingWithRunOnBanner(resent);
+    const stopAnswer = deferred();
+    cancelAutoStackRun.mockReturnValue(stopAnswer.promise);
+    const stopping = store.cancelAutoStack();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(startAutoStackRun).toHaveBeenCalledTimes(2);
+
+    const finished = autoStackRunFixture({
+      status: "complete",
+      active: false,
+      processed: 120,
+      applied: 120,
+    });
+    resent.resolve({ run: finished, retryAfterMs: null });
+    expect(await pending).toEqual({ ok: true, run: finished });
+    expect(store.autoStackRun).toEqual(finished);
+    expect(store.autoStackRunActive).toBe(false);
+    expect(store.autoStackAction).toBe("cancel");
+
+    stopAnswer.resolve({ run: finished, retryAfterMs: null });
+    expect((await stopping).ok).toBe(true);
+    expect(store.autoStackRunActive).toBe(false);
+    expect(store.autoStackAction).toBe(null);
+  });
+
+  // A refusal names the run as the server read it, which can be before it
+  // heard the Stop: it meets the same rules as any other answer.
+  it("does not show the run going again for a refusal read before the Stop it left after", async () => {
+    const resent = deferred();
+    const { store, pending } = await resendingWithRunOnBanner(resent);
+    const asked = autoStackRunFixture({ cancel_requested: true, processed: 60 });
+    cancelAutoStackRun.mockResolvedValue({ run: asked, retryAfterMs: 2000 });
+    await store.cancelAutoStack();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(startAutoStackRun).toHaveBeenCalledTimes(2);
+
+    resent.reject(
+      refusal(409, "auto_stack_run_active", autoStackRunFixture({ processed: 50 })),
+    );
+    expect((await pending).error.code).toBe("auto_stack_run_active");
+    expect(store.autoStackRun).toEqual(asked);
+  });
+
+  it("keeps the Stop's answer when a refusal read before the Stop lands first", async () => {
+    const resent = deferred();
+    const { store, pending } = await resendingWithRunOnBanner(resent);
+    const stopAnswer = deferred();
+    cancelAutoStackRun.mockReturnValue(stopAnswer.promise);
+    const stopping = store.cancelAutoStack();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(startAutoStackRun).toHaveBeenCalledTimes(2);
+
+    resent.reject(
+      refusal(409, "auto_stack_run_active", autoStackRunFixture({ processed: 50 })),
+    );
+    expect((await pending).ok).toBe(false);
+    expect(store.autoStackAction).toBe("cancel");
+
+    const asked = autoStackRunFixture({ cancel_requested: true, processed: 60 });
+    stopAnswer.resolve({ run: asked, retryAfterMs: 2000 });
+    expect(await stopping).toEqual({ ok: true, run: asked });
+    expect(store.autoStackRun).toEqual(asked);
+  });
+
+  // The queue forces a look for the newest run when it opens, and that look
+  // can cross the user's own start on the wire. The run the server started
+  // later (a higher id) is the newer word, whichever answer lands first.
+  it("follows its start's run when a forced look at an older, ended run lands first", async () => {
+    const answer = deferred();
+    startAutoStackRun.mockReturnValueOnce(answer.promise);
+    const store = useDedupStore();
+    const pending = store.startAutoStack();
+    getLatestAutoStackRun.mockResolvedValue(
+      autoStackRunFixture({ id: 6, status: "complete", active: false }),
+    );
+    await store.resumeAutoStackRun({ force: true });
+    expect(store.autoStackRun.id).toBe(6);
+
+    const started = autoStackRunFixture();
+    answer.resolve({ run: started, retryAfterMs: 2000 });
+    expect(await pending).toEqual({ ok: true, run: started });
+    expect(store.autoStackRun).toEqual(started);
+    expect(store.autoStackRunActive).toBe(true);
+  });
+
+  it("keeps its start's run when a forced look at an older run lands after it", async () => {
+    const answer = deferred();
+    startAutoStackRun.mockReturnValueOnce(answer.promise);
+    const latest = deferred();
+    getLatestAutoStackRun.mockReturnValueOnce(latest.promise);
+    const store = useDedupStore();
+    const pending = store.startAutoStack();
+    const looking = store.resumeAutoStackRun({ force: true });
+
+    const started = autoStackRunFixture();
+    answer.resolve({ run: started, retryAfterMs: 2000 });
+    expect((await pending).ok).toBe(true);
+    latest.resolve(
+      autoStackRunFixture({ id: 6, status: "complete", active: false }),
+    );
+    await looking;
+    expect(store.autoStackRun).toEqual(started);
+    expect(store.autoStackRunActive).toBe(true);
+  });
+
+  it("clears a Stop and a start that were out across a session reset", async () => {
+    const resent = deferred();
+    const { store, pending } = await resendingWithRunOnBanner(resent);
+    const stopAnswer = deferred();
+    cancelAutoStackRun.mockReturnValue(stopAnswer.promise);
+    const stopping = store.cancelAutoStack();
+
+    store.reset();
+    expect(store.autoStackAction).toBe(null);
+    stopAnswer.resolve({
+      run: autoStackRunFixture({ cancel_requested: true }),
+      retryAfterMs: 2000,
+    });
+    expect((await stopping).error.kind).toBe("cancelled");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).ok).toBe(false);
+    expect(startAutoStackRun).toHaveBeenCalledTimes(1);
+    expect(store.autoStackRun).toBe(null);
+
+    // The next session's Stop is held by nothing from the last one.
+    getLatestAutoStackRun.mockResolvedValue(autoStackRunFixture({ id: 5 }));
+    await store.resumeAutoStackRun({ force: true });
+    cancelAutoStackRun.mockResolvedValue({
+      run: autoStackRunFixture({ id: 5, cancel_requested: true }),
+      retryAfterMs: 2000,
+    });
+    expect((await store.cancelAutoStack()).ok).toBe(true);
+    expect(cancelAutoStackRun).toHaveBeenLastCalledWith(5);
+    expect(store.autoStackAction).toBe(null);
+  });
+
   // The banner says the progress it shows is the last known while the run
   // cannot be read, and the poll keeps trying, more slowly each time.
   it("keeps polling, more slowly, while the run cannot be read", async () => {
@@ -3485,7 +4183,8 @@ describe("useDedupStore - the auto-stack run", () => {
         Object.assign(new Error("fake-down"), { code: "ERR_NETWORK" }),
       );
     down();
-    await vi.advanceTimersByTimeAsync(2000);
+    // The first, early read of the run just started fails.
+    await vi.advanceTimersByTimeAsync(250);
     expect(getAutoStackRun).toHaveBeenCalledTimes(1);
     expect(store.autoStackRunUnreachable).toBe(true);
     expect(store.autoStackRun.processed).toBe(40);
@@ -3567,8 +4266,19 @@ describe("useDedupStore - the auto-stack run", () => {
     expect(cancelAutoStackRun).not.toHaveBeenCalled();
   });
 
+  /** Revert run 8 of apply run 7, ended `status`; the rest as the server said. */
+  const endedUndo = (status, over = {}) => ({
+    id: 8,
+    kind: "revert",
+    status,
+    active: false,
+    target_run_id: 7,
+    ...over,
+  });
+
   // Undo run reverses an apply run, or resends the undo a revert stopped short
-  // of: the server undoes only what is still stacked.
+  // of: the server undoes only what is still stacked. Whether there is any is
+  // the server's word (`can_revert`, `target_can_revert`), not the status.
   it.each([
     [
       "a finished apply run",
@@ -3580,23 +4290,19 @@ describe("useDedupStore - the auto-stack run", () => {
     ],
     [
       "an undo that a later edit blocked part way",
-      {
-        id: 8,
-        kind: "revert",
-        status: "blocked",
-        active: false,
-        target_run_id: 7,
-      },
+      endedUndo("blocked", { target_can_revert: true }),
     ],
     [
       "an undo that was interrupted",
-      {
-        id: 8,
-        kind: "revert",
-        status: "interrupted",
-        active: false,
-        target_run_id: 7,
-      },
+      endedUndo("interrupted", { target_can_revert: true }),
+    ],
+    [
+      "an undo that was stopped",
+      endedUndo("cancelled", { target_can_revert: true }),
+    ],
+    [
+      "an undo that finished, with steps redone from History since",
+      endedUndo("complete", { target_can_revert: true }),
     ],
   ])("undoes apply run 7 from %s", async (_label, over) => {
     getLatestAutoStackRun.mockResolvedValue(autoStackRunFixture(over));
@@ -3625,15 +4331,15 @@ describe("useDedupStore - the auto-stack run", () => {
       "an apply run with nothing left to undo",
       { status: "complete", active: false, can_revert: false },
     ],
+    ["an undo that finished", endedUndo("complete")],
+    // Its last steps were undone from History, or by another tab's undo.
     [
-      "an undo that finished",
-      {
-        id: 8,
-        kind: "revert",
-        status: "complete",
-        active: false,
-        target_run_id: 7,
-      },
+      "an undo that stopped short, whose run has nothing left",
+      endedUndo("cancelled", { target_can_revert: false }),
+    ],
+    [
+      "an undo that was blocked, whose run has nothing left",
+      endedUndo("blocked", { target_can_revert: false }),
     ],
   ])("offers no undo for %s", async (_label, over) => {
     getLatestAutoStackRun.mockResolvedValue(
@@ -3653,6 +4359,132 @@ describe("useDedupStore - the auto-stack run", () => {
       },
     });
     expect(revertAutoStackRun).not.toHaveBeenCalled();
+  });
+
+  // Each read carries the server's word again: once the stopped undo's run has
+  // nothing left, Undo goes, and comes back if a step is redone.
+  it("offers the undo again on each read only while its run has something left", async () => {
+    getLatestAutoStackRun.mockResolvedValue(
+      autoStackRunFixture(endedUndo("cancelled", { target_can_revert: true })),
+    );
+    const store = useDedupStore();
+    await store.resumeAutoStackRun();
+    expect(store.autoStackCanRevert).toBe(true);
+
+    getLatestAutoStackRun.mockResolvedValue(
+      autoStackRunFixture(endedUndo("cancelled", { target_can_revert: false })),
+    );
+    await store.resumeAutoStackRun({ force: true });
+    expect(store.autoStackRun.target_can_revert).toBe(false);
+    expect(store.autoStackCanRevert).toBe(false);
+
+    getLatestAutoStackRun.mockResolvedValue(
+      autoStackRunFixture(endedUndo("cancelled", { target_can_revert: true })),
+    );
+    await store.resumeAutoStackRun({ force: true });
+    expect(store.autoStackCanRevert).toBe(true);
+  });
+
+  // The refusal names apply run 7, older than the revert run 8 held here, so
+  // the follower drops it and the held run's stale `target_can_revert` would
+  // keep Undo up until the next read. The store reads the newest run again.
+  it("reads the run again when the server says the held undo's run has nothing left", async () => {
+    getLatestAutoStackRun.mockResolvedValue(
+      autoStackRunFixture(endedUndo("cancelled", { target_can_revert: true })),
+    );
+    const store = useDedupStore();
+    await store.resumeAutoStackRun();
+    expect(store.autoStackCanRevert).toBe(true);
+
+    getLatestAutoStackRun.mockResolvedValue(
+      autoStackRunFixture(endedUndo("cancelled", { target_can_revert: false })),
+    );
+    revertAutoStackRun.mockRejectedValue(
+      refusal(
+        409,
+        "nothing_to_revert",
+        autoStackRunFixture({ status: "complete", active: false, can_revert: false }),
+      ),
+    );
+    const result = await store.revertAutoStack({ requestId: "cli-fake-undo" });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe("nothing_to_revert");
+    expect(getLatestAutoStackRun).toHaveBeenCalledTimes(2);
+    expect(store.autoStackRun).toMatchObject({ id: 8, target_can_revert: false });
+    expect(store.autoStackCanRevert).toBe(false);
+  });
+
+  // Only that refusal, about that run, sends the read: another code, or one
+  // naming some other run, leaves the follower to its own reads.
+  it.each([
+    ["another refusal", "auto_stack_run_active", 7],
+    ["a refusal about another run", "nothing_to_revert", 5],
+  ])("does not read the run again on %s", async (_label, code, runId) => {
+    getLatestAutoStackRun.mockResolvedValue(
+      autoStackRunFixture(endedUndo("cancelled", { target_can_revert: true })),
+    );
+    const store = useDedupStore();
+    await store.resumeAutoStackRun();
+    revertAutoStackRun.mockRejectedValue(
+      refusal(
+        409,
+        code,
+        autoStackRunFixture({ id: runId, status: "complete", active: false }),
+      ),
+    );
+    const result = await store.revertAutoStack({ requestId: "cli-fake-undo" });
+    expect(result.error.code).toBe(code);
+    expect(getLatestAutoStackRun).toHaveBeenCalledTimes(1);
+  });
+
+  // The banner's Stop is for the run it shows, so it can go out beside an undo
+  // still waiting for its answer. `autoStackAction` then reads "cancel", and
+  // only `autoStackRevertOut` still says the undo is out.
+  it("keeps the undo out while a Stop goes out beside it", async () => {
+    getLatestAutoStackRun.mockResolvedValue(
+      autoStackRunFixture({
+        status: "complete",
+        active: false,
+        can_revert: true,
+      }),
+    );
+    const store = useDedupStore();
+    await store.resumeAutoStackRun();
+    expect(store.autoStackRevertOut).toBe(false);
+
+    const undoAnswer = deferred();
+    revertAutoStackRun.mockReturnValue(undoAnswer.promise);
+    const undoing = store.revertAutoStack({ requestId: "cli-fake-undo" });
+    expect(store.autoStackAction).toBe("revert");
+    expect(store.autoStackRevertOut).toBe(true);
+
+    // Another read finds the undo already running, so the banner shows it.
+    const undo = autoStackRunFixture({
+      id: 9,
+      kind: "revert",
+      target_run_id: 7,
+    });
+    getLatestAutoStackRun.mockResolvedValue(undo);
+    await store.resumeAutoStackRun({ force: true });
+    expect(store.autoStackRun).toEqual(undo);
+
+    const stopAnswer = deferred();
+    cancelAutoStackRun.mockReturnValue(stopAnswer.promise);
+    const stopping = store.cancelAutoStack();
+    expect(cancelAutoStackRun).toHaveBeenCalledWith(9);
+    expect(store.autoStackAction).toBe("cancel");
+    expect(store.autoStackRevertOut).toBe(true);
+
+    const asked = { ...undo, cancel_requested: true };
+    stopAnswer.resolve({ run: asked, retryAfterMs: 2000 });
+    expect((await stopping).ok).toBe(true);
+    expect(store.autoStackAction).toBe("revert");
+    expect(store.autoStackRevertOut).toBe(true);
+
+    undoAnswer.resolve({ run: asked, retryAfterMs: 2000 });
+    expect(await undoing).toEqual({ ok: true, run: asked });
+    expect(store.autoStackAction).toBe(null);
+    expect(store.autoStackRevertOut).toBe(false);
   });
 
   it("mints the undo's request id when the caller has none", async () => {
@@ -3721,6 +4553,165 @@ describe("useDedupStore - the auto-stack run", () => {
     await vi.advanceTimersByTimeAsync(2000);
     expect(getAutoStackRun).toHaveBeenCalledWith(7);
     expect(store.autoStackRun.processed).toBe(70);
+  });
+
+  // A run takes minutes and the user goes on deciding meanwhile, so the groups
+  // it stacked leave the queue as its polls report them, and the re-read keeps
+  // the user's place rather than sending them back to the top.
+  it("takes the groups a run stacked off the queue as its polls report them, in place", async () => {
+    servePage(groupsFrom(0, 5), { total: 5 });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    // g1 and g5 selected, the cursor on g4.
+    store.toggleSelected(4);
+    store.setFocus(3);
+    expect(store.selectionCount).toBe(2);
+    await followRun({}, 2000);
+    listGroups.mockClear();
+    getCounts.mockClear();
+
+    // A poll that found nothing new done leaves the queue alone.
+    getAutoStackRun.mockResolvedValueOnce({
+      run: autoStackRunFixture({ processed: 60 }),
+      retryAfterMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(store.autoStackRun.processed).toBe(60);
+    expect(listGroups).not.toHaveBeenCalled();
+
+    // The next one found g2 stacked.
+    servePage([group("g1"), group("g3"), group("g4"), group("g5")], {
+      total: 4,
+    });
+    getAutoStackRun.mockResolvedValueOnce({
+      run: autoStackRunFixture({ processed: 80, applied: 41 }),
+      retryAfterMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(listGroups).toHaveBeenCalledTimes(1);
+    expect(store.groups.map((g) => g.signature)).toEqual([
+      "g1",
+      "g3",
+      "g4",
+      "g5",
+    ]);
+    expect(store.focusedGroup.signature).toBe("g4");
+    expect(store.focusIndex).toBe(2);
+    expect(store.isSelected("g1")).toBe(true);
+    expect(store.isSelected("g5")).toBe(true);
+    expect(store.selectionCount).toBe(2);
+    expect(getCounts).toHaveBeenCalled();
+  });
+
+  it("re-reads the queue for a run only once the verdict on the wire is done", async () => {
+    servePage(groupsFrom(0, 3), { total: 3 });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    await followRun({}, 2000);
+    const verdicts = holdCalls(stackGroup);
+    const verdict = store.stack(store.groups[0]);
+    listGroups.mockClear();
+
+    getAutoStackRun.mockResolvedValue({
+      run: autoStackRunFixture({ applied: 41 }),
+      retryAfterMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(store.autoStackRun.applied).toBe(41);
+    expect(listGroups).not.toHaveBeenCalled();
+
+    servePage([group("g3")], { total: 1 });
+    verdicts[0].resolve({});
+    await verdict;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(listGroups).toHaveBeenCalledTimes(1);
+    expect(store.groups.map((g) => g.signature)).toEqual(["g3"]);
+  });
+
+  it("drops a run's re-read that a verdict went out beside, and reads again after it", async () => {
+    servePage(groupsFrom(0, 3), { total: 3 });
+    stackGroup.mockResolvedValue({});
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    await followRun({}, 2000);
+    const reads = holdCalls(listGroups);
+
+    getAutoStackRun.mockResolvedValue({
+      run: autoStackRunFixture({ applied: 41 }),
+      retryAfterMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(reads).toHaveLength(1);
+    await store.stack(store.groups[0]);
+    expect(store.groups.map((g) => g.signature)).toEqual(["g2", "g3"]);
+
+    // Read before the verdict committed: it still lists g1.
+    reads[0].resolve({ groups: groupsFrom(0, 3), total: 3 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.groups.map((g) => g.signature)).not.toContain("g1");
+    expect(reads).toHaveLength(2);
+    reads[1].resolve({ groups: [group("g3")], total: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.groups.map((g) => g.signature)).toEqual(["g3"]);
+  });
+
+  it("lets an End jump finish before a run's re-read, then re-reads around the tail", async () => {
+    listGroups.mockImplementation(async ({ offset = 0, limit }) => ({
+      groups: groupsFrom(offset, limit),
+      total: 200,
+      offset,
+      limit,
+    }));
+    const store = useDedupStore();
+    await store.loadPolicy();
+    await store.loadFirstPage();
+    await followRun({}, 2000);
+    const reads = holdCalls(listGroups);
+    const jump = store.focusEnd();
+    expect(reads).toHaveLength(1);
+
+    getAutoStackRun.mockResolvedValue({
+      run: autoStackRunFixture({ applied: 41 }),
+      retryAfterMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(store.autoStackRun.applied).toBe(41);
+    expect(store.endChaseActive).toBe(true);
+    expect(reads).toHaveLength(1);
+
+    reads[0].resolve({ groups: groupsFrom(180, 20), total: 200 });
+    await jump;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.focusedGroup.signature).toBe("g200");
+    expect(reads).toHaveLength(2);
+    expect(reads[1].args.offset).toBe(179);
+    reads[1].resolve({ groups: groupsFrom(179, 20), total: 199 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(store.focusedGroup.signature).toBe("g199");
+    expect(store.windowStart).toBe(179);
+  });
+
+  it("forgets a re-read a run asked for at a session reset", async () => {
+    servePage(groupsFrom(0, 3), { total: 3 });
+    const store = useDedupStore();
+    await store.loadFirstPage();
+    await followRun({}, 2000);
+    holdCalls(stackGroup);
+    store.stack(store.groups[0]);
+    getAutoStackRun.mockResolvedValue({
+      run: autoStackRunFixture({ applied: 41 }),
+      retryAfterMs: 2000,
+    });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(store.autoStackRun.applied).toBe(41);
+    listGroups.mockClear();
+    getCounts.mockClear();
+
+    // The reset lets go of `busy`; the old session's wish must not fire then.
+    store.reset();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(listGroups).not.toHaveBeenCalled();
+    expect(getCounts).not.toHaveBeenCalled();
   });
 
   // The queue the user is looking at was read after that run ended, so
@@ -3830,6 +4821,48 @@ describe("useDedupStore - the auto-stack run", () => {
     expect(getAutoStackRun).toHaveBeenCalledTimes(1);
     // The previous session's History steps are no longer held back.
     expect(heldBack({ batch_id: "seg-1", op_type: "dedup.stack" })).toBe(false);
+  });
+
+  // The operation store keeps one filter per name; installing it again on
+  // every followed run would re-register the same closure each time.
+  it("installs the receipt filter once across two followed runs", async () => {
+    const store = await followRun();
+    getAutoStackRun.mockResolvedValue({
+      run: autoStackRunFixture({ status: "complete", active: false }),
+      retryAfterMs: null,
+    });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(store.autoStackRunActive).toBe(false);
+
+    startAutoStackRun.mockResolvedValue({
+      run: autoStackRunFixture({ id: 9, request_id: "cli-fake-second" }),
+      retryAfterMs: 2000,
+    });
+    await store.startAutoStack();
+    expect(store.autoStackRunActive).toBe(true);
+    expect(useOperationStore().setNarrationFilter).toHaveBeenCalledTimes(1);
+  });
+
+  // This tab's own stack gestures narrate while a run goes. A gesture sent
+  // under the previous session is not this session's, so after a reset its
+  // History step is held back like any other stack the run may have recorded.
+  it("forgets this tab's own stack gestures at a session reset", async () => {
+    servePage([group("g1"), group("g2")], { total: 2 });
+    const store = await followRun();
+    await store.loadFirstPage();
+    const heldBack = useOperationStore().setNarrationFilter.mock.calls[0][1];
+    stackGroup.mockResolvedValue({ stack_id: 9, batch_id: "srv-1" });
+    await store.stack(store.groups[0]);
+    const own = {
+      batch_id: stackGroup.mock.calls[0][1].batchId,
+      op_type: "dedup.stack",
+    };
+    expect(heldBack(own)).toBe(false);
+
+    store.reset();
+    await followRun();
+    expect(store.autoStackRunActive).toBe(true);
+    expect(heldBack(own)).toBe(true);
   });
 
   it("looks for the newest run again after a session reset", async () => {
@@ -4744,6 +5777,97 @@ describe("useDedupStore: the mixed-stack list is bound to the threshold", () => 
     await store.loadMoreMixedStacks();
     expect(store.mixedStacks.map((s) => s.stack_id)).toEqual([1, 2]);
     expect(store.hasMoreMixed).toBe(false);
+  });
+
+  // A read that left before a newer one, or before a session reset,
+  // must not land over what replaced it.
+  it("drops a reload's answer that lands after a newer reload's", async () => {
+    const reads = [deferred(), deferred()];
+    listMixedStacks
+      .mockReturnValueOnce(reads[0].promise)
+      .mockReturnValueOnce(reads[1].promise);
+    const store = useDedupStore();
+    const older = store.loadMixedStacks();
+    const newer = store.loadMixedStacks();
+    reads[1].resolve(
+      mixedPage([mixedStack({ stack_id: 2 })], { threshold: 0.65 }),
+    );
+    await newer;
+    reads[0].resolve(
+      mixedPage([mixedStack({ stack_id: 1 })], { threshold: 0.9 }),
+    );
+    await older;
+    expect(store.mixedStacks.map((s) => s.stack_id)).toEqual([2]);
+    expect(store.mixedThreshold).toBe(0.65);
+  });
+
+  it("keeps the newer reload's spinner and list when the older read fails", async () => {
+    const reads = [deferred(), deferred()];
+    listMixedStacks
+      .mockReturnValueOnce(reads[0].promise)
+      .mockReturnValueOnce(reads[1].promise);
+    const store = useDedupStore();
+    const older = store.loadMixedStacks();
+    const newer = store.loadMixedStacks();
+    reads[0].reject(new Error("older read failed"));
+    await older;
+    expect(store.mixedLoading).toBe(true);
+    expect(store.mixedError).toBeNull();
+    reads[1].resolve(mixedPage([mixedStack({ stack_id: 2 })]));
+    await newer;
+    expect(store.mixedLoading).toBe(false);
+    expect(store.mixedStacks.map((s) => s.stack_id)).toEqual([2]);
+  });
+
+  it("drops a next page cut from the list a reload replaced", async () => {
+    listMixedStacks.mockResolvedValueOnce(
+      mixedPage([mixedStack({ stack_id: 1 })], { total: 2, next_offset: 1 }),
+    );
+    const store = useDedupStore();
+    await store.loadMixedStacks();
+    const more = deferred();
+    const reload = deferred();
+    listMixedStacks
+      .mockReturnValueOnce(more.promise)
+      .mockReturnValueOnce(reload.promise);
+    const paging = store.loadMoreMixedStacks();
+    const reloading = store.loadMixedStacks();
+    reload.resolve(mixedPage([mixedStack({ stack_id: 5 })]));
+    await reloading;
+    more.resolve(
+      mixedPage([mixedStack({ stack_id: 2 })], { total: 2, next_offset: null }),
+    );
+    await paging;
+    expect(store.mixedStacks.map((s) => s.stack_id)).toEqual([5]);
+    expect(store.mixedLoading).toBe(false);
+  });
+
+  it("drops a read from before a session reset", async () => {
+    const read = deferred();
+    listMixedStacks.mockReturnValueOnce(read.promise);
+    const store = useDedupStore();
+    const pending = store.loadMixedStacks();
+    store.reset();
+    read.resolve(mixedPage([mixedStack({ stack_id: 1 })]));
+    await pending;
+    expect(store.mixedStacks).toEqual([]);
+    expect(store.mixedLoaded).toBe(false);
+    expect(store.mixedLoading).toBe(false);
+  });
+
+  it("drops a policy read from before a session reset", async () => {
+    const read = deferred();
+    getPolicy.mockReturnValueOnce(read.promise);
+    const store = useDedupStore();
+    const pending = store.loadPolicy();
+    store.reset();
+    read.resolve({
+      defaults: { threshold: 0.8 },
+      bounds: { min_threshold: 0.65 },
+    });
+    await pending;
+    expect(store.policyLoaded).toBe(false);
+    expect(store.threshold).toBeNull();
   });
 });
 

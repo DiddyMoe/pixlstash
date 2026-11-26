@@ -67,6 +67,7 @@ from pixlstash.services.dedup_auto_stack_service import (
     ERROR_NOT_FOUND,
     ERROR_NOTHING_TO_REVERT,
     ERROR_REQUEST_ID_REUSED,
+    ERROR_UNAVAILABLE,
     REQUEST_ID_MAX_LENGTH,
     SEGMENT_GROUP_CAP,
     AutoStackRunError,
@@ -110,6 +111,7 @@ from pixlstash.services.dedup_sweep_service import (
     SweepVerdict,
 )
 from pixlstash.utils.request_origin import require_client_batch_id
+from pixlstash.utils.sqlite_ints import SQLITE_INT_MAX, SqliteInt
 
 logger = get_logger(__name__)
 
@@ -127,6 +129,15 @@ MAX_CURSOR_LENGTH = 128
 The cursors this server mints are ~40 characters; anything longer is not one of
 ours, and bounding it here keeps a malformed value from reaching the base64
 decoder as an unbounded string."""
+
+CURSOR_REFUSED = (
+    "That cursor is not one this page gave out. Start again from the first page."
+)
+"""The 400 for a cursor the service cannot read.
+
+The service's own text quotes the cursor and the decoder's error; both are the
+caller's text, so the log has them and the answer does not. One sentence covers
+every case, a queue cursor sent to the decided page and back included."""
 
 MAX_COUNT_SCOPES = 200
 """Cap on the scope list of one ``POST /dedup/counts``.
@@ -148,12 +159,15 @@ AUTO_STACK_RUN_ERROR_STATUS = {
     ERROR_NOTHING_TO_REVERT: 409,
     ERROR_NOT_FOUND: 404,
     ERROR_REQUEST_ID_REUSED: 422,
+    ERROR_UNAVAILABLE: 503,
 }
 """HTTP status per refused run request; the body carries the code itself.
 
 422 for a reused ``request_id`` follows the idempotency-key convention (AIP-155,
 the IETF Idempotency-Key draft): the key names a different request than the one
-sent. 409 is a refusal the current state causes and a later state may lift."""
+sent. 409 is a refusal the current state causes and a later state may lift. 503
+is a server started with no background work (RFC 9110 §15.6.4), sent without
+``Retry-After`` because waiting does not change a configuration."""
 
 
 class SweepPolicyModel(BaseModel):
@@ -199,12 +213,12 @@ class SweepPolicyModel(BaseModel):
             "0 switches the smart-score axis off entirely."
         ),
     )
-    min_group_size: int = Field(
+    min_group_size: SqliteInt = Field(
         default=DEFAULT_MIN_GROUP_SIZE,
         ge=2,
         description="Smallest group the sweep considers at all.",
     )
-    max_auto_group_size: int = Field(
+    max_auto_group_size: SqliteInt = Field(
         default=DEFAULT_MAX_AUTO_GROUP_SIZE,
         ge=2,
         description=(
@@ -223,7 +237,7 @@ class SweepPolicyModel(BaseModel):
             "grid action, which skips it."
         ),
     )
-    max_groups_listed: int = Field(
+    max_groups_listed: SqliteInt = Field(
         default=DEFAULT_MAX_GROUPS_LISTED,
         ge=0,
         description=(
@@ -524,12 +538,12 @@ class TierPolicyModel(BaseModel):
         ),
     )
 
-    min_group_size: int = Field(
+    min_group_size: SqliteInt = Field(
         default=dedup_tier_service.DEFAULT_MIN_GROUP_SIZE,
         ge=2,
         description="Smallest group that counts as a duplicate group at all.",
     )
-    max_group_size: int = Field(
+    max_group_size: SqliteInt = Field(
         default=dedup_tier_service.DEFAULT_MAX_GROUP_SIZE,
         ge=2,
         description=(
@@ -1209,7 +1223,11 @@ class DedupCountsResponse(BaseModel):
     )
     scopes: list[dict[str, Any]] = Field(
         default_factory=list,
-        description="One `{scope_type, scope_id, key, unresolved_groups}` per requested scope.",
+        description=(
+            "One `{scope_type, scope_id, key, unresolved_groups, by_tier}` per "
+            "requested scope. `by_tier` is that scope's own split, under the same "
+            "rules as the top-level `by_tier`."
+        ),
     )
     policy: TierPolicyModel = Field(
         description="The policy these counts were read under."
@@ -1236,14 +1254,14 @@ class StackVerdictRequestModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     signature: str = Field(description="The group signature from the queue.")
-    cover_picture_id: Optional[int] = Field(
+    cover_picture_id: Optional[SqliteInt] = Field(
         default=None,
         description=(
             "The cover the user chose or confirmed. Defaults to the server's "
             "preselection stored on the group. Must be an included member."
         ),
     )
-    excluded_picture_ids: list[int] = Field(
+    excluded_picture_ids: list[SqliteInt] = Field(
         default_factory=list,
         description=(
             "Members the user left out of the stack. They are untouched and "
@@ -1323,6 +1341,15 @@ class VerdictResponse(BaseModel):
             "`{code: 'set_locked', action, sets, picture_ids}`."
         ),
     )
+    stacked_picture_ids: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Every live picture in the resulting stack, for a stack verdict: the "
+            "included members plus every member of an existing stack the verdict "
+            "folded in, which the group itself never named. What the receipt "
+            "counts as stacked. Empty for keep-separate."
+        ),
+    )
 
 
 class VerdictBatchItemModel(BaseModel):
@@ -1332,8 +1359,8 @@ class VerdictBatchItemModel(BaseModel):
 
     verdict: DedupVerdictKind
     signature: str = Field(min_length=1)
-    cover_picture_id: Optional[int] = None
-    excluded_picture_ids: list[int] = Field(default_factory=list)
+    cover_picture_id: Optional[SqliteInt] = None
+    excluded_picture_ids: list[SqliteInt] = Field(default_factory=list)
 
 
 class VerdictBatchRequestModel(BaseModel):
@@ -1411,7 +1438,7 @@ class AutoStackRequestModel(BaseModel):
             "caller that meant to apply learns it did not."
         ),
     )
-    limit: Optional[int] = Field(
+    limit: Optional[SqliteInt] = Field(
         default=None,
         ge=1,
         description="Cap the number of groups counted.",
@@ -1472,7 +1499,7 @@ class AutoStackRunRequestModel(BaseModel):
     scope: Optional[ScopeRequestModel] = Field(
         default=None, description="Restrict to a scope; the whole vault when omitted."
     )
-    limit: Optional[int] = Field(
+    limit: Optional[SqliteInt] = Field(
         default=None,
         ge=1,
         description="Cap the number of groups the run stacks.",
@@ -1564,7 +1591,22 @@ class AutoStackRunModel(BaseModel):
     )
     cancel_requested: bool = Field(description="A cancel is waiting for the slice.")
     can_revert: bool = Field(
-        description="An ended apply run with something left to undo."
+        description=(
+            "An ended apply run with something left to undo: `POST "
+            ".../runs/{id}/revert` would start a revert. Always false for a "
+            "revert run, which cannot itself be reverted; see "
+            "`target_can_revert`."
+        )
+    )
+    target_can_revert: bool = Field(
+        description=(
+            "An ended revert run whose `target_run_id` still has something to "
+            "undo (it would answer `can_revert` true): `POST "
+            ".../runs/{target_run_id}/revert` would start another revert, to "
+            "finish one that stopped short or was blocked. False for an apply "
+            "run, while the revert is active, and once its target is undone "
+            "or no longer kept."
+        )
     )
     error_code: Optional[str] = Field(
         default=None,
@@ -1907,7 +1949,7 @@ class MixedStackSplitRequestModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    picture_ids: Optional[list[int]] = Field(
+    picture_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         description=(
             "The members to split off: **the ids the user marked on the row**, "
@@ -2159,7 +2201,7 @@ def create_router(server) -> APIRouter:
         scope_id: Optional[str] = Query(
             default=None, description="Scope id, required unless scope is global."
         ),
-        offset: Optional[int] = Query(
+        offset: Optional[SqliteInt] = Query(
             default=None,
             ge=0,
             deprecated=True,
@@ -2252,7 +2294,7 @@ def create_router(server) -> APIRouter:
             )
         except DedupCursorError as exc:
             logger.info("[dedup] rejected queue cursor: %s", exc)
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=CURSOR_REFUSED) from exc
 
     @router.get(
         "/dedup/stacks/{stack_id}/members",
@@ -2286,10 +2328,11 @@ def create_router(server) -> APIRouter:
         },
     )
     def get_dedup_stack_members(
-        stack_id: int,
+        stack_id: SqliteInt,
         offset: int = Query(
             default=0,
             ge=0,
+            le=SQLITE_INT_MAX,
             description=(
                 "Members to skip, in canonical stack order. Use the previous "
                 "page's `next_offset`."
@@ -2597,7 +2640,9 @@ def create_router(server) -> APIRouter:
             "`request_id` per gesture: the same id again returns the run it "
             "started (200) rather than starting another, and with different "
             "parameters is 422 `request_id_reused`. One run at a time: while "
-            "one is active this is 409 `auto_stack_run_active`, naming it."
+            "one is active this is 409 `auto_stack_run_active`, naming it. A "
+            "server that runs no background work answers 503 "
+            "`auto_stack_runs_unavailable` and records nothing."
         ),
         status_code=202,
         response_model=AutoStackRunModel,
@@ -2651,7 +2696,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=AutoStackRunModel,
     )
-    def get_auto_stack_run(run_id: int, response: Response):
+    def get_auto_stack_run(run_id: SqliteInt, response: Response):
         try:
             run = dedup_auto_stack_service.get_run(server.vault, run_id)
         except AutoStackRunError as exc:
@@ -2671,7 +2716,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=AutoStackRunModel,
     )
-    def post_cancel_auto_stack_run(run_id: int, response: Response):
+    def post_cancel_auto_stack_run(run_id: SqliteInt, response: Response):
         try:
             run = dedup_auto_stack_service.cancel_run(server.vault, run_id)
         except AutoStackRunError as exc:
@@ -2688,15 +2733,18 @@ def create_router(server) -> APIRouter:
             "undoes the run's History segments newest first, one per slice, "
             "exactly as Ctrl+Z on each would. If an unrelated edit has since "
             "landed above a segment in History, that segment is not undone and "
-            "the revert ends `blocked`; undo that edit, then revert again. 409 "
-            "`not_an_apply_run`, `nothing_to_revert` or `auto_stack_run_active` "
-            "when there is nothing it may do."
+            "the revert ends `blocked`; undo that edit, then revert again. A "
+            "revert run that ended short says whether sending it again would "
+            "undo anything in `target_can_revert`. 409 `not_an_apply_run`, "
+            "`nothing_to_revert` or `auto_stack_run_active` when there is "
+            "nothing it may do; 503 `auto_stack_runs_unavailable` on a server "
+            "that runs no background work."
         ),
         status_code=202,
         response_model=AutoStackRunModel,
     )
     def post_revert_auto_stack_run(
-        run_id: int,
+        run_id: SqliteInt,
         request: Request,
         response: Response,
         payload: Optional[AutoStackRevertRequestModel] = Body(default=None),
@@ -2816,6 +2864,7 @@ def create_router(server) -> APIRouter:
         offset: int = Query(
             default=0,
             ge=0,
+            le=SQLITE_INT_MAX,
             description=(
                 "Rows to skip; follow the previous page's `next_offset`. Plain "
                 "offset paging is correct here (unlike the queue's keyset "
@@ -2911,7 +2960,7 @@ def create_router(server) -> APIRouter:
     )
     def post_mixed_stack_split(
         request: Request,
-        stack_id: int,
+        stack_id: SqliteInt,
         payload: Optional[MixedStackSplitRequestModel] = Body(default=None),
     ):
         # §21 origin discipline: actor / source / origin_client_id are read from
@@ -2965,7 +3014,7 @@ def create_router(server) -> APIRouter:
     )
     def post_mixed_stack_unstack(
         request: Request,
-        stack_id: int,
+        stack_id: SqliteInt,
         payload: Optional[MixedStackUnstackRequestModel] = Body(default=None),
     ):
         # §21 origin discipline, read in the handler - see post_mixed_stack_split.
@@ -3008,7 +3057,7 @@ def create_router(server) -> APIRouter:
             400: {"description": "The stack has no live members."},
         },
     )
-    def post_mixed_stack_keep(request: Request, stack_id: int):
+    def post_mixed_stack_keep(request: Request, stack_id: SqliteInt):
         # Only `actor` is used - the dismissal changes no picture facet, so
         # there is no WS announcement and no operation-log row to originate.
         context = operation_log_service.request_context(request)
@@ -3036,7 +3085,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=MixedStackKeepResponse,
     )
-    def delete_mixed_stack_keep(stack_id: int):
+    def delete_mixed_stack_keep(stack_id: SqliteInt):
         return mixed_stack_service.undismiss_stack(server.vault, stack_id)
 
     return router

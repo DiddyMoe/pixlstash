@@ -32,6 +32,7 @@ function run(overrides = {}) {
     pictures: 96000,
     cancel_requested: false,
     can_revert: false,
+    target_can_revert: false,
     error_code: null,
     error: null,
     ...overrides,
@@ -279,14 +280,45 @@ describe("DedupAutoStackBanner: controls", () => {
     expect(w.emitted("stop")).toBeUndefined();
   });
 
+  // The store sends a Stop for the run shown here even while a start or an
+  // undo is still out, so Stop does not wait for them.
+  it.each(["start", "revert"])(
+    "keeps Stop clickable while a %s request is out",
+    async (action) => {
+      const w = mountBanner({}, { action });
+      const stop = stopButton(w);
+      expect(stop.attributes("disabled")).toBeUndefined();
+      expect(stop.attributes("aria-busy")).toBeUndefined();
+      await stop.trigger("click");
+      expect(w.emitted("stop")).toHaveLength(1);
+    },
+  );
+
   it("holds Undo run as working and the other controls still", () => {
     const w = mountBanner(
       { status: "complete", active: false },
-      { canRevert: true, action: "revert" },
+      { canRevert: true, action: "revert", revertOut: true },
     );
     expect(revertButton(w).attributes("aria-busy")).toBe("true");
+    expect(revertButton(w).attributes("disabled")).toBeDefined();
     expect(dismissButton(w).attributes("disabled")).toBeDefined();
     expect(dismissButton(w).attributes("aria-busy")).toBeUndefined();
+  });
+
+  // A Stop can go out beside an undo still waiting for its answer, and the run
+  // can end before either is answered. `action` then reads "cancel": the
+  // undo's own flag keeps Finish undo working.
+  it("holds Undo run as working while a Stop is out beside the undo", async () => {
+    const w = mountBanner(
+      { kind: "revert", target_run_id: 7, status: "cancelled", active: false },
+      { canRevert: true, action: "cancel", revertOut: true },
+    );
+    const undo = revertButton(w);
+    expect(undo.text()).toBe("Finish undo");
+    expect(undo.attributes("aria-busy")).toBe("true");
+    expect(undo.attributes("disabled")).toBeDefined();
+    await undo.trigger("click");
+    expect(w.emitted("revert")).toBeUndefined();
   });
 
   it("holds Undo run while a new run's start request is out", () => {

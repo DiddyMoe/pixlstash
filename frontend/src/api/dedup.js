@@ -297,7 +297,9 @@ export async function listStackMembers(
  *   [options.scopes=[]] - extra scopes to count.
  * @returns {Promise<Object>} the response body:
  *   `{ unresolved_groups, by_tier, scopes, policy, scan }`, where each entry of
- *   `scopes` is `{ scope_type, scope_id, key, unresolved_groups }`.
+ *   `scopes` is `{ scope_type, scope_id, key, unresolved_groups, by_tier }`.
+ *   A scope's `by_tier` is that scope's own split, under the same rules as the
+ *   top-level `by_tier` (switched-off tiers included).
  */
 export async function getCounts({ policy, scopes = [] } = {}) {
   const body = { scopes: scopes.map((s) => scopeBody(s.scopeType, s.scopeId)) };
