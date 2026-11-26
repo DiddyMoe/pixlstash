@@ -98,6 +98,9 @@ from pixlstash.hub.workflows import filed_instance_hashes, recipes_missing_a_mod
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import operation_log_service, scrapheap_service
 from pixlstash.services.dedup_verdict_service import apply_metadata_union_in_session
+from pixlstash.services.folder_structure_commit_service import (
+    resolve_pending_people_with_faces,
+)
 from pixlstash.services.set_lock_service import (
     enforce_pictures_not_locked,
     locked_sets_for_pictures,
@@ -1040,15 +1043,19 @@ def keep_cover_only_in_session(
     One session, one commit, **one** operation-log row under **one** ``batch_id``:
     so the whole gesture is a single ``Ctrl+Z`` however many stacks it named.
 
-    Per eligible stack, in this order and never the other way round:
+    Over every eligible stack, in this order and never the other way round:
 
     1. :func:`~pixlstash.services.dedup_verdict_service.apply_metadata_union_in_session`
-       over the stack's live members, so the cover carries the union of the
-       tags and the best score **before** any copy leaves;
+       over each stack's cover and leaving copies, so the cover carries the
+       union of its own stack's tags and best score **before** any copy leaves
+       (one call for all stacks; each is unioned over its own members only);
     2. soft-delete the non-cover members (``deleted`` + ``deleted_at``, the same
        pair the grid's ``Delete`` writes), leaving ``stack_id`` alone;
-    3. :func:`~pixlstash.stacking.normalize_stack_positions`, so the cover holds
-       position 0 and the scrapheaped copies sort behind it.
+    3. :func:`~pixlstash.stacking.normalize_stack_positions` per stack, so the
+       cover holds position 0 and the scrapheaped copies sort behind it.
+
+    Each step covers every stack before the next one starts, so the gesture
+    flushes three times rather than three times per stack.
 
     Args:
         session: Pre-opened session; this commits once.
@@ -1165,39 +1172,45 @@ def keep_cover_only_in_session(
     )
     before = operation_log_service.capture_state_in_session(session, undo_targets)
 
-    tags_added = 0
-    scores_lifted = 0
-    covers_gaining_metadata = 0
-    deleted_at = datetime.now(timezone.utc)
-    for row in eligible:
-        # UNCONDITIONAL, and before anything leaves. Stacks made by hand in the
-        # grid have never been unioned; skipping this is silent metadata loss.
-        # Over the cover and the copies that leave, never a copy that stays:
-        # the union writes every tag and the best score onto every member it is
-        # given, and a copy Keep recipes only leaves live is not the cover.
-        union = apply_metadata_union_in_session(
-            session, [row.cover_picture_id, *row.copy_ids], row.stack_id
-        )
-        tags_added += int(union.get("tags_added") or 0)
-        scores_lifted += int(union.get("scores_lifted") or 0)
-        if row.gains_tags or row.gains_score:
-            covers_gaining_metadata += 1
-        session.flush()
+    # UNCONDITIONAL, and before anything leaves. Stacks made by hand in the grid
+    # have never been unioned; skipping this is silent metadata loss. Over the
+    # cover and the copies that leave, never a copy that stays: the union writes
+    # every tag and the best score onto every member it is given, and a copy
+    # Keep recipes only leaves live is not the cover. One call for every stack:
+    # each is still unioned over its own members only, but the reads and the
+    # flush are paid once per gesture rather than once per stack (§22.12).
+    unions = apply_metadata_union_in_session(
+        session,
+        [([row.cover_picture_id, *row.copy_ids], row.stack_id) for row in eligible],
+    )
+    tags_added = sum(int(union.get("tags_added") or 0) for union in unions)
+    scores_lifted = sum(int(union.get("scores_lifted") or 0) for union in unions)
+    covers_gaining_metadata = sum(
+        1 for row in eligible if row.gains_tags or row.gains_score
+    )
+    session.flush()
 
-        for batch in chunked(row.copy_ids):
-            for picture in session.exec(
-                select(Picture).where(Picture.id.in_(batch))
-            ).all():
-                if picture.deleted:
-                    continue
-                picture.deleted = True
-                # Same retention clock the grid's Delete starts, stamped only on
-                # the False -> True transition. stack_id is deliberately left
-                # alone: a restored copy has to rejoin its stack.
-                picture.deleted_at = deleted_at
-                session.add(picture)
-        session.flush()
-        normalize_stack_positions(session, row.stack_id)
+    deleted_at = datetime.now(timezone.utc)
+    for batch in chunked([pid for row in eligible for pid in row.copy_ids]):
+        for picture in session.exec(select(Picture).where(Picture.id.in_(batch))).all():
+            if picture.deleted:
+                continue
+            picture.deleted = True
+            # Same retention clock the grid's Delete starts, stamped only on the
+            # False -> True transition. stack_id is deliberately left alone: a
+            # restored copy has to rejoin its stack.
+            picture.deleted_at = deleted_at
+            session.add(picture)
+    # Flushed before the renumber, which ranks live members ahead of deleted ones
+    # and so has to read the deletes it is ordering by.
+    session.flush()
+    # The stacks are disjoint, so one stack's renumber never reads another's
+    # pending positions; without no_autoflush each stack's read would flush the
+    # previous stack's renumber, one flush per stack again.
+    with session.no_autoflush:
+        for row in eligible:
+            normalize_stack_positions(session, row.stack_id)
+    session.flush()
 
     after = operation_log_service.capture_state_in_session(session, undo_targets)
     recorded = operation_log_service.record_operation_in_session(
@@ -1218,6 +1231,8 @@ def keep_cover_only_in_session(
         actor=actor,
         source=source,
         origin_client_id=origin_client_id,
+        # Committed below with the collapse itself, as one transaction.
+        commit=False,
     )
     if recorded is None:
         # Every eligible stack soft-deletes at least one live member, so the diff
@@ -1364,7 +1379,12 @@ def keep_cover_only(
             },
         )
         vault.notify(EventType.CHANGED_TAGS, {"origin_client_id": origin_client_id})
-    result.pop("event_picture_ids", None)
+    # The union may have set a person pending on a member whose faces already
+    # exist, which extraction never revisits; resolved now the collapse has
+    # committed (docs/backend_architecture.md §24).
+    resolve_pending_people_with_faces(
+        vault, result.pop("event_picture_ids", None) or [], origin="Keep cover only"
+    )
     return result
 
 

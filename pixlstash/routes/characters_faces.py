@@ -18,6 +18,7 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Session, select
 
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.db_models import (
     Character,
     Face,
@@ -36,6 +37,7 @@ from pixlstash.services.project_membership_service import (
 )
 from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
 from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
+from pixlstash.utils.sql_chunking import chunked
 
 logger = get_logger(__name__)
 
@@ -55,11 +57,14 @@ def _enforce_face_mutation_scope(
     server,
     request,
     *,
-    face_ids: list | None,
-    picture_ids: list | None,
+    face_ids: list[int] | None,
+    picture_ids: list[int] | None,
     expand_stacks: bool = False,
 ) -> None:
     """Raise 403 if a scoped token targets faces/pictures outside its scope.
+
+    *face_ids* and *picture_ids* are already parsed by :func:`_id_list`, so
+    this check and the write that follows read the very same ids.
 
     The character face-assign / face-unassign handlers accept *either* a list
     of ``face_ids`` *or* a list of ``picture_ids``. This resolves both paths to
@@ -74,24 +79,21 @@ def _enforce_face_mutation_scope(
     if scope_allowed is None:
         return
 
-    affected: set[int] = set()
-    for raw in picture_ids or []:
-        try:
-            affected.add(int(raw))
-        except (TypeError, ValueError):
-            continue
-
-    normalized_face_ids: list[int] = []
-    for raw in face_ids or []:
-        try:
-            normalized_face_ids.append(int(raw))
-        except (TypeError, ValueError):
-            continue
+    affected: set[int] = set(picture_ids or [])
+    normalized_face_ids: list[int] = list(face_ids or [])
     if normalized_face_ids:
 
         def _resolve(session: Session, ids: list[int]) -> set[int]:
-            rows = session.exec(select(Face.picture_id).where(Face.id.in_(ids))).all()
-            return {int(r) for r in rows if r is not None}
+            # The body's id list has no cap: chunked under SQLite's
+            # bound-parameter limit, and the sets merge.
+            return {
+                int(r)
+                for id_chunk in chunked(ids)
+                for r in session.exec(
+                    select(Face.picture_id).where(Face.id.in_(id_chunk))
+                ).all()
+                if r is not None
+            }
 
         affected |= server.vault.db.run_immediate_read_task(
             _resolve, normalized_face_ids
@@ -111,6 +113,32 @@ def _enforce_face_mutation_scope(
         )
 
 
+def _id_list(values, name: str) -> list[int] | None:
+    """The JSON list *values* from a request body as ids, or None when absent.
+
+    Every entry must be an integer, or a string ``int()`` reads as one, inside
+    SQLite's range; anything else is refused with 400 naming the list. Nothing
+    is skipped: the scope check and the write must see the same ids, and SQLite
+    compares a text value such as ``"5e0"`` or ``"5.0"`` to an INTEGER column
+    as the number 5, which ``int()`` refuses.
+    """
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise HTTPException(status_code=400, detail=f"{name} must be a list")
+    ids: list[int] = []
+    for raw in values:
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            raise HTTPException(status_code=400, detail=f"{name} must be a list of ids")
+        try:
+            ids.append(parse_sqlite_int(raw))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"{name} must be a list of ids"
+            ) from exc
+    return ids
+
+
 def _picture_ids_for_faces(face_ids):
     """Resolver for the operation log: the pictures behind a face-id request.
 
@@ -125,10 +153,12 @@ def _picture_ids_for_faces(face_ids):
         return None
 
     def _resolve(session: Session):
+        # Chunked like the scope check: the request's face ids have no cap.
         return [
             picture_id
+            for id_chunk in chunked(list(face_ids))
             for picture_id in session.exec(
-                select(Face.picture_id).where(Face.id.in_(list(face_ids)))
+                select(Face.picture_id).where(Face.id.in_(id_chunk))
             ).all()
             if picture_id is not None
         ]
@@ -146,16 +176,12 @@ def create_router(server) -> APIRouter:
         response_model=CharacterFaceAssignmentResponse,
     )
     def assign_face_to_character(
-        request: Request, character_id: int, payload: dict = Body(...)
+        request: Request, character_id: SqliteInt, payload: dict = Body(...)
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
-        face_ids = payload.get("face_ids")
-        picture_ids = payload.get("picture_ids")
+        face_ids = _id_list(payload.get("face_ids"), "face_ids")
+        picture_ids = _id_list(payload.get("picture_ids"), "picture_ids")
         face_assignments_raw = payload.get("face_assignments")
-        if face_ids is not None and not isinstance(face_ids, list):
-            raise HTTPException(status_code=400, detail="face_ids must be a list")
-        if picture_ids is not None and not isinstance(picture_ids, list):
-            raise HTTPException(status_code=400, detail="picture_ids must be a list")
         if face_assignments_raw is not None and not isinstance(
             face_assignments_raw, list
         ):
@@ -181,8 +207,8 @@ def create_router(server) -> APIRouter:
                     detail=f"face_assignments[{index}] must be an object",
                 )
             try:
-                picture_id = int(raw["picture_id"])
-                face_id = int(raw["face_id"])
+                picture_id = parse_sqlite_int(raw["picture_id"])
+                face_id = parse_sqlite_int(raw["face_id"])
             except (KeyError, TypeError, ValueError):
                 raise HTTPException(
                     status_code=400,
@@ -225,7 +251,7 @@ def create_router(server) -> APIRouter:
             session: Session,
             face_assignments: list[tuple[int, int]],
             face_ids: list[int],
-            picture_ids: list[str],
+            picture_ids: list[int],
             character_id: int,
         ):
             faces_to_assign = []
@@ -465,11 +491,17 @@ def create_router(server) -> APIRouter:
         )
         for face in faces:
             if face["character_id"] != character_id:
+                logger.error(
+                    "Assigning faces to character %s left face %s (picture %s) on "
+                    "character %s.",
+                    character_id,
+                    face["id"],
+                    face["picture_id"],
+                    face["character_id"],
+                )
                 raise HTTPException(
                     status_code=500,
-                    detail=(
-                        f"Failed to set character {character_id} for face {face['id']}"
-                    ),
+                    detail="Not every face could be assigned to that character.",
                 )
         server.vault.notify(
             EventType.CHANGED_CHARACTERS, {"origin_client_id": origin_client_id}
@@ -494,7 +526,7 @@ def create_router(server) -> APIRouter:
         response_model=CharacterFaceAssignmentResponse,
     )
     def remove_character_from_faces(
-        request: Request, character_id: int, payload: dict = Body(...)
+        request: Request, character_id: SqliteInt, payload: dict = Body(...)
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         face_ids = payload.get("face_ids", None)
@@ -504,6 +536,8 @@ def create_router(server) -> APIRouter:
                 status_code=400,
                 detail="Must send a list of picture_ids or face_ids",
             )
+        face_ids = _id_list(face_ids, "face_ids")
+        picture_ids = _id_list(picture_ids, "picture_ids")
         # Scope guard (BOLA): a write-capable resource-scoped token may only
         # unassign faces on pictures within its granted resource. Covers both
         # the face_ids and picture_ids branches.
@@ -515,8 +549,17 @@ def create_router(server) -> APIRouter:
             session: Session,
             character_id: int,
             face_ids: list[int] = None,
-            picture_ids: list[str] = None,
-        ):
+            picture_ids: list[int] = None,
+        ) -> list[int]:
+            """Unassign this character's faces named by the request.
+
+            A face on another character, or a face id that does not exist, is
+            left alone, so a request that matches nothing changes nothing.
+
+            Returns:
+                list[int]: The ids of the pictures whose faces were actually
+                unassigned, sorted and without repeats.
+            """
             faces = []
             if picture_ids:
                 for pic_id in picture_ids:
@@ -532,27 +575,39 @@ def create_router(server) -> APIRouter:
                     if face and face.character_id == character_id:
                         face.character_id = None
                         session.add(face)
+                        faces.append(face)
             session.flush()
-            session.refresh(face)
-            return faces
+            # Face.picture_id is a nullable column; the resolver above skips a
+            # face without a picture the same way.
+            return sorted(
+                {face.picture_id for face in faces if face.picture_id is not None}
+            )
 
         # Unlike the assign above, this handler does not expand to stacks, so the
         # snapshot covers exactly the requested pictures - plus the pictures of a
         # face-id-addressed request, resolved on the mutation's own session.
-        operation_log_service.run_recorded_metadata_task(
-            server.vault,
-            remove_faces_from_character,
-            character_id,
-            face_ids,
-            picture_ids,
-            op_type="characters.unassign",
-            picture_ids=picture_ids,
-            resolve_picture_ids=_picture_ids_for_faces(face_ids),
-            summary="Unassigned pictures from a character",
-            **operation_log_service.request_context(request),
+        unassigned_picture_ids, _operation = (
+            operation_log_service.run_recorded_metadata_task(
+                server.vault,
+                remove_faces_from_character,
+                character_id,
+                face_ids,
+                picture_ids,
+                op_type="characters.unassign",
+                picture_ids=picture_ids,
+                resolve_picture_ids=_picture_ids_for_faces(face_ids),
+                summary="Unassigned pictures from a character",
+                **operation_log_service.request_context(request),
+            )
         )
 
-        server.vault.db.run_task(Picture.clear_field, picture_ids, "text_embedding")
+        # Only a picture that lost a face of this character has a stale text
+        # embedding. clear_field([]) matches nothing anyway (id IN ()), so this
+        # check only spares the writer an empty task.
+        if unassigned_picture_ids:
+            server.vault.db.run_task(
+                Picture.clear_field, unassigned_picture_ids, "text_embedding"
+            )
         server.vault.notify(
             EventType.CHANGED_CHARACTERS, {"origin_client_id": origin_client_id}
         )

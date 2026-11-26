@@ -25,6 +25,7 @@ from .base_task_finder import BaseTaskFinder
 from .face_model_refresh_task import FaceModelRefreshTask
 from .task_type import TaskType
 from .missing_face_extraction_finder import FACE_EXTRACTION_BATCH_LIMIT
+from .pipeline_scope import pipeline_picture_clauses
 
 
 class MissingFaceModelRefreshFinder(BaseTaskFinder):
@@ -102,9 +103,12 @@ class MissingFaceModelRefreshFinder(BaseTaskFinder):
             )
             .distinct()
         )
+        # The Scrapheap is held out, as from every per-picture stage: a
+        # refresh re-runs detection on the GPU, and a picture restored later
+        # still has its stale faces, so it is refreshed then.
         return session.exec(
             select(Picture)
-            .where(Picture.id.in_(stale_face_subq))
+            .where(Picture.id.in_(stale_face_subq), *pipeline_picture_clauses())
             .where(not_in_json(Picture.id, exclude_ids))
             .options(selectinload(Picture.faces))
             .order_by(Picture.id)

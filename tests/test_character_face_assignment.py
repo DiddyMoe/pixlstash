@@ -34,6 +34,7 @@ from pixlstash.scoring import (
 )
 from pixlstash.server import Server
 from pixlstash.services import operation_log_service
+from pixlstash.tasks.missing_text_embedding_finder import MissingTextEmbeddingFinder
 from tests.test_server import random_images
 from tests.utils import API_PREFIX, upload_pictures_and_wait
 
@@ -509,6 +510,215 @@ def test_existing_reference_faces_still_drive_selection():
             assert body["face_ids"] == [target_fid]
 
 
+# --- unassigning a person's faces -------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def unassign_env():
+    """One server for the unassign tests: ``(server, client, picture ids)``.
+
+    Each test takes its own slice of the eight pictures and creates its own
+    people, so the tests share the server without sharing what they assert on.
+    The text-embedding finder is kept idle so a cleared embedding is not
+    refilled under the assertion.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(MissingTextEmbeddingFinder, "_guard", lambda self: False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            server_config_path = os.path.join(temp_dir, "server_config.json")
+            with Server(server_config_path=server_config_path) as server:
+                client = TestClient(server.api)
+                login = client.post(
+                    "/login", json={"username": "testuser", "password": "testpassword"}
+                )
+                assert login.status_code == 200
+                yield server, client, _upload(client, 8)
+
+
+def _seed_text_embeddings(server, picture_ids):
+    """Give each picture a stand-in text embedding an unassign may clear."""
+
+    def _seed(session):
+        pictures = session.exec(
+            select(Picture).where(Picture.id.in_(list(picture_ids)))
+        ).all()
+        for picture in pictures:
+            picture.text_embedding = b"example-text-embedding"
+            session.add(picture)
+        session.commit()
+
+    server.vault.db.run_task(_seed)
+
+
+def _has_text_embedding(server, picture_ids):
+    """Map picture id to whether it still has a text embedding."""
+
+    def _read(session):
+        rows = session.exec(
+            select(Picture.id, Picture.text_embedding).where(
+                Picture.id.in_(list(picture_ids))
+            )
+        ).all()
+        return {int(pid): embedding is not None for pid, embedding in rows}
+
+    return server.vault.db.run_immediate_read_task(_read)
+
+
+def _unassign(client, character_id, body):
+    return client.request(
+        "DELETE", f"{API_PREFIX}/characters/{character_id}/faces", json=body
+    )
+
+
+def _unassign_operation_ids(server):
+    return [
+        operation["id"]
+        for operation in operation_log_service.list_operations(
+            server.vault, op_type="characters.unassign"
+        )
+    ]
+
+
+def test_unassigning_by_face_id_clears_that_pictures_text_embedding(unassign_env):
+    """A face-id request names no pictures, so the route has to find them.
+
+    It used to clear the text embedding of no picture at all, which left the
+    person's name in the picture's search text.
+    """
+    server, client, pictures = unassign_env
+    target, unrelated = pictures[0:2]
+    character_id = _create_character(client, "Unassigned by face")
+    target_face = _add_face(
+        server, target, ALONG_X, SMALL_BBOX, character_id=character_id
+    )
+    unrelated_face = _add_face(
+        server, unrelated, ALONG_X, SMALL_BBOX, character_id=character_id
+    )
+    _seed_text_embeddings(server, [target, unrelated])
+
+    response = _unassign(client, character_id, {"face_ids": [target_face]})
+
+    assert response.status_code == 200, response.text
+    assert _face_character_ids(server, [target_face, unrelated_face]) == {
+        target_face: None,
+        unrelated_face: character_id,
+    }
+    assert _has_text_embedding(server, [target, unrelated]) == {
+        target: False,
+        unrelated: True,
+    }
+    newest = operation_log_service.list_operations(
+        server.vault, op_type="characters.unassign"
+    )[0]
+    assert newest["target_ids"] == [target]
+
+    undone = client.post(f"{API_PREFIX}/operations/undo")
+    assert undone.status_code == 200, undone.text
+    assert undone.json()["picture_ids"] == [target]
+    assert _face_character_ids(server, [target_face]) == {target_face: character_id}
+
+
+def test_unassigning_by_picture_id_clears_only_pictures_that_lost_the_person(
+    unassign_env,
+):
+    """A named picture whose face is someone else's keeps its text embedding."""
+    server, client, pictures = unassign_env
+    target, someone_elses, unrelated = pictures[2:5]
+    character_id = _create_character(client, "Unassigned by picture")
+    other_character_id = _create_character(client, "Somebody else")
+    target_face = _add_face(
+        server, target, ALONG_X, SMALL_BBOX, character_id=character_id
+    )
+    other_face = _add_face(
+        server, someone_elses, ALONG_X, SMALL_BBOX, character_id=other_character_id
+    )
+    unrelated_face = _add_face(
+        server, unrelated, ALONG_X, SMALL_BBOX, character_id=character_id
+    )
+    _seed_text_embeddings(server, [target, someone_elses, unrelated])
+
+    response = _unassign(client, character_id, {"picture_ids": [target, someone_elses]})
+
+    assert response.status_code == 200, response.text
+    assert _face_character_ids(server, [target_face, other_face, unrelated_face]) == {
+        target_face: None,
+        other_face: other_character_id,
+        unrelated_face: character_id,
+    }
+    assert _has_text_embedding(server, [target, someone_elses, unrelated]) == {
+        target: False,
+        someone_elses: True,
+        unrelated: True,
+    }
+    newest = operation_log_service.list_operations(
+        server.vault, op_type="characters.unassign"
+    )[0]
+    assert newest["target_ids"] == [target]
+
+
+def test_an_unassign_that_matches_nothing_answers_200_and_changes_nothing(
+    unassign_env,
+):
+    """Each of these used to end the request in a 500."""
+    server, client, pictures = unassign_env
+    held, bare = pictures[5:7]
+    character_id = _create_character(client, "Matches nothing")
+    other_character_id = _create_character(client, "Not them")
+    own_face = _add_face(
+        server, held, ALONG_X, SMALL_BBOX, face_index=0, character_id=character_id
+    )
+    other_face = _add_face(
+        server,
+        held,
+        ALONG_Y,
+        SMALL_BBOX,
+        face_index=1,
+        character_id=other_character_id,
+    )
+    unknown_face = max(own_face, other_face) + 1_000_000
+    _seed_text_embeddings(server, [held, bare])
+    recorded = _unassign_operation_ids(server)
+
+    for body in (
+        {"face_ids": [unknown_face]},
+        {"face_ids": [other_face]},
+        {"picture_ids": [bare]},
+        {"picture_ids": []},
+    ):
+        response = _unassign(client, character_id, body)
+
+        assert response.status_code == 200, (body, response.text)
+        assert _face_character_ids(server, [own_face, other_face]) == {
+            own_face: character_id,
+            other_face: other_character_id,
+        }, body
+        assert _has_text_embedding(server, [held, bare]) == {
+            held: True,
+            bare: True,
+        }, body
+    assert _unassign_operation_ids(server) == recorded
+
+
+def test_an_unknown_face_id_beside_a_real_one_still_unassigns_the_real_one(
+    unassign_env,
+):
+    server, client, pictures = unassign_env
+    target = pictures[7]
+    character_id = _create_character(client, "Beside an unknown face")
+    target_face = _add_face(
+        server, target, ALONG_X, SMALL_BBOX, character_id=character_id
+    )
+    _seed_text_embeddings(server, [target])
+
+    response = _unassign(
+        client, character_id, {"face_ids": [target_face, target_face + 1_000_000]}
+    )
+
+    assert response.status_code == 200, response.text
+    assert _face_character_ids(server, [target_face]) == {target_face: None}
+    assert _has_text_embedding(server, [target]) == {target: False}
+
+
 # --- a picture of several people (a run loading their LoRAs) ---------------
 
 
@@ -857,14 +1067,12 @@ def test_a_reference_deleted_while_references_are_chosen_leaves_five(tmp_path):
     deleted = []
 
     def delete_once_ranked(conn, cursor, statement, parameters, context, many):
-        # The ranking read: faces joined to pictures, neither ordered nor
-        # limited in SQL.
+        # The ranking read of the unrated pictures, the one that ranks on
+        # penalised tags: delete the first face it put in line.
         ranking = " ".join(statement.split())
         if deleted or not ranking.startswith("SELECT face.id"):
             return
-        if "JOIN picture" not in ranking or "LIMIT" in ranking:
-            return
-        if "ORDER BY" in ranking:
+        if "JOIN picture" not in ranking or "FROM tag" not in ranking:
             return
         writer = sqlite3.connect(path)
         try:

@@ -1,4 +1,3 @@
-import ast
 import json
 import os
 import random as _random
@@ -21,6 +20,7 @@ from fastapi import (
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field as PydanticField
 from sqlalchemy import exists, func
+from sqlalchemy.orm import load_only
 from sqlmodel import Session, delete, select, update
 from starlette.concurrency import run_in_threadpool
 
@@ -29,6 +29,7 @@ from pixlstash.authz.membership import (
     enforce_project_path_scope,
 )
 from pixlstash.database import DBPriority
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.db_models import (
     ENTITY_CHARACTER,
     AdapterAttachment,
@@ -56,6 +57,7 @@ from pixlstash.services.layout_move_service import rename_entity_folders
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
 from pixlstash.tasks.face_extraction_task import CROP_EXPAND_SCALE
+from pixlstash.routes._helpers import read_json_object
 from pixlstash.routes.pictures import FaceListResponse
 from pixlstash.utils.library_layout import Facet
 from pixlstash.utils.field_allowlist import (
@@ -80,12 +82,16 @@ from pixlstash.utils.service.filter_helpers import (
     fetch_scope_allowed_character_ids,
     fetch_scope_allowed_picture_ids,
     filter_visible_project_ids,
+    is_scrapheap_view_id,
     narrow_project_fields,
+    SCRAPHEAP_VIEW_ID,
     VALID_COMBINE_MODES,
     visible_project_ids,
 )
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
+from pixlstash.utils.sql_chunking import chunked, in_json
 
 logger = get_logger(__name__)
 
@@ -98,13 +104,59 @@ _LIKENESS_SEARCH_MAX_POOL_M = 2000
 _MAX_REFS_PER_CHARACTER = 10
 
 
-def _on_frame_0(face) -> bool:
-    """True when a face's box can be cropped from the picture's first frame.
+def _thumbnail_box(face) -> Optional[list]:
+    """The box a character's thumbnail crops from *face*, or ``None``.
 
     The thumbnail decodes frame 0; a face found later in a video or an animated
-    GIF has a box measured on another frame.
+    GIF has a box measured on another frame. A stored box that is not four
+    finite numbers is skipped too (logged once by :func:`read_stored_bbox`),
+    so the walk moves on to the character's next face instead of failing the
+    request on it.
     """
-    return (getattr(face, "frame_index", 0) or 0) == 0
+    if (getattr(face, "frame_index", 0) or 0) != 0:
+        return None
+    return read_stored_bbox(
+        face.bbox_, owner="Face", row_id=face.id, picture_id=face.picture_id
+    )
+
+
+def _thumbnail_faces(
+    session: Session, character_id: int, picture_id: Optional[int] = None
+) -> list:
+    """A character's faces, with only the columns the thumbnail crop reads.
+
+    A face's ``features`` is its 2 KiB embedding, which the crop never uses;
+    whole rows read it for every face the fallback walks. The rows come back
+    detached, so a column left out here raises when it is read. The
+    no-face sentinel (``face_index`` -1) is left out, as ``Face.find`` leaves
+    it out: it has no box to crop.
+
+    Args:
+        session: The read session.
+        character_id: The character whose faces to return.
+        picture_id: Only the faces on this picture, when given.
+
+    Returns:
+        The faces, ordered by id: the order the ``Character.faces``
+        relationship produced for the fallback walk.
+    """
+    query = (
+        select(Face)
+        .where(Face.character_id == character_id, Face.face_index != -1)
+        .options(
+            load_only(
+                Face.id,
+                Face.picture_id,
+                Face.character_id,
+                Face.frame_index,
+                Face.bbox_,
+            )
+        )
+        .order_by(Face.id)
+    )
+    if picture_id is not None:
+        query = query.where(Face.picture_id == picture_id)
+    return list(session.exec(query).all())
 
 
 def _face_thumbnail_crop_box(bbox, image_width: int, image_height: int):
@@ -255,7 +307,7 @@ def _fetch_character_candidate_embeddings(
         if scope_allowed is not None:
             if not scope_allowed:
                 return []
-            query = query.where(Face.character_id.in_(scope_allowed))
+            query = query.where(in_json(Face.character_id, scope_allowed))
 
         rows = session.execute(query).all()
 
@@ -480,7 +532,7 @@ def create_router(server) -> APIRouter:
                 CharacterProjectMember.character_id == Character.id,
             )
             .where(
-                CharacterProjectMember.project_id.in_(wanted),
+                in_json(CharacterProjectMember.project_id, wanted),
                 func.lower(Character.name) == name.lower(),
             )
         )
@@ -520,7 +572,9 @@ def create_router(server) -> APIRouter:
                     status_code=400, detail="project_ids must be a list"
                 )
             try:
-                return sorted({int(v) for v in raw_ids if v is not None}), True
+                return sorted(
+                    {parse_sqlite_int(v) for v in raw_ids if v is not None}
+                ), True
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -530,7 +584,7 @@ def create_router(server) -> APIRouter:
             if raw is None:
                 return [], True
             try:
-                return [int(raw)], True
+                return [parse_sqlite_int(raw)], True
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -597,8 +651,11 @@ def create_router(server) -> APIRouter:
         if join_character:
             query = query.join(Character, Character.id == Face.character_id)
         query = query.where(
-            Face.character_id.in_(char_ids),
-            Picture.deleted.is_(False),
+            in_json(Face.character_id, char_ids),
+            # ``deleted IS NOT 1``: no index serves it, so the person ids lead
+            # the plan instead of ``ix_picture_deleted`` walking every kept
+            # picture (backend_architecture.md, "Probe cost").
+            Picture.deleted.is_not(True),
             *(extra_conditions or []),
         ).group_by(Face.character_id)
         return {
@@ -759,14 +816,14 @@ def create_router(server) -> APIRouter:
                 select(Tag.id).where(
                     Tag.picture_id == Picture.id,
                     Tag.tag.is_not(None),
-                    func.lower(Tag.tag).in_(hidden_tag_set),
+                    in_json(func.lower(Tag.tag), hidden_tag_set),
                 )
             )
 
         # Scope guard (BOLA): a resource-scoped token may only summarise its own
         # character; the aggregate ALL/UNASSIGNED/SCRAPHEAP views are owner-only.
         scope = getattr(request.state, "token_scope", None)
-        if id in ("ALL", "UNASSIGNED", "SCRAPHEAP"):
+        if id in ("ALL", "UNASSIGNED", SCRAPHEAP_VIEW_ID):
             if scope is not None and scope.resource_type is not None:
                 raise HTTPException(
                     status_code=403,
@@ -774,11 +831,12 @@ def create_router(server) -> APIRouter:
                 )
         else:
             try:
-                _require_scope_allows_character(request, int(id))
+                character_id = parse_sqlite_int(id)
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid character id"
                 ) from exc
+            _require_scope_allows_character(request, character_id)
 
         if id == "ALL":
 
@@ -795,7 +853,7 @@ def create_router(server) -> APIRouter:
             image_count = server.vault.db.run_immediate_read_task(count_all)
             logger.debug("ALL pics count: {}".format(image_count))
             char_id = None
-        elif id == "SCRAPHEAP":
+        elif is_scrapheap_view_id(id):
 
             def count_scrapheap(session: Session) -> int:
                 conditions = [
@@ -817,7 +875,7 @@ def create_router(server) -> APIRouter:
                 unassigned_project_only = True
             elif project_id is not None:
                 try:
-                    unassigned_project_id = int(project_id)
+                    unassigned_project_id = parse_sqlite_int(project_id)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail="Invalid project_id")
 
@@ -851,7 +909,7 @@ def create_router(server) -> APIRouter:
                 assigned_project_unassigned = True
             elif project_id is not None:
                 try:
-                    assigned_project_id = int(project_id)
+                    assigned_project_id = parse_sqlite_int(project_id)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail="Invalid project_id")
 
@@ -873,9 +931,9 @@ def create_router(server) -> APIRouter:
                 ).one()
 
             image_count = server.vault.db.run_immediate_read_task(
-                count_assigned, character_id=int(id)
+                count_assigned, character_id=character_id
             )
-            char_id = int(id)
+            char_id = character_id
 
         if char_id:
             thumb_url = None
@@ -900,7 +958,7 @@ def create_router(server) -> APIRouter:
         description="Returns picture ids selected as reference faces for the given character.",
         response_model=CharacterReferencePicturesResponse,
     )
-    def get_character_reference_pictures(request: Request, id: int):
+    def get_character_reference_pictures(request: Request, id: SqliteInt):
         """Return reference picture ids for a character.
 
         Args:
@@ -964,9 +1022,9 @@ def create_router(server) -> APIRouter:
         ),
         response_model=CharacterMutationResponse,
     )
-    async def patch_character(id: int, request: Request):
+    async def patch_character(id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
-        data = await request.json()
+        data = await read_json_object(request)
         name = data.get("name")
         description = data.get("description")
         # Sentinel, because ``null`` is a meaningful value here: it clears the
@@ -974,7 +1032,7 @@ def create_router(server) -> APIRouter:
         thumbnail_picture_id = data.get("thumbnail_picture_id", _UNSET)
         if thumbnail_picture_id is not _UNSET and thumbnail_picture_id is not None:
             try:
-                thumbnail_picture_id = int(thumbnail_picture_id)
+                thumbnail_picture_id = parse_sqlite_int(thumbnail_picture_id)
             except (TypeError, ValueError):
                 raise HTTPException(
                     status_code=400,
@@ -1084,11 +1142,13 @@ def create_router(server) -> APIRouter:
                     if project_change is not None and project_change.changed:
                         picture_ids = list(
                             {
-                                face.picture_id
-                                for face in session.exec(
-                                    select(Face).where(Face.character_id == id)
+                                picture_id
+                                for picture_id in session.exec(
+                                    select(Face.picture_id).where(
+                                        Face.character_id == id
+                                    )
                                 ).all()
-                                if face.picture_id is not None
+                                if picture_id is not None
                             }
                         )
                         # Project membership is stack-atomic: a character on one
@@ -1112,11 +1172,11 @@ def create_router(server) -> APIRouter:
                     # clearing it there. Character reassignment itself stays allowed.
                     if identity_changed:
                         character_pic_ids = [
-                            face.picture_id
-                            for face in session.exec(
-                                select(Face).where(Face.character_id == id)
+                            picture_id
+                            for picture_id in session.exec(
+                                select(Face.picture_id).where(Face.character_id == id)
                             ).all()
-                            if face.picture_id is not None
+                            if picture_id is not None
                         ]
                         locked_pics = locked_picture_ids(session, character_pic_ids)
                         for pic_id in character_pic_ids:
@@ -1159,28 +1219,37 @@ def create_router(server) -> APIRouter:
                 payload["project_ids"] = character_project_ids(session, id)
                 return (payload, local_project_membership_updated)
 
-            char, project_membership_updated = await run_in_threadpool(
-                server.vault.db.run_task,
-                alter_char,
-                id,
-                name,
-                description,
-                thumbnail_picture_id,
-                priority=DBPriority.IMMEDIATE,
-            )
-            server.vault.notify(
-                EventType.CHANGED_CHARACTERS,
-                {"origin_client_id": origin_client_id},
-            )
-            if project_membership_updated:
-                server.vault.notify(
-                    EventType.CHANGED_PICTURES,
-                    {
-                        "source": "ui",
-                        "origin_client_id": origin_client_id,
-                        "change_kind": "updated",
-                    },
+            def alter_and_announce():
+                # The notifies run in the worker thread, beside the write: a
+                # cancelled request (client gone) still lets the thread finish
+                # and commit, but raises at the ``await`` below, so a notify
+                # placed after it would never announce a write that landed.
+                result = server.vault.db.run_task(
+                    alter_char,
+                    id,
+                    name,
+                    description,
+                    thumbnail_picture_id,
+                    priority=DBPriority.IMMEDIATE,
                 )
+                server.vault.notify(
+                    EventType.CHANGED_CHARACTERS,
+                    {"origin_client_id": origin_client_id},
+                )
+                if result[1]:
+                    server.vault.notify(
+                        EventType.CHANGED_PICTURES,
+                        {
+                            "source": "ui",
+                            "origin_client_id": origin_client_id,
+                            "change_kind": "updated",
+                        },
+                    )
+                return result
+
+            char, project_membership_updated = await run_in_threadpool(
+                alter_and_announce
+            )
 
         except KeyError:
             raise HTTPException(status_code=404, detail="Character not found")
@@ -1193,7 +1262,7 @@ def create_router(server) -> APIRouter:
         description="Deletes a character, clears character assignment from faces, and removes its reference set when present.",
         response_model=CharacterDeleteResponse,
     )
-    def delete_character(id: int, request: Request):
+    def delete_character(id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
 
@@ -1270,7 +1339,7 @@ def create_router(server) -> APIRouter:
     )
     def get_batch_character_membership(
         request: Request,
-        picture_ids: list[int] = Body(default=[], embed=True),
+        picture_ids: list[SqliteInt] = Body(default=[], embed=True),
     ):
         if not picture_ids:
             return {"character_assignments": {}, "pictures_with_faces": []}
@@ -1284,12 +1353,19 @@ def create_router(server) -> APIRouter:
                 return {"character_assignments": {}, "pictures_with_faces": []}
 
         def fetch(session, ids: list[int]):
-            rows = session.exec(
-                select(Face.character_id, Face.picture_id).where(
-                    Face.picture_id.in_(ids),
-                    Face.face_index != -1,
+            # The body has no cap (a select-all reaches it), so the faces are
+            # read in chunks under SQLite's bound-parameter limit. Duplicate ids
+            # are dropped first, so no face row is read in two chunks.
+            rows = []
+            for id_chunk in chunked(sorted(set(ids))):
+                rows.extend(
+                    session.exec(
+                        select(Face.character_id, Face.picture_id).where(
+                            Face.picture_id.in_(id_chunk),
+                            Face.face_index != -1,
+                        )
+                    ).all()
                 )
-            ).all()
             assignments: dict[int, list[int]] = {}
             pictures_with_faces: set[int] = set()
             for character_id, pid in rows:
@@ -1309,7 +1385,7 @@ def create_router(server) -> APIRouter:
         description="Returns a single character record by id.",
         response_model=Optional[CharacterResponse],
     )
-    def get_character_by_id(request: Request, id: int):
+    def get_character_by_id(request: Request, id: SqliteInt):
         try:
             # A scoped token may read the character but must not learn which
             # *other* projects it belongs to (issue #125 / R1).
@@ -1389,7 +1465,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=FaceListResponse,
     )
-    def list_character_faces(request: Request, id: int):
+    def list_character_faces(request: Request, id: SqliteInt):
         # Dedicated, projected replacement for `GET /characters/{id}/{field}`
         # with field="faces", which served the ORM relationship and therefore
         # the embedding too (issue #721).
@@ -1403,9 +1479,23 @@ def create_router(server) -> APIRouter:
         # they differ by method, and Starlette falls through a path-only match.
         def fetch_faces(session: Session):
             # Ordered by id to reproduce the row set and order that the
-            # `Character.faces` relationship produced on the old path.
+            # `Character.faces` relationship produced on the old path. Only the
+            # columns `to_public_dict` serves: whole rows read every face's
+            # embedding to send none of them.
             rows = session.exec(
-                select(Face).where(Face.character_id == id).order_by(Face.id)
+                select(Face)
+                .where(Face.character_id == id)
+                .options(
+                    load_only(
+                        Face.id,
+                        Face.picture_id,
+                        Face.character_id,
+                        Face.frame_index,
+                        Face.face_index,
+                        Face.bbox_,
+                    )
+                )
+                .order_by(Face.id)
             ).all()
             return [face.to_public_dict() for face in rows]
 
@@ -1442,7 +1532,7 @@ def create_router(server) -> APIRouter:
             404: {"description": "The character does not exist."},
         },
     )
-    def get_character_field_by_id(request: Request, id: int, field: str):
+    def get_character_field_by_id(request: Request, id: SqliteInt, field: str):
         # Deny-by-default: only the character's own column namespace (plus the
         # declared exceptions, which include the synthesised ``thumbnail``) is
         # servable. This runs BEFORE any lookup so the refusal cannot depend on
@@ -1504,9 +1594,9 @@ def create_router(server) -> APIRouter:
                     # derivable from ``picture_id``: on the automatic path that
                     # id names the query's winner, which is NOT always the
                     # picture the render below crops (it can fall through to the
-                    # reference set or to `char.faces`). Pinning the picture the
-                    # query already named would therefore leave the key
-                    # unchanged and serve the old crop - the most likely click
+                    # reference set or to the character's other faces). Pinning
+                    # the picture the query already named would therefore leave
+                    # the key unchanged and serve the old crop - the most likely click
                     # of all, since the grid is ordered by the same scorer.
                     "pinned_picture_id": (
                         int(pinned_id) if pinned_id is not None else None
@@ -1537,7 +1627,7 @@ def create_router(server) -> APIRouter:
                     logger.debug("Failed to read character thumbnail cache: %s", exc)
             char = server.vault.db.run_immediate_read_task(
                 Character.find,
-                select_fields=["reference_picture_set_id", "faces"],
+                select_fields=["reference_picture_set_id"],
                 id=id,
             )
             if not char:
@@ -1555,13 +1645,10 @@ def create_router(server) -> APIRouter:
                     Picture.find, id=pinned_id
                 )
                 faces = server.vault.db.run_immediate_read_task(
-                    Face.find, picture_id=pinned_id
+                    _thumbnail_faces, char.id, pinned_id
                 )
                 best_pic = pics[0] if pics else None
-                best_face = next(
-                    (f for f in faces if f.character_id == char.id and _on_frame_0(f)),
-                    None,
-                )
+                best_face = next((f for f in faces if _thumbnail_box(f)), None)
                 if not (best_pic and best_face):
                     best_pic = best_face = None
 
@@ -1584,10 +1671,10 @@ def create_router(server) -> APIRouter:
                 pics = sorted(members, key=lambda p: p.score or 0, reverse=True)
                 for pic in pics:
                     faces = server.vault.db.run_immediate_read_task(
-                        Face.find, picture_id=pic.id
+                        _thumbnail_faces, char.id, pic.id
                     )
                     for face in faces:
-                        if face.character_id == char.id and _on_frame_0(face):
+                        if _thumbnail_box(face):
                             best_pic = pic
                             best_face = face
                             break
@@ -1595,8 +1682,10 @@ def create_router(server) -> APIRouter:
                         logger.debug("Found thumbnail from reference set!")
                         break
             if not best_pic or not best_face:
-                for face in char.faces:
-                    if not _on_frame_0(face):
+                for face in server.vault.db.run_immediate_read_task(
+                    _thumbnail_faces, char.id
+                ):
+                    if not _thumbnail_box(face):
                         continue
                     pic = server.vault.db.run_immediate_read_task(
                         Picture.find,
@@ -1612,7 +1701,8 @@ def create_router(server) -> APIRouter:
                     status_code=404, detail="No face thumbnail found for character"
                 )
 
-            bbox = best_face.bbox
+            # Every path above chose a face whose box reads.
+            bbox = _thumbnail_box(best_face)
 
             if isinstance(best_pic, list):
                 best_pic = best_pic[0]
@@ -1620,15 +1710,6 @@ def create_router(server) -> APIRouter:
             picture_path = ImageUtils.resolve_picture_path(
                 server.vault.image_root, best_pic.file_path
             )
-            if isinstance(bbox, str):
-                try:
-                    bbox = ast.literal_eval(bbox)
-                except Exception:
-                    bbox = None
-            if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                raise HTTPException(
-                    status_code=404, detail="Failed to crop face thumbnail"
-                )
             try:
                 if VideoUtils.is_video_file(picture_path):
                     frame_bgr = VideoUtils.read_first_video_frame_bgr(picture_path)
@@ -1808,7 +1889,9 @@ def create_router(server) -> APIRouter:
                         query = query.where(character_in_no_project())
                     else:
                         try:
-                            query = query.where(character_in_project(int(project_id)))
+                            query = query.where(
+                                character_in_project(parse_sqlite_int(project_id))
+                            )
                         except (TypeError, ValueError):
                             raise HTTPException(
                                 status_code=400, detail="Invalid project_id"
@@ -1838,7 +1921,7 @@ def create_router(server) -> APIRouter:
                         select(
                             CharacterProjectMember.character_id,
                             CharacterProjectMember.project_id,
-                        ).where(CharacterProjectMember.character_id.in_(char_ids))
+                        ).where(in_json(CharacterProjectMember.character_id, char_ids))
                     ).all():
                         project_ids_by_char.setdefault(int(cid), []).append(int(pid))
 
@@ -1899,8 +1982,14 @@ def create_router(server) -> APIRouter:
         except KeyError:
             logger.error("Character not found")
             raise HTTPException(status_code=404, detail="Character not found")
-        except Exception as e:
-            logger.error(f"Error fetching characters: {e}")
+        except Exception:
+            logger.error(
+                "Listing characters failed (name=%r, project_id=%r, include_counts=%s)",
+                name,
+                project_id,
+                include_counts,
+                exc_info=True,
+            )
             raise HTTPException(status_code=500, detail="Internal Server Error")
 
     @router.post(
@@ -2053,7 +2142,10 @@ def create_router(server) -> APIRouter:
         if combine not in VALID_COMBINE_MODES:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid combine mode {combine!r}. Must be one of: {', '.join(sorted(VALID_COMBINE_MODES))}",
+                detail=(
+                    "Invalid combine mode. Must be one of: "
+                    f"{', '.join(sorted(VALID_COMBINE_MODES))}"
+                ),
             )
 
         # ── Scope-based candidate restriction ────────────────────────────
@@ -2114,7 +2206,11 @@ def create_router(server) -> APIRouter:
             all_face_results = task_runner.submit_and_wait(detection_task, 60.0)
         except TimeoutError as exc:
             logger.error(
-                "characters/likeness-search: face detection timed out: %s", exc
+                "characters/likeness-search: face detection timed out on %d "
+                "image(s): %s",
+                len(bgr_images),
+                exc,
+                exc_info=True,
             )
             raise HTTPException(
                 status_code=503,
@@ -2122,7 +2218,10 @@ def create_router(server) -> APIRouter:
             ) from exc
         except RuntimeError as exc:
             logger.error(
-                "characters/likeness-search: face detection task failed: %s", exc
+                "characters/likeness-search: face detection failed on %d image(s): %s",
+                len(bgr_images),
+                exc,
+                exc_info=True,
             )
             raise HTTPException(
                 status_code=503,

@@ -1,16 +1,29 @@
 """Tests for the Characters API: create, update, delete, and reference pictures."""
 
+import asyncio
 import gc
 import glob
 import hashlib
 import json
+import logging
 import os
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
+from types import SimpleNamespace
 
+import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
-from pixlstash.db_models import Face, Picture
-from pixlstash.routes.characters import _face_thumbnail_crop_box
+from pixlstash.db_models import Character, Face, Picture, PictureSetMember
+from pixlstash.event_types import EventType
+from pixlstash.routes.characters import (
+    _face_thumbnail_crop_box,
+    create_router as create_characters_router,
+)
 from pixlstash.tasks.face_extraction_task import CROP_EXPAND_SCALE
 from pixlstash.server import Server
 from tests.utils import upload_pictures_and_wait
@@ -85,6 +98,91 @@ def test_patch_character_name_and_description():
         assert resp.status_code == 200
         assert resp.json()["name"] == "Charles"
     finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def _patch_character_endpoint(server):
+    [endpoint] = [
+        route.endpoint
+        for route in create_characters_router(server).routes
+        if route.path == "/characters/{id}" and "PATCH" in route.methods
+    ]
+    return endpoint
+
+
+async def _cancel_patch_mid_write(server, char_id, body, entered, release):
+    """Start the PATCH, cancel it while its write is held in the worker
+    thread, then let the write finish. The thread commits regardless; the
+    cancellation surfaces at the route's ``await``."""
+
+    async def read_body():
+        return body
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(origin_client_id="test-origin"), json=read_body
+    )
+    task = asyncio.create_task(
+        _patch_character_endpoint(server)(id=char_id, request=request)
+    )
+    deadline = time.monotonic() + 30
+    try:
+        while not entered.is_set():
+            if task.done():
+                task.result()
+                raise AssertionError("the PATCH finished without reaching its write")
+            assert time.monotonic() < deadline, "the PATCH never reached its write"
+            await asyncio.sleep(0.01)
+        task.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_a_cancelled_patch_still_announces_the_write_that_landed():
+    """A client that goes away mid-PATCH cancels the route at its ``await``,
+    but the worker thread still commits. Every listener (the grid, the
+    sidebar, other tabs) must hear about the write that landed."""
+    temp_dir, client, server = _setup()
+    db = server.vault.db
+    try:
+        char_id = client.post("/characters", json={"name": "test-before"}).json()[
+            "character"
+        ]["id"]
+        events = []
+        heard = threading.Event()
+
+        def listener(event_type, data):
+            if event_type == EventType.CHANGED_CHARACTERS:
+                events.append(data)
+                heard.set()
+
+        server.vault.add_event_listener(listener)
+        entered = threading.Event()
+        release = threading.Event()
+        real_run_task = db.run_task
+
+        def gated_run_task(func, *args, **kwargs):
+            if getattr(func, "__name__", "") == "alter_char":
+                entered.set()
+                assert release.wait(30), "the test never released the write"
+            return real_run_task(func, *args, **kwargs)
+
+        db.run_task = gated_run_task
+        asyncio.run(
+            _cancel_patch_mid_write(
+                server, char_id, {"name": "test-after"}, entered, release
+            )
+        )
+
+        assert heard.wait(30), "the committed rename was never announced"
+        assert events == [{"origin_client_id": "test-origin"}]
+        del db.run_task
+        assert client.get(f"/characters/{char_id}").json()["name"] == "test-after"
+    finally:
+        db.__dict__.pop("run_task", None)
         server.close()
         temp_dir.cleanup()
         gc.collect()
@@ -199,6 +297,43 @@ def test_get_characters_invalid_project_id_returns_400():
         gc.collect()
 
 
+def test_a_failed_character_listing_answers_a_fixed_sentence_and_logs_the_cause(
+    caplog,
+):
+    """A fault in ``GET /characters`` is a 500 whose body is a sentence the
+    server wrote, never the exception's text; the exception itself goes to the
+    log, with its traceback and the request's filters."""
+    leak = "test-leak-detail-from-the-database"
+
+    def failing_read(*_args, **_kwargs):
+        raise RuntimeError(leak)
+
+    server = SimpleNamespace(
+        vault=SimpleNamespace(db=SimpleNamespace(run_immediate_read_task=failing_read))
+    )
+    app = FastAPI()
+    # The suite's TestClient puts every path under /api/v1 (conftest), as the
+    # server mounts its routers.
+    app.include_router(create_characters_router(server), prefix="/api/v1")
+    client = TestClient(app, raise_server_exceptions=False)
+
+    with caplog.at_level(logging.ERROR, logger="pixlstash.routes.characters"):
+        resp = client.get("/characters", params={"project_id": "UNASSIGNED"})
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json() == {"detail": "Internal Server Error"}
+    assert leak not in resp.text
+    [record] = [
+        r for r in caplog.records if r.getMessage().startswith("Listing characters")
+    ]
+    assert record.levelno == logging.ERROR
+    # ``exc_info=False`` leaves ``False`` here, ``None`` when omitted.
+    assert isinstance(record.exc_info, tuple), "logged without its traceback"
+    assert isinstance(record.exc_info[1], RuntimeError)
+    assert str(record.exc_info[1]) == leak
+    assert "project_id='UNASSIGNED'" in record.getMessage()
+
+
 def test_character_scoped_token_may_not_filter_by_project():
     """Issue #708 F3 - this test previously pinned the vulnerability.
 
@@ -290,7 +425,7 @@ def _link_face(server, pic_id, char_id, face_index=0):
                 frame_index=0,
                 face_index=face_index,
                 character_id=char_id,
-                bbox_="0,0,10,10",
+                bbox=[0, 0, 10, 10],
             )
         )
         session.commit()
@@ -436,9 +571,8 @@ def _import_two_pictures(client):
 def _link_face_with_bbox(server, pic_id, char_id):
     """Assign a face with a REAL bbox, which the thumbnail crop needs.
 
-    ``_link_face`` above writes ``"0,0,10,10"``, which ``Face.bbox`` cannot
-    parse (it is JSON) - fine for the assignment tests that use it, useless for
-    a render.
+    ``_link_face`` above writes a 10 px box at index 0, which is enough for the
+    assignment tests that use it and too small for a render.
 
     ``face_index`` sits above anything detection produces: import runs the face
     detector, and index 0 is whichever face it found, so writing there races the
@@ -677,6 +811,122 @@ def test_pinning_a_picture_without_this_persons_face_is_rejected():
         assert (
             client.get(f"/characters/{char_id}").json()["thumbnail_picture_id"] is None
         )
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+# ── the character routes read no face embedding ────────────────────────────
+#
+# A face's ``features`` column is its 2 KiB ArcFace embedding. The thumbnail
+# render, the faces listing and a character edit need a face's box, frame or
+# picture id, never the embedding; loading whole rows read it for every face.
+
+
+@contextmanager
+def _request_statements(server):
+    """The SQL the request handlers run while the block is open.
+
+    Statements on the threads that serve the TestClient's sync routes, and the
+    ones on the database's writer thread that select faces by character: a
+    route's ``run_task`` work (the character edit's) runs there, beside the
+    background workers', and only the route filters faces by character. The
+    workers keep reading faces of their own while the test runs, which is why
+    every other statement is left out.
+    """
+    statements = []
+    writer = server.vault.db._task_worker
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        thread = threading.current_thread()
+        if thread.name == "AnyIO worker thread" or (
+            thread is writer and "face.character_id = " in statement
+        ):
+            statements.append(statement)
+
+    engine = server.vault.db._engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+def _add_face(server, pic_id, char_id, face_index):
+    def _add(session):
+        session.add(
+            Face(
+                picture_id=pic_id,
+                frame_index=0,
+                face_index=face_index,
+                character_id=char_id,
+                bbox=[0, 0, 32, 32],
+            )
+        )
+        session.commit()
+
+    server.vault.db.run_task(_add)
+
+
+def _assert_no_embedding_read(statements, what):
+    face_reads = [s for s in statements if "FROM face" in s]
+    assert face_reads, f"{what}: the request read no face at all"
+    embedding_reads = [s for s in face_reads if "face.features" in s]
+    assert not embedding_reads, f"{what} read face embeddings: {embedding_reads}"
+
+
+def test_character_routes_read_no_face_embedding():
+    """Each way the thumbnail finds its face (the pin, the reference set, the
+    character's other faces), the faces listing and an edit of the character
+    read the face rows without their embedding, and the thumbnail still
+    renders."""
+    temp_dir, client, server = _setup()
+    try:
+        first_pic, second_pic = _import_two_pictures(client)
+        ids = {}
+        for index, name in enumerate(("Pinned", "Referenced", "Fallback")):
+            ids[name] = client.post("/characters", json={"name": name}).json()[
+                "character"
+            ]["id"]
+            _add_face(server, first_pic, ids[name], 90 + index)
+        _add_face(server, second_pic, ids["Referenced"], 95)
+
+        def add_reference(session):
+            character = session.get(Character, ids["Referenced"])
+            session.add(
+                PictureSetMember(
+                    set_id=character.reference_picture_set_id, picture_id=second_pic
+                )
+            )
+            session.commit()
+
+        server.vault.db.run_task(add_reference)
+        resp = client.patch(
+            f"/characters/{ids['Pinned']}", json={"thumbnail_picture_id": first_pic}
+        )
+        assert resp.status_code == 200, resp.text
+
+        for name, char_id in ids.items():
+            with _request_statements(server) as statements:
+                _thumbnail_bytes(client, char_id)
+            _assert_no_embedding_read(statements, f"the {name} thumbnail")
+
+        with _request_statements(server) as statements:
+            resp = client.get(f"/characters/{ids['Fallback']}/faces")
+        assert resp.status_code == 200
+        assert [face["picture_id"] for face in resp.json()["faces"]] == [first_pic]
+        _assert_no_embedding_read(statements, "the faces listing")
+
+        project_id = client.post("/projects", json={"name": "Faces Move"}).json()["id"]
+        with _request_statements(server) as statements:
+            resp = client.patch(
+                f"/characters/{ids['Fallback']}",
+                json={"name": "Renamed", "project_id": project_id},
+            )
+        assert resp.status_code == 200, resp.text
+        assert first_pic in _project_picture_ids(client, project_id)
+        _assert_no_embedding_read(statements, "the character edit")
     finally:
         server.close()
         temp_dir.cleanup()

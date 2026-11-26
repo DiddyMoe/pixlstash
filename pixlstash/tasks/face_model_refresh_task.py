@@ -45,7 +45,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from pixlstash.database import DBPriority
-from pixlstash.db_models.face import Face
+from pixlstash.db_models.face import Face, read_stored_bbox
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
 from pixlstash.tasks.face_extraction_task import CROP_EXPAND_SCALE, FaceExtractionTask
@@ -469,7 +469,20 @@ class FaceModelRefreshTask(BaseTask):
         With ``redetect`` the index match also needs the boxes to overlap, and
         the last leftovers are matched by embedding similarity within the same
         frame and pack.
+
+        An existing row's box is its stored text, read by
+        :func:`read_stored_bbox`: one that is not four finite numbers overlaps
+        nothing (logged once), so the row is matched by index or embedding or
+        not at all. Parsed by the property it raised, the picture's write
+        failed, and the finder selected it again on every sweep. A paired row
+        takes the new detection's box, which replaces the bad one.
         """
+        stored_box = {
+            id(f): read_stored_bbox(
+                f.bbox_, owner="Face", row_id=f.id, picture_id=f.picture_id
+            )
+            for f in existing
+        }
         existing_by_key = {(f.frame_index, f.face_index): f for f in existing}
         pairs: list[tuple[Face, Face]] = []
         unmatched_new: list[Face] = []
@@ -482,7 +495,8 @@ class FaceModelRefreshTask(BaseTask):
                 ef is not None
                 and id(ef) not in matched_existing
                 and (
-                    not redetect or _bbox_iou(ef.bbox, nf.bbox) >= _IOU_MATCH_THRESHOLD
+                    not redetect
+                    or _bbox_iou(stored_box[id(ef)], nf.bbox) >= _IOU_MATCH_THRESHOLD
                 )
             ):
                 pairs.append((ef, nf))
@@ -500,7 +514,7 @@ class FaceModelRefreshTask(BaseTask):
             for ef in leftover_existing:
                 if ef.frame_index != nf.frame_index or id(ef) in matched_existing:
                     continue
-                iou = _bbox_iou(ef.bbox, nf.bbox)
+                iou = _bbox_iou(stored_box[id(ef)], nf.bbox)
                 if iou >= best_iou:
                     best_iou = iou
                     best_ef = ef

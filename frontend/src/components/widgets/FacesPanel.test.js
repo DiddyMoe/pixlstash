@@ -98,11 +98,24 @@ describe("FacesPanel", () => {
   });
 
   it("stops listening once it is gone", async () => {
-    const w = mountPanel();
-    await flushPromises();
-    w.unmount();
-    document.body.dispatchEvent(new Event("pointerdown", { bubbles: true }));
-    expect(w.emitted("close")).toBeUndefined();
+    // Read off the document's listeners: once unmounted, the panel can emit
+    // nothing (Vue drops it) and Test Utils has cleared its emitted history,
+    // so neither could show a listener left behind.
+    const added = vi.spyOn(document, "addEventListener");
+    const removed = vi.spyOn(document, "removeEventListener");
+    try {
+      const w = mountPanel();
+      await flushPromises();
+      const [, handler, capture] = added.mock.calls.find(
+        ([type]) => type === "pointerdown",
+      );
+      expect(removed).not.toHaveBeenCalledWith("pointerdown", handler, capture);
+      w.unmount();
+      expect(removed).toHaveBeenCalledWith("pointerdown", handler, capture);
+    } finally {
+      added.mockRestore();
+      removed.mockRestore();
+    }
   });
 
   it("says there is nothing to name when there are no faces", async () => {

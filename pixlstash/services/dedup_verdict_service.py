@@ -23,7 +23,9 @@ which is the failure mode that burns Immich users.
 
 Project and set membership already had a union in
 :func:`pixlstash.services.stack_membership.reconcile_stack_membership`; this
-module calls it and adds the three the design requires on top:
+module calls its many-stack form,
+:func:`~pixlstash.services.stack_membership.reconcile_stacks_membership`, and
+adds the three the design requires on top:
 
 * **tags** - every member gains every non-sentinel tag any member carries.
   Sentinel tags (``__tag``, ``__tag:<engine>``) are pipeline markers, not user
@@ -126,6 +128,9 @@ from pixlstash.services.dedup_tier_service import (
     # ever disagreeing again.
     live_groups_filter,
 )
+from pixlstash.services.folder_structure_commit_service import (
+    resolve_pending_people_with_faces,
+)
 from pixlstash.services.set_lock_service import (
     LOCKED_STATUS_CODE,
     build_locked_set_lookup,
@@ -134,7 +139,7 @@ from pixlstash.services.set_lock_service import (
 )
 from pixlstash.services.stack_membership import (
     expand_picture_ids_to_stacks,
-    reconcile_stack_membership,
+    reconcile_stacks_membership,
 )
 from pixlstash.stacking import normalize_stack_positions
 from pixlstash.utils.service.scope_table import scope_id_subquery
@@ -220,6 +225,11 @@ class VerdictResult:
             verdict records them as exclusions so a rescan does not re-ask); this
             field is what tells the client the exclusion was the server's doing
             rather than the user's.
+        stacked_picture_ids: Every live picture in the resulting stack, for a
+            stack verdict: the included members plus the full membership of
+            every existing stack the verdict folded in, which the group itself
+            never named. What the receipt counts as stacked. Empty for
+            keep-separate.
         event_picture_ids: The pictures the WS ``pictures_changed`` announcement
             should name - for a stack verdict the stack-expanded set (folding a
             stack in touches siblings the group never named), for keep-separate
@@ -236,6 +246,7 @@ class VerdictResult:
     batch_id: Optional[str]
     metadata_union: dict[str, Any]
     skipped: list[dict[str, Any]] = field(default_factory=list)
+    stacked_picture_ids: list[int] = field(default_factory=list)
     event_picture_ids: list[int] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -249,6 +260,7 @@ class VerdictResult:
             "batch_id": self.batch_id,
             "metadata_union": dict(self.metadata_union),
             "skipped": [dict(entry) for entry in self.skipped],
+            "stacked_picture_ids": list(self.stacked_picture_ids),
         }
 
 
@@ -332,7 +344,8 @@ def _load_group(session: Session, signature: str) -> tuple[DedupGroup, list[int]
         select(DedupGroup).where(DedupGroup.signature == signature)
     ).first()
     if group is None:
-        raise DedupVerdictError(f"No duplicate group with signature {signature!r}")
+        # The routes answer this text, so the caller's signature is not in it.
+        raise DedupVerdictError("No duplicate group has that signature.")
     member_ids = [
         int(row)
         for row in session.exec(
@@ -388,135 +401,152 @@ def _upsert_verdict(
 
 
 def apply_metadata_union_in_session(
-    session: Session, picture_ids: list[int], stack_id: int
-) -> dict[str, Any]:
-    """Union tags, membership, score and (where safe) characters across a stack.
+    session: Session, stacks: list[tuple[list[int], int]]
+) -> list[dict[str, Any]]:
+    """Union tags, membership, score and (where safe) characters across stacks.
 
     Additive only. See the module docstring for why characters go through
     ``pending_character_id`` rather than through fabricated ``Face`` rows.
 
+    Each stack is unioned over its own pictures only; nothing crosses from one
+    stack to another. The reads, the lock check and the anomaly snapshot run
+    once over every stack's pictures rather than once per stack, so a gesture
+    over many stacks (Keep cover only) pays a fixed number of statements per id
+    chunk and flushes once, not several times per stack. Every flush runs the
+    metadata-hash updater (``database._after_flush_hash_updater``), which is
+    where a per-stack loop spent most of its time.
+
     Args:
         session: Pre-opened session. Not committed here - the caller owns the
             transaction so a verdict lands as one unit.
-        picture_ids: The stack's members.
-        stack_id: The stack they were just placed in; the project / set union
-            reconciles over the whole stack, not only over the group.
+        stacks: ``(picture_ids, stack_id)`` per stack: the members to union and
+            the stack they were just placed in (the project / set union
+            reconciles over the whole stack, not only over these members). No
+            picture may appear under two stacks, since the union of one would
+            then depend on whether the other ran first.
 
     Returns:
-        A summary of what changed, for the action receipt.
+        One summary of what changed per stack, in the order given, for the
+        action receipt.
+
+    Raises:
+        ValueError: when a picture is listed under two stacks.
     """
     # Imported locally: set_lock_service imports stack_membership, so a
     # module-level import here would be circular.
     from pixlstash.services.set_lock_service import enforce_pictures_not_locked
 
-    if len(picture_ids) < 2:
-        return {"tags_added": 0, "scores_lifted": 0, "characters_pending": 0}
+    entries = [
+        ([int(pid) for pid in dict.fromkeys(picture_ids)], int(stack_id))
+        for picture_ids, stack_id in stacks
+    ]
+    summaries: list[dict[str, Any]] = [
+        {"tags_added": 0, "scores_lifted": 0, "characters_pending": 0} for _ in entries
+    ]
+    unioned = [index for index, (ids, _) in enumerate(entries) if len(ids) >= 2]
+    all_ids = [pid for index in unioned for pid in entries[index][0]]
+    if len(set(all_ids)) != len(all_ids):
+        raise ValueError(
+            "apply_metadata_union_in_session was given a picture under two "
+            f"stacks (stacks {[entries[i][1] for i in unioned]})"
+        )
+    if not unioned:
+        return summaries
 
     # The union writes tags and scores, which are curation state. A picture
     # frozen by a locked set must not have either changed behind the user's
     # back, so this is a hard 423 rather than a skip: a partially applied union
     # would be worse than a refused one.
-    enforce_pictures_not_locked(session, picture_ids, "union duplicate metadata")
+    enforce_pictures_not_locked(session, all_ids, "union duplicate metadata")
 
-    membership_changed = reconcile_stack_membership(session, stack_id)
+    # One reconcile over every stack: per stack, it read and autoflushed several
+    # times each, which was half of what Keep cover only cost.
+    reconciled = reconcile_stacks_membership(
+        session, [entries[index][1] for index in unioned]
+    )
+    membership_changed = {index: reconciled[entries[index][1]] for index in unioned}
 
-    # Every read below goes by id chunk: a stack is not bounded in size, and one
-    # bound parameter per member overruns SQLite's per-statement cap. One chunk
-    # for any ordinary stack, so the common case pays nothing for it.
-    batches = list(chunked(sorted({int(pid) for pid in picture_ids})))
+    # Every read below goes by id chunk: a selection is not bounded in size, and
+    # one bound parameter per member overruns SQLite's per-statement cap.
+    batches = list(chunked(sorted(all_ids)))
 
-    # --- Tags: every member gains every real tag any member carries ---
-    tag_rows = [
-        row
-        for batch in batches
-        for row in session.exec(
-            select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(batch))
-        ).all()
-    ]
+    # --- Tags: every member gains every real tag any member of its stack has ---
     # A tag removed from tagging stays where it is but is never copied.
     exclusions = session_tag_exclusions(session)
-    tags_by_picture: dict[int, set[str]] = {pid: set() for pid in picture_ids}
-    union: set[str] = set()
-    for picture_id, tag in tag_rows:
-        if is_tag_sentinel(tag) or is_excluded(tag, exclusions):
-            continue
-        tags_by_picture.setdefault(int(picture_id), set()).add(str(tag))
-        union.add(str(tag))
-    tags_added = 0
+    tags_by_picture: dict[int, set[str]] = {pid: set() for pid in all_ids}
+    for batch in batches:
+        for picture_id, tag in session.exec(
+            select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(batch))
+        ).all():
+            if is_tag_sentinel(tag) or is_excluded(tag, exclusions):
+                continue
+            tags_by_picture[int(picture_id)].add(str(tag))
     # A unioned tag can be an anomaly tag ("malformed eyes" on one member reaches
     # all of them), and a Tag row is a human-verified label the scorer penalises.
     # The guard clears the cached smart score of exactly the members whose anomaly
     # inputs moved, so the stack does not keep scores computed without the penalty.
-    with invalidate_on_anomaly_change(
-        session, picture_ids, context="dedup metadata union"
-    ):
-        for picture_id in picture_ids:
-            for tag in sorted(union - tags_by_picture.get(picture_id, set())):
-                session.add(Tag(picture_id=picture_id, tag=tag))
-                tags_added += 1
+    with invalidate_on_anomaly_change(session, all_ids, context="dedup metadata union"):
+        for index in unioned:
+            picture_ids = entries[index][0]
+            union = set().union(*(tags_by_picture[pid] for pid in picture_ids))
+            for picture_id in picture_ids:
+                for tag in sorted(union - tags_by_picture[picture_id]):
+                    session.add(Tag(picture_id=picture_id, tag=tag))
+                    summaries[index]["tags_added"] += 1
 
-    # --- Score: lift every member to the highest rating in the group ---
-    pictures = [
-        pic
+    # --- Score: lift every member to the highest rating in its stack ---
+    pictures_by_id = {
+        int(pic.id): pic
         for batch in batches
         for pic in session.exec(select(Picture).where(Picture.id.in_(batch))).all()
-    ]
-    best_score = max((int(pic.score or 0) for pic in pictures), default=0)
-    scores_lifted = 0
-    if best_score > 0:
-        for pic in pictures:
-            if int(pic.score or 0) < best_score:
-                pic.score = best_score
-                session.add(pic)
-                scores_lifted += 1
-
+    }
     # --- Characters: only the unambiguous single-character case ---
-    character_ids = {
-        int(row)
-        for batch in batches
-        for row in session.exec(
-            select(Face.character_id).where(
+    characters_by_picture: dict[int, set[int]] = defaultdict(set)
+    for batch in batches:
+        for picture_id, character_id in session.exec(
+            select(Face.picture_id, Face.character_id).where(
                 Face.picture_id.in_(batch), Face.character_id.is_not(None)
             )
-        ).all()
-        if row is not None
-    }
-    characters_pending = 0
-    if len(character_ids) == 1:
-        character_id = next(iter(character_ids))
-        assigned = {
-            int(row)
-            for batch in batches
-            for row in session.exec(
-                select(Face.picture_id).where(
-                    Face.picture_id.in_(batch),
-                    Face.character_id == character_id,
-                )
-            ).all()
-        }
-        for pic in pictures:
-            if int(pic.id) in assigned or pic.pending_character_id == character_id:
-                continue
-            pic.pending_character_id = character_id
-            session.add(pic)
-            characters_pending += 1
-    elif len(character_ids) > 1:
-        logger.info(
-            "[dedup-verdict] stack over pictures %s references %d characters %s; "
-            "characters are left as-is rather than guessing which one the stack "
-            "belongs to (no face data is fabricated)",
-            picture_ids,
-            len(character_ids),
-            sorted(character_ids),
-        )
+        ).all():
+            characters_by_picture[int(picture_id)].add(int(character_id))
 
-    return {
-        "tags_added": tags_added,
-        "scores_lifted": scores_lifted,
-        "characters_pending": characters_pending,
-        "membership_changed": bool(membership_changed),
-        "best_score": best_score,
-    }
+    for index in unioned:
+        picture_ids, _stack_id = entries[index]
+        pictures = [pictures_by_id[pid] for pid in picture_ids if pid in pictures_by_id]
+        best_score = max((int(pic.score or 0) for pic in pictures), default=0)
+        if best_score > 0:
+            for pic in pictures:
+                if int(pic.score or 0) < best_score:
+                    pic.score = best_score
+                    session.add(pic)
+                    summaries[index]["scores_lifted"] += 1
+
+        character_ids = set().union(
+            *(characters_by_picture.get(pid, set()) for pid in picture_ids)
+        )
+        if len(character_ids) == 1:
+            character_id = next(iter(character_ids))
+            for pic in pictures:
+                if (
+                    character_id in characters_by_picture.get(int(pic.id), set())
+                    or pic.pending_character_id == character_id
+                ):
+                    continue
+                pic.pending_character_id = character_id
+                session.add(pic)
+                summaries[index]["characters_pending"] += 1
+        elif len(character_ids) > 1:
+            logger.info(
+                "[dedup-verdict] stack over pictures %s references %d characters "
+                "%s; characters are left as-is rather than guessing which one "
+                "the stack belongs to (no face data is fabricated)",
+                picture_ids,
+                len(character_ids),
+                sorted(character_ids),
+            )
+        summaries[index]["membership_changed"] = bool(membership_changed[index])
+        summaries[index]["best_score"] = best_score
+    return summaries
 
 
 # --- Stacking ---------------------------------------------------------------
@@ -563,7 +593,15 @@ def _stack_members(
     wanted = sorted({int(pid) for pid in picture_ids} | {int(cover_picture_id)})
     pictures = {
         int(pic.id): pic
-        for pic in session.exec(select(Picture).where(Picture.id.in_(wanted))).all()
+        for pic in session.exec(
+            select(Picture).where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, wanted, name="_pixlstash_verdict_stack_member_ids"
+                    )
+                )
+            )
+        ).all()
     }
     missing = sorted(set(wanted) - set(pictures))
     if missing:
@@ -591,7 +629,13 @@ def _stack_members(
     folded_ids = [sid for sid in existing_stack_ids if sid != stack_id]
     if folded_ids:
         for pic in session.exec(
-            select(Picture).where(Picture.stack_id.in_(folded_ids))
+            select(Picture).where(
+                Picture.stack_id.in_(
+                    scope_id_subquery(
+                        session, folded_ids, name="_pixlstash_verdict_folded_stack_ids"
+                    )
+                )
+            )
         ).all():
             pictures.setdefault(int(pic.id), pic)
 
@@ -881,10 +925,19 @@ def apply_stack_verdict_in_session(
             "exclusions; a stack needs at least two"
         )
 
+    preselected = (
+        int(group.cover_picture_id) if group.cover_picture_id is not None else None
+    )
+    # With no cover from the caller (an auto-stack run), the group's stored
+    # preselection leads only while it is still an included member: one sent
+    # to the Scrapheap since the scan is no longer one, and the dry run counts
+    # such a group with its first live member as the cover
+    # (:func:`_dry_run_summary_in_session`), so the run must stack it the same
+    # way rather than refuse it.
     cover_id = (
         int(cover_picture_id)
         if cover_picture_id is not None
-        else int(group.cover_picture_id or included[0])
+        else (preselected if preselected in included else included[0])
     )
     # The cover is validated against what will actually END UP in the stack, not
     # against the group's own members (B2). A group frequently names only ONE
@@ -957,9 +1010,6 @@ def apply_stack_verdict_in_session(
         # ranking rather than whichever member happens to sort first. Both
         # candidates are group members, so both are in the resulting stack by
         # construction.
-        preselected = (
-            int(group.cover_picture_id) if group.cover_picture_id is not None else None
-        )
         cover_id = preselected if preselected in included else included[0]
 
     # Snapshot the stack-expanded set: folding an existing stack in reparents
@@ -967,7 +1017,7 @@ def apply_stack_verdict_in_session(
     undo_targets = _undo_targets(session, included)
     before = _capture_state(session, undo_targets)
     stack_id = _stack_members(session, included, cover_id)
-    union = apply_metadata_union_in_session(session, included, stack_id)
+    (union,) = apply_metadata_union_in_session(session, [(included, stack_id)])
     _upsert_verdict(
         session,
         signature=signature,
@@ -1020,6 +1070,7 @@ def apply_stack_verdict_in_session(
         batch_id=batch_id,
         metadata_union=union,
         skipped=[member.as_dict() for member in skipped],
+        stacked_picture_ids=sorted(stack_expanded),
         # The stack-expanded set: the fold and the renumber touch siblings the
         # group never named, and the WS announcement must cover them too.
         event_picture_ids=sorted(undo_targets),
@@ -1146,7 +1197,14 @@ def _verdict_stack_still_standing(session: Session, row: DedupVerdict) -> bool:
     if not member_ids:
         return False
     live = session.exec(
-        select(Picture).where(Picture.id.in_(member_ids), Picture.deleted.is_(False))
+        select(Picture).where(
+            Picture.id.in_(
+                scope_id_subquery(
+                    session, member_ids, name="_pixlstash_verdict_standing_ids"
+                )
+            ),
+            Picture.deleted.is_(False),
+        )
     ).all()
     if len(live) < 2:
         return False
@@ -1235,9 +1293,19 @@ def _recorded_stack_state(operation: Operation, signature: str) -> dict[str, dic
     try:
         recorded = json.loads(operation.before_state or "{}")
     except (TypeError, ValueError) as exc:
+        # The parser's own text goes to the log; the refusal is answered to
+        # the client as the 400 detail.
+        logger.warning(
+            "[dedup-verdict] cannot revert the stack for verdict %r: the "
+            "before-state of operation %s does not parse",
+            signature,
+            operation.id,
+            exc_info=exc,
+        )
         raise DedupVerdictError(
             f"cannot revert the stack for verdict {signature!r}: the recorded "
-            f"before-state of operation {operation.id} is unreadable ({exc})"
+            f"before-state of operation {operation.id} is unreadable. The "
+            "server log says why."
         ) from exc
     state: dict[str, dict] = {}
     for picture_id, facets in (recorded or {}).items():
@@ -1326,13 +1394,15 @@ def reopen_verdict_in_session(
     row = session.exec(
         select(DedupVerdict).where(DedupVerdict.signature == signature)
     ).first()
+    # The route answers these texts as they are: none repeats the caller's
+    # signature or batch id.
     if row is None:
-        raise DedupVerdictError(f"No verdict recorded for signature {signature!r}")
+        raise DedupVerdictError("No verdict is recorded for that signature.")
     if row.reopened_at is not None:
-        raise DedupVerdictError(f"Verdict for {signature!r} is already reopened")
+        raise DedupVerdictError("That verdict is already reopened.")
     if batch_id and batch_id == row.batch_id:
         raise DedupVerdictError(
-            f"batch_id {batch_id!r} is the verdict's own batch: grafting the "
+            "That batch_id is the verdict's own batch: grafting the "
             "clear into it would make one undo apply the stack and its inverse "
             "in the same restore. Supply a fresh batch id or omit it."
         )
@@ -1388,6 +1458,10 @@ def reopen_verdict_in_session(
             actor=actor,
             source=source,
             origin_client_id=origin_client_id,
+            # Committed below with the reopen and its repair: a commit here
+            # made every clear two commits, and the second one alone carried
+            # the dropped batch id when the diff came out empty.
+            commit=False,
         )
         if recorded is None:
             # Cannot happen while the standing check gates the unstack (the
@@ -1767,7 +1841,11 @@ def _auto_stack_report(
     return {
         "batch_id": batch_id,
         "groups": len(results),
-        "pictures": sum(len(item["picture_ids"]) for item in results),
+        # Distinct pictures now stacked, folded stack siblings included: a
+        # group naming one member of an existing stack moves the whole stack.
+        "pictures": len(
+            {pid for item in results for pid in item["stacked_picture_ids"]}
+        ),
         "scope": scope.as_dict(),
         "results": results,
         "failures": failures,
@@ -1960,6 +2038,12 @@ def apply_stack_verdict(
         source,
         origin_client_id,
     )
+    # The union may have set a person pending on a member whose faces already
+    # exist; extraction will never revisit it, so it is resolved now that the
+    # verdict has committed (docs/backend_architecture.md §24).
+    resolve_pending_people_with_faces(
+        vault, result.event_picture_ids, origin="Duplicate merge"
+    )
     notify_pictures_changed(vault, result.event_picture_ids, origin_client_id, source)
     return result
 
@@ -2037,7 +2121,10 @@ def apply_verdict_batch_in_session(
                     commit=False,
                 )
             else:
-                raise DedupVerdictError(f"unknown verdict {verdict!r}")
+                # Not reachable over HTTP (the request model is the closed
+                # DedupVerdictKind); the value is logged, never repeated.
+                logger.info("[dedup-verdict] unknown verdict %r refused", verdict)
+                raise DedupVerdictError("unknown verdict")
             results.append(result)
             event_picture_ids.update(result.event_picture_ids)
         session.commit()
@@ -2070,6 +2157,11 @@ def apply_verdict_batch(
         origin_client_id,
     )
     event_picture_ids = report.pop("event_picture_ids", [])
+    # As in :func:`apply_stack_verdict`: a stacked verdict's union may have set
+    # a person pending on a member that already has faces.
+    resolve_pending_people_with_faces(
+        vault, event_picture_ids, origin="Duplicate merge"
+    )
     notify_pictures_changed(vault, event_picture_ids, origin_client_id, source)
     return report
 
