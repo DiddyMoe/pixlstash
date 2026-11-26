@@ -18,6 +18,8 @@ import pathlib
 
 import pytest
 
+from tests.package_sources import package_sources
+
 PACKAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent / "pixlstash"
 
 # The task-runner methods that execute a callable against a database.
@@ -38,7 +40,7 @@ _ALLOWLIST: dict[str, str] = {
 
 def _iter_python_files():
     """Yield every module in the package except migrations and caches."""
-    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+    for path in package_sources(PACKAGE_ROOT):
         relative = path.relative_to(PACKAGE_ROOT).as_posix()
         if relative.startswith("migrations/") or "__pycache__" in relative:
             continue

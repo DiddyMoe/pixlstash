@@ -44,6 +44,7 @@ from pixlstash.services import folder_structure_commit_service
 from pixlstash.services import keep_cover_only_service, operation_log_service
 from pixlstash.services.dedup_tier_service import DedupScope, ScopeType, TierPolicy
 from pixlstash.tasks.dedup_auto_stack_finder import DedupAutoStackFinder
+from tests.package_sources import package_sources
 
 
 def _vault_tables(server):
@@ -366,7 +367,7 @@ def test_nothing_else_writes_a_pending_person_without_a_face_check():
     root = Path(__file__).resolve().parents[1] / "pixlstash"
     found = sorted(
         path.relative_to(root).as_posix()
-        for path in root.rglob("*.py")
+        for path in package_sources(root)
         if "migrations" not in path.parts
         and "db_models" not in path.parts
         and any(

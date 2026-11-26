@@ -63,6 +63,7 @@ from pixlstash.tasks.task_type import TaskType
 from pixlstash.tasks.text_score_task import TextScoreTask
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.vault import Vault
+from tests.package_sources import package_sources
 
 PACKAGE = Path(__file__).resolve().parent.parent / "pixlstash"
 
@@ -144,7 +145,7 @@ def test_every_cuda_ort_session_site_is_built_from_the_budget():
     puts them on the CUDA provider rather than losing them in the indirection.
     """
     sites = []
-    for path in sorted(PACKAGE.rglob("*.py")):
+    for path in package_sources(PACKAGE):
         lines = path.read_text().splitlines()
         for number, line in _code_lines(path):
             if re.search(r"\b(InferenceSession|FaceAnalysis)\(", line):

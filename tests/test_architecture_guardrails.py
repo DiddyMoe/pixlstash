@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from tests.network_vectors import LAN_IPV4, PRIVATE_10_IPV4, PRIVATE_172_IPV4
+from tests.package_sources import package_sources
 
 REPO_ROOT = Path(__file__).parent.parent
 PIXLSTASH_DIR = REPO_ROOT / "pixlstash"
@@ -785,7 +786,7 @@ def _unchecked_tag_rows(source: str) -> list[tuple[int, str, str]]:
 def test_tag_rows_respect_the_tags_removed_from_tagging():
     unchecked = []
     used_exemptions = set()
-    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+    for path in package_sources(PIXLSTASH_DIR):
         rel = path.relative_to(REPO_ROOT).as_posix()
         if rel.startswith("pixlstash/migrations/"):
             continue
@@ -1434,6 +1435,30 @@ def test_the_pack_call_reader_has_teeth(tmp_path):
     (tmp_path / "more.py").write_text('NEW = "/api/v1/users/me/token"\n')
     with pytest.raises(AssertionError, match="more.py:1: /api/v1/users/me/token"):
         _comfyui_pack_calls(tmp_path)
+
+
+def test_a_package_walk_leaves_out_the_staged_comfyui_pack(tmp_path):
+    """A non-editable install copies the nodes into ``pixlstash/data/`` (setup.py),
+    and the walks read them as PixlStash's own code: on Windows CI the pack's
+    raw ``request.json()`` and its ``verify=`` failed two guardrails here."""
+    for relative in (
+        "server.py",
+        "data/comfyui_pack.py",
+        "data/comfyui-pack/ComfyUI-PixlStash/connection.py",
+        "data/comfyui-pack/loose.py",
+        "routes/data/comfyui-pack/nested.py",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    walked = [
+        path.relative_to(tmp_path).as_posix() for path in package_sources(tmp_path)
+    ]
+    assert walked == [
+        "data/comfyui_pack.py",
+        "routes/data/comfyui-pack/nested.py",
+        "server.py",
+    ]
 
 
 def test_the_comfyui_scope_section_of_the_matrix_matches_the_code():
@@ -2549,7 +2574,7 @@ def _scan_for_engine_factories(root: Path, base: Path) -> dict[str, list]:
         build an engine of their own.
     """
     found: dict[str, list] = {}
-    for path in sorted(root.rglob("*.py")):
+    for path in package_sources(root):
         try:
             source = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -2823,7 +2848,7 @@ def _scan_for_unlimited_ordered_reads(root: Path, base: Path) -> dict[str, list]
         ``{posix relative path: [(lineno, snippet), ...]}``.
     """
     found: dict[str, list] = {}
-    for path in sorted(root.rglob("*.py")):
+    for path in package_sources(root):
         try:
             source = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -3991,7 +4016,7 @@ def test_no_naive_datetime_is_written():
     """Every stored datetime is aware UTC; sqlmodel >= 0.0.45 raises on naive."""
     models_dir = PIXLSTASH_DIR / "db_models"
     offenders = []
-    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+    for path in package_sources(PIXLSTASH_DIR):
         if "migrations" in path.parts:
             continue
         in_models = models_dir in path.parents
@@ -4035,7 +4060,7 @@ def test_plugin_check_is_imported_only_by_the_cli():
     """
     mentions = {
         path.relative_to(REPO_ROOT).as_posix()
-        for path in PIXLSTASH_DIR.rglob("*.py")
+        for path in package_sources(PIXLSTASH_DIR)
         if "plugin_check" in path.read_text(encoding="utf-8")
     }
     assert mentions == {"pixlstash/cli.py", "pixlstash/plugin_check.py"}
@@ -4091,7 +4116,7 @@ def test_sqlite_connection_strings_are_built_by_the_helper():
     helper = PIXLSTASH_DIR / "utils" / "sqlite_uri.py"
     offenders = [
         f"  {path.relative_to(REPO_ROOT)}:{lineno}"
-        for path in sorted(PIXLSTASH_DIR.rglob("*.py"))
+        for path in package_sources(PIXLSTASH_DIR)
         if path != helper
         for lineno in _hand_built_sqlite_strings(path.read_text("utf-8"))
     ]
@@ -4243,7 +4268,7 @@ def test_no_coroutine_waits_on_a_database_itself():
     """No ``async def`` under ``pixlstash/`` blocks the event loop on a database."""
     offenders = [
         f"  {path.relative_to(REPO_ROOT)}:{lineno}: {coroutine} calls {call}()"
-        for path in sorted(PIXLSTASH_DIR.rglob("*.py"))
+        for path in package_sources(PIXLSTASH_DIR)
         for lineno, coroutine, call in _blocking_waits_in_coroutines(
             path.read_text("utf-8")
         )
@@ -4389,7 +4414,7 @@ def _functions_calling(source: str, callee: str) -> set[str]:
 
 def test_the_scrapheap_pseudo_id_is_spelled_only_by_its_owner():
     hits = []
-    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+    for path in package_sources(PIXLSTASH_DIR):
         rel = path.relative_to(REPO_ROOT).as_posix()
         if rel == _SCRAPHEAP_SCOPE_OWNER:
             continue
@@ -4468,7 +4493,7 @@ def _raw_json_reads(source: str) -> list[int]:
 
 def test_a_handler_reads_its_own_body_through_the_helper():
     hits = []
-    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+    for path in package_sources(PIXLSTASH_DIR):
         rel = path.relative_to(REPO_ROOT).as_posix()
         if rel in _RAW_JSON_READ_OWNERS:
             continue
@@ -4555,7 +4580,7 @@ def test_nothing_in_pixlstash_sets_tls_verification():
     stands in for it. Wrong if any code can turn that check off or point it
     at another trust store."""
     hits = []
-    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+    for path in package_sources(PIXLSTASH_DIR):
         source = path.read_text(encoding="utf-8")
         for line in _tls_verify_overrides(source):
             hits.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{line}")
@@ -4886,7 +4911,7 @@ def _unproven_in_lists(source: str) -> list[tuple[int, str, str]]:
 def _scan_unproven_in_lists(root: Path, base: Path) -> dict[tuple, list[int]]:
     """``{(path, function, argument): [lineno, ...]}`` under *root*."""
     found: dict[tuple, list[int]] = {}
-    for path in sorted(root.rglob("*.py")):
+    for path in package_sources(root):
         rel = path.relative_to(base).as_posix()
         for lineno, function, argument in _unproven_in_lists(
             path.read_text(encoding="utf-8")

@@ -20,6 +20,7 @@ import types
 import pytest
 
 from pixlstash.utils.model_utils import loaded_module
+from tests.package_sources import package_sources
 from tests.test_ml_first_import_race import (
     ML_PACKAGES,
     REPO_ROOT,
@@ -81,7 +82,7 @@ def _raw_reads(tree: ast.AST) -> list[tuple[int, str]]:
 
 def test_no_ml_package_is_read_off_sys_modules_directly():
     offenders = []
-    for path in sorted((REPO_ROOT / "pixlstash").rglob("*.py")):
+    for path in package_sources(REPO_ROOT / "pixlstash"):
         rel = path.relative_to(REPO_ROOT).as_posix()
         if rel in RAW_READ_ALLOWED:
             continue

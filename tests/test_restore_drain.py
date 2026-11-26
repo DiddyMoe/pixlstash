@@ -100,6 +100,7 @@ from pixlstash.tasks.device_release_task import DeviceReleaseTask
 from pixlstash.tasks.task_type import TaskType
 from pixlstash.utils.snapshot_compression import materialize_snapshot
 from tests.utils import wipe_tables
+from tests.package_sources import package_sources
 
 API = "/api/v1"
 SECRET_DETAIL = "test-secret-detail /home/me/library/vault.db"
@@ -1026,7 +1027,7 @@ _SUBMIT_NAMES = {"submit", "submit_task", "submit_and_wait"}
 
 
 def _python_sources():
-    for path in sorted(_PIXLSTASH_ROOT.rglob("*.py")):
+    for path in package_sources(_PIXLSTASH_ROOT):
         yield path, ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 

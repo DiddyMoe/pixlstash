@@ -42,6 +42,7 @@ from pixlstash.tagger_plugins.clip_service import ClipService
 from pixlstash.tagger_plugins.registry import TaggerPluginManager
 from pixlstash.utils import accelerator, model_utils
 from pixlstash.utils.model_utils import MODEL_CONSTRUCTION_LOCK, ml_imports
+from tests.package_sources import package_sources
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -818,7 +819,7 @@ def _top_level_imports(tree: ast.Module, module: str, is_package: bool) -> set:
 @cache
 def _parsed() -> dict[Path, ast.Module]:
     """Every module under ``pixlstash/``, parsed once for both sweeps."""
-    files = sorted((REPO_ROOT / "pixlstash").rglob("*.py"))
+    files = package_sources(REPO_ROOT / "pixlstash")
     return {path: ast.parse(path.read_text(encoding="utf-8")) for path in files}
 
 

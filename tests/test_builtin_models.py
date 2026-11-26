@@ -32,6 +32,7 @@ from pixlstash.services.builtin_caches import (
 )
 from pixlstash.utils.adapter_header import FILE_CHECKPOINT, FILE_ENGINE, FILE_UNKNOWN
 from pixlstash.utils.insightface_model_utils import KNOWN_MODEL_PACKS
+from tests.package_sources import package_sources
 
 
 @pytest.fixture
@@ -1599,7 +1600,7 @@ def test_no_module_builds_the_download_path_for_itself():
     root = pathlib.Path(pixlstash.__file__).parent
     offenders = [
         path.relative_to(root).as_posix()
-        for path in root.rglob("*.py")
+        for path in package_sources(root)
         if BUILTIN_DIRNAME in path.read_text(encoding="utf-8")
         and path.name != "builtin_models.py"
     ]

@@ -36,6 +36,7 @@ from pixlstash.utils.comfyui_url import SAVED_ADDRESS_INVALID
 from pixlstash.vault import Vault
 from pixlstash import vault as vault_module
 from tests.utils import quiesce_background_work
+from tests.package_sources import package_sources
 
 API = "/api/v1"
 PACKAGE = Path(__file__).resolve().parent.parent / "pixlstash"
@@ -127,7 +128,7 @@ def test_no_module_reads_the_saved_address_around_the_normaliser():
     ``comfyui_connections.is_configured`` when only "is one saved" matters."""
     found: set[tuple[str, str]] = set()
     lines: list[str] = []
-    for path in sorted(PACKAGE.rglob("*.py")):
+    for path in package_sources(PACKAGE):
         module = path.relative_to(PACKAGE).as_posix()
         if module in OWNERS:
             continue
