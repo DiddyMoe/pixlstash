@@ -292,6 +292,7 @@
                   <DownloadingMark
                     v-if="row.coming"
                     :percent="row.coming.percent"
+                    :status="row.coming.status"
                   />
                   <v-icon v-else size="14" aria-hidden="true"
                     >mdi-alert-outline</v-icon
@@ -1141,8 +1142,8 @@
             placeholder="Name of the new workflow"
             aria-label="Name of the new workflow"
             data-testid="wftab-new-name"
-            @keydown.enter.prevent="saveAsNew"
-            @keydown.esc.stop.prevent="stopNaming"
+            @keydown.enter="onNameKey"
+            @keydown.esc.stop="onNameKey"
           />
           <div class="wftab-draft__verbs">
             <AppButton
@@ -1476,7 +1477,7 @@ import { useModelShelfStore } from "../../stores/useModelShelfStore";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useSidebarStore } from "../../stores/useSidebarStore";
 import { useRunDialogStore } from "../../stores/useRunDialogStore";
-import { useTasksStore } from "../../stores/useTasksStore";
+import { downloadQueued, useTasksStore } from "../../stores/useTasksStore";
 import { useWorkflowsStore } from "../../stores/useWorkflowsStore";
 import { errorMessage } from "../../utils/apiError";
 import { modelLabel } from "../../utils/filterChips";
@@ -1521,6 +1522,7 @@ import {
 } from "../../utils/workflowPins";
 import { slotOf, whole } from "../../utils/workflowChanges";
 import { pictureCount } from "../../utils/workflowSets";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import {
   countChanges,
   loraRemoved,
@@ -2040,8 +2042,12 @@ const packUpdate = usePixlstashPackUpdate(() => {
  */
 function missingNote(file, kind) {
   if (!preflightAnswered.value) return "";
-  if (tasksStore.runningDownload({ file, slot: kind }))
-    return " is still downloading. It runs once it has finished.";
+  const coming = tasksStore.runningDownload({ file, slot: kind });
+  if (coming) {
+    return downloadQueued(coming)
+      ? " is queued. It runs once it has downloaded."
+      : " is still downloading. It runs once it has finished.";
+  }
   if (staleFiles.value.has(file))
     return " is on your shelf, but ComfyUI's PixlStash nodes are too old to load it.";
   return kind === "checkpoint"
@@ -2231,6 +2237,7 @@ function comingOptions(spec, file) {
       group: "Downloading",
       groupIcon: "download",
       groupDownloading: true,
+      downloadStatus: d.status,
       groupNote: "runs once it has landed",
     }));
 }
@@ -2338,7 +2345,9 @@ const modelRows = computed(() => {
       missing: gone,
       coming: goneComing,
       missingText: goneComing
-        ? `Downloading${goneComing.percent ? ` · ${Math.round(goneComing.percent)}%` : ""}`
+        ? downloadQueued(goneComing)
+          ? "Queued"
+          : `Downloading${goneComing.percent ? ` · ${Math.round(goneComing.percent)}%` : ""}`
         : staleFiles.value.has(gone)
           ? PACK_OUTDATED_TEXT
           : spec.missingText,
@@ -3918,6 +3927,15 @@ async function stopNaming() {
 }
 const saveAsNewButton = ref(null);
 
+// Enter in the name field saves, Escape backs out. The Enter that commits an
+// input method's composition, and the Escape that cancels it, are the IME's.
+function onNameKey(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  if (event.key === "Enter") saveAsNew();
+  else stopNaming();
+}
+
 /**
  * Save as new…: the same graph stored as a new workflow under the name
  * given. This one is left as it was, with nothing waiting, and the new one
@@ -4978,7 +4996,7 @@ watch(
           row.missing &&
           !row.pick &&
           !downloadableFiles.value.has(row.missing) &&
-          !tasksStore.runningDownloadFiles.has(fileName(row.missing)),
+          !tasksStore.runningDownload({ file: row.missing, slot: row.kind }),
       )
       .map((row) => [
         row,

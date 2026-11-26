@@ -703,6 +703,7 @@ import { useEntityListsStore } from "../../stores/useEntityListsStore";
 import { useTrainingRunsStore } from "../../stores/useTrainingRunsStore";
 import { useTrainingStore } from "../../stores/useTrainingStore";
 import { arrowStep, tabStopId } from "../../utils/radioGroup.js";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import {
   EFFORT_LABELS,
   FIT_LABELS,
@@ -1524,9 +1525,12 @@ async function onStart() {
 /**
  * Enter in an Advanced field finishes the edit; it never starts a run. The
  * dialog's Enter-accepts contract skips an event already handled, so this
- * marks it. Buttons in the table keep Enter for themselves.
+ * marks it. Buttons in the table keep Enter for themselves. An Enter that
+ * commits an input method's candidate is the IME's: it is left unmarked, and
+ * the dialog skips it as composing.
  */
 function keepEnterInField(event) {
+  if (isImeComposing(event)) return;
   if (event.target instanceof HTMLInputElement) event.preventDefault();
 }
 

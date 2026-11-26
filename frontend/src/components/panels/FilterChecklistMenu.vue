@@ -28,7 +28,7 @@
           "
           @keydown.down.prevent="move(1)"
           @keydown.up.prevent="move(-1)"
-          @keydown.enter.prevent="toggleHighlighted"
+          @keydown.enter="onFieldEnter"
         />
       </div>
       <div
@@ -93,6 +93,7 @@
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { formatCount } from "../../utils/filterChips";
 import KeyCap from "../widgets/KeyCap.vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 const MAX_SHOWN = 50;
 
@@ -153,6 +154,19 @@ function move(step) {
 function toggleHighlighted() {
   const item = shown.value[highlight.value];
   if (item) emit("toggle", item.value, !isChecked(item.value));
+}
+
+// Enter ticks the highlighted row. The Enter that commits an input method's
+// composition is the IME's: it ticks nothing and is not prevented, and it is
+// stopped short of the menu around the field, whose own Enter handling
+// (Vuetify's VMenu) would prevent it.
+function onFieldEnter(event) {
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
+  event.preventDefault();
+  toggleHighlighted();
 }
 
 onMounted(() => nextTick(() => fieldRef.value?.focus()));

@@ -27,6 +27,7 @@
  */
 import { ref } from "vue";
 import { VIcon } from "vuetify/components";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 defineProps({
   modelValue: { type: String, default: "" },
@@ -38,6 +39,13 @@ const emit = defineEmits(["update:modelValue"]);
 const fieldRef = ref(null);
 
 function onEsc(event) {
+  // Escape that cancels an input method's composition is the IME's: it clears
+  // nothing, and it is stopped, or the menu or view behind would close on it.
+  // Not prevented, so the IME still gets it.
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   if (!event.target.value) return;
   event.preventDefault();
   event.stopPropagation();

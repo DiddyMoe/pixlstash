@@ -183,6 +183,7 @@ import {
 import { VIcon } from "vuetify/components";
 
 import { useModelShelfStore } from "../../stores/useModelShelfStore";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import StackLayer from "./StackLayer.vue";
 
 defineOptions({ inheritAttrs: false });
@@ -347,6 +348,15 @@ function footAct() {
 }
 
 function onKeydown(event) {
+  // Every key an input method's composition takes is the IME's: Enter commits
+  // the candidate, Escape cancels it, the arrows walk its list. None of them
+  // works this menu, and none reaches the host, which would take the Escape
+  // as a cancel and the Enter as a commit. Nothing is prevented, so the IME
+  // still gets its key.
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   const list = matches.value;
   if (event.key === "ArrowDown") {
     // The one gesture that OPENS the menu: with it shut, the first press asks

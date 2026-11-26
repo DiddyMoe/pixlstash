@@ -1092,7 +1092,7 @@
             label="Name of the new workflow"
             :readonly="Boolean(saving)"
             @enter="saveAsNew"
-            @keydown.esc="backFromName"
+            @keydown.esc="!isImeComposing($event) && backFromName()"
             @keydown.stop
           />
           <AppButton
@@ -1413,6 +1413,7 @@ import RunReasonNotice from "./RunReasonNotice.vue";
 import PromptAssistGroup from "./PromptAssistGroup.vue";
 import RunResetChip from "./RunResetChip.vue";
 import UpscaleChoice from "./UpscaleChoice.vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 const props = defineProps({
   /**
@@ -5317,9 +5318,15 @@ function close() {
  * A persistent dialog suppresses `AppDialog`'s own Escape, so the close is made
  * here. Saving a recipe is its own dialog now and answers its own Escape from
  * its own teleported subtree, so there is no nested mode in this footer left
- * to back out of first.
+ * to back out of first. The Escape that cancels an input method's composition
+ * is the IME's and closes nothing; it is stopped all the same, so Vuetify's
+ * overlay, which listens for Escape on the window, does not answer it either.
  */
 function onEscape(event) {
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   if (close()) event.stopPropagation();
 }
 

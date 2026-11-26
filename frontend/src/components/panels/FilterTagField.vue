@@ -33,7 +33,7 @@
           @keydown.down.prevent="move(1)"
           @keydown.up.prevent="move(-1)"
           @keydown.right="onRight"
-          @keydown.enter.prevent.stop="onEnter"
+          @keydown.enter="onEnter"
           @keydown.tab="onTab"
           @keydown.backspace="removeLast"
           @keydown.esc="onEsc"
@@ -188,6 +188,7 @@
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { groupToken, useTagGroupsStore } from "../../stores/useTagGroupsStore";
 import { formatCount, percent } from "../../utils/filterChips";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import KeyCap from "../widgets/KeyCap.vue";
 
 const MAX_SUGGESTIONS = 4;
@@ -388,8 +389,12 @@ function groupAria(item) {
 }
 
 function onEnter(event) {
-  // Enter that commits an IME composition is not a pick.
-  if (event.isComposing) return;
+  // Stopped either way: the menu around the field reads Enter as "focus the
+  // next control, or close" (see onTab). Enter that commits an input method's
+  // composition is the IME's: not a pick, and not prevented.
+  event.stopPropagation();
+  if (isImeComposing(event)) return;
+  event.preventDefault();
   const item = items.value[highlight.value];
   if (item) activate(item, event.shiftKey);
 }
@@ -403,15 +408,28 @@ function onEnter(event) {
 // next control, or close when there is none", so a tag typed before the
 // vocabulary arrived, or one with no match, closed the whole Filters menu.
 function onTab(event) {
+  // Tab that walks an input method's candidates is the IME's: no completion,
+  // nothing prevented, and stopped, or that menu would close on it.
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   const item = suggestions.value[highlight.value];
-  if (!item || event.isComposing) return;
+  if (!item) return;
   event.preventDefault();
   event.stopPropagation();
   activate(item, event.shiftKey);
 }
 
 // A first Esc empties the field; only an empty field lets the menu close.
+// Escape that cancels an input method's composition does neither: it is
+// stopped, or the overlay's window listener would close the menu, and the
+// field keeps its text (the model is still empty mid-composition anyway).
 function onEsc(event) {
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   if (!query.value) return;
   event.stopPropagation();
   query.value = "";

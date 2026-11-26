@@ -20,6 +20,7 @@ import {
 import { VIcon } from "vuetify/components";
 import AppButton from "./AppButton.vue";
 import { useWhatsChangedStore } from "../../stores/useWhatsChangedStore";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 const props = defineProps({
   /**
@@ -218,6 +219,10 @@ watch(
 
 function onKeydown(event) {
   if (!step.value) return;
+  // A key an input method's composition takes is the field's: Escape cancels
+  // the composition, not the tour, and Enter commits the candidate rather
+  // than taking Next (the dialog's Enter-accepts lets a composing Enter by).
+  if (isImeComposing(event)) return;
   if (event.key === "Escape") {
     event.preventDefault();
     event.stopImmediatePropagation();

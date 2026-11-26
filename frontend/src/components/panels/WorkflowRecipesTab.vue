@@ -55,7 +55,7 @@
                   autoselect
                   @enter="commitRename(recipe)"
                   @blur="commitRename(recipe)"
-                  @keydown.esc.stop.prevent="cancelRename"
+                  @keydown.esc.stop="cancelRename"
                 />
                 <span v-else class="wfrt-name">{{ recipe.name || "Untitled" }}</span>
                 <v-menu
@@ -235,7 +235,7 @@
                       autoselect
                       @enter="commitRename(recipe)"
                       @blur="commitRename(recipe)"
-                      @keydown.esc.stop.prevent="cancelRename"
+                      @keydown.esc.stop="cancelRename"
                     />
                     <span v-else class="wfrt-name">{{ recipe.name || "Untitled" }}</span>
 
@@ -558,6 +558,7 @@ import { lookLoraDiff, recipeDiff } from "../../utils/recipeDiff";
 import { loraKey, promptKey } from "../../utils/recipeKey";
 import { resolveRecipeLoras } from "../../utils/recipeLoras";
 import { onMenuKeydown } from "../../utils/menuKeyboard";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import { withRef } from "../../utils/withRef";
 import { pictureCount } from "../../utils/workflowSets";
 import ExportRecipeDialog from "../io/ExportRecipeDialog.vue";
@@ -990,7 +991,11 @@ async function commitRename(recipe) {
   }
 }
 
-function cancelRename() {
+// Escape gives the rename up. The Escape that cancels an input method's
+// composition is the IME's: the field stays.
+function cancelRename(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
   renamingId.value = null;
   renameDraft.value = "";
 }

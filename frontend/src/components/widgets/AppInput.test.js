@@ -80,4 +80,22 @@ describe("AppInput", () => {
     expect([field.selectionStart, field.selectionEnd]).toEqual([0, 8]);
     w.unmount();
   });
+
+  it("emits enter on a plain Enter", async () => {
+    const w = mount(AppInput);
+    await w.find("input").trigger("keydown", { key: "Enter" });
+    expect(w.emitted("enter")).toHaveLength(1);
+  });
+
+  it.each([
+    ["isComposing", { isComposing: true }],
+    ["Safari's keyCode 229", { keyCode: 229 }],
+  ])(
+    "leaves the Enter that commits a composition (%s) to the input method",
+    async (_name, init) => {
+      const w = mount(AppInput);
+      await w.find("input").trigger("keydown", { key: "Enter", ...init });
+      expect(w.emitted("enter")).toBeFalsy();
+    },
+  );
 });

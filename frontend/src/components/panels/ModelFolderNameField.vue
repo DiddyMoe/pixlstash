@@ -28,6 +28,7 @@
 
 <script setup>
 import { nextTick, onMounted, ref, useId, watch } from "vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 // `useId`, not a counter: inside <script setup> a counter restarts for every
 // instance, and two open fields would share one id.
@@ -74,6 +75,10 @@ watch(draft, (value) => emit("update:modelValue", value));
  */
 function onKeydown(event) {
   event.stopPropagation();
+  // Enter that commits an input method's composition, and Escape that cancels
+  // one, are the IME's: stopped above like every key, but neither applies nor
+  // cancels, and neither is prevented.
+  if (isImeComposing(event)) return;
   if (event.key === "Enter") {
     event.preventDefault();
     emit("submit");

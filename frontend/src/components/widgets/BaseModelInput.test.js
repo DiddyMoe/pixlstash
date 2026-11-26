@@ -238,6 +238,41 @@ describe("the base-model completion list", () => {
     await input.trigger("keydown", { key: "Escape" });
     expect(wrapper.emitted("cancel")).toHaveLength(1);
   });
+
+  it.each([
+    ["isComposing", { isComposing: true }],
+    ["Safari's keyCode 229", { keyCode: 229 }],
+  ])(
+    "leaves the keys of an input method's composition (%s) to the input method",
+    async (_name, init) => {
+      // Enter commits the candidate and Escape cancels it: neither is the
+      // field's commit or cancel, and neither may reach a host that would
+      // take it as one.
+      const wrapper = await field();
+      const input = wrapper.find("input");
+      await input.setValue("s");
+      await wrapper.vm.$nextTick();
+      const shown = menuItems();
+      expect(shown.length).toBeGreaterThan(0);
+      expect(input.attributes("aria-activedescendant")).toBeUndefined();
+      const onWindow = vi.fn();
+      window.addEventListener("keydown", onWindow);
+      try {
+        for (const key of ["ArrowDown", "Enter", "Escape"]) {
+          await input.trigger("keydown", { key, ...init });
+        }
+      } finally {
+        window.removeEventListener("keydown", onWindow);
+      }
+      await wrapper.vm.$nextTick();
+      // The arrow walked the IME's list, not this one: nothing highlighted.
+      expect(input.attributes("aria-activedescendant")).toBeUndefined();
+      expect(menuItems()).toEqual(shown);
+      expect(wrapper.emitted("confirm")).toBeUndefined();
+      expect(wrapper.emitted("cancel")).toBeUndefined();
+      expect(onWindow).not.toHaveBeenCalled();
+    },
+  );
 });
 
 // Photo look's rows: the full list on focus, a remembered entry forgotten by

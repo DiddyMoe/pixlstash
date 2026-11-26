@@ -327,6 +327,33 @@ describe("SearchTokenField", () => {
     );
   });
 
+  it.each([
+    ["isComposing", { isComposing: true }],
+    ["Safari's keyCode 229", { keyCode: 229 }],
+  ])(
+    "leaves the keys of an input method's composition (%s) to the input method",
+    async (_name, mods) => {
+      // Enter commits the candidate, Escape cancels it, and Backspace edits
+      // it while the committed words are still empty: none of them searches,
+      // closes or drops a token, and none is prevented.
+      await mountField();
+      const filters = useFilterStore();
+      filters.tagFilter = ["rain"];
+      await type("look");
+      for (const key of ["Enter", "Escape"]) {
+        const event = await press(key, mods);
+        expect(event.defaultPrevented).toBe(false);
+      }
+      expect(useSearchStore().searchQuery).not.toBe("look");
+      expect(wrapper.find(".stf-drop").exists()).toBe(true);
+      await type("");
+      const backspace = await press("Backspace", mods);
+      expect(backspace.defaultPrevented).toBe(false);
+      expect(filters.tagFilter).toEqual(["rain"]);
+      expect(wrapper.find("input.stf-input").exists()).toBe(true);
+    },
+  );
+
   it("Escape with text hides the list first, then Tab moves focus", async () => {
     await mountField();
     await type("look");

@@ -234,6 +234,7 @@ import {
   modelLabel,
 } from "../../utils/filterChips";
 import { isGroupToken } from "../../stores/useTagGroupsStore";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import Tooltip from "../widgets/Tooltip.vue";
 import KeyCap from "../widgets/KeyCap.vue";
 
@@ -710,6 +711,10 @@ function onPaste(event) {
 }
 
 function onKeydown(event) {
+  // Every key an input method's composition takes is the IME's: Enter commits
+  // the candidate (not a search), Escape cancels it (not a close), and
+  // Backspace edits it while the committed words are still empty.
+  if (isImeComposing(event)) return;
   const field = event.target;
   if (event.key === "Enter") {
     // Enter searches the words, whichever row is highlighted.

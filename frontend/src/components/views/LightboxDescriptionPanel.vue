@@ -278,9 +278,7 @@
             :readonly="!isEditingDescription || readOnly"
             @focus="onFieldFocus"
             @click="!readOnly && startEditDescription()"
-            @keydown.enter.prevent="
-              isEditingDescription && !$event.shiftKey && saveDescription()
-            "
+            @keydown.enter="onDescriptionEnter"
             @keydown="handleDescriptionEditorKey"
             @blur="onFieldBlur"
             @scroll="syncMarkScroll"
@@ -348,6 +346,7 @@ import { copyText } from "../../utils/clipboard";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { errorDetail } from "../../utils/apiError";
 import { onMenuKeydown } from "../../utils/menuKeyboard.js";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import Tooltip from "../widgets/Tooltip.vue";
 import SectionHeader from "../widgets/SectionHeader.vue";
 import { useSectionCollapse } from "../../composables/useSectionCollapse";
@@ -738,7 +737,18 @@ async function refreshDescription(model = null) {
   }
 }
 
+// Enter never makes a newline here; a plain one saves while editing. The
+// Enter that commits an input method's composition is the IME's: no save, and
+// not prevented, so the candidate lands in the text.
+function onDescriptionEnter(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  if (isEditingDescription.value && !event.shiftKey) saveDescription();
+}
+
 function handleDescriptionEditorKey(event) {
+  // The Escape that cancels a composition, and its Ctrl+Enter, are the IME's.
+  if (isImeComposing(event)) return;
   if (event.key === "Escape") {
     event.preventDefault();
     cancelEditDescription();

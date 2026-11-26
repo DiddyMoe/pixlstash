@@ -24,6 +24,7 @@ import { useFilterStore } from "../../stores/useFilterStore";
 import { useUserPrefsStore } from "../../stores/useUserPrefsStore";
 import { errorMessage } from "../../utils/apiError";
 import { onMenuKeydown } from "../../utils/menuKeyboard.js";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import { formatUserDay } from "../../utils/utils";
 import { withRef } from "../../utils/withRef.js";
 import AppButton from "../widgets/AppButton.vue";
@@ -221,6 +222,14 @@ function cancelEdit(refocus = true) {
   editing.value = null;
   editError.value = "";
   if (id && refocus) focusMore(id);
+}
+
+// Escape backs out of an edit. The Escape that cancels an input method's
+// composition is the IME's: the edit stays open.
+function onEditEscape(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  cancelEdit();
 }
 
 async function saveName(row) {
@@ -427,7 +436,7 @@ function onMenuKey(event, row) {
                   v-if="editing?.id === row.id && editing.kind === 'name'"
                   class="cct-edit"
                   @submit.prevent="saveName(row)"
-                  @keydown.esc.stop.prevent="cancelEdit"
+                  @keydown.esc.stop="onEditEscape"
                 >
                   <AppInput
                     v-model="nameField"
@@ -617,7 +626,7 @@ function onMenuKey(event, row) {
                   class="cct-address"
                   data-testid="comfyui-edit-address"
                   @submit.prevent="saveAddress(row)"
-                  @keydown.esc.stop.prevent="cancelEdit"
+                  @keydown.esc.stop="onEditEscape"
                 >
                   <div class="cct-fields">
                     <Segmented v-model="scheme" :options="SCHEME_OPTIONS" aria-label="Scheme" />

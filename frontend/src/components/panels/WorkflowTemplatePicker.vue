@@ -293,6 +293,7 @@ import ModelDownloadButton from "../widgets/ModelDownloadButton.vue";
 import ModelMark from "../widgets/ModelMark.vue";
 import Segmented from "../widgets/Segmented.vue";
 import Tooltip from "../widgets/Tooltip.vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 /** How many partial rows draw before "Show more", without a search. */
 const PARTIAL_DEPTH = 30;
@@ -477,6 +478,15 @@ function press(item) {
 }
 
 function onKeydown(event) {
+  // Every key an input method's composition takes is the IME's: Enter commits
+  // the candidate, Space and the arrows walk its list, Escape cancels it. None
+  // of them works this list, and none is prevented. Stopped short of the
+  // popup's root, which closes on Escape, and of the menu's own Enter handling
+  // (Vuetify's VMenu prevents Enter), which would swallow the commit.
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   const list = walk.value;
   const at = list.findIndex((item) => item.key === cursor.value);
   if (event.key === "ArrowDown" || event.key === "ArrowUp") {

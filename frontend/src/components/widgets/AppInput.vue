@@ -26,7 +26,7 @@
         :aria-invalid="error ? 'true' : undefined"
         @input="emit('update:modelValue', $event.target.value)"
         @blur="emit('blur')"
-        @keydown.enter="emit('enter')"
+        @keydown.enter="!isImeComposing($event) && emit('enter')"
       />
     </div>
     <span v-if="typeof error === 'string' && error" class="app-input__error">{{
@@ -45,6 +45,7 @@
 import { onMounted, ref } from "vue";
 import { VIcon } from "vuetify/components";
 import FieldLabel from "./FieldLabel.vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 const props = defineProps({
   modelValue: { type: [String, Number, null], default: "" },
@@ -72,6 +73,8 @@ const props = defineProps({
   max: { type: [String, Number], default: "" },
 });
 
+// `enter` is the field's submit: the Enter that commits an input method's
+// composition (Japanese, Chinese, Korean) is the IME's, so it emits nothing.
 const emit = defineEmits(["update:modelValue", "enter", "blur"]);
 
 const inputRef = ref(null);

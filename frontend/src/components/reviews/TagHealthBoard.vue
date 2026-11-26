@@ -124,7 +124,7 @@
             class="rs-board-filter-input"
             type="text"
             placeholder="Filter tags… ( / )"
-            @keydown.escape.stop.prevent="clearFilter"
+            @keydown.escape.stop="clearFilter"
           />
         </div>
         <button
@@ -481,6 +481,7 @@ import {
   zeroYieldReason,
   zeroTailStart,
 } from "./tagHealthBoardLogic";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 defineProps({
   // Where the controls draw: the view's toolbar line. Null draws them in place.
@@ -566,7 +567,11 @@ function focusFilter() {
 }
 defineExpose({ focusFilter, handleEscape });
 
-function clearFilter() {
+// Escape empties the filter. The Escape that cancels an input method's
+// composition is the IME's: it clears nothing.
+function clearFilter(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
   filter.value = "";
   filterRef.value?.blur();
 }

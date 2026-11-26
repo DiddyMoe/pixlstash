@@ -18,6 +18,7 @@ import SettingsRow from "./SettingsRow.vue";
 import SettingsTwoCol from "./SettingsTwoCol.vue";
 import { VSlider, VSwitch, VIcon, VProgressLinear } from "vuetify/components";
 import { errorDetail } from "../../utils/apiError";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -325,6 +326,15 @@ async function applyServer() {
     progress.value = null;
     await refresh();
   }
+}
+
+// Enter in the password field applies. With the password shown the field is
+// plain text, so the Enter that commits an input method's composition is the
+// IME's and applies nothing.
+function onOwnerPasswordEnter(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  applyServer();
 }
 
 const install = (accel) => guarded(() => desktop.installAccelerator(accel));
@@ -710,7 +720,7 @@ onUnmounted(() => {
               placeholder="Password (min 8 characters)"
               autocomplete="new-password"
               :disabled="busy"
-              @keydown.enter.prevent="applyServer"
+              @keydown.enter="onOwnerPasswordEnter"
             />
             <button
               type="button"

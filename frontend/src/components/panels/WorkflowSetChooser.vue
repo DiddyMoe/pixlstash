@@ -134,6 +134,7 @@
                 ><DownloadingMark
                   v-if="item.download"
                   :percent="item.download.percent"
+                  :status="item.download.status"
                   class="wsc__dl"
                 />{{ item.detail }}</span
               >
@@ -227,6 +228,7 @@ import FavouriteHeart from "../widgets/FavouriteHeart.vue";
 import KeyCap from "../widgets/KeyCap.vue";
 import ModelMark from "../widgets/ModelMark.vue";
 import Segmented from "../widgets/Segmented.vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 /** How many rows a section draws before "Show more" is asked for. */
 const SECTION_DEPTH = 8;
@@ -526,6 +528,15 @@ function submit() {
 }
 
 function onKeydown(event) {
+  // Every key an input method's composition takes is the IME's: Enter commits
+  // the candidate, Space and the arrows walk its list, Escape cancels it. None
+  // of them works this list, and none is prevented. Stopped short of the
+  // popup's root, which closes on Escape, and of the menu's own Enter handling
+  // (Vuetify's VMenu prevents Enter), which would swallow the commit.
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   if (event.key === "ArrowDown") {
     event.preventDefault();
     move(1);

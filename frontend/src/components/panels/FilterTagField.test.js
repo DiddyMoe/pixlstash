@@ -3,7 +3,8 @@
 // tags, and typing replaces the list with suggestions in which a matching group
 // name is one row. Tab never takes the list, so the field is not a trap.
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { nextTick } from "vue";
 import { mount } from "@vue/test-utils";
 import { setActivePinia, createPinia } from "pinia";
 
@@ -44,10 +45,11 @@ function filedGroups() {
   return store;
 }
 
-function mountField(props = {}) {
+function mountField(props = {}, options = {}) {
   return mount(FilterTagField, {
     props: { title: "Tags", tags: TAGS, rows: ROWS, grouped: true, ...props },
     global: { stubs: { "v-icon": true } },
+    ...options,
   });
 }
 
@@ -158,6 +160,72 @@ describe("FilterTagField: BY GROUP", () => {
     field.element.dispatchEvent(tab);
     expect(tab.defaultPrevented).toBe(false);
     expect(wrapper.emitted("add")).toHaveLength(2);
+  });
+
+  it.each([
+    ["isComposing", { isComposing: true }],
+    ["Safari's keyCode 229", { keyCode: 229 }],
+  ])(
+    "leaves the Enter, Escape and Tab of an input method's composition (%s) to it",
+    async (_name, init) => {
+      // Enter commits the candidate, Escape cancels it and Tab walks the
+      // candidates: no pick, no completion, no emptying, nothing prevented,
+      // and none reaches the menu around the field, which closes on a window
+      // Escape and moves on (or closes) at an Enter or a Tab.
+      const wrapper = mountField({}, { attachTo: document.body });
+      const field = wrapper.find("input");
+      await field.setValue("ha");
+      const onWindow = vi.fn();
+      window.addEventListener("keydown", onWindow);
+      try {
+        for (const key of ["Enter", "Escape", "Tab"]) {
+          const event = new KeyboardEvent("keydown", {
+            key,
+            cancelable: true,
+            bubbles: true,
+            ...init,
+          });
+          field.element.dispatchEvent(event);
+          expect(event.defaultPrevented).toBe(false);
+        }
+        // Flushed before reading the field: an emptying Escape only reaches
+        // the input on the next render.
+        await nextTick();
+        expect(field.element.value).toBe("ha");
+        // Before unmount: unmounting clears the wrapper's emitted history.
+        expect(wrapper.emitted("add")).toBeUndefined();
+        expect(onWindow).not.toHaveBeenCalled();
+      } finally {
+        window.removeEventListener("keydown", onWindow);
+        wrapper.unmount();
+      }
+    },
+  );
+
+  it("stops a plain Enter and a clearing Escape from reaching the menu", async () => {
+    filedGroups();
+    const wrapper = mountField({}, { attachTo: document.body });
+    const field = wrapper.find("input");
+    await field.setValue("cop");
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    try {
+      const enter = new KeyboardEvent("keydown", {
+        key: "Enter",
+        cancelable: true,
+        bubbles: true,
+      });
+      field.element.dispatchEvent(enter);
+      expect(enter.defaultPrevented).toBe(true);
+      expect(wrapper.emitted("add")).toEqual([["__group:2", "has"]]);
+      await field.setValue("ha");
+      await field.trigger("keydown", { key: "Escape" });
+      expect(field.element.value).toBe("");
+    } finally {
+      window.removeEventListener("keydown", onWindow);
+      wrapper.unmount();
+    }
+    expect(onWindow).not.toHaveBeenCalled();
   });
 
   it("folding a group under the highlight moves the highlight onto its row", async () => {

@@ -16,7 +16,7 @@
         class="sed-input"
         type="text"
         placeholder="Leave empty to use the filename"
-        @keydown.enter.prevent="submit"
+        @keydown.enter="onFieldEnter"
       />
     </label>
 
@@ -50,7 +50,7 @@
         placeholder="e.g. ohwx"
         aria-describedby="sed-trigger-hint"
         @input="triggerTouched = true"
-        @keydown.enter.exact="onTriggerEnter"
+        @keydown.enter.exact="onFieldEnter"
       ></textarea>
       <!-- The instruction lives here and not in the placeholder, which is gone
            the moment the field has a value - and it usually opens with one. -->
@@ -83,7 +83,7 @@
           class="sed-input"
           type="text"
           placeholder="lora, lokr, loha, dora, oft…"
-          @keydown.enter.prevent="submit"
+          @keydown.enter="onFieldEnter"
         />
       </label>
 
@@ -169,6 +169,7 @@ import {
   capabilityLabel,
   recordedTriggerWords,
 } from "../../utils/modelShelf";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 const props = defineProps({
   /**
@@ -436,12 +437,13 @@ function changes() {
 }
 
 /**
- * Enter applies, as it does in the fields beside this one. Not while an input
- * method is composing, where Enter picks a candidate; Shift+Enter is left to
- * the textarea, which makes a line break the parser reads as a comma.
+ * Enter applies, in every field of this dialog. Not the Enter that commits an
+ * input method's composition, which picks a candidate: that one is the IME's
+ * and is not prevented. On the trigger words' textarea Shift+Enter is left to
+ * the field, which makes a line break the parser reads as a comma.
  */
-function onTriggerEnter(event) {
-  if (event.isComposing) return;
+function onFieldEnter(event) {
+  if (isImeComposing(event)) return;
   event.preventDefault();
   submit();
 }
