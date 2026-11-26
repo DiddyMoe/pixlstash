@@ -512,6 +512,18 @@ class TaskRunner:
                 )
             self._replace_dead_workers_locked()
 
+    def replace_dead_workers(self) -> None:
+        """Replace each worker that has exited, while the runner is open.
+
+        Called on every planner tick, so work queued behind a lost worker runs
+        without waiting for a submission. Unlike ``start`` it never reopens a
+        stopped runner: a planner that outlived its stop may still tick.
+        """
+        with self._lock:
+            if self._closed or self._stop.is_set():
+                return
+            self._replace_dead_workers_locked()
+
     def _start_worker(
         self, work_queue: queue.PriorityQueue, name: str
     ) -> threading.Thread:
@@ -704,7 +716,7 @@ class TaskRunner:
 
         ``degraded`` is True while the runner is meant to be running and a
         worker has exited: the work queued for its lane waits until the next
-        submission replaces it (``submit``). A runner that was never started,
+        submission or planner tick replaces it. A runner that was never started,
         or was stopped, is not degraded; nothing is meant to run.
 
         Returns:
@@ -768,7 +780,7 @@ class TaskRunner:
             # fault in the loop itself - a malformed queue item, a failure
             # while failing a task - and it ends this worker, with the work
             # queued behind it waiting. Recorded for ``lane_health()``; the
-            # next ``submit()`` or ``start()`` replaces the worker.
+            # next ``submit()``, ``start()`` or planner tick replaces it.
             worker = threading.current_thread().name
             with self._lock:
                 self._last_lane_failure = {
@@ -778,7 +790,8 @@ class TaskRunner:
                 }
             logger.error(
                 "TaskRunner %s worker %s stopped unexpectedly; the work queued "
-                "for it waits until the next submission replaces it: %r",
+                "for it waits until the next submission or planner tick "
+                "replaces it: %r",
                 self._name,
                 worker,
                 exc,
