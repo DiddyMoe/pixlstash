@@ -57,6 +57,7 @@
         <!-- The picked row's group mark stays with it (`groupIcon`). -->
         <DownloadingMark
           v-if="current?.groupDownloading"
+          :status="current.downloadStatus"
           class="app-select__mark"
         />
         <v-icon
@@ -201,7 +202,9 @@ const props = defineProps({
   // may give its heading a mark and a note (`groupIcon`, an mdi name without
   // the prefix; `groupTone`, success|warning|error|info; `groupNote`), and the
   // mark stays beside the value once picked. `groupDownloading` draws the
-  // animated download mark in its place, for models still on their way. `quiet` draws a name in
+  // animated download mark in its place, for models still on their way, and
+  // `downloadStatus` is that option's own download status, so a picked one
+  // still waiting for a slot reads "Queued". `quiet` draws a name in
   // secondary ink. `disabled` makes a row inert: shown, never picked.
   options: { type: Array, default: () => [] },
   // What a listbox field reads while its value is none of the options.

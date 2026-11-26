@@ -2116,6 +2116,87 @@ describe("a VAE or text encoder row (#1596, #1850)", () => {
     expect(picker.find('[data-testid="downloading-mark"]').exists()).toBe(true);
   });
 
+  it("marks a missing file's queued download Queued, not Downloading", async () => {
+    readModelSwap.mockReset().mockImplementation(replacementsByKind({}));
+    getWorkflowCard.mockResolvedValue(detail({ card: withSupport }));
+    preflightWorkflowRun.mockResolvedValue(
+      missing({ file: "t5/t5xxl_fp8.safetensors", folder: "text_encoders" }),
+    );
+    useTasksStore().modelDownloads = [
+      { id: "d1", file: "t5xxl_fp8.safetensors", status: "queued", percent: 0 },
+    ];
+    const { wrapper } = await mountWith([KEY], [withSupport]);
+    await settle(wrapper);
+    const marks = row(wrapper, "text_encoder")
+      .findAll('[data-testid="downloading-mark"]')
+      .map((mark) => mark.attributes("aria-label"));
+    expect(marks).toEqual(["Queued"]);
+    // The words beside it say so too.
+    const text = row(wrapper, "text_encoder").text();
+    expect(text).toContain("t5xxl_fp8 is queued. It runs once it has downloaded.");
+    expect(text).not.toContain("still downloading");
+    expect(text).not.toContain("Downloading");
+    wrapper.unmount();
+  });
+
+  it("leaves a missing file queued under another case to its download, and not one for another slot", async () => {
+    readModelSwap.mockReset().mockImplementation(
+      replacementsByKind({
+        text_encoder: [{ id: 5, filename: "t5-xxl_fp8.safetensors", likely: true }],
+      }),
+    );
+    getWorkflowCard.mockResolvedValue(detail({ card: withSupport }));
+    preflightWorkflowRun.mockResolvedValue(
+      missing({ file: "t5/t5xxl_fp8.safetensors", folder: "text_encoders" }),
+    );
+    for (const [slot, picked] of [
+      ["text_encoder", false],
+      ["vae", true],
+    ]) {
+      setWorkflowChanges.mockClear();
+      useTasksStore().modelDownloads = [
+        { id: "d1", file: "T5XXL_FP8.safetensors", status: "queued", slot },
+      ];
+      const { wrapper } = await mountWith([KEY], [withSupport]);
+      await settle(wrapper);
+      expect(setWorkflowChanges.mock.calls.length > 0).toBe(picked);
+      wrapper.unmount();
+    }
+  });
+
+  it("marks a picked download still waiting for a slot Queued", async () => {
+    readModelSwap.mockReset().mockImplementation(replacementsByKind({}));
+    getWorkflowCard.mockResolvedValue(detail({ card: withSupport }));
+    preflightWorkflowRun.mockResolvedValue(
+      missing({ file: "t5/t5xxl_fp8.safetensors", folder: "text_encoders" }),
+    );
+    useTasksStore().modelDownloads = [
+      {
+        id: "d2",
+        file: "UMT5_xxl.safetensors",
+        status: "queued",
+        directory: "text_encoders",
+        percent: 0,
+      },
+    ];
+    const { wrapper } = await mountWith([KEY], [withSupport]);
+    await settle(wrapper);
+    const picker = row(wrapper, "text_encoder").find(
+      '[data-testid="wftab-pick-text_encoder"]',
+    );
+    await picker.find('[role="combobox"]').trigger("click");
+    await picker
+      .findAll('[role="option"]')
+      .find((o) => o.text().includes("UMT5_xxl"))
+      .trigger("click");
+    await settle(wrapper);
+    const field = row(wrapper, "text_encoder").find('[role="combobox"]');
+    expect(field.find('[data-testid="downloading-mark"]').attributes("aria-label")).toBe(
+      "Queued",
+    );
+    wrapper.unmount();
+  });
+
   it("files the missing file's misfiled shelf copy and picks it, in one choice", async () => {
     // #1962 after #1966: the copy is on the shelf as Unclassified, so nothing
     // offers it until it is filed as a text encoder.

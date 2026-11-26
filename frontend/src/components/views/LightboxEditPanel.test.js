@@ -17,6 +17,13 @@ vi.mock("../../api/workflows", () => ({
 vi.mock("../../api/pictures", () => ({
   getPictureMetadata: vi.fn(async () => ({ stack_id: null })),
   pictureThumbnailUrl: (id) => `/thumb/${id}`,
+  // The tasks store follows the Scrapheap run (useScrapheapRunStore), whose
+  // setup hands these to its follower: a mock without them fails every mount.
+  cancelScrapheapRun: vi.fn(),
+  getLatestScrapheapRun: vi.fn(),
+  getScrapheapRun: vi.fn(),
+  startScrapheapRun: vi.fn(),
+  undoScrapheapRun: vi.fn(),
 }));
 vi.mock("../../api/stacks", () => ({ listStackPictures: vi.fn(async () => []) }));
 vi.mock("../../api/comfyui", () => ({
@@ -309,6 +316,38 @@ describe("the Edit tab", () => {
     // Nor through Ctrl+Enter, which calls submit directly.
     await wrapper.vm.submit();
     expect(runWorkflowCard).not.toHaveBeenCalled();
+  });
+
+  it("flags a card waiting only on downloads queued or still downloading", async () => {
+    for (const [statuses, tip] of [
+      [["queued", "queued"], "A model it needs is queued"],
+      [["queued", "running"], "Still downloading a model it needs"],
+    ]) {
+      preflightWorkflowRun.mockImplementation(async ({ target }) => ({
+        groups: [
+          {
+            reasons:
+              target === "out"
+                ? [
+                    {
+                      code: "models_downloading",
+                      models: statuses.map((status, i) => ({
+                        file: `m${i}.safetensors`,
+                        percent: 0,
+                        status,
+                      })),
+                    },
+                  ]
+                : [],
+          },
+        ],
+      }));
+      const wrapper = await mountPanel();
+      expect(
+        wrapper.findAll("[role=menuitemradio]").map((row) => row.text()),
+      ).toEqual([`Widen, ${tip}, Outpaint`, "Relight, Image to Image"]);
+      wrapper.unmount();
+    }
   });
 
   it("asks again when a download lands, and turns Run on", async () => {

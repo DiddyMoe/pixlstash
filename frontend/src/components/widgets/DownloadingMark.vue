@@ -1,6 +1,7 @@
 <template>
   <span
     class="dlm"
+    :class="{ 'dlm--queued': queued }"
     role="img"
     :aria-label="spoken"
     data-testid="downloading-mark"
@@ -15,7 +16,9 @@
 <script setup>
 /**
  * A model PixlStash is still downloading (`POST /model-downloads`): the
- * download glyph, its arrow dropping, in the accent hue live work wears.
+ * download glyph, its arrow dropping, in the accent hue live work wears. A
+ * download waiting for one of the server's few download slots reads "Queued",
+ * its arrow still, as the Tasks list says of it.
  *
  * Drawn where a model on its way is offered or held (a workflow's model
  * picker, a set's slot and its picker, a run's refusal), so the owner can put
@@ -32,10 +35,17 @@ const props = defineProps({
   percent: { type: Number, default: null },
   /** The icon sizes: 16 in a row, 18 beside text. */
   size: { type: Number, default: 16 },
+  /** The download's own `status`; omitted where several downloads share it. */
+  status: { type: String, default: null },
 });
 
+const queued = computed(() => props.status === "queued");
 const spoken = computed(() =>
-  props.percent ? `Downloading, ${Math.round(props.percent)}%` : "Downloading",
+  queued.value
+    ? "Queued"
+    : props.percent
+      ? `Downloading, ${Math.round(props.percent)}%`
+      : "Downloading",
 );
 </script>
 
@@ -49,6 +59,11 @@ const spoken = computed(() =>
 
 .dlm :deep(.v-icon) {
   animation: dlm-drop 1.4s var(--ease-standard) infinite;
+}
+
+/* Waiting for a slot: nothing is arriving yet, so the arrow holds still. */
+.dlm--queued :deep(.v-icon) {
+  animation: none;
 }
 
 @keyframes dlm-drop {

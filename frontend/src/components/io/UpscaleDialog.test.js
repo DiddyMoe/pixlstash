@@ -190,6 +190,9 @@ describe("UpscaleDialog", () => {
     expect(
       wrapper.find("[data-testid=upscale-get-model] button").exists(),
     ).toBe(false);
+    expect(wrapper.find("[data-testid=upscale-get-model]").text()).toBe(
+      "Downloading RealESRGAN: the Tasks list in the title bar shows how far.",
+    );
 
     const esrgan = "c".repeat(64);
     listAdapters.mockResolvedValue([
@@ -202,6 +205,24 @@ describe("UpscaleDialog", () => {
       false,
     );
     expect(store.model.sha256).toBe(esrgan);
+  });
+
+  // One name in any case is one download to the server, and one
+  // waiting for a slot reads Queued.
+  it("says RealESRGAN is queued while a download of it in any case waits", async () => {
+    preflightUpscale.mockResolvedValue({ pictures: [picture(7)] });
+    const { wrapper } = await open([7]);
+    useTasksStore().downloadStarted({
+      id: "d1",
+      file: "realesrgan_x4plus.safetensors",
+      status: "queued",
+    });
+    await flushPromises();
+    const get = wrapper.find("[data-testid=upscale-get-model]");
+    expect(get.find("button").exists()).toBe(false);
+    expect(get.text()).toBe(
+      "RealESRGAN is queued: the Tasks list in the title bar shows when it starts.",
+    );
   });
 
   it("does not offer RealESRGAN to a shelf that has it", async () => {

@@ -1046,4 +1046,37 @@ describe("Download missing models", () => {
     );
     wrapper.unmount();
   });
+
+  it("is refused while what it lacks is queued under another case, and says it is queued", async () => {
+    preflightWorkflowRun
+      .mockReset()
+      .mockResolvedValue(answer("vae/vae.safetensors"));
+    useTasksStore().modelDownloads = [
+      { id: "d1", file: "VAE.safetensors", status: "queued" },
+    ];
+    const wrapper = await opened(["a"]);
+    const row = rowOf(wrapper);
+    expect(row.attributes("aria-disabled")).toBe("true");
+    expect(row.find(".tip").attributes("data-text")).toBe(
+      "Already queued: the Tasks list in the title bar shows when it starts",
+    );
+    wrapper.unmount();
+  });
+
+  it("says downloading while any file it lacks is fetching, though another is queued", async () => {
+    preflightWorkflowRun
+      .mockReset()
+      .mockResolvedValue(answer("vae.safetensors", "clip.safetensors"));
+    useTasksStore().modelDownloads = [
+      { id: "d1", file: "vae.safetensors", status: "queued" },
+      { id: "d2", file: "clip.safetensors", status: "running" },
+    ];
+    const wrapper = await opened(["a"]);
+    const row = rowOf(wrapper);
+    expect(row.attributes("aria-disabled")).toBe("true");
+    expect(row.find(".tip").attributes("data-text")).toBe(
+      "Already downloading: the Tasks list in the title bar shows how far",
+    );
+    wrapper.unmount();
+  });
 });

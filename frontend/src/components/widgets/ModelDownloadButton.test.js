@@ -62,6 +62,48 @@ describe("ModelDownloadButton", () => {
     expect(show).toHaveBeenCalled();
   });
 
+  // The server fetches a few at once and queues the rest; it refuses a second
+  // start of a queued file as of a running one.
+  // The server refuses a second start of a file in any case, so the
+  // button does not offer one for a download spelled otherwise.
+  it("is busy while its file is on its way under another case", async () => {
+    useTasksStore().modelDownloads = [
+      { id: "d-1", file: "FLUX1-Dev.safetensors", status: "running" },
+    ];
+    const wrapper = mountButton();
+    expect(wrapper.attributes("aria-label")).toBe(
+      "Downloading flux1-dev.safetensors",
+    );
+    await wrapper.trigger("click");
+    await flushPromises();
+    expect(startModelDownload).not.toHaveBeenCalled();
+  });
+
+  it("is busy while its file is queued, and says it is queued", async () => {
+    startModelDownload.mockResolvedValue({
+      id: "d-1",
+      file: "flux1-dev.safetensors",
+      status: "queued",
+    });
+    const wrapper = mountButton();
+    await wrapper.trigger("click");
+    await flushPromises();
+    expect(wrapper.attributes("aria-label")).toBe(
+      "Queued to download flux1-dev.safetensors",
+    );
+    await wrapper.trigger("click");
+    expect(startModelDownload).toHaveBeenCalledTimes(1);
+
+    // Its slot comes free: it reads as downloading.
+    useTasksStore().modelDownloads = [
+      { id: "d-1", file: "flux1-dev.safetensors", status: "running" },
+    ];
+    await flushPromises();
+    expect(wrapper.attributes("aria-label")).toBe(
+      "Downloading flux1-dev.safetensors",
+    );
+  });
+
   it("says why when the server refuses", async () => {
     startModelDownload.mockRejectedValue({
       response: { data: { detail: "flux1-dev.safetensors is already there." } },

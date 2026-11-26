@@ -451,6 +451,69 @@ describe("choosing a set", () => {
     );
   });
 
+  /** SHELF with off-shelf *members* added to set 7, held by their digests. */
+  function withComing(...members) {
+    return {
+      ...SHELF,
+      hand_made: SHELF.hand_made.map((set) =>
+        set.id === 7
+          ? {
+              ...set,
+              members: [
+                ...set.members,
+                ...members.map(([sha, name]) => ({
+                  id: null,
+                  slot: "lora",
+                  on_shelf: false,
+                  sha256: sha,
+                  name,
+                })),
+              ],
+            }
+          : set,
+      ),
+    };
+  }
+
+  it("says a member whose download waits for a slot is queued", async () => {
+    const sha = "f".repeat(64);
+    fetchWorkflowSets.mockResolvedValue(withComing([sha, "Coming LoRA"]));
+    const wrapper = mountMenu();
+    useTasksStore().modelDownloads = [
+      { id: "d", file: "coming.safetensors", status: "queued", sha256: sha },
+    ];
+    await openMenu(wrapper);
+    expect(meta(wrapper, "hand:7")).toContain("Coming LoRA queued, left out");
+    await row(wrapper, "hand:7").trigger("click");
+    const warned = useNoticeStore().notices.find((n) => n.level === "warning");
+    expect(warned?.text).toBe(
+      'Coming LoRA is queued, so "Portraits" was used without it. ' +
+        "Use the set again once the download has finished.",
+    );
+  });
+
+  it("says still downloading while any of its members is fetching", async () => {
+    const [one, two] = ["e".repeat(64), "f".repeat(64)];
+    fetchWorkflowSets.mockResolvedValue(
+      withComing([one, "Queued LoRA"], [two, "Fetching LoRA"]),
+    );
+    const wrapper = mountMenu();
+    useTasksStore().modelDownloads = [
+      { id: "d1", file: "queued.safetensors", status: "queued", sha256: one },
+      { id: "d2", file: "fetching.safetensors", status: "running", sha256: two },
+    ];
+    await openMenu(wrapper);
+    expect(meta(wrapper, "hand:7")).toContain(
+      "2 of its models still downloading, left out",
+    );
+    await row(wrapper, "hand:7").trigger("click");
+    const warned = useNoticeStore().notices.find((n) => n.level === "warning");
+    expect(warned?.text).toBe(
+      '2 of its models are still downloading, so "Portraits" was used without them. ' +
+        "Use the set again once the download has finished.",
+    );
+  });
+
   describe("over a row that already has an unsaved pick", () => {
     const PICKED = [
       {

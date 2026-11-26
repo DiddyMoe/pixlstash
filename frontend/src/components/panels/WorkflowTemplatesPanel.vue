@@ -257,12 +257,9 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { VIcon, VMenu } from "vuetify/components";
 
 import { useContextMenuAt } from "../../composables/useContextMenuAt";
-import {
-  downloadModels,
-  modelBaseName,
-} from "../../composables/useModelDownloads";
+import { downloadModels } from "../../composables/useModelDownloads";
 import { useFilterStore } from "../../stores/useFilterStore";
-import { useTasksStore } from "../../stores/useTasksStore";
+import { downloadQueued, useTasksStore } from "../../stores/useTasksStore";
 import { useWorkflowTemplatesStore } from "../../stores/useWorkflowTemplatesStore";
 import { isReadOnly } from "../../utils/apiClient";
 import { onMenuKeydown } from "../../utils/menuKeyboard.js";
@@ -331,21 +328,30 @@ const addLabel = computed(() => {
 const { contextOpen, contextAt, openContextMenu } = useContextMenuAt();
 
 /**
- * The selection's missing files PixlStash knows where to get, less those
- * already downloading. None in a read-only session, which cannot download.
- * A landed one leaves by itself: `models_arrived` re-reads the list.
+ * The selection's missing files PixlStash knows where to get, by name. A
+ * landed one leaves by itself: `models_arrived` re-reads the list.
  */
-const downloadFiles = computed(() => {
-  if (isReadOnly.value) return [];
+const fetchableFiles = computed(() => {
   const names = store.selectedTemplates.flatMap((template) =>
     (template.files ?? [])
       .filter((file) => !file.present && file.downloadable)
       .map((file) => file.name),
   );
-  return [...new Set(names)].filter(
-    (name) => !tasksStore.runningDownloadFiles.has(modelBaseName(name)),
-  );
+  return [...new Set(names)];
 });
+/**
+ * Of those, the ones not already on their way (queued or running), matched
+ * as the server's duplicate-start rule matches a name: by name alone, since
+ * the server, not the template, picks the folder a download goes to. None in
+ * a read-only session, which cannot download.
+ */
+const downloadFiles = computed(() =>
+  isReadOnly.value
+    ? []
+    : fetchableFiles.value.filter(
+        (name) => !tasksStore.runningDownload({ file: name }),
+      ),
+);
 const downloadLabel = computed(() => {
   const n = downloadFiles.value.length;
   if (!n) return "Download missing models";
@@ -358,7 +364,12 @@ const downloadTitle = computed(() => {
     .flatMap((t) => t.files ?? [])
     .filter((file) => !file.present);
   if (files.some((file) => file.downloadable)) {
-    return "Already downloading: the Tasks list in the title bar shows how far";
+    const onWay = fetchableFiles.value.map((name) =>
+      tasksStore.runningDownload({ file: name }),
+    );
+    return onWay.every(downloadQueued)
+      ? "Already queued: the Tasks list in the title bar shows when it starts"
+      : "Already downloading: the Tasks list in the title bar shows how far";
   }
   return files.length
     ? "PixlStash does not know where to get the files missing from your shelf"

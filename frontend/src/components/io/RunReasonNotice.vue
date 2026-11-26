@@ -18,7 +18,11 @@
         <li v-for="file in read.files" :key="file.file">
           <span class="rrn-mono">{{ file.file }}</span>
           <template v-if="file.downloading">
-            <DownloadingMark :percent="file.percent" class="rrn-dl" />{{
+            <DownloadingMark
+              :percent="file.percent"
+              :status="file.status"
+              class="rrn-dl"
+            />{{
               file.percent ? ` ${Math.round(file.percent)}%` : ""
             }}</template
           >

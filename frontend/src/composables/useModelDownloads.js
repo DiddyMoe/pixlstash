@@ -8,7 +8,7 @@ import { startModelDownload } from "../api/modelDownloads";
 import { preflightWorkflowRun } from "../api/workflows";
 import { DEFAULT_TIMEOUTS, useNoticeStore } from "../stores/useNoticeStore";
 import { useSidebarStore } from "../stores/useSidebarStore";
-import { useTasksStore } from "../stores/useTasksStore";
+import { downloadQueued, useTasksStore } from "../stores/useTasksStore";
 import { errorDetail } from "../utils/apiError";
 import { MODELS_DOWNLOADING, UNCHECKED_CODES } from "../utils/runReasons";
 
@@ -93,7 +93,11 @@ export async function downloadableInWorkflows(cards) {
 }
 
 /**
- * Start downloading *files*, once each by name, skipping any already running.
+ * Start downloading *files*, once each by name, skipping any already on its
+ * way (queued or running), as the server would refuse it. Names compare with
+ * their case folded, as the server's duplicate-start rule does; for the rare
+ * non-ASCII name `toLowerCase()` folds differently from Python's `casefold()`,
+ * and the server's refusal is shown in its own words.
  *
  * @param {string[]} files - names as the workflows' loaders spell them.
  * @returns {Promise<number>} how many downloads started.
@@ -102,17 +106,20 @@ export async function downloadModels(files) {
   const tasksStore = useTasksStore();
   const notices = useNoticeStore();
   // By basename: a download's `file` is the name it lands under, never the
-  // loader's subfolder spelling.
+  // loader's subfolder spelling. Keyed by the folded name, so two spellings
+  // of one file start once.
   const byName = new Map();
-  let running = 0;
+  const onTheirWay = [];
   for (const file of files) {
     const name = modelBaseName(file);
-    if (byName.has(name)) continue;
-    if (tasksStore.runningDownloadFiles.has(name)) running += 1;
-    else byName.set(name, file);
+    const folded = name.toLowerCase();
+    if (byName.has(folded)) continue;
+    const download = tasksStore.runningDownload({ file: name });
+    if (download) onTheirWay.push(download);
+    else byName.set(folded, { name, file });
   }
   const started = [];
-  for (const [name, file] of byName) {
+  for (const { name, file } of byName.values()) {
     try {
       tasksStore.downloadStarted(await startModelDownload(file));
       started.push(name);
@@ -140,11 +147,16 @@ export async function downloadModels(files) {
           ? `model-download-started-${started[0]}`
           : "model-downloads-started",
     });
-  } else if (running && !byName.size) {
-    // Everything asked for is on its way already, which is not nothing.
+  } else if (onTheirWay.length && !byName.size) {
+    // Everything asked for is on its way already, which is not nothing. It
+    // says queued only when every one still waits for a download slot, as
+    // the Tasks list does. (A start's own answer always reads queued until
+    // its thread takes a slot, so the notice above keeps "Downloading".)
     notices.push({
       level: "info",
-      text: "Already downloading: the Tasks list in the title bar shows how far.",
+      text: onTheirWay.every(downloadQueued)
+        ? "Already queued: the Tasks list in the title bar shows them waiting."
+        : "Already downloading: the Tasks list in the title bar shows how far.",
       action: {
         label: "Show",
         handler: () => useSidebarStore().showTasksTab(),

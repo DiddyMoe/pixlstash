@@ -272,6 +272,36 @@ describe("WorkflowTemplatesPanel card menu", () => {
     );
   });
 
+  // The server refuses a second start of one name in any case, and a
+  // download waiting for a slot reads Queued wherever it is said.
+  it("leaves out a file queued under another case, and says it is queued", async () => {
+    const wrapper = await mounted(["default/b"]);
+    useTasksStore().downloadStarted({
+      id: "s",
+      file: "SHARED.safetensors",
+      status: "queued",
+    });
+    await row(wrapper, "default/b").trigger("contextmenu");
+    const download = menuRow(wrapper, "download-missing");
+    expect(download.attributes("aria-disabled")).toBe("true");
+    expect(download.find(".tip").attributes("data-text")).toBe(
+      "Already queued: the Tasks list in the title bar shows when it starts",
+    );
+  });
+
+  it("says downloading while any file on its way is fetching", async () => {
+    const wrapper = await mounted(["default/a"]);
+    const tasks = useTasksStore();
+    tasks.downloadStarted({ id: "s", file: "shared.safetensors", status: "queued" });
+    tasks.downloadStarted({ id: "o", file: "only-a.safetensors", status: "running" });
+    await row(wrapper, "default/a").trigger("contextmenu");
+    const download = menuRow(wrapper, "download-missing");
+    expect(download.attributes("aria-disabled")).toBe("true");
+    expect(download.find(".tip").attributes("data-text")).toBe(
+      "Already downloading: the Tasks list in the title bar shows how far",
+    );
+  });
+
   it("offers no download in a read-only session, saying why", async () => {
     sessionContext.value = { scope: "READ" };
     try {

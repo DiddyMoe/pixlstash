@@ -23,9 +23,7 @@
     </div>
     <UpscaleChoice :disabled="sending" />
     <p v-if="offerRealEsrgan" class="upd-get" data-testid="upscale-get-model">
-      <template v-if="realEsrganBusy"
-        >Downloading RealESRGAN: the Tasks list in the title bar shows how far.</template
-      >
+      <template v-if="realEsrganBusy">{{ realEsrganBusyText }}</template>
       <button v-else type="button" class="upd-link" @click="getRealEsrgan">
         Download RealESRGAN x4, a general-purpose upscaler
       </button>
@@ -60,7 +58,7 @@ import AppButton from "../widgets/AppButton.vue";
 import UpscaleChoice from "./UpscaleChoice.vue";
 import { useUpscaleStore } from "../../stores/useUpscaleStore";
 import { useNoticeStore } from "../../stores/useNoticeStore";
-import { useTasksStore } from "../../stores/useTasksStore";
+import { downloadQueued, useTasksStore } from "../../stores/useTasksStore";
 import { pictureThumbnailUrl } from "../../api/pictures";
 import { useRunDialogStore } from "../../stores/useRunDialogStore";
 import { preflightUpscale, upscalePictures } from "../../api/workflows";
@@ -141,8 +139,18 @@ const offerRealEsrgan = computed(
 const starting = ref(false);
 // Set by the link, so the model it fetched is the one picked once it lands.
 const pickRealEsrgan = ref(false);
+// By name alone, as the server refuses a second start of one: the server,
+// not this dialog, picks the folder the download goes to.
+const realEsrganDownload = computed(() =>
+  tasks.runningDownload({ file: REALESRGAN_FILE }),
+);
 const realEsrganBusy = computed(
-  () => starting.value || tasks.runningDownloadFiles.has(REALESRGAN_FILE),
+  () => starting.value || realEsrganDownload.value !== null,
+);
+const realEsrganBusyText = computed(() =>
+  downloadQueued(realEsrganDownload.value)
+    ? "RealESRGAN is queued: the Tasks list in the title bar shows when it starts."
+    : "Downloading RealESRGAN: the Tasks list in the title bar shows how far.",
 );
 
 async function getRealEsrgan() {

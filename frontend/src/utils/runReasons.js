@@ -13,6 +13,8 @@
 // run that IS about to happen (a bypassed LoRA, #1463), which the same notice
 // draws in the warning hue and without the "can't run" lead.
 
+import { downloadQueued } from "../stores/useTasksStore";
+
 /**
  * The optional stages a run can skip (`skip_stages`), as a row names them. The
  * one spelling, for the Run popup, the Workflow tab and the notices below.
@@ -45,7 +47,8 @@ export const MISSING_NODES = "missing_nodes";
 
 /**
  * A model file the graph names that PixlStash is still downloading: put in
- * while it was on its way, and refused until it lands. Each carries `percent`.
+ * while it was on its way, and refused until it lands. Each carries `percent`
+ * and its download's `status`, "queued" while it waits for a download slot.
  */
 export const MODELS_DOWNLOADING = "models_downloading";
 
@@ -320,12 +323,16 @@ export function readReason(reason) {
       // A caller may fold the files still downloading in (the Edit tab's one
       // notice per card): they are not missing, and are said apart.
       const count = files.filter((file) => !file.downloading).length;
-      const coming = files.length - count;
+      const coming = files.filter((file) => file.downloading);
+      // "Queued" only when every one still waits for a download slot.
+      const comingState = coming.every(downloadQueued)
+        ? "queued"
+        : "still downloading";
       return read(
         [
           count ? `${count} ${count === 1 ? "model is" : "models are"} missing.` : "",
-          coming
-            ? `${coming} ${coming === 1 ? "model is" : "models are"} still downloading.`
+          coming.length
+            ? `${coming.length} ${coming.length === 1 ? "model is" : "models are"} ${comingState}.`
             : "",
         ]
           .filter(Boolean)
@@ -339,8 +346,13 @@ export function readReason(reason) {
         .filter(Boolean)
         .map((file) => ({ ...file, downloading: true }));
       const one = files.length === 1;
+      const lead = one ? "A model it needs is" : `${files.length} models it needs are`;
+      const done = one ? "it has" : "they have";
+      // "Queued" only when every one still waits for a download slot.
       return read(
-        `${one ? "A model it needs is" : `${files.length} models it needs are`} still downloading. Run it once ${one ? "it has" : "they have"} finished: the Tasks list in the title bar shows how far.`,
+        files.every(downloadQueued)
+          ? `${lead} queued. Run it once ${done} downloaded: the Tasks list in the title bar shows when it starts.`
+          : `${lead} still downloading. Run it once ${done} finished: the Tasks list in the title bar shows how far.`,
         null,
         files,
       );

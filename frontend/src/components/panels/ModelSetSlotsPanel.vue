@@ -322,7 +322,10 @@
                   aria-hidden="true"
                   ><DownloadingMark
                     :percent="coming(item.member).percent"
-                  />Downloading</span
+                    :status="coming(item.member).status"
+                  />{{
+                    downloadQueued(coming(item.member)) ? "Queued" : "Downloading"
+                  }}</span
                 >
                 <span
                   v-else-if="!item.member.on_shelf"
@@ -471,7 +474,7 @@
 import { computed, ref, watch } from "vue";
 import { VIcon } from "vuetify/components";
 
-import { useTasksStore } from "../../stores/useTasksStore";
+import { downloadQueued, useTasksStore } from "../../stores/useTasksStore";
 import { isReadOnly } from "../../utils/apiClient";
 import { modelFileTitle, quantBadge } from "../../utils/modelShelf";
 import { memberVerdictOf, memberVerdictText } from "../../utils/setVerdicts";
@@ -772,7 +775,9 @@ function tileName(member, slot) {
     member.on_shelf
       ? member.base_model
       : coming(member)
-        ? "still downloading"
+        ? downloadQueued(coming(member))
+          ? "queued"
+          : "still downloading"
         : "not on shelf, kept by its hash",
     member.new
       ? "new: the pictures started using it"

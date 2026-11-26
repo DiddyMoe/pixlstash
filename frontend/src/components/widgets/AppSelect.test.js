@@ -320,3 +320,28 @@ describe("AppSelect with chip options", () => {
     expect(combo(w).attributes("aria-expanded")).toBe("false");
   });
 });
+
+describe("AppSelect's downloads on their way", () => {
+  const coming = (value, status) => ({
+    value,
+    label: `${value} (downloading)`,
+    name: value,
+    group: "Downloading",
+    groupIcon: "download",
+    groupDownloading: true,
+    downloadStatus: status,
+  });
+  const options = [coming("waiting", "queued"), coming("fetching", "running")];
+  const fieldMark = (w) =>
+    combo(w).find('[data-testid="downloading-mark"]').attributes("aria-label");
+
+  it("marks a picked download still waiting for a slot Queued", () => {
+    const w = mount(AppSelect, { props: { modelValue: "waiting", label: "Model", options } });
+    expect(fieldMark(w)).toBe("Queued");
+  });
+
+  it("marks a picked running download Downloading", () => {
+    const w = mount(AppSelect, { props: { modelValue: "fetching", label: "Model", options } });
+    expect(fieldMark(w)).toBe("Downloading");
+  });
+});

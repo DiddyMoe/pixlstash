@@ -94,10 +94,10 @@ vi.mock("../../api/modelShelf", () => ({
   putMemberVerdict: vi.fn(),
 }));
 
-const getWorkflowCard = vi.fn();
+const listWorkflowCards = vi.fn();
 vi.mock("../../api/workflows", async (importOriginal) => ({
   ...(await importOriginal()),
-  getWorkflowCard: (...args) => getWorkflowCard(...args),
+  listWorkflowCards: (...args) => listWorkflowCards(...args),
 }));
 
 vi.mock("../../api/modelDownloads", () => ({
@@ -261,7 +261,7 @@ beforeEach(() => {
   // The grid is mounted without the shelf, which is what declares the host.
   useOperationStore().setLocalReceiptHost(true);
   window.localStorage.clear();
-  getWorkflowCard.mockReset().mockResolvedValue({ card: { name: "" } });
+  listWorkflowCards.mockReset().mockResolvedValue({ cards: [], one_offs: 0, hidden: 0 });
   listAdapters.mockReset().mockResolvedValue([]);
   listSupport.mockReset().mockResolvedValue([]);
   fetchWorkflowSets
@@ -389,9 +389,14 @@ describe("the cards", () => {
   });
 
   it("names the workflows in the note and offers to replace in all of them", async () => {
-    getWorkflowCard.mockImplementation(async (id) => ({
-      card: { id, name: id === "auto:n1" ? "Text to Image" : "Upscale" },
-    }));
+    listWorkflowCards.mockResolvedValue({
+      cards: [
+        { id: "auto:n1", name: "Text to Image" },
+        { id: "auto:n2", name: "Upscale" },
+      ],
+      one_offs: 0,
+      hidden: 0,
+    });
     const { wrapper, store } = await mountGrid({
       combinations: [
         {
@@ -2434,6 +2439,7 @@ describe("hand-made sets (#1520)", () => {
     const options = chooser.findAll('[role="option"]');
     const option = options.find((o) => o.text().includes("Coming_LoRA"));
     expect(option.find('[data-testid="downloading-mark"]').exists()).toBe(true);
+    expect(option.find(".wsc__detail").text()).toBe("40%");
     expect(options.some((o) => o.text().includes("gated"))).toBe(false);
     expect(options.some((o) => o.text().includes("other_vae"))).toBe(false);
 
@@ -2451,6 +2457,8 @@ describe("hand-made sets (#1520)", () => {
       .findAll(".mss__tile")
       .find((t) => t.text().includes("Coming LoRA"));
     expect(tile.find('[data-testid="downloading-mark"]').exists()).toBe(true);
+    expect(tile.find(".mss__coming").text()).toBe("Downloading");
+    expect(tile.attributes("aria-label")).toContain(", still downloading");
     expect(tile.text()).not.toContain("Not on shelf");
     expect(tile.classes()).not.toContain("mss__tile--gone");
 
@@ -2463,6 +2471,60 @@ describe("hand-made sets (#1520)", () => {
     expect(addWorkflowSetMembers).toHaveBeenLastCalledWith(10, [
       { sha256: coming, slot: "lora", label: "Coming_LoRA.safetensors" },
     ]);
+  });
+
+  it("marks a held member's queued download Queued on its tile", async () => {
+    const coming = "d".repeat(64);
+    useTasksStore().modelDownloads = [
+      { id: "a", file: "Coming_LoRA.safetensors", status: "queued", sha256: coming, slot: "lora", percent: 0 },
+    ];
+    const held = {
+      sha256: coming,
+      slot: "lora",
+      label: "Coming_LoRA.safetensors",
+      on_shelf: false,
+      id: null,
+      name: "Coming LoRA",
+    };
+    const { wrapper, store } = await mountGrid({
+      rows: [row(1, "realvisXL_v5", "checkpoint")],
+      handMade: [handSet(10, [SET_CKPT, held])],
+    });
+    store.toggleSet("hand:10");
+    await wrapper.vm.$nextTick();
+    const marks = wrapper
+      .findAll(".mss__tile")
+      .filter((t) => t.text().includes("Coming LoRA"))
+      .map((t) => t.find('[data-testid="downloading-mark"]').attributes("aria-label"));
+    expect(marks).toEqual(["Queued"]);
+    // The words beside the mark, seen and heard, say so too.
+    const tile = wrapper
+      .findAll(".mss__tile")
+      .find((t) => t.text().includes("Coming LoRA"));
+    expect(tile.find(".mss__coming").text()).toBe("Queued");
+    expect(tile.attributes("aria-label")).toContain(", queued");
+    expect(tile.attributes("aria-label")).not.toContain("still downloading");
+  });
+
+  it("says a queued download is queued in a slot's picker", async () => {
+    useTasksStore().modelDownloads = [
+      { id: "a", file: "Coming_LoRA.safetensors", status: "queued", sha256: "d".repeat(64), slot: "lora", percent: 0 },
+    ];
+    const { wrapper, store } = await mountGrid({
+      rows: [row(1, "realvisXL_v5", "checkpoint")],
+      handMade: [handSet(10, [SET_CKPT])],
+    });
+    store.toggleSet("hand:10");
+    await wrapper.vm.$nextTick();
+    await wrapper
+      .findAll(".mss__tile--add")
+      .find((tile) => tile.attributes("aria-label") === "Add LoRA…")
+      .trigger("click");
+    const option = wrapper
+      .find('[data-testid="workflow-set-chooser"]')
+      .findAll('[role="option"]')
+      .find((o) => o.text().includes("Coming_LoRA"));
+    expect(option.find(".wsc__detail").text()).toBe("Queued");
   });
 
   it("still adds a download by its digest when it lands between draw and click", async () => {

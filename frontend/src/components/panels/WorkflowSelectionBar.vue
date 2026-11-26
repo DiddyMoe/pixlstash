@@ -216,12 +216,9 @@ import AppBarButton from "../widgets/AppBarButton.vue";
 import ComfyuiIcon from "../widgets/ComfyuiIcon.vue";
 import Tooltip from "../widgets/Tooltip.vue";
 import { useComfyuiOpen } from "../../composables/useComfyuiOpen";
-import {
-  downloadableInWorkflows,
-  modelBaseName,
-} from "../../composables/useModelDownloads";
+import { downloadableInWorkflows } from "../../composables/useModelDownloads";
 import { isReadOnly } from "../../utils/apiClient";
-import { useTasksStore } from "../../stores/useTasksStore";
+import { downloadQueued, useTasksStore } from "../../stores/useTasksStore";
 import { useWorkflowsStore } from "../../stores/useWorkflowsStore";
 import {
   favouriteVerb,
@@ -695,7 +692,7 @@ watch(
     store.selectedKeys.join("\n"),
     // A download landing, failing or cancelled leaves the running list, and
     // only a fresh answer says whether that file is now there or fetchable.
-    [...tasksStore.runningDownloadFiles].sort().join("\n"),
+    tasksStore.runningDownloads.map((download) => download.id).sort().join("\n"),
   ],
   async ([open]) => {
     const check = ++missingCheck;
@@ -711,11 +708,15 @@ watch(
     }
   },
 );
-/** Of those, the ones not already downloading; null while not known. */
+/**
+ * Of those, the ones not already on their way; null while not known. By name
+ * alone, folded as the server's duplicate-start rule folds it: the server
+ * picks the folder, so a slot from the loader could name the wrong one.
+ */
 const toDownload = computed(
   () =>
     missing.value?.files.filter(
-      (file) => !tasksStore.runningDownloadFiles.has(modelBaseName(file)),
+      (file) => !tasksStore.runningDownload({ file }),
     ) ?? null,
 );
 const downloadTitle = computed(() => {
@@ -724,8 +725,13 @@ const downloadTitle = computed(() => {
     return "A draft has no graph to check yet: open it in ComfyUI and save it";
   }
   if (toDownload.value?.length === 0) {
-    if (missing.value.files.length || missing.value.downloading.length) {
-      return "Already downloading: the Tasks list in the title bar shows how far";
+    const onWay = [...missing.value.files, ...missing.value.downloading];
+    if (onWay.length) {
+      return onWay
+        .map((file) => tasksStore.runningDownload({ file }))
+        .every(downloadQueued)
+        ? "Already queued: the Tasks list in the title bar shows when it starts"
+        : "Already downloading: the Tasks list in the title bar shows how far";
     }
     return single.value
       ? "Nothing this workflow is missing can be downloaded"

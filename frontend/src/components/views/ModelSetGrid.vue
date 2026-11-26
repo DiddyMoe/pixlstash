@@ -408,7 +408,7 @@ import { useEntityListsStore } from "../../stores/useEntityListsStore";
 import { useSidebarStore } from "../../stores/useSidebarStore";
 import { useModelShelfStore } from "../../stores/useModelShelfStore";
 import { useFavouritesStore } from "../../stores/useFavouritesStore";
-import { useTasksStore } from "../../stores/useTasksStore";
+import { downloadQueued, useTasksStore } from "../../stores/useTasksStore";
 import {
   assignmentRing,
   formatModelSize,
@@ -1415,7 +1415,11 @@ function comingSection(set, slotId, added) {
       id: `download:${d.id}`,
       row: { filename: d.file, sha256: d.sha256 },
       download: d,
-      detail: d.percent ? `${Math.round(d.percent)}%` : "",
+      detail: downloadQueued(d)
+        ? "Queued"
+        : d.percent
+          ? `${Math.round(d.percent)}%`
+          : "",
       checked: added.has(`download:${d.id}`),
     }))
     .filter((item) => rowMatches(item.row, needle));

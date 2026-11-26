@@ -7,8 +7,20 @@
     variant="ghost"
     icon-left="download"
     :loading="busy"
-    :tooltip="busy ? `Downloading ${name}…` : `Download ${name}`"
-    :aria-label="busy ? `Downloading ${name}` : `Download ${name}`"
+    :tooltip="
+      queued
+        ? `Queued to download ${name}`
+        : busy
+          ? `Downloading ${name}…`
+          : `Download ${name}`
+    "
+    :aria-label="
+      queued
+        ? `Queued to download ${name}`
+        : busy
+          ? `Downloading ${name}`
+          : `Download ${name}`
+    "
     data-testid="model-download"
     @click="start"
   />
@@ -41,9 +53,14 @@ const tasksStore = useTasksStore();
 const starting = ref(false);
 
 const name = computed(() => modelBaseName(props.file));
-const busy = computed(
-  () => starting.value || tasksStore.runningDownloadFiles.has(name.value),
+// Its download on its way, matched by name with case folded, as the server
+// refuses a second start of it.
+const download = computed(() =>
+  tasksStore.runningDownload({ file: name.value }),
 );
+const busy = computed(() => starting.value || download.value !== null);
+// A download waiting for one of the server's few download slots says so.
+const queued = computed(() => download.value?.status === "queued");
 
 async function start() {
   if (busy.value) return;

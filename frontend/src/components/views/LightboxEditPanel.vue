@@ -454,7 +454,7 @@ import {
 import { pictureThumbnailUrl } from "../../api/pictures";
 import { useLibrariesStore } from "../../stores/useLibrariesStore";
 import { useRunDialogStore } from "../../stores/useRunDialogStore";
-import { useTasksStore } from "../../stores/useTasksStore";
+import { downloadQueued, useTasksStore } from "../../stores/useTasksStore";
 import { errorMessage } from "../../utils/apiError";
 import {
   MISSING_MODELS,
@@ -595,7 +595,12 @@ const chosenMissing = computed(
 function missingTip(key) {
   const models = missing.value.get(key)?.models || [];
   const gone = models.filter((model) => !model.downloading).length;
-  if (!gone) return "Still downloading a model it needs";
+  if (!gone) {
+    // "Queued" only when every one still waits for a download slot.
+    return models.every(downloadQueued)
+      ? "A model it needs is queued"
+      : "Still downloading a model it needs";
+  }
   return `${gone} ${gone === 1 ? "model" : "models"} missing`;
 }
 

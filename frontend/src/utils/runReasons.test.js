@@ -127,6 +127,42 @@ describe("models_downloading refuses until the download lands", () => {
         .text,
     ).toBe("1 model is missing.");
   });
+
+  it("says queued when every file on its way waits for a download slot", () => {
+    const queued = { file: "a.safetensors", percent: 0, status: "queued" };
+    const running = { file: "b.safetensors", percent: 40, status: "running" };
+    expect(
+      readReason({ code: "models_downloading", models: [queued] }).text,
+    ).toBe(
+      "A model it needs is queued. Run it once it has downloaded: " +
+        "the Tasks list in the title bar shows when it starts.",
+    );
+    expect(
+      readReason({ code: "models_downloading", models: [queued, running] }).text,
+    ).toBe(
+      "2 models it needs are still downloading. Run it once they have finished: " +
+        "the Tasks list in the title bar shows how far.",
+    );
+    expect(
+      readReason({
+        code: "missing_models",
+        models: [
+          { file: "c.safetensors" },
+          { ...queued, downloading: true },
+          { ...queued, file: "d.safetensors", downloading: true },
+        ],
+      }).text,
+    ).toBe("1 model is missing. 2 models are queued.");
+    expect(
+      readReason({
+        code: "missing_models",
+        models: [
+          { ...queued, downloading: true },
+          { ...running, downloading: true },
+        ],
+      }).text,
+    ).toBe("2 models are still downloading.");
+  });
 });
 
 describe("missing_nodes names our own pack", () => {

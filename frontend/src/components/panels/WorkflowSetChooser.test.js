@@ -109,3 +109,31 @@ describe("the slot picker's favourites (#1578)", () => {
     wrapper.unmount();
   });
 });
+
+describe("the slot picker's downloads on their way", () => {
+  beforeEach(() => {
+    listFavourites.mockReset().mockResolvedValue({ model: [], workflow: [], set: [] });
+  });
+
+  it("a queued download's mark says Queued, a running one how far", async () => {
+    const download = (id, name, status, percent) => ({
+      id: `download:${id}`,
+      row: { filename: `${name}.safetensors`, sha256: name[0].repeat(64) },
+      download: { id, file: `${name}.safetensors`, status, percent },
+      detail: percent ? `${percent}%` : "",
+    });
+    const wrapper = mountChooser([
+      {
+        id: "downloading",
+        label: "Downloading",
+        items: [download("a", "waiting", "queued", 0), download("b", "fetching", "running", 40)],
+      },
+    ]);
+    await flushPromises();
+    const marks = wrapper
+      .findAll('[data-testid="downloading-mark"]')
+      .map((mark) => mark.attributes("aria-label"));
+    expect(marks).toEqual(["Queued", "Downloading, 40%"]);
+    wrapper.unmount();
+  });
+});

@@ -539,3 +539,19 @@ describe("ComfyUI-PixlStash too old to load a shelf model", () => {
     expect(wrapper.text()).toContain("Update ComfyUI-PixlStash, then restart ComfyUI.");
   });
 });
+
+describe("a model still downloading", () => {
+  it("marks a queued download Queued and a running one with how far", () => {
+    const wrapper = mountNotice({
+      code: "models_downloading",
+      models: [
+        { file: "waiting.safetensors", status: "queued", percent: 0 },
+        { file: "fetching.safetensors", status: "running", percent: 40 },
+      ],
+    });
+    const marks = wrapper
+      .findAll('[data-testid="downloading-mark"]')
+      .map((mark) => mark.attributes("aria-label"));
+    expect(marks).toEqual(["Queued", "Downloading, 40%"]);
+  });
+});
