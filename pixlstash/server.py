@@ -4,6 +4,7 @@ import uvicorn
 import os
 import sqlite3
 import json
+import math
 import re
 import socket
 import asyncio
@@ -24,10 +25,12 @@ from fastapi import (
     Request,
     HTTPException,
 )
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
+from starlette.requests import ClientDisconnect
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from pillow_heif import register_heif_opener
 
@@ -57,6 +60,7 @@ from pixlstash.services import (
     workflow_ghost_service,
 )
 from pixlstash.utils.quality.smart_score_utils import resolve_owner_penalised_tags
+from pixlstash.utils.query.folder_prefix import FolderPrefix
 from pixlstash.startup_checks import StartupChecks
 from pixlstash.startup_permissions import mkdir_private
 from pixlstash.hub.bootstrap import (
@@ -96,6 +100,7 @@ from pixlstash.telemetry import (
     maybe_send_in_background,
     start_periodic_sender,
 )
+from pixlstash.task_runner import TaskAdmissionRefused
 from pixlstash.vault import Vault
 from pixlstash.routes.config import create_router as create_config_router
 from pixlstash.routes.character_face_clusters import (
@@ -187,6 +192,7 @@ from pixlstash.server_config_io import DEVICE_ON_DISK_KEY, persist_server_config
 from pixlstash.tasks import TaskType
 from pixlstash.utils.accelerator import VALID_DEVICE_SETTINGS
 from pixlstash.utils.atomic_write import write_json_atomic
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_mapper import PathMapper
 from pixlstash.utils.rate_limiter import RateLimitMiddleware
 from pixlstash.utils.request_origin import OriginClientMiddleware
@@ -286,33 +292,85 @@ def _masked_location(loc, declared: set[str]) -> tuple:
 
 
 def _client_errors(errors) -> list[dict]:
-    """``errors`` as a 422 answers them: each one's type, location and message.
+    """``errors`` as a 422 answers them: type, location, message and bounds.
 
     Pydantic's error also carries ``input`` (the submitted value: a password, a
-    token, a host path), ``ctx`` (the raised exception object, or the values a
-    check compared against) and, when asked for, ``url``. None of them is
-    answered. ``msg`` is a template a validator can format the submitted value
-    into (``'<value>' is not a model file``), so every text value of the
-    error's ``input`` is written as ``*`` in it, where it appears as sent or in
-    a ``repr`` spelling. A value a validator reshaped first (its case changed,
-    a slice of it, two values joined with nothing between them) is text this
-    cannot recognise, so a validator never reshapes a submitted value it puts
-    in its message. The location is kept as it is: it is the field's address,
-    the key of a mapping entry included.
+    token, a host path) and, when asked for, ``url``; neither is answered. Its
+    ``ctx`` is answered only as the bounds the route declared
+    (:data:`_DECLARED_BOUNDS`), and only when there is one. ``msg`` is a
+    template a validator can format the submitted value into (``'<value>' is
+    not a model file``), so every text value of the error's ``input`` is
+    written as ``*`` in it, where it appears as sent or in a ``repr``
+    spelling. A value a validator reshaped first (its case changed, a slice of
+    it, two values joined with nothing between them) is text this cannot
+    recognise, so a validator never reshapes a submitted value it puts in its
+    message. The location is kept as it is: it is the field's address, the
+    key of a mapping entry included.
 
-    Every value answered is a string or a list of strings and integers, so the
-    body needs no encoder; the exception object in ``ctx`` is never written.
+    Every value answered is a string, a finite number or a list of strings and
+    integers, so the body needs no encoder.
     """
-    return [
-        {
+    answered = []
+    for error in errors:
+        shaped = {
             "type": error.get("type"),
             "loc": list(error.get("loc") or ()),
             "msg": _without_submitted_text(
                 str(error.get("msg", "")), error.get("input")
             ),
         }
-        for error in errors
-    ]
+        bounds = _declared_bounds(error.get("ctx"))
+        if bounds:
+            shaped["ctx"] = bounds
+        answered.append(shaped)
+    return answered
+
+
+# The ``ctx`` keys that state what the route accepts, each written from its
+# own declaration: a number's bounds and step, a length limit, a pattern, the
+# accepted values of a Literal or an Enum, a decimal's digits. Every other key
+# is left out: ``error`` holds the raised exception (a validator's ValueError,
+# which can carry the value sent) or a parse error about it, ``tag`` is the
+# discriminator value sent, ``actual_length`` measures what was sent. A key
+# not named here stays out until someone has checked what it can hold.
+_DECLARED_BOUNDS = frozenset(
+    {
+        "gt",
+        "ge",
+        "lt",
+        "le",
+        "multiple_of",
+        "min_length",
+        "max_length",
+        "pattern",
+        "expected",
+        "max_digits",
+        "decimal_places",
+        "whole_digits",
+    }
+)
+
+
+def _declared_bounds(ctx) -> dict:
+    """The entries of ``ctx`` that are the route's declared bounds.
+
+    A bound is answered when its value is text or a finite number, which is
+    every bound a request model here declares (pydantic writes a date bound as
+    text). A bound of another type (a ``Decimal``, an infinite float) is no
+    JSON value and is left out: the message states it too.
+    """
+    if not isinstance(ctx, dict):
+        return {}
+    return {
+        key: value
+        for key, value in ctx.items()
+        if key in _DECLARED_BOUNDS
+        and (
+            isinstance(value, str)
+            or (isinstance(value, int) and not isinstance(value, bool))
+            or (isinstance(value, float) and math.isfinite(value))
+        )
+    }
 
 
 def _without_submitted_text(msg: str, submitted) -> str:
@@ -1002,13 +1060,19 @@ class Server(
         self.auth.seed_desktop_session()
         self.apply_user_settings_to_vault(self.vault)
         self.reconcile_library_settings(self.vault)
+        # Owns replacing the vault when the active library changes, and the
+        # state requests are refused in while that is happening. Built before
+        # the vault starts and handed to it: ``vault.start()`` reconciles
+        # training runs that finished while PixlStash was down, and importing
+        # one takes a read lease from this coordinator, so the vault must have
+        # it before that first import can run. A switch hands it to each vault
+        # it publishes.
+        self.library_coordinator = LibraryGenerationCoordinator(self)
+        self.vault.library_coordinator = self.library_coordinator
         self.vault.start()
         _log_stage("auth wired + background workers started")
         self._start_edit_copies()
 
-        # Owns replacing the vault when the active library changes, and the
-        # state requests are refused in while that is happening.
-        self.library_coordinator = LibraryGenerationCoordinator(self)
         self.library_switch = LibrarySwitchService(self)
 
         self.api = FastAPI(
@@ -1036,11 +1100,14 @@ class Server(
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
-            # Retry-After is not a CORS-safelisted response header, so without
-            # this a client on another origin (the Vite dev server) is denied
-            # the poll interval of a background run and the 429 backoff alike.
-            # It widens nothing: a refused origin still gets no Allow-Origin.
-            expose_headers=["Retry-After"],
+            # Neither header is CORS-safelisted, so without this a client on
+            # another allowed origin (the Vite dev server) is denied
+            # Retry-After (the poll interval of a background run and the 429
+            # backoff) and Content-Disposition (the name the server gives an
+            # export download, which the client then replaced with a fixed
+            # one). It widens nothing: a refused origin still gets no
+            # Allow-Origin, so it reads neither the headers nor the body.
+            expose_headers=["Retry-After", "Content-Disposition"],
         )
         # Captures the originating tab's ``X-Client-Id`` header into
         # ``request.state.origin_client_id`` / ``origin_client_id_var`` so
@@ -1841,13 +1908,63 @@ class Server(
         # CORSMiddleware and so never gets stamped. The validation handler
         # probably is redundant, but it takes no headers from its exception,
         # so it is left alone rather than widened into this fix.
+        #
+        # The 500 says ``Connection: close`` because the connection does
+        # close: ServerErrorMiddleware re-raises after sending this response
+        # (the TestClient relies on that to surface the error in a test), and
+        # uvicorn answers an exception from the app by closing the transport.
+        # Without the header the client was told the connection persists and
+        # its next request on it was lost (RFC 9112 §9.6). The traceback is
+        # logged once, by uvicorn, from the re-raise.
+
+        # A person's work refused because a library restore paused task
+        # admission (``TaskRunner.submit``): 409, not 503. The request
+        # conflicts with what the server is doing now, the person can act on
+        # it (try again after the restore), and nothing was started; a 503
+        # reads to the client as a model or ComfyUI that is down (RFC 9110
+        # §15.5.10, §15.6.4). The detail is fixed text the runner composed.
+        @self.api.exception_handler(TaskAdmissionRefused)
+        async def task_admission_refused_handler(request, exc):
+            logger.info(
+                "Refused %s %s: task admission is paused for %s.",
+                request.method,
+                request.url.path,
+                exc.reason,
+            )
+            return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+        # A client that went away before its request body arrived (a closed
+        # tab, a cancelled fetch) raises ClientDisconnect out of a handler's
+        # own body read. That is the client's doing, so it is logged as such
+        # instead of reaching the handler below as a server fault with a
+        # traceback. FastAPI answers the same thing with 400 when it reads the
+        # body itself; this matches it, and nobody is left to receive it.
+        @self.api.exception_handler(ClientDisconnect)
+        async def client_disconnect_handler(request, exc):
+            logger.info(
+                "%s %s: the client closed the connection before the request "
+                "body arrived.",
+                request.method,
+                request.url.path,
+            )
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "The request body was not received in full."},
+            )
 
         @self.api.exception_handler(Exception)
         async def generic_exception_handler(request, exc):
-            logger.error(f"Unhandled exception: {exc}")
+            logger.error(
+                "Unhandled exception on %s %s: %s: %s",
+                request.method,
+                request.url.path,
+                type(exc).__name__,
+                exc,
+            )
             origin = request.headers.get("origin")
             headers = {
                 "Access-Control-Allow-Credentials": "true",
+                "Connection": "close",
             }
             if origin and (
                 origin in self.allow_origins
@@ -1912,15 +2029,18 @@ class Server(
 
             return JSONResponse(
                 status_code=422,
-                # The caller is told which field failed and how: no ``input``,
-                # ``ctx`` or ``url``, and the submitted text starred out of
-                # ``msg`` where it appears as sent (see _client_errors).
+                # The caller is told which field failed and how: no ``input``
+                # or ``url``, ``ctx`` only as the route's declared bounds, and
+                # the submitted text starred out of ``msg`` where it appears
+                # as sent (see _client_errors).
                 #
                 # NOTE for validator authors: a validator's ValueError text
                 # still reaches the caller here, so it must not carry a host
                 # path or a credential, nor a submitted value reshaped (case,
                 # slice, run into another with nothing between): the starring
-                # finds a value only as sent or in a repr spelling.
+                # finds a value only as sent or in a repr spelling. A
+                # PydanticCustomError's ctx under a bound's name (``expected``)
+                # is answered, so it holds only the server's own text.
                 content={"detail": _client_errors(detail)},
                 headers=headers,
             )
@@ -2489,18 +2609,63 @@ class Server(
         async def protected():
             return {"message": "You are authenticated!"}
 
+        def _is_api_path(path: str) -> bool:
+            return path == API_V1_PREFIX or path.startswith(f"{API_V1_PREFIX}/")
+
+        def _reached_through_a_link(dist_dir: str, candidate: str) -> bool:
+            """Whether a link (a symlink or a Windows junction) is on the way
+            from the built frontend down to *candidate*, *candidate* included.
+
+            The ``/assets`` mount resolves its path and refuses one that leads
+            out; the build has no links of its own, so any link below it is
+            refused here. ``dist_dir`` itself may be one. Only paths below
+            ``dist_dir`` are ``lstat``-ed, and *candidate* must be one.
+            """
+            step = os.path.abspath(dist_dir)
+            for part in os.path.relpath(candidate, step).split(os.sep):
+                step = os.path.join(step, part)
+                if is_link_or_missing(step):
+                    return True
+            return False
+
+        # The SPA catch-all matches every path, the API's included. A path
+        # under the API prefix that no API route matched is an API 404, for
+        # every method: never the SPA document with a 200 (a client reading
+        # JSON got HTML) and never a 405 naming GET, which the catch-all's
+        # partial match made the answer to every other method.
         @self.api.get("/{full_path:path}", include_in_schema=False)
         async def frontend_fallback(full_path: str):
+            if _is_api_path(f"/{full_path}"):
+                raise HTTPException(status_code=404, detail="Not Found")
             dist_dir = self._get_frontend_dist_dir()
             if not dist_dir:
                 raise HTTPException(status_code=404, detail="Not Found")
 
             safe_path = os.path.normpath(full_path).lstrip(os.sep)
             candidate = os.path.abspath(os.path.join(dist_dir, safe_path))
-            if candidate.startswith(dist_dir) and os.path.isfile(candidate):
+            # Bounded by a separator: a ``..`` in the path (sent as ``%2e%2e``
+            # it reaches here decoded) must not serve a prefix sibling such as
+            # ``dist-old``. Lexical only, so nothing outside is ever stat'ed.
+            # Then no link inside the build may lead the read out of it.
+            if (
+                FolderPrefix.of(dist_dir).contains(candidate)
+                and not _reached_through_a_link(dist_dir, candidate)
+                and os.path.isfile(candidate)
+            ):
                 return FileResponse(candidate)
 
             index_response = self._index_html_response()
             if not index_response:
                 raise HTTPException(status_code=404, detail="Not Found")
             return index_response
+
+        @self.api.exception_handler(405)
+        async def method_not_allowed_handler(request: Request, exc: HTTPException):
+            # Only the catch-all's partial match under the API prefix is
+            # answered as a 404; a 405 from a real route (its path exists,
+            # the method does not) keeps FastAPI's answer and its Allow header.
+            if request.scope.get("endpoint") is frontend_fallback and _is_api_path(
+                request.url.path
+            ):
+                return JSONResponse(status_code=404, content={"detail": "Not Found"})
+            return await http_exception_handler(request, exc)

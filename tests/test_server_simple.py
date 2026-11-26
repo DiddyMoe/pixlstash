@@ -310,7 +310,7 @@ def test_scrapheap_purge_logs_deleted_files(server):
     # Soft-delete into the scrapheap, then permanently purge it.
     delete_resp = client.delete(f"/pictures/{pic_id}")
     assert delete_resp.status_code == 200
-    purge_resp = _purge_scrapheap(client)
+    purge_resp = _purge_scrapheap(server, client)
     assert purge_resp.status_code == 200
 
     # The row and the file on disk are gone...
@@ -353,7 +353,7 @@ def test_scrapheap_purge_reports_snapshots_with_deleted(server):
     cp = server.vault.snapshot_service.create_snapshot("MANUAL")
     delete_resp = client.delete(f"/pictures/{pic_id}")
     assert delete_resp.status_code == 200
-    resp = _purge_scrapheap(client)
+    resp = _purge_scrapheap(server, client)
     assert resp.status_code == 200
     body = resp.json()
 
@@ -363,18 +363,24 @@ def test_scrapheap_purge_reports_snapshots_with_deleted(server):
     )
 
 
-def _purge_scrapheap(client, *, ids=None, include_protected=None):
+def _purge_scrapheap(server, client, *, ids=None, include_protected=None):
     """Drive the real preview -> confirm delete-forever flow.
 
     ``DELETE /pictures/scrapheap`` refuses without the single-use
     ``confirm_token`` the preview mints for that exact selection, so a test may
-    not call the destructive endpoint bare.
+    not call the destructive endpoint bare. It also refuses the whole heap
+    (that is a purge run), so *ids* ``None`` names every picture in the
+    Scrapheap now.
     """
+    if ids is None:
+        ids = server.vault.db.run_task(
+            lambda session: sorted(
+                session.exec(select(Picture.id).where(Picture.deleted.is_(True))).all()
+            )
+        )
     preview = client.post("/pictures/scrapheap/delete-preview", json={"ids": ids})
     assert preview.status_code == 200, preview.text
-    body = {"confirm_token": preview.json()["confirm_token"]}
-    if ids is not None:
-        body["picture_ids"] = ids
+    body = {"confirm_token": preview.json()["confirm_token"], "picture_ids": ids}
     if include_protected is not None:
         body["include_protected"] = include_protected
     return client.request("DELETE", "/api/v1/pictures/scrapheap", json=body)
@@ -463,7 +469,7 @@ def test_scrapheap_delete_forever_destroys_protected_reference_original(
     delete_resp = client.delete(f"/pictures/{pic_id}")
     assert delete_resp.status_code == 200
     # include_protected=true is the type-to-confirm "delete all" action.
-    purge_resp = _purge_scrapheap(client, include_protected=True)
+    purge_resp = _purge_scrapheap(server, client, include_protected=True)
     assert purge_resp.status_code == 200
     assert purge_resp.json()["deleted_count"] == 1
 
@@ -608,7 +614,7 @@ def test_scrapheap_delete_include_protected_false_skips_protected(server, tmp_pa
         server, client, tmp_path
     )
 
-    resp = _purge_scrapheap(client, include_protected=False)
+    resp = _purge_scrapheap(server, client, include_protected=False)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["deleted_count"] == 1, body
@@ -645,7 +651,7 @@ def test_scrapheap_delete_include_protected_true_destroys_all(server, tmp_path):
         server, client, tmp_path
     )
 
-    resp = _purge_scrapheap(client, include_protected=True)
+    resp = _purge_scrapheap(server, client, include_protected=True)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["deleted_count"] == 3, body
@@ -680,7 +686,7 @@ def test_scrapheap_purge_unprotected_folder_removes_file_and_logs(server, tmp_pa
 
     delete_resp = client.delete(f"/pictures/{pic_id}")
     assert delete_resp.status_code == 200
-    purge_resp = _purge_scrapheap(client)
+    purge_resp = _purge_scrapheap(server, client)
     assert purge_resp.status_code == 200
     assert purge_resp.json()["deleted_count"] == 1
 
@@ -835,7 +841,7 @@ def test_scrapheap_delete_forever_upgrades_stale_kept_flag(server, tmp_path):
         session.commit()
 
     server.vault.db.run_task(_scrapheap)
-    assert _purge_scrapheap(client).json()["deleted_count"] == 1
+    assert _purge_scrapheap(server, client).json()["deleted_count"] == 1
 
     flags = _ledger_flags_for(server, abs_file_path)
     assert flags == [True], (
@@ -889,7 +895,10 @@ def test_pictures_export(server):
     )
     assert resp.status_code == 200
 
-    resp = client.get("/pictures/export")
+    # The export strips generation data by default, which rewrites the PNGs;
+    # this test compares exported bytes with the originals, so it asks for them
+    # untouched. Stripping itself is covered by tests/test_share_copies.py.
+    resp = client.get("/pictures/export", params={"keep_generation_data": "true"})
     assert resp.status_code == 200, f"Error: {resp.text}"
     assert resp.headers["content-type"] == "application/json"
 
