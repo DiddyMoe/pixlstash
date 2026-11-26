@@ -671,6 +671,85 @@ describe("LibraryLayoutDialog", () => {
     expect(runLayoutMigrationPass).not.toHaveBeenCalled();
   });
 
+  // ---- reopening ------------------------------------------------------------
+
+  it("counts again every time it is reopened", async () => {
+    // Pictures are imported and moved while the dialog is closed. A count kept
+    // from the last visit would sit beside the Move button as the plan.
+    const wrapper = mountDialog();
+    await flushPromises();
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+
+    getLayoutMigrationPreview.mockResolvedValue({
+      ...WOULD_MOVE,
+      picture_count: 5120,
+    });
+    await wrapper.setProps({ open: false });
+    await flushPromises();
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    expect(getLayoutSettings).toHaveBeenCalledTimes(2);
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("5,120");
+  });
+
+  it("does not re-read under a move that is still running", async () => {
+    let finishPass;
+    runLayoutMigrationPass.mockReturnValue(
+      new Promise((resolve) => (finishPass = resolve)),
+    );
+    const wrapper = mountDialog();
+    await flushPromises();
+    await buttonWith(wrapper, "Move them now").trigger("click");
+    await flushPromises();
+    const counts = getLayoutMigrationPreview.mock.calls.length;
+
+    await wrapper.setProps({ open: false });
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    expect(getLayoutSettings).toHaveBeenCalledTimes(1);
+    expect(getLayoutMigrationPreview.mock.calls.length).toBe(counts);
+    finishPass(PASS_DONE);
+    await flushPromises();
+  });
+
+  it("does not re-read when the registry's answer settles again while it stays open", async () => {
+    // Only a reopen re-reads. The library registry can answer again while the
+    // dialog is open (blocked, then allowed), and that is not a new visit.
+    const wrapper = mountDialog();
+    await flushPromises();
+    const store = useLibrariesStore();
+
+    store.canManage = false;
+    await flushPromises();
+    store.canManage = true;
+    await flushPromises();
+
+    expect(getLayoutSettings).toHaveBeenCalledTimes(1);
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+  });
+
+  it("keeps an edit closed inside its debounce across the reopen's read", async () => {
+    vi.useFakeTimers();
+    const wrapper = mountDialog();
+    await flushPromises();
+    editLevel(wrapper, 0, ["tag"]);
+    await wrapper.setProps({ open: false });
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    // The reopen read the stored layout, which still says `project`; the edit
+    // the server has not been sent yet is what stays on screen.
+    expect(getLayoutSettings).toHaveBeenCalledTimes(2);
+    const first = wrapper.findAllComponents({ name: "v-select" })[0];
+    expect(first.props("modelValue")).toEqual(["tag"]);
+
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(setLayoutSettings).toHaveBeenCalledTimes(1);
+  });
+
   // ---- a count that lands after the one asked for since ---------------------
 
   it.each([
@@ -779,9 +858,142 @@ describe("LibraryLayoutDialog", () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain("fake-save-refused");
-    expect(wrapper.find(".layout-tree__more").text()).toBe(
-      "No folders to draw.",
+    // The layout the re-read put back is counted, and the dropped count does
+    // not land over it.
+    expect(wrapper.text()).not.toContain("Reading your folders…");
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+  });
+
+  // "counting…" with nothing counting reads as a count about to land, and the
+  // owner waits on it. Each way a count stops coming says so instead.
+  it("says the count is unavailable when a refused save cannot be re-read, until a reopen reads it", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wrapper = mountDialog();
+    await flushPromises();
+    setLayoutSettings.mockRejectedValueOnce(new Error("fake-save-refused"));
+    getLayoutSettings.mockRejectedValueOnce(new Error("fake-reread-failed"));
+
+    editLevel(wrapper, 0, ["tag"]);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("fake-save-refused");
+    expect(wrapper.find(".layout-consequence__num").text()).toBe(
+      "count unavailable",
     );
+    expect(wrapper.find(".layout-consequence__sub").text()).toBe(
+      "reopen this dialog to count again",
+    );
+    expect(buttonWith(wrapper, "Move them now").attributes("disabled")).toBe(
+      "",
+    );
+    expect(warn.mock.calls.at(-1)[1].message).toBe("fake-reread-failed");
+    // A sweep toggle cannot count either: the server may hold another layout.
+    const counted = getLayoutMigrationPreview.mock.calls.length;
+    await wrapper.find(".layout-unfiled input[type=checkbox]").setValue(true);
+    await flushPromises();
+    expect(getLayoutMigrationPreview).toHaveBeenCalledTimes(counted);
+    expect(wrapper.find(".layout-consequence__num").text()).toBe(
+      "count unavailable",
+    );
+
+    // The reopen's read is the re-read the refused save was owed: the builder
+    // takes the server's layout and counts it.
+    await wrapper.setProps({ open: false });
+    await flushPromises();
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    const levels = wrapper.findAllComponents({ name: "v-select" });
+    expect(levels[0].props("modelValue")).toEqual(["project"]);
+    expect(getLayoutMigrationPreview).toHaveBeenCalledTimes(counted + 1);
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+    expect(
+      buttonWith(wrapper, "Move them now").attributes("disabled"),
+    ).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it("keeps an edit made after a failed re-read when the dialog is reopened mid-save", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wrapper = mountDialog();
+    await flushPromises();
+    setLayoutSettings.mockRejectedValueOnce(new Error("fake-save-refused"));
+    getLayoutSettings.mockRejectedValueOnce(new Error("fake-reread-failed"));
+    editLevel(wrapper, 0, ["tag"]);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(wrapper.find(".layout-consequence__num").text()).toBe(
+      "count unavailable",
+    );
+
+    // The owner edits again; that save is on its way when the dialog reopens.
+    const saving = deferred();
+    setLayoutSettings.mockReturnValueOnce(saving.promise);
+    editLevel(wrapper, 0, ["person"]);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(setLayoutSettings).toHaveBeenCalledTimes(2);
+    await wrapper.setProps({ open: false });
+    await flushPromises();
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    // The new edit's own save answers for the builder now, so the reopen's
+    // read must not snap it back to the stored layout.
+    const levels = wrapper.findAllComponents({ name: "v-select" });
+    expect(levels[0].props("modelValue")).toEqual(["person"]);
+    expect(wrapper.find(".layout-consequence__num").text()).toBe("counting…");
+    warn.mockRestore();
+  });
+
+  it("counts the layout the server holds once a refused save is re-read", async () => {
+    vi.useFakeTimers();
+    const wrapper = mountDialog();
+    await flushPromises();
+    setLayoutSettings.mockRejectedValueOnce(new Error("fake-save-refused"));
+
+    editLevel(wrapper, 0, ["tag"]);
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("fake-save-refused");
+    const levels = wrapper.findAllComponents({ name: "v-select" });
+    expect(levels[0].props("modelValue")).toEqual(["project"]);
+    const counts = getLayoutMigrationPreview.mock;
+    expect(counts.calls).toHaveLength(2);
+    expect(counts.invocationCallOrder[1]).toBeGreaterThan(
+      getLayoutSettings.mock.invocationCallOrder.at(-1),
+    );
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+    expect(
+      buttonWith(wrapper, "Move them now").attributes("disabled"),
+    ).toBeUndefined();
+  });
+
+  it("says the count is unavailable when the count read fails, and counts again on reopen", async () => {
+    getLayoutMigrationPreview.mockRejectedValueOnce(
+      new Error("fake-count-failed"),
+    );
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("fake-count-failed");
+    expect(wrapper.find(".layout-consequence__num").text()).toBe(
+      "count unavailable",
+    );
+    expect(buttonWith(wrapper, "Move them now").attributes("disabled")).toBe(
+      "",
+    );
+
+    await wrapper.setProps({ open: false });
+    await flushPromises();
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
   });
 
   it.each([

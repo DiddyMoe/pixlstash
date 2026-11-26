@@ -58,7 +58,9 @@ from pixlstash.database import DBPriority
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.model_mover import publish_no_clobber
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import path_is_within, resolve_path_within
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.library_layout import (
     DEFAULT_LAYOUT,
     Facet,
@@ -1563,10 +1565,14 @@ def _directories_at_depth(root: str, depth: int) -> list:
         for parent in level:
             try:
                 with os.scandir(parent) as entries:
+                    # A Windows junction lists as a plain directory, so its own
+                    # lstat leaves it out as a symlink is left out: a rename
+                    # must never reach a folder outside the library through one.
                     children.extend(
                         entry.path
                         for entry in entries
                         if entry.is_dir(follow_symlinks=False)
+                        and not is_link_or_missing(entry.path)
                     )
             except OSError as exc:
                 logger.warning("Layout rename: cannot list %s (%s)", parent, exc)
@@ -1810,15 +1816,19 @@ def claim_own_moves(session: Session, pairs: Iterable[tuple]) -> set:
     if not wanted:
         return set()
     olds = {old for old, _ in wanted}
-    rows = session.exec(
-        select(PictureMove)
-        .where(PictureMove.old_path.in_(olds))
-        .where(PictureMove.consumed.is_(False))
-        .order_by(PictureMove.id)
-    ).all()
+    # A folder rename pairs every file in it, past SQLite's bound-parameter
+    # limit: chunked by old path. A pair's rows share its old path, so each
+    # pair's list is read whole from one chunk and stays in ``id`` order.
     by_pair: dict = {}
-    for row in rows:
-        by_pair.setdefault((row.old_path, row.new_path), []).append(row)
+    for path_chunk in chunked(sorted(olds)):
+        rows = session.exec(
+            select(PictureMove)
+            .where(PictureMove.old_path.in_(path_chunk))
+            .where(PictureMove.consumed.is_(False))
+            .order_by(PictureMove.id)
+        ).all()
+        for row in rows:
+            by_pair.setdefault((row.old_path, row.new_path), []).append(row)
 
     claimed = set()
     for pair in wanted:

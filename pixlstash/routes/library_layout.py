@@ -22,6 +22,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.event_types import EventType
 from pixlstash.services.layout_migration_service import (
     MIGRATION_BATCH,
@@ -41,6 +42,7 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.host_open import open_in_file_manager
 from pixlstash.utils.library_layout import (
     DEFAULT_LAYOUT,
+    Facet,
     folder_name,
     format_layout,
     parse_layout,
@@ -57,6 +59,20 @@ logger = get_logger(__name__)
 #: a person can hold in their head. The background engine batches at the same
 #: order (``layout_move_service.BATCH_SIZE``) and simply takes more passes.
 MOVE_TO_MATCH_MAX_IDS = 200
+
+# The 400 for an unfiled folder name that is not one safe path component. It
+# names no part of what was sent: the log line beside the raise has that.
+UNFILED_NOT_SAFE = (
+    "layout_unfiled must be a single safe path component: no path separator, "
+    "no '..', nothing a folder name cannot hold."
+)
+
+# The 400 for a layout naming something that is not a facet. It names the
+# server's vocabulary, never the facet that was sent.
+NOT_A_LAYOUT_FACET = (
+    "The layout names something that is not a layout facet; "
+    f"expected one of {', '.join(facet.value for facet in Facet)}."
+)
 
 
 class LayoutResponse(BaseModel):
@@ -285,7 +301,7 @@ class MigrationRunRequest(BaseModel):
         }
     )
 
-    after_id: int = Field(
+    after_id: SqliteInt = Field(
         default=0,
         ge=0,
         description=(
@@ -329,7 +345,7 @@ class MigrationRunResponse(BaseModel):
 
 
 class MoveToMatchRequest(BaseModel):
-    picture_ids: list[int] = Field(description="The pictures to move.")
+    picture_ids: list[SqliteInt] = Field(description="The pictures to move.")
 
 
 class MoveToMatchResponse(BaseModel):
@@ -441,18 +457,23 @@ def create_router(server) -> APIRouter:
         # check, so an unfiled name that could escape the library root would be
         # stored and only refused later, on read, as if the owner had asked for
         # no layout at all.
+        # The refusals name the server's own vocabulary, never the text the
+        # caller sent; not even a cleaned-up suggestion, which is that text
+        # with its unsafe characters swapped out.
         if unfiled is not None and unfiled != folder_name(unfiled):
+            logger.info("Layout refused (400): unfiled %r is not safe.", unfiled)
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"layout_unfiled must be a single safe path component, got "
-                    f"{unfiled!r} (try {folder_name(unfiled)!r})"
-                ),
+                detail=UNFILED_NOT_SAFE,
             )
         try:
             parse_layout(layout, unfiled or DEFAULT_LAYOUT.unfiled)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            logger.info("Layout refused (400): %s", exc)
+            raise HTTPException(
+                status_code=400,
+                detail=NOT_A_LAYOUT_FACET,
+            ) from exc
         set_layout(server.vault.db, layout, unfiled)
         return _response(*get_layout(server.vault.db))
 
@@ -615,7 +636,7 @@ def create_router(server) -> APIRouter:
         # names what a host file manager is about to open.
         if relative not in {folder["path"] for folder in listed}:
             raise HTTPException(
-                status_code=404, detail=f"No picture is filed in {relative}"
+                status_code=404, detail="No picture is filed in that folder."
             )
         root = os.path.realpath(server.vault.image_root)
         folder = os.path.realpath(os.path.join(root, *relative.split("/")))
@@ -672,7 +693,7 @@ def register_picture_routes(router: APIRouter, server) -> None:
         ),
         response_model=PictureLayoutResponse,
     )
-    def get_picture_layout(id: int, request: Request):
+    def get_picture_layout(id: SqliteInt, request: Request):
         entry = picture_layout(server.vault, id)
         if entry is None:
             # Either the picture is not in a laid-out root or it does not exist.

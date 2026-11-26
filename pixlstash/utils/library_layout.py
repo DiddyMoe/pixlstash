@@ -122,12 +122,13 @@ def refusal_for_folder_name(name: str) -> str | None:
         name: One path component, as typed.
 
     Returns:
-        A sentence saying what is wrong, or None when the name is usable.
+        A sentence saying what is wrong, or None when the name is usable. It
+        never repeats *name*: routes answer it to the caller as it is.
     """
     if not name or not name.strip():
         return "A folder needs a name."
     if name in (".", ".."):
-        return f"{name!r} is not a folder name."
+        return "'.' and '..' are not folder names."
     if _UNSAFE_FOLDER_CHARS_RE.search(name):
         return 'A folder name cannot contain / \\ : * ? " < > | or control characters.'
     if name.startswith("."):
@@ -138,7 +139,8 @@ def refusal_for_folder_name(name: str) -> str | None:
         return "A folder name cannot start with a space."
     if name.split(".")[0].lower() in _WINDOWS_RESERVED:
         return (
-            f"{name!r} is a name Windows reserves, so the folder could not exist there."
+            "Windows reserves CON, PRN, AUX, NUL, COM1 to COM9 and LPT1 to LPT9, "
+            "with or without an extension, so the folder could not exist there."
         )
     if len(name.encode("utf-8")) > 255:
         return "That name is too long for a folder."

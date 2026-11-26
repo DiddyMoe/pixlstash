@@ -52,6 +52,7 @@ from pixlstash.utils.library_layout import (
     parse_layout,
     read_named_components,
     reconcile_move,
+    refusal_for_folder_name,
     relocate,
     render,
 )
@@ -325,6 +326,28 @@ def test_a_tree_below_a_folder_that_happens_to_be_named_like_the_unfiled_one():
 )
 def test_folder_name(name, expected):
     assert folder_name(name) == expected
+
+
+@pytest.mark.parametrize(
+    "name, reason",
+    [
+        ("..", "'.' and '..' are not folder names."),
+        (
+            "CON.example-leak",
+            "Windows reserves CON, PRN, AUX, NUL, COM1 to COM9 and LPT1 to LPT9, "
+            "with or without an extension, so the folder could not exist there.",
+        ),
+        (
+            "lpt7",
+            "Windows reserves CON, PRN, AUX, NUL, COM1 to COM9 and LPT1 to LPT9, "
+            "with or without an extension, so the folder could not exist there.",
+        ),
+    ],
+)
+def test_a_refused_folder_name_is_not_repeated_in_the_reason(name, reason):
+    """Routes answer the reason to the caller as it is, so it is the server's
+    sentence and never the name typed."""
+    assert refusal_for_folder_name(name) == reason
 
 
 def test_matching_ignores_case_and_unicode_form():

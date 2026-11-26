@@ -162,8 +162,20 @@ async function load() {
   error.value = "";
   loadError.value = "";
   refused.value = false;
+  // An edit the server does not hold yet (its save is debounced or in flight)
+  // outranks this read: applying the read would snap the builder back to the
+  // stored layout, and the save's own answer may already have landed.
+  const seq = editSeq;
   try {
-    applySettings(await getLayoutSettings());
+    const body = await getLayoutSettings();
+    // A refused save whose re-read also failed left the builder on a layout
+    // the server may not hold, with no save coming to put that right: this
+    // read is the re-read it was owed.
+    if (seq === editSeq && (storedEditSeq === editSeq || rereadOwed)) {
+      applySettings(body);
+      storedEditSeq = editSeq;
+      rereadOwed = false;
+    }
     loaded.value = true;
     // A library with no layout opens on an empty slot, and the dialog writes
     // NOTHING until the owner picks a level.
@@ -187,19 +199,6 @@ async function load() {
   }
 }
 
-// Vuetify dialogs stay mounted after the first open, so onMounted fires only
-// once - fetch on the open transition instead (the house pattern). `blocked` is
-// watched alongside it because the registry read that answers it is still in
-// flight when the dialog opens.
-watch(
-  [() => props.open, blocked],
-  ([isOpen, cannot]) => {
-    if (!isOpen || cannot || loaded.value) return;
-    load();
-  },
-  { immediate: true },
-);
-
 /**
  * Coalesce a burst of edits into one PATCH.
  *
@@ -219,6 +218,12 @@ let editSeq = 0;
  * rather than the one on screen.
  */
 let storedEditSeq = 0;
+/**
+ * A save was refused and the re-read after it failed, so the builder may show a
+ * layout the server does not hold and no save is coming to say which. The next
+ * read of the layout (a reopen) is adopted whatever `storedEditSeq` says.
+ */
+let rereadOwed = false;
 /**
  * Bumped per count, and by every edit, so a count read for a layout or sweep
  * that is no longer on screen is not applied.
@@ -248,6 +253,8 @@ function scheduleWrite(patch) {
   // The count on the bar now describes a layout nobody is looking at, and so
   // does a count still being read: dropped, so it cannot land and clear this.
   countStale.value = true;
+  countUnavailable.value = false;
+  rereadOwed = false;
   dropCount();
   editSeq += 1;
   const seq = editSeq;
@@ -277,13 +284,29 @@ async function save(next, seq = ++editSeq) {
       errorDetail(err) || err?.message || "Could not save the layout.";
     // The server stored nothing, so what the builder is showing is not what is
     // recorded. Re-read rather than leave it showing a layout that was refused.
+    let held;
     try {
-      applySettings(await getLayoutSettings());
-      // The builder now shows the layout the server holds, so it can be counted.
-      if (seq === editSeq) storedEditSeq = seq;
-    } catch {
-      // Already covered by the error above.
+      held = await getLayoutSettings();
+    } catch (rereadErr) {
+      console.warn(
+        "Could not re-read the layout after a refused save; the builder may " +
+          "show a layout the server does not hold, so it is not counted:",
+        rereadErr,
+      );
+      // Nothing is counting and nothing will: the bar says so instead of
+      // "counting…" for good.
+      if (seq === editSeq) {
+        rereadOwed = true;
+        countUnavailable.value = true;
+      }
+      return;
     }
+    // A newer edit is queued and its own save answers for the builder.
+    if (seq !== editSeq) return;
+    applySettings(held);
+    // The builder now shows the layout the server holds, so it can be counted.
+    storedEditSeq = seq;
+    await refreshPreview();
   }
 }
 
@@ -312,6 +335,13 @@ const preview = ref(null);
 const previewing = ref(false);
 /** The count on the bar no longer describes the layout on screen. */
 const countStale = ref(true);
+/**
+ * Stale, and no count is coming: the count read failed, or a refused save's
+ * re-read did. The bar says "count unavailable" rather than "counting…", which
+ * would otherwise stay up with nothing being counted. Move stays inert, since
+ * the count is still stale.
+ */
+const countUnavailable = ref(false);
 const migrating = ref(false);
 /** Undo is one request with no per-pass progress, so its bar is indeterminate. */
 const undoing = ref(false);
@@ -492,6 +522,7 @@ async function refreshPreview() {
   // The layout on screen is not saved yet, so the server would count the one it
   // holds. The count stays stale; the save counts again when it lands.
   if (storedEditSeq !== editSeq) return;
+  countUnavailable.value = false;
   previewing.value = true;
   try {
     const plan = await getLayoutMigrationPreview({
@@ -508,6 +539,7 @@ async function refreshPreview() {
       return;
     }
     preview.value = null;
+    countUnavailable.value = true;
     // Only when the run has not already said something more specific: "the
     // move stopped part way, press Move again" is what the owner has to act
     // on, and a failed re-count on top of it is the lesser fact.
@@ -519,6 +551,33 @@ async function refreshPreview() {
     if (seq === previewSeq) previewing.value = false;
   }
 }
+
+// Vuetify dialogs stay mounted after the first open, so onMounted fires only
+// once - fetch on the open transition instead (the house pattern). `blocked` is
+// watched alongside it because the registry read that answers it is still in
+// flight when the dialog opens.
+//
+// Every open reads again, not only the first. Pictures are imported, assigned
+// and moved while the dialog is closed, so the count from the last visit is not
+// the plan any more, and the Move button would offer it as one. A move or an
+// undo still going is the exception: its own loop owns the bar until it ends.
+// Declared below the state it reads: `immediate` runs it during setup, and
+// `load()` reads the edit sequence before its first await.
+watch(
+  [() => props.open, blocked],
+  ([isOpen, cannot], previous) => {
+    if (!isOpen || cannot) return;
+    if (!loaded.value) {
+      load();
+      return;
+    }
+    // Loaded and already open: `blocked` settled again, nothing was reopened.
+    if (previous?.[0]) return;
+    if (migrating.value || undoing.value) return;
+    load();
+  },
+  { immediate: true },
+);
 
 // The sweep changes the count, so toggling it is an edit as far as the bar is
 // concerned: stale until the new count lands.
@@ -890,7 +949,13 @@ function netDelta(row) {
             role="status"
             aria-live="polite"
           >
-            <template v-if="previewing || countStale">
+            <template v-if="countUnavailable">
+              <div class="layout-consequence__num">count unavailable</div>
+              <div class="layout-consequence__sub">
+                reopen this dialog to count again
+              </div>
+            </template>
+            <template v-else-if="previewing || countStale">
               <div class="layout-consequence__num">counting…</div>
             </template>
             <template v-else-if="lastRun">
