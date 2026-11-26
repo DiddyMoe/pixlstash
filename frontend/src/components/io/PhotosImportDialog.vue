@@ -4,8 +4,11 @@ import {
   extractSupportedImportFilesFromDataTransfer,
   isSupportedImportFile,
   IMPORT_FILE_ACCEPT,
+  isFileDrag,
   unreadableDropReporter,
 } from "../../utils/media.js";
+import { isOwnShareCopyDrop } from "../../utils/shareDrag.js";
+import { useNoticeStore } from "../../stores/useNoticeStore";
 import { listProjects } from "../../api/projects.js";
 import ProjectEditor from "../editors/ProjectEditor.vue";
 import AppButton from "../widgets/AppButton.vue";
@@ -88,19 +91,14 @@ const dropMessage = computed(() => {
   if (!count) {
     return "Drop files here or select files with the Choose Files button.";
   }
-  return `${count} file${count === 1 ? "" : "s"} ready to import.`;
+  return `${count.toLocaleString()} file${count === 1 ? "" : "s"} ready to import.`;
 });
 
 function getSupportedFiles(fileList) {
   return Array.from(fileList || []).filter(isSupportedImportFile);
 }
 
-async function getSupportedFilesFromDataTransfer(dataTransfer) {
-  if (!dataTransfer) return [];
-  return extractSupportedImportFilesFromDataTransfer(dataTransfer, {
-    onUnreadable: unreadableDropReporter(dataTransfer),
-  });
-}
+const noticeStore = useNoticeStore();
 
 function openLocalPicker() {
   if (localInputRef.value) {
@@ -158,8 +156,36 @@ async function handleLocalDrop(event) {
   event?.preventDefault?.();
   event?.stopPropagation?.();
   dragActive.value = false;
-  const files = await getSupportedFilesFromDataTransfer(event?.dataTransfer);
-  if (!files.length) return;
+  const dataTransfer = event?.dataTransfer;
+  if (!dataTransfer) return;
+  // Our own drag-out dropped back: the window's drop listener says so.
+  if (isOwnShareCopyDrop(dataTransfer)) return;
+  // Read before the walk awaits: the drop's payload is gone after dispatch.
+  const carriedFiles = isFileDrag(dataTransfer);
+  const reportUnreadable = unreadableDropReporter(dataTransfer);
+  let hadUnreadable = false;
+  const files = await extractSupportedImportFilesFromDataTransfer(
+    dataTransfer,
+    {
+      onUnreadable: (report) => {
+        hadUnreadable = true;
+        reportUnreadable(report);
+      },
+    },
+  );
+  if (!files.length) {
+    // The window's drop listener leaves this zone's drops to it
+    // (`data-owns-file-drop`), so the zone says why nothing came in. The
+    // unreadable-items warning already has, when that is the reason.
+    if (hadUnreadable) return;
+    noticeStore.warning(
+      carriedFiles
+        ? "None of those files are a supported image, video or archive."
+        : "That drop carried no files. If you dragged a lot of files at once, drag fewer at a time, or use Import.",
+      { key: "import-unsupported-files" },
+    );
+    return;
+  }
   triggerLocalImport(files);
 }
 
@@ -213,6 +239,7 @@ watch(dialogOpen, (isOpen) => {
           <div
             class="local-import-dropzone"
             :class="{ 'is-dragging': dragActive }"
+            data-owns-file-drop
             @dragenter.stop.prevent="handleLocalDragEnter"
             @dragover.stop.prevent="handleLocalDragOver"
             @dragleave.stop.prevent="handleLocalDragLeave"

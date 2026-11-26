@@ -199,11 +199,21 @@ export function useGridDragDrop(
     // a scrap of text; saying "not supported" there sent the owner hunting a
     // regression in the importer.
     const carriedFiles = isFileDrag(e.dataTransfer);
+    const reportUnreadable = unreadableDropReporter(e.dataTransfer);
+    let hadUnreadable = false;
     const files = await extractSupportedImportFilesFromDataTransfer(
       e.dataTransfer,
-      { onUnreadable: unreadableDropReporter(e.dataTransfer) },
+      {
+        onUnreadable: (report) => {
+          hadUnreadable = true;
+          reportUnreadable(report);
+        },
+      },
     );
     if (!files.length) {
+      // The unreadable-items warning already said why nothing came in; a
+      // second "not supported" on top of it blames files that were never read.
+      if (hadUnreadable) return;
       noticeStore.warning(
         carriedFiles
           ? "None of those files are a supported image, video or archive."

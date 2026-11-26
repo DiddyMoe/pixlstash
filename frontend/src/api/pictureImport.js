@@ -103,6 +103,8 @@ export const IMPORT_ENDPOINTS = {
  * @typedef {Object} StagingSession
  * @property {string} stagingId    Opaque session id used on every later call.
  * @property {number} safeThreshold Declared file count for the safe-window hint (0 if none).
+ * @property {string} libraryUuid  The library the session belongs to, as the
+ *   server names it ("" from a server that does not say).
  * @property {Object} raw
  */
 
@@ -140,6 +142,7 @@ export async function openStagingSession({
   return {
     stagingId: d.staging_id ?? null,
     safeThreshold: d.safe_threshold ?? 0,
+    libraryUuid: d.library_uuid ?? "",
     raw: d,
   };
 }

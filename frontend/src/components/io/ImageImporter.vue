@@ -1,9 +1,10 @@
 <script setup>
-import { nextTick, onBeforeUnmount, ref } from "vue";
+import { nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { API_BASE_URL, isReadOnly } from "../../utils/apiClient";
 import { useTasksStore } from "../../stores/useTasksStore";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useImportArrivalsStore } from "../../stores/useImportArrivalsStore";
+import { useLibrariesStore } from "../../stores/useLibrariesStore";
 import {
   cancelStaging,
   commitStaging,
@@ -13,6 +14,11 @@ import {
 } from "../../api/pictureImport";
 import { errorDetail } from "../../utils/apiError";
 import { importRelativePath } from "../../utils/media";
+import {
+  claimCommitRecords,
+  dropCommitRecord,
+  saveCommitRecord,
+} from "../../utils/importCommitRecord";
 import {
   abortableSleep,
   isTransientError,
@@ -71,6 +77,7 @@ const emit = defineEmits([
 const tasksStore = useTasksStore();
 const noticeStore = useNoticeStore();
 const arrivals = useImportArrivalsStore();
+const librariesStore = useLibrariesStore();
 
 // Whole-flow gate (Phase A + Phase B) used for re-entrancy.
 const importActive = ref(false);
@@ -122,6 +129,8 @@ const TERMINAL_IMPORT_PHASES = new Set([
 
 // The longest wait between two sends of one batch, or two commits.
 const MAX_RESEND_WAIT_MS = 8000;
+// How many times one batch, or one commit, is sent.
+const MAX_RETRIES = 3;
 
 /** The code of a refusal the server explained (`detail: {code, message}`). */
 function refusalCode(err) {
@@ -525,7 +534,6 @@ async function startImport(files, options = {}) {
   });
 
   const BATCH_SIZE = 100;
-  const MAX_RETRIES = 3;
   const MIN_TIMEOUT_MS = 60000;
   const TIMEOUT_PER_FILE_MS = 4000;
   const TIMEOUT_PER_MB_MS = 100;
@@ -552,6 +560,10 @@ async function startImport(files, options = {}) {
       return;
     }
     currentStagingId = session.stagingId;
+    // The library the session belongs to, as the server names it: the commit
+    // record is kept under it, so a reload resumes the import in that library
+    // whether or not the libraries registry had loaded when it was sent.
+    const sessionLibraryUuid = session.libraryUuid;
 
     for (let i = 0; i < files.length; i += BATCH_SIZE) {
       if (cancelImport.value) {
@@ -738,11 +750,32 @@ async function startImport(files, options = {}) {
     });
 
     const stagingId = currentStagingId;
+    // Kept until the commit is answered, so a reload while it is unanswered
+    // picks the import up again (resumeInterruptedCommits). From the answer
+    // on, the tasks store keeps the import for a reload.
+    const libraryUuid = sessionLibraryUuid;
+    if (libraryUuid) {
+      saveCommitRecord(libraryUuid, {
+        runId: importRunId,
+        stagingId,
+        total: importTotal.value,
+      });
+    } else {
+      console.warn(
+        "[IMPORT] The staging session named no library; a reload before the commit is answered loses this import",
+        stagingId,
+      );
+    }
     // The store's signal, not this importer's: a view switch unmounts the
     // importer and the commit is still settled and handed to the store, but
     // signing out stops it.
     const stopSignal = tasksStore.importWorkSignal();
-    const commit = await commitImport(stagingId, MAX_RETRIES, stopSignal);
+    let commit;
+    try {
+      commit = await commitImport(stagingId, MAX_RETRIES, stopSignal);
+    } finally {
+      if (libraryUuid) dropCommitRecord(libraryUuid, stagingId);
+    }
     if (commit.aborted || stopSignal.aborted) {
       endUnfollowedImport(stagingId);
       return;
@@ -765,6 +798,103 @@ async function startImport(files, options = {}) {
     logImportTrace("Import failed", { message });
   }
 }
+
+/**
+ * Settle a commit that a reload of the tab interrupted: all of its
+ * files were staged, so the import goes ahead as dropped. The commit is sent
+ * again, which the server answers with the import it already started, if it
+ * did; a commit still being taken is waited on. Then the tasks store follows
+ * the import, as it follows any other.
+ */
+async function resumeCommit(libraryUuid, { runId, stagingId, total }) {
+  logImportTrace("Picking up a commit a reload interrupted", { stagingId });
+  tasksStore.setImportRun(runId, {
+    status: "running",
+    percent: 0,
+    current: 0,
+    total,
+    message: "Handing over to the server…",
+    label: "Importing pictures",
+  });
+  const stopSignal = tasksStore.importWorkSignal();
+  let commit;
+  try {
+    commit = await commitImport(stagingId, MAX_RETRIES, stopSignal);
+  } finally {
+    dropCommitRecord(libraryUuid, stagingId);
+  }
+  if (commit.aborted || stopSignal.aborted) {
+    tasksStore.clearImportRun(runId);
+    logImportTrace("Polling stopped before the resumed commit was answered", {
+      stagingId,
+    });
+    return;
+  }
+  if (commit.committed) {
+    tasksStore
+      .followImportRun({
+        runId,
+        stagingId,
+        backendUrl: props.backendUrl,
+        total,
+      })
+      .catch((error) =>
+        console.error(
+          "[IMPORT] Could not follow the import picked up after a reload",
+          stagingId,
+          error,
+        ),
+      );
+    return;
+  }
+  tasksStore.clearImportRun(runId);
+  console.warn(
+    "[IMPORT] The commit a reload interrupted was refused",
+    stagingId,
+    commit.error,
+  );
+  if (commit.error?.response?.status === 404) {
+    // The server no longer has the session (restarted, or it expired).
+    noticeStore.warning(
+      "The import a reload interrupted is no longer on the server. Drop those pictures again.",
+      { key: "import-resume-failed" },
+    );
+    return;
+  }
+  noticeStore.warning(
+    `The import a reload interrupted could not start: ${refusalMessage(commit.error, "the server refused it.")}`,
+    { key: "import-resume-failed" },
+  );
+  cancelStaging({ backendUrl: props.backendUrl, stagingId }).catch((err) => {
+    console.warn(
+      "Could not discard the staging session; the server removes it when it expires",
+      stagingId,
+      err,
+    );
+  });
+}
+
+/** Pick up the commits of `libraryUuid` a reload interrupted. */
+function resumeInterruptedCommits(libraryUuid) {
+  if (!libraryUuid || isReadOnly.value) return;
+  for (const record of claimCommitRecords(libraryUuid)) {
+    resumeCommit(libraryUuid, record).catch((error) =>
+      console.error(
+        "[IMPORT] Could not pick up the commit a reload interrupted",
+        record.stagingId,
+        error,
+      ),
+    );
+  }
+}
+
+// The library is known once the registry has loaded, after a reload as on a
+// sign-in; its interrupted commits are picked up then.
+watch(
+  () => librariesStore.activeLibrary?.uuid ?? "",
+  resumeInterruptedCommits,
+  { immediate: true },
+);
 
 onBeforeUnmount(() => {
   disarmGuard();

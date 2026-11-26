@@ -264,8 +264,11 @@ describe("a drop on the grid that imports nothing", () => {
 });
 
 describe("a grid drop with items that could not be read", () => {
-  /** A dropped folder holding one readable picture and one the browser refuses. */
-  function folderDrop() {
+  /**
+   * A dropped folder holding one readable picture and one the browser refuses,
+   * or, with `readable: false`, only the refused one.
+   */
+  function folderDrop({ readable = true } = {}) {
     const fileEntry = (name, file) => ({
       isFile: true,
       isDirectory: false,
@@ -275,7 +278,7 @@ describe("a grid drop with items that could not be read", () => {
         file ? ok(file) : fail?.(new DOMException("gone", "NotFoundError")),
     });
     const children = [
-      fileEntry("keep.jpg", new File(["x"], "keep.jpg")),
+      ...(readable ? [fileEntry("keep.jpg", new File(["x"], "keep.jpg"))] : []),
       fileEntry("gone.jpg", null),
     ];
     const entry = {
@@ -319,6 +322,16 @@ describe("a grid drop with items that could not be read", () => {
     ]);
     expect(unreadableNotices().map((n) => [n.text, n.count])).toEqual([
       ["1 item could not be read and was skipped", 1],
+    ]);
+  });
+
+  it("says only that the items could not be read when none of them could", async () => {
+    const event = folderDrop({ readable: false });
+    const importer = { startImport: vi.fn() };
+    await grid([1, 2], importer).handleGridDrop(event);
+    expect(importer.startImport).not.toHaveBeenCalled();
+    expect(useNoticeStore().notices.map((n) => [n.key, n.text])).toEqual([
+      ["import-unreadable-items", "1 item could not be read and was skipped"],
     ]);
   });
 

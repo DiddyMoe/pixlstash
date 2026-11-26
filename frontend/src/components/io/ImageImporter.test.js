@@ -27,6 +27,8 @@ import {
   stageFiles,
 } from "../../api/pictureImport";
 import { useTasksStore } from "../../stores/useTasksStore";
+import { useLibrariesStore } from "../../stores/useLibrariesStore";
+import { useNoticeStore } from "../../stores/useNoticeStore";
 import { extractSupportedImportFilesFromDataTransfer } from "../../utils/media";
 import ImageImporter from "./ImageImporter.vue";
 
@@ -191,7 +193,9 @@ beforeEach(() => {
   openStagingSession.mockResolvedValue({
     stagingId: "staging-1",
     safeThreshold: 0,
-    raw: {},
+    libraryUuid: "lib-1",
+    // The importer reads the mapped field: the server's body names no library.
+    raw: { staging_id: "staging-1", safe_threshold: 0 },
   });
   stageFiles.mockImplementation(uploadAnsweringAfter(10));
   commitStaging.mockResolvedValue({
@@ -661,5 +665,172 @@ describe("ImageImporter after the commit", () => {
       message: "Imported 2 images",
     });
     expect(window.sessionStorage.getItem("pixlstash:importRuns")).toBeNull();
+  });
+});
+
+describe("ImageImporter and a reload during the commit", () => {
+  const COMMIT_KEY = "pixlstash:importCommit:lib-1";
+
+  function inLibrary() {
+    useLibrariesStore().libraries = [{ uuid: "lib-1", is_active: true }];
+  }
+  function interruptedCommit(stagingId) {
+    window.sessionStorage.setItem(
+      COMMIT_KEY,
+      JSON.stringify([{ runId: "import-before", stagingId, total: 2 }]),
+    );
+  }
+  function savedCommits() {
+    return JSON.parse(window.sessionStorage.getItem(COMMIT_KEY) || "[]");
+  }
+
+  it("keeps the staging id while the commit is unanswered", async () => {
+    inLibrary();
+    let answer;
+    commitStaging.mockImplementation(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    const importer = mountImporter();
+
+    const run = importer.vm.startImport(pictures(2));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(savedCommits()).toEqual([
+      expect.objectContaining({ stagingId: "staging-1", total: 2 }),
+    ]);
+
+    answer({ taskId: "task-1", stagedCount: 2, replayed: false });
+    await vi.advanceTimersByTimeAsync(3000);
+    await run;
+    // The tasks store keeps it from the answer on.
+    expect(window.sessionStorage.getItem(COMMIT_KEY)).toBeNull();
+    expect(importer.emitted("import-finished")).toHaveLength(1);
+  });
+
+  // The record is the session's library's, as the staging open names
+  // it, not whichever library this tab believes is active. Before the registry
+  // has loaded there is no active library at all, and the commit was not kept.
+  it.each([
+    ["before the libraries registry has loaded", () => {}],
+    [
+      "while another library is the active one",
+      () => {
+        useLibrariesStore().libraries = [{ uuid: "lib-2", is_active: true }];
+      },
+    ],
+  ])(
+    "keeps the unanswered commit under the session's own library %s",
+    async (_when, arrange) => {
+      arrange();
+      let answer;
+      commitStaging.mockImplementation(
+        () => new Promise((resolve) => (answer = resolve)),
+      );
+      const importer = mountImporter();
+
+      const run = importer.vm.startImport(pictures(2));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(savedCommits()).toEqual([
+        expect.objectContaining({ stagingId: "staging-1", total: 2 }),
+      ]);
+      expect(
+        window.sessionStorage.getItem("pixlstash:importCommit:lib-2"),
+      ).toBeNull();
+
+      answer({ taskId: "task-1", stagedCount: 2, replayed: false });
+      await vi.advanceTimersByTimeAsync(3000);
+      await run;
+    },
+  );
+
+  it("picks the import up again once the library is known", async () => {
+    interruptedCommit("staging-reload");
+    commitStaging.mockResolvedValue({
+      taskId: "task-1",
+      stagedCount: 2,
+      replayed: true,
+    });
+    mountImporter();
+    const store = useTasksStore();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(commitStaging).not.toHaveBeenCalled();
+
+    inLibrary();
+    // Short of the 2.6 s a completed row stays in the Tasks panel.
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(commitStaging).toHaveBeenCalledTimes(1);
+    expect(commitStaging.mock.calls[0][0]).toMatchObject({
+      stagingId: "staging-reload",
+    });
+    expect(cancelStaging).not.toHaveBeenCalled();
+    expect(onlyRun(store)).toMatchObject({
+      status: "completed",
+      message: "Imported 2 images",
+    });
+    expect(window.sessionStorage.getItem(COMMIT_KEY)).toBeNull();
+  });
+
+  it("does not commit again what this page is still committing", async () => {
+    inLibrary();
+    let answer;
+    commitStaging.mockImplementation(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    const importer = mountImporter();
+    const run = importer.vm.startImport(pictures(2));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(commitStaging).toHaveBeenCalledTimes(1);
+
+    // The sidebar's importer, or the grid's again after a view switch.
+    const other = mount(ImageImporter);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(commitStaging).toHaveBeenCalledTimes(1);
+
+    answer({ taskId: "task-1", stagedCount: 2, replayed: false });
+    await vi.advanceTimersByTimeAsync(3000);
+    await run;
+    other.unmount();
+  });
+
+  it("says so when the server no longer has the interrupted import", async () => {
+    interruptedCommit("staging-gone");
+    commitStaging.mockRejectedValue(httpError(404));
+    inLibrary();
+    mountImporter();
+    const store = useTasksStore();
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(
+      useNoticeStore()
+        .notices.filter((n) => n.key === "import-resume-failed")
+        .map((n) => n.text),
+    ).toEqual([
+      "The import a reload interrupted is no longer on the server. Drop those pictures again.",
+    ]);
+    expect(cancelStaging).not.toHaveBeenCalled();
+    expect(store.importRuns).toEqual({});
+    expect(window.sessionStorage.getItem(COMMIT_KEY)).toBeNull();
+  });
+
+  it("discards the staging when the server refuses the interrupted commit", async () => {
+    const message = "Not enough free disk space to import these.";
+    interruptedCommit("staging-full");
+    commitStaging.mockRejectedValue(
+      refusal(507, "insufficient_storage", message),
+    );
+    inLibrary();
+    mountImporter();
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(
+      useNoticeStore()
+        .notices.filter((n) => n.key === "import-resume-failed")
+        .map((n) => n.text),
+    ).toEqual([`The import a reload interrupted could not start: ${message}`]);
+    expect(cancelStaging).toHaveBeenCalledTimes(1);
+    expect(cancelStaging.mock.calls[0][0]).toMatchObject({
+      stagingId: "staging-full",
+    });
+    expect(useTasksStore().importRuns).toEqual({});
   });
 });

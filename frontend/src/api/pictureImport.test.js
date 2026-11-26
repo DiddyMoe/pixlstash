@@ -12,12 +12,33 @@ import {
   commitStaging,
   fetchStagingStatus,
   IMPORT_ENDPOINTS,
+  openStagingSession,
   stageFiles,
 } from "./pictureImport";
 
 beforeEach(() => {
   apiClient.get.mockReset();
   apiClient.post.mockReset();
+});
+
+describe("api/pictureImport: opening a staging session", () => {
+  it("names the library the server opened the session in", async () => {
+    apiClient.post.mockResolvedValue({
+      data: { staging_id: "s1", safe_threshold: 3, library_uuid: "lib-9" },
+    });
+    const session = await openStagingSession({ backendUrl: "/be" });
+    expect(session).toMatchObject({
+      stagingId: "s1",
+      safeThreshold: 3,
+      libraryUuid: "lib-9",
+    });
+  });
+
+  it("names no library when an older server does not say", async () => {
+    apiClient.post.mockResolvedValue({ data: { staging_id: "s1" } });
+    const session = await openStagingSession({ backendUrl: "/be" });
+    expect(session.libraryUuid).toBe("");
+  });
 });
 
 describe("api/pictureImport: resending a batch", () => {
