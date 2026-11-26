@@ -66,7 +66,9 @@ from pixlstash.utils.adapter_header import (
     describe_adapter,
 )
 from pixlstash.utils.known_base_models import SOURCE_RANK, identify, rank
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.model_utils import quant_from_filename
+from pixlstash.utils.query.folder_prefix import FolderPrefix
 
 logger = get_logger(__name__)
 
@@ -168,11 +170,6 @@ _WRITE_BATCH = 200
 # scan that reads tens of gigabytes. ``_WRITE_BATCH`` is therefore left alone: it
 # bounds transaction size, which is a job it still does correctly.
 _WRITE_INTERVAL_S = 2.0
-
-# SQLite LIKE wildcards. Escaped before a relpath prefix is used in a LIKE, or a
-# folder named ``sd_xl`` would match ``sdaxl`` and quietly protect the wrong
-# subtree from the missing sweep.
-_LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": "\\%", "_": "\\_"})
 
 
 @dataclass
@@ -315,6 +312,44 @@ def _still_arriving(path: str) -> bool:
             logger.info("Cannot stat %s, leaving it for the next scan: %s", path, exc)
             return True
     return not safetensors_complete(path) and describe_adapter(path) is not None
+
+
+def _real(path: str) -> str:
+    """*path* with every link resolved, case-folded where the OS folds case."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _walked_key(path: str, real: str) -> tuple:
+    """What tells directory *path* (real path *real*) apart from every other.
+
+    ``(st_dev, st_ino)`` from ``os.stat``, which follows symlinks and
+    junctions: the identity ``os.path.samestat`` and GNU ``find`` compare.
+    A real path can miss that two spellings are one directory (a bind mount,
+    a case-folding volume on a case-sensitive OS) and the device and inode
+    do not. Python documents ``st_ino`` as identifying a file only when it is
+    non-zero, and some network volumes answer 0; a directory that answers 0,
+    or that cannot be stat-ed (``os.walk`` then reports it to ``on_error``,
+    which marks it unreachable), is told apart by its real path, which no
+    ``(st_dev, st_ino)`` key can equal.
+    """
+    try:
+        stat_result = os.stat(path)
+    except OSError as exc:
+        logger.info(
+            "Model scan cannot stat %s (%s); telling it apart by its real path %s.",
+            path,
+            exc,
+            real,
+        )
+        return ("path", real)
+    if stat_result.st_ino == 0:
+        return ("path", real)
+    return (stat_result.st_dev, stat_result.st_ino)
+
+
+def _is_within(path: str, base: str) -> bool:
+    """Whether real path *path* is *base* or lies under it (both from ``_real``)."""
+    return path == base or path.startswith(base.rstrip(os.sep) + os.sep)
 
 
 def _utcnow() -> str:
@@ -480,7 +515,7 @@ class ModelFolderScanner:
             if not self._is_readable(path):
                 continue
             known = self._known_files(folder_id)
-            for abs_path, relpath in self._walk(path, set()):
+            for abs_path, relpath in self._walk(folder_id, path, set()):
                 if os.path.basename(relpath).lower() in names and relpath not in known:
                     found.append((folder_id, abs_path, relpath))
         return found
@@ -517,7 +552,7 @@ class ModelFolderScanner:
         # and a caller with no denominator has nothing to show for the expensive
         # one. Only ``.safetensors`` files are yielded, so the list is small even
         # for a folder of 1,800 adapters.
-        files = list(self._walk(path, blocked))
+        files = list(self._walk(folder_id, path, blocked))
         if not files and not blocked and self._is_empty_dir(path):
             # An unmounted drive often leaves its mount point behind, empty and
             # readable. Sweeping that would mark every model missing and hash
@@ -600,18 +635,48 @@ class ModelFolderScanner:
             logger.info("Cannot list %s to see whether it is empty: %s", path, exc)
             return False
 
-    @staticmethod
-    def _walk(root: str, blocked: set[str]):
+    def _walk(self, folder_id: int, root: str, blocked: set[str]):
         """Yield ``(abs_path, relpath)`` for every model file under *root*.
 
-        Symlinks are not followed (``os.walk`` default), so a folder that links
-        back into itself or into another registered folder cannot make the scan
-        loop or double-count.
+        Directory links of both kinds - symlinks, and Windows junctions - are
+        followed, as ComfyUI's ``folder_paths`` follows them: a
+        ``models/checkpoints`` linked to another drive is where the owner's
+        checkpoints are, and ComfyUI loads them from there. (Windows junctions
+        were always walked, by accident: ``os.walk`` descends one even with
+        ``followlinks=False``, CPython bpo-23407.) *relpath* stays the path as
+        spelled under *root*, through the link, because that is the name ComfyUI
+        loads the file by.
+
+        Following links needs guards against looping and counting a file twice.
+        Each directory's real path (``os.path.realpath``, which resolves a
+        junction on Windows since Python 3.8) is computed - by ``realpath`` for
+        a link, and by joining the parent's real path for anything else - and a
+        directory is skipped, with an info line naming it and its target, when:
+
+        * it was already walked in this pass (two links to one place, or a link
+          back into a tree already listed), told by its device and inode
+          (:func:`_walked_key`), not its real path;
+        * it is a link whose target is inside this folder, or is this folder or
+          the directory holding the link or any directory above them: the plain
+          walk lists that tree under its own name, and an ancestor is a loop;
+        * its real path is inside another registered model folder: that folder
+          is on the shelf under its own row and its own scan, and listing it
+          here too would put one file on the shelf twice.
+
+        Directories are walked in name order, so which spelling wins when two
+        reach one place is the same on every scan.
 
         A directory that cannot be listed is collected into *blocked* rather
         than discarded. ``os.walk`` swallows those errors by default, which
         would make an unplugged mount under a registered folder indistinguishable
         from a deletion - the one thing this module promises never to do.
+
+        Args:
+            folder_id: The registered folder being walked, so the others can
+                be told apart from it.
+            root: Its path.
+            blocked: Collects the relpath of every directory that could not be
+                listed.
         """
 
         def on_error(exc: OSError) -> None:
@@ -624,7 +689,53 @@ class ModelFolderScanner:
             )
             blocked.add(os.path.relpath(failed, root))
 
-        for directory, _dirs, files in os.walk(root, onerror=on_error):
+        real_root = _real(root)
+        others = [
+            _real(row["path"])
+            for row in self._hub.fetchall(
+                "SELECT path FROM model_folder WHERE id != ?", (folder_id,)
+            )
+            if row["path"]
+        ]
+        visited = {_walked_key(root, real_root)}
+        real_of = {root: real_root}
+
+        for directory, dirs, files in os.walk(root, onerror=on_error, followlinks=True):
+            real_parent = real_of.pop(directory)
+            kept = []
+            for name in sorted(dirs):
+                child = os.path.join(directory, name)
+                linked = is_link_or_missing(child)
+                real = (
+                    _real(child)
+                    if linked
+                    else os.path.normcase(os.path.join(real_parent, name))
+                )
+                key = _walked_key(child, real)
+                reason = None
+                if key in visited:
+                    reason = "was already walked in this scan"
+                elif linked and (
+                    _is_within(real, real_root)
+                    or _is_within(real_root, real)
+                    or _is_within(real_parent, real)
+                ):
+                    reason = "is inside this folder or above the link"
+                elif any(_is_within(real, other) for other in others):
+                    reason = "is inside another registered model folder"
+                if reason is not None:
+                    logger.info(
+                        "Model scan of %s skips %s: its target %s %s.",
+                        root,
+                        child,
+                        real,
+                        reason,
+                    )
+                    continue
+                visited.add(key)
+                real_of[child] = real
+                kept.append(name)
+            dirs[:] = kept
             for name in sorted(files):
                 if not name.lower().endswith(SHELF_MODEL_SUFFIXES):
                     continue
@@ -1184,16 +1295,21 @@ class ModelFolderScanner:
                         (STATE_UNREACHABLE, scanned_at, folder_id, STATE_REMOVED),
                     )
                 else:
-                    prefix = (relative_dir + os.sep).translate(_LIKE_ESCAPE)
+                    # Below this directory and nowhere else: separator-bounded,
+                    # so blocking ``sd`` never marks ``sd_xl``; case as the
+                    # platform compares paths, so blocking ``Flux`` on Linux
+                    # never marks ``flux`` (FolderPrefix).
+                    under, under_params = FolderPrefix.of(relative_dir).under_sql(
+                        "relpath"
+                    )
                     cursor = conn.execute(
                         "UPDATE model_file SET state = ?, seen_at = ? "
-                        "WHERE model_folder_id = ? AND relpath LIKE ? ESCAPE '\\' "
-                        "AND state != ?",
+                        f"WHERE model_folder_id = ? AND {under} AND state != ?",
                         (
                             STATE_UNREACHABLE,
                             scanned_at,
                             folder_id,
-                            prefix + "%",
+                            *under_params,
                             STATE_REMOVED,
                         ),
                     )

@@ -192,9 +192,11 @@ describe("restoring /ref-folder/:id", () => {
   });
 
   it("re-spells a relative query into a Windows folder's separators", async () => {
-    // Same rule as the absolute case: `file_path_prefix` is a literal LIKE
-    // against the stored `file_path`, so a slash-spelled prefix on a Windows
-    // library matches nothing.
+    // Same rule as the absolute case: `file_path_prefix` takes the pictures in
+    // that folder (direct children for the listing, the sub-tree for the stats
+    // sidebar), comparing the folder as written against the stored
+    // `file_path`, so a slash-spelled prefix on a Windows library matches
+    // nothing.
     const wrapper = await mountSidebar();
     routeToFolder("2024/summer", "rf-6");
     await flushPromises();
@@ -245,8 +247,9 @@ describe("restoring /ref-folder/:id", () => {
   // Reading the relative shape (#1206 item 9) made that refusal conditional on
   // the string LOOKING absolute: `?path=../../..` was taken as the tail
   // verbatim and built a pathPrefix outside the folder. Harmless today -
-  // `file_path_prefix` is a literal escaped LIKE and `reference_folder_id`
-  // still scopes the query, so it returns an empty grid - but it is the
+  // `file_path_prefix` takes only pictures in the folder it spells, compared
+  // as written (nothing collapses the `..`), and `reference_folder_id` still
+  // scopes the query, so it returns an empty grid - but it is the
   // containment rule, and a rule that holds by accident downstream is one
   // change away from not holding.
   it.each([
@@ -499,9 +502,11 @@ describe("restoring /ref-folder/:id", () => {
     await flushPromises();
 
     // And the payload comes back in the FOLDER's spelling, not the URL's.
-    // `file_path_prefix` is a literal LIKE against the stored `file_path`
-    // (`utils/query/predicate_filter.py`), so a slash-spelled prefix against a
-    // Windows library matches nothing and the grid comes back empty - and the
+    // `file_path_prefix` takes the pictures in that folder (direct children for
+    // the listing, the sub-tree for the stats sidebar), comparing the folder as
+    // written against the stored `file_path` (`utils/query/folder_prefix.py`),
+    // so a slash-spelled prefix against a Windows library matches nothing and
+    // the grid comes back empty - and the
     // tree row's own key, built from the browse listing, would not match the
     // highlight either.
     expect(lastFolderPayload(wrapper)).toEqual({

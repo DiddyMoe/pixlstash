@@ -19,7 +19,9 @@ about the claims the rest of the feature is built on:
 
 import json
 import os
+import stat
 import struct
+import sys
 import time
 
 import pytest
@@ -35,6 +37,10 @@ from pixlstash.services.model_folder_scanner import (
 )
 from pixlstash.hub.schema import _backfill_base_model_canonical
 from pixlstash.services.model_shelf_service import update_models
+from pixlstash.utils.query.folder_prefix import PATHS_FOLD_CASE
+
+if sys.platform == "win32":
+    import _winapi
 
 SKIP_AS_ROOT = pytest.mark.skipif(
     hasattr(os, "getuid") and os.getuid() == 0,
@@ -528,7 +534,7 @@ class TestStates:
         """The subtree sweep is a second query and needs its own assertion.
 
         A NAS mounted inside a registered folder flips only the rows under it, by
-        a `relpath LIKE` predicate rather than by folder - so the folder-wide test
+        a `relpath` range predicate rather than by folder - so the folder-wide test
         above does not exercise this branch at all. A `removed` row flipped to
         `unreachable` here is worse than cosmetic: `unreachable` is in
         `_KEEPS_A_MODEL_ALIVE`, so it would wrongly block Forget, and the next
@@ -564,8 +570,8 @@ class TestStates:
     ):
         """The subtree sweep's other branch, driven directly.
 
-        `_mark_unreachable_subtrees` has two UPDATEs: one keyed on
-        `relpath LIKE prefix` (above) and one with no path predicate at all, for
+        `_mark_unreachable_subtrees` has two UPDATEs: one keyed on the
+        directory's `relpath` range (above) and one with no path predicate at all, for
         `blocked = {"."}` - the root became unlistable *after* `scan_folder`'s
         readability check passed, which is a race no test can force and
         `on_error` genuinely produces (`os.path.relpath(root, root)` is `"."`).
@@ -594,6 +600,43 @@ class TestStates:
         assert rows["a.safetensors"]["state"] == STATE_REMOVED
         assert rows["b.safetensors"]["state"] == STATE_UNREACHABLE
         assert touched == 1, "the removed copy was counted as newly unreachable"
+
+    def test_an_unlistable_subdirectory_takes_no_sibling_and_no_other_case(
+        self, hub, scanner, tmp_path
+    ):
+        """Blocking ``sd`` marks what is under ``sd`` and nothing else.
+
+        Not ``sd_xl`` or ``sd-old`` (a bare prefix walks into those), and on a
+        platform whose paths are case-sensitive not ``SD`` either: SQLite's
+        ``LIKE`` folds ASCII case, so the old predicate took it on Linux too.
+        Driven directly, like the root branch above, because a ``chmod`` cannot
+        make two directories unlistable without also blocking the siblings.
+        """
+        folder = tmp_path / "models"
+        names = ["sd", "sd_xl", "sd-old", "sd0", "sdx"]
+        if not PATHS_FOLD_CASE:
+            names.append("SD")
+        for pad, name in enumerate(names):
+            (folder / name).mkdir(parents=True)
+            write_adapter(folder / name / "a.safetensors", pad=pad)
+        (folder / "sd" / "deep").mkdir()
+        write_adapter(folder / "sd" / "deep" / "b.safetensors", pad=len(names))
+        folder_id = register_folder(hub, folder)
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        touched = scanner._mark_unreachable_subtrees(
+            folder_id, {"sd"}, scanner_module._utcnow()
+        )
+
+        under = {
+            os.path.join("sd", "a.safetensors"),
+            os.path.join("sd", "deep", "b.safetensors"),
+        }
+        states = {relpath: row["state"] for relpath, row in located(hub).items()}
+        assert {r for r, s in states.items() if s == STATE_UNREACHABLE} == under
+        assert all(states[r] == STATE_PRESENT for r in states if r not in under)
+        assert len(states) == len(names) + 1
+        assert touched == len(under)
 
     def test_a_removed_copy_that_comes_back_is_present_again(
         self, hub, scanner, tmp_path
@@ -872,6 +915,83 @@ class TestUnreadableFiles:
         assert result.unreadable == 1
         assert models(hub) == {}
         assert located(hub) == {}
+
+    def test_a_header_nested_past_the_parser_is_unreadable(
+        self, hub, scanner, tmp_path, caplog
+    ):
+        """JSON nested deeper than the parser recurses raises RecursionError,
+        not ValueError. The file is refused as unreadable and the scan goes on
+        to the file beside it."""
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        blob = b"[" * 100_000 + b"]" * 100_000
+        (folder / "deep.safetensors").write_bytes(struct.pack("<Q", len(blob)) + blob)
+        write_adapter(folder / "good.safetensors")
+        folder_id = register_folder(hub, folder)
+
+        with caplog.at_level("WARNING"):
+            result = scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert result.unreadable == 1
+        assert set(located(hub)) == {"good.safetensors"}
+        assert any(
+            "deep.safetensors is not valid JSON" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_tag_frequency_nested_past_the_parser_gives_no_triggers(
+        self, hub, scanner, tmp_path, caplog
+    ):
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        tensors = {"blocks.0.lora_A.weight": _tensor([8, 16])}
+        tensors["blocks.0.lora_B.weight"] = _tensor([16, 8])
+        deep = "[" * 100_000 + "]" * 100_000
+        _write_safetensors(
+            folder / "a.safetensors",
+            tensors,
+            {"format": "pt", "ss_output_name": "Deep", "ss_tag_frequency": deep},
+        )
+        folder_id = register_folder(hub, folder)
+
+        with caplog.at_level("WARNING"):
+            result = scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert result.unreadable == 0
+        row = next(iter(adapters(hub).values()))
+        assert row["display_name"] == "Deep"
+        assert row["trigger_words"] is None
+        assert any(
+            "ss_tag_frequency is not valid JSON" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_training_info_nested_past_the_parser_is_ignored(
+        self, hub, scanner, tmp_path, caplog
+    ):
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        tensors = {"blocks.0.lora_A.weight": _tensor([8, 16])}
+        tensors["blocks.0.lora_B.weight"] = _tensor([16, 8])
+        deep = "[" * 100_000 + "]" * 100_000
+        _write_safetensors(
+            folder / "a.safetensors",
+            tensors,
+            {"format": "pt", "ss_output_name": "Deep", "training_info": deep},
+        )
+        folder_id = register_folder(hub, folder)
+
+        with caplog.at_level("WARNING"):
+            result = scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert result.unreadable == 0
+        row = next(iter(adapters(hub).values()))
+        assert row["display_name"] == "Deep"
+        assert row["training_step"] is None
+        assert any(
+            "Metadata key 'training_info' is not valid JSON" in r.getMessage()
+            for r in caplog.records
+        )
 
 
 class TestProgressReporting:
@@ -1259,6 +1379,217 @@ class TestPickingUpALateFile:
             scanner.find_unregistered([(folder_id, str(folder))], {"late.safetensors"})
             == []
         )
+
+
+def _dir_link(link, target):
+    """Make *link* a directory link to *target*: a junction on Windows, where a
+    symlink needs a privilege and a junction needs none, a symlink elsewhere."""
+    if sys.platform == "win32":
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+class TestDirectoryLinks:
+    """A linked directory inside a registered folder is walked, as ComfyUI walks
+    it (``os.walk(..., followlinks=True)``), without looping, without listing
+    one place twice, and without listing another registered folder."""
+
+    def test_a_link_to_a_directory_outside_the_folder_is_walked(
+        self, hub, scanner, tmp_path
+    ):
+        """Wrong if the link is not followed: ``models/loras`` linked to another
+        drive is where the owner's models are, and ComfyUI loads them."""
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        write_adapter(folder / "here.safetensors", name="Here")
+        elsewhere = tmp_path / "other-drive"
+        elsewhere.mkdir()
+        write_adapter(elsewhere / "there.safetensors", name="There")
+        _dir_link(folder / "external", elsewhere)
+        folder_id = register_folder(hub, folder)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {
+            "here.safetensors",
+            os.path.join("external", "there.safetensors"),
+        }
+
+    def test_two_links_to_one_place_list_it_once(self, hub, scanner, tmp_path, caplog):
+        """Wrong if both links are listed: one file would be two copies."""
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        elsewhere = tmp_path / "other-drive"
+        elsewhere.mkdir()
+        write_adapter(elsewhere / "there.safetensors", name="There")
+        _dir_link(folder / "first", elsewhere)
+        _dir_link(folder / "second", elsewhere)
+        folder_id = register_folder(hub, folder)
+
+        with caplog.at_level("INFO", logger=scanner_module.logger.name):
+            scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {os.path.join("first", "there.safetensors")}
+        skipped = [r.getMessage() for r in caplog.records if "skips" in r.message]
+        assert skipped == [
+            f"Model scan of {folder} skips {folder / 'second'}: its target "
+            f"{os.path.normcase(os.path.realpath(elsewhere))} was already walked "
+            "in this scan."
+        ], "the skipped link and its target did not reach the log"
+
+    def test_a_link_to_a_directory_inside_the_folder_is_not_listed_again(
+        self, hub, scanner, tmp_path
+    ):
+        """Wrong if the file is listed through the link: the alias sorts before
+        the real name, so listing it would also hide the real name's row."""
+        folder = tmp_path / "loras"
+        (folder / "sub").mkdir(parents=True)
+        write_adapter(folder / "sub" / "a.safetensors", name="A")
+        _dir_link(folder / "alias", folder / "sub")
+        folder_id = register_folder(hub, folder)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {os.path.join("sub", "a.safetensors")}
+
+    def test_a_link_to_a_directory_above_it_is_not_a_loop(self, hub, scanner, tmp_path):
+        """Wrong if a link to an ancestor is walked: of the folder (``up``, and
+        ``home`` reached through a followed link), or of the link's own
+        directory (``deep/up``, through a followed link)."""
+        folder = tmp_path / "a" / "loras"
+        folder.mkdir(parents=True)
+        write_adapter(tmp_path / "a" / "test-stray.safetensors", name="Stray")
+        _dir_link(folder / "up", tmp_path / "a")
+        elsewhere = tmp_path / "b" / "other-drive"
+        (elsewhere / "deep").mkdir(parents=True)
+        write_adapter(elsewhere / "there.safetensors", name="There")
+        write_adapter(tmp_path / "b" / "test-stray-b.safetensors", name="StrayB")
+        _dir_link(elsewhere / "deep" / "up", tmp_path / "b")
+        _dir_link(elsewhere / "home", tmp_path / "a")
+        _dir_link(folder / "external", elsewhere)
+        folder_id = register_folder(hub, folder)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {os.path.join("external", "there.safetensors")}
+
+    def test_a_link_into_another_registered_folder_is_left_to_that_folder(
+        self, hub, scanner, tmp_path
+    ):
+        """Wrong if this folder lists what another registered folder holds,
+        through a link to it (``other``) or to a directory above it
+        (``drive``, whose own files are listed)."""
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        write_adapter(folder / "here.safetensors", name="Here")
+        drive = tmp_path / "drive"
+        registered = drive / "checkpoints"
+        registered.mkdir(parents=True)
+        write_adapter(registered / "theirs.safetensors", name="Theirs")
+        write_adapter(drive / "loose.safetensors", name="Loose")
+        _dir_link(folder / "other", registered)
+        _dir_link(folder / "drive", drive)
+        folder_id = register_folder(hub, folder)
+        register_folder(hub, registered)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {
+            "here.safetensors",
+            os.path.join("drive", "loose.safetensors"),
+        }
+
+    def test_one_directory_under_two_spellings_is_listed_once(
+        self, hub, scanner, tmp_path, monkeypatch, caplog
+    ):
+        """Wrong if a walked directory is known by its real path: a bind mount,
+        or a case-folding volume on a case-sensitive OS, gives one directory two
+        real paths, and its file would be on the shelf twice. ``second``'s real
+        path is spelled differently here (a bind mount needs root); its device
+        and inode are the ones ``first`` was walked under."""
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        elsewhere = tmp_path / "other-drive"
+        elsewhere.mkdir()
+        write_adapter(elsewhere / "there.safetensors", name="There")
+        _dir_link(folder / "first", elsewhere)
+        _dir_link(folder / "second", elsewhere)
+        folder_id = register_folder(hub, folder)
+        real = scanner_module._real
+
+        def respelled(path):
+            resolved = real(path)
+            if os.path.basename(path) == "second":
+                return resolved.swapcase()
+            return resolved
+
+        monkeypatch.setattr(scanner_module, "_real", respelled)
+
+        with caplog.at_level("INFO", logger=scanner_module.logger.name):
+            scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {os.path.join("first", "there.safetensors")}
+        skipped = [r.getMessage() for r in caplog.records if "skips" in r.message]
+        assert skipped == [
+            f"Model scan of {folder} skips {folder / 'second'}: its target "
+            f"{real(str(elsewhere)).swapcase()} was already walked in this scan."
+        ]
+
+    def test_a_loop_of_links_outside_the_folder_ends(self, hub, scanner, tmp_path):
+        """Wrong if the walk does not stop at a directory it has walked: ``a``
+        and ``b`` link to each other, neither is above the other, so only the
+        walked set ends ``external/b/a/b/...``, and each file is listed once."""
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        dir_a = tmp_path / "drive" / "a"
+        dir_b = tmp_path / "drive" / "b"
+        dir_a.mkdir(parents=True)
+        dir_b.mkdir()
+        write_adapter(dir_a / "in-a.safetensors", name="InA")
+        write_adapter(dir_b / "in-b.safetensors", name="InB")
+        _dir_link(dir_a / "b", dir_b)
+        _dir_link(dir_b / "a", dir_a)
+        _dir_link(folder / "external", dir_a)
+        folder_id = register_folder(hub, folder)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {
+            os.path.join("external", "in-a.safetensors"),
+            os.path.join("external", "b", "in-b.safetensors"),
+        }
+
+    def test_directories_that_answer_inode_zero_are_all_walked(
+        self, hub, scanner, tmp_path, monkeypatch
+    ):
+        """Wrong if an ``st_ino`` of 0 is taken as an identity: Python documents
+        it as one only when non-zero, some network volumes answer 0 for every
+        directory, and every directory after the first would be skipped."""
+        folder = tmp_path / "loras"
+        (folder / "a").mkdir(parents=True)
+        (folder / "b").mkdir()
+        write_adapter(folder / "a" / "one.safetensors", name="One")
+        write_adapter(folder / "b" / "two.safetensors", name="Two")
+        folder_id = register_folder(hub, folder)
+        real_stat = os.stat
+
+        def inode_zero_for_directories(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if not stat.S_ISDIR(result.st_mode):
+                return result
+            fields = list(result)
+            fields[1] = 0  # st_ino
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(scanner_module.os, "stat", inode_zero_for_directories)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {
+            os.path.join("a", "one.safetensors"),
+            os.path.join("b", "two.safetensors"),
+        }
 
 
 class TestBaseModelIdentification:

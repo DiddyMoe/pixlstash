@@ -56,6 +56,7 @@ from pixlstash.db_models import (
     Tag,
 )
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.query.folder_prefix import FolderPrefix
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pixlstash.vault import Vault
@@ -396,7 +397,8 @@ def _duplicate_scope(facts: "_LibraryFacts", left: str, right: str) -> Optional[
     empty queue for a finding that had just told them 90 of 100 pictures were
     duplicated, on exactly the un-swept library the finding is designed for.
 
-    The queue's folder scope is a **sub-tree** prefix match, so the common
+    The queue's folder scope is the **sub-tree** below the folder
+    (:class:`~pixlstash.utils.query.folder_prefix.FolderPrefix`), so the common
     ancestor holds both copies and the group forms.
 
     Returns ``None`` when there is no ancestor worth naming, and the caller
@@ -418,8 +420,8 @@ def _duplicate_scope(facts: "_LibraryFacts", left: str, right: str) -> Optional[
       narrowing, it is the whole library wearing a folder's name, and the
       unscoped queue is the honest thing to open.
 
-    Relative paths are refused outright: the queue's folder predicate is
-    ``file_path LIKE '<prefix>%'`` against absolute stored paths, so a relative
+    Relative paths are refused outright: the queue's folder predicate is a
+    separator-bounded path range against absolute stored paths, so a relative
     ancestor matches nothing and the queue would be silently empty.
     """
     if not (os.path.isabs(left) and os.path.isabs(right)):
@@ -434,13 +436,14 @@ def _duplicate_scope(facts: "_LibraryFacts", left: str, right: str) -> Optional[
         return None
 
     pair = len(facts.by_folder[left]) + len(facts.by_folder[right])
-    # Measured with the QUEUE's own predicate, which is `file_path LIKE
-    # '<prefix>%'` with NO separator (`DedupScope.picture_predicate`). Counting
-    # a separator-bounded sub-tree instead is tidier and wrong: `/lib-archive`
-    # is outside `/lib` by that arithmetic and inside the scope the owner is
-    # handed, so a prefix-sibling folder walked straight through the ceiling.
+    # Measured with the QUEUE's own rule (`DedupScope.picture_predicate` uses
+    # the same FolderPrefix): the folder itself and every folder below it,
+    # separator-bounded, so `/lib-archive` is outside `/lib` here exactly as it
+    # is outside the scope the owner is handed. Two spellings of "under" are
+    # how a prefix-sibling folder once walked straight through the ceiling.
+    scope = FolderPrefix.of(common)
     under = sum(
-        len(ids) for folder, ids in facts.by_folder.items() if folder.startswith(common)
+        len(ids) for folder, ids in facts.by_folder.items() if scope.covers(folder)
     )
     return common if pair and under <= pair * SCOPE_MAX_WIDENING else None
 

@@ -132,8 +132,8 @@ def clean_library(server):
 def _seed(srv, specs):
     """Insert one picture per spec and return the ids in order.
 
-    Keys: ``folder`` (joined under :data:`LIB`; omit for a vault-managed flat
-    name), ``name``, ``pixel_sha``, ``size_bytes``, ``description``, ``tags``,
+    Keys: ``folder`` (joined under :data:`LIB`, so ``""`` is :data:`LIB`
+    itself; omit for a vault-managed flat name), ``name``, ``pixel_sha``, ``size_bytes``, ``description``, ``tags``,
     ``deleted``, ``face`` (``True`` for an unnamed face, a string for a named
     one), ``face_scanned_empty`` (the no-face sentinel row), ``in_set``,
     ``in_project``, ``stack`` (a key; all specs sharing it land in one stack)
@@ -165,7 +165,7 @@ def _seed(srv, specs):
             name = spec.get("name", f"pic_{index}.png")
             folder = spec.get("folder")
             pic = Picture(
-                file_path=os.path.join(LIB, folder, name) if folder else name,
+                file_path=name if folder is None else os.path.join(LIB, folder, name),
                 format="png",
                 width=4000,
                 height=3000,
@@ -720,19 +720,38 @@ def test_the_ordinary_grid_keeps_a_folder_stack_whose_cover_is_elsewhere(
     assert f"{LIB}/_unsorted" in grid.json()[0]["file_path"]
 
 
-def test_a_prefix_sibling_folder_does_not_walk_through_the_ceiling(server):
-    """The queue scopes on `LIKE '<prefix>%'` with no separator, so `/lib` also
-    catches `/lib-archive`. Measuring a separator-bounded sub-tree instead let
-    an unrelated folder's pictures into a scope the ceiling had cleared."""
+def test_a_prefix_sibling_folder_is_outside_the_scope_and_the_ceiling(server):
+    """`/lib-archive` is not inside `/lib`, for the queue or for the ceiling.
+
+    The two used to spell "under" differently: the queue scoped on
+    `LIKE '<prefix>%'`, which takes `/lib-archive`, so the ceiling had to count
+    the same way or an unrelated folder walked through it. Both now use the
+    queue's separator-bounded rule (`FolderPrefix`), so the archive is outside
+    the scope, the ceiling does not count it, and the queue the finding opens
+    holds the pair's pictures and not the archive's.
+    """
+    shared = insights.OVERLAP_MIN_PICTURES
     _seed(
         server,
-        _copies("lib/selects", "lib/final", shared=insights.OVERLAP_MIN_PICTURES)
-        + _solo("lib-archive", insights.OVERLAP_MIN_PICTURES * 20, "arch"),
+        _copies("lib/selects", "lib/final", shared=shared)
+        + _solo("lib-archive", shared * 20, "arch"),
     )
 
     overlap = _findings(server)["overlapping_folders"]
     assert overlap["state"] == "todo"
-    assert overlap["action"]["kind"] == "duplicates"
+    assert overlap["action"]["kind"] == "duplicates_in_folder"
+    assert overlap["action"]["path"] == os.path.join(LIB, "lib")
+
+    scope = DedupScope(scope_type=ScopeType.FOLDER, scope_id=overlap["action"]["path"])
+    in_scope = _run(
+        server,
+        lambda session: session.exec(
+            select(func.count()).select_from(Picture).where(scope.picture_predicate())
+        ).one(),
+    )
+    assert in_scope == 2 * shared, "the archive must be outside the queue's scope"
+    groups = _run(server, tiers.find_exact_groups_in_session, scope)
+    assert len(groups) == shared
 
 
 def test_a_relative_path_never_becomes_a_queue_scope(server):
@@ -759,6 +778,42 @@ def test_an_ancestor_that_narrows_nothing_opens_the_whole_queue(server):
     assert overlap["state"] == "todo"
     assert overlap["action"]["kind"] == "duplicates"
     assert "path" not in overlap["action"]
+
+
+@pytest.mark.parametrize(
+    "extra_over_ceiling, scoped",
+    [(0, True), (1, False)],
+    ids=["at-the-ceiling", "one-over"],
+)
+def test_pictures_in_the_ancestor_itself_count_toward_the_ceiling(
+    server, extra_over_ceiling, scoped
+):
+    """The ancestor's own pictures are in the queue's scope, so they count.
+
+    The queue's folder scope is the folder itself and everything below it
+    (`FolderPrefix.under`), so the ceiling measures with `covers`, not
+    `contains` (below only). Counting only the sub-folders left a library whose
+    loose files sit in the common folder itself under-counted: the scope opened
+    on it however many pictures it held. The boundary pair pins the arm: at
+    exactly `SCOPE_MAX_WIDENING` times the pair the folder is still a scope,
+    one more loose picture and it is the whole library.
+    """
+    shared = insights.OVERLAP_MIN_PICTURES
+    pair = 2 * shared
+    loose = pair * (insights.SCOPE_MAX_WIDENING - 1) + extra_over_ceiling
+    _seed(
+        server,
+        _copies("Pictures", "Downloads", shared=shared) + _solo("", loose, "loose"),
+    )
+
+    overlap = _findings(server)["overlapping_folders"]
+    assert overlap["state"] == "todo"
+    if scoped:
+        assert overlap["action"]["kind"] == "duplicates_in_folder"
+        assert overlap["action"]["path"] == LIB
+    else:
+        assert overlap["action"]["kind"] == "duplicates", overlap["action"]
+        assert "path" not in overlap["action"]
 
 
 # ── 5. what is not counted ───────────────────────────────────────────────────
