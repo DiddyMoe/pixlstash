@@ -896,6 +896,44 @@ def test_a_failed_text_embedding_batch_is_not_handed_out_again(tmp_path):
         assert candidates() == {tags_pending}
 
 
+def test_a_picture_that_cannot_be_read_lets_the_hash_finder_run_dry(tmp_path):
+    """A missing file is tried once a session, not on every sweep.
+
+    A duplicate scan waits until this finder reports no work, so one picture
+    handed out forever kept every requested scan pending.
+    """
+    with Vault(image_root=str(tmp_path)) as vault:
+
+        def seed(session: Session) -> list[int]:
+            ids = []
+            for name in ("kept.png", "gone.png"):
+                picture = Picture(
+                    file_path=_write_image(tmp_path, name, size=(8, 8)),
+                    format="png",
+                    width=8,
+                    height=8,
+                    deleted=False,
+                )
+                session.add(picture)
+                session.flush()
+                ids.append(picture.id)
+            session.commit()
+            return ids
+
+        kept, gone = vault.db.run_task(seed)
+        (tmp_path / "gone.png").unlink()
+        finder = MissingPixelShaFinder(vault.db)
+
+        task = finder.find_task()
+        assert sorted(task.params["picture_ids"]) == sorted([kept, gone])
+        task.run()
+        finder.on_task_complete(task, None)
+
+        again = finder.find_task()
+        assert again is None, f"handed out {again.params['picture_ids']} again"
+        assert vault.db.run_task(lambda session: session.get(Picture, kept).pixel_sha)
+
+
 _LIKENESS_PROBE = "picture.size_bin_index is null"
 
 

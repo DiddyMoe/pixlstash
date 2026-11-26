@@ -2,18 +2,28 @@
 
 from typing import Collection
 
-from pixlstash.tasks.base_task_finder import SimpleMissingFinder
+from pixlstash.task_runner import TaskCancelledError
+from pixlstash.tasks.base_task_finder import BaseDeferringFinder, SimpleMissingFinder
 from pixlstash.tasks.pixel_sha_task import PixelShaTask
 
 
-class MissingPixelShaFinder(SimpleMissingFinder):
+class MissingPixelShaFinder(SimpleMissingFinder, BaseDeferringFinder):
     """Queue :class:`PixelShaTask` for pictures whose ``pixel_sha`` is NULL.
 
     Tier 1 of the duplicate queue groups on ``picture.pixel_sha``; a NULL there
     is a duplicate nobody can find. Reading a file to digest it is cheap next to
     the embedding pipeline, so this runs at one task in flight and gets out of
     the way.
+
+    A picture whose file cannot be read is deferred for the rest of the session
+    (:class:`BaseDeferringFinder`). A duplicate scan waits until this finder
+    runs dry, and a pending scan holds off a snapshot restore, so one picture
+    handed out on every sweep kept both waiting for as long as the server ran.
     """
+
+    _IDS_PARAM = "picture_ids"
+    _TRANSIENT = (TaskCancelledError,)
+    _WHAT = "Hashing pictures for exact duplicates"
 
     def finder_name(self) -> str:
         return "MissingPixelShaFinder"
@@ -28,7 +38,7 @@ class MissingPixelShaFinder(SimpleMissingFinder):
         self, session, limit: int, suppressed_ids: Collection[int] = frozenset()
     ) -> list:
         return PixelShaTask.find_pictures_missing_pixel_sha(
-            session, limit, suppressed_ids
+            session, limit, set(suppressed_ids) | self._deferred
         )
 
     def _create_task(self, pictures: list):

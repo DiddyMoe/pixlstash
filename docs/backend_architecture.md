@@ -7884,7 +7884,11 @@ every byte of every file in the library on upgrade to buy a guarantee this featu
 does not need. `pixel_sha` is already computed incrementally on every import path;
 `MissingPixelShaFinder` / `PixelShaTask` (`TaskType.PIXEL_SHA`) backfill the rows
 that predate it, selecting on `pixel_sha IS NULL` — which is why migration
-`0088` contains no `NULL` reset.
+`0088` contains no `NULL` reset. A picture whose file cannot be read is
+deferred for the rest of the session (`BaseDeferringFinder`): `DedupScanFinder`
+depends on `TaskType.PIXEL_SHA` and waits until this finder runs dry, so a
+picture handed out on every sweep would keep every requested scan pending, and
+a pending scan makes a snapshot restore wait.
 
 ### 22.2 Tier 2 — bucketed near, and what "bucket" reuses
 
