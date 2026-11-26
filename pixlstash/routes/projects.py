@@ -3,7 +3,7 @@ import json
 import mimetypes
 import os
 import re
-import shutil
+import threading
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -17,6 +17,8 @@ from sqlalchemy import delete, exists, func, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
+from pixlstash.utils.sql_chunking import chunked, in_json
 from pixlstash.authz.membership import (
     enforce_project_path_scope,
     enforce_project_scope,
@@ -143,6 +145,11 @@ def create_router(server) -> APIRouter:
     """
     router = APIRouter()
 
+    # Held while an upload creates its project folder and writes its file, and
+    # while a cleanup removes files and empty folders, so a cleanup cannot
+    # remove a folder between an upload's makedirs and its open.
+    attachment_files_lock = threading.Lock()
+
     def _attachments_dir(project_id: int) -> str:
         """Return (and create) the on-disk directory for a project's attachments."""
         path = resolve_path_within(
@@ -150,6 +157,47 @@ def create_router(server) -> APIRouter:
         )
         os.makedirs(path, exist_ok=True)
         return path
+
+    def _remove_attachment_files(project_id: int, full_paths: list[str]) -> None:
+        """Remove these files, then the project's folders if they are empty.
+
+        Only the listed files: a project id can be reused, so the folder may
+        already hold a recreated project's attachments, which a live row
+        references. A cleanup failure is logged and never replaces the error
+        or result of the request that called it.
+        """
+        with attachment_files_lock:
+            for full_path in full_paths:
+                try:
+                    os.remove(full_path)
+                except FileNotFoundError:
+                    logger.debug(
+                        "Attachment file %s of project %s was already gone",
+                        full_path,
+                        project_id,
+                    )
+                except OSError:
+                    logger.warning(
+                        "Could not remove attachment file %s of project %s",
+                        full_path,
+                        project_id,
+                        exc_info=True,
+                    )
+            project_dir = resolve_path_within(
+                server.vault.image_root, "projects", str(project_id)
+            )
+            for folder in (os.path.join(project_dir, "attachments"), project_dir):
+                if not os.path.isdir(folder) or os.listdir(folder):
+                    continue
+                try:
+                    os.rmdir(folder)
+                except OSError:
+                    logger.warning(
+                        "Could not remove empty folder %s of project %s",
+                        folder,
+                        project_id,
+                        exc_info=True,
+                    )
 
     def _max_attachment_bytes() -> int:
         mb = server._server_config.get(
@@ -264,8 +312,12 @@ def create_router(server) -> APIRouter:
                     .select_from(PictureProjectMember)
                     .join(Picture, Picture.id == PictureProjectMember.picture_id)
                     .where(
-                        PictureProjectMember.project_id.in_(listed_ids),
-                        Picture.deleted.is_(False),
+                        in_json(PictureProjectMember.project_id, listed_ids),
+                        # ``deleted IS NOT 1``: no index serves it, so the
+                        # project ids lead the plan instead of
+                        # ``ix_picture_deleted`` walking every kept picture
+                        # (backend_architecture.md, "Probe cost").
+                        Picture.deleted.is_not(True),
                     )
                     .group_by(PictureProjectMember.project_id)
                 ).all():
@@ -303,7 +355,7 @@ def create_router(server) -> APIRouter:
     )
     def get_batch_project_membership(
         request: Request,
-        picture_ids: list[int] = Body(default=[], embed=True),
+        picture_ids: list[SqliteInt] = Body(default=[], embed=True),
     ):
         if not picture_ids:
             return {"project_assignments": {}, "unassigned_picture_ids": []}
@@ -324,13 +376,21 @@ def create_router(server) -> APIRouter:
         visible_projects = visible_project_ids(server, request)
 
         def fetch(session, ids: list[int]):
-            rows = session.exec(
-                select(
-                    PictureProjectMember.project_id, PictureProjectMember.picture_id
-                ).where(
-                    PictureProjectMember.picture_id.in_(ids),
+            # The body has no cap (a select-all reaches it), so the memberships
+            # are read in chunks under SQLite's bound-parameter limit. Duplicate
+            # ids are dropped first, so no membership row is read twice.
+            rows = []
+            for id_chunk in chunked(sorted(set(ids))):
+                rows.extend(
+                    session.exec(
+                        select(
+                            PictureProjectMember.project_id,
+                            PictureProjectMember.picture_id,
+                        ).where(
+                            PictureProjectMember.picture_id.in_(id_chunk),
+                        )
+                    ).all()
                 )
-            ).all()
             assignments: dict[int, list[int]] = {}
             for project_id, pid in rows:
                 if project_id is not None:
@@ -404,7 +464,7 @@ def create_router(server) -> APIRouter:
             # Resolve by numeric ID first, then fall back to case-insensitive name.
             project = None
             try:
-                numeric_id = int(pid_or_name)
+                numeric_id = parse_sqlite_int(pid_or_name)
                 project = session.get(Project, numeric_id)
             except (TypeError, ValueError):
                 # If parsing as an integer fails, treat pid_or_name as a project name instead.
@@ -440,7 +500,7 @@ def create_router(server) -> APIRouter:
                     select(
                         PictureSetProjectMember.set_id,
                         PictureSetProjectMember.project_id,
-                    ).where(PictureSetProjectMember.set_id.in_(listed_ids))
+                    ).where(in_json(PictureSetProjectMember.set_id, listed_ids))
                 ).all():
                     project_ids_by_set.setdefault(int(sid), []).append(int(pid))
             return [
@@ -472,7 +532,7 @@ def create_router(server) -> APIRouter:
         def fetch(session: Session, value: str):
             project = None
             try:
-                project = session.get(Project, int(value))
+                project = session.get(Project, parse_sqlite_int(value))
             except (TypeError, ValueError):
                 # Value is not a valid integer project ID; fall back to lookup by name.
                 logger.debug("Could not parse project value %r as integer ID.", value)
@@ -500,7 +560,7 @@ def create_router(server) -> APIRouter:
     )
     def update_project(
         request: Request,
-        project_id: int,
+        project_id: SqliteInt,
         payload: ProjectUpdateRequest = Body(...),
     ):
         server.auth.require_user_id(request)
@@ -570,7 +630,7 @@ def create_router(server) -> APIRouter:
         summary="Delete a project",
         response_model=ProjectDeleteResponse,
     )
-    def delete_project(request: Request, project_id: int):
+    def delete_project(request: Request, project_id: SqliteInt):
         """Delete a project.
 
         Characters and picture sets belonging to the project have their
@@ -660,36 +720,22 @@ def create_router(server) -> APIRouter:
             do_delete, project_id, priority=DBPriority.IMMEDIATE
         )
 
-        # Remove attachment files from disk after the transaction commits.
+        # After the commit, and only the files of the rows it removed. The
+        # folder is not removed whole: the id can already belong to a new
+        # project whose uploads live there (ids are reused).
+        full_paths = []
         for stored_path in attachment_paths:
+            if not stored_path:
+                continue  # A URL bookmark has no file.
             try:
-                full_path = resolve_path_within(server.vault.image_root, stored_path)
+                full_paths.append(
+                    resolve_path_within(server.vault.image_root, stored_path)
+                )
             except ValueError:
                 logger.warning(
                     "Refusing to delete suspicious stored_path: %r", stored_path
                 )
-                continue
-            try:
-                if os.path.isfile(full_path):
-                    os.remove(full_path)
-            except OSError as exc:
-                logger.warning(
-                    "Could not remove attachment file %s: %s", full_path, exc
-                )
-
-        # Remove the project attachments directory if it is now empty.
-        project_dir = resolve_path_within(
-            server.vault.image_root,
-            "projects",
-            str(project_id),
-        )
-        try:
-            if os.path.isdir(project_dir):
-                shutil.rmtree(project_dir, ignore_errors=True)
-        except OSError as exc:
-            logger.warning(
-                "Could not remove project directory %s: %s", project_dir, exc
-            )
+        _remove_attachment_files(project_id, full_paths)
 
         return {"status": "deleted", "id": project_id}
 
@@ -712,7 +758,7 @@ def create_router(server) -> APIRouter:
                 )
         else:
             try:
-                _require_scope_allows_project(request, int(project_id))
+                _require_scope_allows_project(request, parse_sqlite_int(project_id))
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -735,7 +781,7 @@ def create_router(server) -> APIRouter:
                 select(Tag.id).where(
                     Tag.picture_id == Picture.id,
                     Tag.tag.is_not(None),
-                    func.lower(Tag.tag).in_(hidden_tag_set),
+                    in_json(func.lower(Tag.tag), hidden_tag_set),
                 )
             )
 
@@ -750,7 +796,7 @@ def create_router(server) -> APIRouter:
             ]
         else:
             try:
-                pid = int(project_id)
+                pid = parse_sqlite_int(project_id)
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -794,7 +840,7 @@ def create_router(server) -> APIRouter:
     )
     def export_project(
         request: Request,
-        project_id: int,
+        project_id: SqliteInt,
         include_pictures: bool = Query(default=True),
         include_attachments: bool = Query(default=True),
     ):
@@ -1024,7 +1070,7 @@ def create_router(server) -> APIRouter:
         summary="List attachments for a project",
         response_model=list[ProjectAttachmentResponse],
     )
-    def list_attachments(request: Request, project_id: int):
+    def list_attachments(request: Request, project_id: SqliteInt):
         server.auth.require_user_id(request)
         token_scope = getattr(request.state, "token_scope", None)
         # Every scoped token, not only a READ one: the attachment opt-in is a
@@ -1053,7 +1099,7 @@ def create_router(server) -> APIRouter:
         summary="Upload an attachment to a project",
         response_model=ProjectAttachmentResponse,
     )
-    def upload_attachment(request: Request, project_id: int, file: UploadFile):
+    def upload_attachment(request: Request, project_id: SqliteInt, file: UploadFile):
         server.auth.require_user_id(request)
 
         max_bytes = _max_attachment_bytes()
@@ -1068,30 +1114,36 @@ def create_router(server) -> APIRouter:
             )
 
         def check_project(session: Session, pid: int):
-            if session.get(Project, pid) is None:
+            project = session.get(Project, pid)
+            if project is None:
                 raise HTTPException(status_code=404, detail="Project not found")
+            return project.created_at
 
-        server.vault.db.run_task(
+        # The project's identity is its id AND its creation time: ids are
+        # reused (INTEGER PRIMARY KEY without AUTOINCREMENT), so a project
+        # deleted while this file is written and then recreated would have
+        # the same id. The inserting transaction checks both.
+        checked_created_at = server.vault.db.run_task(
             check_project, project_id, priority=DBPriority.IMMEDIATE
         )
 
-        att_dir = _attachments_dir(project_id)
         safe_stem = uuid.uuid4().hex
         original_filename = file.filename or "attachment"
         raw_ext = os.path.splitext(original_filename)[1]
         ext = re.sub(r"[^a-zA-Z0-9.]", "", raw_ext)[:16]
         stored_filename = safe_stem + ext
-        full_path = resolve_path_within(att_dir, stored_filename)
-
-        with open(full_path, "wb") as f:
-            f.write(contents)
-
         mime_type = file.content_type or mimetypes.guess_type(original_filename)[0]
-        # Derive rel_path from the already-validated full_path so the stored
-        # value is guaranteed to be within image_root (CodeQL sanitizer path).
-        rel_path = os.path.relpath(full_path, server.vault.image_root)
+        committed = False
 
-        def insert_record(session: Session):
+        def insert_record(session: Session, rel_path: str):
+            nonlocal committed
+            # Checked again in the inserting transaction: the project can be
+            # deleted (and its id reused) while the file is written. The
+            # writer runs one task at a time, so a delete either commits
+            # first (404 here) or lists this row's file for removal.
+            project = session.get(Project, project_id)
+            if project is None or project.created_at != checked_created_at:
+                raise HTTPException(status_code=404, detail="Project not found")
             attachment = ProjectAttachment(
                 project_id=project_id,
                 original_filename=original_filename,
@@ -1101,11 +1153,35 @@ def create_router(server) -> APIRouter:
                 created_at=datetime.now(timezone.utc),
             )
             session.add(attachment)
+            session.flush()
+            # Built before the commit, so nothing after it can fail and send
+            # the caller's cleanup after the file of a committed row.
+            response = ProjectAttachmentResponse.model_validate(attachment)
             session.commit()
-            session.refresh(attachment)
-            return attachment
+            committed = True
+            return response
 
-        return server.vault.db.run_task(insert_record, priority=DBPriority.IMMEDIATE)
+        full_path = None
+        try:
+            with attachment_files_lock:
+                full_path = resolve_path_within(
+                    _attachments_dir(project_id), stored_filename
+                )
+                with open(full_path, "wb") as handle:
+                    handle.write(contents)
+            # Derived from the already-validated full_path so the stored value
+            # is guaranteed to be within image_root (CodeQL sanitizer path).
+            rel_path = os.path.relpath(full_path, server.vault.image_root)
+            return server.vault.db.run_task(
+                insert_record, rel_path, priority=DBPriority.IMMEDIATE
+            )
+        except BaseException:
+            # A partial write, a refused or failed insert: no row points at
+            # the file, so nothing else would remove it. After the commit the
+            # row owns the file and it stays.
+            if not committed and full_path is not None:
+                _remove_attachment_files(project_id, [full_path])
+            raise
 
     @router.post(
         "/projects/{project_id}/attachments/url",
@@ -1114,7 +1190,7 @@ def create_router(server) -> APIRouter:
     )
     def add_url_attachment(
         request: Request,
-        project_id: int,
+        project_id: SqliteInt,
         body: ProjectUrlAttachmentRequest,
     ):
         server.auth.require_user_id(request)
@@ -1158,7 +1234,9 @@ def create_router(server) -> APIRouter:
         response_class=FileResponse,
         responses={200: {"content": {"application/octet-stream": {}}}},
     )
-    def download_attachment(request: Request, project_id: int, attachment_id: int):
+    def download_attachment(
+        request: Request, project_id: SqliteInt, attachment_id: SqliteInt
+    ):
         server.auth.require_user_id(request)
         token_scope = getattr(request.state, "token_scope", None)
         # Every scoped token, not only a READ one: the attachment opt-in is a
@@ -1199,7 +1277,9 @@ def create_router(server) -> APIRouter:
         summary="Delete a project attachment",
         response_model=ProjectDeleteResponse,
     )
-    def delete_attachment(request: Request, project_id: int, attachment_id: int):
+    def delete_attachment(
+        request: Request, project_id: SqliteInt, attachment_id: SqliteInt
+    ):
         server.auth.require_user_id(request)
 
         def remove(session: Session, pid: int, aid: int):

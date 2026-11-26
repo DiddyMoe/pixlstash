@@ -8,7 +8,9 @@ import zipfile
 from io import BytesIO
 
 from fastapi.testclient import TestClient
+from sqlmodel import select
 
+from pixlstash.db_models.project import Project, ProjectAttachment
 from pixlstash.server import Server
 from tests.utils import upload_pictures_and_wait
 
@@ -39,6 +41,69 @@ def _upload_picture(client, filename="Bad1.png"):
         )
     assert result["status"] == "completed"
     return result["results"][0]["picture_id"]
+
+
+def _upload_races_a_project_delete(client, server):
+    """The project is deleted after the upload checked it and wrote the file.
+
+    The upload re-checks the project in the transaction that inserts the row,
+    so the loser of the race gets a 404, not a foreign-key 500, and its file
+    is not left on disk with no row pointing at it.
+    """
+    real_run_task = server.vault.db.run_task
+
+    def attachment_rows(pid):
+        return real_run_task(
+            lambda s: s.exec(
+                select(ProjectAttachment).where(ProjectAttachment.project_id == pid)
+            ).all()
+        )
+
+    def delete_row_only(pid):
+        # The rows a project delete removes, without its folder cleanup: shows
+        # the upload removes its own file.
+        def _delete(session):
+            session.delete(session.get(Project, pid))
+            session.commit()
+
+        real_run_task(_delete)
+
+    deleters = {
+        "the delete route": lambda pid: client.delete(f"/projects/{pid}"),
+        "a row-only delete": delete_row_only,
+    }
+    for how, deleter in deleters.items():
+        pid = client.post("/projects", json={"name": f"Doomed {how}"}).json()["id"]
+        att_dir = os.path.join(
+            server.vault.image_root, "projects", str(pid), "attachments"
+        )
+        fired = []
+
+        def run_task_after_the_file_is_written(fn, *args, **kwargs):
+            # Fires once, in the upload's own call that follows the file write.
+            if (
+                not fired
+                and "upload_attachment" in fn.__qualname__
+                and os.path.isdir(att_dir)
+                and os.listdir(att_dir)
+            ):
+                fired.append(fn.__qualname__)
+                deleter(pid)
+            return real_run_task(fn, *args, **kwargs)
+
+        server.vault.db.run_task = run_task_after_the_file_is_written
+        try:
+            resp = client.post(
+                f"/projects/{pid}/attachments",
+                files={"file": ("late.txt", b"late attachment", "text/plain")},
+            )
+        finally:
+            del server.vault.db.run_task
+        assert fired, f"{how}: the race was never staged"
+        assert resp.status_code == 404, (how, resp.status_code, resp.text)
+        assert attachment_rows(pid) == [], how
+        left = os.listdir(att_dir) if os.path.isdir(att_dir) else []
+        assert left == [], f"{how}: orphaned attachment file {left}"
 
 
 def test_create_and_get_project():
@@ -217,6 +282,8 @@ def test_project_attachment_upload_list_delete():
         assert [a["url"] for a in resp.json() if a.get("url")] == [
             "https://example.com/ref"
         ]
+
+        _upload_races_a_project_delete(client, server)
     finally:
         server.close()
         temp_dir.cleanup()
