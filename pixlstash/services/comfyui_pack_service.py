@@ -26,7 +26,8 @@ from send2trash import send2trash
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import comfyui_link_service
-from pixlstash.services.comfyui_service import comfyui_folder_paths
+from pixlstash.services.comfyui_service import READ_MAX_BYTES, comfyui_folder_paths
+from pixlstash.utils.bounded_http import bounded_request
 
 logger = get_logger(__name__)
 
@@ -140,11 +141,12 @@ def _plausible_custom_nodes(folder: Path) -> bool:
 def _comfyui_busy(pinned_url: str) -> Optional[str]:
     """Why ComfyUI must not restart now, or ``None`` when its queue is empty."""
     try:
-        response = requests.request(
+        response = bounded_request(
             "GET",
             f"{pinned_url}queue",
             timeout=10,
-            allow_redirects=False,
+            deadline_s=10,
+            max_bytes=READ_MAX_BYTES,
             proxies=comfyui_link_service.NO_PROXY,
         )
         queue = response.json() if response.status_code == 200 else None
@@ -181,12 +183,13 @@ def restart_comfyui(pinned_url: str) -> Optional[str]:
     last = "ComfyUI-Manager is not installed"
     for method, path in attempts:
         try:
-            response = requests.request(
+            response = bounded_request(
                 method,
                 f"{pinned_url}{path}",
                 json={} if method == "POST" else None,
                 timeout=10,
-                allow_redirects=False,
+                deadline_s=10,
+                max_bytes=READ_MAX_BYTES,
                 proxies=comfyui_link_service.NO_PROXY,
             )
         except requests.ConnectionError:

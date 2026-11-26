@@ -1484,17 +1484,16 @@ class TestWaitingOutARun:
     def test_the_queue_is_read_for_its_prompts(self, monkeypatch, queue, answer):
         asked = []
 
-        def get(url, timeout=None, allow_redirects=True, proxies=None):
-            asked.append((url, allow_redirects, proxies))
+        def get(url, proxies=None, **_kwargs):
+            asked.append((url, proxies))
             return SimpleNamespace(
                 status_code=200, raise_for_status=lambda: None, json=lambda: queue
             )
 
-        monkeypatch.setattr(comfyui_service.requests, "get", get)
+        monkeypatch.setattr(comfyui_service, "bounded_get", get)
         assert comfyui_service._read_comfyui_queue("http://comfy") == answer
-        # Straight to the address asked, never through an environment proxy,
-        # and never on to wherever a redirect points.
-        assert asked == [("http://comfy/queue", False, comfyui_service.NO_PROXY)]
+        # Straight to the address asked, never through an environment proxy.
+        assert asked == [("http://comfy/queue", comfyui_service.NO_PROXY)]
 
     @pytest.mark.parametrize(
         "get",
@@ -1522,7 +1521,7 @@ class TestWaitingOutARun:
         ids=["refused", "error-status", "redirect", "not-json"],
     )
     def test_a_queue_that_cannot_be_read_is_no_answer(self, monkeypatch, get):
-        monkeypatch.setattr(comfyui_service.requests, "get", get)
+        monkeypatch.setattr(comfyui_service, "bounded_get", get)
         assert comfyui_service._read_comfyui_queue("http://comfy") is None
 
     def test_a_queue_that_cannot_be_read_does_not_abandon_the_run(self, monkeypatch):
@@ -1679,24 +1678,23 @@ class _Rounds:
 
 
 class _FakeComfyUI:
-    """A ComfyUI's queue and history, answered in process as ``requests.get``.
-    Notes each request made of it with whether a redirect would be followed
-    and the proxies it was sent with."""
+    """A ComfyUI's queue and history, answered in process as ``bounded_get``.
+    Notes each request made of it with the proxies it was sent with."""
 
     def __init__(self, rounds: _Rounds):
         self._rounds = rounds
         self._lock = threading.Lock()
-        self._asked: list[tuple[str, object, object]] = []
+        self._asked: list[tuple[str, object]] = []
         self.running: list[str] = []
         self.pending: list[str] = []
         self.histories: dict[str, dict] = {}
         # (exception, how many other waiters share the read before it raises)
         self.queue_failure: tuple[BaseException, int] | None = None
 
-    def get(self, url, timeout=None, allow_redirects=True, proxies=None):
+    def get(self, url, proxies=None, **_kwargs):
         failure = None
         with self._lock:
-            self._asked.append((url, allow_redirects, proxies))
+            self._asked.append((url, proxies))
             if url == f"{COMFY}/queue":
                 failure, self.queue_failure = self.queue_failure, None
                 body = {
@@ -1717,7 +1715,7 @@ class _FakeComfyUI:
             status_code=200, text="", raise_for_status=lambda: None, json=lambda: body
         )
 
-    def taken(self) -> list[tuple[str, object, object]]:
+    def taken(self) -> list[tuple[str, object]]:
         """The requests made since this was last asked, in order."""
         with self._lock:
             asked, self._asked = self._asked, []
@@ -1734,16 +1732,16 @@ def comfyui(monkeypatch):
     monkeypatch.setattr(comfyui_service, "_queue_waits", {})
     monkeypatch.setattr(comfyui_service, "_QueueRead", rounds.read_type())
     monkeypatch.setattr(comfyui_service, "time", SimpleNamespace(sleep=rounds.sleep))
-    monkeypatch.setattr(comfyui_service.requests, "get", fake.get)
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake.get)
     yield fake, rounds
     rounds.stop()
 
 
-QUEUE_READ = (f"{COMFY}/queue", False, comfyui_service.NO_PROXY)
+QUEUE_READ = (f"{COMFY}/queue", comfyui_service.NO_PROXY)
 
 
-def _history_read(prompt_id: str) -> tuple[str, object, object]:
-    return (f"{COMFY}/history/{prompt_id}", False, comfyui_service.NO_PROXY)
+def _history_read(prompt_id: str) -> tuple[str, object]:
+    return (f"{COMFY}/history/{prompt_id}", comfyui_service.NO_PROXY)
 
 
 def _saved(prompt_id: str) -> dict:
@@ -2061,7 +2059,7 @@ class TestHowARunEnded:
         def refuse(*a, **k):
             raise comfyui_service.requests.ConnectionError("refused")
 
-        monkeypatch.setattr(comfyui_service.requests, "get", refuse)
+        monkeypatch.setattr(comfyui_service, "bounded_get", refuse)
         with pytest.raises(comfyui_service.HTTPException) as gone:
             comfyui_service._fetch_comfyui_history("http://comfy", "prompt-1")
         assert gone.value.detail == "ComfyUI stopped answering before the run finished"

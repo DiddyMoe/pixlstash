@@ -63,10 +63,12 @@ from pixlstash.server_config_io import persist_server_config
 from pixlstash.services import comfyui_connections
 from pixlstash.services.comfyui_service import (
     NO_PROXY,
+    READ_MAX_BYTES,
     comfyui_can_open_workflows,
     normalize_comfyui_url,
     probe_comfyui,
 )
+from pixlstash.utils.bounded_http import bounded_get, bounded_request
 
 logger = get_logger(__name__)
 
@@ -421,11 +423,13 @@ def _write_settings(pinned_url: str, settings: dict) -> None:
     to whatever ``Location`` names, and that host was never checked. Only a
     200 is success.
     """
-    response = requests.post(
+    response = bounded_request(
+        "POST",
         f"{pinned_url}settings",
         json=settings,
         timeout=10,
-        allow_redirects=False,
+        deadline_s=10,
+        max_bytes=READ_MAX_BYTES,
         proxies=NO_PROXY,
     )
     if response.status_code != 200:
@@ -457,11 +461,12 @@ def _check_round_trip(pinned_url: str, token: str) -> Optional[str]:
     written reach PixlStash and PixlStash accepts the token.
     """
     try:
-        response = requests.get(
+        response = bounded_get(
             f"{pinned_url}pixlstash/sort_mechanisms",
             headers={"Authorization": f"Bearer {token}"},
             timeout=30,
-            allow_redirects=False,
+            deadline_s=30,
+            max_bytes=READ_MAX_BYTES,
             proxies=NO_PROXY,
         )
     except requests.RequestException as exc:

@@ -33,6 +33,8 @@ import requests
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import comfyui_link_service, node_packs
 from pixlstash.services.comfyui_pack_service import restart_comfyui
+from pixlstash.services.comfyui_service import READ_MAX_BYTES
+from pixlstash.utils.bounded_http import BoundedResponse, bounded_request
 
 logger = get_logger(__name__)
 
@@ -67,19 +69,20 @@ def _call(
     *,
     body: Optional[dict] = None,
     timeout: float = 10,
-) -> Optional[requests.Response]:
+) -> Optional[BoundedResponse]:
     """One request to the pinned ComfyUI, or ``None`` when it did not answer.
 
     Never through a proxy and never after a redirect: the pinned address is the
     vetted one, and a redirect could send the request somewhere that is not.
     """
     try:
-        return requests.request(
+        return bounded_request(
             method,
             f"{pinned}{path}",
             json=body,
             timeout=timeout,
-            allow_redirects=False,
+            deadline_s=timeout,
+            max_bytes=READ_MAX_BYTES,
             proxies=comfyui_link_service.NO_PROXY,
         )
     except requests.RequestException as exc:
