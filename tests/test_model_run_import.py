@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -42,6 +43,8 @@ from pixlstash.services import model_mover as mover_module
 from pixlstash.services import run_importer as importer_module
 from pixlstash.services.model_mover import MoveRefused, file_digest
 from pixlstash.services.run_importer import (
+    IMPORT_FAILED_DETAIL,
+    IMPORT_NAME_TAKEN_DETAIL,
     PROVENANCE_TRAINED,
     STATUS_CANCELLED,
     STATUS_FAILED,
@@ -215,6 +218,16 @@ def test_a_copy_that_does_not_verify_registers_nothing(shelf, monkeypatch):
     )
 
     assert {outcome.status for outcome in report.outcomes} == {STATUS_FAILED}
+    # The detail is the server's sentence about a registered file name; the
+    # run's path on disk is what the old OSError text carried.
+    assert {outcome.detail for outcome in report.outcomes} == {
+        f"The copy of {outcome.filename} did not verify; the copy was discarded "
+        "and the run's file is untouched."
+        for outcome in report.outcomes
+    }
+    assert all(
+        str(shelf["run_dir"]) not in outcome.detail for outcome in report.outcomes
+    )
     assert models(shelf["hub"]) == {}
     assert os.path.exists(shelf["run_dir"] / "Clementine.safetensors")
     assert sorted(os.listdir(shelf["destination_dir"])) == []
@@ -456,10 +469,15 @@ def test_a_source_folder_is_never_an_import_destination(shelf):
 
 
 def test_a_run_with_nothing_selected_is_refused(shelf):
-    with pytest.raises(MoveRefused, match="no checkpoint to import"):
+    with pytest.raises(MoveRefused) as refused:
         RunImporter(shelf["hub"]).import_run(
-            str(shelf["run_dir"]), shelf["destination_id"], steps=[9999]
+            str(shelf["run_dir"]), shelf["destination_id"], steps=[987654321]
         )
+    # The steps are the caller's; the run's name is the folder the server found.
+    assert str(refused.value) == (
+        "Clementine has no checkpoint to import at the steps asked for."
+    )
+    assert "987654321" not in str(refused.value)
     assert os.listdir(shelf["destination_dir"]) == []
 
 
@@ -476,7 +494,7 @@ def test_a_name_already_in_the_destination_is_refused_before_anything_copies(she
 
 
 def test_a_file_that_lands_on_the_destination_name_mid_copy_is_not_overwritten(
-    shelf, monkeypatch
+    shelf, monkeypatch, caplog
 ):
     """The TOCTOU between ``_resolve_targets`` and ``os.replace``.
 
@@ -496,11 +514,23 @@ def test_a_file_that_lands_on_the_destination_name_mid_copy_is_not_overwritten(
 
     monkeypatch.setattr(importer_module, "file_digest", gatecrash_then_digest)
 
-    report = RunImporter(shelf["hub"]).import_run(
-        str(shelf["run_dir"]), shelf["destination_id"], steps=[None], delete_source=True
-    )
+    with caplog.at_level(logging.ERROR, logger=importer_module.logger.name):
+        report = RunImporter(shelf["hub"]).import_run(
+            str(shelf["run_dir"]),
+            shelf["destination_id"],
+            steps=[None],
+            delete_source=True,
+        )
 
     assert [outcome.status for outcome in report.outcomes] == [STATUS_FAILED]
+    # The refusal's OSError text names the destination path: logged with its
+    # traceback, never in the outcome the POST answers with.
+    [outcome] = report.outcomes
+    assert outcome.detail == IMPORT_FAILED_DETAIL
+    assert str(shelf["destination_dir"]) not in outcome.detail
+    [logged] = [r for r in caplog.records if r.name == importer_module.logger.name]
+    assert logged.exc_info is not None
+    assert isinstance(logged.exc_info[1], FileExistsError)
     assert target.read_bytes() == b"somebody else's file", (
         "the import wrote over a file that appeared after the batch was planned"
     )
@@ -516,7 +546,7 @@ def test_a_file_that_lands_on_the_destination_name_mid_copy_is_not_overwritten(
 
 
 def test_a_destination_row_registered_mid_copy_fails_the_file_and_leaves_it_alone(
-    shelf, monkeypatch
+    shelf, monkeypatch, caplog
 ):
     """``ON CONFLICT(model_folder_id, relpath) DO UPDATE`` would repoint it.
 
@@ -553,11 +583,23 @@ def test_a_destination_row_registered_mid_copy_fails_the_file_and_leaves_it_alon
 
     monkeypatch.setattr(importer_module, "file_digest", gatecrash_then_digest)
 
-    report = RunImporter(hub).import_run(
-        str(shelf["run_dir"]), shelf["destination_id"], steps=[None], delete_source=True
-    )
+    with caplog.at_level(logging.ERROR, logger=importer_module.logger.name):
+        report = RunImporter(hub).import_run(
+            str(shelf["run_dir"]),
+            shelf["destination_id"],
+            steps=[None],
+            delete_source=True,
+        )
 
     assert [outcome.status for outcome in report.outcomes] == [STATUS_FAILED]
+    # SQLite's UNIQUE text names the table and its columns: the log has it,
+    # with the traceback; the outcome says what happened in the server's words.
+    [outcome] = report.outcomes
+    assert outcome.detail == IMPORT_NAME_TAKEN_DETAIL
+    assert "UNIQUE" not in outcome.detail
+    [logged] = [r for r in caplog.records if r.name == importer_module.logger.name]
+    assert logged.exc_info is not None
+    assert isinstance(logged.exc_info[1], sqlite3.IntegrityError)
     row = hub.fetchone(
         "SELECT model_id, state FROM model_file WHERE model_folder_id = ? "
         "AND relpath = 'Clementine.safetensors'",

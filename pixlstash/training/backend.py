@@ -91,8 +91,10 @@ class TrainingProgress:
         speed: Speed string from the trainer (e.g. ``"2.31 iter/sec"``), used
             to derive an ETA. Empty string when unknown.
         loss_curve: Ordered list of ``{"step": int, "loss": float}`` points,
-            or ``None`` when the source could not be read this poll (the caller
-            keeps what it had). A backend never mutates a list it has returned.
+            every loss finite (JSON has no ``inf`` or ``nan``, so a backend
+            leaves out a step that logged one), or ``None`` when the source
+            could not be read this poll (the caller keeps what it had). A
+            backend never mutates a list it has returned.
         samples: Absolute paths to generated preview sample files.
         checkpoints: Absolute paths to intermediate ``.safetensors`` checkpoints
             (excluding the final one), oldest first.

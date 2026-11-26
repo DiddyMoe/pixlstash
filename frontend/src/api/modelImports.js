@@ -1,11 +1,12 @@
 // Taking a training run onto the shelf - /model-folders/{id}/runs and
 // /model-imports.
 //
-// **Listing a run costs nothing and changes nothing.** The listing reads
-// filenames and one `config.yaml` per run; it does not hash, copy, move or
-// write, which is what lets the whole card grid be drawn for an output root
-// before the user has decided about any of it. Do not add a call here that
-// erodes that.
+// **Listing a run changes nothing.** The listing reads filenames and one
+// `config.yaml` per run; it does not hash, copy, move or write, which is what
+// lets the whole card grid be drawn for an output root before the user has
+// decided about any of it. Do not add a call here that erodes that. It is not
+// free, though: the server walks the output root, so `useTrainingRunsStore`
+// shares a read in flight between readers that only want the list as it is.
 //
 // The import is the committing half and runs the same ordering as a move: copy,
 // verify by SHA-256, register the row and commit, then unlink. It shares the

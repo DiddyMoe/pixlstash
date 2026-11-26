@@ -14,10 +14,13 @@ and a figure that could not be read is ``None``, never 0: the view draws
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
 import statistics
+import threading
+from collections import OrderedDict
 from datetime import datetime
 
 from pixlstash.pixl_logging import get_logger
@@ -385,10 +388,69 @@ def read_trainer_info(sqlite_db_path: str, job_uuid: str) -> str:
     return str(row[0] or "") if row else ""
 
 
+# The step times read last, per loss log, with the stat of the log and its WAL
+# when they were read. Every open live view polls once a second while the
+# trainer logs a step every few seconds, so most polls find nothing new.
+_STEP_TIMES_CACHE_SIZE = 8
+_step_times_cache: OrderedDict[str, tuple[tuple, tuple[tuple[int, float], ...]]] = (
+    OrderedDict()
+)
+_step_times_lock = threading.Lock()
+
+
+def _file_identity(path: str) -> tuple | None:
+    """``(device, inode, size, mtime_ns)`` of *path*, or None when it is absent."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def read_step_times(loss_db_path: str) -> list[tuple[int, float]]:
     """``(step, wall_time)`` of every logged step, oldest first; [] when unreadable.
 
     The same read-only, WAL-aware open the adapter uses for the loss curve.
+
+    The read is cached against the identity, size and modification time of the
+    log *and* of its ``-wal`` file: a committed step lands in the WAL first and
+    leaves the main file untouched until a checkpoint, so the main file alone
+    would hide it. A poll that finds both unchanged returns the last read
+    without opening the database. The trainer also rewrites earlier steps
+    (a resume, a carry-on cut back), which is why the whole table is reread on
+    any change rather than only the steps past the last one seen.
+    """
+    try:
+        identity = (_file_identity(loss_db_path), _file_identity(loss_db_path + "-wal"))
+    except OSError as exc:
+        logger.debug("Could not stat the loss log %s: %s", loss_db_path, exc)
+        identity = None
+    if identity is not None and identity[0] is not None:
+        with _step_times_lock:
+            cached = _step_times_cache.get(loss_db_path)
+            if cached is not None and cached[0] == identity:
+                _step_times_cache.move_to_end(loss_db_path)
+                return list(cached[1])
+    # The stat is taken before the read, so a step landing in between is
+    # stored under the older stat and the next poll reads again: the cache can
+    # only err towards an extra read, never towards a missed step.
+    times = _read_step_times_uncached(loss_db_path)
+    if times is None:
+        # A failed read is not cached: the next poll tries the file again.
+        return []
+    if identity is not None and identity[0] is not None:
+        with _step_times_lock:
+            _step_times_cache[loss_db_path] = (identity, tuple(times))
+            _step_times_cache.move_to_end(loss_db_path)
+            while len(_step_times_cache) > _STEP_TIMES_CACHE_SIZE:
+                _step_times_cache.popitem(last=False)
+    return times
+
+
+def _read_step_times_uncached(loss_db_path: str) -> list[tuple[int, float]] | None:
+    """Open the loss log read-only and read every ``(step, wall_time)``.
+
+    Returns None when the log could not be opened or read.
     """
     try:
         conn = sqlite3.connect(
@@ -396,7 +458,7 @@ def read_step_times(loss_db_path: str) -> list[tuple[int, float]]:
         )
     except sqlite3.Error as exc:
         logger.debug("No step times in %s: %s", loss_db_path, exc)
-        return []
+        return None
     try:
         conn.execute("PRAGMA query_only=1")
         rows = conn.execute(
@@ -404,7 +466,7 @@ def read_step_times(loss_db_path: str) -> list[tuple[int, float]]:
         ).fetchall()
     except sqlite3.Error as exc:
         logger.debug("Could not read step times from %s: %s", loss_db_path, exc)
-        return []
+        return None
     finally:
         conn.close()
     times = []
@@ -419,6 +481,53 @@ def read_step_times(loss_db_path: str) -> list[tuple[int, float]]:
                 "Skipping an unreadable step time in %s: %s", loss_db_path, exc
             )
     return times
+
+
+def finite_loss_curve(curve: list[dict] | None) -> tuple[list[dict] | None, list]:
+    """*curve* without its points whose loss is not a finite number.
+
+    A diverged step logs ``inf`` or ``nan``. JSON has no such numbers (RFC 8259
+    section 6): Python's encoder writes ``Infinity``, which the hub's JSON
+    functions then read as malformed, and the API's encoder writes ``null``,
+    which a chart reads as 0. So such a point is not part of the curve. The
+    backend leaves it out as it reads the trainer's log; this drops it from a
+    stored curve, which a build from before that (or an older build sharing
+    the hub) may have written with one. The caller says which steps it dropped.
+
+    Returns:
+        ``(curve, dropped_steps)``. *curve* is returned as it is, the same
+        list, when nothing was dropped, and None stays None.
+    """
+    if not curve:
+        return curve, []
+    dropped = [
+        point.get("step")
+        for point in curve
+        if isinstance(point, dict) and _not_finite(point.get("loss"))
+    ]
+    if not dropped:
+        return curve, []
+    kept = [
+        point
+        for point in curve
+        if not (isinstance(point, dict) and _not_finite(point.get("loss")))
+    ]
+    return kept, dropped
+
+
+def latest_finite_loss(curve: list[dict] | None) -> float | None:
+    """The loss of the last point of *curve* that has a finite one, else None."""
+    for point in reversed(curve or []):
+        loss = point.get("loss") if isinstance(point, dict) else None
+        if isinstance(loss, (int, float)) and not isinstance(loss, bool):
+            if math.isfinite(loss):
+                return float(loss)
+    return None
+
+
+def _not_finite(value) -> bool:
+    """True for a float that is ``inf``, ``-inf`` or ``nan``."""
+    return isinstance(value, float) and not math.isfinite(value)
 
 
 def speed(step_times: list[tuple[int, float]], total_steps: int | None) -> dict:
@@ -505,6 +614,8 @@ __all__ = [
     "cell_state",
     "checkpoint_columns",
     "downloading",
+    "finite_loss_curve",
+    "latest_finite_loss",
     "parse_phase_log",
     "phase_durations",
     "phase_of",

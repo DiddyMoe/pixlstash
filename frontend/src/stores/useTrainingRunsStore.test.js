@@ -332,6 +332,33 @@ describe("reading the runs and the jobs", () => {
     expect(store.jobs.map((j) => j.uuid)).toEqual(["fake-new"]);
   });
 
+  it("answers each jobs reader with what its read found, superseded or not", async () => {
+    // A store outside this one (naming a new run, the Tasks quit) reads the
+    // jobs here and needs the list its own read found, or null if it failed.
+    const store = useTrainingRunsStore();
+    const older = deferred();
+    const newer = deferred();
+    listTrainingJobs
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise)
+      .mockRejectedValueOnce(new Error("fake-down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const first = store.loadJobs();
+    const second = store.loadJobs();
+    const joined = store.loadJobs({ join: true });
+    newer.resolve([{ uuid: "fake-new", name: "new", status: "queued" }]);
+    older.resolve([{ uuid: "fake-old", name: "old", status: "queued" }]);
+    expect((await first).map((j) => j.uuid)).toEqual(["fake-old"]);
+    expect((await second).map((j) => j.uuid)).toEqual(["fake-new"]);
+    expect(await joined).toBe(await second);
+    expect(store.jobs.map((j) => j.uuid)).toEqual(["fake-new"]);
+
+    expect(await store.loadJobs()).toBeNull();
+    expect(store.jobsFailed).toBe(true);
+    warn.mockRestore();
+  });
+
   it("gives a failed jobs read to every reader that joined it, and asks again next time", async () => {
     const store = useTrainingRunsStore();
     const failing = deferred();

@@ -32,6 +32,7 @@ import zipfile
 import psutil
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from pixlstash.hub import dataset_snapshots, training_runs
 from pixlstash.resources import comfyui_tenant
@@ -39,8 +40,9 @@ from pixlstash.resources.arbiter import Lease, LeaseKind, Tenant, arbiter
 from pixlstash.routes import training as training_routes
 from pixlstash.routes.training import _redact_host_paths
 from pixlstash.training import preset_updates, presets
+from pixlstash.training.config_render import NOT_TUNABLE_MESSAGE
 from pixlstash.server import Server
-from pixlstash.services.training_service import TrainingService
+from pixlstash.services.training_service import TrainingService, TrainingStoreError
 from pixlstash.training.local_ai_toolkit import LocalAiToolkit
 from pixlstash.utils.service.export_utils import ExportUtils
 
@@ -459,10 +461,23 @@ def test_create_job_unknown_preset_is_404():
                 "character_id": 7,
                 "name": "x",
                 "trigger_word": "alice",
-                "preset": "does-not-exist",
+                "preset": "example-not-a-recipe",
             },
         )
         assert r.status_code == 404, r.text
+        assert r.json()["detail"] == (
+            "No such training recipe; GET /training/presets lists them."
+        )
+        r = owner.post(
+            "/training/resolve",
+            json={
+                "preset": "example-not-a-recipe",
+                "subject": "person",
+                "picture_count": 1,
+            },
+        )
+        assert r.status_code == 404, r.text
+        assert "example-not-a-recipe" not in r.text
     finally:
         _teardown(temp_dir, server)
 
@@ -641,6 +656,28 @@ def test_get_job_detail_owner_works():
         _teardown(temp_dir, server)
 
 
+def test_a_stored_loss_that_is_not_finite_is_not_sent():
+    """A curve stored before such points were left out still holds Infinity."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        stored = json.dumps(
+            [
+                {"step": 1, "loss": 0.5},
+                {"step": 2, "loss": float("inf")},
+                {"step": 3, "loss": 0.4},
+            ]
+        )
+        assert "Infinity" in stored
+        job_id, _ = _seed_job(server, loss_curve=stored)
+        finite = [{"step": 1, "loss": 0.5}, {"step": 3, "loss": 0.4}]
+        for path in (f"/training/jobs/{job_id}", f"/training/jobs/{job_id}/live"):
+            r = owner.get(path)
+            assert r.status_code == 200, (path, r.text)
+            assert r.json()["loss_curve"] == finite, path
+    finally:
+        _teardown(temp_dir, server)
+
+
 def test_get_job_detail_missing_is_404():
     temp_dir, owner, server, read_token = _setup()
     try:
@@ -684,13 +721,79 @@ def test_job_status_has_no_latest_loss_without_a_readable_curve(caplog):
     """No curve, an empty one or an unreadable one: no latest loss, never a 500."""
     temp_dir, owner, server, read_token = _setup()
     try:
-        for stored in (None, "[]", "not json", json.dumps([{"step": 1}])):
+        for stored in (None, "[]", "not json", json.dumps([{"step": 1}]), "5"):
             job_id, _ = _seed_job(server, loss_curve=stored)
             with caplog.at_level("WARNING"):
                 r = owner.get(f"/training/jobs/{job_id}/status")
             assert r.status_code == 200, r.text
             assert r.json()["latest_loss"] is None, stored
         assert caplog.text.count("Could not parse loss_curve") == 1
+        assert caplog.text.count("not a list of points") == 1
+    finally:
+        _teardown(temp_dir, server)
+
+
+def _strict_json(text):
+    """Parse *text* as RFC 8259 JSON, which has no Infinity or NaN."""
+
+    def refuse(name):
+        raise ValueError(f"{name} is not JSON")
+
+    return json.loads(text, parse_constant=refuse)
+
+
+# Curves as a build before non-finite points were left out stored them: Python's
+# encoder writes Infinity and NaN, which SQLite's JSON functions call malformed.
+_LEGACY_CURVES = (
+    ([0.5, float("inf"), 0.4], 0.4),
+    ([0.5, 0.4, float("inf")], 0.4),
+    ([0.5, 0.3, float("nan")], 0.3),
+    ([0.6, 0.2, float("-inf"), float("inf")], 0.2),
+)
+
+
+def test_a_curve_stored_with_a_loss_that_is_not_finite_still_shows_its_latest():
+    """The status poll reads a legacy curve as the detail and the live view do."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        for losses, latest in _LEGACY_CURVES:
+            stored = json.dumps(
+                [{"step": i + 1, "loss": loss} for i, loss in enumerate(losses)]
+            )
+            job_id, _ = _seed_job(server, loss_curve=stored)
+            r = owner.get(f"/training/jobs/{job_id}/status")
+            assert r.status_code == 200, r.text
+            assert _strict_json(r.text)["latest_loss"] == latest, stored
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_no_reader_of_a_run_answers_500_for_a_stored_curve_it_cannot_draw():
+    """Every GET on one run, for every stored curve no build should have written.
+
+    The body is RFC 8259 JSON wherever it is JSON at all, so a browser's
+    ``JSON.parse`` reads it. ``train-longer`` is the one GET left out: it asks
+    the training service, stubbed here, and reads no stored curve.
+    """
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        stored_curves = [
+            json.dumps([{"step": i + 1, "loss": v} for i, v in enumerate(losses)])
+            for losses, _ in _LEGACY_CURVES
+        ] + ["not json", "5", json.dumps({"loss": 0.1})]
+        for stored in stored_curves:
+            job_id, _ = _seed_job(server, loss_curve=stored)
+            for suffix in (
+                "",
+                "/status",
+                "/live",
+                "/snapshot",
+                "/snapshot/export",
+            ):
+                r = owner.get(f"/training/jobs/{job_id}{suffix}")
+                assert r.status_code < 500, (stored, suffix, r.text)
+                if r.headers.get("content-type", "").startswith("application/json"):
+                    _strict_json(r.text)
     finally:
         _teardown(temp_dir, server)
 
@@ -1413,6 +1516,88 @@ def test_cancel_job_terminal_is_409():
         _teardown(temp_dir, server)
 
 
+def test_cancel_whose_stop_cannot_be_saved_is_503_not_cancelled():
+    """A queued job's unsaved stop leaves it queued, so the cancel must fail."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        job_id, _ = _seed_job(server, status="queued")
+
+        def cannot_save(_job_id):
+            raise TrainingStoreError("The stop could not be recorded.")
+
+        server.vault.training_service.cancel = cannot_save
+        r = owner.post(f"/training/jobs/{job_id}/cancel")
+        assert r.status_code == 503, r.text
+        assert "could not be saved" in r.json()["detail"]
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_train_longer_whose_requeue_cannot_be_saved_is_503_not_queued():
+    """An unsaved requeue leaves the run as it ended, so the press must fail,
+    and with a sentence the server wrote rather than the service's message."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        job_id, _ = _seed_job(server, status="completed")
+
+        def cannot_save(_job_id, **_steps):
+            raise TrainingStoreError(
+                "Run example-run could not be queued: its row was not written."
+            )
+
+        server.vault.training_service.train_longer = cannot_save
+        r = owner.post(
+            f"/training/jobs/{job_id}/train-longer",
+            json={"from_step": 4, "more_steps": 2},
+        )
+        assert r.status_code == 503, r.text
+        assert r.json()["detail"] == (
+            "The run could not be queued to train longer. Try again in a moment."
+        )
+        assert "example-run" not in r.text
+    finally:
+        _teardown(temp_dir, server)
+
+
+def test_create_job_whose_run_cannot_be_written_is_503_with_the_server_sentence(
+    caplog,
+):
+    """A busy hub rolls the insert back, so nothing is queued: the owner reads a
+    sentence the server wrote, and the log has the job and the cause."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        char_id = _make_character(owner)
+
+        def cannot_write(**_fields):
+            raise TrainingStoreError(
+                "Training run 'example-run' could not be written to the hub."
+            )
+
+        server.vault.training_service.enqueue = cannot_write
+        with caplog.at_level("ERROR"):
+            r = owner.post(
+                "/training/jobs",
+                json={
+                    "character_id": char_id,
+                    "name": "Alice LoRA",
+                    "trigger_word": "alice",
+                },
+            )
+        assert r.status_code == 503, r.text
+        assert r.json()["detail"] == (
+            "The run could not be started. Try again in a moment."
+        )
+        assert "example-run" not in r.text
+        logged = [
+            rec
+            for rec in caplog.records
+            if rec.levelname == "ERROR" and "Alice LoRA" in rec.getMessage()
+        ]
+        assert logged and logged[0].exc_info, caplog.text
+    finally:
+        _teardown(temp_dir, server)
+
+
 def test_cancel_409_names_the_status_the_service_saw():
     """A job that finishes while cancel runs is reported as it is now, not as read before."""
     temp_dir, owner, server, read_token = _setup()
@@ -2045,6 +2230,13 @@ def test_resolve_previews_the_run_and_every_recipes_fit():
         r = owner.post("/training/resolve", json={**body, "pins": {"model.arch": "x"}})
         assert r.status_code == 200, r.text
         assert "model.arch" in r.json()["error"]["message"]
+        # A key outside the tunables is the caller's text: not repeated.
+        r = owner.post(
+            "/training/resolve", json={**body, "pins": {"training_folder": "/etc"}}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["error"]["message"] == NOT_TUNABLE_MESSAGE, r.text
+        assert "training_folder" not in r.text and "/etc" not in r.text, r.text
 
         scoped = _scoped_client(server, read_token)
         assert scoped.post("/training/resolve", json=body).status_code == 403
@@ -2352,6 +2544,61 @@ def test_character_set_suggestion_ranks_stills_and_clips_apart(key_list_plan):
         _teardown(temp_dir, server)
 
 
+# Stored face boxes a reader cannot use: written before the ``bbox_``
+# validator, or by a tool outside the app.
+DAMAGED_FACE_BOXES = {
+    "huge-int-y2": "[0, 0, 10, " + "9" * 400 + "]",
+    "infinity": "[0, 0, 10, Infinity]",
+    "json-string": '"abcd"',
+    "nested-lists": "[[0], [0], [10], [10]]",
+    "object": '{"a": 1}',
+    "not-json": "test-not-json",
+}
+
+
+def test_character_set_suggestion_leaves_a_damaged_face_box_out():
+    """A damaged stored box is no box: 200, framed as if it had none, while a
+    readable box on another picture still frames that one."""
+    temp_dir, owner, server, _read_token = _setup()
+    try:
+        char_id = _make_character(owner, "Bea")
+        a, b, _c, _d, _clip, _other = _seed_character_pictures(server, char_id)
+        url = "/training/character_set_suggestion"
+
+        def store_box(raw):
+            def write(session):
+                session.execute(
+                    text(
+                        "UPDATE face SET bbox = :raw WHERE picture_id = :pid "
+                        "AND character_id = :cid AND face_index = 0"
+                    ),
+                    {"raw": raw, "pid": a, "cid": char_id},
+                )
+                session.commit()
+
+            server.vault.db.run_task(write)
+
+        def framing():
+            r = owner.get(url, params={"character_id": char_id})
+            assert r.status_code == 200, r.text[:300]
+            picks = r.json()["stills"]["picks"]
+            return {p["picture_id"]: p["buckets"]["framing"] for p in picks}
+
+        boxed = framing()
+        # The box (90 of 100 rows below a 40-row face) frames both, not
+        # their Close-up and full body tags.
+        assert boxed[a] == boxed[b] == ["upper body"]
+        store_box(None)
+        unboxed = framing()
+        assert unboxed[a] != ["upper body"], "without a box, a's tag frames it"
+        assert unboxed[b] == ["upper body"]
+        for name, raw in DAMAGED_FACE_BOXES.items():
+            store_box(raw)
+            assert framing() == unboxed, name
+    finally:
+        _teardown(temp_dir, server)
+
+
 def test_create_job_on_a_reference_set_is_filed_under_its_character():
     temp_dir, owner, server, read_token = _setup()
     try:
@@ -2460,14 +2707,28 @@ def _walk_strings(value):
 
 
 def test_create_job_refuses_locked_and_untunable_pins_before_enqueue():
-    """A pin on a locked recipe key, or on a key outside the tunables, is a 422
-    naming the key, and nothing is queued. The raw config patch is gone."""
+    """A pin on a locked recipe key is a 422 naming the key (the recipe's own);
+    one on a key outside the tunables is a 422 that does not repeat the key,
+    which is the caller's text. Nothing is queued. The raw config patch is gone."""
     temp_dir, owner, server, read_token = _setup()
     try:
         char_id = _make_character(owner)
         for pins, key in (
             ({"model.name_or_path": "/evil"}, "model.name_or_path"),
             ({"model.arch": "flux"}, "model.arch"),
+        ):
+            r = owner.post(
+                "/training/jobs",
+                json={
+                    "character_id": char_id,
+                    "name": "x",
+                    "trigger_word": "tw",
+                    "pins": pins,
+                },
+            )
+            assert r.status_code == 422, r.text
+            assert key in r.text, r.text
+        for pins, key in (
             ({"training_folder": "/etc"}, "training_folder"),
             ({"datasets[*].folder_path": "/etc"}, "folder_path"),
         ):
@@ -2481,7 +2742,8 @@ def test_create_job_refuses_locked_and_untunable_pins_before_enqueue():
                 },
             )
             assert r.status_code == 422, r.text
-            assert key in r.text, r.text
+            assert r.json()["detail"] == NOT_TUNABLE_MESSAGE, r.text
+            assert key not in r.text and "/etc" not in r.text, r.text
         assert (
             "fixed by the Z-Image Turbo recipe"
             in owner.post(

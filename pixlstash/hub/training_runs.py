@@ -11,7 +11,7 @@ strings the hub stores. Callers that need JSON columns parse them.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Mapping, Optional, Sequence
 
 from pixlstash.hub.db import HubDatabase, now_iso
 
@@ -101,6 +101,7 @@ def create_run(
     preset: Optional[str] = None,
     resolved_profile: Optional[str] = None,
     advanced_pins: Optional[str] = None,
+    comfyui_quit: Optional[str] = None,
 ) -> int:
     """Insert a queued run and return its id.
 
@@ -116,6 +117,9 @@ def create_run(
         preset: The recipe as ``id@version``.
         resolved_profile: The resolver's result, as JSON.
         advanced_pins: The owner's Advanced values, as JSON.
+        comfyui_quit: ``"allowed"`` when the owner said ComfyUI may be quit
+            for the run (#2558), else None. Written with the row, so a worker
+            that claims the run always reads the answer.
 
     Returns:
         The new ``training_run.id``.
@@ -124,8 +128,8 @@ def create_run(
         cursor = conn.execute(
             "INSERT INTO training_run (uuid, library_uuid, name, status, set_id, "
             "character_id, base_model, trigger_word, preset, resolved_profile, "
-            "advanced_pins, created_at) "
-            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
+            "advanced_pins, comfyui_quit, created_at) "
+            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 uuid,
                 library_uuid,
@@ -137,6 +141,7 @@ def create_run(
                 preset,
                 resolved_profile,
                 advanced_pins,
+                comfyui_quit,
                 now_iso(),
             ),
         )
@@ -172,33 +177,22 @@ def get_run_status(hub: HubDatabase, run_uuid: str) -> Optional[str]:
     return str(row[0]) if row is not None else None
 
 
-# The loss of a stored curve's last point, read in SQL so the status poll never
-# loads the curve. NULL when there is no curve, it has no points, or it is not
-# valid JSON. The last index is computed rather than written ``$[#-1]``: that
-# form needs SQLite 3.31, and on a malformed curve it raises instead of
-# returning NULL.
-_LATEST_LOSS_SQL = (
-    "CASE WHEN json_valid(loss_curve) AND json_array_length(loss_curve) > 0 "
-    "THEN json_extract(loss_curve, "
-    "'$[' || (json_array_length(loss_curve) - 1) || '].loss') END"
-)
-
-
 def get_run_status_summary(
     hub: HubDatabase, library_uuid: str, run_id: int
 ) -> Optional[dict]:
-    """One run's status fields and its latest loss, without its curve.
+    """One run's status fields and its stored loss curve, for the status poll.
 
-    For the status poll. The row holds ``id``, ``uuid``, ``status``, ``step``,
-    ``total_steps``, ``report`` and ``error``, plus ``latest_loss`` (the last
-    curve point's loss, or None) and ``loss_curve_malformed`` (true when a
-    stored curve is not valid JSON). None when the run is absent or in another
-    library.
+    The row holds ``id``, ``uuid``, ``status``, ``step``, ``total_steps``,
+    ``report``, ``error`` and ``loss_curve`` (the JSON text as stored). None
+    when the run is absent or in another library.
+
+    The latest loss is not read in SQL. A curve written before non-finite
+    points were left out can hold ``Infinity`` or ``NaN``, which SQLite's JSON
+    functions reject as malformed before 3.42 and read only as JSON5 after it,
+    so the caller parses the curve with the same reader as every other one.
     """
     row = hub.fetchone(
-        "SELECT id, uuid, status, step, total_steps, report, error, "
-        f"{_LATEST_LOSS_SQL} AS latest_loss, "
-        "(loss_curve <> '' AND NOT json_valid(loss_curve)) AS loss_curve_malformed "
+        "SELECT id, uuid, status, step, total_steps, report, error, loss_curve "
         "FROM training_run WHERE id = ? AND library_uuid = ?",
         (run_id, library_uuid),
     )
@@ -283,30 +277,54 @@ def busy_runs(hub: HubDatabase) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def update_run(hub: HubDatabase, run_uuid: str, **fields) -> bool:
-    """Set mutable columns on one run, by uuid.
+def update_run(
+    hub: HubDatabase,
+    run_uuid: str,
+    *,
+    only_if: Optional[Mapping[str, Sequence[object]]] = None,
+    **fields,
+) -> bool:
+    """Set mutable columns on one run, by uuid, optionally only from a known state.
+
+    With *only_if* the write is a compare-and-set: each named column must hold
+    one of its listed values (compared with ``IS``, so ``None`` matches NULL)
+    or nothing is written. The test is part of the UPDATE itself, so no other
+    writer can change the row between the check and the write. A status write
+    that must not overwrite a newer state - ``stopping`` over a run that has
+    already ended, ``running`` over a run cancelled while it launched - says
+    which states it may follow here.
 
     Args:
         hub: The open hub.
         run_uuid: The run's uuid.
+        only_if: Column name to the values it may hold for the write to land.
         **fields: Column names to set. Names outside the mutable set raise.
 
     Returns:
-        True when a row was updated, False when no run has that uuid.
+        True when the row was updated; False when no run has that uuid or the
+        row did not hold the state *only_if* asks for.
 
     Raises:
-        ValueError: A field is not a mutable column.
+        ValueError: A field or *only_if* column is not a mutable column, or an
+            *only_if* column lists no values.
     """
-    unknown = set(fields) - _MUTABLE_COLUMNS
+    unknown = (set(fields) | set(only_if or ())) - _MUTABLE_COLUMNS
     if unknown:
         raise ValueError(f"Not a mutable training_run column: {sorted(unknown)}")
     if not fields:
         return False
     assignments = ", ".join(f"{column} = ?" for column in fields)
+    where = "uuid = ?"
+    params: list[object] = [*fields.values(), run_uuid]
+    for column, allowed in (only_if or {}).items():
+        allowed = tuple(allowed)
+        if not allowed:
+            raise ValueError(f"only_if lists no values for {column}")
+        where += " AND (" + " OR ".join(f"{column} IS ?" for _ in allowed) + ")"
+        params.extend(allowed)
     with hub.transaction() as conn:
         cursor = conn.execute(
-            f"UPDATE training_run SET {assignments} WHERE uuid = ?",
-            (*fields.values(), run_uuid),
+            f"UPDATE training_run SET {assignments} WHERE {where}", params
         )
         return cursor.rowcount > 0
 

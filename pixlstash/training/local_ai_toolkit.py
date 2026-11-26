@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ import signal
 import sqlite3
 import subprocess
 import time
+from dataclasses import dataclass
 
 import psutil
 
@@ -171,13 +173,51 @@ def safe_job_stem(name: str, job_id: str) -> str:
     return stem
 
 
-def _loss_points(rows: list[tuple]) -> list[dict]:
-    """Turn ``(step, value)`` loss rows into curve points, skipping empty values."""
-    return [
-        {"step": int(step), "loss": float(value)}
-        for step, value in rows
-        if value is not None
-    ]
+def _loss_points(rows: list[tuple]) -> tuple[list[dict], list[int]]:
+    """Turn ``(step, value)`` loss rows into curve points, and the steps left out.
+
+    An empty value has no point. Nor has a loss that is not finite: a diverged
+    step logs ``inf`` (SQLite stores a NaN as NULL, so it arrives empty), and
+    JSON has no such number (RFC 8259 section 6). The curve a backend hands on
+    is finite by contract (:attr:`TrainingProgress.loss_curve`), so this is the
+    one place such a step is dropped.
+
+    Returns:
+        ``(points, dropped_steps)``: the points in row order, and the steps
+        whose loss was not finite.
+    """
+    points: list[dict] = []
+    dropped: list[int] = []
+    for step, value in rows:
+        if value is None:
+            continue
+        loss = float(value)
+        if math.isfinite(loss):
+            points.append({"step": int(step), "loss": loss})
+        else:
+            dropped.append(int(step))
+    return points, dropped
+
+
+@dataclass(frozen=True)
+class CarryOn:
+    """What :meth:`LocalAiToolkit.carry_on_from` did to a run folder.
+
+    Each rename is atomic on its own, the set of them is not (Python's
+    ``os.replace``), so :meth:`LocalAiToolkit.undo_carry_on` takes them back
+    one by one, newest first: a compensating action, not a rollback.
+
+    Attributes:
+        take: The take folder's name when later files were set aside, else None.
+        moves: Every ``(source, dest)`` rename made, in the order made.
+        loss_log_copy: The take's whole copy of the run's ``loss_log.db``, once
+            it was made, else None. The run's own log is then cut back at the
+            step it carries on from.
+    """
+
+    take: str | None
+    moves: tuple[tuple[str, str], ...]
+    loss_log_copy: str | None
 
 
 class LocalAiToolkit(TrainerBackend):
@@ -223,6 +263,9 @@ class LocalAiToolkit(TrainerBackend):
         # The loss logs (by path) whose last read found loss rows, so a log
         # that goes missing after it was read is logged as a warning.
         self._loss_logs_read: set[str] = set()
+        # How many non-finite loss steps each log (by path) held at its last
+        # read, so a diverged step is warned about once, not on every poll.
+        self._non_finite_steps: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Path layout (single source of truth)
@@ -359,7 +402,7 @@ class LocalAiToolkit(TrainerBackend):
     @staticmethod
     def carry_on_from(
         handle: TrainingHandle, step: int, final_step: int | None = None
-    ) -> str | None:
+    ) -> CarryOn:
         """Leave *step* as the checkpoint the trainer resumes from.
 
         ai-toolkit resumes from the newest ``<stem>*`` file in ``save_root`` by
@@ -376,13 +419,17 @@ class LocalAiToolkit(TrainerBackend):
           starts a fresh optimizer from it. The loss log is copied into the
           take and its rows past *step* dropped from the run's own.
 
+        :meth:`undo_carry_on` puts the folder back, for a run that could not
+        be queued after all.
+
         Args:
             handle: The run's handle.
             step: A step from :meth:`kept_checkpoints`.
             final_step: As for :meth:`kept_checkpoints`.
 
         Returns:
-            The take folder's name when later files were set aside, else None.
+            What was done: the take folder's name when later files were set
+            aside, every rename made, and the take's copy of the loss log.
 
         Raises:
             FileNotFoundError: The run kept no checkpoint at *step*.
@@ -449,32 +496,110 @@ class LocalAiToolkit(TrainerBackend):
             for source, dest in moves:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 os.rename(source, dest)
-                moved.append((dest, source))
+                moved.append((source, dest))
         except OSError:
-            for dest, source in reversed(moved):
-                try:
-                    os.rename(dest, source)
-                except OSError as exc:
-                    logger.error(
-                        "Could not move %s back to %s after a failed "
-                        "set-aside (%s); the run folder is left partly moved.",
-                        dest,
-                        source,
-                        exc,
-                    )
-            for empty in (folder and os.path.join(folder, "samples"), folder):
-                try:
-                    if empty and os.path.isdir(empty) and not os.listdir(empty):
-                        os.rmdir(empty)
-                except OSError as exc:
-                    logger.warning("Could not remove empty %s: %s", empty, exc)
+            LocalAiToolkit._put_back(moved, folder)
             raise
+        loss_log_copy = None
         if folder:
-            LocalAiToolkit._set_loss_log_aside(handle.loss_db_path, folder, step)
-        return take_name
+            loss_log_copy = LocalAiToolkit._set_loss_log_aside(
+                handle.loss_db_path, folder, step
+            )
+        return CarryOn(take_name, tuple(moved), loss_log_copy)
 
     @staticmethod
-    def _set_loss_log_aside(loss_db: str, folder: str, step: int) -> None:
+    def undo_carry_on(handle: TrainingHandle, carried: CarryOn) -> bool:
+        """Put a run folder back as it was before :meth:`carry_on_from`.
+
+        For a run that could not be queued after all: the run's loss log is
+        written back from the take's copy, every rename is taken back newest
+        first, and the take folder goes once it is empty. A step that fails is
+        logged at error level with its paths and the rest are still taken back,
+        so as much as can be is put back.
+
+        Args:
+            handle: The run's handle.
+            carried: What :meth:`carry_on_from` returned for it.
+
+        Returns:
+            True when everything was put back; False when something stays
+            carried on (each such path is logged).
+        """
+        folder = os.path.join(handle.save_root, carried.take) if carried.take else None
+        restored = True
+        copy = carried.loss_log_copy
+        if copy:
+            try:
+                source = sqlite3.connect(copy)
+                try:
+                    dest = sqlite3.connect(handle.loss_db_path, timeout=2.0)
+                    try:
+                        source.backup(dest)
+                    finally:
+                        dest.close()
+                finally:
+                    source.close()
+            except sqlite3.Error as exc:
+                restored = False
+                logger.error(
+                    "Could not write the loss log %s back from %s (%s); the "
+                    "run's log stays cut back, and the take keeps the whole one.",
+                    handle.loss_db_path,
+                    copy,
+                    exc,
+                )
+            else:
+                try:
+                    os.remove(copy)
+                except OSError as exc:
+                    restored = False
+                    logger.error(
+                        "Wrote the loss log %s back, but could not remove the "
+                        "take's copy %s (%s); the take stays.",
+                        handle.loss_db_path,
+                        copy,
+                        exc,
+                    )
+        return LocalAiToolkit._put_back(list(carried.moves), folder) and restored
+
+    @staticmethod
+    def _put_back(moved: list[tuple[str, str]], folder: str | None) -> bool:
+        """Rename each ``(source, dest)`` of *moved* back, newest first.
+
+        Then the take *folder* (and its ``samples``) goes if left empty. A
+        rename that fails is logged at error level with both paths, and the
+        rest are still tried.
+
+        Args:
+            moved: The renames made, in the order made.
+            folder: The take folder they were made into, or None.
+
+        Returns:
+            True when every rename was taken back.
+        """
+        stuck = 0
+        for source, dest in reversed(moved):
+            try:
+                os.rename(dest, source)
+            except OSError as exc:
+                stuck += 1
+                logger.error(
+                    "Could not move %s back to %s (%s); the run folder is "
+                    "left partly carried on.",
+                    dest,
+                    source,
+                    exc,
+                )
+        for empty in (folder and os.path.join(folder, "samples"), folder):
+            try:
+                if empty and os.path.isdir(empty) and not os.listdir(empty):
+                    os.rmdir(empty)
+            except OSError as exc:
+                logger.warning("Could not remove empty %s: %s", empty, exc)
+        return stuck == 0
+
+    @staticmethod
+    def _set_loss_log_aside(loss_db: str, folder: str, step: int) -> str | None:
         """Copy the loss log into the take, then drop its rows past *step*.
 
         ai-toolkit drops those rows itself, but only on its first logged step
@@ -486,10 +611,15 @@ class LocalAiToolkit(TrainerBackend):
             loss_db: The run's ``loss_log.db``.
             folder: The take folder the later files were set aside in.
             step: The step the run carries on from.
+
+        Returns:
+            The take's copy once it is whole (the run's log may still be
+            uncut, if the cut failed), else None.
         """
         if not os.path.isfile(loss_db):
-            return
+            return None
         kept = os.path.join(folder, os.path.basename(loss_db))
+        copied = None
         try:
             source = sqlite3.connect(loss_db, timeout=2.0)
             try:
@@ -498,6 +628,7 @@ class LocalAiToolkit(TrainerBackend):
                     source.backup(dest)
                 finally:
                     dest.close()
+                copied = kept
                 with source:
                     source.execute("DELETE FROM metrics WHERE step > ?", (step,))
                     source.execute("DELETE FROM steps WHERE step > ?", (step,))
@@ -511,6 +642,17 @@ class LocalAiToolkit(TrainerBackend):
                 step,
                 exc,
             )
+            if copied is None and os.path.exists(kept):
+                # A copy cut off midway is no record of the take's loss.
+                try:
+                    os.remove(kept)
+                except OSError as remove_exc:
+                    logger.warning(
+                        "Could not remove the partial loss log copy %s: %s",
+                        kept,
+                        remove_exc,
+                    )
+        return copied
 
     @staticmethod
     def template_from_rendered(config: dict) -> dict:
@@ -1378,9 +1520,9 @@ class LocalAiToolkit(TrainerBackend):
         Returns:
             A ``(loss_curve, max_step)`` tuple. ``loss_curve`` is a new list of
             ``{"step": int, "loss": float}`` dicts ordered by step on every
-            read. It is empty for a DB with no loss rows and ``None`` for one
-            not read. ``max_step`` is the highest logged step or ``None`` if
-            unavailable.
+            read, every loss finite (see :func:`_loss_points`). It is empty for
+            a DB with no loss rows and ``None`` for one not read. ``max_step``
+            is the highest logged step or ``None`` if unavailable.
         """
         path = handle.loss_db_path
         if not os.path.exists(path):
@@ -1402,7 +1544,7 @@ class LocalAiToolkit(TrainerBackend):
                     conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
                     conn.execute("PRAGMA query_only=1")
                     conn.execute("BEGIN")
-                    curve, max_step = self._read_loss_rows(conn)
+                    curve, max_step, dropped = self._read_loss_rows(conn)
                     conn.commit()
                 finally:
                     conn.close()
@@ -1415,6 +1557,15 @@ class LocalAiToolkit(TrainerBackend):
                 self._loss_logs_read.add(path)
             else:
                 self._loss_logs_read.discard(path)
+            if len(dropped) > self._non_finite_steps.get(path, 0):
+                logger.warning(
+                    "Loss log %s: %d step(s) logged a loss that is not finite; "
+                    "they are left out of the curve (steps %s).",
+                    path,
+                    len(dropped),
+                    dropped[:10],
+                )
+            self._non_finite_steps[path] = len(dropped)
             return curve, max_step
 
         logger.warning(
@@ -1426,7 +1577,9 @@ class LocalAiToolkit(TrainerBackend):
         return None, None
 
     @staticmethod
-    def _read_loss_rows(conn: sqlite3.Connection) -> tuple[list[dict], int | None]:
+    def _read_loss_rows(
+        conn: sqlite3.Connection,
+    ) -> tuple[list[dict], int | None, list[int]]:
         """Read the whole loss curve and the max step of a loss log.
 
         The whole log is read because the trainer rewrites earlier steps: it
@@ -1439,9 +1592,9 @@ class LocalAiToolkit(TrainerBackend):
             conn: A read-only connection inside a read transaction.
 
         Returns:
-            ``(loss_curve, max_step)``: the loss points ordered by step (empty
-            if the log has no loss rows), and the highest logged step or
-            ``None``.
+            ``(loss_curve, max_step, dropped_steps)``: the finite loss points
+            ordered by step (empty if the log has no loss rows), the highest
+            logged step or ``None``, and the steps whose loss was not finite.
         """
         max_row = conn.execute("SELECT MAX(step) FROM steps").fetchone()
         max_step = (
@@ -1451,7 +1604,8 @@ class LocalAiToolkit(TrainerBackend):
             "SELECT step, value_real FROM metrics WHERE key = ? ORDER BY step",
             (_LOSS_METRIC_KEY,),
         ).fetchall()
-        return _loss_points(rows), max_step
+        curve, dropped = _loss_points(rows)
+        return curve, max_step, dropped
 
     # ------------------------------------------------------------------
     # Private helpers: config

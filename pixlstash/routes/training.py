@@ -39,6 +39,7 @@ from starlette.background import BackgroundTask
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import Character, Face, Picture, PictureSet, Tag, User
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.db_models.tag import description_caption_content
 from pixlstash.hub import dataset_snapshots, training_runs
 from pixlstash.hub.db import now_iso
@@ -47,6 +48,7 @@ from pixlstash.resources.arbiter import Lease, LeaseState, arbiter
 from pixlstash.resources.comfyui_tenant import probe as comfyui_probe
 from pixlstash.resources.ledger import ledger
 from pixlstash.resources.ledger import ram as read_ram
+from pixlstash.routes.comfyui import _comfyui_url
 from pixlstash.routes.model_folders import register_model_folder
 from pixlstash.scoring import select_reference_faces_for_character
 from pixlstash.services import face_clusters
@@ -58,7 +60,7 @@ from pixlstash.services.dedup_tier_service import (
 from pixlstash.services.model_folder_scanner import SOURCE_FOLDER_KIND
 from pixlstash.services.picture_set_tree import owning_character_id
 from pixlstash.services.comfyui_service import RUN_CLIENT_ID
-from pixlstash.services.training_service import handle_for_run
+from pixlstash.services.training_service import TrainingStoreError, handle_for_run
 from pixlstash.training import (
     ai_toolkit_install,
     dataset_picker,
@@ -84,6 +86,8 @@ from pixlstash.utils.service.user_settings_utils import (
     apply_user_config_patch,
     validate_ai_toolkit_settings,
 )
+from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -139,6 +143,38 @@ def _parse_json_field(raw: str | None, field_name: str, job_uuid: str | None = N
     except (json.JSONDecodeError, TypeError) as exc:
         logger.warning("Could not parse %s for job %s: %s", field_name, job_uuid, exc)
         return None
+
+
+def _stored_loss_curve(raw: str | None, job_uuid: str) -> list | None:
+    """A run's stored loss curve, without points whose loss is not finite.
+
+    The backend leaves such points out, but a curve written before it did, or
+    by an older build sharing the hub, can still hold one (stored as
+    ``Infinity``). Sent as it is, the response would carry it as ``null``,
+    which the chart draws as 0, so it is dropped here.
+    """
+    curve = _parse_json_field(raw, "loss_curve", job_uuid)
+    if curve is None:
+        return None
+    if not isinstance(curve, list):
+        # Valid JSON that is not a curve: no point to draw and no latest loss,
+        # for every reader alike, rather than a response that fails its model.
+        logger.warning(
+            "The stored loss_curve of job %s is a %s, not a list of points.",
+            job_uuid,
+            type(curve).__name__,
+        )
+        return None
+    curve, dropped = live_view.finite_loss_curve(curve)
+    if dropped:
+        logger.debug(
+            "Job %s: left %d non-finite loss point(s) out of its stored curve "
+            "(steps %s).",
+            job_uuid,
+            len(dropped),
+            dropped[:10],
+        )
+    return curve
 
 
 # An absolute host path, as it appears inside a string: a ``file://`` URI, or a
@@ -339,7 +375,9 @@ def create_router(server) -> APIRouter:
         The probe is otherwise registered only by a ComfyUI run; unregistered,
         ComfyUI's memory counts as other apps' and no quit can be offered.
         """
-        url = (getattr(server._user, "comfyui_url", None) or "").rstrip("/")
+        # Through the normaliser: an invalid saved address is the 409, and
+        # nothing is sent to it.
+        url = _comfyui_url(server._user, None)
         if url:
             comfyui_probe(RUN_CLIENT_ID, url)
         return server.vault.training_room()
@@ -412,7 +450,7 @@ def create_router(server) -> APIRouter:
 
         model_config = ConfigDict(extra="forbid")
 
-        set_id: Optional[int] = Field(
+        set_id: Optional[SqliteInt] = Field(
             default=None,
             description=(
                 "Picture-set id to train on. With character_id it must be "
@@ -420,7 +458,7 @@ def create_router(server) -> APIRouter:
                 "filed under its character."
             ),
         )
-        character_id: Optional[int] = Field(
+        character_id: Optional[SqliteInt] = Field(
             default=None,
             description=(
                 "Character id to train on, or to file a reference-set run "
@@ -505,14 +543,14 @@ def create_router(server) -> APIRouter:
 
         model_config = ConfigDict(extra="forbid")
 
-        set_id: Optional[int] = Field(
+        set_id: Optional[SqliteInt] = Field(
             default=None,
             description=(
                 "Picture-set scope, as POST /training/jobs takes it. With neither "
                 "scope the previews are written from no captions."
             ),
         )
-        character_id: Optional[int] = Field(
+        character_id: Optional[SqliteInt] = Field(
             default=None,
             description="Character scope, as POST /training/jobs takes it.",
         )
@@ -857,7 +895,7 @@ def create_router(server) -> APIRouter:
 
         model_config = ConfigDict(extra="forbid")
 
-        step: int = Field(..., ge=0, description="A checkpoint step of the run.")
+        step: SqliteInt = Field(..., ge=0, description="A checkpoint step of the run.")
 
     class TrainLongerStep(BaseModel):
         """A step a run can be trained on from."""
@@ -887,7 +925,7 @@ def create_router(server) -> APIRouter:
 
         model_config = ConfigDict(extra="forbid")
 
-        from_step: int = Field(..., ge=1, description="A step the run kept.")
+        from_step: SqliteInt = Field(..., ge=1, description="A step the run kept.")
         more_steps: int = Field(
             ..., ge=1, le=100000, description="How many steps past from_step."
         )
@@ -1796,10 +1834,7 @@ def create_router(server) -> APIRouter:
                 else None
             ),
             **_cover_state(job, on_disk),
-            "loss_curve": _parse_json_field(
-                job["loss_curve"], "loss_curve", job["uuid"]
-            )
-            or [],
+            "loss_curve": _stored_loss_curve(job["loss_curve"], job["uuid"]) or [],
             "dataset_picture_ids": _parse_json_field(
                 job["dataset_picture_ids"], "dataset_picture_ids", job["uuid"]
             )
@@ -1895,6 +1930,17 @@ def create_router(server) -> APIRouter:
     def _lookup(preset, context: dict):
         return measurements.make_lookup(server.vault.hub, preset, **context)
 
+    def _known_preset(name: str) -> dict:
+        """The recipe *name* names; a 404 that does not repeat the name."""
+        preset = presets.get_preset(name)
+        if preset is None:
+            logger.info("Training refused (404): no recipe %r.", name)
+            raise HTTPException(
+                status_code=404,
+                detail="No such training recipe; GET /training/presets lists them.",
+            )
+        return preset
+
     def _verdict(preset, offered: bool, context, **choices) -> str:
         """How *preset* would fit this machine with *choices* and no pins."""
         if not offered:
@@ -1930,7 +1976,8 @@ def create_router(server) -> APIRouter:
         description=(
             "Creates a queued LoRA training job for a picture set, a character "
             "or a character's reference set (filed under the character). The "
-            "background trainer picks it up FIFO. "
+            "background trainer picks it up FIFO. 503 when the hub was too "
+            "busy to save it: nothing was queued, try again. "
             "Owner-only."
         ),
     )
@@ -1938,11 +1985,7 @@ def create_router(server) -> APIRouter:
         _ensure_secure(request)
 
         set_id, character_id = _scope(payload.set_id, payload.character_id)
-        preset = presets.get_preset(payload.preset)
-        if preset is None:
-            raise HTTPException(
-                status_code=404, detail=f"No training recipe '{payload.preset}'."
-            )
+        preset = _known_preset(payload.preset)
         user = server.auth.get_user()
         repo_path = user.ai_toolkit_repo_path if user is not None else None
         if not repo_path:
@@ -2053,6 +2096,18 @@ def create_router(server) -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TrainingStoreError as exc:
+            # The insert rolled back (enqueue), so there is no run to show.
+            logger.error(
+                "Training job %r could not be queued: %s",
+                payload.name,
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The run could not be started. Try again in a moment.",
+            ) from exc
 
         return _redact_job(
             {
@@ -2080,8 +2135,8 @@ def create_router(server) -> APIRouter:
     )
     def list_training_jobs(
         request: Request,
-        set_id: Optional[int] = None,
-        character_id: Optional[int] = None,
+        set_id: Optional[SqliteInt] = None,
+        character_id: Optional[SqliteInt] = None,
     ):
         _ensure_secure(request)
         hub, library_uuid = _store()
@@ -2104,7 +2159,7 @@ def create_router(server) -> APIRouter:
             "timestamps. Owner-only."
         ),
     )
-    def get_training_job(job_id: int, request: Request):
+    def get_training_job(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         job = training_runs.get_run(hub, library_uuid, job_id)
@@ -2122,9 +2177,7 @@ def create_router(server) -> APIRouter:
                 "trigger_word": job["trigger_word"],
                 "step": job["step"],
                 "total_steps": job["total_steps"],
-                "loss_curve": _parse_json_field(
-                    job["loss_curve"], "loss_curve", job["uuid"]
-                ),
+                "loss_curve": _stored_loss_curve(job["loss_curve"], job["uuid"]),
                 "rendered_config": _parse_json_field(
                     job["rendered_config"], "rendered_config", job["uuid"]
                 ),
@@ -2162,18 +2215,18 @@ def create_router(server) -> APIRouter:
             "PLUGIN_PROGRESS events the service emits. Owner-only."
         ),
     )
-    def get_training_job_status(job_id: int, request: Request):
+    def get_training_job_status(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
-        # The latest loss is read in SQL; the curve itself is never loaded here.
         job = training_runs.get_run_status_summary(hub, library_uuid, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Training job not found")
-        if job["loss_curve_malformed"]:
-            logger.warning("Could not parse loss_curve for job %s", job["uuid"])
-        latest_loss = job["latest_loss"]
-        if not isinstance(latest_loss, (int, float)):
-            latest_loss = None
+        # The same reader as the detail and the live view, so a curve stored
+        # before non-finite points were left out still shows its last finite
+        # loss here.
+        latest_loss = live_view.latest_finite_loss(
+            _stored_loss_curve(job["loss_curve"], job["uuid"])
+        )
         total = job["total_steps"] or 0
         # A trainer can report a step past its planned total; the fraction stops at 1.
         progress = min(job["step"] / total, 1.0) if total > 0 else 0.0
@@ -2184,7 +2237,7 @@ def create_router(server) -> APIRouter:
                 "status": job["status"],
                 "step": job["step"],
                 "total_steps": job["total_steps"],
-                "latest_loss": None if latest_loss is None else float(latest_loss),
+                "latest_loss": latest_loss,
                 "progress": progress,
                 "info": job["report"] or job["error"],
             }
@@ -2204,7 +2257,7 @@ def create_router(server) -> APIRouter:
             "read is null, never 0. Owner-only."
         ),
     )
-    def get_training_job_live(job_id: int, request: Request):
+    def get_training_job_live(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         job = training_runs.get_run(hub, library_uuid, job_id)
@@ -2226,7 +2279,7 @@ def create_router(server) -> APIRouter:
         ),
     )
     def set_training_job_cover(
-        job_id: int, payload: CoverStepRequest, request: Request
+        job_id: SqliteInt, payload: CoverStepRequest, request: Request
     ):
         _ensure_secure(request)
         hub, library_uuid = _store()
@@ -2244,16 +2297,23 @@ def create_router(server) -> APIRouter:
         # committed its models, which the call below then finds and moves.
         previous = job.get("cover_step")
         training_runs.update_run(hub, job["uuid"], cover_step=payload.step)
+        # A rollback puts the old step back only while the row still holds the
+        # one written above, so it never undoes a newer choice made meanwhile.
+        ours = {"cover_step": (payload.step,)}
         try:
             applied = server.vault.choose_training_cover(job, payload.step)
         except LookupError as exc:
-            training_runs.update_run(hub, job["uuid"], cover_step=previous)
+            training_runs.update_run(
+                hub, job["uuid"], cover_step=previous, only_if=ours
+            )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
             # The stack cover lives in the hub and the attachment in the vault,
             # so a failure between them cannot be rolled back as one; the
             # recorded step goes back and the failure is logged in full.
-            training_runs.update_run(hub, job["uuid"], cover_step=previous)
+            training_runs.update_run(
+                hub, job["uuid"], cover_step=previous, only_if=ours
+            )
             logger.exception(
                 "Training job id=%s: step %s could not be made the cover.",
                 job_id,
@@ -2283,7 +2343,7 @@ def create_router(server) -> APIRouter:
             "trainer's step log; returns no host path. Owner-only."
         ),
     )
-    def get_training_job_train_longer(job_id: int, request: Request):
+    def get_training_job_train_longer(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         job = training_runs.get_run(hub, library_uuid, job_id)
@@ -2319,11 +2379,13 @@ def create_router(server) -> APIRouter:
             "never deleted. When it is imported, the new steps join the run's "
             "stack on the shelf and the longer-trained final takes the final's "
             "file name. 404 for an unknown job, 409 when it cannot be trained "
-            "on from that step (the detail says why). Owner on this machine."
+            "on from that step (the detail says why), 503 when the hub was too "
+            "busy to save it: nothing was queued, try again. Owner on this "
+            "machine."
         ),
     )
     def train_training_job_longer(
-        job_id: int, payload: TrainLongerRequest, request: Request
+        job_id: SqliteInt, payload: TrainLongerRequest, request: Request
     ):
         _ensure_secure(request)
         try:
@@ -2353,6 +2415,21 @@ def create_router(server) -> APIRouter:
                 "Training job id=%s cannot be trained longer: %s", job_id, exc
             )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except TrainingStoreError as exc:
+            # The run keeps the status it ended with and its staged spec is
+            # dropped (train_longer), so a second press starts clean.
+            logger.error(
+                "Train longer of training job id=%s from step %s failed: %s",
+                job_id,
+                payload.from_step,
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The run could not be queued to train longer. Try again "
+                "in a moment.",
+            ) from exc
         return {
             "job_id": job_id,
             "status": job["status"],
@@ -2390,7 +2467,7 @@ def create_router(server) -> APIRouter:
             "dataset is not built yet. Owner-only."
         ),
     )
-    def get_training_job_snapshot(job_id: int, request: Request):
+    def get_training_job_snapshot(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         job, snapshot = _snapshot_of(job_id)
         return {
@@ -2412,7 +2489,7 @@ def create_router(server) -> APIRouter:
             "unknown job and for one with no snapshot. Owner-only."
         ),
     )
-    def export_training_job_snapshot(job_id: int, request: Request):
+    def export_training_job_snapshot(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         job, snapshot = _snapshot_of(job_id)
         dataset_dir = job.get("dataset_snapshot_path") or ""
@@ -2489,10 +2566,12 @@ def create_router(server) -> APIRouter:
         response_model=CancelJobResponse,
         description=(
             "Cancels a queued or running job. Returns 404 if the job is "
-            "unknown and 409 if it is already in a terminal state. Owner-only."
+            "unknown, 409 if it is already in a terminal state and 503 if a "
+            "queued job's stop could not be saved (it is still queued). "
+            "Owner-only."
         ),
     )
-    def cancel_training_job(job_id: int, request: Request):
+    def cancel_training_job(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
 
         # First distinguish "unknown job" (404) from "already terminal" (409):
@@ -2504,7 +2583,16 @@ def create_router(server) -> APIRouter:
             raise HTTPException(status_code=404, detail="Training job not found")
         current_status = job["status"]
 
-        cancelled = server.vault.training_service.cancel(job_id)
+        try:
+            cancelled = server.vault.training_service.cancel(job_id)
+        except TrainingStoreError as exc:
+            logger.error(
+                "Cancel of training job id=%s failed: %s", job_id, exc, exc_info=True
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="The stop could not be saved. Try again in a moment.",
+            ) from exc
         if not cancelled:
             # Existence was already confirmed, so a False return means the job
             # was in a terminal state (completed/stopped/error). Name the state
@@ -2531,7 +2619,7 @@ def create_router(server) -> APIRouter:
             "Owner-only."
         ),
     )
-    def quit_comfyui_for_job(job_id: int, request: Request):
+    def quit_comfyui_for_job(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         job = training_runs.get_run(hub, library_uuid, job_id)
@@ -2540,8 +2628,29 @@ def create_router(server) -> APIRouter:
         if job["status"] != "queued":
             raise HTTPException(status_code=409, detail="That run is not waiting.")
         # The row first, then the lease: the worker asks its lease and then
-        # reads the row, so one of the two sees the other's answer.
-        training_runs.update_run(hub, job["uuid"], comfyui_quit="allowed")
+        # reads the row, so one of the two sees the other's answer. The write
+        # lands only on a run still queued and not yet past the quit, so a run
+        # that started or ended since the read above is not given a yes.
+        allowed = training_runs.update_run(
+            hub,
+            job["uuid"],
+            comfyui_quit="allowed",
+            only_if={"status": ("queued",), "comfyui_quit": (None, "allowed")},
+        )
+        if not allowed:
+            latest = training_runs.get_run(hub, library_uuid, job_id)
+            if latest is None:
+                raise HTTPException(status_code=404, detail="Training job not found")
+            if latest["status"] != "queued":
+                raise HTTPException(status_code=409, detail="That run is not waiting.")
+            # Still queued, so the worker has already quit ComfyUI for it: the
+            # yes was used, and there is nothing left to allow.
+            logger.info(
+                "Training job %s: ComfyUI was already quit (comfyui_quit=%s).",
+                job_id,
+                latest.get("comfyui_quit"),
+            )
+            return {"status": "allowed", "job_id": job_id}
         for lease in arbiter().leases():
             if lease.job_id == job["uuid"]:
                 lease.allow_comfyui_quit()
@@ -2563,7 +2672,7 @@ def create_router(server) -> APIRouter:
             "Owner-only."
         ),
     )
-    def delete_training_job(job_id: int, request: Request):
+    def delete_training_job(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
 
         training_root = _training_root()
@@ -2922,8 +3031,8 @@ def create_router(server) -> APIRouter:
     )
     def get_training_sample_prompts(
         request: Request,
-        set_id: Optional[int] = None,
-        character_id: Optional[int] = None,
+        set_id: Optional[SqliteInt] = None,
+        character_id: Optional[SqliteInt] = None,
         subject: Optional[Literal["person", "style", "thing"]] = None,
         trigger_word: Optional[str] = None,
     ):
@@ -2951,8 +3060,8 @@ def create_router(server) -> APIRouter:
     )
     def get_training_dataset(
         request: Request,
-        set_id: Optional[int] = None,
-        character_id: Optional[int] = None,
+        set_id: Optional[SqliteInt] = None,
+        character_id: Optional[SqliteInt] = None,
     ):
         _ensure_secure(request)
         set_id, character_id = _scope(set_id, character_id)
@@ -3126,14 +3235,15 @@ def create_router(server) -> APIRouter:
         for pid, tag in tag_rows:
             tags.setdefault(pid, []).append(tag)
 
-        def face_room(pic):
+        def face_room(pid, pic):
             best = None
-            for _fid, bbox, _feat in pic["faces"]:
-                try:
-                    x1, y1, x2, y2 = json.loads(bbox)[:4] if bbox else (0, 0, 0, 0)
-                except (ValueError, TypeError) as exc:
-                    logger.warning("Unreadable face box %r (%s); ignored.", bbox, exc)
+            for fid, bbox, _feat in pic["faces"]:
+                # A damaged stored box (not JSON, not four finite numbers) is
+                # left out, logged once by the reader: this face has no box.
+                box = read_stored_bbox(bbox, owner="Face", row_id=fid, picture_id=pid)
+                if box is None:
                     continue
+                x1, y1, x2, y2 = box
                 if x2 > x1 and y2 > y1:
                     area = (x2 - x1) * (y2 - y1)
                     if best is None or area > best[0]:
@@ -3149,9 +3259,12 @@ def create_router(server) -> APIRouter:
             # runs ``ANALYZE``), the planner rates two or more stack ids below
             # ``ix_picture_deleted`` and walks every kept picture to find the
             # stacks' few. Alone, the ids search ``ix_picture_stack_id``
-            # (backend_architecture.md, "Probe cost").
+            # (backend_architecture.md, "Probe cost"). A character can span
+            # more stacks than SQLite binds in one statement: chunked, and
+            # every stack's members land in the chunk holding its id.
             members = [
                 row
+                for id_chunk in chunked(sorted(stacked))
                 for row in session.exec(
                     select(
                         Picture.id,
@@ -3159,7 +3272,7 @@ def create_router(server) -> APIRouter:
                         Picture.stack_position,
                         Picture.created_at,
                         Picture.deleted,
-                    ).where(Picture.stack_id.in_(stacked))
+                    ).where(Picture.stack_id.in_(id_chunk))
                 ).all()
                 if not row.deleted
             ]
@@ -3183,7 +3296,7 @@ def create_router(server) -> APIRouter:
                     face_count_max=most_faces.get(pid, 1),
                     stack_id=pic["stack"],
                     tags=tuple(tags.get(pid, ())),
-                    face_room=face_room(pic),
+                    face_room=face_room(pid, pic),
                     description=pic["description"],
                     embedding=(
                         np.frombuffer(bytes(emb), dtype=np.float32)
@@ -3234,7 +3347,7 @@ def create_router(server) -> APIRouter:
     )
     def get_character_set_suggestion(
         request: Request,
-        character_id: int,
+        character_id: SqliteInt,
         include_other_people: bool = False,
         include_near_duplicates: bool = False,
         min_likeness: int = Query(
@@ -3332,11 +3445,7 @@ def create_router(server) -> APIRouter:
     )
     def resolve_training_run(payload: ResolveRequest, request: Request):
         _ensure_secure(request)
-        preset = presets.get_preset(payload.preset)
-        if preset is None:
-            raise HTTPException(
-                status_code=404, detail=f"No training recipe '{payload.preset}'."
-            )
+        preset = _known_preset(payload.preset)
         row = preset["effort"][payload.effort]
         room = _room()
         rule = {k: row[k] for k in presets.EFFORT_STEP_KEYS}

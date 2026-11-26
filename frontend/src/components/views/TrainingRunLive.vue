@@ -676,8 +676,10 @@ import {
 } from "../../api/training";
 import { runSampleUrl } from "../../api/modelImports";
 import SampleMedia from "../widgets/SampleMedia.vue";
+import { useConfirm } from "../../composables/useConfirm";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useSidebarStore } from "../../stores/useSidebarStore";
+import { stopTrainingQuestion } from "../../stores/useTrainingRunsStore";
 import { errorDetail } from "../../utils/apiError";
 import { copyText } from "../../utils/clipboard";
 import { isTypingTarget } from "../../utils/dom.js";
@@ -702,6 +704,7 @@ const props = defineProps({
   folderId: { type: Number, default: null },
 });
 const emit = defineEmits(["close"]);
+const { confirm } = useConfirm();
 
 const POLL_MS = 2000;
 
@@ -1416,19 +1419,22 @@ async function useStep(step) {
 }
 
 async function stop() {
-  // The same confirmation as Settings' Cancel: a stopped run cannot resume.
-  // Skip previews (a trained run) keeps the model, so it does not ask.
-  if (
-    live.value?.status !== "completed" &&
-    !window.confirm(
-      `Stop training "${live.value?.name}"? The checkpoints it saved are kept.`,
-    )
-  ) {
-    return;
+  // The run the owner is asked about. The poll keeps going behind the dialog,
+  // and the page can move to another run while it is open.
+  const jobId = props.jobId;
+  // The same question as the rail's and the runs grid's Stop training: a
+  // stopped run cannot resume. Skip previews (a trained run) keeps the model,
+  // so it does not ask.
+  if (live.value?.status !== "completed") {
+    if (!(await confirm(stopTrainingQuestion(live.value?.name)))) return;
+    // The yes was to stopping this run while it trained. A run that ended
+    // meanwhile (failed, stopped elsewhere, or trained and now drawing its
+    // previews) or a page now on another run has nothing that yes applies to.
+    if (props.jobId !== jobId || !LIVE_STATUSES.includes(live.value?.status)) return;
   }
   stopping.value = true;
   try {
-    await cancelTrainingJob(props.jobId);
+    await cancelTrainingJob(jobId);
     await load();
     schedule();
   } catch (err) {

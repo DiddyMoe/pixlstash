@@ -38,6 +38,8 @@ vi.mock("../../api/modelImports", () => ({
 
 import TrainingRunLive from "./TrainingRunLive.vue";
 import { useSidebarStore } from "../../stores/useSidebarStore";
+import ConfirmDialog from "../widgets/ConfirmDialog.vue";
+import { unregisterConfirmHost } from "../../composables/useConfirm";
 
 const stubs = {
   "v-icon": true,
@@ -126,6 +128,42 @@ function payload(overrides = {}) {
 }
 
 const mounted = [];
+
+// The app's own confirm dialog, as App.vue mounts it, so Stop is answered by
+// its buttons and never by the browser's native prompt. It carries the
+// view's stubs too: test-utils re-renders every mounted tree with the stubs
+// of the latest mount, so each must hold what the other needs.
+function mountConfirmHost() {
+  const host = mount(ConfirmDialog, {
+    attachTo: document.body,
+    global: {
+      stubs: {
+        ...stubs,
+        // AppDialog is Vuetify's v-dialog underneath, and these files do not
+        // install Vuetify: its title, body and footer render in place.
+        AppDialog: {
+          props: ["open", "title"],
+          emits: ["close", "accept"],
+          template:
+            "<div v-if='open' class='app-dialog'><h2 class='app-dialog__title'>{{ title }}</h2>" +
+            "<slot /><footer class='app-dialog__footer'><slot name='footer' /></footer></div>",
+        },
+        "v-icon": true,
+        // The dialog's own buttons, so the danger variant is the real one.
+        AppButton: false,
+      },
+    },
+  });
+  mounted.push(host);
+  return host;
+}
+
+const confirmButton = (host, label) =>
+  host
+    .find(".app-dialog__footer")
+    .findAll("button")
+    .find((b) => b.text().includes(label));
+
 async function open(body) {
   getTrainingJobLive.mockResolvedValue(body);
   const wrapper = mount(TrainingRunLive, {
@@ -147,6 +185,7 @@ beforeEach(() => {
 
 afterEach(() => {
   while (mounted.length) mounted.pop().unmount();
+  unregisterConfirmHost();
   vi.restoreAllMocks();
 });
 
@@ -410,10 +449,12 @@ describe("TrainingRunLive", () => {
 
       cancelTrainingJob.mockResolvedValue({ status: "cancelled" });
       // Skipping keeps the trained model, so it does not ask as Stop does.
-      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      const host = mountConfirmHost();
+      const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
       await wrapper.find(".app-btn").trigger("click");
       await flushPromises();
-      expect(confirm).not.toHaveBeenCalled();
+      expect(host.find(".app-dialog").exists()).toBe(false);
+      expect(nativeConfirm).not.toHaveBeenCalled();
       expect(cancelTrainingJob).toHaveBeenCalledWith(7);
     } finally {
       vi.useRealTimers();
@@ -564,6 +605,7 @@ describe("TrainingRunLive", () => {
     vi.useFakeTimers();
     try {
       const wrapper = await open(payload());
+      const host = mountConfirmHost();
       getTrainingJobLive.mockRejectedValueOnce(
         Object.assign(new Error("Training job not found"), {
           response: { status: 404 },
@@ -575,9 +617,13 @@ describe("TrainingRunLive", () => {
 
       // Stop reads the run again, and it answers: polling resumes.
       cancelTrainingJob.mockResolvedValue({});
-      vi.spyOn(window, "confirm").mockReturnValue(true);
+      const nativeConfirm = vi.spyOn(window, "confirm");
       await wrapper.find(".app-btn").trigger("click");
       await flushPromises();
+      await confirmButton(host, "Stop training").trigger("click");
+      await flushPromises();
+      expect(nativeConfirm).not.toHaveBeenCalled();
+      expect(cancelTrainingJob).toHaveBeenCalledWith(7);
       expect(wrapper.find(".trl-notice--err").exists()).toBe(false);
       getTrainingJobLive.mockClear();
       await vi.advanceTimersByTimeAsync(4_000);
@@ -605,19 +651,100 @@ describe("TrainingRunLive", () => {
   });
 
   it("asks before stopping, and stops nothing when the owner says no", async () => {
+    // The app's ConfirmDialog asks, never the browser's own prompt.
     const wrapper = await open(payload({ status: "running" }));
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const host = mountConfirmHost();
+    const nativeConfirm = vi.spyOn(window, "confirm");
     await wrapper.find(".app-btn").trigger("click");
     await flushPromises();
-    expect(confirm).toHaveBeenCalledWith(
-      'Stop training "ohwx-portrait-v2"? The checkpoints it saved are kept.',
+    // The rail's and the runs grid's Stop training ask the same question.
+    expect(host.find(".app-dialog__title").text()).toBe('Stop training "ohwx-portrait-v2"?');
+    expect(host.find(".confirm-dialog__message").text()).toBe(
+      'Stopping "ohwx-portrait-v2" keeps the checkpoints it saved.',
     );
+    expect(confirmButton(host, "Stop training").classes()).toContain("app-btn--danger");
+    await confirmButton(host, "Keep training").trigger("click");
+    await flushPromises();
+    expect(host.find(".app-dialog").exists()).toBe(false);
     expect(cancelTrainingJob).not.toHaveBeenCalled();
 
-    confirm.mockReturnValue(true);
     await wrapper.find(".app-btn").trigger("click");
     await flushPromises();
+    expect(cancelTrainingJob).not.toHaveBeenCalled();
+    await confirmButton(host, "Stop training").trigger("click");
+    await flushPromises();
     expect(cancelTrainingJob).toHaveBeenCalledWith(7);
+    expect(host.find(".app-dialog").exists()).toBe(false);
+    expect(nativeConfirm).not.toHaveBeenCalled();
+  });
+
+  // The page polls on behind the dialog, so by the owner's answer the run it
+  // asked about may have ended. A stop sent then would be refused, or, for a
+  // run that has trained and is drawing its previews, would skip them: not
+  // what the owner said yes to.
+  it.each([
+    ["failed", { status: "error", phase: null }],
+    ["was stopped elsewhere", { status: "stopped", phase: null }],
+    ["finished training and draws its previews", { status: "completed", phase: "previews" }],
+  ])("sends no stop for a run that %s while the dialog was open", async (_case, ended) => {
+    vi.useFakeTimers();
+    try {
+      const wrapper = await open(payload({ status: "running" }));
+      const host = mountConfirmHost();
+      await wrapper.find(".app-btn").trigger("click");
+      await flushPromises();
+      getTrainingJobLive.mockResolvedValue(payload(ended));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await flushPromises();
+      expect(getTrainingJobLive).toHaveBeenCalledTimes(2);
+
+      await confirmButton(host, "Stop training").trigger("click");
+      await flushPromises();
+      expect(host.find(".app-dialog").exists()).toBe(false);
+      expect(cancelTrainingJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still stops a run that only started while the dialog was open", async () => {
+    // The positive control for the test above: queued to running is not an
+    // end, and the stop goes out.
+    vi.useFakeTimers();
+    try {
+      const wrapper = await open(payload({ status: "queued", phase: "waiting_gpu" }));
+      const host = mountConfirmHost();
+      cancelTrainingJob.mockResolvedValue({});
+      await wrapper.find(".app-btn").trigger("click");
+      await flushPromises();
+      getTrainingJobLive.mockResolvedValue(payload({ status: "running", phase: "training" }));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await flushPromises();
+      expect(getTrainingJobLive).toHaveBeenCalledTimes(2);
+
+      await confirmButton(host, "Stop training").trigger("click");
+      await flushPromises();
+      expect(cancelTrainingJob).toHaveBeenCalledWith(7);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends no stop when the page moved to another run while the dialog was open", async () => {
+    const wrapper = await open(payload({ status: "running" }));
+    const host = mountConfirmHost();
+    await wrapper.find(".app-btn").trigger("click");
+    await flushPromises();
+    getTrainingJobLive.mockResolvedValue(
+      payload({ id: 8, uuid: "efgh", name: "other-run", status: "running" }),
+    );
+    await wrapper.setProps({ jobId: 8 });
+    await flushPromises();
+    expect(getTrainingJobLive).toHaveBeenLastCalledWith(8);
+
+    await confirmButton(host, "Stop training").trigger("click");
+    await flushPromises();
+    expect(cancelTrainingJob).not.toHaveBeenCalled();
   });
 
   it("says a run waits for ComfyUI to be closed, and offers to quit it (#2558)", async () => {

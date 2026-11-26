@@ -27,13 +27,15 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Mapping, Sequence
 
 from pixlstash.event_types import EventType
 from pixlstash.hub import dataset_snapshots, training_runs
@@ -44,7 +46,12 @@ from pixlstash.resources.arbiter import Lease
 from pixlstash.resources.ledger import ledger
 from pixlstash.resources.ledger import ram as read_ram
 from pixlstash.services.downloads_intake import safetensors_complete
+from pixlstash.services.library_generation_coordinator import (
+    LibraryNotReadyError,
+    SwitchState,
+)
 from pixlstash.services.model_folder_scanner import SOURCE_FOLDER_KIND
+from pixlstash.services.model_mover import file_digest
 from pixlstash.training import ai_toolkit_install, live_view, measurements, presets
 from pixlstash.training.backend import TrainerBackend, TrainingProgress, TrainingSpec
 from pixlstash.training.config_render import deep_merge
@@ -61,6 +68,24 @@ _TERMINAL_JOB_STATUSES = frozenset({"completed", "stopped", "error"})
 _TERMINAL_PROGRESS_STATUSES = frozenset({"completed", "stopped", "error"})
 # Cap on the trainer log tail we persist onto the job row.
 _LOG_TAIL_BYTES = 8192
+# A write of a terminal status that hits a busy or locked hub is tried this
+# many times in all. Each try already waits out the hub's busy timeout, so a
+# lost one is a sustained outage, which more tries would not cure.
+_TERMINAL_WRITE_ATTEMPTS = 3
+# The capped exponential backoff between those tries, drawn with full jitter.
+_TERMINAL_WRITE_BACKOFF_S = 0.5
+_TERMINAL_WRITE_BACKOFF_CAP_S = 4.0
+# How often a finished run's import asks again while a restore or a library
+# switch holds admission. It never gives up: the LoRA is the owner's work.
+_LIBRARY_NOT_READY_RETRY_S = 5.0
+# A write that moves a run on names the states it may move it from
+# (``training_runs.update_run``'s compare-and-set), so it never lands on a
+# newer state another thread wrote meanwhile.
+_ONLY_QUEUED = {"status": ("queued",)}
+_ONLY_UNFINISHED = {"status": training_runs.UNFINISHED_STATUSES}
+_ONLY_UNENDED = {"status": ("queued", *training_runs.UNFINISHED_STATUSES)}
+# Trained, and not yet on the shelf: its previews are drawn or it is imported.
+_ONLY_COMPLETED_UNIMPORTED = {"status": ("completed",), "completed_at": (None,)}
 
 #: How long a run adopted at start-up keeps its lease exclusive and unshrunk:
 #: PixlStash has not watched it reach its peak since the restart.
@@ -73,10 +98,17 @@ MAX_PROBES = 3
 RAM_GUARD_MB = 1024
 #: How long a dead trainer's processes get to give their GPU memory back.
 RELEASE_GRACE_S = 10.0
+#: Why a profile is passed over when the run cannot be resolved on it again.
+#: The cause names a key or a pinned value: the log's, not the run's error.
+RESOLVE_AGAIN_FAILED = "the run could not be resolved again; the server log says why"
 # How often a probe or an after-training preview pass is polled.
 _SHORT_POLL_S = 1.0
 # A checkpoint's step: ``<stem>_<step:09d>.safetensors``.
 _CHECKPOINT_STEP_RE = re.compile(r"_(\d{4,})\.safetensors$")
+
+
+class TrainingStoreError(RuntimeError):
+    """A change to a training run could not be written to the hub."""
 
 
 @dataclass
@@ -255,7 +287,9 @@ class TrainingService:
         # Leases granted at start-up to runs that outlived the restart, by job
         # uuid, until reconcile_on_startup resumes watching them.
         self._adopted: dict[str, Lease] = {}
-        # Runs whose remaining after-training previews were cancelled.
+        # Runs drawing their after-training previews, and those of them whose
+        # remaining previews were cancelled. Both under ``_active_lock``.
+        self._drawing_previews: set[str] = set()
         self._skip_previews: set[str] = set()
         # One Train longer at a time: it renames files in the run's folder.
         self._train_longer_lock = threading.Lock()
@@ -394,28 +428,38 @@ class TrainingService:
         Raises:
             ValueError: If neither ``set_id`` nor ``character_id`` is given.
             RuntimeError: No hub or library is open to hold the run.
+            TrainingStoreError: The hub was too busy to write the run, so
+                nothing was queued.
         """
         if set_id is None and character_id is None:
             raise ValueError("A training run needs a set_id or a character_id.")
         hub, library_uuid = self._store()
 
         job_uuid = uuid.uuid4().hex
-        run_id = training_runs.create_run(
-            hub,
-            library_uuid=library_uuid,
-            uuid=job_uuid,
-            name=name,
-            set_id=set_id,
-            character_id=character_id,
-            base_model=base_model,
-            trigger_word=trigger_word,
-            preset=(resolution or {}).get("preset"),
-            resolved_profile=json.dumps(resolution) if resolution else None,
-            advanced_pins=json.dumps(pins or {}),
-        )
-        if quit_comfyui:
-            # Before the worker can claim it: its lease reads the answer.
-            self._update_job(job_uuid, comfyui_quit="allowed")
+        try:
+            run_id = training_runs.create_run(
+                hub,
+                library_uuid=library_uuid,
+                uuid=job_uuid,
+                name=name,
+                set_id=set_id,
+                character_id=character_id,
+                base_model=base_model,
+                trigger_word=trigger_word,
+                preset=(resolution or {}).get("preset"),
+                resolved_profile=json.dumps(resolution) if resolution else None,
+                advanced_pins=json.dumps(pins or {}),
+                # In the insert itself: the worker's lease reads the answer,
+                # and a run it could claim without it would wait for the GPU
+                # as though the owner had said no.
+                comfyui_quit="allowed" if quit_comfyui else None,
+            )
+        except sqlite3.OperationalError as exc:
+            # A busy or locked hub: the insert rolled back, so there is no run
+            # and nothing is staged for one.
+            raise TrainingStoreError(
+                f"Training run {name!r} could not be written to the hub."
+            ) from exc
         self._note_phase(job_uuid, "waiting_gpu")
         job = training_runs.get_run(hub, library_uuid, run_id)
         # The template path and the config patches have no column. Keep them
@@ -516,6 +560,10 @@ class TrainingService:
             LookupError: No such run in this library.
             ValueError: The run cannot be trained on from *from_step*; the
                 message says why.
+            TrainingStoreError: The hub was too busy to write the requeue and
+                the shelf's final, which are one transaction, so the run keeps
+                the status it ended with and is not queued, and its folder is
+                put back as it was.
         """
         hub, library_uuid = self._store()
         with self._train_longer_lock:
@@ -538,6 +586,10 @@ class TrainingService:
             handle = handle_for_run(self._training_root, run)
             final_step = next((o["step"] for o in options["steps"] if o["final"]), None)
             template_path = os.path.join(work_dir, "trained_on_template.json")
+            # A press that is not queued takes away a template it was the first
+            # to write. One an earlier press left is that press's, read by
+            # nothing since its stretch launched; the next press rewrites it.
+            template_is_new = not os.path.exists(template_path)
             write_json_atomic(
                 template_path, LocalAiToolkit.template_from_rendered(config)
             )
@@ -555,46 +607,134 @@ class TrainingService:
                 "caption_mode": None,
                 "continuation": True,
             }
-            # Everything that can be written first is: the run's folder is the
-            # one step that cannot be taken back by writing the row again.
+            # Everything that can be written first is: the run's folder is
+            # taken back only by undoing each rename, not by writing again.
             with self._pending_specs_lock:
                 self._pending_specs[run["uuid"]] = pending
             self._write_pending_sidecar(run["uuid"], pending)
+            requeued = False
+            carried = None
             try:
-                take = LocalAiToolkit.carry_on_from(
+                carried = LocalAiToolkit.carry_on_from(
                     handle, from_step, run.get("total_steps")
                 )
-            except OSError:
-                with self._pending_specs_lock:
-                    self._pending_specs.pop(run["uuid"], None)
-                self._remove_pending_sidecar(run["uuid"])
-                raise
-            if final_step is not None:
-                # The shelf's copy of the final is that step from now on; the
-                # bare name is the longer-trained file's once it is imported.
-                with hub.transaction() as conn:
-                    conn.execute(
-                        "UPDATE model SET training_step = ? "
-                        "WHERE training_run_id = ? AND training_step IS NULL",
-                        (final_step, run["id"]),
-                    )
-            self._update_job(
-                run["uuid"],
-                status="queued",
-                step=from_step,
-                total_steps=total,
-                error=None,
-                report=None,
-                pid=None,
-                completed_at=None,
-                finished_unwatched=0,
-                comfyui_quit=None,
-                continued_from_step=from_step,
-                continued_at=now_iso(),
-                set_aside_take=take,
-                # This stretch's phases are timed from its own start.
-                phase_log=None,
-            )
+                take = carried.take
+                # The press is answered as queued only once the row says so, so
+                # the write is tried as often as an end state is.
+                for attempt in range(1, _TERMINAL_WRITE_ATTEMPTS + 1):
+                    try:
+                        # One transaction: the shelf's final renumbered without
+                        # the requeue would map the cover to a step of a run
+                        # that is not training on.
+                        with hub.transaction() as conn:
+                            if final_step is not None:
+                                # The shelf's copy of the final is that step
+                                # from now on; the bare name is the
+                                # longer-trained file's once it is imported.
+                                conn.execute(
+                                    "UPDATE model SET training_step = ? "
+                                    "WHERE training_run_id = ? "
+                                    "AND training_step IS NULL",
+                                    (final_step, run["id"]),
+                                )
+                            cursor = conn.execute(
+                                "UPDATE training_run SET status = 'queued', "
+                                "step = ?, total_steps = ?, error = NULL, "
+                                "report = NULL, pid = NULL, completed_at = NULL, "
+                                "finished_unwatched = 0, comfyui_quit = NULL, "
+                                "continued_from_step = ?, continued_at = ?, "
+                                "set_aside_take = ?, "
+                                # This stretch's phases are timed from its own
+                                # start.
+                                "phase_log = NULL "
+                                "WHERE uuid = ?",
+                                (
+                                    from_step,
+                                    total,
+                                    from_step,
+                                    now_iso(),
+                                    take,
+                                    run["uuid"],
+                                ),
+                            )
+                            if cursor.rowcount == 0:
+                                # Deleted since it was read: raised inside the
+                                # transaction, so the renumbering rolls back.
+                                raise TrainingStoreError(
+                                    f"Run {run['uuid']} could not be queued to "
+                                    f"train on from step {from_step}: its row is "
+                                    "gone."
+                                )
+                        requeued = True
+                        break
+                    except sqlite3.OperationalError as exc:
+                        # A busy or locked hub: the transaction rolled back
+                        # whole, the renumbering with it.
+                        if attempt == _TERMINAL_WRITE_ATTEMPTS:
+                            logger.error(
+                                "Run %s: could not be queued to train on from "
+                                "step %s after %d tries (%s).",
+                                run["uuid"],
+                                from_step,
+                                attempt,
+                                exc,
+                                exc_info=True,
+                            )
+                            raise TrainingStoreError(
+                                f"Run {run['uuid']} could not be queued to train "
+                                f"on from step {from_step}: the hub was busy."
+                            ) from exc
+                        # Full jitter, as _update_job waits between tries.
+                        delay = random.uniform(
+                            0.0,
+                            min(
+                                _TERMINAL_WRITE_BACKOFF_CAP_S,
+                                _TERMINAL_WRITE_BACKOFF_S * 2 ** (attempt - 1),
+                            ),
+                        )
+                        logger.warning(
+                            "Run %s: queueing it to train on failed (try %d of "
+                            "%d: %s); trying again in %.2f s.",
+                            run["uuid"],
+                            attempt,
+                            _TERMINAL_WRITE_ATTEMPTS,
+                            exc,
+                            delay,
+                        )
+                        time.sleep(delay)
+            finally:
+                if not requeued:
+                    # Every way out before the requeue lands. The row still
+                    # says how the run ended, so the worker, which claims only
+                    # queued runs, never reads this spec: dropping it strands
+                    # nothing, and a second press stages a fresh one. The
+                    # folder is put back as it was, so the row (which names no
+                    # take) still describes it, and a second press is offered
+                    # the same steps as the first.
+                    with self._pending_specs_lock:
+                        self._pending_specs.pop(run["uuid"], None)
+                    self._remove_pending_sidecar(run["uuid"])
+                    if carried is not None and not LocalAiToolkit.undo_carry_on(
+                        handle, carried
+                    ):
+                        logger.error(
+                            "Run %s: the carry-on from step %s could not be "
+                            "undone whole after it failed to queue; the paths "
+                            "left moved are logged above.",
+                            run["uuid"],
+                            from_step,
+                        )
+                    if template_is_new:
+                        try:
+                            os.remove(template_path)
+                        except OSError as exc:
+                            logger.warning(
+                                "Run %s: could not remove %s after it failed to "
+                                "queue: %s",
+                                run["uuid"],
+                                template_path,
+                                exc,
+                            )
             with self._phase_lock:
                 self._phase_logs.pop(run["uuid"], None)
             self._note_phase(run["uuid"], "waiting_gpu")
@@ -626,14 +766,24 @@ class TrainingService:
         backend to cancel it (cooperative stop, escalating to signals if
         needed). Marks the job ``stopping``; the poll loop observes the terminal
         process state and finalizes it. If the job is queued (not yet started),
-        it is marked ``stopped`` directly.
+        it is marked ``stopped`` directly. A trained run drawing its deferred
+        previews skips the rest of them and is imported as it is.
+
+        Every write is conditional on the state the cancel moves the run from,
+        so a run that moved on since it was read (launched, or ended) is never
+        written back.
 
         Args:
             job_id: Primary key of the ``training_run`` row to cancel.
 
         Returns:
             ``True`` if a job was found and a cancel was actioned, else
-            ``False``.
+            ``False`` (no such job, or nothing left to stop: it has ended, or
+            it has trained and is being imported).
+
+        Raises:
+            TrainingStoreError: A queued job's stop could not be written, so
+                it is still queued and would still launch.
         """
 
         hub, library_uuid = self._store()
@@ -642,59 +792,45 @@ class TrainingService:
             logger.warning("cancel: no training job with id=%s", job_id)
             return False
 
-        with self._active_lock:
-            drawing = self._active_job_uuid == info["uuid"]
-        if info["status"] == "completed" and not info["completed_at"] and drawing:
-            # Trained, and drawing its deferred previews: stop those and
-            # import the run as it is.
-            self._skip_previews.add(info["uuid"])
-            logger.info("cancel: job %s skips its remaining previews.", info["uuid"])
-            return True
-
-        if info["status"] in _TERMINAL_JOB_STATUSES:
-            logger.info(
-                "cancel: job %s already terminal (%s); nothing to do.",
-                info["uuid"],
-                info["status"],
-            )
-            return False
-
         if info["status"] == "queued":
-            # Not started yet: mark it stopped so the worker skips it, and drop
-            # the lease it may be waiting on so the worker moves on. The stop is
-            # written under the lock the worker clears its wait under, and the
-            # lease is released only while still waiting: one granted meanwhile
-            # belongs to the worker, which releases it when it sees the stop.
-            # The worker launches the run under the same lock, so the status is
-            # read again there: one launched since is stopped like a running one.
-            with self._active_lock:
-                waiting = self._waiting
-                queued = self._job_status(info["uuid"]) == "queued"
-                if queued:
-                    self._update_job(
-                        info["uuid"], status="stopped", error="Cancelled before start"
-                    )
-            if queued:
-                if waiting is not None and waiting[0] == info["uuid"]:
-                    waiting[1].release(only_waiting=True)
-                self._emit_progress(
-                    info["uuid"], status="stopped", message="Cancelled before start"
-                )
-                logger.info("cancel: queued job %s marked stopped.", info["uuid"])
+            if self._stop_queued(info["uuid"]):
                 return True
+            # Launched or ended since it was read.
             info = training_runs.get_run(hub, library_uuid, job_id)
-            if info is None or info["status"] in _TERMINAL_JOB_STATUSES:
+            if info is None:
                 return False
+
+        if info["status"] not in training_runs.UNFINISHED_STATUSES:
+            return self._stop_previews(info)
 
         # Running/stopping: mark the job 'stopping' BEFORE signalling the
         # backend. backend.cancel() blocks until the process exits, by which
         # point the worker's poll loop may have already finalized the job to its
         # terminal status; writing 'stopping' after that would clobber the
-        # terminal state. Marking it first lets the worker's _finalize win. Under
-        # the lock _persist_progress reads and writes under, so a poll cannot
-        # read "running" and then write it over this flag.
+        # terminal state. Marking it first lets the worker's _finalize win, and
+        # the write lands only while the run is still running or stopping, so
+        # a run that ended since it was read keeps its end state. Under the
+        # lock _persist_progress reads and writes under, so a poll cannot read
+        # "running" and then write it over this flag.
         with self._active_lock:
-            self._update_job(info["uuid"], status="stopping")
+            marked = self._update_job(
+                info["uuid"], status="stopping", only_if=_ONLY_UNFINISHED
+            )
+        if marked is False:
+            status = self._job_status(info["uuid"])
+            if status is None:
+                return False
+            if status not in training_runs.UNFINISHED_STATUSES:
+                # Ended, or trained, since it was read.
+                return self._stop_previews({**info, "status": status})
+            # Still running, so the flag was lost to a busy hub: the poll
+            # keeps the row "running" until the trainer stops, which it is
+            # asked to below all the same.
+            logger.warning(
+                "cancel: job %s could not be marked stopping; asking its "
+                "trainer to stop all the same.",
+                info["uuid"],
+            )
         logger.info("cancel: job %s asked to stop (status=stopping).", info["uuid"])
 
         with self._active_lock:
@@ -711,6 +847,80 @@ class TrainingService:
             transient.cancel(handle)
 
         return True
+
+    def _stop_queued(self, job_uuid: str) -> bool:
+        """Mark a queued run ``stopped``, and drop the lease it waits on.
+
+        The stop is written only while the run is still queued, and outside
+        ``_active_lock``: a write that meets a busy hub is retried for
+        seconds, which must not hold up the worker or a poll. The worker's
+        wait is read after the write, under the lock the worker starts and
+        clears its wait under: either the worker starts waiting after the
+        stop, and reads the stop first (``_run_job``), or this sees its
+        wait. The lease is released only while still waiting: one granted
+        meanwhile belongs to the worker, which releases it when it sees the
+        stop.
+
+        Args:
+            job_uuid: The run's uuid.
+
+        Returns:
+            True when the stop was written. False when the run is no longer
+            queued: launched, ended or gone.
+
+        Raises:
+            TrainingStoreError: The stop could not be written and the run is
+                still queued, so it would still launch.
+        """
+        if not self._update_job(
+            job_uuid,
+            status="stopped",
+            error="Cancelled before start",
+            only_if=_ONLY_QUEUED,
+        ):
+            if self._job_status(job_uuid) == "queued":
+                # Unrecorded, the worker would still launch the run.
+                raise TrainingStoreError(
+                    f"The stop of queued job {job_uuid} could not be recorded."
+                )
+            return False
+        with self._active_lock:
+            waiting = self._waiting
+        if waiting is not None and waiting[0] == job_uuid:
+            waiting[1].release(only_waiting=True)
+        self._emit_progress(
+            job_uuid, status="stopped", message="Cancelled before start"
+        )
+        logger.info("cancel: queued job %s marked stopped.", job_uuid)
+        return True
+
+    def _stop_previews(self, info: dict) -> bool:
+        """Skip the remaining previews of a run that has trained and draws them.
+
+        Args:
+            info: The run's fields, with the status it was last read with.
+
+        Returns:
+            True when the run is drawing its deferred previews: the rest are
+            skipped and the run is imported as it is. False when there is
+            nothing left to stop: the run has ended, or it is being imported.
+        """
+        with self._active_lock:
+            drawing = info["uuid"] in self._drawing_previews
+            if drawing:
+                self._skip_previews.add(info["uuid"])
+        if drawing:
+            logger.info("cancel: job %s skips its remaining previews.", info["uuid"])
+            return True
+        logger.info(
+            "cancel: job %s is %s%s; nothing to stop.",
+            info["uuid"],
+            info["status"],
+            " and being imported"
+            if info["status"] == "completed" and not info.get("completed_at")
+            else "",
+        )
+        return False
 
     def adopt_live_runs(self) -> None:
         """Give every run whose trainer outlived the restart its lease at once.
@@ -805,6 +1015,7 @@ class TrainingService:
                 info["uuid"],
                 status="error",
                 error="Interrupted before launch (no training folder recorded)",
+                only_if={"status": (info["status"],)},
             )
             return
 
@@ -851,18 +1062,22 @@ class TrainingService:
             # A completed run left unimported was watched to its end.
             self._update_job(info["uuid"], finished_unwatched=1)
         progress = backend.reconcile(handle)
-        self._finalize(backend, handle, info, progress)
+        # Reconciled while the library starts: during a switch, admission opens
+        # only once the start-up returns, so an import that must wait for it
+        # waits on its own thread.
+        self._finalize(backend, handle, info, progress, defer_wait=True)
 
     def _poll_and_finalize_reattached(
         self, backend: TrainerBackend, handle, info: dict, lease: Lease
     ) -> None:
-        """Resume polling a re-attached live job, then finalize and release GPU.
+        """Resume polling a re-attached live job, release its GPU, then finalize.
 
         Args:
             backend: The backend bound to the live run.
             handle: The reconstructed handle.
             info: Persisted job fields.
-            lease: The run's VRAM lease, released when the run ends.
+            lease: The run's VRAM lease, released once the trainer is done
+                with the card: before the import, as :meth:`_run_job` does.
         """
         with self._active_lock:
             self._active_backend = backend
@@ -873,17 +1088,18 @@ class TrainingService:
                 LocalAiToolkit.peaks_folder(handle.work_dir)
             ),
         )
+        released = False
         try:
             progress = self._poll_until_done(
                 backend, handle, info["uuid"], lease, watch
             )
             if self._after_training(backend, handle, info, progress, lease, watch):
+                released = True
+                self._release_gpu(info["uuid"], lease, watch)
                 self._finalize(backend, handle, info, progress)
         except Exception:
             logger.exception("Re-attached job %s failed during polling", info["uuid"])
-            self._update_job(
-                info["uuid"], status="error", error="Polling failed after re-attach"
-            )
+            self._write_failure(info["uuid"], "Polling failed after re-attach")
         finally:
             with self._active_lock:
                 # Only the run that holds the slot clears it: a later run may
@@ -891,8 +1107,8 @@ class TrainingService:
                 if self._active_backend is backend:
                     self._active_backend = None
                     self._active_job_uuid = None
-            self._check_released(info["uuid"], lease, watch)
-            lease.release()
+            if not released:
+                self._release_gpu(info["uuid"], lease, watch)
 
     # ------------------------------------------------------------------
     # Worker loop
@@ -946,9 +1162,11 @@ class TrainingService:
 
         need = self._lease_need(info)
         if need is None:
-            msg = "Queued before training recipes existed; queue it again."
-            self._update_job(job_uuid, status="error", error=msg)
-            self._emit_progress(job_uuid, status="error", message=msg)
+            self._fail(
+                job_uuid,
+                "Queued before training recipes existed; queue it again.",
+                log=False,
+            )
             return
 
         if continuing:
@@ -969,8 +1187,7 @@ class TrainingService:
                 training_folder, dataset_dir = self._run_folders(job_uuid)
             except RuntimeError as exc:
                 logger.error("Job %s: %s", job_uuid, exc)
-                self._update_job(job_uuid, status="error", error=str(exc))
-                self._emit_progress(job_uuid, status="error", message=str(exc))
+                self._fail(job_uuid, str(exc), log=False)
                 return
 
             # 1. Build the dataset snapshot.
@@ -978,10 +1195,7 @@ class TrainingService:
             if manifest is None:
                 return  # dataset error already recorded
             if int(manifest.get("image_count") or 0) <= 0:
-                msg = "Training dataset is empty (no eligible images)."
-                logger.warning("Job %s: %s", job_uuid, msg)
-                self._update_job(job_uuid, status="error", error=msg)
-                self._emit_progress(job_uuid, status="error", message=msg)
+                self._fail(job_uuid, "Training dataset is empty (no eligible images).")
                 return
 
             self._update_job(
@@ -1003,10 +1217,16 @@ class TrainingService:
             lease.allow_comfyui_quit()
         watch = _Watch()
         backend: TrainerBackend | None = None
+        released = False
         try:
+            # A cancel writes its stop and then looks for this wait under the
+            # lock (_stop_queued): read under it, the stop is seen here or the
+            # wait is seen there, so a cancelled run never waits on.
             with self._active_lock:
-                self._waiting = (job_uuid, lease)
-            granted = lease.wait(self._stop)
+                cancelled = self._job_status(job_uuid) != "queued"
+                if not cancelled:
+                    self._waiting = (job_uuid, lease)
+            granted = False if cancelled else lease.wait(self._stop)
             with self._active_lock:
                 self._waiting = None
             if any(w.get("code") == "comfyui_quit" for w in lease.warnings):
@@ -1019,8 +1239,10 @@ class TrainingService:
                 if not self._stop.is_set():
                     # Cancelled from the Tasks tab's waiting row.
                     msg = "Cancelled while waiting for the GPU"
-                    self._update_job(job_uuid, status="stopped", error=msg)
-                    self._emit_progress(job_uuid, status="stopped", message=msg)
+                    if self._update_job(
+                        job_uuid, status="stopped", error=msg, only_if=_ONLY_QUEUED
+                    ):
+                        self._emit_progress(job_uuid, status="stopped", message=msg)
                 return  # on shutdown it stays queued for the next start
             backend = self._make_backend()
             if not continuing and not self._check_memory_and_speed(
@@ -1038,14 +1260,20 @@ class TrainingService:
                 watch=watch,
             )
             if launched is None:
-                return  # cancelled after its memory check, before launch
+                return  # cancelled before launch, or its launch went unrecorded
             handle, progress = launched
             if self._after_training(backend, handle, info, progress, lease, watch):
+                # The trainer is done with the card. Bringing the run to the
+                # shelf needs none, and may wait out a restore or a library
+                # switch, so the lease goes back first: other GPU work runs
+                # meanwhile. The row is past queued, so the worker, which
+                # claims only queued runs, never claims it again.
+                released = True
+                self._release_gpu(job_uuid, lease, watch)
                 self._finalize(backend, handle, info, progress)
         except Exception:
             logger.exception("Job %s failed during training", job_uuid)
-            self._update_job(job_uuid, status="error", error="Training run failed")
-            self._emit_progress(job_uuid, status="error", message="Training run failed")
+            self._write_failure(job_uuid, "Training run failed")
         finally:
             with self._active_lock:
                 # Only the run that holds the slot clears it, as a re-attached
@@ -1054,8 +1282,8 @@ class TrainingService:
                     self._active_backend = None
                     self._active_job_uuid = None
                 self._waiting = None
-            self._check_released(job_uuid, lease, watch)
-            lease.release()
+            if not released:
+                self._release_gpu(job_uuid, lease, watch)
             # A job still queued at shutdown runs on the next start, and needs
             # its spec then, so only drop it once the job has left the queue.
             if self._job_status(job_uuid) != "queued":
@@ -1076,10 +1304,14 @@ class TrainingService:
     ) -> tuple[object, TrainingProgress] | None:
         """Prepare + submit + poll a run while the GPU lease is held.
 
-        The run is launched and marked ``running`` under the lock
-        :meth:`cancel` writes a queued run's stop under, and only while the run
-        is still queued: a cancel during the memory check's last seconds, or
-        between the claim and the launch, is never overwritten.
+        The run is launched only while it is still queued, and marked
+        ``running`` only from queued: a cancel during the memory check's last
+        seconds, or between the claim and the launch, is never overwritten.
+        The launch write is the row's only record of the trainer's pid and
+        folder, which the start-up reconcile re-attaches by, so it is retried
+        on a busy hub like an end state. A trainer whose launch could not be
+        recorded is stopped at once rather than left running unrecorded: see
+        :meth:`_abandon_launch`.
 
         Args:
             backend: The trainer backend.
@@ -1095,7 +1327,7 @@ class TrainingService:
         Returns:
             A ``(handle, progress)`` tuple: the launched handle and the terminal
             :class:`TrainingProgress` snapshot. None when the run was cancelled
-            before it could launch.
+            before it could launch, or its launch could not be recorded.
         """
         job_uuid = info["uuid"]
         pending = self._load_pending_spec(job_uuid)
@@ -1128,18 +1360,27 @@ class TrainingService:
             backend.submit(handle, spec)
             self._active_backend = backend
             self._active_job_uuid = job_uuid
-            config = self._read_rendered_config(handle.config_path)
-            total_steps = self._total_steps_from_config(config)
-            self._update_job(
-                job_uuid,
-                status="running",
-                pid=handle.pid,
-                training_folder=handle.training_folder,
-                rendered_config=json.dumps(config) if config is not None else None,
-                ai_toolkit_commit=commit,
-                total_steps=total_steps,
-                started_at=now_iso(),
-            )
+        # Outside the lock: a busy hub's retries must not hold up a cancel. A
+        # cancel meanwhile reads the run queued and writes its stop from
+        # queued, so exactly one of the two writes lands: this one, and the
+        # cancel stops the trainer as a running one; or the stop, and the
+        # trainer is stopped here.
+        config = self._read_rendered_config(handle.config_path)
+        total_steps = self._total_steps_from_config(config)
+        if not self._update_job(
+            job_uuid,
+            status="running",
+            pid=handle.pid,
+            training_folder=handle.training_folder,
+            rendered_config=json.dumps(config) if config is not None else None,
+            ai_toolkit_commit=commit,
+            total_steps=total_steps,
+            started_at=now_iso(),
+            only_if=_ONLY_QUEUED,
+            attempts=_TERMINAL_WRITE_ATTEMPTS,
+        ):
+            self._abandon_launch(backend, handle, job_uuid)
+            return None
         self._note_phase(job_uuid, "loading")
         self._emit_progress(
             job_uuid, status="running", current=0, total=total_steps, message="Started"
@@ -1147,6 +1388,44 @@ class TrainingService:
 
         progress = self._poll_until_done(backend, handle, job_uuid, lease, watch)
         return handle, progress
+
+    def _abandon_launch(self, backend: TrainerBackend, handle, job_uuid: str) -> None:
+        """Stop a trainer whose launch is not on its row.
+
+        Without it the row names neither the trainer's pid nor its folder, so
+        nothing re-attaches to it after a restart and it trains under a lease
+        nobody holds. Stopped first, the row is then left saying where the run
+        is: stopped by a cancel that came first, or, while still queued, an
+        error. A row that cannot take even that write stays queued, and the
+        worker tries the run again.
+
+        Args:
+            backend: The backend the trainer was submitted to.
+            handle: The trainer's handle.
+            job_uuid: The run's uuid.
+        """
+        backend.cancel(handle)
+        status = self._job_status(job_uuid)
+        if status != "queued":
+            logger.info(
+                "Job %s was %s before its launch was recorded; its trainer "
+                "(pid %s) is stopped.",
+                job_uuid,
+                status,
+                handle.pid,
+            )
+            return
+        logger.error(
+            "Job %s: its launch could not be recorded, so its trainer (pid %s) "
+            "is stopped.",
+            job_uuid,
+            handle.pid,
+        )
+        self._fail(
+            job_uuid,
+            "The run could not be recorded as started, so it was stopped.",
+            log=False,
+        )
 
     def _poll_until_done(
         self,
@@ -1495,9 +1774,13 @@ class TrainingService:
         except presets.NoProfileFits:
             raise
         except (KeyError, TypeError, ValueError) as exc:
-            raise presets.NoProfileFits(
-                f"the run could not be resolved again: {exc}", "profile", 0, 0
-            ) from exc
+            logger.warning(
+                "Job %s: profile %s could not be resolved again.",
+                info["uuid"],
+                profile,
+                exc_info=True,
+            )
+            raise presets.NoProfileFits(RESOLVE_AGAIN_FAILED, "profile", 0, 0) from exc
 
     def _settle(self, job_uuid: str, settled: dict) -> None:
         """Make *settled* the run's resolution and what it renders."""
@@ -1742,12 +2025,18 @@ class TrainingService:
         if self._stop.is_set():
             return True
         if resolution.get("previews_deferred") and progress.final_checkpoint:
+            # A cancel skips the remaining previews only while they are drawn
+            # (_stop_previews), so no skip outlives them.
+            with self._active_lock:
+                self._drawing_previews.add(info["uuid"])
             try:
                 return self._sample_after_training(
                     backend, handle, info, progress, lease
                 )
             finally:
-                self._skip_previews.discard(info["uuid"])
+                with self._active_lock:
+                    self._drawing_previews.discard(info["uuid"])
+                    self._skip_previews.discard(info["uuid"])
         return True
 
     def _record_run(
@@ -1923,20 +2212,82 @@ class TrainingService:
         reading = ledger().device(device) if device else None
         return reading.name if reading is not None else None
 
-    def _fail(self, job_uuid: str, message: str) -> None:
-        """End a run that never trained as ``error`` with *message*."""
-        logger.warning("Job %s: %s", job_uuid, message)
-        self._update_job(job_uuid, status="error", error=message)
-        self._emit_progress(job_uuid, status="error", message=message)
+    def _fail(self, job_uuid: str, message: str, *, log: bool = True) -> None:
+        """End a run that never trained as ``error`` with *message*.
+
+        Written only while the run is still queued: a cancel that stopped it
+        meanwhile keeps its stop.
+
+        Args:
+            job_uuid: The run's uuid.
+            message: The error the run's card shows.
+            log: False when the caller has logged the cause already.
+        """
+        if log:
+            logger.warning("Job %s: %s", job_uuid, message)
+        if self._update_job(
+            job_uuid, status="error", error=message, only_if=_ONLY_QUEUED
+        ):
+            self._emit_progress(job_uuid, status="error", message=message)
+
+    def _write_failure(self, job_uuid: str, message: str) -> None:
+        """End a run an unexpected error broke off as ``error`` with *message*.
+
+        It may have broken off anywhere from its claim to its import, so it is
+        written over any state short of the run's end, and never over an end
+        already written.
+        """
+        if self._update_job(
+            job_uuid, status="error", error=message, only_if=_ONLY_UNENDED
+        ) or self._update_job(
+            job_uuid, status="error", error=message, only_if=_ONLY_COMPLETED_UNIMPORTED
+        ):
+            self._emit_progress(job_uuid, status="error", message=message)
+
+    def _release_gpu(self, job_uuid: str, lease: Lease, watch: _Watch) -> None:
+        """Give the run's GPU lease back once its trainer has let go of the card.
+
+        The check before it only warns about memory the trainer kept. It runs
+        before the import, so its failure is logged and costs that warning, not
+        the trained run: the lease goes back and the import goes on, as when
+        the check ran after the import and its error ended in the worker loop's
+        log.
+
+        Args:
+            job_uuid: The run's uuid.
+            lease: The run's lease.
+            watch: The run's watch, which names the trainer's processes.
+        """
+        try:
+            self._check_released(job_uuid, lease, watch)
+        except Exception:
+            logger.exception(
+                "Job %s: could not check what GPU memory its trainer (pids %s) "
+                "let go of on device %s; its lease is released all the same.",
+                job_uuid,
+                sorted(watch.pids),
+                lease.device,
+            )
+        finally:
+            lease.release()
 
     # ------------------------------------------------------------------
     # Finalization
     # ------------------------------------------------------------------
 
     def _finalize(
-        self, backend: TrainerBackend, handle, info: dict, progress: TrainingProgress
+        self,
+        backend: TrainerBackend,
+        handle,
+        info: dict,
+        progress: TrainingProgress,
+        *,
+        defer_wait: bool = False,
     ) -> None:
         """Write the terminal job state and, on success, bring the run to the shelf.
+
+        Called once the run's GPU lease is released: the import needs no GPU,
+        and may wait out a restore or a library switch.
 
         Args:
             backend: The trainer backend (unused beyond context, kept for
@@ -1944,6 +2295,9 @@ class TrainingService:
             handle: The job handle.
             info: Persisted job fields (needs uuid, name, set_id, character_id).
             progress: The terminal progress snapshot.
+            defer_wait: An import that must wait for a library switch waits on
+                a thread of its own, and this returns at once. For the
+                start-up reconcile, which a switch's admission waits on.
         """
         job_uuid = info["uuid"]
         status = progress.status
@@ -1963,33 +2317,57 @@ class TrainingService:
             )
             return
 
-        if status == "completed" and progress.final_checkpoint:
+        if status == "completed":
             try:
-                # The final checkpoint sits in the run folder, which is the
-                # ai-toolkit run the importer reads (``save_root``).
-                landed = self._import_run(
-                    os.path.dirname(progress.final_checkpoint), info
-                )
-                report = (
-                    f"Trained {info['name']} to step {progress.step}; "
-                    f"{landed['imported']} file(s) on the shelf "
-                    f"(stack {landed['stack_id']})."
-                )
-                self._update_job(
-                    job_uuid,
-                    status="completed",
-                    step=progress.step,
-                    report=report,
-                    completed_at=now_iso(),
-                )
-                self._emit_progress(
-                    job_uuid,
-                    status="completed",
-                    current=progress.step,
-                    total=progress.total_steps,
-                    message="Completed",
-                )
-                logger.info("Job %s completed: %s", job_uuid, report)
+                # A run finalized again (its end state was lost to a busy hub,
+                # or a restart or its library's refusal came during its
+                # import) may be on the shelf already. Its source folder may
+                # then have taken the run's files, so there is no final to read.
+                landed = self._landed_on_shelf(info, progress.final_checkpoint)
+                if landed is None and not progress.final_checkpoint:
+                    msg = "Run reported completed but no final checkpoint was found."
+                    logger.warning("Job %s: %s", job_uuid, msg)
+                    self._update_job(
+                        job_uuid,
+                        status="error",
+                        error=msg,
+                        completed_at=now_iso(),
+                    )
+                    self._emit_progress(job_uuid, status="error", message=msg)
+                    return
+                if (
+                    landed is None
+                    and training_runs.get_run_by_uuid(self._hub, job_uuid) is None
+                ):
+                    # Deleted while it trained, or gone with the database:
+                    # nothing owns the LoRA now, so its files stay put.
+                    logger.warning(
+                        "Training run %s (id %s) finished, but its row is gone; "
+                        "%s is left in place and not imported.",
+                        job_uuid,
+                        info.get("id"),
+                        progress.final_checkpoint,
+                    )
+                    return
+                if landed is None or info.get("continued_from_step") is None:
+                    # A first run on the shelf goes through the import all the
+                    # same: it answers from the shelf, and attaches the LoRA to
+                    # the run's set or character, which a refusal or a restart
+                    # may have come before. A run trained longer attaches
+                    # nothing, so it has nothing left to do.
+                    # The final checkpoint sits in the run folder, which is the
+                    # ai-toolkit run the importer reads (``save_root``).
+                    run_dir = (
+                        os.path.dirname(progress.final_checkpoint)
+                        if progress.final_checkpoint
+                        else handle.save_root
+                    )
+                    landed = self._import_when_admitted(
+                        backend, handle, info, progress, run_dir, defer_wait
+                    )
+                    if landed is None:
+                        return
+                self._write_completed(job_uuid, info, progress, landed)
                 return
             except Exception:
                 logger.exception(
@@ -2006,18 +2384,6 @@ class TrainingService:
                     job_uuid, status="error", message="LoRA import failed"
                 )
                 return
-
-        if status == "completed" and not progress.final_checkpoint:
-            msg = "Run reported completed but no final checkpoint was found."
-            logger.warning("Job %s: %s", job_uuid, msg)
-            self._update_job(
-                job_uuid,
-                status="error",
-                error=msg,
-                completed_at=now_iso(),
-            )
-            self._emit_progress(job_uuid, status="error", message=msg)
-            return
 
         # stopped / error / anything else terminal.
         final_status = "stopped" if status == "stopped" else "error"
@@ -2043,6 +2409,162 @@ class TrainingService:
             message=error_msg or progress.info or final_status,
         )
         logger.info("Job %s finalized as %s.", job_uuid, final_status)
+
+    def _import_when_admitted(
+        self,
+        backend: TrainerBackend,
+        handle,
+        info: dict,
+        progress: TrainingProgress,
+        run_dir: str,
+        defer_wait: bool,
+    ) -> dict | None:
+        """Import the run once its library admits it.
+
+        Args:
+            backend: As :meth:`_finalize`.
+            handle: As :meth:`_finalize`.
+            info: As :meth:`_finalize`.
+            progress: As :meth:`_finalize`.
+            run_dir: The ai-toolkit run folder the importer reads.
+            defer_wait: As :meth:`_finalize`.
+
+        Returns:
+            What the importer answers (``stack_id``, ``imported``). None when
+            the import is left to a later finalize: refused until the library
+            opens again, stopped while it waited, or handed to a thread of its
+            own (*defer_wait*). The row is left as it is for that finalize.
+        """
+        job_uuid = info["uuid"]
+        while True:
+            try:
+                return self._import_run(run_dir, info)
+            except LibraryNotReadyError as exc:
+                if exc.state is not SwitchState.SWITCHING:
+                    # UNAVAILABLE stays so until a restart, and READY here
+                    # means another vault is the active library. Either way
+                    # the row stays, and the reconcile the next time this
+                    # library opens imports the run.
+                    logger.warning(
+                        "Job %s: the import of %s is refused (%s); "
+                        "leaving it for reconcile_on_startup.",
+                        job_uuid,
+                        run_dir,
+                        exc,
+                    )
+                    return None
+                if defer_wait:
+                    logger.info(
+                        "Job %s: the import of %s waits for the library (%s) on "
+                        "a thread of its own, so the library's start goes on.",
+                        job_uuid,
+                        run_dir,
+                        exc,
+                    )
+                    threading.Thread(
+                        target=self._finalize,
+                        args=(backend, handle, info, progress),
+                        name=f"TrainingImport-{job_uuid[:8]}",
+                        daemon=True,
+                    ).start()
+                    return None
+                # A restore or a library switch holds the library. The import
+                # waits for it rather than fail the run.
+                logger.info(
+                    "Job %s: the import of %s waits for the library (%s); "
+                    "asking again in %.0f s.",
+                    job_uuid,
+                    run_dir,
+                    exc,
+                    _LIBRARY_NOT_READY_RETRY_S,
+                )
+                if self._stop.wait(_LIBRARY_NOT_READY_RETRY_S):
+                    # As at shutdown: the row stays, and the next
+                    # reconcile_on_startup imports the run.
+                    logger.info(
+                        "Job %s: stopping before its import was admitted; "
+                        "leaving it for reconcile_on_startup.",
+                        job_uuid,
+                    )
+                    return None
+
+    def _write_completed(
+        self, job_uuid: str, info: dict, progress: TrainingProgress, landed: dict
+    ) -> None:
+        """Write and announce ``completed`` for a run whose LoRA is on the shelf.
+
+        Args:
+            job_uuid: The run's uuid.
+            info: Persisted run fields (needs ``name``).
+            progress: The terminal progress snapshot.
+            landed: What is on the shelf (``imported``, ``stack_id``).
+        """
+        report = (
+            f"Trained {info['name']} to step {progress.step}; "
+            f"{landed['imported']} file(s) on the shelf "
+            f"(stack {landed['stack_id']})."
+        )
+        self._update_job(
+            job_uuid,
+            status="completed",
+            step=progress.step,
+            report=report,
+            completed_at=now_iso(),
+        )
+        self._emit_progress(
+            job_uuid,
+            status="completed",
+            current=progress.step,
+            total=progress.total_steps,
+            message="Completed",
+        )
+        logger.info("Job %s completed: %s", job_uuid, report)
+
+    def _landed_on_shelf(self, info: dict, final_checkpoint: str | None) -> dict | None:
+        """What an earlier import of this run's final put on the shelf, or None.
+
+        The import stamps every model it registers with the run's id, and the
+        shelf keys a model by ``sha256`` (UNIQUE), so the final is on the shelf
+        when a model of the run has its hash. When the run folder no longer
+        holds the final (its source folder deletes after import), the shelf's
+        bare final says so instead: the importer registers it with no
+        ``training_step``, and :meth:`train_longer` stamps it with its step
+        before a run trains on, so a run trained longer is matched by hash
+        only. A first finalize finds no model of the run and hashes nothing.
+
+        Args:
+            info: Persisted run fields (needs ``id``, ``uuid`` and
+                ``continued_from_step``).
+            final_checkpoint: The final checkpoint in the run folder, or None
+                when the run folder has none.
+
+        Returns:
+            ``{"stack_id", "imported"}``, as the importer answers them, with
+            ``imported`` counting every model of the run on the shelf; None
+            when the final has not landed.
+        """
+        rows = self._hub.fetchall(
+            "SELECT sha256, stack_id, training_step FROM model "
+            "WHERE training_run_id = ?",
+            (info["id"],),
+        )
+        if not rows:
+            return None
+        if final_checkpoint is not None:
+            digest = file_digest(final_checkpoint)
+            final = next((r for r in rows if r["sha256"] == digest), None)
+        elif info.get("continued_from_step") is None:
+            final = next((r for r in rows if r["training_step"] is None), None)
+        else:
+            final = None
+        if final is None:
+            return None
+        logger.info(
+            "Job %s: its final is already on the shelf (stack %s); not imported again.",
+            info["uuid"],
+            final["stack_id"],
+        )
+        return {"stack_id": final["stack_id"], "imported": len(rows)}
 
     # ------------------------------------------------------------------
     # Persistence helpers
@@ -2084,23 +2606,113 @@ class TrainingService:
         """A job's persisted status, or None when it is gone."""
         return training_runs.get_run_status(self._hub, job_uuid)
 
-    def _update_job(self, job_uuid: str, **fields) -> bool:
+    def _update_job(
+        self,
+        job_uuid: str,
+        *,
+        only_if: Mapping[str, Sequence[object]] | None = None,
+        attempts: int | None = None,
+        **fields,
+    ) -> bool:
         """Update columns on a training run by uuid.
+
+        A write that ends the run (``status`` completed, stopped or error) is
+        retried when the hub is busy or locked: lost, it would leave the run
+        ``running`` or ``queued`` in the list until the next start-up's
+        :meth:`reconcile_on_startup`. Any other write is tried once unless
+        *attempts* says otherwise. Only the progress columns
+        :meth:`_persist_progress` writes are written again by the next poll;
+        any other write tried once stays lost when it fails, so a write that
+        must land (the launch's) passes *attempts*.
 
         Args:
             job_uuid: The job uuid.
+            only_if: Write only while each named column holds one of its
+                values (compare-and-set: see ``training_runs.update_run``);
+                None writes whatever the row holds.
+            attempts: Tries in all on a busy or locked hub. None:
+                :data:`_TERMINAL_WRITE_ATTEMPTS` for an end state, else 1.
             **fields: Column names → values to set.
 
         Returns:
             True when the row was written. False, after logging why, when no
-            run has that uuid or the write failed.
+            run has that uuid, *only_if* did not hold, or the write failed.
         """
-        try:
-            if training_runs.update_run(self._hub, job_uuid, **fields):
-                return True
-            logger.warning("_update_job: no job with uuid=%s", job_uuid)
-        except Exception:
-            logger.exception("Failed to update job %s with %s", job_uuid, list(fields))
+        terminal = fields.get("status") in _TERMINAL_JOB_STATUSES
+        if attempts is None:
+            attempts = _TERMINAL_WRITE_ATTEMPTS if terminal else 1
+        # Passed only when given, so an unconditional write calls the store as
+        # it always has.
+        condition = {} if only_if is None else {"only_if": only_if}
+        for attempt in range(1, attempts + 1):
+            try:
+                if training_runs.update_run(self._hub, job_uuid, **condition, **fields):
+                    return True
+                if only_if is None:
+                    logger.warning("_update_job: no job with uuid=%s", job_uuid)
+                else:
+                    logger.info(
+                        "Job %s: %s not written, as the run no longer holds %s "
+                        "(or is gone).",
+                        job_uuid,
+                        list(fields),
+                        dict(only_if),
+                    )
+                return False
+            except sqlite3.OperationalError as exc:
+                if attempt == attempts:
+                    if terminal:
+                        logger.error(
+                            "Job %s: could not write its end state %r after %d "
+                            "tries (%s); it stays at its last status until the "
+                            "next start-up reconciles it.",
+                            job_uuid,
+                            fields["status"],
+                            attempts,
+                            exc,
+                            exc_info=True,
+                        )
+                    elif attempts > 1:
+                        logger.error(
+                            "Job %s: could not write %s after %d tries (%s).",
+                            job_uuid,
+                            list(fields),
+                            attempts,
+                            exc,
+                            exc_info=True,
+                        )
+                    else:
+                        logger.exception(
+                            "Failed to update job %s with %s", job_uuid, list(fields)
+                        )
+                    return False
+                # Full jitter: a random wait up to the capped exponential
+                # step, so writers that failed together do not retry together.
+                delay = random.uniform(
+                    0.0,
+                    min(
+                        _TERMINAL_WRITE_BACKOFF_CAP_S,
+                        _TERMINAL_WRITE_BACKOFF_S * 2 ** (attempt - 1),
+                    ),
+                )
+                logger.warning(
+                    "Job %s: writing %s failed (try %d of %d: %s); "
+                    "trying again in %.2f s.",
+                    job_uuid,
+                    f"its end state {fields['status']!r}" if terminal else list(fields),
+                    attempt,
+                    attempts,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+            except Exception:
+                # Not a busy hub (an unknown column, a constraint): another try
+                # would fail the same way.
+                logger.exception(
+                    "Failed to update job %s with %s", job_uuid, list(fields)
+                )
+                return False
         return False
 
     def _persist_progress(
@@ -2125,7 +2737,8 @@ class TrainingService:
             "log_tail": self._read_log_tail(handle.log_path),
         }
         # A curve of None is one the backend could not read this poll, so the
-        # stored curve stays; an empty one was read and has no points.
+        # stored curve stays; an empty one was read and has no points. Every
+        # loss in it is finite: the backend leaves out a step that is not.
         if progress.loss_curve is not None:
             values["loss_curve"] = progress.loss_curve or None
         # The trainer reports running for a while after a cancel; the row's
@@ -2150,8 +2763,11 @@ class TrainingService:
                     if fields.get(column) is not None:
                         fields[column] = json.dumps(fields[column])
                 # A failed write leaves the snapshot as it was, so the next
-                # poll writes these columns again.
-                if self._update_job(job_uuid, status=status, **fields):
+                # poll writes these columns again. Tried once even for an end
+                # state: a retry would hold the lock a cancel waits on, and
+                # _finalize writes the end state again, with its retries,
+                # outside it.
+                if self._update_job(job_uuid, status=status, attempts=1, **fields):
                     self._persisted[job_uuid] = {**written, **changed}
         # A completed trainer is imported next: `_finalize` writes completed_at.
         self._note_phase(
@@ -2335,10 +2951,7 @@ class TrainingService:
             )
         except Exception:
             logger.exception("Job %s: dataset build failed", info["uuid"])
-            self._update_job(info["uuid"], status="error", error="Dataset build failed")
-            self._emit_progress(
-                info["uuid"], status="error", message="Dataset build failed"
-            )
+            self._fail(info["uuid"], "Dataset build failed", log=False)
             return None
         # Enqueue refused a motion run with no clips, but they can be removed
         # while it waits; it must not then train its motion on stills alone.
@@ -2348,8 +2961,7 @@ class TrainingService:
             logger.warning(
                 "Job %s: %s (%d stills built)", info["uuid"], msg, len(items)
             )
-            self._update_job(info["uuid"], status="error", error=msg)
-            self._emit_progress(info["uuid"], status="error", message=msg)
+            self._fail(info["uuid"], msg, log=False)
             return None
         return manifest
 
@@ -2386,9 +2998,9 @@ class TrainingService:
                 info["uuid"],
                 manifest.get("dest_dir"),
             )
-            msg = "Dataset snapshot could not be recorded"
-            self._update_job(info["uuid"], status="error", error=msg)
-            self._emit_progress(info["uuid"], status="error", message=msg)
+            self._fail(
+                info["uuid"], "Dataset snapshot could not be recorded", log=False
+            )
             return False
 
     def _make_backend(self) -> TrainerBackend:

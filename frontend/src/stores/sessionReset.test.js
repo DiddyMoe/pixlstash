@@ -347,7 +347,6 @@ const STORES = [
     name: "useTrainingStore",
     use: useTrainingStore,
     seed: (s) => {
-      s.jobs = [{ id: 1, name: "Ada", status: "completed" }];
       s.aiToolkitRepoPath = "/srv/ai-toolkit";
       s.configLoaded = true;
       s.aiToolkitDiscovery = { found: true, repo_path: "/srv/ai-toolkit" };
@@ -355,7 +354,6 @@ const STORES = [
       s.aiToolkitStatus = { configured: true, runs: { run_count: 3 } };
     },
     isEmpty: (s) =>
-      s.jobs.length === 0 &&
       s.aiToolkitRepoPath === "" &&
       s.configLoaded === false &&
       s.aiToolkitDiscovery === null &&

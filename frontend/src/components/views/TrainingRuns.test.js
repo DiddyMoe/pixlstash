@@ -61,6 +61,7 @@ vi.mock("vue-router", async () => {
 });
 
 import TrainingRuns from "./TrainingRuns.vue";
+import ConfirmDialog from "../widgets/ConfirmDialog.vue";
 import { useModelFoldersStore } from "../../stores/useModelFoldersStore";
 import { useModelShelfStore } from "../../stores/useModelShelfStore";
 import { useNoticeStore } from "../../stores/useNoticeStore";
@@ -129,6 +130,41 @@ async function settle(wrapper) {
 // a later test fires - which is exactly how the teardown assertion below first
 // counted twenty-five reloads instead of one.
 const mounted = [];
+
+// The app's own confirm dialog, as App.vue mounts it, so a question is answered
+// by its buttons and never by the browser's native prompt. It carries the
+// view's stubs too: test-utils re-renders every mounted tree with the stubs
+// of the latest mount, so each must hold what the other needs.
+function mountConfirmHost() {
+  const host = mount(ConfirmDialog, {
+    attachTo: document.body,
+    global: {
+      stubs: {
+        ...globalOpts.global.stubs,
+        // AppDialog is Vuetify's v-dialog underneath, and these files do not
+        // install Vuetify: its title, body and footer render in place.
+        AppDialog: {
+          props: ["open", "title"],
+          emits: ["close", "accept"],
+          template:
+            "<div v-if='open' class='app-dialog'><h2 class='app-dialog__title'>{{ title }}</h2>" +
+            "<slot /><footer class='app-dialog__footer'><slot name='footer' /></footer></div>",
+        },
+        "v-icon": true,
+        // The dialog's own buttons, so the danger variant is the real one.
+        AppButton: false,
+      },
+    },
+  });
+  mounted.push(host);
+  return host;
+}
+
+const confirmButton = (host, label) =>
+  host
+    .find(".app-dialog__footer")
+    .findAll("button")
+    .find((b) => b.text().includes(label));
 
 async function openWith(runs, folders = FOLDERS) {
   listRuns.mockResolvedValue(runs);
@@ -1724,19 +1760,33 @@ describe("the runs PixlStash trains (#2118)", () => {
     );
   });
 
-  it("stops a training run from the menu, after asking", async () => {
+  it("stops a training run from the menu only once the app's dialog says yes", async () => {
     listTrainingJobs.mockResolvedValue([job()]);
     cancelTrainingJob.mockResolvedValue({});
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const nativeConfirm = vi.spyOn(window, "confirm");
     try {
       const wrapper = await openWith([run("Clementine_abcd1234")]);
-      await cardNamed(wrapper, "Clementine").trigger("contextmenu");
-      await wrapper.find("[data-testid='tr-menu-stop']").trigger("click");
+      const host = mountConfirmHost();
+      const askToStop = async () => {
+        await cardNamed(wrapper, "Clementine").trigger("contextmenu");
+        await wrapper.find("[data-testid='tr-menu-stop']").trigger("click");
+        await settle(wrapper);
+      };
+
+      await askToStop();
+      expect(host.find(".app-dialog__title").text()).toMatch(/^Stop training "Clementine/);
+      await confirmButton(host, "Keep training").trigger("click");
       await settle(wrapper);
-      expect(confirm).toHaveBeenCalled();
+      expect(host.find(".app-dialog").exists()).toBe(false);
+      expect(cancelTrainingJob).not.toHaveBeenCalled();
+
+      await askToStop();
+      await confirmButton(host, "Stop training").trigger("click");
+      await settle(wrapper);
       expect(cancelTrainingJob).toHaveBeenCalledWith(7);
+      expect(nativeConfirm).not.toHaveBeenCalled();
     } finally {
-      confirm.mockRestore();
+      nativeConfirm.mockRestore();
     }
   });
 

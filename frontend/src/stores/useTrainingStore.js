@@ -1,16 +1,13 @@
 import { computed, onScopeDispose, ref, watch } from "vue";
 import { defineStore } from "pinia";
 import {
-  cancelTrainingJob,
   checkAiToolkit,
   checkTrainingPresets,
   createTrainingJob,
-  deleteTrainingJob,
   discoverAiToolkit,
   getAiToolkitStatus,
   getTrainingDataset,
   getTrainingSamplePrompts,
-  listTrainingJobs,
   listTrainingPresets,
   putAiToolkitConfig,
   resolveTraining,
@@ -33,7 +30,7 @@ import {
   toggleTrigger,
   triggerFromName,
 } from "../utils/trainingPlan";
-import { isBusyJob } from "../utils/trainingRuns.js";
+import { useTrainingRunsStore } from "./useTrainingRunsStore";
 
 // How long the dialog waits after a change before it asks the server again.
 const RESOLVE_DEBOUNCE_MS = 150;
@@ -107,11 +104,6 @@ export const useTrainingStore = defineStore("training", () => {
   // "quit" or "queue" (Clear), sent with the next Start; null when not asked.
   const comfyuiAnswer = ref(null);
 
-  // ── Jobs (settings section) ──────────────────────────────────────
-  const jobs = ref([]);
-  const jobsLoading = ref(false);
-  const jobsError = ref("");
-
   // ── Setup config (ai-toolkit paths) ─────────────────────────────────────────
   const aiToolkitRepoPath = ref("");
   const aiToolkitPython = ref("");
@@ -129,8 +121,6 @@ export const useTrainingStore = defineStore("training", () => {
 
   // ── Derived ─────────────────────────────────────────────────────────────────
   const aiToolkitConfigured = computed(() => aiToolkitSaved.value);
-
-  const hasRunningJob = computed(() => jobs.value.some(isBusyJob));
 
   /** The character the run is filed under, or null for an ordinary set. */
   const character = computed(() => dataset.value?.character || null);
@@ -438,13 +428,9 @@ export const useTrainingStore = defineStore("training", () => {
       if (seq === planSeq) plan.value = { ...data, choicesKey: key };
     } catch (err) {
       if (seq !== planSeq) return;
-      const detail = err?.response?.data?.detail;
       plan.value = {
         error: {
-          message:
-            (typeof detail === "string" ? detail : "") ||
-            err?.message ||
-            "Could not work out the run's settings.",
+          message: errorMessage(err, "Could not work out the run's settings."),
         },
       };
     } finally {
@@ -591,13 +577,16 @@ export const useTrainingStore = defineStore("training", () => {
       // recipe's, read by the server.
       const trigger = triggerWord.value.trim();
       const model = presets.value.find((p) => p.id === selectedPreset.value)?.label;
-      const existing = await listTrainingJobs();
+      // A fresh read, not a joined one: the read in flight may predate a
+      // run started since, and the name must not repeat it.
+      const existing = await useTrainingRunsStore().loadJobs();
+      if (!existing) throw new Error("Could not read the training runs to name this one.");
       const body = {
         ...scopePayload.value,
         name: runName(
           displayName.value,
           model,
-          (Array.isArray(existing) ? existing : []).map((j) => j.name),
+          existing.map((j) => j.name),
         ),
         trigger_word: trigger,
         effort: effort.value,
@@ -613,39 +602,11 @@ export const useTrainingStore = defineStore("training", () => {
       // A run that fits nowhere answers { message, budget, need_mb, free_mb }.
       const detail = err?.response?.data?.detail;
       submitError.value =
-        detail?.message ||
-        (typeof detail === "string" ? detail : "") ||
-        err?.message ||
-        "Failed to queue training job.";
+        detail?.message || errorMessage(err, "Failed to queue training job.");
       throw err;
     } finally {
       submitting.value = false;
     }
-  }
-
-  // ── Registry / jobs actions ───────────────────────────────────────────────────
-
-  async function fetchJobs() {
-    jobsLoading.value = true;
-    jobsError.value = "";
-    try {
-      const data = await listTrainingJobs();
-      jobs.value = Array.isArray(data) ? data : [];
-    } catch (err) {
-      jobsError.value = errorMessage(err, "Failed to load training jobs.");
-    } finally {
-      jobsLoading.value = false;
-    }
-  }
-
-  async function cancelJob(jobId) {
-    await cancelTrainingJob(jobId);
-    await fetchJobs();
-  }
-
-  async function deleteJob(jobId) {
-    await deleteTrainingJob(jobId);
-    jobs.value = jobs.value.filter((j) => j.id !== jobId);
   }
 
   // ── Setup config (ai-toolkit paths) ───────────────────────────────────────────
@@ -721,11 +682,9 @@ export const useTrainingStore = defineStore("training", () => {
     settingsTabRequest.value += 1;
   }
 
-  // Every route here is owner-only, and the jobs and ai-toolkit paths
+  // Every route here is owner-only, and the presets and ai-toolkit paths
   // belong to the credential that read them: a change of credential empties them.
   function resetForSession() {
-    jobs.value = [];
-    jobsError.value = "";
     presets.value = [];
     presetsAutoCheck.value = null;
     presetCheckMessage.value = "";
@@ -821,14 +780,6 @@ export const useTrainingStore = defineStore("training", () => {
     resolvePlan,
     loadPrompts,
     startTraining,
-    // jobs
-    jobs,
-    jobsLoading,
-    jobsError,
-    hasRunningJob,
-    fetchJobs,
-    cancelJob,
-    deleteJob,
     // setup config
     aiToolkitRepoPath,
     aiToolkitPython,

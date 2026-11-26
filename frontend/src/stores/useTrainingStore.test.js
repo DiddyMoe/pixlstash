@@ -23,6 +23,7 @@ vi.mock("../api/config", () => ({ getUserConfig: vi.fn() }));
 import * as training from "../api/training";
 import { getUserConfig } from "../api/config";
 import { useTrainingStore } from "./useTrainingStore";
+import { useTrainingRunsStore } from "./useTrainingRunsStore";
 
 const T = "{{TRIGGER_WORD}}";
 const GRANDAD = {
@@ -278,6 +279,43 @@ describe("startTraining", () => {
     expect(body).not.toHaveProperty("pins");
   });
 
+  it("names the run from a read started after the click, not one in flight", async () => {
+    training.getTrainingDataset.mockResolvedValue(dataset({ set_id: 9 }));
+    const store = useTrainingStore();
+    await store.openForScope({ type: "set", id: 9, name: "Pub nights" });
+    let answerOld;
+    training.listTrainingJobs.mockReturnValueOnce(
+      new Promise((resolve) => {
+        answerOld = resolve;
+      }),
+    );
+    const inFlight = useTrainingRunsStore().loadJobs({ join: true });
+    training.listTrainingJobs.mockResolvedValueOnce([
+      { name: "Pub nights Z-Image Turbo #1" },
+    ]);
+    await store.startTraining();
+    answerOld([]);
+    await inFlight;
+
+    expect(training.listTrainingJobs).toHaveBeenCalledTimes(2);
+    expect(training.createTrainingJob.mock.calls[0][0].name).toBe(
+      "Pub nights Z-Image Turbo #2",
+    );
+  });
+
+  it("starts nothing when the runs cannot be read to name it", async () => {
+    training.getTrainingDataset.mockResolvedValue(dataset({ set_id: 9 }));
+    const store = useTrainingStore();
+    await store.openForScope({ type: "set", id: 9, name: "Pub nights" });
+    training.listTrainingJobs.mockRejectedValue(new Error("Network Error"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(store.startTraining()).rejects.toBeTruthy();
+    warn.mockRestore();
+    expect(training.createTrainingJob).not.toHaveBeenCalled();
+    expect(store.submitError).toBe("Could not read the training runs to name this one.");
+  });
+
   it("shows the message of a run that fits nowhere", async () => {
     const store = useTrainingStore();
     training.createTrainingJob.mockRejectedValue({
@@ -314,11 +352,55 @@ describe("error copy from a refused request", () => {
     expect(store.datasetError).toBe("Could not read the pictures to train on.");
   });
 
-  it("shows a refused job list as its fallback sentence", async () => {
+  // utils/apiClient.js marks the saved-address 409 once its notice says why;
+  // the dialog then says only what failed.
+  const NOTICED_409 = {
+    response: {
+      status: 409,
+      data: { detail: "The saved ComfyUI address is not valid, so nothing was sent to it." },
+    },
+    message: "Request failed with status code 409",
+    savedAddressNoticed: true,
+  };
+
+  it("leaves the saved-address sentence to its notice when the settings are worked out", async () => {
+    training.getTrainingDataset.mockResolvedValue(
+      dataset({ set_id: 40, character_id: 4, character: GRANDAD }),
+    );
     const store = useTrainingStore();
-    training.listTrainingJobs.mockRejectedValue(VALIDATION_422);
-    await store.fetchJobs();
-    expect(store.jobsError).toBe("Failed to load training jobs.");
+    await store.openForScope({ type: "character", id: 4, name: "Grandad" });
+    training.resolveTraining.mockRejectedValue(NOTICED_409);
+    await store.resolvePlan();
+    expect(store.plan.error.message).toBe("Could not work out the run's settings.");
+  });
+
+  it("shows another refusal's sentence when the settings are worked out", async () => {
+    training.getTrainingDataset.mockResolvedValue(
+      dataset({ set_id: 40, character_id: 4, character: GRANDAD }),
+    );
+    const store = useTrainingStore();
+    await store.openForScope({ type: "character", id: 4, name: "Grandad" });
+    training.resolveTraining.mockRejectedValue({
+      response: { status: 409, data: { detail: "Pick a model first." } },
+    });
+    await store.resolvePlan();
+    expect(store.plan.error.message).toBe("Pick a model first.");
+  });
+
+  it("leaves the saved-address sentence to its notice when a run is queued", async () => {
+    const store = useTrainingStore();
+    training.createTrainingJob.mockRejectedValue(NOTICED_409);
+    await expect(store.startTraining()).rejects.toBe(NOTICED_409);
+    expect(store.submitError).toBe("Failed to queue training job.");
+  });
+
+  it("shows another refusal's sentence when a run is queued", async () => {
+    const store = useTrainingStore();
+    training.createTrainingJob.mockRejectedValue({
+      response: { status: 409, data: { detail: "A run with that name already exists." } },
+    });
+    await expect(store.startTraining()).rejects.toBeTruthy();
+    expect(store.submitError).toBe("A run with that name already exists.");
   });
 });
 

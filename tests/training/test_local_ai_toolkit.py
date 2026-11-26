@@ -371,10 +371,16 @@ def test_cancel_never_signals_a_pid_that_is_not_the_trainer(tmp_path):
     spec = _make_spec(tmp_path)
     handle = backend.prepare(spec)
     LocalAiToolkit._set_job_status(handle.sqlite_db_path, handle.job_id, "running")
+    # The print proves the sleeper is past exec, so cancel reads its real argv,
+    # not the empty one a just-spawned process shows (see the positive control).
     sleeper = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+        [sys.executable, "-c", "import time; print('up', flush=True); time.sleep(60)"],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
     )
     try:
+        assert sleeper.stdout.readline() == "up\n"
         handle.pid = sleeper.pid
         backend.cancel(handle)
         assert sleeper.poll() is None, "cancel signalled a process that is not ours"
@@ -383,6 +389,7 @@ def test_cancel_never_signals_a_pid_that_is_not_the_trainer(tmp_path):
     finally:
         sleeper.kill()
         sleeper.wait()
+        sleeper.stdout.close()
 
 
 def test_an_unverifiable_inherited_pid_stays_alive_but_is_never_signalled(
@@ -458,13 +465,22 @@ def test_cancel_still_signals_an_inherited_trainer_it_can_verify(tmp_path, monke
         [
             sys.executable,
             "-c",
-            "import time; time.sleep(60)",
+            "import time; print('up', flush=True); time.sleep(60)",
             backend.run_script,
             handle.config_path,
         ],
         start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
     )
     try:
+        # Popen returns once the exec has closed the CLOEXEC error pipe, which
+        # is before the kernel publishes the new argv: a /proc cmdline read in
+        # that window is empty, so the trainer read as "not ours" (12 of 1400
+        # back-to-back spawns, load 1). An inherited trainer has been running
+        # for a while; a line from the child's own code proves this one is
+        # past exec too.
+        assert trainer.stdout.readline() == "up\n"
         handle.pid = trainer.pid
         assert backend.is_alive(handle)
         backend.cancel(handle)
@@ -473,6 +489,7 @@ def test_cancel_still_signals_an_inherited_trainer_it_can_verify(tmp_path, monke
         if trainer.poll() is None:
             trainer.kill()
             trainer.wait()
+        trainer.stdout.close()
 
 
 def _submit_loading(tmp_path, monkeypatch):
@@ -965,7 +982,11 @@ def loss_log(tmp_path):
 
 
 def _full_read(path):
-    """The loss curve and max step of the log at *path*, read whole here."""
+    """The loss curve and max step of the log at *path*, read whole here.
+
+    A point has a finite loss, as the backend contract asks: an empty value or
+    a diverged step's ``inf`` has none.
+    """
     con = sqlite3.connect(path)
     try:
         (max_step,) = con.execute("SELECT MAX(step) FROM steps").fetchone()
@@ -975,6 +996,7 @@ def _full_read(path):
                 "SELECT step, value_real FROM metrics "
                 "WHERE key = 'loss/loss' AND value_real IS NOT NULL ORDER BY step"
             )
+            if math.isfinite(loss)
         ]
     finally:
         con.close()
@@ -1055,6 +1077,30 @@ def test_a_resume_after_an_infinite_loss_is_read_as_it_now_is(loss_log):
     writer.execute("DELETE FROM steps WHERE step > 3")
     _log_step(writer, 4, 0.55)
     assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+
+def test_a_loss_that_is_not_finite_has_no_point(loss_log, caplog):
+    """A diverged step is left out of the curve, which stays RFC 8259 JSON.
+
+    The trainer logs the step's ``inf`` as it is; the warning names it once,
+    and again only when another step diverges.
+    """
+    handle, writer = loss_log([(1, 0.9), (2, math.inf), (3, -math.inf), (4, 0.6)])
+    backend = _make_backend()
+
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            curve, max_step = backend._read_loss_db(handle)
+            assert [p["step"] for p in curve] == [1, 4]
+            assert max_step == 4
+            json.dumps(curve, allow_nan=False)
+        assert caplog.text.count("not finite") == 1
+
+        _log_step(writer, 5, math.inf)
+        curve, _ = backend._read_loss_db(handle)
+    assert [p["step"] for p in curve] == [1, 4]
+    assert caplog.text.count("not finite") == 2
+    assert "steps [2, 3, 5]" in caplog.text
 
 
 def test_a_loss_log_cut_back_by_a_carry_on_is_read_again(loss_log, tmp_path):

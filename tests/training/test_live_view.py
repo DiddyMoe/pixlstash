@@ -1,5 +1,6 @@
 """The live view's reading of a run (#2118): phases, columns, cells and speed."""
 
+import os
 import sqlite3
 
 import pytest
@@ -301,6 +302,91 @@ def test_a_malformed_step_time_is_skipped_not_fatal(tmp_path):
     assert live_view.read_step_times(path) == [(1, 10.0), (3, 14.0)]
 
 
+def _counting_connect(monkeypatch):
+    """Count the loss log opens ``read_step_times`` makes."""
+    opens = []
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        opens.append(args[0])
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(live_view.sqlite3, "connect", connect)
+    return opens
+
+
+def test_a_poll_with_no_new_step_does_not_reopen_the_loss_log(tmp_path, monkeypatch):
+    path = str(tmp_path / "loss_log.db")
+    _loss_db(path, [(1, 10.0), (2, 12.0)])
+    opens = _counting_connect(monkeypatch)
+
+    first = live_view.read_step_times(path)
+    second = live_view.read_step_times(path)
+
+    assert first == second == [(1, 10.0), (2, 12.0)]
+    assert len(opens) == 1
+    # Each caller gets its own list, so one cannot change another's read.
+    second.append((3, 99.0))
+    assert live_view.read_step_times(path) == [(1, 10.0), (2, 12.0)]
+
+
+def test_a_step_committed_to_the_wal_is_read_on_the_next_poll(tmp_path):
+    # The trainer keeps its connection open, so a committed step sits in
+    # loss_log.db-wal and the main file does not change until a checkpoint.
+    path = str(tmp_path / "loss_log.db")
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE steps (step INTEGER PRIMARY KEY, wall_time REAL)")
+        writer.execute("INSERT INTO steps VALUES (1, 10.0)")
+        writer.commit()
+        assert live_view.read_step_times(path) == [(1, 10.0)]
+        main_before = os.stat(path)
+
+        writer.execute("INSERT INTO steps VALUES (2, 12.0)")
+        writer.commit()
+
+        main_after = os.stat(path)
+        # The case under test: only the WAL moved.
+        assert (main_after.st_size, main_after.st_mtime_ns) == (
+            main_before.st_size,
+            main_before.st_mtime_ns,
+        )
+        assert live_view.read_step_times(path) == [(1, 10.0), (2, 12.0)]
+    finally:
+        writer.close()
+
+
+def test_a_rewritten_earlier_step_is_read_again(tmp_path):
+    # A resume or a carry-on cut back rewrites steps already logged, so a
+    # change rereads the whole table, not only the steps after the last one.
+    path = str(tmp_path / "loss_log.db")
+    _loss_db(path, [(1, 10.0), (2, 12.0)])
+    assert live_view.read_step_times(path) == [(1, 10.0), (2, 12.0)]
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT OR REPLACE INTO steps VALUES (2, 50.0)")
+    conn.commit()
+    conn.close()
+    assert live_view.read_step_times(path) == [(1, 10.0), (2, 50.0)]
+
+
+def test_a_failed_read_is_not_kept_for_the_next_poll(tmp_path, monkeypatch):
+    path = str(tmp_path / "loss_log.db")
+    _loss_db(path, [(1, 10.0)])
+    real_read = live_view._read_step_times_uncached
+    calls = []
+
+    def _fail_then_read(loss_db_path):
+        calls.append(loss_db_path)
+        return None if len(calls) == 1 else real_read(loss_db_path)
+
+    monkeypatch.setattr(live_view, "_read_step_times_uncached", _fail_then_read)
+
+    assert live_view.read_step_times(path) == []
+    assert live_view.read_step_times(path) == [(1, 10.0)]
+    assert len(calls) == 2
+
+
 @pytest.mark.parametrize(
     ("log", "fetching"),
     [
@@ -332,3 +418,31 @@ def test_a_download_is_read_from_the_last_line_of_the_trainer_log(
 
 def test_a_missing_trainer_log_is_not_a_download(tmp_path):
     assert live_view.downloading(str(tmp_path / "absent.txt")) is False
+
+
+def test_a_loss_that_is_not_finite_is_left_out_of_the_curve():
+    curve = [
+        {"step": 1, "loss": 0.5},
+        {"step": 2, "loss": float("inf")},
+        {"step": 3, "loss": float("nan")},
+        {"step": 4, "loss": float("-inf")},
+        {"step": 5, "loss": 0.4},
+    ]
+    kept, dropped = live_view.finite_loss_curve(curve)
+    assert kept == [{"step": 1, "loss": 0.5}, {"step": 5, "loss": 0.4}]
+    assert dropped == [2, 3, 4]
+
+
+def test_a_finite_curve_is_returned_as_it_is():
+    curve = [{"step": 1, "loss": 0.5}, {"step": 2, "loss": 1}]
+    kept, dropped = live_view.finite_loss_curve(curve)
+    assert kept is curve and dropped == []
+    assert live_view.finite_loss_curve(None) == (None, [])
+    assert live_view.finite_loss_curve([]) == ([], [])
+
+
+def test_the_latest_loss_is_the_last_finite_one():
+    curve = [{"step": 1, "loss": 0.5}, {"step": 2, "loss": float("inf")}]
+    assert live_view.latest_finite_loss(curve) == 0.5
+    assert live_view.latest_finite_loss([{"step": 1, "loss": float("nan")}]) is None
+    assert live_view.latest_finite_loss(None) is None

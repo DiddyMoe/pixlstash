@@ -248,6 +248,7 @@ import { importRun, runSampleUrl } from "../../api/modelImports";
 import SampleMedia from "../widgets/SampleMedia.vue";
 import { pictureThumbnailUrl } from "../../api/pictures";
 import { exportTrainingSnapshot, getTrainingJobLive } from "../../api/training";
+import { useConfirm } from "../../composables/useConfirm";
 import { useEntityListsStore } from "../../stores/useEntityListsStore";
 import { useModelFoldersStore } from "../../stores/useModelFoldersStore";
 import { useModelShelfStore } from "../../stores/useModelShelfStore";
@@ -291,6 +292,7 @@ const runsStore = useTrainingRunsStore();
 const lists = useEntityListsStore();
 const folders = useModelFoldersStore();
 const shelf = useModelShelfStore();
+const { confirm } = useConfirm();
 
 const live = ref(null);
 const stopping = ref(false);
@@ -498,11 +500,17 @@ async function shelve() {
   const runName = props.card.run?.name;
   if (shelving.value || !cp || !runName) return;
   // The same consent the grid's Import asks for, said before the file goes.
+  // The message names the file too: the `window.confirm` fallback shows it
+  // without the title.
   if (
     runsStore.source?.delete_after_import &&
-    !window.confirm(
-      `This folder removes what it imports, so ${cp.filename} will leave the run once it is on the shelf. Put it on the shelf?`,
-    )
+    !(await confirm({
+      title: `Put ${cp.filename} on the shelf?`,
+      message:
+        `This folder removes what it imports, so ${cp.filename} leaves the ` +
+        "run once it is on the shelf.",
+      confirmLabel: "Put it on the shelf",
+    }))
   ) {
     return;
   }

@@ -1,6 +1,7 @@
-// The Models rail's card for one training run (#2169): its Stop asks before it
-// stops the run, as Settings' Cancel does (#2295); with the run's page open it
-// says only what the run was made of.
+// The Models rail's card for one training run (#2169): its Stop asks in the
+// app's dialog before it stops the run, with the same question as the run's page
+// and the runs grid; with the run's page open it says only what the run was
+// made of.
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
@@ -60,6 +61,12 @@ vi.mock("../../stores/useModelShelfStore", () => ({
 
 import ModelsRailRun from "./ModelsRailRun.vue";
 import { useTrainingRunsStore } from "../../stores/useTrainingRunsStore";
+import {
+  activeConfirm,
+  registerConfirmHost,
+  resolveConfirm,
+  unregisterConfirmHost,
+} from "../../composables/useConfirm";
 
 const stubs = {
   ModelsRailSection: {
@@ -119,6 +126,7 @@ const live = {
 const mounted = [];
 afterEach(() => {
   while (mounted.length) mounted.pop().unmount();
+  unregisterConfirmHost();
   vi.restoreAllMocks();
   cancelTrainingJob.mockClear();
   exportTrainingSnapshot.mockReset();
@@ -177,18 +185,46 @@ describe("the rail's training card", () => {
     mounted.push(wrapper);
     await flushPromises();
 
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    // The app's ConfirmDialog asks, never the browser's own prompt.
+    registerConfirmHost();
+    const nativeConfirm = vi.spyOn(window, "confirm");
     await wrapper.find('[data-testid="mrr-stop"]').trigger("click");
     await flushPromises();
-    expect(confirm).toHaveBeenCalledWith(
-      'Stop training "ohwx-portrait-v2"? The checkpoints it saved are kept.',
-    );
+    expect(activeConfirm.value.options).toMatchObject({
+      title: 'Stop training "ohwx-portrait-v2"?',
+      message: 'Stopping "ohwx-portrait-v2" keeps the checkpoints it saved.',
+      confirmLabel: "Stop training",
+      cancelLabel: "Keep training",
+      danger: true,
+    });
+    resolveConfirm(false);
+    await flushPromises();
     expect(cancelTrainingJob).not.toHaveBeenCalled();
 
-    confirm.mockReturnValue(true);
     await wrapper.find('[data-testid="mrr-stop"]').trigger("click");
     await flushPromises();
+    expect(cancelTrainingJob).not.toHaveBeenCalled();
+    resolveConfirm(true);
+    await flushPromises();
     expect(cancelTrainingJob).toHaveBeenCalledWith(7);
+    expect(nativeConfirm).not.toHaveBeenCalled();
+  });
+
+  it("names the run in the browser's prompt when the app's dialog is not mounted", async () => {
+    // With no host, useConfirm asks window.confirm(message || title): only
+    // the message shows, so it must say which run stops.
+    setActivePinia(createPinia());
+    getTrainingJobLive.mockResolvedValue(live);
+    const wrapper = mount(ModelsRailRun, { props: { card }, global: { stubs } });
+    mounted.push(wrapper);
+    await flushPromises();
+
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await wrapper.find('[data-testid="mrr-stop"]').trigger("click");
+    await flushPromises();
+    expect(nativeConfirm).toHaveBeenCalledTimes(1);
+    expect(nativeConfirm.mock.calls[0][0]).toContain('"ohwx-portrait-v2"');
+    expect(cancelTrainingJob).not.toHaveBeenCalled();
   });
 
   it("skips a trained run's previews without asking: the model is kept", async () => {
@@ -473,10 +509,42 @@ describe("the rail's training card", () => {
     folders.sourceFolder.delete_after_import = true;
     try {
       const wrapper = await openRail({ card: failedCard, open: true });
-      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      registerConfirmHost();
       await wrapper.find('[data-testid="mrr-shelve"]').trigger("click");
       await flushPromises();
-      expect(confirm).toHaveBeenCalled();
+      expect(activeConfirm.value.options).toMatchObject({
+        title: expect.stringMatching(/^Put .+ on the shelf\?$/),
+        message: expect.stringContaining("This folder removes what it imports"),
+        confirmLabel: "Put it on the shelf",
+        danger: false,
+      });
+      resolveConfirm(false);
+      await flushPromises();
+      expect(importRun).not.toHaveBeenCalled();
+
+      importRun.mockResolvedValue({ files: [] });
+      await wrapper.find('[data-testid="mrr-shelve"]').trigger("click");
+      await flushPromises();
+      expect(importRun).not.toHaveBeenCalled();
+      resolveConfirm(true);
+      await flushPromises();
+      expect(importRun).toHaveBeenCalledTimes(1);
+    } finally {
+      folders.sourceFolder.delete_after_import = false;
+    }
+  });
+
+  it("names the file in the browser's prompt when the app's dialog is not mounted", async () => {
+    // With no host, useConfirm asks window.confirm(message || title): only
+    // the message shows, so it must say which file leaves the run.
+    folders.sourceFolder.delete_after_import = true;
+    try {
+      const wrapper = await openRail({ card: failedCard, open: true });
+      const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      await wrapper.find('[data-testid="mrr-shelve"]').trigger("click");
+      await flushPromises();
+      expect(nativeConfirm).toHaveBeenCalledTimes(1);
+      expect(nativeConfirm.mock.calls[0][0]).toContain("old-sailor_000000500.safetensors");
       expect(importRun).not.toHaveBeenCalled();
     } finally {
       folders.sourceFolder.delete_after_import = false;

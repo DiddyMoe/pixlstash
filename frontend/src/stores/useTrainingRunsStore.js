@@ -9,6 +9,7 @@ import {
   getTrainingJob,
   listTrainingJobs,
 } from "../api/training";
+import { useConfirm } from "../composables/useConfirm";
 import { onSessionReset } from "../utils/apiClient";
 import { errorDetail } from "../utils/apiError";
 import { isBusyJob } from "../utils/trainingRuns.js";
@@ -17,6 +18,25 @@ import { useNoticeStore } from "./useNoticeStore";
 
 /** A job that ended in one of these may have ended before it was started. */
 const ENDED_EARLY = ["error", "stopped"];
+
+/**
+ * The question every Stop training control asks (the rail, the runs grid's
+ * menu and the live page), so the three say the same thing. The message names
+ * the run as well as the title: with no dialog mounted `useConfirm` falls back
+ * to `window.confirm(message)`, which shows the message alone.
+ *
+ * @param {string} name - the run's name as its card shows it.
+ * @returns {object} options for `useConfirm().confirm`.
+ */
+export function stopTrainingQuestion(name) {
+  return {
+    title: `Stop training "${name}"?`,
+    message: `Stopping "${name}" keeps the checkpoints it saved.`,
+    confirmLabel: "Stop training",
+    cancelLabel: "Keep training",
+    danger: true,
+  };
+}
 
 /**
  * The Models workspace's training runs (#2169): the runs in the ai-toolkit
@@ -37,6 +57,7 @@ const ENDED_EARLY = ["error", "stopped"];
  */
 export const useTrainingRunsStore = defineStore("trainingRuns", () => {
   const folders = useModelFoldersStore();
+  const { confirm } = useConfirm();
 
   const runs = ref([]);
   const loading = ref(false);
@@ -330,8 +351,10 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
    *
    * @param {{join?: boolean}} [options] - as for `loadRuns`: `join` shares
    *   the newest read in flight; a reader that follows a change must not.
-   * @returns {Promise<void>} settles with the read it started or joined. It
-   *   never rejects: a failure is reported in `jobsFailed`.
+   * @returns {Promise<Array|null>} settles with the read it started or
+   *   joined: the jobs that read found, or null when it failed. It never
+   *   rejects: a failure is also reported in `jobsFailed`. A superseded read
+   *   still answers its own caller, though only the newest one is kept.
    */
   let jobsGeneration = 0;
   /** The newest read of the jobs while it is in flight: `{gen, request}`. */
@@ -348,13 +371,15 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
   }
 
   async function readJobs(gen) {
+    let found = null;
     try {
-      const found = await listTrainingJobs();
-      if (gen !== jobsGeneration) return;
-      jobs.value = Array.isArray(found) ? found : [];
+      const answer = await listTrainingJobs();
+      found = Array.isArray(answer) ? answer : [];
+      if (gen !== jobsGeneration) return found;
+      jobs.value = found;
       jobsFailed.value = false;
     } catch (err) {
-      if (gen !== jobsGeneration) return;
+      if (gen !== jobsGeneration) return null;
       // The grid still lists the folder's runs; only the live pages are lost.
       console.warn("Could not list the training jobs:", err);
       jobs.value = [];
@@ -363,6 +388,7 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
       if (gen === jobsGeneration) jobsLoaded.value = true;
     }
     reconcile();
+    return found;
   }
 
   /** Both reads; `options` as for `loadRuns`. */
@@ -373,17 +399,15 @@ export const useTrainingRunsStore = defineStore("trainingRuns", () => {
   /**
    * Stop a live job, or skip a trained one's remaining previews.
    *
-   * The same confirmation as Settings' Cancel: a stopped run cannot resume.
-   * Skip previews (a `completed` job) keeps the model, so it does not ask.
+   * Asks `stopTrainingQuestion` first: a stopped run cannot resume. Skip
+   * previews (a `completed` job) keeps the model, so it does not ask.
    *
    * @returns {Promise<boolean>} whether the job was asked to stop.
    */
   async function stopJob(job, name) {
     if (
       job.status !== "completed" &&
-      !window.confirm(
-        `Stop training "${name}"? The checkpoints it saved are kept.`,
-      )
+      !(await confirm(stopTrainingQuestion(name)))
     ) {
       return false;
     }

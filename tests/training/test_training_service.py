@@ -16,9 +16,11 @@ the suite records that call instead of touching a shelf.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -41,6 +43,7 @@ from pixlstash.training import local_ai_toolkit as local_ai_toolkit_module
 from pixlstash.training.backend import TrainingProgress
 from pixlstash.training.local_ai_toolkit import LocalAiToolkit
 from pixlstash.vault import Vault
+from tests.test_model_run_import import write_adapter
 from tests.training.fake_run import _init_loss_db, _log_step
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1578,11 +1581,18 @@ def test_vault_reconciles_a_surviving_trainer_before_the_worker_starts():
     def noop(*_args, **_kwargs):
         return None
 
+    # Each session task start() runs answers in its own shape, in start()'s
+    # order. The previous process left nothing: no auto-stack run to close, no
+    # Scrapheap run interrupted or to load back (``(interrupted, runs)``), and
+    # no picture with faces whose person is still pending.
+    answers = [0, (0, []), []]
+
     stand_in = SimpleNamespace(
         _disable_background_workers=False,
         _started=False,
-        # Closes a previous process's auto-stack runs first; nothing to close here.
-        db=SimpleNamespace(run_task=noop),
+        _runs_recovered=False,
+        db=SimpleNamespace(run_task=lambda _fn, *_args, **_kwargs: answers.pop(0)),
+        scrapheap_runs=SimpleNamespace(load=lambda runs: order.append("recover")),
         _task_runner=SimpleNamespace(start=lambda: order.append("tasks")),
         _work_planner=SimpleNamespace(start=noop),
         _arbiter=SimpleNamespace(
@@ -1593,7 +1603,7 @@ def test_vault_reconciles_a_surviving_trainer_before_the_worker_starts():
         _queue_cuda_suspend=noop,
         _ref_folder_watcher=SimpleNamespace(start=noop),
         _model_folder_watcher=SimpleNamespace(start=noop),
-        _start_existing_folder_watches=noop,
+        _start_reference_folder_watches=noop,
         training_service=SimpleNamespace(
             adopt_live_runs=lambda: order.append("adopt"),
             reconcile_on_startup=lambda: order.append("reconcile"),
@@ -1603,7 +1613,8 @@ def test_vault_reconciles_a_surviving_trainer_before_the_worker_starts():
 
     Vault.start(stand_in)
 
-    assert order == ["adopt", "tasks", "reconcile", "start"]
+    assert order == ["recover", "adopt", "tasks", "reconcile", "start"]
+    assert answers == [], "every session task start() runs was answered"
     # The arbiter can then suspend PixlStash's CUDA context for that run (#2557).
     assert suspenders == [stand_in._queue_cuda_suspend]
 
@@ -2124,6 +2135,44 @@ def test_a_loader_error_stops_the_search(hub, repo_dir, watched, monkeypatch):
     assert len(watched()) == 1
 
 
+def test_a_run_that_cannot_be_resolved_again_keeps_the_cause_in_the_log(
+    hub, repo_dir, watched, monkeypatch, caplog
+):
+    """Wrong if the run's error repeats the exception's text, which can carry
+    a pinned value or a key name: the server's sentence, the cause logged with
+    its traceback."""
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    job = _enqueue_resolved(
+        service, _resolve_small(hub), _write_template(repo_dir, steps=4, save_every=2)
+    )
+    cause = ValueError("invalid literal for int() with base 10: 'example-leak-marker'")
+
+    def unresolvable(*args, **kwargs):
+        raise cause
+
+    monkeypatch.setattr(presets, "resolve", unresolvable)
+    caplog.set_level(logging.WARNING, logger=training_service_module.logger.name)
+
+    row = _run_to_end(hub, service, job)
+
+    assert row.status == "error"
+    assert f"({training_service_module.RESOLVE_AGAIN_FAILED})" in row.error, row.error
+    assert "example-leak-marker" not in row.error
+    logged = [
+        r.exc_info[1]
+        for r in caplog.records
+        if r.name == training_service_module.logger.name and r.exc_info
+    ]
+    assert logged and all(e is cause for e in logged), logged
+    assert watched() == []
+
+
 def test_the_ram_guard_stops_a_probe(hub, repo_dir, watched, monkeypatch):
     monkeypatch.setattr(
         training_service_module,
@@ -2417,6 +2466,140 @@ def test_a_run_trained_but_not_imported_before_a_restart_is_imported(hub, repo_d
     assert row.finished_unwatched == 0
 
 
+def _a_trained_run_on_a_shelf(hub, repo_dir, tmp_path, *, delete_after_import):
+    """A finished run in the shelf's ai-toolkit folder, left ``running``.
+
+    The trainer's job DB says ``completed`` and its pid is dead, as a crash or
+    a restart leaves it; the shelf has a download folder to receive it. The
+    service imports with the vault's real importer, which reads only the hub.
+    """
+    source_dir = tmp_path / "ai-toolkit"
+    destination_dir = tmp_path / "loras"
+    source_dir.mkdir()
+    destination_dir.mkdir()
+    with hub.transaction() as conn:
+        conn.execute(
+            "INSERT INTO model_folder (path, kind, owner, movable, "
+            "delete_after_import, created_at) VALUES (?, 'source', 'builtin', 0, ?, ?)",
+            (str(source_dir), delete_after_import, now_iso()),
+        )
+        conn.execute(
+            "INSERT INTO model_folder (path, kind, movable, is_download_target, "
+            "created_at) VALUES (?, 'user', 'per_item', 1, ?)",
+            (str(destination_dir), now_iso()),
+        )
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+        importer=lambda run_dir, info: Vault._import_training_run(
+            SimpleNamespace(_hub=hub), run_dir, info
+        ),
+    )
+    job_uuid = "re-finalized-run"
+    training_runs.create_run(
+        hub,
+        library_uuid=_LIBRARY_UUID,
+        uuid=job_uuid,
+        name="Clementine",
+        set_id=None,
+        character_id=None,
+        base_model="m",
+        trigger_word="t",
+    )
+    work_dir = os.path.join(os.path.dirname(hub.path), "training", job_uuid)
+    handle = LocalAiToolkit.handle_for(
+        work_dir, job_uuid, "Clementine", training_folder=str(source_dir)
+    )
+    os.makedirs(handle.save_root)
+    os.makedirs(work_dir)
+    stem = os.path.basename(handle.save_root)
+    for name, seed in (
+        (f"{stem}_000000002.safetensors", b"step2"),
+        (f"{stem}_000000004.safetensors", b"step4"),
+        (f"{stem}.safetensors", b"final"),
+    ):
+        write_adapter(os.path.join(handle.save_root, name), seed=seed)
+    conn = sqlite3.connect(handle.sqlite_db_path)
+    try:
+        conn.execute(local_ai_toolkit_module._JOB_TABLE_SQL)
+        conn.execute(
+            "INSERT INTO Job (id, status, info, step) VALUES (?, 'completed', 'done', 4)",
+            (job_uuid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    training_runs.update_run(
+        hub,
+        job_uuid,
+        status="running",
+        pid=999_999_999,
+        training_folder=str(source_dir),
+        total_steps=4,
+        step=4,
+    )
+    return service, job_uuid, destination_dir
+
+
+@pytest.mark.parametrize("delete_after_import", [0, 1])
+def test_a_run_imported_before_its_end_was_written_is_not_imported_again(
+    hub, repo_dir, tmp_path, monkeypatch, delete_after_import
+):
+    """A run whose LoRA landed but whose ``completed`` was lost ends completed.
+
+    The import succeeds, then the hub stays busy through every try of the end
+    state, so the row is still ``running`` and the next start-up finalizes the
+    run again. The shelf already holds its LoRA: that start-up writes
+    ``completed`` and leaves the shelf as it is, whether the source folder kept
+    the run's files or gave them up.
+    """
+    service, job_uuid, destination_dir = _a_trained_run_on_a_shelf(
+        hub, repo_dir, tmp_path, delete_after_import=delete_after_import
+    )
+    real_update_run = training_runs.update_run
+    lost = []
+
+    def busy_for_the_end_state(hub_, run_uuid, **fields):
+        if fields.get("status") == "completed" and len(lost) < 3:
+            lost.append(fields)
+            raise sqlite3.OperationalError("database is locked")
+        return real_update_run(hub_, run_uuid, **fields)
+
+    monkeypatch.setattr(
+        training_service_module.training_runs, "update_run", busy_for_the_end_state
+    )
+    monkeypatch.setattr(training_service_module, "_TERMINAL_WRITE_BACKOFF_S", 0.0)
+
+    service.reconcile_on_startup()
+    assert len(lost) == 3
+    assert _job_status(hub, job_uuid).status == "running"
+    run_id = _job_status(hub, job_uuid).id
+    landed = hub.fetchall(
+        "SELECT m.sha256, mf.relpath FROM model m "
+        "JOIN model_file mf ON mf.model_id = m.id WHERE m.training_run_id = ?",
+        (run_id,),
+    )
+    assert len(landed) == 3
+
+    service.reconcile_on_startup()
+
+    row = _job_status(hub, job_uuid)
+    assert (row.status, row.error) == ("completed", None)
+    assert row.completed_at
+    assert "3 file(s) on the shelf" in row.report
+    again = hub.fetchall(
+        "SELECT m.sha256, mf.relpath FROM model m "
+        "JOIN model_file mf ON mf.model_id = m.id WHERE m.training_run_id = ?",
+        (run_id,),
+    )
+    assert sorted(map(tuple, again)) == sorted(map(tuple, landed))
+    assert hub.fetchone("SELECT COUNT(*) AS n FROM model")["n"] == 3
+    assert len(list(destination_dir.glob("*.safetensors"))) == 3
+
+
 def test_a_lease_adopted_for_a_run_reconcile_cannot_take_is_released(
     hub, repo_dir, monkeypatch
 ):
@@ -2537,21 +2720,25 @@ def test_a_trainer_a_crashed_pass_left_running_is_stopped_before_a_new_pass(
     os.makedirs(pass_dir)
     os.makedirs(tmp_path / "after" / "250")
     pass_handle = LocalAiToolkit.handle_for(pass_dir, "orphaned-job", "orphaned")
+    # Each prints once it runs: Popen returns before the kernel publishes the
+    # new argv, and an empty cmdline would make both halves pass or fail on
+    # timing rather than on what the argv names.
+    up = "import time; print('up', flush=True); time.sleep(60)"
     stranger = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)", backend.run_script],
+        [sys.executable, "-c", up, backend.run_script],
         start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
     )
     trainer = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import time; time.sleep(60)",
-            backend.run_script,
-            pass_handle.config_path,
-        ],
+        [sys.executable, "-c", up, backend.run_script, pass_handle.config_path],
         start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
     )
     try:
+        assert stranger.stdout.readline() == "up\n"
+        assert trainer.stdout.readline() == "up\n"
         service._update_job("orphaned-job", pid=stranger.pid)
         service._stop_orphaned_pass(backend, "orphaned-job", "orphaned", str(tmp_path))
         time.sleep(0.5)
@@ -2565,6 +2752,7 @@ def test_a_trainer_a_crashed_pass_left_running_is_stopped_before_a_new_pass(
             if process.poll() is None:
                 process.kill()
                 process.wait()
+            process.stdout.close()
 
 
 def test_a_re_attached_run_leaves_a_later_runs_backend_in_the_slot(
@@ -2946,7 +3134,7 @@ def test_a_stamped_file_at_the_finals_step_is_set_aside_too(tmp_path):
 
     with pytest.raises(FileExistsError, match="kept twice"):
         LocalAiToolkit.carry_on_from(handle, 4)
-    assert LocalAiToolkit.carry_on_from(handle, 2) == "take-1"
+    assert LocalAiToolkit.carry_on_from(handle, 2).take == "take-1"
     assert set(os.listdir(handle.save_root)) == {
         f"{stem}_000000002.safetensors",
         "take-1",
@@ -2988,7 +3176,7 @@ def test_training_on_from_an_earlier_step_keeps_the_later_loss_with_the_take(
         )
         return [point["step"] for point in curve], max_step
 
-    assert LocalAiToolkit.carry_on_from(handle, 2) == "take-1"
+    assert LocalAiToolkit.carry_on_from(handle, 2).take == "take-1"
     assert logged(handle.loss_db_path) == ([1, 2], 2)
     kept = os.path.join(handle.save_root, "take-1", "loss_log.db")
     assert logged(kept) == ([1, 2, 3, 4], 4)
@@ -3063,3 +3251,446 @@ def test_a_set_aside_that_fails_midway_leaves_the_folder_as_it_was(
     monkeypatch.setattr(os, "rename", real_rename)
 
     assert sorted(os.listdir(handle.save_root)) == before
+
+
+# ---------------------------------------------------------------------------
+# A write that ends a run, against a busy hub
+# ---------------------------------------------------------------------------
+
+
+def _busy_hub_for(monkeypatch, failures, error=None):
+    """Make the next *failures* run writes raise; record every write tried."""
+    real_update_run = training_runs.update_run
+    tried = []
+
+    def update_run(hub, run_uuid, **fields):
+        tried.append(fields)
+        if len(tried) <= failures:
+            raise error or sqlite3.OperationalError("database is locked")
+        return real_update_run(hub, run_uuid, **fields)
+
+    monkeypatch.setattr(training_service_module.training_runs, "update_run", update_run)
+    monkeypatch.setattr(training_service_module, "_TERMINAL_WRITE_BACKOFF_S", 0.0)
+    return tried
+
+
+def _queued_job(hub, repo_dir, notify=None):
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=notify or _CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    job = service.enqueue(
+        set_id=_SET_ID,
+        name="end-state",
+        base_model="m",
+        trigger_word="t",
+        template_path=_write_template(repo_dir, steps=4, save_every=2),
+        resolution=_RESOLUTION,
+    )
+    return service, job
+
+
+def test_an_end_state_write_that_meets_a_busy_hub_is_tried_again(
+    hub, repo_dir, monkeypatch
+):
+    service, job = _queued_job(hub, repo_dir)
+    training_runs.update_run(hub, job["uuid"], status="running")
+    tried = _busy_hub_for(monkeypatch, failures=2)
+
+    service._finalize(
+        None,
+        None,
+        {"uuid": job["uuid"]},
+        TrainingProgress(
+            status="stopped", info="Job stopped", step=3, total_steps=4, speed=""
+        ),
+    )
+
+    assert len(tried) == 3
+    final = _job_status(hub, job["uuid"])
+    assert final.status == "stopped"
+    assert final.completed_at is not None
+
+
+def test_an_end_state_write_gives_up_and_says_which_run(
+    hub, repo_dir, monkeypatch, caplog
+):
+    service, job = _queued_job(hub, repo_dir)
+    tried = _busy_hub_for(monkeypatch, failures=99)
+
+    with caplog.at_level("ERROR"):
+        service._fail(job["uuid"], "The dataset is gone.")
+
+    assert len(tried) == training_service_module._TERMINAL_WRITE_ATTEMPTS
+    assert _job_status(hub, job["uuid"]).status == "queued"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any(job["uuid"] in r.getMessage() for r in errors), caplog.text
+    assert any(r.exc_info for r in errors)
+
+
+def test_a_progress_write_is_not_retried(hub, repo_dir, monkeypatch):
+    # The next poll writes the step again, so only an end state is retried.
+    service, job = _queued_job(hub, repo_dir)
+    tried = _busy_hub_for(monkeypatch, failures=1)
+
+    assert service._update_job(job["uuid"], step=2) is False
+    assert len(tried) == 1
+
+
+def test_a_write_that_cannot_succeed_is_not_retried(hub, repo_dir, monkeypatch):
+    service, job = _queued_job(hub, repo_dir)
+    tried = _busy_hub_for(
+        monkeypatch, failures=99, error=sqlite3.IntegrityError("constraint failed")
+    )
+
+    assert service._update_job(job["uuid"], status="error", error="x") is False
+    assert len(tried) == 1
+
+
+def test_a_queued_stop_that_cannot_be_saved_is_not_reported_as_done(
+    hub, repo_dir, monkeypatch
+):
+    # Unsaved, the row is still queued and the worker would launch it, so the
+    # cancel must fail rather than say the run stopped.
+    notify = _CapturingNotify()
+    service, job = _queued_job(hub, repo_dir, notify=notify)
+    job_id = _job_status(hub, job["uuid"]).id
+    _busy_hub_for(monkeypatch, failures=99)
+
+    with pytest.raises(training_service_module.TrainingStoreError):
+        service.cancel(job_id)
+
+    assert _job_status(hub, job["uuid"]).status == "queued"
+    assert not [e for e in notify.plugin_progress() if e.get("status") == "stopped"]
+
+
+class _RequeueOnABusyHub:
+    """A hub connection whose next *failures* requeue statements are refused.
+
+    Each refusal is raised inside the transaction, after the shelf's
+    renumbering ran, the way a lock lost between the two statements would be.
+    """
+
+    def __init__(self, conn, tried, failures, seen):
+        self._conn = conn
+        self._tried = tried
+        self._failures = failures
+        self._seen = seen
+
+    def execute(self, sql, params=()):
+        # The requeue only: the phase notes after it write the row too.
+        if sql.startswith("UPDATE training_run SET status = 'queued'"):
+            self._tried.append(self._seen())
+            if len(self._tried) <= self._failures:
+                raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, params)
+
+
+def _busy_requeue_for(monkeypatch, hub, failures, seen=lambda: None):
+    """Refuse the next *failures* requeues; record *seen()* at each one tried."""
+    real_transaction = hub.transaction
+    tried = []
+
+    @contextlib.contextmanager
+    def transaction():
+        with real_transaction() as conn:
+            yield _RequeueOnABusyHub(conn, tried, failures, seen)
+
+    monkeypatch.setattr(hub, "transaction", transaction)
+    monkeypatch.setattr(training_service_module, "_TERMINAL_WRITE_BACKOFF_S", 0.0)
+    return tried
+
+
+def _shelve_final(hub, run):
+    """Put *run*'s final on the shelf the way its import does: no step."""
+    with hub.transaction() as conn:
+        conn.execute(
+            "INSERT INTO model (file_kind, kind, filename, sha256, provenance, "
+            "training_run_id) VALUES ('adapter', 'lora', ?, ?, 'trained', ?)",
+            (f"{run['name']}.safetensors", f"test-{run['uuid']}", run["id"]),
+        )
+
+
+def _shelved_step(hub, run):
+    (row,) = hub.fetchall(
+        "SELECT training_step FROM model WHERE training_run_id = ?", (run["id"],)
+    )
+    return row["training_step"]
+
+
+def test_a_train_longer_that_cannot_be_saved_is_not_queued_and_the_shelf_is_untouched(
+    hub, repo_dir, monkeypatch
+):
+    # Unsaved, the row still says the run completed and the worker never
+    # claims it, so the press must fail rather than answer queued, and must
+    # not leave a spec behind for a run that is not queued. The shelf's final
+    # is renumbered in the same transaction as the requeue, so it keeps no
+    # step either: renumbered alone, the cover would name a step of a run
+    # that is not training on.
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    run = _finished_run(hub, repo_dir, service, name="unsaved")
+    _shelve_final(hub, run)
+    sidecar = service._pending_sidecar_path(run["uuid"])
+    attempts = training_service_module._TERMINAL_WRITE_ATTEMPTS
+    tried = _busy_requeue_for(
+        monkeypatch,
+        hub,
+        failures=99,
+        # What train_longer staged before the write, seen at the write.
+        seen=lambda: (run["uuid"] in service._pending_specs, os.path.isfile(sidecar)),
+    )
+
+    with pytest.raises(training_service_module.TrainingStoreError) as raised:
+        service.train_longer(run["id"], from_step=4, more_steps=2)
+
+    assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+    assert tried == [(True, True)] * attempts
+    assert _shelved_step(hub, run) is None
+    row = _job_status(hub, run["uuid"])
+    assert (row.status, row.total_steps, row.continued_from_step) == (
+        "completed",
+        4,
+        None,
+    )
+    assert run["uuid"] not in service._pending_specs
+    assert not os.path.exists(sidecar)
+
+
+def test_a_train_longer_that_meets_a_busy_hub_once_is_queued_on_the_next_try(
+    hub, repo_dir, monkeypatch
+):
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    run = _finished_run(hub, repo_dir, service, name="busy-once")
+    _shelve_final(hub, run)
+    tried = _busy_requeue_for(monkeypatch, hub, failures=1)
+
+    service.train_longer(run["id"], from_step=4, more_steps=2)
+
+    assert len(tried) == 2
+    assert _shelved_step(hub, run) == 4
+    row = _job_status(hub, run["uuid"])
+    assert (row.status, row.total_steps, row.continued_from_step) == (
+        "queued",
+        6,
+        4,
+    )
+    assert run["uuid"] in service._pending_specs
+
+
+def _files_under(*roots):
+    """Every folder and file under *roots*: each file's size and contents.
+
+    A loss log's contents are its rows: put back through SQLite's backup, its
+    header counters differ from the original's while every row is the same.
+    Its ``-wal`` and ``-shm`` are SQLite's own: a progress read (read-only)
+    leaves them, the next writable connection to close folds them into the log
+    and removes them, reading the rows here included.
+    """
+    found = {}
+    for root in roots:
+        for folder, folders, files in os.walk(root):
+            for name in folders:
+                found[os.path.join(folder, name)] = "folder"
+            for name in files:
+                if name.endswith(("-wal", "-shm")):
+                    continue
+                path = os.path.join(folder, name)
+                if name == "loss_log.db":
+                    with contextlib.closing(sqlite3.connect(path)) as conn:
+                        contents = list(conn.iterdump())
+                else:
+                    with open(path, "rb") as fh:
+                        contents = hashlib.sha256(fh.read()).hexdigest()
+                found[path] = (os.path.getsize(path), contents)
+    return found
+
+
+@pytest.mark.parametrize("from_step", [2, 4], ids=["earlier-step", "final"])
+def test_a_train_longer_that_cannot_be_queued_leaves_the_run_folder_as_it_was(
+    hub, repo_dir, monkeypatch, from_step
+):
+    # From step 2 the final, the optimizer and the loss past step 2 go into a
+    # take; from the final, it is renamed to its stamped name. Either way the
+    # row is not queued, so it still describes the folder as it was only if
+    # every one of those is put back.
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    run = _finished_run(hub, repo_dir, service, name="unqueued")
+    save_root = os.path.join(repo_dir, "output", f"unqueued_{run['uuid'][:8]}")
+    work_dir = os.path.dirname(service._pending_sidecar_path(run["uuid"]))
+    before = _files_under(save_root, work_dir)
+    assert os.path.join(save_root, "loss_log.db") in before
+    offered = service.train_longer_options(run)
+    _busy_requeue_for(monkeypatch, hub, failures=99)
+
+    with pytest.raises(training_service_module.TrainingStoreError):
+        service.train_longer(run["id"], from_step=from_step, more_steps=4)
+
+    assert _files_under(save_root, work_dir) == before
+    row = training_runs.get_run_by_uuid(hub, run["uuid"])
+    assert service.train_longer_options(row) == offered
+
+
+def test_a_carry_on_that_cannot_be_undone_whole_names_what_stays_moved(
+    hub, repo_dir, monkeypatch, caplog
+):
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    run = _finished_run(hub, repo_dir, service, name="stuck")
+    stem = f"stuck_{run['uuid'][:8]}"
+    save_root = os.path.join(repo_dir, "output", stem)
+    stuck = os.path.join(save_root, "take-1", "optimizer.pt")
+    real_rename = os.rename
+
+    def optimizer_held(source, dest):
+        if source == stuck:
+            raise PermissionError("held open")
+        real_rename(source, dest)
+
+    _busy_requeue_for(monkeypatch, hub, failures=99)
+    monkeypatch.setattr(os, "rename", optimizer_held)
+    caplog.set_level(logging.ERROR)
+
+    # The press still answers with the store's refusal, not the undo's error.
+    with pytest.raises(training_service_module.TrainingStoreError):
+        service.train_longer(run["id"], from_step=2, more_steps=4)
+
+    assert sorted(os.listdir(os.path.join(save_root, "take-1"))) == ["optimizer.pt"]
+    assert os.path.isfile(os.path.join(save_root, f"{stem}.safetensors"))
+    held = [r for r in caplog.records if stuck in r.getMessage()]
+    assert held and held[0].levelno == logging.ERROR
+    assert os.path.join(save_root, "optimizer.pt") in held[0].getMessage()
+    assert any(
+        run["uuid"] in r.getMessage() and "could not be undone" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def _enqueue_quit_allowed(service, repo_dir, name):
+    return service.enqueue(
+        set_id=_SET_ID,
+        name=name,
+        base_model="m",
+        trigger_word="t",
+        template_path=_write_template(repo_dir, steps=4, save_every=2),
+        resolution=_RESOLUTION,
+        quit_comfyui=True,
+    )
+
+
+def test_leave_to_quit_comfyui_is_written_with_the_run_itself(
+    hub, repo_dir, monkeypatch
+):
+    # Written after the insert, a worker could claim the run in between and
+    # wait for the GPU as though the owner had said no. In the insert there
+    # is no such moment: the run has never been queued without the answer.
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    tried = _busy_hub_for(monkeypatch, failures=0)
+    inserted = []
+    real_create_run = training_runs.create_run
+
+    def create_run(hub_, **fields):
+        inserted.append(fields.get("comfyui_quit"))
+        return real_create_run(hub_, **fields)
+
+    monkeypatch.setattr(training_service_module.training_runs, "create_run", create_run)
+
+    job = _enqueue_quit_allowed(service, repo_dir, "quit-allowed")
+
+    assert inserted == ["allowed"]
+    assert [fields for fields in tried if "comfyui_quit" in fields] == []
+    assert _job_status(hub, job["uuid"]).comfyui_quit == "allowed"
+
+
+def test_a_run_the_hub_is_too_busy_to_write_is_refused_and_nothing_is_staged(
+    hub, repo_dir, monkeypatch
+):
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+
+    def busy_create_run(hub_, **fields):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        training_service_module.training_runs, "create_run", busy_create_run
+    )
+
+    with pytest.raises(training_service_module.TrainingStoreError) as raised:
+        _enqueue_quit_allowed(service, repo_dir, "unwritten")
+
+    assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+    assert service._pending_specs == {}
+    assert (
+        hub.fetchall("SELECT id FROM training_run WHERE name = ?", ("unwritten",)) == []
+    )
+
+
+def _strict_json(text):
+    """Parse *text* as RFC 8259 JSON, which has no Infinity or NaN."""
+
+    def refuse(name):
+        raise ValueError(f"{name} is not JSON")
+
+    return json.loads(text, parse_constant=refuse)
+
+
+def test_a_loss_that_is_not_finite_is_not_stored(hub, repo_dir, tmp_path):
+    """A diverged step never reaches the stored curve, which stays RFC 8259 JSON.
+
+    The loss log is the trainer's own; the adapter reads it and the service
+    stores what it hands over, with no filter of its own.
+    """
+    service, job = _queued_job(hub, repo_dir)
+    training_runs.update_run(hub, job["uuid"], status="running")
+    backend = LocalAiToolkit(str(tmp_path), sys.executable)
+    handle = LocalAiToolkit.handle_for(str(tmp_path / "work"), job["uuid"], "nf")
+    os.makedirs(handle.save_root)
+    _write_loss_log(
+        handle.loss_db_path,
+        [(1, 0.5), (2, 0.4), (3, float("inf")), (4, 0.3)],
+    )
+
+    service._persist_progress(job["uuid"], backend.progress(handle), handle)
+
+    stored = _strict_json(_job_status(hub, job["uuid"]).loss_curve)
+    assert stored == [
+        {"step": 1, "loss": 0.5},
+        {"step": 2, "loss": 0.4},
+        {"step": 4, "loss": 0.3},
+    ]
