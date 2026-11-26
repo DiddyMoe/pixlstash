@@ -24,6 +24,7 @@ from pixlstash.db_models import (  # noqa: F401
     Tag,
     TagPrediction,
 )
+from pixlstash.utils.query.folder_prefix import PATHS_FOLD_CASE
 from pixlstash.utils.query.predicate_filter import PredicateFilter
 
 
@@ -566,24 +567,48 @@ def test_stack_state_composes_with_another_predicate(session):
 # --------------------------------------------------------------------------- #
 
 
+def _add_folder_neighbours(session):
+    """Pictures in the folder's prefix siblings and its other-case twin.
+
+    Returns the twin, which is the same folder only where the platform folds
+    path case (Windows).
+    """
+    _add_picture(session, file_path="/ref/photos2/c.jpg")  # sibling prefix
+    _add_picture(session, file_path="/ref/photos-old/d.jpg")  # sibling prefix
+    _add_picture(session, file_path="/ref/photos0/e.jpg")  # just past the range
+    _add_picture(session, file_path="/ref/photos.jpg")  # a file, not the folder
+    _add_picture(session, file_path="/ref/pho_os/f.jpg")  # LIKE `_`, as a pattern
+    return _add_picture(session, file_path="/ref/PHOTOS/g.jpg")
+
+
 def test_file_path_prefix_children_only(session):
     direct = _add_picture(session, file_path="/ref/photos/a.jpg")
     _add_picture(session, file_path="/ref/photos/sub/b.jpg")  # sub-dir excluded
-    _add_picture(session, file_path="/ref/photos2/c.jpg")  # sibling prefix excluded
+    twin = _add_folder_neighbours(session)
+    expected = {direct.id, twin.id} if PATHS_FOLD_CASE else {direct.id}
 
-    flt = PredicateFilter(file_path_prefix="/ref/photos")
-    _assert_matches_agrees(session, flt, {direct.id})
+    for prefix in ("/ref/photos", "/ref/photos/"):
+        flt = PredicateFilter(file_path_prefix=prefix)
+        _assert_matches_agrees(session, flt, expected)
+    # `_` and `%` in the browsed folder's name are characters, not wildcards.
+    _assert_matches_agrees(
+        session, PredicateFilter(file_path_prefix="/ref/ph_tos"), set()
+    )
 
 
 def test_file_path_prefix_subtree(session):
     direct = _add_picture(session, file_path="/ref/photos/a.jpg")
     nested = _add_picture(session, file_path="/ref/photos/sub/b.jpg")
     _add_picture(session, file_path="/other/c.jpg")
+    twin = _add_folder_neighbours(session)
+    expected = {direct.id, nested.id}
+    if PATHS_FOLD_CASE:
+        expected.add(twin.id)
 
     flt = PredicateFilter(
         file_path_prefix="/ref/photos", file_path_prefix_children_only=False
     )
-    _assert_matches_agrees(session, flt, {direct.id, nested.id})
+    _assert_matches_agrees(session, flt, expected)
 
 
 def test_import_source_folder(session):

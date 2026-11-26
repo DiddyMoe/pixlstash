@@ -1,4 +1,3 @@
-import ast
 import asyncio
 import os
 import re
@@ -21,6 +20,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import Session, select
 from starlette.concurrency import run_in_threadpool
 
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
     Character,
@@ -28,6 +28,7 @@ from pixlstash.db_models import (
     Picture,
     Tag,
 )
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.pixl_logging import get_logger
 from pixlstash.scoring import (
     get_smart_score_penalised_tags_from_request,
@@ -35,9 +36,22 @@ from pixlstash.scoring import (
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 
 from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
+from pixlstash.utils.sql_chunking import chunked, in_json
+
+from ._listing import forget_refused_stored_values, stored_value
 
 
 logger = get_logger(__name__)
+
+
+# The picture columns the batch sends as the bitmap's geometry.
+_GEOMETRY_COLUMNS = (
+    "thumbnail_width",
+    "thumbnail_height",
+    "square_crop_x",
+    "square_crop_y",
+    "square_crop_side",
+)
 
 
 # Thumbnails are served under content-addressed URLs (the ?v=WxH version changes
@@ -67,10 +81,33 @@ def register_routes(router, server):
 
     def clear_thumbnail_runtime_cache() -> None:
         thumbnail_generation_locks.clear()
+        # The stored values answered null are keyed by row id, which the next
+        # library reuses: its own damaged rows are logged afresh.
+        forget_refused_stored_values()
 
     # The locks are route-local, so expose their one lifecycle operation to the
     # server's library switch coordinator without exposing the storage itself.
     server._clear_thumbnail_runtime_cache = clear_thumbnail_runtime_cache
+
+    def stored_number(value, *, table: str, row_id, column: str, picture_id):
+        """*value* as its column declares it, or None: the listing's rule.
+
+        The batch is rendered with ``allow_nan=False`` once every picture's
+        entry is built, outside the per-picture ``try``, so one infinity or
+        one blob in one row made the whole batch a 500. Such a value is
+        logged once per row and column (:func:`stored_value`) and answered as
+        null, which the grid already reads as "not processed yet". Only that
+        value is lost: the rest of the entry, and every other picture in the
+        batch, is served.
+        """
+        return stored_value(
+            value,
+            table=table,
+            row_id=row_id,
+            column=column,
+            picture_id=picture_id,
+            log=logger,
+        )
 
     def get_thumbnail_lock(picture_id: int) -> asyncio.Lock:
         lock = thumbnail_generation_locks.get(picture_id)
@@ -127,7 +164,7 @@ def register_routes(router, server):
         response_class=FileResponse,
         responses={200: {"content": {"image/webp": {}}}},
     )
-    async def get_thumbnail(request: Request, id: int):
+    async def get_thumbnail(request: Request, id: SqliteInt):
         started_at = datetime.now(timezone.utc)
         vault = server.vault
         generation = getattr(server, "library_generation", 0)
@@ -318,7 +355,7 @@ def register_routes(router, server):
             filtered_ids = []
             for raw_id in ids:
                 try:
-                    if int(raw_id) in scope_allowed:
+                    if parse_sqlite_int(raw_id) in scope_allowed:
                         filtered_ids.append(raw_id)
                 except (TypeError, ValueError):
                     continue
@@ -338,7 +375,7 @@ def register_routes(router, server):
         ids_int = []
         for raw_id in ids:
             try:
-                ids_int.append(int(raw_id))
+                ids_int.append(parse_sqlite_int(raw_id))
             except (TypeError, ValueError):
                 continue
 
@@ -346,20 +383,29 @@ def register_routes(router, server):
         if ids_int and penalised_tag_set:
 
             def fetch_penalised_tags(session: Session):
-                return session.exec(
-                    select(Tag.picture_id, Tag.tag).where(
-                        Tag.picture_id.in_(ids_int),
-                        Tag.tag.is_not(None),
-                        func.lower(Tag.tag).in_(penalised_tag_set),
-                    )
-                ).all()
+                # The request's id list has no cap: chunked under SQLite's
+                # bound-parameter limit. Each row names its own picture, so
+                # the chunks add up to one read. The penalised names have no
+                # cap either and ride with every chunk, so they bind as one
+                # JSON array rather than one parameter each.
+                return [
+                    row
+                    for id_chunk in chunked(ids_int)
+                    for row in session.exec(
+                        select(Tag.picture_id, Tag.tag).where(
+                            Tag.picture_id.in_(id_chunk),
+                            Tag.tag.is_not(None),
+                            in_json(func.lower(Tag.tag), penalised_tag_set),
+                        )
+                    ).all()
+                ]
 
             rows = server.vault.db.run_immediate_read_task(fetch_penalised_tags)
             for pic_id, tag in rows or []:
                 if tag:
                     penalised_tag_map[pic_id].append(tag)
 
-        def map_bbox_to_thumbnail(bbox, picture):
+        def map_bbox_to_thumbnail(bbox, picture, out_w, out_h):
             # Map a picture-space (source pixel) bbox into AR-BITMAP pixel space
             # (0..thumbnail_width × 0..thumbnail_height, origin top-left). The
             # bitmap is a uniform resize of the WHOLE frame, so the scale is
@@ -367,10 +413,10 @@ def register_routes(router, server):
             # picture's, but ``picture.width``/``height`` are stored un-rotated:
             # for an EXIF-rotated (90°/270°) image the bitmap swaps them, so pick
             # whichever orientation shares the bitmap's aspect ratio.
+            # ``out_w``/``out_h`` are the bitmap size as the batch sends it:
+            # a finite number, or None when unset or not a number.
             if not bbox or len(bbox) != 4:
                 return bbox, False
-            out_w = getattr(picture, "thumbnail_width", None)
-            out_h = getattr(picture, "thumbnail_height", None)
             pic_w = getattr(picture, "width", None)
             pic_h = getattr(picture, "height", None)
             if not out_w or not out_h or not pic_w or not pic_h:
@@ -400,10 +446,15 @@ def register_routes(router, server):
                     ],
                     True,
                 )
-            except Exception as exc:
-                logger.debug(
-                    "Could not map bbox to thumbnail for picture %s (%s); "
-                    "returning unscaled bbox.",
+            except (TypeError, ValueError) as exc:
+                # The box is four finite numbers (``read_stored_bbox``) and
+                # the bitmap size a finite number, so every product above is
+                # finite or clamped. The picture's own width and height arrive
+                # unchecked: a row written outside the app can hold text there.
+                logger.warning(
+                    "Could not map bbox %r to the thumbnail of picture %s (%s); "
+                    "returning it unscaled.",
+                    bbox,
                     getattr(picture, "id", None),
                     exc,
                 )
@@ -446,20 +497,24 @@ def register_routes(router, server):
                 # sends; loading whole rows read it for every face on the page.
                 # The same detached-row rule as above: a column missing here
                 # makes the face's read raise, and the face drops out silently.
-                for face in session.exec(
-                    select(Face)
-                    .where(Face.picture_id.in_([pic.id for pic in found]))
-                    .options(
-                        load_only(
-                            Face.id,
-                            Face.picture_id,
-                            Face.character_id,
-                            Face.frame_index,
-                            Face.bbox_,
+                # The request's id list has no cap, so the faces are read in
+                # chunks under SQLite's bound-parameter limit; each face lands
+                # under its own picture, so the chunks add up to one read.
+                for id_chunk in chunked([pic.id for pic in found]):
+                    for face in session.exec(
+                        select(Face)
+                        .where(Face.picture_id.in_(id_chunk))
+                        .options(
+                            load_only(
+                                Face.id,
+                                Face.picture_id,
+                                Face.character_id,
+                                Face.frame_index,
+                                Face.bbox_,
+                            )
                         )
-                    )
-                ).all():
-                    faces_by_picture[face.picture_id].append(face)
+                    ).all():
+                        faces_by_picture[face.picture_id].append(face)
             return found, faces_by_picture
 
         pics, faces_by_picture = server.vault.db.run_task(
@@ -479,68 +534,105 @@ def register_routes(router, server):
         if character_ids:
 
             def fetch_character_names(session: Session):
-                return session.exec(
-                    select(Character.id, Character.name).where(
-                        Character.id.in_(character_ids)
-                    )
-                ).all()
+                # Every person on the batch's faces: as uncapped as the batch,
+                # so chunked like the reads above.
+                return [
+                    row
+                    for id_chunk in chunked(sorted(character_ids))
+                    for row in session.exec(
+                        select(Character.id, Character.name).where(
+                            Character.id.in_(id_chunk)
+                        )
+                    ).all()
+                ]
 
             rows = server.vault.db.run_immediate_read_task(fetch_character_names)
             character_name_map = {char_id: name for char_id, name in rows or []}
         results = {}
         for pic in pics:
             try:
+                # Every stored number the entry sends, but the row ids (SQLite
+                # holds only integers in an INTEGER PRIMARY KEY) and the face's
+                # character id (a foreign key to one), is checked: rendered
+                # after this loop, one that JSON cannot carry fails the batch.
+                geometry = {
+                    column: stored_number(
+                        getattr(pic, column, None),
+                        table="picture",
+                        row_id=pic.id,
+                        column=column,
+                        picture_id=pic.id,
+                    )
+                    for column in _GEOMETRY_COLUMNS
+                }
+                out_w = geometry["thumbnail_width"]
+                out_h = geometry["thumbnail_height"]
                 face_entries = []
-                raw_face_bboxes = []
                 for face in faces_by_picture.get(pic.id, []):
-                    bbox = None
-                    try:
-                        bbox = face.bbox if hasattr(face, "bbox") else None
-                        if bbox and isinstance(bbox, str):
-                            bbox = ast.literal_eval(bbox)
-                    except Exception:
-                        bbox = None
-                    if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-                        raw_face_bboxes.append(list(bbox))
-                        face_entries.append(
-                            {
-                                "id": face.id,
-                                "bbox": list(bbox),
-                                "character_id": face.character_id,
-                                "character_name": character_name_map.get(
-                                    face.character_id
-                                ),
-                                "frame_index": getattr(face, "frame_index", None),
-                            }
-                        )
+                    # Logged once per row and text: the grid asks for the same
+                    # page on every scroll.
+                    bbox = read_stored_bbox(
+                        face.bbox_, owner="Face", row_id=face.id, picture_id=pic.id
+                    )
+                    if bbox is None:
+                        continue
+                    face_entries.append(
+                        {
+                            "id": face.id,
+                            "bbox": bbox,
+                            "character_id": face.character_id,
+                            "character_name": character_name_map.get(face.character_id),
+                            "frame_index": stored_number(
+                                getattr(face, "frame_index", None),
+                                table="face",
+                                row_id=face.id,
+                                column="frame_index",
+                                picture_id=pic.id,
+                            ),
+                        }
+                    )
                 face_data = []
                 for entry in face_entries:
-                    mapped_bbox, _mapped = map_bbox_to_thumbnail(entry.get("bbox"), pic)
+                    mapped_bbox, _mapped = map_bbox_to_thumbnail(
+                        entry.get("bbox"), pic, out_w, out_h
+                    )
                     face_data.append({**entry, "bbox": mapped_bbox})
 
                 # Object detections, mapped into AR-bitmap space exactly like
                 # faces so the grid overlay renders them identically.
                 detection_entries = []
                 for det in getattr(pic, "detections", []):
-                    bbox = getattr(det, "bbox", None)
-                    if bbox and isinstance(bbox, str):
-                        try:
-                            bbox = ast.literal_eval(bbox)
-                        except Exception:
-                            bbox = None
-                    if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-                        detection_entries.append(
-                            {
-                                "id": det.id,
-                                "bbox": list(bbox),
-                                "label": det.label,
-                                "score": det.score,
-                                "frame_index": getattr(det, "frame_index", None),
-                            }
-                        )
+                    bbox = read_stored_bbox(
+                        det.bbox_, owner="Detection", row_id=det.id, picture_id=pic.id
+                    )
+                    if bbox is None:
+                        continue
+                    detection_entries.append(
+                        {
+                            "id": det.id,
+                            "bbox": bbox,
+                            "label": det.label,
+                            "score": stored_number(
+                                det.score,
+                                table="detection",
+                                row_id=det.id,
+                                column="score",
+                                picture_id=pic.id,
+                            ),
+                            "frame_index": stored_number(
+                                getattr(det, "frame_index", None),
+                                table="detection",
+                                row_id=det.id,
+                                column="frame_index",
+                                picture_id=pic.id,
+                            ),
+                        }
+                    )
                 detection_data = []
                 for entry in detection_entries:
-                    mapped_bbox, _mapped = map_bbox_to_thumbnail(entry.get("bbox"), pic)
+                    mapped_bbox, _mapped = map_bbox_to_thumbnail(
+                        entry.get("bbox"), pic, out_w, out_h
+                    )
                     detection_data.append({**entry, "bbox": mapped_bbox})
 
                 # Cache-buster keyed on the thumbnail bitmap itself. Regeneration
@@ -551,8 +643,8 @@ def register_routes(router, server):
                 # browser kept painting the pre-upgrade square bitmap into the
                 # justified layout's AR cell -> squashed thumbnails.
                 v = ImageUtils.thumbnail_cache_version(
-                    getattr(pic, "thumbnail_width", None),
-                    getattr(pic, "thumbnail_height", None),
+                    out_w,
+                    out_h,
                     getattr(pic, "orientation", None),
                     file_path=pic.file_path,
                 )
@@ -564,11 +656,7 @@ def register_routes(router, server):
                     "thumbnail": thumbnail_url,
                     "faces": face_data,
                     "detections": detection_data,
-                    "thumbnail_width": getattr(pic, "thumbnail_width", None),
-                    "thumbnail_height": getattr(pic, "thumbnail_height", None),
-                    "square_crop_x": getattr(pic, "square_crop_x", None),
-                    "square_crop_y": getattr(pic, "square_crop_y", None),
-                    "square_crop_side": getattr(pic, "square_crop_side", None),
+                    **geometry,
                     "penalised_tags": list(
                         dict.fromkeys(penalised_tag_map.get(pic.id, []))
                     ),

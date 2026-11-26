@@ -30,18 +30,33 @@ These tests pin both halves of that change:
 
 from __future__ import annotations
 
+import importlib
 import itertools
+import json
+import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import event, func, or_
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import aliased
 from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, exists, insert, select
 
 # Importing the models registers them on SQLModel.metadata.
-from pixlstash.db_models import Picture, PictureStack, SortMechanism
+from pixlstash.db_models import (
+    DedupGroup,
+    DedupGroupMember,
+    Picture,
+    PictureProjectMember,
+    PictureStack,
+    Project,
+    ReferenceFolder,
+    SortMechanism,
+)
+from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK
 
 _file_names = itertools.count()
 
@@ -131,6 +146,53 @@ def test_unassigned_stack_leaders_support_recently_changed_sort(session):
     )
 
     assert [pic.id for pic in found] == [newer_cover.id, older_cover.id]
+
+
+def test_unassigned_takes_an_id_list_past_the_sqlite_variable_limit(session):
+    """``find_unassigned`` reads an id list of any length, as ``find`` does.
+
+    A plain ``IN`` binds one variable per id and SQLite builds before 3.32
+    refuse more than 999, so past ``SQLITE_ID_CHUNK`` the list is read from a
+    temp table. The count covers the whole list, and the page is one window
+    over the whole sorted list, not one per chunk.
+    """
+    session.execute(
+        insert(Picture.__table__),
+        [
+            {"file_path": f"named_{index}.jpg", "deleted": False, "score": index % 6}
+            for index in range(SQLITE_ID_CHUNK + 300)
+        ],
+    )
+    session.commit()
+    pictures = list(session.exec(select(Picture).order_by(Picture.id)).all())
+    named = [pic.id for pic in pictures if pic.id % 7 != 0]
+    assert len(named) > SQLITE_ID_CHUNK
+    by_score = sorted(
+        (pic for pic in pictures if pic.id % 7 != 0),
+        key=lambda pic: (pic.score, pic.id),
+        reverse=True,
+    )
+
+    dbapi = session.connection().connection.dbapi_connection
+    previous = dbapi.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+    dbapi.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+    try:
+        count = Picture.find_unassigned(session, picture_ids=named, count_only=True)
+        page = Picture.find_unassigned(
+            session,
+            picture_ids=named,
+            sort_mech=SortMechanism(SortMechanism.Keys.SCORE, descending=True),
+            offset=950,
+            limit=60,
+        )
+        # The pin is on the connection both calls ran on: a plain IN fails.
+        with pytest.raises(OperationalError, match="too many SQL variables"):
+            session.exec(select(Picture.id).where(Picture.id.in_(named))).all()
+    finally:
+        dbapi.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+    assert count == len(named)
+    assert [pic.id for pic in page] == [pic.id for pic in by_score[950:1010]]
 
 
 def _legacy_scoped_leader_ids(
@@ -419,4 +481,428 @@ def test_id_scoped_leader_count_is_single_pass(session):
         f"id-scoped stack-leader COUNT took {elapsed:.2f}s for {len(ids)} ids "
         f"(budget {_SINGLE_PASS_BUDGET_S}s): the per-row correlated subquery "
         "has probably come back"
+    )
+
+
+# Every narrowing that can hide a stack's cover is in the leader scope.
+#
+# The collapse ranks each stack's members inside the leader scope and keeps the
+# best-ranked one. A narrowing the outer query applies but the leader scope
+# leaves out lets the global cover win that rank and then fail the outer
+# filter, so the stack shows no tile at all, in the grid and in its count.
+
+_INSIDE_SOURCE = "/example-import/inside"
+_OUTSIDE_SOURCE = "/example-import/outside"
+_INSIDE_IMPORTED = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+_OUTSIDE_IMPORTED = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+_INBOX_CUTOFF = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def narrowed(session):
+    """Pictures inside and outside every narrowing at once.
+
+    * ``straddling``: a stack whose cover is outside and whose two other
+      members are inside. Its position-1 member must represent it.
+    * ``inside``: a stack wholly inside. Its cover must represent it.
+    * a loose picture inside, and a loose picture and a stack wholly outside.
+
+    Inside and outside differ in every narrowing: folder, import source and
+    time, project, format, resolution, workflow, and the inside pictures are
+    one unresolved duplicate group.
+    """
+    folders = {}
+    for name in ("inside", "outside"):
+        folder = ReferenceFolder(folder=f"/example-library/{name}", label=name)
+        session.add(folder)
+        session.commit()
+        session.refresh(folder)
+        folders[name] = folder.id
+    projects = {}
+    for name in ("inside", "other", "outside"):
+        project = Project(name=f"example-{name}")
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        projects[name] = project.id
+
+    def picture(where: str, **kwargs) -> Picture:
+        pic = _add_picture(
+            session,
+            reference_folder_id=folders[where],
+            import_source_folder=(
+                _INSIDE_SOURCE if where == "inside" else _OUTSIDE_SOURCE
+            ),
+            imported_at=(_INSIDE_IMPORTED if where == "inside" else _OUTSIDE_IMPORTED),
+            format="PNG" if where == "inside" else "JPEG",
+            # 4 MP inside ("4-8mp"), a quarter of one outside ("lt1mp").
+            width=2000 if where == "inside" else 500,
+            height=2000 if where == "inside" else 500,
+            workflow_structural_hash=f"test-wf-{where}",
+            comfyui_models=json.dumps([f"test-model-{where}"]),
+            **kwargs,
+        )
+        session.add(PictureProjectMember(picture_id=pic.id, project_id=projects[where]))
+        session.commit()
+        return pic
+
+    straddling = _new_stack(session)
+    straddling_cover = picture("outside", stack_id=straddling, stack_position=0)
+    straddling_first = picture("inside", stack_id=straddling, stack_position=1)
+    straddling_second = picture("inside", stack_id=straddling, stack_position=2)
+    inside = _new_stack(session)
+    inside_cover = picture("inside", stack_id=inside, stack_position=0)
+    inside_member = picture("inside", stack_id=inside, stack_position=1)
+    loose_inside = picture("inside")
+    picture("outside")
+    outside = _new_stack(session)
+    picture("outside", stack_id=outside, stack_position=0)
+    picture("outside", stack_id=outside, stack_position=1)
+    inside_ids = [
+        straddling_first.id,
+        straddling_second.id,
+        inside_cover.id,
+        inside_member.id,
+        loose_inside.id,
+    ]
+    group = DedupGroup(signature="test-group", tier="exact", resolved=False)
+    session.add(group)
+    session.commit()
+    session.refresh(group)
+    for position, picture_id in enumerate(inside_ids):
+        session.add(
+            DedupGroupMember(
+                group_id=group.id, picture_id=picture_id, position=position
+            )
+        )
+    session.commit()
+    return {
+        "folders": folders,
+        "projects": projects,
+        "straddling_cover": straddling_cover.id,
+        "straddling_first": straddling_first.id,
+        "inside_cover": inside_cover.id,
+        "loose_inside": loose_inside.id,
+        "inside_ids": inside_ids,
+        "expected": {straddling_first.id, inside_cover.id, loose_inside.id},
+    }
+
+
+# The grid's filters that read the picture's own row, beside the scopes. Scores
+# and tags stay out of the leader scope (a stack is one tile for its cover's
+# score and tags), and ``stacked`` / ``unstacked`` hold or fail for the whole
+# stack, so none of those can hide a cover the rest of its stack matches.
+_PICTURE_FILTERS = {
+    "format": {"format": ["PNG"]},
+    "resolution_bucket": {"resolution_bucket": "4-8mp"},
+    "workflow": {"workflow_structural_hashes": ["test-wf-inside"]},
+    "unresolved": {"stack_state": "unresolved"},
+}
+
+
+def _find_narrowings(narrowed) -> dict[str, dict]:
+    return {
+        **_PICTURE_FILTERS,
+        "reference_folder_id": {"reference_folder_id": narrowed["folders"]["inside"]},
+        # The listing hands its query string to ``find`` unparsed.
+        "reference_folder_id as text": {
+            "reference_folder_id": str(narrowed["folders"]["inside"])
+        },
+        "import_source_folder": {"import_source_folder": _INSIDE_SOURCE},
+        "several projects": {
+            "project_id": [
+                narrowed["projects"]["inside"],
+                narrowed["projects"]["other"],
+            ]
+        },
+    }
+
+
+def _unassigned_narrowings(narrowed) -> dict[str, dict]:
+    return {
+        **_PICTURE_FILTERS,
+        "reference_folder_id": {"reference_folder_id": narrowed["folders"]["inside"]},
+        "import_source_folder": {"import_source_folder": _INSIDE_SOURCE},
+        "imported_since": {"imported_since": _INBOX_CUTOFF},
+        "picture_ids": {"picture_ids": narrowed["inside_ids"]},
+    }
+
+
+def _assert_collapsed_to(found, count, expected: set[int]):
+    assert {pic.id for pic in found} == expected
+    assert count == len(expected)
+
+
+@pytest.mark.parametrize(
+    "narrowing",
+    [
+        "reference_folder_id",
+        "reference_folder_id as text",
+        "import_source_folder",
+        "several projects",
+        *_PICTURE_FILTERS,
+    ],
+)
+def test_find_keeps_a_stack_whose_cover_a_filter_hides(session, narrowed, narrowing):
+    search = _find_narrowings(narrowed)[narrowing]
+
+    found = Picture.find(session, stack_leaders_only=True, **search)
+    count = Picture.find(session, stack_leaders_only=True, count_only=True, **search)
+
+    _assert_collapsed_to(found, count, narrowed["expected"])
+
+
+def test_find_keeps_the_stack_of_one_named_non_cover(session, narrowed):
+    """A single id is a column filter like a list: it scopes the rank too."""
+    member = narrowed["straddling_first"]
+
+    found = Picture.find(session, stack_leaders_only=True, id=member)
+    count = Picture.find(session, stack_leaders_only=True, count_only=True, id=member)
+
+    _assert_collapsed_to(found, count, {member})
+
+
+@pytest.mark.parametrize(
+    "narrowing",
+    [
+        "reference_folder_id",
+        "import_source_folder",
+        "imported_since",
+        "picture_ids",
+        *_PICTURE_FILTERS,
+    ],
+)
+def test_unassigned_keeps_a_stack_whose_cover_a_filter_hides(
+    session, narrowed, narrowing
+):
+    search = _unassigned_narrowings(narrowed)[narrowing]
+
+    found = Picture.find_unassigned(session, stack_leaders_only=True, **search)
+    count = Picture.find_unassigned(
+        session, stack_leaders_only=True, count_only=True, **search
+    )
+
+    _assert_collapsed_to(found, count, narrowed["expected"])
+
+
+def test_unassigned_keeps_the_stack_of_an_id_list_of_one_non_cover(session, narrowed):
+    """The share-token scope and ``?id=`` reach ``find_unassigned`` as
+    ``picture_ids``: a list holding only a non-cover member still shows it."""
+    member = narrowed["straddling_first"]
+
+    found = Picture.find_unassigned(
+        session, stack_leaders_only=True, picture_ids=[member]
+    )
+    count = Picture.find_unassigned(
+        session, stack_leaders_only=True, count_only=True, picture_ids=[member]
+    )
+
+    _assert_collapsed_to(found, count, {member})
+
+
+# The bound-parameter cap of SQLite builds before 3.32. Current builds allow
+# 32,766, which no grid filter reaches in a test that runs quickly.
+VARIABLE_CEILING = 999
+
+
+@contextmanager
+def _variable_ceiling(session):
+    """Pin the session's connection to ``VARIABLE_CEILING`` bound parameters.
+
+    The pin is proved before the block runs, so a build that ignored
+    ``setlimit`` could not pass vacuously.
+    """
+    dbapi = session.connection().connection.dbapi_connection
+    previous = dbapi.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+    dbapi.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, VARIABLE_CEILING)
+    try:
+        with pytest.raises(OperationalError, match="too many SQL variables"):
+            session.exec(
+                select(Picture.id).where(
+                    Picture.id.in_(list(range(VARIABLE_CEILING + 1)))
+                )
+            ).all()
+        yield
+    finally:
+        dbapi.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+
+def _plan(session, run) -> list[str]:
+    """The query plan of the last statement *run* sends, one string per step."""
+    engine = session.get_bind()
+    sent = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        sent.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        run()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    statement, parameters = sent[-1]
+    rows = session.connection().exec_driver_sql(
+        "EXPLAIN QUERY PLAN " + statement, parameters
+    )
+    return [row[3] for row in rows]
+
+
+@pytest.mark.parametrize("narrowing", list(_PICTURE_FILTERS))
+@pytest.mark.parametrize("lister", ["find", "find_unassigned"])
+def test_a_grid_filter_in_the_leader_scope_reads_no_whole_table(
+    session, lister, narrowing
+):
+    """The collapse ranks the stacked members a filter keeps without reading
+    every picture to find them."""
+    search = _PICTURE_FILTERS[narrowing]
+
+    plan = _plan(
+        session,
+        lambda: getattr(Picture, lister)(session, stack_leaders_only=True, **search),
+    )
+
+    # "SCAN picture USING INDEX ..." reads every row too, in index order.
+    assert not [step for step in plan if step.split()[:2] == ["SCAN", "picture"]], plan
+
+
+# The grid's partial indexes, as the migration that last built them defines
+# them. ``create_all`` does not build them, so a test that needs one builds it.
+_GRID_INDEXES = importlib.import_module(
+    "pixlstash.migrations.versions.0052_drop_import_excluded_sentinel"
+)._GRID_INDEXES_WITHOUT_IMPORT_EXCLUDED
+
+
+@pytest.mark.parametrize("lister", ["find", "find_unassigned"])
+def test_the_collapsed_grid_can_read_a_partial_leader_index(session, lister):
+    """The listing states ``deleted = 0``, the leader indexes' own term.
+
+    ``deleted IS 0`` selects the same rows, but SQLite uses a partial index only
+    for a query that repeats the index's WHERE, so the newest-first grid read the
+    whole-table grid index and skipped every stacked member by hand.
+    """
+    for name, columns, where in _GRID_INDEXES:
+        if where is not None:
+            session.connection().exec_driver_sql(
+                f"CREATE INDEX {name} ON picture ({', '.join(columns)}) WHERE {where}"
+            )
+
+    plan = _plan(
+        session,
+        lambda: getattr(Picture, lister)(
+            session,
+            stack_leaders_only=True,
+            sort_mech=SortMechanism(SortMechanism.Keys.DATE, descending=True),
+            limit=50,
+        ),
+    )
+
+    assert any("ix_picture_grid_leaders_created_at" in step for step in plan), plan
+
+
+def _long_lists(narrowed) -> dict[str, dict]:
+    """Each narrowing as a list one value past ``VARIABLE_CEILING``."""
+    absent = range(VARIABLE_CEILING)
+    return {
+        "import sources": {
+            "import_source_folder": [
+                _INSIDE_SOURCE,
+                *(f"/example-import/absent-{index}" for index in absent),
+            ]
+        },
+        "formats": {"format": ["PNG", *(f"TEST{index}" for index in absent)]},
+        "projects": {
+            "project_id": [
+                narrowed["projects"]["inside"],
+                *(10**9 + index for index in absent),
+            ]
+        },
+    }
+
+
+@pytest.mark.parametrize("narrowing", ["import sources", "formats", "projects"])
+def test_find_binds_a_long_list_once_under_the_collapse(session, narrowed, narrowing):
+    """The collapse applies each narrowing twice, outside and in its leader
+    scope, so a list bound one variable per value had to fit the statement
+    twice. Bound as one JSON array, it costs one variable in each place."""
+    search = _long_lists(narrowed)[narrowing]
+
+    with _variable_ceiling(session):
+        found = Picture.find(session, stack_leaders_only=True, **search)
+        count = Picture.find(
+            session, stack_leaders_only=True, count_only=True, **search
+        )
+
+    _assert_collapsed_to(found, count, narrowed["expected"])
+
+
+def test_unassigned_binds_a_long_format_list_once_under_the_collapse(session, narrowed):
+    search = _long_lists(narrowed)["formats"]
+
+    with _variable_ceiling(session):
+        found = Picture.find_unassigned(session, stack_leaders_only=True, **search)
+        count = Picture.find_unassigned(
+            session, stack_leaders_only=True, count_only=True, **search
+        )
+
+    _assert_collapsed_to(found, count, narrowed["expected"])
+
+
+@pytest.mark.parametrize(
+    "narrowing, probe",
+    [
+        (
+            "import sources",
+            "SEARCH picture USING INDEX ix_picture_import_source_folder"
+            " (import_source_folder=?)",
+        ),
+        (
+            "projects",
+            "SEARCH pictureprojectmember USING COVERING INDEX"
+            " sqlite_autoindex_pictureprojectmember_1 (picture_id=? AND project_id=?)",
+        ),
+    ],
+)
+def test_a_long_list_still_probes_its_index(session, narrowed, narrowing, probe):
+    """A JSON array is read through the column's index, as the values were.
+
+    ``include_deleted`` leaves the list the only narrowing, so the plan shows
+    how the list itself is read and not which of two indexes SQLite preferred.
+    """
+    search = _long_lists(narrowed)[narrowing]
+
+    plan = _plan(session, lambda: Picture.find(session, include_deleted=True, **search))
+
+    assert probe in plan, plan
+
+
+@pytest.mark.parametrize("lister", ["find", "find_unassigned"])
+def test_a_long_comfyui_model_list_binds_once_under_the_collapse(
+    session, narrowed, lister
+):
+    """A stack shows when any member used one of the models, so the collapse
+    tests the list against the picture and against its stack: two places, one
+    JSON array each. Its tile stays the stack's cover."""
+    names = [
+        "test-model-inside",
+        *(f"test-model-absent-{index}" for index in range(VARIABLE_CEILING)),
+    ]
+    find = getattr(Picture, lister)
+
+    with _variable_ceiling(session):
+        found = find(session, stack_leaders_only=True, comfyui_models_filter=names)
+        count = find(
+            session,
+            stack_leaders_only=True,
+            count_only=True,
+            comfyui_models_filter=names,
+        )
+
+    _assert_collapsed_to(
+        found,
+        count,
+        {
+            narrowed["straddling_cover"],
+            narrowed["inside_cover"],
+            narrowed["loose_inside"],
+        },
     )

@@ -21,6 +21,14 @@ import { getPictureStats } from "../../api/pictures";
 import { isReadOnly } from "../../utils/apiClient";
 import { formatUserDate } from "../../utils/utils.js";
 import { recipeForPanel } from "../../utils/pictureRecipe.js";
+import { formatCount } from "../../utils/filterChips.js";
+import { UNTAGGED_STATES } from "../../utils/untaggedStates";
+// The view's scope and filters, built as the grid builds them.
+import {
+  normalizedCharacterIds,
+  normalizedSetIds,
+  viewQueryParams,
+} from "../../utils/viewQueryParams.js";
 import {
   SECTION_SCOPE,
   useSectionCollapse,
@@ -47,10 +55,7 @@ import {
   isGroupToken,
   useTagGroupsStore,
 } from "../../stores/useTagGroupsStore";
-import {
-  ALL_PICTURES_ID,
-  SCRAPHEAP_PICTURES_ID,
-} from "../../stores/useViewStore";
+import { SCRAPHEAP_PICTURES_ID } from "../../stores/useViewStore";
 
 // Store-direct (Phase 3): the panel reads the same filter/selection state the
 // grid queries from straight from the stores, and writes filter changes back
@@ -67,10 +72,22 @@ const inboxStore = useInboxStore();
 const whatsChanged = useWhatsChangedStore();
 
 
-// The two folder facets are derived from the sidebar's folder selection, same
-// as App.vue used to compute them for the old props.
+// The folder facets are derived from the sidebar's folder selection, as the
+// grid derives them (`useGridFetch`).
+const referenceFolderIdFilter = computed(
+  () => selectionStore.selectedFolderFilter?.referenceFolderId ?? null,
+);
 const filePathPrefixFilter = computed(
   () => selectionStore.selectedFolderFilter?.pathPrefix ?? null,
+);
+// What the Pictures tile counts that the grid's own count does not: every
+// picture in a stack (the grid shows a collapsed stack once) and, with a folder
+// open, the pictures in its subfolders (the stats read takes the folder as a
+// sub-tree, `picture_stats`; the grid lists only the folder's own pictures).
+const picturesTileTip = computed(() =>
+  filePathPrefixFilter.value != null
+    ? "Every picture in this folder and its subfolders, counting each picture in a stack."
+    : "Every picture here, counting each picture in a stack.",
 );
 const importSourceFolderFilter = computed(
   () => filterStore.importedFromFilter ?? null,
@@ -79,19 +96,6 @@ const importSourceFolderFilter = computed(
 const inboxPeriod = computed(() =>
   selectionStore.selectedFolderFilter?.inbox ? inboxStore.period : null,
 );
-
-// ─── PIL / Video extension lists ─────────────────────────────────────────────
-const PIL_IMAGE_EXTENSIONS = [
-  "jpg",
-  "jpeg",
-  "png",
-  "webp",
-  "gif",
-  "bmp",
-  "tiff",
-  "avif",
-];
-const VIDEO_EXTENSIONS = ["mp4", "webm", "mov", "avi", "mkv", "m4v"];
 
 const props = defineProps({
   /** The view the grid shows: the head's title while nothing is selected. */
@@ -359,21 +363,44 @@ function runOnPicture() {
   });
 }
 
+// ─── Request tickets ──────────────────────────────────────────────────────────
+// The panel sends up to seven /pictures/stats reads per view, and a reply can
+// land after the view changed or after a newer read of its kind: the Scrapheap
+// then showed the library's numbers under its own title. Each read takes a
+// ticket, and only a live ticket's reply (or error) is applied, and only it
+// clears its loading flag. The view's scope bumps `statsScope`, which retires
+// every ticket at once, including kinds the new view does not read again.
+// https://maxrozen.com/race-conditions-fetching-data-react-with-useeffect
+let statsScope = 0;
+const latestTicket = {};
+function takeTicket(kind) {
+  latestTicket[kind] = (latestTicket[kind] ?? 0) + 1;
+  return { kind, n: latestTicket[kind], scope: statsScope };
+}
+function isLive(ticket) {
+  return ticket.scope === statsScope && latestTicket[ticket.kind] === ticket.n;
+}
+
 // Picture stats
 const picStats = ref(null);
 const picStatsLoaded = ref(false);
 const picStatsLoading = ref(false);
 
 async function fetchPicStats() {
+  const ticket = takeTicket("picture");
   const qs = buildQueryParams();
   picStatsLoading.value = true;
   try {
-    picStats.value = await getPictureStats(qs, { include: "picture" });
+    const body = await getPictureStats(qs, { include: "picture" });
+    if (!isLive(ticket)) return;
+    picStats.value = body;
     picStatsLoaded.value = true;
-  } catch {
+  } catch (e) {
+    if (!isLive(ticket)) return;
+    console.warn("Failed to load picture stats:", e);
     picStats.value = null;
   } finally {
-    picStatsLoading.value = false;
+    if (isLive(ticket)) picStatsLoading.value = false;
   }
 }
 
@@ -389,23 +416,34 @@ const confTagData = ref(null);
 const confTagLoading = ref(false);
 
 async function fetchTagConfidence(tag) {
+  const ticket = takeTicket("confTag");
   const qs = buildQueryParams();
   confTagLoading.value = true;
   try {
-    confTagData.value = await getPictureStats(qs, {
+    const body = await getPictureStats(qs, {
       include: "conf",
       confidence_tag: tag,
     });
-  } catch {
+    if (!isLive(ticket)) return;
+    confTagData.value = body;
+  } catch (e) {
+    if (!isLive(ticket)) return;
+    console.warn(`Failed to load confidence stats for "${tag}":`, e);
     confTagData.value = null;
   } finally {
-    confTagLoading.value = false;
+    if (isLive(ticket)) confTagLoading.value = false;
   }
 }
 
 watch(selectedConfTag, (tag) => {
   confTagData.value = null;
-  if (tag) fetchTagConfidence(tag);
+  if (tag) {
+    fetchTagConfidence(tag);
+  } else {
+    // Cleared: a read still out for the old tag is no longer wanted.
+    takeTicket("confTag");
+    confTagLoading.value = false;
+  }
 });
 
 // ─── Stats data ───────────────────────────────────────────────────────────────
@@ -413,154 +451,54 @@ const stats = ref(null);
 const loading = ref(false);
 const error = ref(null);
 
+// The stats are read for the view the grid shows: its scope and filters come
+// from `utils/viewQueryParams`, which the grid's list query
+// (`useGridFetch.buildPictureIdsQueryParams`) is built on too, with the set
+// and people ids normalised as `ImageGrid.vue` normalises them. The grid adds
+// only what this read leaves out: `sort`, `descending`, `fields` and
+// `reference_character_id`, which do not change which pictures are counted,
+// and the text `query` and `guest_session_id` (why: `GET /pictures/stats` in
+// docs/backend_architecture.md). StatsSidebarScope.test.js holds the two equal.
 function buildQueryParams() {
-  const params = new URLSearchParams();
-
-  const normalizedSetIds = Array.isArray(selectionStore.selectedSetIds)
-    ? selectionStore.selectedSetIds
-        .map((id) => Number(id))
-        .filter((id) => Number.isFinite(id) && id > 0)
-    : [];
-  const hasSetSelection = !!(
-    (selectionStore.selectedSet != null && selectionStore.selectedSet !== "") ||
-    normalizedSetIds.length > 0
-  );
-  const isSetOverlap = normalizedSetIds.length > 1;
-  const primarySetId =
-    !isSetOverlap &&
-    selectionStore.selectedSet != null &&
-    selectionStore.selectedSet !== ""
-      ? Number(selectionStore.selectedSet)
-      : null;
-  const normalizedCharIds = Array.isArray(selectionStore.selectedCharacterIds)
-    ? selectionStore.selectedCharacterIds
-        .map((id) => Number(id))
-        .filter((id) => Number.isFinite(id) && id > 0)
-    : [];
-  const isMultiCharacterView = normalizedCharIds.length > 1;
-
-  if (hasSetSelection) {
-    if (isSetOverlap) {
-      for (const id of normalizedSetIds) params.append("set_ids", String(id));
-      params.append("set_mode", selectionStore.setMultiMode || "intersection");
-      if (
-        selectionStore.setMultiMode === "difference" &&
-        selectionStore.setDifferenceBaseId != null
-      ) {
-        params.append(
-          "base_set_id",
-          String(selectionStore.setDifferenceBaseId),
-        );
-      }
-    } else if (primarySetId != null) {
-      params.append("set_id", String(primarySetId));
-    }
-    if (projectStore.projectViewMode === "project") {
-      params.append(
-        "project_id",
-        projectStore.selectedProjectId != null
-          ? projectStore.selectedProjectId
-          : "UNASSIGNED",
-      );
-    }
-  } else if (isMultiCharacterView) {
-    for (const id of normalizedCharIds)
-      params.append("character_ids", String(id));
-    params.append(
-      "character_mode",
-      selectionStore.characterMultiMode || "union",
-    );
-    if (projectStore.projectViewMode === "project") {
-      params.append(
-        "project_id",
-        projectStore.selectedProjectId != null
-          ? projectStore.selectedProjectId
-          : "UNASSIGNED",
-      );
-    }
-  } else if (
-    selectionStore.selectedCharacter != null &&
-    selectionStore.selectedCharacter !== "" &&
-    selectionStore.selectedCharacter !== ALL_PICTURES_ID
-  ) {
-    if (selectionStore.selectedCharacter === String(SCRAPHEAP_PICTURES_ID)) {
-      params.append("only_deleted", "true");
-    } else {
-      params.append("character_id", selectionStore.selectedCharacter);
-      if (projectStore.projectViewMode === "project") {
-        params.append(
-          "project_id",
-          projectStore.selectedProjectId != null
-            ? projectStore.selectedProjectId
-            : "UNASSIGNED",
-        );
-      }
-    }
-  } else if (
-    selectionStore.selectedCharacter === ALL_PICTURES_ID &&
-    projectStore.projectViewMode === "project"
-  ) {
-    params.append(
-      "project_id",
-      projectStore.selectedProjectId != null
-        ? projectStore.selectedProjectId
-        : "UNASSIGNED",
-    );
-  }
-
-  if (filterStore.mediaTypeFilter === "images") {
-    for (const ext of PIL_IMAGE_EXTENSIONS)
-      params.append("format", ext.toUpperCase());
-  } else if (filterStore.mediaTypeFilter === "videos") {
-    for (const ext of VIDEO_EXTENSIONS)
-      params.append("format", ext.toUpperCase());
-  }
-
-  if (filterStore.minScoreFilter != null)
-    params.append("min_score", filterStore.minScoreFilter);
-  if (filterStore.maxScoreFilter != null)
-    params.append("max_score", filterStore.maxScoreFilter);
-  if (filterStore.unscoredOnlyFilter) params.append("unscored", "1");
-  if (filterStore.favouriteOnlyFilter) params.append("favourite", "1");
-  if (filterStore.smartScoreBucketFilter != null)
-    params.append("smart_score_bucket", filterStore.smartScoreBucketFilter);
-  if (filterStore.resolutionBucketFilter != null)
-    params.append("resolution_bucket", filterStore.resolutionBucketFilter);
-  if (filePathPrefixFilter.value != null)
-    params.append("file_path_prefix", filePathPrefixFilter.value);
-  if (importSourceFolderFilter.value != null)
-    params.append("import_source_folder", importSourceFolderFilter.value);
-  if (inboxPeriod.value) params.append("inbox", inboxPeriod.value);
-  (filterStore.tagFilter || []).forEach((t) => params.append("tag", t));
-  (filterStore.tagRejectedFilter || []).forEach((t) =>
-    params.append("rejected_tag", t),
-  );
-  if (filterStore.faceBboxFilter != null) {
-    params.append("face_filter", filterStore.faceBboxFilter);
-  }
-  (filterStore.tagConfidenceAboveFilter || []).forEach((e) =>
-    params.append("tag_confidence_above", e),
-  );
-  (filterStore.tagConfidenceBelowFilter || []).forEach((e) =>
-    params.append("tag_confidence_below", e),
-  );
-
-  return params.toString();
+  return viewQueryParams({
+    setIds: normalizedSetIds(selectionStore),
+    characterIds: normalizedCharacterIds(selectionStore),
+    selection: selectionStore,
+    project: projectStore,
+    filters: filterStore,
+    applyTagFilter: userPrefsStore.applyTagFilter,
+    referenceFolderId: referenceFolderIdFilter.value,
+    filePathPrefix: filePathPrefixFilter.value,
+    importSourceFolder: importSourceFolderFilter.value,
+    inboxPeriod: inboxPeriod.value,
+  }).toString();
 }
 
+// Resolves true when its reply was applied, so the sections that read after it
+// run only for the view on screen.
 async function fetchStats() {
+  const ticket = takeTicket("main");
   const qs = buildQueryParams();
-  const prevRegularTags = stats.value?.regular_tags;
   loading.value = true;
   error.value = null;
   try {
     const body = await getPictureStats(qs);
-    stats.value = { ...body, regular_tags: prevRegularTags };
-  } catch {
+    if (!isLive(ticket)) return false;
+    // The basic read returns the co-occurrence and confidence sections empty,
+    // so they are not loaded any more and read again when next shown. The
+    // regular-tag list (from the conf read) still holds within one view.
+    stats.value = { ...body, regular_tags: stats.value?.regular_tags };
+    coocLoaded.value = false;
+    confLoaded.value = false;
+    return true;
+  } catch (e) {
+    if (!isLive(ticket)) return false;
+    console.warn("Failed to load stats:", e);
     error.value = "Failed to load stats";
     stats.value = null;
+    return false;
   } finally {
-    loading.value = false;
+    if (isLive(ticket)) loading.value = false;
   }
 }
 
@@ -579,16 +517,20 @@ const statsPenalisedBoth = ref(null);
 const loadingPenalisedBoth = ref(false);
 
 async function fetchCooc() {
+  const ticket = takeTicket("cooc");
   const qs = buildQueryParams();
   try {
     const body = await getPictureStats(qs, { include: "cooc" });
-    if (stats.value)
-      stats.value = {
-        ...stats.value,
-        top_cooccurrences: body.top_cooccurrences,
-      };
+    // Merged into this view's stats only, and loaded only once merged: a reply
+    // dropped for want of stats must not stop the next open from reading.
+    if (!isLive(ticket) || !stats.value) return;
+    stats.value = {
+      ...stats.value,
+      top_cooccurrences: body.top_cooccurrences,
+    };
     coocLoaded.value = true;
   } catch (e) {
+    if (!isLive(ticket)) return;
     // Non-fatal: the co-occurrence section stays empty and the rest of the
     // panel still renders. Log it so it is not an invisible failure.
     console.warn("Failed to load tag co-occurrence stats:", e);
@@ -596,18 +538,21 @@ async function fetchCooc() {
 }
 
 async function fetchConf() {
+  const ticket = takeTicket("conf");
   const qs = buildQueryParams();
   try {
     const body = await getPictureStats(qs, { include: "conf" });
-    if (stats.value)
-      stats.value = {
-        ...stats.value,
-        confidence_histogram: body.confidence_histogram,
-        regular_tags: body.regular_tags,
-      };
+    if (!isLive(ticket) || !stats.value) return;
+    stats.value = {
+      ...stats.value,
+      confidence_histogram: body.confidence_histogram,
+      regular_tags: body.regular_tags,
+    };
     confLoaded.value = true;
-  } catch {
-    // silently fail - conf stays empty
+  } catch (e) {
+    if (!isLive(ticket)) return;
+    // Non-fatal: the confidence section stays empty.
+    console.warn("Failed to load tag confidence stats:", e);
   }
 }
 
@@ -630,21 +575,36 @@ const statsQueryParams = computed(() => {
 watch(
   statsQueryParams,
   () => {
+    // A new view: every read still out is for the old one, and nothing of the
+    // old one stays on screen under the new title (the spinner shows instead).
+    statsScope += 1;
+    // The candidates a selected confidence tag is checked against once the new
+    // view's stats land: the old view's regular tags, as before (the new
+    // view's come with the conf read, which runs after).
+    const priorRegularTags = stats.value?.regular_tags ?? [];
+    stats.value = null;
+    error.value = null;
+    loading.value = false;
     statsPenalised.value = null;
+    loadingPenalised.value = false;
     statsPenalisedBoth.value = null;
+    loadingPenalisedBoth.value = false;
     confTagData.value = null;
+    confTagLoading.value = false;
     coocLoaded.value = false;
     confLoaded.value = false;
     picStatsLoaded.value = false;
+    picStatsLoading.value = false;
     picStats.value = null;
-    fetchStats().then(() => {
+    fetchStats().then((applied) => {
+      if (!applied) return;
       if (coocOpen.value) fetchCooc();
       if (confHistOpen.value) fetchConf();
       if (activeTab.value === "pictures") fetchPicStats();
       if (selectedConfTag.value) {
         const allAvailable = new Set([
           ...anomalyTagOptions.value,
-          ...regularTags.value,
+          ...priorRegularTags,
         ]);
         if (!allAvailable.has(selectedConfTag.value)) {
           selectedConfTag.value = null;
@@ -670,29 +630,31 @@ onMounted(() => {
 });
 
 // When tags change on any picture, the backend cache is already cleared via the
-// CHANGED_TAGS event. Refetch stats so the sidebar reflects the updated counts.
-// Debounce rapid tag-change bursts (e.g. a tagging run) so we don't hit
-// /pictures/stats on every task completion while the sidebar is closed.
-let _wsTagUpdateTimer = null;
-watch(
-  () => wsStore.wsTagUpdate,
-  () => {
-    if (!sidebarStore.statsOpen) return;
-    clearTimeout(_wsTagUpdateTimer);
-    _wsTagUpdateTimer = setTimeout(() => {
-      fetchStats().then(() => {
-        if (coocOpen.value) fetchCooc();
-        if (confHistOpen.value) fetchConf();
-        if (activeTab.value === "pictures") fetchPicStats();
-        if (penalisedOnlyTags.value || penalisedOnlyCooc.value > 0)
-          fetchStatsPenalised();
-        if (penalisedOnlyCooc.value === 2) fetchStatsPenalisedBoth();
-      });
-    }, 2000);
-  },
-);
+// CHANGED_TAGS event; when pictures arrive, leave or come back (an import, the
+// Scrapheap, a restore), `wsPicturesChanged` moves with the sidebar's own
+// refresh. Either way the counts are stale, so read the view again. Debounce
+// the bursts (a tagging run, a large scrap) so we don't hit /pictures/stats on
+// every message, and skip it while the panel is closed.
+let _wsStatsRefreshTimer = null;
+function scheduleStatsRefresh() {
+  if (!sidebarStore.statsOpen) return;
+  clearTimeout(_wsStatsRefreshTimer);
+  _wsStatsRefreshTimer = setTimeout(() => {
+    fetchStats().then((applied) => {
+      if (!applied) return;
+      if (coocOpen.value) fetchCooc();
+      if (confHistOpen.value) fetchConf();
+      if (activeTab.value === "pictures") fetchPicStats();
+      if (penalisedOnlyTags.value || penalisedOnlyCooc.value > 0)
+        fetchStatsPenalised();
+      if (penalisedOnlyCooc.value === 2) fetchStatsPenalisedBoth();
+    });
+  }, 2000);
+}
+watch(() => wsStore.wsTagUpdate, scheduleStatsRefresh);
+watch(() => wsStore.wsPicturesChanged.key, scheduleStatsRefresh);
 onUnmounted(() => {
-  clearTimeout(_wsTagUpdateTimer);
+  clearTimeout(_wsStatsRefreshTimer);
 });
 
 // The one picture's tags or description changed elsewhere (a tagger run, the
@@ -736,6 +698,26 @@ const donutUntaggedOffset = computed(() => {
   return -(taggedFraction * DONUT_CIRCUMFERENCE);
 });
 
+// ─── Untagged breakdown ───────────────────────────────────────────────────────
+// Why the untagged are untagged, each row a filter on the view (`tag_state`).
+// A row with none is left out, except the one filtered on, which clears it.
+// The states and their wording come from `UNTAGGED_STATES`, shared with the
+// grid's filter chip.
+const untaggedRows = computed(() => {
+  const breakdown = stats.value?.untagged_breakdown;
+  if (!breakdown) return [];
+  return UNTAGGED_STATES.map((row) => ({
+    ...row,
+    count: breakdown[row.state],
+  })).filter(
+    (row) => row.count > 0 || filterStore.tagStateFilter === row.state,
+  );
+});
+function toggleTagStateFilter(state) {
+  filterStore.tagStateFilter =
+    filterStore.tagStateFilter === state ? null : state;
+}
+
 // ─── Bar chart ────────────────────────────────────────────────────────────────
 const maxTagCount = computed(() => {
   return displayedTags.value.length ? displayedTags.value[0].count : 1;
@@ -758,32 +740,42 @@ const hasPenalisedTags = computed(
 );
 
 async function fetchStatsPenalised() {
+  const ticket = takeTicket("penalised");
   const qs = buildQueryParams();
   loadingPenalised.value = true;
   try {
-    statsPenalised.value = await getPictureStats(qs, {
+    const body = await getPictureStats(qs, {
       only_penalised: 1,
       include: "cooc",
     });
-  } catch {
+    if (!isLive(ticket)) return;
+    statsPenalised.value = body;
+  } catch (e) {
+    if (!isLive(ticket)) return;
+    console.warn("Failed to load penalised-tag stats:", e);
     statsPenalised.value = null;
   } finally {
-    loadingPenalised.value = false;
+    if (isLive(ticket)) loadingPenalised.value = false;
   }
 }
 
 async function fetchStatsPenalisedBoth() {
+  const ticket = takeTicket("penalisedBoth");
   const qs = buildQueryParams();
   loadingPenalisedBoth.value = true;
   try {
-    statsPenalisedBoth.value = await getPictureStats(qs, {
+    const body = await getPictureStats(qs, {
       only_penalised: "both",
       include: "cooc",
     });
-  } catch {
+    if (!isLive(ticket)) return;
+    statsPenalisedBoth.value = body;
+  } catch (e) {
+    if (!isLive(ticket)) return;
+    console.warn("Failed to load both-penalised pair stats:", e);
     statsPenalisedBoth.value = null;
   } finally {
-    loadingPenalisedBoth.value = false;
+    if (isLive(ticket)) loadingPenalisedBoth.value = false;
   }
 }
 
@@ -1307,14 +1299,13 @@ function handleResolutionBarClick(label) {
     <template v-if="railMode === 'none' && stats" #lead>
       <div class="stats-tiles">
         <div class="stats-tile">
-          <span class="stats-tile-value">{{
-            stats.total.toLocaleString()
-          }}</span>
+          <span class="stats-tile-value">{{ formatCount(stats.total) }}</span>
           <span class="stats-tile-label">Pictures</span>
+          <Tooltip :text="picturesTileTip" activator="parent" />
         </div>
         <div class="stats-tile">
           <span class="stats-tile-value">{{
-            (stats.total_tags ?? 0).toLocaleString()
+            formatCount(stats.total_tags ?? 0)
           }}</span>
           <span class="stats-tile-label">Tags</span>
         </div>
@@ -1377,6 +1368,13 @@ function handleResolutionBarClick(label) {
     </div>
 
     <div v-else-if="error" class="stats-error">{{ error }}</div>
+
+    <div
+      v-else-if="stats && stats.total === 0 && activeTab === 'tags'"
+      class="stats-empty"
+    >
+      No pictures in this view
+    </div>
 
     <template v-else-if="stats && activeTab === 'tags'">
       <!-- Overview section -->
@@ -1443,12 +1441,42 @@ function handleResolutionBarClick(label) {
           <div class="donut-legend">
             <span class="legend-dot tagged-dot" />
             <span class="legend-text"
-              >Tagged {{ stats.tagged.toLocaleString() }}</span
+              >Tagged {{ formatCount(stats.tagged) }}</span
             >
             <span class="legend-dot untagged-dot" />
             <span class="legend-text"
-              >Untagged {{ stats.untagged.toLocaleString() }}</span
+              >Untagged {{ formatCount(stats.untagged) }}</span
             >
+          </div>
+          <div
+            v-if="untaggedRows.length"
+            class="untagged-breakdown"
+            role="group"
+            aria-label="Why pictures are untagged"
+          >
+            <button
+              v-for="row in untaggedRows"
+              :key="row.state"
+              type="button"
+              class="untagged-row"
+              :class="{ active: filterStore.tagStateFilter === row.state }"
+              :aria-pressed="filterStore.tagStateFilter === row.state"
+              :data-tag-state="row.state"
+              @click="toggleTagStateFilter(row.state)"
+            >
+              <span class="untagged-row-label">{{ row.label }}</span>
+              <span class="untagged-row-count">{{
+                formatCount(row.count)
+              }}</span>
+              <Tooltip
+                :text="
+                  filterStore.tagStateFilter === row.state
+                    ? 'Show every picture again'
+                    : row.tooltip
+                "
+                activator="parent"
+              />
+            </button>
           </div>
         </div>
       </div>
@@ -1702,7 +1730,10 @@ function handleResolutionBarClick(label) {
 
     <!-- ── Pictures tab ──────────────────────────────────────────────── -->
     <template v-if="activeTab === 'pictures'">
-      <div v-if="picStatsLoading && !picStats" class="stats-loading">
+      <div v-if="stats && stats.total === 0" class="stats-empty">
+        No pictures in this view
+      </div>
+      <div v-else-if="picStatsLoading && !picStats" class="stats-loading">
         <v-progress-circular
           indeterminate
           size="24"
@@ -2008,6 +2039,13 @@ function handleResolutionBarClick(label) {
   padding: var(--space-3) 0;
 }
 
+.stats-empty {
+  font-size: var(--text-sm);
+  color: rgba(var(--v-theme-on-surface), 0.65);
+  padding: var(--space-6) 0;
+  text-align: center;
+}
+
 /* Three tiles across the rail (#2161): pictures, tags, tags per picture. */
 .stats-tiles {
   display: grid;
@@ -2130,6 +2168,42 @@ function handleResolutionBarClick(label) {
 .legend-text {
   font-size: var(--text-2xs);
   color: rgba(var(--v-theme-on-surface), 0.65);
+}
+
+/* The Untagged split: a filter row each, olive when it is the view's filter. */
+.untagged-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  margin-top: var(--space-2);
+}
+
+.untagged-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-2xs);
+  color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
+  text-align: left;
+  transition: background var(--dur-1) var(--ease-standard);
+}
+
+.untagged-row:hover {
+  background: var(--hover-wash);
+}
+
+.untagged-row.active {
+  background: var(--active-wash);
+  box-shadow: inset var(--rail-w) 0 0 var(--active-bar);
+  color: var(--active-text);
+}
+
+.untagged-row-count {
+  font-variant-numeric: tabular-nums;
 }
 
 .penalised-toggle {

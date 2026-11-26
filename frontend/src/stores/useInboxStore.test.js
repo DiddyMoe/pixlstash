@@ -12,6 +12,7 @@ vi.mock("../utils/apiClient", async () => {
 
 import { inboxEmptyState, useInboxStore } from "./useInboxStore";
 import { useProjectStore } from "./useProjectStore";
+import { useUserPrefsStore } from "./useUserPrefsStore";
 
 beforeEach(() => {
   window.localStorage.removeItem("pixlstash:inboxPeriod");
@@ -40,6 +41,20 @@ describe("useInboxStore", () => {
     projects.selectedProjectId = null;
     expect(query("30d").project_id).toBe("UNASSIGNED");
   });
+
+  it("leaves out what hidden tags hide only while that preference is on", () => {
+    const store = useInboxStore();
+    const query = (id) => Object.fromEntries(new URLSearchParams(store.countQuery(id)));
+    const prefs = useUserPrefsStore();
+    prefs.hiddenTags = ["example-hidden"];
+    expect(query("30d")).not.toHaveProperty("apply_tag_filter");
+    prefs.applyTagFilter = true;
+    expect(query("30d")).toEqual({
+      inbox: "30d",
+      stack_leaders_only: "true",
+      apply_tag_filter: "true",
+    });
+  });
 });
 
 describe("useInboxStore counts", () => {
@@ -56,6 +71,76 @@ describe("useInboxStore counts", () => {
     projects.selectedProjectId = 7;
     await store.refreshCount();
     expect(store.counts).toEqual({ "14d": 5 });
+  });
+
+  // The server answers 25 with hidden pictures left out, 40 with them in.
+  async function answerByPreference() {
+    const { apiClient } = await import("../utils/apiClient");
+    const answers = [];
+    apiClient.get.mockReset();
+    apiClient.get.mockImplementation((url) => {
+      const on = new URLSearchParams(String(url).split("?")[1]).has("apply_tag_filter");
+      let release;
+      const held = new Promise((resolve) => {
+        release = () => resolve({ data: { count: on ? 25 : 40 } });
+      });
+      answers.push({ on, release });
+      return held;
+    });
+    return answers;
+  }
+
+  it("drops counts read before hidden tags were turned on, even late ones", async () => {
+    const answers = await answerByPreference();
+    const store = useInboxStore();
+    const before = store.refreshAllCounts();
+    const sentBefore = answers.length;
+    const prefs = useUserPrefsStore();
+    prefs.hiddenTags = ["example-hidden"];
+    prefs.applyTagFilter = true;
+    const after = store.refreshCount();
+    expect(answers.slice(sentBefore).map((a) => a.on)).toEqual([true]);
+    answers.slice(sentBefore).forEach((a) => a.release());
+    await after;
+    // The reads sent with the preference off land last, and change nothing.
+    answers.slice(0, sentBefore).forEach((a) => a.release());
+    await before;
+    expect(store.counts).toEqual({ "14d": 25 });
+  });
+
+  it("drops counts read under other hidden tags while the preference is on", async () => {
+    const answers = await answerByPreference();
+    const prefs = useUserPrefsStore();
+    prefs.applyTagFilter = true;
+    prefs.hiddenTags = ["example-hidden"];
+    const store = useInboxStore();
+    const first = store.refreshAllCounts();
+    answers.forEach((a) => a.release());
+    await first;
+    expect(store.counts["90d"]).toBe(25);
+
+    prefs.hiddenTags = ["example-hidden", "example-other"];
+    const second = store.refreshCount();
+    answers.forEach((a) => a.release());
+    await second;
+    expect(store.counts).toEqual({ "14d": 25 });
+  });
+
+  it("keeps its counts when the hidden tags change with the preference off", async () => {
+    const answers = await answerByPreference();
+    const prefs = useUserPrefsStore();
+    const store = useInboxStore();
+    const first = store.refreshAllCounts();
+    answers.forEach((a) => a.release());
+    await first;
+    expect(store.counts["90d"]).toBe(40);
+
+    prefs.hiddenTags = ["example-hidden"];
+    const second = store.refreshCount();
+    answers.forEach((a) => a.release());
+    await second;
+    expect(store.counts["90d"]).toBe(40);
+    expect(store.counts["14d"]).toBe(40);
   });
 });
 

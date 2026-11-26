@@ -61,3 +61,36 @@ describe("FilterStrip", () => {
     expect(tail(wrapper)).toBe("12 workflows");
   });
 });
+
+// The grid counts a collapsed stack once and the Details panel counts every
+// picture in it, so while a stack is collapsed the tail says which it is.
+describe("FilterStrip's count with stacks collapsed", () => {
+  const tip = (wrapper) =>
+    wrapper.find(".filter-strip-count tooltip-stub");
+
+  it("says a collapsed stack counts once", async () => {
+    const grid = useGridStore();
+    grid.totalStackCount = 3;
+    grid.expandedStackCount = 1;
+    const wrapper = await mountStrip();
+    expect(tip(wrapper).attributes("text")).toBe(
+      "A collapsed stack counts once here. The Details panel counts every picture in it.",
+    );
+  });
+
+  it("says nothing when every stack is open", async () => {
+    const grid = useGridStore();
+    grid.totalStackCount = 2;
+    grid.expandedStackCount = 2;
+    const wrapper = await mountStrip();
+    expect(tip(wrapper).exists()).toBe(false);
+  });
+
+  it("says nothing over an owner's own label", async () => {
+    const grid = useGridStore();
+    grid.totalStackCount = 3;
+    grid.expandedStackCount = 0;
+    const wrapper = await mountStrip({ ofLabel: "12 workflows" });
+    expect(tip(wrapper).exists()).toBe(false);
+  });
+});

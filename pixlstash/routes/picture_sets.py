@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 from sqlalchemy import desc, exists, func, nullslast
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
+from pixlstash.utils.sqlite_ints import SqliteInt, is_sqlite_int, parse_sqlite_int
 from pixlstash.authz.membership import (
     enforce_project_path_scope,
     enforce_set_scope,
@@ -64,12 +65,15 @@ from pixlstash.scoring import (
     find_pictures_by_smart_score,
     get_smart_score_penalised_tags_from_request,
 )
+from pixlstash.routes.pictures._listing import stored_picture_dict
 from pixlstash.utils.http_cache import conditional_file_response
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.service.caption_utils import normalize_hidden_tags
 from pixlstash.utils.service.smart_set_refresher import refresh_smart_sets
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked, in_json
 from pixlstash.utils.stack.stack_utils import deduplicate_by_stack
 from pixlstash.utils.query.predicate_filter import PredicateFilter
 
@@ -240,6 +244,24 @@ class LockedSetMembersResponse(BaseModel):
     sets: list[LockedSetSummary] = []
 
 
+def _parent_ids_from(payload: dict):
+    """The ``parent_set_id`` and ``parent_character_id`` a create or update
+    sends. An integer SQLite cannot store is refused with 400 here, before it
+    reaches a query; ``validate_parent`` checks everything else."""
+    parent_set_id = payload.get("parent_set_id")
+    parent_character_id = payload.get("parent_character_id")
+    for value in (parent_set_id, parent_character_id):
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and not is_sqlite_int(value)
+        ):
+            raise HTTPException(
+                status_code=400, detail="A parent id is not a valid id."
+            )
+    return parent_set_id, parent_character_id
+
+
 def _building_from(payload: dict):
     """The ``building`` a create or update sends: a JSON object, null, or
     ``_UNSET`` when the key is absent. Anything else, or an object past
@@ -289,7 +311,7 @@ def create_router(server) -> APIRouter:
                 PictureSetProjectMember.set_id == PictureSet.id,
             )
             .where(
-                PictureSetProjectMember.project_id.in_(wanted),
+                in_json(PictureSetProjectMember.project_id, wanted),
                 func.lower(PictureSet.name) == name.lower(),
             )
         )
@@ -329,7 +351,9 @@ def create_router(server) -> APIRouter:
                     status_code=400, detail="project_ids must be a list"
                 )
             try:
-                return sorted({int(v) for v in raw_ids if v is not None}), True
+                return sorted(
+                    {parse_sqlite_int(v) for v in raw_ids if v is not None}
+                ), True
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -339,7 +363,7 @@ def create_router(server) -> APIRouter:
             if raw is None:
                 return [], True
             try:
-                return [int(raw)], True
+                return [parse_sqlite_int(raw)], True
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -374,12 +398,20 @@ def create_router(server) -> APIRouter:
             return pictures
 
         def fetch_stack_info(session: Session, ids: list[int]):
-            id_stack_rows = session.exec(
-                select(Picture.id, Picture.stack_id).where(
-                    Picture.id.in_(ids),
-                    Picture.deleted.is_(False),
-                )
-            ).all()
+            # A set listing passes every member (limit ``sys.maxsize``), so
+            # both reads run in chunks under SQLite's bound-parameter limit.
+            # The ids and stack ids are unique, and the count groups by the
+            # chunked column, so no row or count is split.
+            id_stack_rows = [
+                row
+                for id_chunk in chunked(sorted(set(ids)))
+                for row in session.exec(
+                    select(Picture.id, Picture.stack_id).where(
+                        Picture.id.in_(id_chunk),
+                        Picture.deleted.is_(False),
+                    )
+                ).all()
+            ]
             stack_ids = sorted(
                 {
                     int(stack_id)
@@ -390,15 +422,19 @@ def create_router(server) -> APIRouter:
             if not stack_ids:
                 return id_stack_rows, []
 
-            stack_count_rows = session.exec(
-                select(Picture.stack_id, func.count(Picture.id))
-                .where(
-                    Picture.stack_id.in_(stack_ids),
-                    # Not ``IS 0``: it beats the stack index from one id ("Probe cost").
-                    Picture.deleted.is_not(True),
-                )
-                .group_by(Picture.stack_id)
-            ).all()
+            stack_count_rows = [
+                row
+                for stack_chunk in chunked(stack_ids)
+                for row in session.exec(
+                    select(Picture.stack_id, func.count(Picture.id))
+                    .where(
+                        Picture.stack_id.in_(stack_chunk),
+                        # Not ``IS 0``: it beats the stack index from one id ("Probe cost").
+                        Picture.deleted.is_not(True),
+                    )
+                    .group_by(Picture.stack_id)
+                ).all()
+            ]
             return id_stack_rows, stack_count_rows
 
         id_stack_rows, stack_count_rows = server.vault.db.run_immediate_read_task(
@@ -472,7 +508,7 @@ def create_router(server) -> APIRouter:
             select(Tag.picture_id).where(
                 Tag.picture_id == Picture.id,
                 Tag.tag.is_not(None),
-                func.lower(Tag.tag).in_(hidden_tag_set),
+                in_json(func.lower(Tag.tag), hidden_tag_set),
             )
         )
 
@@ -482,11 +518,17 @@ def create_router(server) -> APIRouter:
         if not picture_ids or not hidden_tags:
             return picture_ids
         hidden_tag_set = {str(tag).strip().lower() for tag in hidden_tags if tag}
+        # ``picture_ids`` is a whole set, so the ids come from a temp table;
+        # the hidden tags, which have no cap, bind as one JSON array.
         rows = session.exec(
             select(Tag.picture_id).where(
-                Tag.picture_id.in_(picture_ids),
+                Tag.picture_id.in_(
+                    scope_id_subquery(
+                        session, picture_ids, name="_pixlstash_hidden_filter_ids"
+                    )
+                ),
                 Tag.tag.is_not(None),
-                func.lower(Tag.tag).in_(hidden_tag_set),
+                in_json(func.lower(Tag.tag), hidden_tag_set),
             )
         ).all()
         hidden_ids = {row for row in rows if row is not None}
@@ -576,7 +618,7 @@ def create_router(server) -> APIRouter:
                     select(
                         PictureSetProjectMember.set_id,
                         PictureSetProjectMember.project_id,
-                    ).where(PictureSetProjectMember.set_id.in_(listed_ids))
+                    ).where(in_json(PictureSetProjectMember.set_id, listed_ids))
                 ).all():
                     project_ids_by_set.setdefault(int(sid), []).append(int(pid))
             # Counts and previews for EVERY listed set in two queries, not two
@@ -596,7 +638,7 @@ def create_router(server) -> APIRouter:
             top_ids_by_set: dict[int, list[int]] = {}
             if listed_ids:
                 member_conditions = [
-                    PictureSetMember.set_id.in_(listed_ids),
+                    in_json(PictureSetMember.set_id, listed_ids),
                     Picture.deleted.is_(False),
                 ]
                 if project_filter is not None:
@@ -963,7 +1005,7 @@ def create_router(server) -> APIRouter:
                 PictureSetProjectMember,
                 PictureSetProjectMember.set_id == PictureSet.id,
             )
-            .where(PictureSetProjectMember.project_id.in_(wanted))
+            .where(in_json(PictureSetProjectMember.project_id, wanted))
             .distinct()
             if wanted
             else select(PictureSet.set_icon, PictureSet.set_color)
@@ -1011,8 +1053,7 @@ def create_router(server) -> APIRouter:
         project_ids, _provided = _resolve_target_project_ids(payload, None)
         set_icon = payload.get("set_icon", _UNSET)
         set_color = payload.get("set_color", _UNSET)
-        parent_set_id = payload.get("parent_set_id")
-        parent_character_id = payload.get("parent_character_id")
+        parent_set_id, parent_character_id = _parent_ids_from(payload)
         building = _building_from(payload)
         if not name:
             raise HTTPException(status_code=400, detail="name is required")
@@ -1077,7 +1118,7 @@ def create_router(server) -> APIRouter:
     )
     def get_batch_membership(
         request: Request,
-        picture_ids: list[int] = Body(default=[]),
+        picture_ids: list[SqliteInt] = Body(default=[]),
         include_deleted: bool = Body(False),
     ):
         if not picture_ids:
@@ -1092,14 +1133,24 @@ def create_router(server) -> APIRouter:
                 return {}
 
         def fetch_membership(session, ids: list[int], include_deleted: bool):
+            # The body has no cap (a select-all reaches it), so every read
+            # below runs in chunks under SQLite's bound-parameter limit. Each
+            # chunk is of unique ids and each row stands alone, so no row is
+            # read twice.
             # Expand stacks: include all stack siblings of requested pictures.
-            id_stack_rows = session.exec(
-                select(Picture.id, Picture.stack_id).where(
-                    Picture.id.in_(ids),
-                    Picture.deleted.is_(False),
-                )
-            ).all()
-            stack_ids = [int(sid) for _pid, sid in id_stack_rows if sid is not None]
+            id_stack_rows = [
+                row
+                for id_chunk in chunked(sorted(set(ids)))
+                for row in session.exec(
+                    select(Picture.id, Picture.stack_id).where(
+                        Picture.id.in_(id_chunk),
+                        Picture.deleted.is_(False),
+                    )
+                ).all()
+            ]
+            stack_ids = sorted(
+                {int(sid) for _pid, sid in id_stack_rows if sid is not None}
+            )
             expanded_ids = set(ids)
             if stack_ids:
                 # Every sibling, scrapheaped or not: the membership read below
@@ -1109,20 +1160,28 @@ def create_router(server) -> APIRouter:
                 # more stack ids below ``ix_picture_deleted`` and walks every
                 # kept picture; alone, the ids search ``ix_picture_stack_id``
                 # (backend_architecture.md, "Probe cost").
-                extra = session.exec(
-                    select(Picture.id).where(Picture.stack_id.in_(stack_ids))
-                ).all()
+                extra = [
+                    pic_id
+                    for stack_chunk in chunked(stack_ids)
+                    for pic_id in session.exec(
+                        select(Picture.id).where(Picture.stack_id.in_(stack_chunk))
+                    ).all()
+                ]
                 expanded_ids |= {e for e in extra if e is not None}
 
             # Find all set memberships for the expanded id set.
-            filters = [PictureSetMember.picture_id.in_(expanded_ids)]
-            if not include_deleted:
-                filters.append(Picture.deleted.is_(False))
-            rows = session.exec(
-                select(PictureSetMember.set_id, PictureSetMember.picture_id)
-                .join(Picture, Picture.id == PictureSetMember.picture_id)
-                .where(*filters)
-            ).all()
+            rows = []
+            for id_chunk in chunked(sorted(expanded_ids)):
+                filters = [PictureSetMember.picture_id.in_(id_chunk)]
+                if not include_deleted:
+                    filters.append(Picture.deleted.is_(False))
+                rows.extend(
+                    session.exec(
+                        select(PictureSetMember.set_id, PictureSetMember.picture_id)
+                        .join(Picture, Picture.id == PictureSetMember.picture_id)
+                        .where(*filters)
+                    ).all()
+                )
 
             result: dict[int, list[int]] = {}
             for set_id, pid in rows:
@@ -1140,7 +1199,7 @@ def create_router(server) -> APIRouter:
         response_class=Response,
         responses={200: {"content": {"image/png": {}}}},
     )
-    def get_picture_set_thumbnail(id: int, request: Request):
+    def get_picture_set_thumbnail(id: SqliteInt, request: Request):
         thumbnail_cache_version = 17
         cache_dir = os.path.join(server.vault.image_root, "tmp", "set_thumbnails")
         os.makedirs(cache_dir, exist_ok=True)
@@ -1376,7 +1435,7 @@ def create_router(server) -> APIRouter:
     )
     def get_picture_set(
         request: Request,
-        id: int,
+        id: SqliteInt,
         info: bool = Query(False),
         sort: str = Query(None),
         descending: bool = Query(True),
@@ -1385,8 +1444,8 @@ def create_router(server) -> APIRouter:
         reference_character_id: str | None = Query(None),
         project_id: str | None = Query(None),
         fields: str = Query(None),
-        min_score: int | None = Query(None),
-        max_score: int | None = Query(None),
+        min_score: SqliteInt | None = Query(None),
+        max_score: SqliteInt | None = Query(None),
         smart_score_bucket: str | None = Query(None),
         resolution_bucket: str | None = Query(None),
         expand_stacks: bool = Query(False),
@@ -1401,7 +1460,7 @@ def create_router(server) -> APIRouter:
         tags_confidence_above_filter = _predicate_filter.tags_confidence_above_filter
         tags_confidence_below_filter = _predicate_filter.tags_confidence_below_filter
         try:
-            id = int(id)
+            id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=422,
@@ -1419,7 +1478,11 @@ def create_router(server) -> APIRouter:
                 sort_mech = SortMechanism.from_string(sort, descending=descending)
             except ValueError as ve:
                 logger.error("Invalid sort mechanism: %s - %s", sort, ve)
-                raise HTTPException(status_code=400, detail=str(ve))
+                # The sentence the listing and search routes answer: the
+                # ValueError repeats the caller's sort text.
+                raise HTTPException(
+                    status_code=400, detail="Invalid sort mechanism"
+                ) from ve
 
         project_filter = None
         if project_id is not None:
@@ -1492,14 +1555,21 @@ def create_router(server) -> APIRouter:
         def expand_with_stack_members(session, ids):
             if not ids:
                 return ids
-            base_query = select(Picture.id, Picture.stack_id).where(
-                Picture.id.in_(ids),
-                Picture.deleted.is_(False),
+            # ``ids`` is every member of the set, so both reads run in chunks
+            # under SQLite's bound-parameter limit (``project_filter`` binds at
+            # most one more). The ids and stack ids are unique per chunk.
+            rows = []
+            for id_chunk in chunked(sorted(set(ids))):
+                base_query = select(Picture.id, Picture.stack_id).where(
+                    Picture.id.in_(id_chunk),
+                    Picture.deleted.is_(False),
+                )
+                if project_filter is not None:
+                    base_query = base_query.where(project_filter)
+                rows.extend(session.exec(base_query).all())
+            stack_ids = sorted(
+                {int(stack_id) for _, stack_id in rows if stack_id is not None}
             )
-            if project_filter is not None:
-                base_query = base_query.where(project_filter)
-            rows = session.exec(base_query).all()
-            stack_ids = [int(stack_id) for _, stack_id in rows if stack_id is not None]
             if not stack_ids:
                 return ids
             # Soft-deleted siblings are dropped here rather than in SQL: beside
@@ -1508,16 +1578,18 @@ def create_router(server) -> APIRouter:
             # ``ix_picture_deleted`` and walks every kept picture to find the
             # stacks' few. Alone, the ids search ``ix_picture_stack_id``
             # (backend_architecture.md, "Probe cost").
-            extra_query = select(Picture.id, Picture.deleted).where(
-                Picture.stack_id.in_(stack_ids)
-            )
-            if project_filter is not None:
-                extra_query = extra_query.where(project_filter)
-            extra = [
-                picture_id
-                for picture_id, deleted in session.exec(extra_query).all()
-                if not deleted
-            ]
+            extra = []
+            for stack_chunk in chunked(stack_ids):
+                extra_query = select(Picture.id, Picture.deleted).where(
+                    Picture.stack_id.in_(stack_chunk)
+                )
+                if project_filter is not None:
+                    extra_query = extra_query.where(project_filter)
+                extra.extend(
+                    picture_id
+                    for picture_id, deleted in session.exec(extra_query).all()
+                    if not deleted
+                )
             return list(set(ids) | set(extra))
 
         picture_ids = server.vault.db.run_immediate_read_task(
@@ -1600,15 +1672,15 @@ def create_router(server) -> APIRouter:
                 tags_confidence_above_filter=tags_confidence_above_filter,
                 tags_confidence_below_filter=tags_confidence_below_filter,
             )
+            # Read through the column types: a stored value its column does not
+            # declare is null in its row, not a 500 for the set.
+            excluded = {"file_path", "thumbnail", "text_embedding", "image_embedding"}
             return [
-                pic.dict(
-                    exclude={
-                        "file_path",
-                        "thumbnail",
-                        "text_embedding",
-                        "image_embedding",
-                    }
-                )
+                {
+                    key: value
+                    for key, value in stored_picture_dict(pic).items()
+                    if key not in excluded
+                }
                 for pic in pics
             ]
 
@@ -1651,7 +1723,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=PictureSetUpdateResponse,
     )
-    def update_picture_set(id: int, request: Request, payload: dict = Body(...)):
+    def update_picture_set(id: SqliteInt, request: Request, payload: dict = Body(...)):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         name = payload.get("name")
         description = payload.get("description")
@@ -1661,8 +1733,7 @@ def create_router(server) -> APIRouter:
         if locked_param is not _UNSET:
             locked_param = bool(locked_param)
         parent_provided = "parent_set_id" in payload or "parent_character_id" in payload
-        parent_set_id = payload.get("parent_set_id")
-        parent_character_id = payload.get("parent_character_id")
+        parent_set_id, parent_character_id = _parent_ids_from(payload)
         building = _building_from(payload)
         smart_reset = payload.get("smart_reset") is True
 
@@ -1879,7 +1950,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=PictureSetDeleteResponse,
     )
-    def delete_picture_set(id: int):
+    def delete_picture_set(id: SqliteInt):
         def delete_set(session, id):
             picture_set = session.get(PictureSet, id)
             if not picture_set:
@@ -1917,7 +1988,7 @@ def create_router(server) -> APIRouter:
         response_model=PictureSetMembersResponse,
     )
     def get_picture_set_pictures(
-        id: int,
+        id: SqliteInt,
         request: Request,
         include_deleted: bool = Query(False),
         expand_stacks: bool = Query(False),
@@ -1944,17 +2015,25 @@ def create_router(server) -> APIRouter:
             # Expand stacks: if any member of a stack is in the set, include
             # all other non-deleted members of that stack so the stack leader
             # is recognised as a set member in the frontend.
-            id_stack_rows = session.exec(
-                select(Picture.id, Picture.stack_id).where(
-                    Picture.id.in_(picture_ids),
-                    Picture.deleted.is_(False),
-                )
-            ).all()
-            stack_ids = [
-                int(stack_id)
-                for _pic_id, stack_id in id_stack_rows
-                if stack_id is not None
+            # ``picture_ids`` is the whole set, so both reads run in chunks
+            # under SQLite's bound-parameter limit; the ids are unique.
+            id_stack_rows = [
+                row
+                for id_chunk in chunked(sorted(picture_ids))
+                for row in session.exec(
+                    select(Picture.id, Picture.stack_id).where(
+                        Picture.id.in_(id_chunk),
+                        Picture.deleted.is_(False),
+                    )
+                ).all()
             ]
+            stack_ids = sorted(
+                {
+                    int(stack_id)
+                    for _pic_id, stack_id in id_stack_rows
+                    if stack_id is not None
+                }
+            )
             if stack_ids:
                 # Soft-deleted siblings are dropped here rather than in SQL:
                 # beside ``deleted IS 0``, and without ``sqlite_stat1``
@@ -1962,11 +2041,15 @@ def create_router(server) -> APIRouter:
                 # more stack ids below ``ix_picture_deleted`` and walks every
                 # kept picture to find the stacks' few. Alone, the ids search
                 # ``ix_picture_stack_id`` (backend_architecture.md, "Probe cost").
-                extra = session.exec(
-                    select(Picture.id, Picture.deleted).where(
-                        Picture.stack_id.in_(stack_ids)
-                    )
-                ).all()
+                extra = [
+                    row
+                    for stack_chunk in chunked(stack_ids)
+                    for row in session.exec(
+                        select(Picture.id, Picture.deleted).where(
+                            Picture.stack_id.in_(stack_chunk)
+                        )
+                    ).all()
+                ]
                 picture_ids = list(
                     set(picture_ids)
                     | {
@@ -1991,7 +2074,7 @@ def create_router(server) -> APIRouter:
         description="Adds one picture to a set when the set and picture are valid and membership does not already exist.",
         response_model=PictureSetAddPictureResponse,
     )
-    def add_picture_to_set(id: int, picture_id: int, request: Request):
+    def add_picture_to_set(id: SqliteInt, picture_id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         reference_character_id = _find_reference_character_id_for_set(id)
 
@@ -2004,12 +2087,18 @@ def create_router(server) -> APIRouter:
             # Sets are atomic for stacks: adding any stacked picture adds every
             # member of its stack.
             target_ids = expand_picture_ids_to_stacks(session, [picture_id])
-            pictures = session.exec(
-                select(Picture).where(
-                    Picture.id.in_(target_ids),
-                    Picture.deleted.is_(False),
-                )
-            ).all()
+            # A stack has no size cap, so its pictures are read in chunks
+            # under SQLite's bound-parameter limit.
+            pictures = [
+                picture
+                for id_chunk in chunked(sorted(set(target_ids)))
+                for picture in session.exec(
+                    select(Picture).where(
+                        Picture.id.in_(id_chunk),
+                        Picture.deleted.is_(False),
+                    )
+                ).all()
+            ]
             if not pictures:
                 return False
             added_any = False
@@ -2086,7 +2175,7 @@ def create_router(server) -> APIRouter:
         description="Removes one picture membership from a picture set.",
         response_model=PictureSetRemovePictureResponse,
     )
-    def remove_picture_from_set(id: int, picture_id: int, request: Request):
+    def remove_picture_from_set(id: SqliteInt, picture_id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         reference_character_id = _find_reference_character_id_for_set(id)
 
@@ -2102,12 +2191,18 @@ def create_router(server) -> APIRouter:
             # where the requested id is a collapsed-stack leader shown because a
             # different member of its stack is the one actually in the set.
             target_ids = expand_picture_ids_to_stacks(session, [picture_id])
-            members = session.exec(
-                select(PictureSetMember).where(
-                    PictureSetMember.set_id == id,
-                    PictureSetMember.picture_id.in_(target_ids),
-                )
-            ).all()
+            # A stack has no size cap, so its memberships are read in chunks
+            # under SQLite's bound-parameter limit.
+            members = [
+                member
+                for id_chunk in chunked(sorted(set(target_ids)))
+                for member in session.exec(
+                    select(PictureSetMember).where(
+                        PictureSetMember.set_id == id,
+                        PictureSetMember.picture_id.in_(id_chunk),
+                    )
+                ).all()
+            ]
             if not members:
                 return False
             for m in members:
@@ -2152,13 +2247,15 @@ def create_router(server) -> APIRouter:
         description="Adds a batch of pictures to a set (non-destructive). Skips pictures already in the set.",
         response_model=PictureSetBulkAddResponse,
     )
-    def bulk_add_pictures_to_set(id: int, request: Request, payload: dict = Body(...)):
+    def bulk_add_pictures_to_set(
+        id: SqliteInt, request: Request, payload: dict = Body(...)
+    ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         raw_ids = payload.get("picture_ids", [])
         if not isinstance(raw_ids, list):
             raise HTTPException(status_code=400, detail="picture_ids must be a list")
         try:
-            picture_ids = [int(i) for i in raw_ids]
+            picture_ids = [parse_sqlite_int(i) for i in raw_ids]
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400, detail="All picture ids must be integers"
@@ -2257,14 +2354,14 @@ def create_router(server) -> APIRouter:
         response_model=PictureSetBulkReplaceResponse,
     )
     def bulk_replace_pictures_in_set(
-        id: int, request: Request, payload: dict = Body(...)
+        id: SqliteInt, request: Request, payload: dict = Body(...)
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         raw_ids = payload.get("picture_ids", [])
         if not isinstance(raw_ids, list):
             raise HTTPException(status_code=400, detail="picture_ids must be a list")
         try:
-            picture_ids = [int(i) for i in raw_ids]
+            picture_ids = [parse_sqlite_int(i) for i in raw_ids]
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400, detail="All picture ids must be integers"

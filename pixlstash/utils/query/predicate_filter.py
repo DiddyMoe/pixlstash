@@ -29,19 +29,30 @@ with a pre-resolved set via the caller's own ``Picture.id.in_(...)`` clause.
 """
 
 import json
-import os
+import math
+from functools import cache
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Sequence
+from typing import Collection, List, Optional, Sequence
 
 from fastapi import HTTPException
 from pydantic import BaseModel
-from sqlalchemy import and_, case, exists, func, not_, or_, text
+from sqlalchemy import and_, case, false, not_, or_, text, true
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import select
 
 from pixlstash.db_models.dedup import DedupGroup, DedupGroupMember
 from pixlstash.db_models.picture import Picture
-from pixlstash.db_models.tag import TAG_SENTINEL_LIKE_PATTERN, TAG_SENTINEL_ESCAPE_CHAR
+from pixlstash.utils.query.folder_prefix import FolderPrefix
+from pixlstash.db_models.tag import (
+    TAG_PENDING_SENTINEL,
+    TAG_SENTINEL_ESCAPE_CHAR,
+    TAG_SENTINEL_LIKE_PATTERN,
+    Tag,
+)
+from pixlstash.services.set_lock_service import locked_picture_id_subquery
+from pixlstash.utils.service.filter_helpers import is_truthy_flag  # noqa: F401
+from pixlstash.utils.sql_chunking import in_json, not_in_json
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 from pixlstash.utils.workflow_ids import AUTO_PREFIX, MANUAL_PREFIX
 from pixlstash.utils.service.person_tags import (
     FACE_REQUIRING_TAGS,
@@ -100,16 +111,6 @@ ONLY_MADE_BY = "="
 RUN_VARIANT = "@"
 
 
-def _in_json(column, values: Sequence[str]) -> ColumnElement:
-    """``column IN values`` as one bound JSON array, through ``json_each``.
-
-    An ``IN`` list would bind one parameter per value and meet SQLite's cap,
-    which several workflows' variants together can reach.
-    """
-    rows = func.json_each(json.dumps(sorted(values))).table_valued("value")
-    return column.in_(select(rows.c.value))
-
-
 def made_by_run_filed(live: Sequence[str]) -> ColumnElement:
     """``picture.run_workflow_id`` names one of the *live* run-filed workflows.
 
@@ -117,7 +118,7 @@ def made_by_run_filed(live: Sequence[str]) -> ColumnElement:
     workflows the hub holds and the automatic ones the owner saved over. A
     picture naming a manual workflow that has since been deleted is in none.
     """
-    return _in_json(Picture.run_workflow_id, live)
+    return in_json(Picture.run_workflow_id, live)
 
 
 def filed_as(live: Sequence[str]) -> ColumnElement:
@@ -165,7 +166,7 @@ def workflow_keys_predicate(keys: Sequence[str]) -> ColumnElement:
         for key in keys
         if key not in own and key[:1] not in (NOT_MADE_BY, ONLY_MADE_BY, RUN_VARIANT)
     ]
-    found = _in_json(Picture.workflow_structural_hash, variants)
+    found = in_json(Picture.workflow_structural_hash, variants)
     if excluded:
         found = and_(
             found,
@@ -175,11 +176,36 @@ def workflow_keys_predicate(keys: Sequence[str]) -> ColumnElement:
         found = or_(
             found,
             and_(
-                _in_json(Picture.workflow_structural_hash, held),
-                _in_json(Picture.run_workflow_id, only),
+                in_json(Picture.workflow_structural_hash, held),
+                in_json(Picture.run_workflow_id, only),
             ),
         )
-    return or_(_in_json(Picture.run_workflow_id, own), found) if own else found
+    return or_(in_json(Picture.run_workflow_id, own), found) if own else found
+
+
+@cache
+def _unresolved_pictures():
+    """The pictures in a duplicate group still awaiting a ruling, as one CTE.
+
+    A CTE so the statement carries it once, at the top: the stack-leader collapse
+    compiles this filter a second time inside its ranked subquery, and nested
+    there in full (``live_groups_filter`` is itself four subqueries deep) the
+    statement reached SQLite's parser-stack limit, so one more level of nesting
+    from any caller would fail. One object for every statement, because two
+    CTEs of one name in one statement are an error.
+
+    ``live_groups_filter`` is imported lazily for the same reason
+    ``Picture.find`` imports this module lazily: ``db_models.picture`` sits
+    between the two.
+    """
+    from pixlstash.services.dedup_tier_service import live_groups_filter
+
+    return (
+        select(DedupGroupMember.picture_id)
+        .join(DedupGroup, DedupGroup.id == DedupGroupMember.group_id)
+        .where(DedupGroup.resolved.is_(False), live_groups_filter())
+        .cte("unresolved_pictures")
+    )
 
 
 # Tag vocabularies for the live "Impossible tags" grid filters, lowercased once for
@@ -203,16 +229,140 @@ _NO_REAL_FACE_SQL = (
 )
 
 
-def is_truthy_flag(raw) -> bool:
-    """Return ``True`` for the boolean query-param spellings the frontend sends.
+# Why an untagged picture has no tags (``?tag_state=``), for the insights
+# panel's untagged legend and the grid it opens. "Untagged" is no tag but the
+# pending sentinels (``__tag``/``__tag:<engine>``), the same test the stats count
+# uses. The three states partition the untagged pictures:
+#
+# * ``unprocessable``: the tagger could not read the file and the in-memory
+#   unprocessable registry suppresses it, so its sentinel stays and nothing
+#   retries it until the server restarts (the registry is not persisted).
+# * ``pending``: the tagger will take it up, by the one definition the tag
+#   finder and the tagger's remaining count also apply
+#   (:func:`awaiting_tagger_clauses`), so this row is what the finder hands out.
+# * ``none``: not suppressed and not waiting for the tagger. Usually the tagger
+#   ran and found nothing to write, or every tag was removed afterwards (by
+#   hand, or by the removed-from-tagging cleanup); nothing re-queues those, a
+#   manual Re-tag does. It also holds a picture whose sentinel the tagger will
+#   not act on where it is now: in the Scrapheap, frozen by a locked set, or
+#   with no file. It keeps the sentinel, so a restore or an unlock makes it
+#   ``pending`` again.
+TAG_STATES = ("pending", "unprocessable", "none")
 
-    ``unscored=1`` is the contract, but ``true``/``yes``/``on`` are accepted too so
-    a hand-written URL behaves the same. Anything else (including an absent param
-    and the explicit ``unscored=0``) is False.
+
+def parse_tag_state(raw: Optional[str]) -> Optional[str]:
+    """The ``tag_state`` query param, validated. ``None`` or empty is no filter.
+
+    Raises:
+        HTTPException: 422 for a value outside :data:`TAG_STATES`. Silently
+            ignoring it would show every picture under a filter the request
+            says is applied.
     """
-    if isinstance(raw, bool):
-        return raw
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    if raw is None or raw == "":
+        return None
+    if raw not in TAG_STATES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid tag_state: must be one of {', '.join(TAG_STATES)}",
+        )
+    return raw
+
+
+def _is_sentinel_tag() -> ColumnElement:
+    return Tag.tag.like(TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR)
+
+
+def untagged_predicate() -> ColumnElement:
+    """The picture has no tag but the pending sentinels."""
+    return ~Picture.tags.any(and_(~_is_sentinel_tag(), Tag.tag.is_not(None)))
+
+
+def tag_state_predicates(
+    state: str, unprocessable_ids: Collection[int]
+) -> list[ColumnElement]:
+    """The clauses for one of :data:`TAG_STATES` (see there for the meaning).
+
+    Args:
+        state: One of :data:`TAG_STATES`.
+        unprocessable_ids: The registry's suppressed picture ids
+            (``unprocessable_images.active_suppressed_ids()``), bound as one
+            JSON array so the size of the set is not a parameter-count risk.
+
+    Raises:
+        ValueError: *state* is not one of :data:`TAG_STATES`.
+    """
+    suppressed = ~not_in_json(Picture.id, unprocessable_ids)
+    if state == "unprocessable":
+        return [untagged_predicate(), suppressed]
+    awaiting = awaiting_tagger_clauses(unprocessable_ids)
+    if state == "pending":
+        return [untagged_predicate(), *awaiting]
+    if state == "none":
+        # The complement of ``pending`` among the untagged, unsuppressed
+        # pictures, so the three states still add up to the untagged count.
+        return [untagged_predicate(), ~suppressed, not_(and_(*awaiting))]
+    raise ValueError(f"Unknown tag_state {state!r}; expected one of {TAG_STATES}")
+
+
+# Every sentinel value starts with TAG_PENDING_SENTINEL (``__tag`` or
+# ``__tag:<engine>``), so the half-open range [``__tag``, ``__tah``) is the
+# sentinel set. Written as a range rather than the LIKE pattern because SQLite
+# cannot serve LIKE ... ESCAPE from an index: this form walks ``ix_tag_tag``.
+_TAG_SENTINEL_RANGE_END = TAG_PENDING_SENTINEL[:-1] + chr(
+    ord(TAG_PENDING_SENTINEL[-1]) + 1
+)
+
+
+def awaiting_tagger_clauses(
+    suppressed_ids: Collection[int],
+    *,
+    sentinel_terms: Sequence[ColumnElement] = (),
+) -> tuple[ColumnElement, ...]:
+    """The pictures the tagger will take up: one definition for every reader.
+
+    A pending-retag sentinel on a picture tagging may touch (not scrapheaped,
+    has a file), not frozen by a locked set, and not suppressed by the
+    unprocessable registry. Three readers apply exactly these clauses, so
+    their numbers cannot drift apart:
+
+    * ``MissingTagFinder._fetch_missing_tags``: the pictures handed out. It
+      adds two waits that end by themselves: a picture's faces must be known,
+      and a plugin on a backend hold does not select (``sentinel_terms``).
+    * ``TagTask.count_missing_tags``: the tagger's remaining count, which
+      also counts a picture re-tagged with real tags kept
+      (``retag_face_crops`` keeps every tag the crops did not write).
+    * ``tag_state_predicates("pending")``: the "Waiting for the tagger" row
+      and the grid it opens. They split the *untagged* pictures only, so such
+      a picture is in the count above and not in this row.
+
+    Args:
+        suppressed_ids: ``unprocessable_images.active_suppressed_ids()``,
+            bound as one JSON array.
+        sentinel_terms: Extra conditions on the sentinel ``Tag`` row, applied
+            inside the subquery (the finder's held-plugin narrowing).
+
+    Returns:
+        WHERE terms on ``Picture``. The sentinel test is one uncorrelated
+        ``picture.id IN (SELECT tag.picture_id ...)`` over the sentinel range,
+        which ``ix_tag_tag`` serves.
+    """
+    # Local import: initialising ``pixlstash.tasks`` loads this module part-way
+    # (tasks.description_task -> services.scrapheap_service -> ... ->
+    # ``pixlstash.utils.query``, whose package init imports this module), so a
+    # top-level import of tag_task would be circular.
+    from pixlstash.tasks.tag_task import taggable_picture_clauses
+
+    sentinel_picture_ids = select(Tag.picture_id).where(
+        Tag.tag >= TAG_PENDING_SENTINEL,
+        Tag.tag < _TAG_SENTINEL_RANGE_END,
+        *sentinel_terms,
+    )
+    return (
+        Picture.id.in_(sentinel_picture_ids),
+        *taggable_picture_clauses(),
+        ~Picture.id.in_(locked_picture_id_subquery()),
+        not_in_json(Picture.id, suppressed_ids),
+    )
 
 
 # Tag-group terms travel inside the ordinary ``tag`` / ``rejected_tag`` params:
@@ -223,6 +373,20 @@ GROUP_TERM_NONE = "__group:none"
 # SQLite's INTEGER is 64-bit; an id beyond it cannot name a group, so it binds to
 # a value no group can have (ids start at 1) rather than overflowing the driver.
 _SQLITE_MAX_INT = 2**63 - 1
+
+# SQLite's smallest cap on the variables one statement binds (older builds;
+# current ones allow 32766).
+_SQLITE_VARIABLE_FLOOR = 999
+
+#: Most values one request may send in each of the ``tag``, ``rejected_tag``,
+#: ``tag_confidence_above``, ``tag_confidence_below``, ``comfyui_model`` and
+#: ``comfyui_lora`` lists. Each value binds its own variables, a confidence
+#: entry two (its tag and its threshold), so the six lists full bind at most
+#: eight per unit of the cap. That keeps them inside half the floor and leaves
+#: the other half for what else the statement binds. Each value is also one
+#: more ``AND`` in the statement, and SQLite refuses an expression tree deeper
+#: than 1000 by default: about 160 values a list already crosses that.
+MAX_FILTER_TERMS = _SQLITE_VARIABLE_FLOOR // 2 // 8
 
 
 def _group_term_id(term: str) -> Optional[int]:
@@ -308,28 +472,27 @@ def comfyui_leaf_parts(
     the single definition of the ComfyUI leaf snippet; callers decide how to combine
     the fragments (``AND`` of separate clauses vs. ``OR`` within one clause, with or
     without stack expansion).
+
+    Each list is one fragment, "records any of these names", with the names bound
+    as ONE JSON array (``:cmf`` / ``:clf``). The stack-expanded form repeats the
+    fragment for the member row, so one parameter per name would bind every name
+    twice and a long pick would pass SQLite's variable limit.
     """
     self_parts: list[str] = []
     member_parts: list[str] = []
     bind_params: dict = {}
-    if models_filter:
-        for i, m in enumerate(models_filter):
-            self_parts.append(
-                f"EXISTS (SELECT 1 FROM json_each(picture.comfyui_models) WHERE value = :cmf_{i})"
+    for names, column, param in (
+        (models_filter, "comfyui_models", "cmf"),
+        (loras_filter, "comfyui_loras", "clf"),
+    ):
+        if not names:
+            continue
+        for row, parts in (("picture", self_parts), ("_m", member_parts)):
+            parts.append(
+                f"EXISTS (SELECT 1 FROM json_each({row}.{column})"
+                f" WHERE value IN (SELECT value FROM json_each(:{param})))"
             )
-            member_parts.append(
-                f"EXISTS (SELECT 1 FROM json_each(_m.comfyui_models) WHERE value = :cmf_{i})"
-            )
-            bind_params[f"cmf_{i}"] = m
-    if loras_filter:
-        for i, m in enumerate(loras_filter):
-            self_parts.append(
-                f"EXISTS (SELECT 1 FROM json_each(picture.comfyui_loras) WHERE value = :clf_{i})"
-            )
-            member_parts.append(
-                f"EXISTS (SELECT 1 FROM json_each(_m.comfyui_loras) WHERE value = :clf_{i})"
-            )
-            bind_params[f"clf_{i}"] = m
+        bind_params[param] = json.dumps(sorted(set(names)))
     return self_parts, member_parts, bind_params
 
 
@@ -389,11 +552,17 @@ class PredicateFilter(BaseModel):
     # face-requiring tag) and ``"no_humans"`` (no face, tagged "no humans"/"scenery", yet
     # a person-tag). Multiple kinds are OR'd. Only ever narrows a scope-enforced listing.
     impossible_sources: Optional[List[str]] = None
+    # Why the picture is untagged (one of ``TAG_STATES``); ``None`` is no filter.
+    # ``unprocessable_ids`` is the in-memory registry's suppressed set, which only
+    # the caller can read, so a filter with a state and no set is refused at
+    # compile time rather than read as "nothing is unprocessable".
+    tag_state: Optional[str] = None
+    unprocessable_ids: Optional[frozenset[int]] = None
     file_path_prefix: Optional[str] = None
-    # ``find()`` browses a folder and shows direct children only (separator-aware,
-    # LIKE-escaped).  The stats sidebar instead aggregates the whole sub-tree under a
-    # prefix.  ``True`` selects the children-only behaviour; ``False`` the sub-tree
-    # ``startswith`` behaviour.
+    # ``find()`` browses a folder and shows direct children only.  The stats
+    # sidebar instead aggregates the whole sub-tree under the folder.  ``True``
+    # selects the children-only behaviour; ``False`` the sub-tree.  Both are
+    # separator-bounded (see ``FolderPrefix``).
     file_path_prefix_children_only: bool = True
     import_source_folder: Optional[str] = None
     # Added at or after this time (the Inbox's period, see ``inbox_cutoff``).
@@ -447,29 +616,16 @@ class PredicateFilter(BaseModel):
         folder, so the collapse has to know which members are in scope, and a
         second spelling of "in this folder" is how it gets that wrong.
         """
-        target = Picture
         if self.file_path_prefix is None:
             return []
+        # One spelling of "in this folder" (FolderPrefix): separator-bounded, so
+        # "/ref/photos" never takes "/ref/photos2/a.jpg"; case and separators
+        # as the platform's paths compare; "%" and "_" are plain characters.
+        prefix = FolderPrefix.of(self.file_path_prefix)
         if not self.file_path_prefix_children_only:
             # Sub-tree match used by the stats sidebar.
-            return [target.file_path.startswith(self.file_path_prefix)]
-        # Normalise to always end with a path separator so that a prefix like
-        # "/ref/photos" does not accidentally match "/ref/photos2/a.jpg".  Support
-        # both Unix ("/") and Windows ("\") separators.
-        if self.file_path_prefix.endswith("/") or self.file_path_prefix.endswith("\\"):
-            prefix = self.file_path_prefix
-        else:
-            prefix = self.file_path_prefix + os.sep
-        # Escape LIKE special characters in the literal prefix.
-        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        # Only show direct children - exclude files that have another path separator
-        # after the prefix (i.e. files in sub-directories).  Check for both "/" and
-        # "\" to handle all platforms.
-        return [
-            target.file_path.like(escaped + "%", escape="\\"),
-            ~target.file_path.like(escaped + "%/%", escape="\\"),
-            ~target.file_path.like(escaped + "%\\\\%", escape="\\"),
-        ]
+            return [prefix.under(Picture.file_path)]
+        return [prefix.directly_in(Picture.file_path)]
 
     def face_predicates(self) -> list[ColumnElement]:
         """The "has a real face" / "has none" clauses.
@@ -508,10 +664,14 @@ class PredicateFilter(BaseModel):
         preds: list[ColumnElement] = []
 
         if self.apply_deleted_filter:
+            # ``deleted = 0``, not ``IS 0``. The column is NOT NULL, so both
+            # select the same rows, but SQLite chooses a partial index only when
+            # the query states its WHERE term exactly, and the grid's leader
+            # indexes (``ix_picture_grid_leaders_*``) say ``deleted = 0``.
             if self.only_deleted:
-                preds.append(Picture.deleted.is_(True))
+                preds.append(Picture.deleted == true())
             elif not self.include_deleted:
-                preds.append(Picture.deleted.is_(False))
+                preds.append(Picture.deleted == false())
 
         if not self.include_unimported:
             preds.append(Picture.imported_at.is_not(None))
@@ -525,7 +685,7 @@ class PredicateFilter(BaseModel):
             preds.append(Picture.imported_at >= self.imported_since)
 
         if self.format:
-            preds.append(Picture.format.in_(self.format))
+            preds.append(in_json(Picture.format, self.format))
 
         score_range: list[ColumnElement] = []
         if self.min_score is not None:
@@ -570,16 +730,13 @@ class PredicateFilter(BaseModel):
                 )
 
         if self.hidden_tags_filter:
-            placeholders = ", ".join(
-                f":ht_{i}" for i in range(len(self.hidden_tags_filter))
-            )
+            # The owner's whole hidden list, so one JSON array, not a
+            # parameter per tag.
             preds.append(
                 text(
-                    f"NOT EXISTS (SELECT 1 FROM tag WHERE tag.picture_id = picture.id"
-                    f" AND LOWER(tag.tag) IN ({placeholders}))"
-                ).bindparams(
-                    **{f"ht_{i}": t for i, t in enumerate(self.hidden_tags_filter)}
-                )
+                    "NOT EXISTS (SELECT 1 FROM tag WHERE tag.picture_id = picture.id"
+                    " AND LOWER(tag.tag) IN (SELECT value FROM json_each(:ht)))"
+                ).bindparams(ht=json.dumps(sorted(set(self.hidden_tags_filter))))
             )
 
         if self.tags_confidence_above_filter:
@@ -648,9 +805,8 @@ class PredicateFilter(BaseModel):
                     ).bindparams(**{f"clf_{i}": m})
                 )
         if self.workflow_structural_hashes is not None:
-            # ponytail: one expanding IN, unchunked. SQLite's parameter ceiling
-            # is 32,766 on the bundled builds, so a card would need that many
-            # variants to reach it; a temp table and a join if one ever does.
+            # Each key list is bound as one JSON array (``in_json``), so no
+            # number of variants meets SQLite's variable limit.
             preds.append(workflow_keys_predicate(self.workflow_structural_hashes))
 
         preds.extend(self.face_predicates())
@@ -667,7 +823,7 @@ class PredicateFilter(BaseModel):
             # neither. Collapsing a stack to its cover produces that state every
             # time, which is how a rare inconsistency became a guaranteed one.
             #
-            # Imported lazily for the same reason `live_groups_filter` below is:
+            # Imported lazily for the same reason `live_groups_filter` is:
             # `db_models.picture` sits between this module and that one.
             from pixlstash.services.stack_membership import in_a_live_stack
 
@@ -683,22 +839,8 @@ class PredicateFilter(BaseModel):
             # ``live_groups_filter`` is the OTHER half of what the badge counts,
             # and leaving it out is what let a scrapheaped partner keep marking
             # its survivor: the group had left the queue and the badge, but the
-            # grid still called the remaining picture unresolved. It is imported
-            # lazily for the same reason ``Picture.find`` imports this module
-            # lazily: ``db_models.picture`` sits between the two.
-            from pixlstash.services.dedup_tier_service import live_groups_filter
-
-            preds.append(
-                exists(
-                    select(DedupGroupMember.picture_id)
-                    .join(DedupGroup, DedupGroup.id == DedupGroupMember.group_id)
-                    .where(
-                        DedupGroupMember.picture_id == Picture.id,
-                        DedupGroup.resolved.is_(False),
-                        live_groups_filter(),
-                    )
-                )
-            )
+            # grid still called the remaining picture unresolved.
+            preds.append(Picture.id.in_(select(_unresolved_pictures().c.picture_id)))
 
         if self.impossible_sources:
             # Each selected kind is a live "impossible combination" predicate over the
@@ -722,6 +864,14 @@ class PredicateFilter(BaseModel):
                 )
             if clauses:
                 preds.append(or_(*clauses))
+
+        if self.tag_state is not None:
+            if self.unprocessable_ids is None:
+                raise ValueError(
+                    "PredicateFilter.tag_state needs unprocessable_ids: the caller "
+                    "reads them from vault.db.unprocessable_images"
+                )
+            preds.extend(tag_state_predicates(self.tag_state, self.unprocessable_ids))
 
         return preds
 
@@ -760,7 +910,7 @@ class PredicateFilter(BaseModel):
             if raw is None:
                 return None
             try:
-                return int(raw)
+                return parse_sqlite_int(raw)
             except (TypeError, ValueError) as exc:
                 # A malformed numeric query param is a client error, not a
                 # server fault. Raise 422 with a clear message instead of
@@ -770,6 +920,35 @@ class PredicateFilter(BaseModel):
                     detail=f"Invalid {name}: must be an integer",
                 ) from exc
 
+        def _terms(name: str) -> List[str]:
+            # One bound term per value (see ``MAX_FILTER_TERMS``): a list past
+            # the cap is refused here, before it reaches SQLite's variable limit.
+            values = qp.getlist(name)
+            if len(values) > MAX_FILTER_TERMS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Too many {name} values: at most {MAX_FILTER_TERMS}",
+                )
+            return values
+
+        def _confidence_entries(name: str) -> Optional[List[str]]:
+            # ``tag:threshold``, compiled by ``predicates()`` with ``rsplit`` and
+            # ``float``: a value they cannot read is the client's error, refused
+            # here rather than raised mid-query as a 500.
+            entries = _terms(name)
+            for entry in entries:
+                tag, sep, threshold = entry.rpartition(":")
+                try:
+                    readable = bool(sep and tag) and math.isfinite(float(threshold))
+                except ValueError:
+                    readable = False
+                if not readable:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Invalid {name}: each value must be tag:number",
+                    )
+            return entries or None
+
         return cls(
             format=qp.getlist("format") or None,
             min_score=_int_or_none("min_score"),
@@ -778,13 +957,13 @@ class PredicateFilter(BaseModel):
             favourite_only=is_truthy_flag(qp.get("favourite")),
             smart_score_bucket=qp.get("smart_score_bucket") or None,
             resolution_bucket=qp.get("resolution_bucket") or None,
-            comfyui_models_filter=qp.getlist("comfyui_model") or None,
-            comfyui_loras_filter=qp.getlist("comfyui_lora") or None,
-            tags_filter=qp.getlist("tag") or None,
-            tags_rejected_filter=qp.getlist("rejected_tag") or None,
+            comfyui_models_filter=_terms("comfyui_model") or None,
+            comfyui_loras_filter=_terms("comfyui_lora") or None,
+            tags_filter=_terms("tag") or None,
+            tags_rejected_filter=_terms("rejected_tag") or None,
             hidden_tags_filter=qp.getlist("hidden_tag") or None,
-            tags_confidence_above_filter=qp.getlist("tag_confidence_above") or None,
-            tags_confidence_below_filter=qp.getlist("tag_confidence_below") or None,
+            tags_confidence_above_filter=_confidence_entries("tag_confidence_above"),
+            tags_confidence_below_filter=_confidence_entries("tag_confidence_below"),
             face_filter=qp.get("face_filter") or None,
             stack_state=qp.get("stack_state") or None,
             impossible_sources=qp.getlist("impossible_tag_source") or None,

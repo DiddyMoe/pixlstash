@@ -1,4 +1,4 @@
-import { ref, computed, nextTick, onScopeDispose } from "vue";
+import { ref, computed, markRaw, nextTick, onScopeDispose } from "vue";
 import { isReadOnly, onSessionReset } from "../utils/apiClient";
 import {
   getPictureCount,
@@ -21,12 +21,16 @@ import {
   setCohesion,
   SET_SUGGEST_FALLBACK_THRESHOLD,
 } from "../utils/setSuggestionCut.js";
-import {
-  getPictureId,
-  PIL_IMAGE_EXTENSIONS,
-  VIDEO_EXTENSIONS,
-} from "../utils/media.js";
+import { getPictureId } from "../utils/media.js";
 import { debounce } from "../utils/utils";
+import {
+  appendFaceClusterParams,
+  appendMediaTypeParams,
+  appendUnassignedParams,
+  appendViewSelectionParams,
+  unassignedFilterOn,
+  viewQueryParams,
+} from "../utils/viewQueryParams.js";
 import {
   useFilterStore,
   workflowFilterParams,
@@ -84,7 +88,6 @@ export function useGridFetch(
     normalizedSelectedSetIds,
     hasSetSelection,
     isSetOverlapView,
-    isMultiCharacterView,
     primarySelectedSetId,
     smartScoreProgress,
     exportProgress,
@@ -109,6 +112,8 @@ export function useGridFetch(
     resetThumbnailState,
     triggerNewImageHighlight,
     updateVisibleThumbnails,
+    forgetThumbnailRangesFrom,
+    holdView,
     fetchThumbnailsBatch,
     startSmartScoreProgress,
     completeSmartScoreProgress,
@@ -163,6 +168,13 @@ export function useGridFetch(
   const lastFetchKey = ref("");
   const lastFetchError = ref({ key: "", at: 0 });
   const lastFetchSuccess = ref({ key: "", at: 0 });
+  // Whether the rows in lastFetchedGridImages show each stack as one card.
+  // The server lists every row of a view whose scope query asks for scrapped
+  // pictures (only_deleted, the Scrapheap), and stack leaders only elsewhere.
+  // Each load decides this once from its view and commits it together with
+  // its rows; the load's fold and every later rebuild read this one value
+  // (collapseStackImages in useStackOrdering), so no caller guesses it again.
+  const loadFoldsStacks = ref(true);
   const smartScoreLoadingVisible = computed(
     () =>
       !!getActiveSortKey() &&
@@ -270,162 +282,63 @@ export function useGridFetch(
     });
   }
 
+  // The view as `utils/viewQueryParams` reads it: the selection ImageGrid
+  // derives, the stores, and the folder facets above. The helpers below hand
+  // it to that module, so the grid's builders and the Details panel share one
+  // definition of the view's scope and filters.
+  function _gridView() {
+    return {
+      setIds: normalizedSelectedSetIds.value,
+      characterIds: normalizedSelectedCharacterIds.value,
+      selection: selectionStore,
+      project: projectStore,
+      filters: filterStore,
+      applyTagFilter: userPrefsStore.applyTagFilter,
+      referenceFolderId: referenceFolderIdFilter.value,
+      filePathPrefix: filePathPrefixFilter.value,
+      importSourceFolder: importSourceFolderFilter.value,
+      inboxPeriod: inboxPeriod.value,
+    };
+  }
+
   function _unassignedFilterOn() {
-    return !!(filterStore.noCharacterFilter || filterStore.noSetFilter);
+    return unassignedFilterOn(filterStore);
   }
 
-  /**
-   * "No character" and "In no set" are halves of one backend view,
-   * `character_id=UNASSIGNED`: both on is the whole of it (neither a person
-   * nor a set), one on narrows it with `unassigned_by`.
-   */
   function _setUnassignedParams(params) {
-    params.set("character_id", String(UNASSIGNED_PICTURES_ID));
-    if (!(filterStore.noCharacterFilter && filterStore.noSetFilter)) {
-      params.set(
-        "unassigned_by",
-        filterStore.noCharacterFilter ? "character" : "set",
-      );
-    }
+    appendUnassignedParams(params, filterStore);
   }
 
-  // The Likeness filter's cluster: only in one person's view, which is the
-  // only view whose clusters it numbers.
   function _appendFaceClusterParams(params) {
-    const pick = filterStore.faceClusterFilter;
-    if (!pick) return;
-    params.set("face_cluster", String(pick.cluster));
-    params.set("face_cluster_threshold", String(pick.threshold));
+    appendFaceClusterParams(params, filterStore.faceClusterFilter);
   }
 
-  function _appendSelectionParams(
-    params,
-    { unassignedOnly = true, faceCluster = true } = {},
-  ) {
-    if (hasSetSelection.value) {
-      if (isSetOverlapView.value) {
-        for (const setId of normalizedSelectedSetIds.value) {
-          params.append("set_ids", String(setId));
-        }
-        params.append(
-          "set_mode",
-          selectionStore.setMultiMode ?? "intersection",
-        );
-        if (
-          selectionStore.setMultiMode === "difference" &&
-          selectionStore.setDifferenceBaseId != null
-        ) {
-          params.append(
-            "base_set_id",
-            String(selectionStore.setDifferenceBaseId),
-          );
-        }
-        if (projectStore.projectViewMode === "project") {
-          // Derive effective project_id from per-set data; skip when sets span multiple projects.
-          const pidSet = new Set(
-            normalizedSelectedSetIds.value.map(
-              (id) => projectStore.setProjectIds?.[id] ?? null,
-            ),
-          );
-          if (pidSet.size === 1) {
-            const pid = [...pidSet][0];
-            params.append("project_id", pid != null ? pid : "UNASSIGNED");
-          }
-        }
-      } else if (primarySelectedSetId.value != null) {
-        params.append("set_id", String(primarySelectedSetId.value));
-        if (projectStore.projectViewMode === "project") {
-          params.append(
-            "project_id",
-            projectStore.selectedProjectId != null
-              ? projectStore.selectedProjectId
-              : "UNASSIGNED",
-          );
-        }
-      }
-    } else if (isMultiCharacterView.value) {
-      for (const charId of normalizedSelectedCharacterIds.value) {
-        params.append("character_ids", String(charId));
-      }
-      params.append(
-        "character_mode",
-        selectionStore.characterMultiMode ?? "union",
-      );
-      if (projectStore.projectViewMode === "project") {
-        // Derive effective project_id from per-character data; if all chars share
-        // the same project use it, if they span multiple projects skip the filter.
-        const pidSet = new Set(
-          normalizedSelectedCharacterIds.value.map(
-            (id) => projectStore.characterProjectIds?.[id] ?? null,
-          ),
-        );
-        if (pidSet.size === 1) {
-          const pid = [...pidSet][0];
-          params.append("project_id", pid != null ? pid : "UNASSIGNED");
-        }
-      }
-    } else if (
-      selectionStore.selectedCharacter !== undefined &&
-      selectionStore.selectedCharacter !== null &&
-      selectionStore.selectedCharacter !== "" &&
-      selectionStore.selectedCharacter !== ALL_PICTURES_ID
-    ) {
-      if (selectionStore.selectedCharacter === String(SCRAPHEAP_PICTURES_ID)) {
-        params.append("only_deleted", "true");
-      } else {
-        params.append("character_id", selectionStore.selectedCharacter);
-        if (faceCluster) _appendFaceClusterParams(params);
-        if (projectStore.projectViewMode === "project") {
-          params.append(
-            "project_id",
-            projectStore.selectedProjectId != null
-              ? projectStore.selectedProjectId
-              : "UNASSIGNED",
-          );
-        }
-      }
-    } else if (
-      selectionStore.selectedCharacter === ALL_PICTURES_ID &&
-      unassignedOnly &&
-      _unassignedFilterOn()
-    ) {
-      _setUnassignedParams(params);
-      if (projectStore.projectViewMode === "project") {
-        params.append(
-          "project_id",
-          projectStore.selectedProjectId != null
-            ? projectStore.selectedProjectId
-            : "UNASSIGNED",
-        );
-      }
-    } else if (
-      selectionStore.selectedCharacter === ALL_PICTURES_ID &&
-      projectStore.projectViewMode === "project"
-    ) {
-      params.append(
-        "project_id",
-        projectStore.selectedProjectId != null
-          ? projectStore.selectedProjectId
-          : "UNASSIGNED",
-      );
-    }
+  function _appendSelectionParams(params, options) {
+    appendViewSelectionParams(params, _gridView(), options);
   }
 
   function _appendMediaTypeParams(params) {
-    if (filterStore.mediaTypeFilter === "images") {
-      for (const ext of PIL_IMAGE_EXTENSIONS) {
-        params.append("format", ext.toUpperCase());
-      }
-    } else if (filterStore.mediaTypeFilter === "videos") {
-      for (const ext of VIDEO_EXTENSIONS) {
-        params.append("format", ext.toUpperCase());
-      }
-    }
+    appendMediaTypeParams(params, filterStore.mediaTypeFilter);
   }
 
+  /**
+   * The view's query, with the result pill's "In text" switch when the view is
+   * a text search and the switch is on. The grid's search sends this and an
+   * export of the view sends it too, so the server narrows both by one rule.
+   */
+  function searchViewQueryParams() {
+    const params = new URLSearchParams(buildPictureIdsQueryParams());
+    if (params.has("query") && searchStore.textMatchesOnly === true) {
+      params.set("text_match_only", "true");
+    }
+    return params.toString();
+  }
+
+  // The view's scope and filters (`utils/viewQueryParams`, which the Details
+  // panel's stats read uses too), then what only the list needs: its order,
+  // the text query in its place, and the fields a tile shows.
   function buildPictureIdsQueryParams() {
-    const params = new URLSearchParams();
-    _appendSelectionParams(params);
+    const params = viewQueryParams(_gridView());
     if (
       sortStore.selectedSort === "CHARACTER_LIKENESS" &&
       sortStore.selectedSimilarityCharacter
@@ -454,77 +367,6 @@ export function useGridFetch(
       }
     }
     params.append("fields", "grid");
-    _appendMediaTypeParams(params);
-    (filterStore.comfyuiModelFilter || []).forEach((m) =>
-      params.append("comfyui_model", m),
-    );
-    (filterStore.comfyuiLoraFilter || []).forEach((l) =>
-      params.append("comfyui_lora", l),
-    );
-    workflowFilterParams(filterStore.workflowFilter).forEach(([name, value]) =>
-      params.append(name, value),
-    );
-    if (filterStore.minScoreFilter != null) {
-      params.append("min_score", filterStore.minScoreFilter);
-    }
-    if (filterStore.maxScoreFilter != null) {
-      params.append("max_score", filterStore.maxScoreFilter);
-    }
-    if (filterStore.unscoredOnlyFilter) {
-      params.append("unscored", "1");
-    }
-    if (filterStore.favouriteOnlyFilter) {
-      params.append("favourite", "1");
-    }
-    if (filterStore.smartScoreBucketFilter != null) {
-      params.append("smart_score_bucket", filterStore.smartScoreBucketFilter);
-    }
-    if (filterStore.resolutionBucketFilter != null) {
-      params.append("resolution_bucket", filterStore.resolutionBucketFilter);
-    }
-    (filterStore.tagFilter || []).forEach((t) => params.append("tag", t));
-    (filterStore.tagRejectedFilter || []).forEach((t) =>
-      params.append("rejected_tag", t),
-    );
-    (filterStore.tagConfidenceAboveFilter || []).forEach((e) =>
-      params.append("tag_confidence_above", e),
-    );
-    (filterStore.tagConfidenceBelowFilter || []).forEach((e) =>
-      params.append("tag_confidence_below", e),
-    );
-    if (userPrefsStore.applyTagFilter) {
-      params.append("apply_tag_filter", "true");
-    }
-    if (referenceFolderIdFilter.value != null) {
-      params.append(
-        "reference_folder_id",
-        String(referenceFolderIdFilter.value),
-      );
-    }
-    if (filePathPrefixFilter.value != null) {
-      params.append("file_path_prefix", filePathPrefixFilter.value);
-    }
-    if (importSourceFolderFilter.value != null) {
-      params.append("import_source_folder", importSourceFolderFilter.value);
-    }
-    if (inboxPeriod.value) params.append("inbox", inboxPeriod.value);
-    if (filterStore.faceBboxFilter != null) {
-      params.append("face_filter", filterStore.faceBboxFilter);
-    }
-    (filterStore.impossibleSources || []).forEach((s) =>
-      params.append("impossible_tag_source", s),
-    );
-    // "all" is the absence of the filter, so it is expressed by omission rather
-    // than by a sentinel the backend would have to know a second spelling for.
-    if (
-      filterStore.stackStateFilter &&
-      filterStore.stackStateFilter !== "all"
-    ) {
-      params.append("stack_state", filterStore.stackStateFilter);
-    }
-    if (filterStore.sharedOnlyFilter) {
-      params.append("shared_only", "true");
-    }
     // For rejected-consent guests: pass the in-memory session ID so the backend
     // can overlay their scores for the current page session (no cookie available).
     if (
@@ -620,6 +462,11 @@ export function useGridFetch(
     );
     if (filterStore.faceBboxFilter != null) {
       params.append("face_filter", filterStore.faceBboxFilter);
+    }
+    // Why the untagged are untagged (the stats rail's rows). Every view's
+    // list and count must carry it, or the rail's row would narrow nothing.
+    if (filterStore.tagStateFilter != null) {
+      params.append("tag_state", filterStore.tagStateFilter);
     }
     (filterStore.impossibleSources || []).forEach((s) =>
       params.append("impossible_tag_source", s),
@@ -841,6 +688,9 @@ export function useGridFetch(
     // Filter params: face bbox filter
     if (filterStore.faceBboxFilter != null)
       _filterP.set("face_filter", String(filterStore.faceBboxFilter));
+    // Filter params: why the untagged are untagged (the stats rail's rows)
+    if (filterStore.tagStateFilter != null)
+      _filterP.set("tag_state", String(filterStore.tagStateFilter));
     // Filter params: impossible-tag sources (repeatable, OR'd)
     (filterStore.impossibleSources || []).forEach((s) =>
       _filterP.append("impossible_tag_source", s),
@@ -871,13 +721,83 @@ export function useGridFetch(
   // cancels its reads, and its promise. Null when no load is running.
   let inFlight = null;
 
+  // The pictures taken out of the grid while the running load still streams
+  // it in, by id, or null when no stream is running. removeImagesById reports
+  // them through noteRemovedDuringStream. A batch the server answered before
+  // the delete committed still lists them, and must not write them back.
+  let streamRemovedIds = null;
+
+  /**
+   * Tell the running stream that these pictures have left the grid, so no
+   * batch still to land writes them in again. Does nothing when no stream
+   * is running.
+   *
+   * @param {Array<number|string>} ids
+   */
+  function noteRemovedDuringStream(ids) {
+    if (!streamRemovedIds) return;
+    for (const id of ids) {
+      if (id != null) streamRemovedIds.add(String(id));
+    }
+  }
+
   // Cancel the running load and move the epoch on, so nothing it still has in
-  // flight can write into the grid or finalize a newer load's state.
+  // flight can write into the grid or finalize a newer load's state. Neither
+  // it nor a re-read queued behind it (runTrailingLoad) will reach its end,
+  // so no load is left to put back a place pending for its view.
   function cancelGridLoad() {
     const current = inFlight;
     inFlight = null;
     gridLoadEpoch.value += 1;
+    if (current && pendingScrollTop.value?.key === current.key) {
+      pendingScrollTop.value = null;
+    }
     current?.controller.abort();
+  }
+
+  // A scroll place: where a load that keeps the scroll puts the view back
+  // once its answer is in, for the view `key` it was recorded in.
+  // `pendingScrollTop` holds at most one. The loads of its view share it and
+  // the first to reach its end puts the view back there; a load of another
+  // view, a cancel, and a user scroll (ImageGrid) drop it. A load knows its
+  // place by identity, so the place is kept raw: a deep ref would hand back
+  // a reactive proxy that never equals the load's own object.
+  function newScrollPlace(key) {
+    return markRaw({ top: scrollWrapper.value.scrollTop, key });
+  }
+
+  /**
+   * Record where the view is now for the next load of this view to put back:
+   * the gridVersion refresh calls this, then clears the flag that says to
+   * keep the scroll before its debounced re-read runs.
+   */
+  function recordScrollPlace() {
+    pendingScrollTop.value = scrollWrapper.value
+      ? newScrollPlace(buildGridFetchKey())
+      : null;
+  }
+
+  /**
+   * The place the load this call starts for view `key` puts the view back
+   * to, or null.
+   *
+   * A place pending for the same view is shared, whatever the call's own
+   * flag says: the one the gridVersion refresh recorded (recordScrollPlace),
+   * or the one the running load of the view, or the re-read already queued
+   * behind it, holds. Whichever load reaches its end first puts it back, and
+   * only once. A place for another view is dropped, since the view it was
+   * recorded in is gone. Otherwise a call that keeps the scroll records where
+   * the view is now, and a call that does not gets none, so it cannot put the
+   * view back where a load it cancels began.
+   */
+  function claimScrollPlace(key, keepsScroll) {
+    const pending = pendingScrollTop.value;
+    if (pending?.key === key) return pending;
+    pendingScrollTop.value = null;
+    if (!keepsScroll || !scrollWrapper.value) return null;
+    const place = newScrollPlace(key);
+    pendingScrollTop.value = place;
+    return place;
   }
 
   // A credential change: the previous principal's load must never land, and
@@ -914,19 +834,13 @@ export function useGridFetch(
     // Capture scroll-preservation intent *synchronously* before any await so
     // that it is not affected by the gridVersion watcher clearing it later.
     const fetchStartedWithPreserveScroll = preserveScrollOnNextFetch.value;
-    if (
-      fetchStartedWithPreserveScroll &&
-      pendingScrollTop.value === null &&
-      scrollWrapper.value
-    ) {
-      pendingScrollTop.value = scrollWrapper.value.scrollTop;
-    }
     const fetchKey = buildGridFetchKey();
     const current = inFlight;
     if (current && current.key === fetchKey) {
       if (!force && join) return current.promise;
+      const place = claimScrollPlace(fetchKey, fetchStartedWithPreserveScroll);
       const runTrailing = () =>
-        runTrailingLoad(current, options, fetchStartedWithPreserveScroll);
+        runTrailingLoad(current, options, fetchStartedWithPreserveScroll, place);
       return current.promise.then(runTrailing, runTrailing);
     }
     const now = Date.now();
@@ -946,30 +860,53 @@ export function useGridFetch(
     ) {
       return undefined;
     }
-    return beginGridLoad(fetchKey, options, fetchStartedWithPreserveScroll);
+    return beginGridLoad(
+      fetchKey,
+      options,
+      fetchStartedWithPreserveScroll,
+      claimScrollPlace(fetchKey, fetchStartedWithPreserveScroll),
+    );
   }
 
   // The forced re-read behind `previous`, run once it settles. Every call for
   // its view that arrived while it ran and did not join lands here: the first
   // starts the re-read and the rest join it. Nothing runs once the view has
   // moved on or a session reset cancelled `previous`.
-  function runTrailingLoad(previous, options, fetchStartedWithPreserveScroll) {
+  function runTrailingLoad(
+    previous,
+    options,
+    fetchStartedWithPreserveScroll,
+    place,
+  ) {
     if (previous.controller.signal.aborted) return undefined;
     if (buildGridFetchKey() !== previous.key) return undefined;
-    if (inFlight?.key === previous.key) return inFlight.promise;
+    if (inFlight?.key === previous.key) {
+      // The re-read stands for every call that joins it, so a place one of
+      // them recorded is the re-read's to put back.
+      if (place && !inFlight.place) inFlight.place = place;
+      return inFlight.promise;
+    }
     return beginGridLoad(
       previous.key,
       { ...options, force: true },
       fetchStartedWithPreserveScroll,
+      place,
     );
   }
 
-  function beginGridLoad(fetchKey, options, fetchStartedWithPreserveScroll) {
+  function beginGridLoad(
+    fetchKey,
+    options,
+    fetchStartedWithPreserveScroll,
+    place,
+  ) {
     inFlight?.controller.abort();
     const record = {
       key: fetchKey,
       controller: new AbortController(),
       promise: null,
+      // The scroll place this load puts back at its end (claimScrollPlace).
+      place,
     };
     inFlight = record;
     record.promise = runGridLoad(
@@ -980,6 +917,119 @@ export function useGridFetch(
       if (inFlight === record) inFlight = null;
     });
     return record.promise;
+  }
+
+  // Which read fills the grid for the current settings: the first of these
+  // that applies, else the stream. A text search outranks the suggestion and
+  // likeness searches, and the likeness-groups sort outranks a text search.
+  // runGridLoad branches on it, and the reconnect read re-reads a view only
+  // while it is still in the mode it loaded in.
+  function currentFetchMode() {
+    if (sortStore.selectedSort === LIKENESS_GROUPS_SORT_KEY) {
+      return "likeness-groups";
+    }
+    if (searchStore.searchQuery?.trim()) return "text-search";
+    if (reverseImageSearchPictureIds?.value?.length) {
+      return "reverse-image-search";
+    }
+    if (faceSearchCharacter?.value?.id) return "character-face-search";
+    if (setSuggestSet?.value?.id) return "set-suggest-search";
+    if (faceLikenessSearchFaceId?.value) return "face-likeness-search";
+    return "stream";
+  }
+
+  // The suggestion lists as their sliders cut them.
+  function cutFaceView(ranked) {
+    return cutFaceSuggestions(
+      ranked,
+      faceSearchThreshold?.value ?? 0,
+      faceSearchMinRefs?.value ?? 1,
+    );
+  }
+
+  function cutSetView(ranked) {
+    return cutSetSuggestions(
+      ranked,
+      setSuggestThreshold?.value ?? 0,
+      setSuggestMinTags?.value ?? 0,
+    );
+  }
+
+  // A ranked search's grid rows, in rank order, less any picture the server
+  // no longer lists.
+  function inRankOrder(idOrder, rows) {
+    const picturesById = {};
+    for (const pic of rows) picturesById[pic.id] = pic;
+    return idOrder.map((id) => picturesById[id]).filter(Boolean);
+  }
+
+  async function rowsInRankOrder(idOrder, signal) {
+    if (!idOrder.length) return [];
+    const rows = await listPicturesByIds(idOrder, { fields: "grid", signal });
+    return inRankOrder(idOrder, Array.isArray(rows) ? rows : []);
+  }
+
+  // A reconnect read's answer must be a list: an empty one reads as "every
+  // card left", so a malformed one must not be taken for it.
+  function reconcileList(body, read) {
+    if (!Array.isArray(body)) {
+      throw new Error(`readIdListForReconcile: ${read} returned no list`);
+    }
+    return body;
+  }
+
+  /**
+   * Re-read the rows of an id-list view (the likeness groups, a text search,
+   * a suggestion or likeness search) for the reconnect reconcile: the read
+   * runGridLoad makes for the current mode, asked of the server rather than a
+   * cached ranked list, and writing nothing. Each of these reads returns the
+   * view's whole list. Rejects on an answer that is not a list.
+   *
+   * @param {{signal?: AbortSignal}} [options]
+   * @returns {Promise<Array<Object>>} the view's rows, in load order.
+   */
+  async function readIdListForReconcile({ signal } = {}) {
+    const mode = currentFetchMode();
+    if (mode === "likeness-groups") {
+      const data = await getLikenessGroups(
+        getStackThreshold(sortStore.stackThreshold),
+        buildLikenessGroupQueryParams(),
+        { signal },
+      );
+      return reconcileList(data, "the likeness-groups read");
+    }
+    if (mode === "text-search") {
+      const body = await searchPictures(searchStore.searchQuery.trim(), {
+        query: searchViewQueryParams(),
+        signal,
+      });
+      return reconcileList(body, "the text search");
+    }
+    let ranked;
+    if (mode === "reverse-image-search") {
+      ranked = await likenessSearch(reverseImageSearchPictureIds.value, {
+        signal,
+      });
+    } else if (mode === "character-face-search") {
+      ranked = await characterFaceSearch(faceSearchCharacter.value.id, {
+        signal,
+      });
+    } else if (mode === "set-suggest-search") {
+      ranked = await setLikenessSearch(setSuggestSet.value.id, { signal });
+    } else if (mode === "face-likeness-search") {
+      ranked = await faceSearch(faceLikenessSearchFaceId.value, { signal });
+    } else {
+      throw new Error(
+        `readIdListForReconcile: the ${mode} view is not an id-list view`,
+      );
+    }
+    ranked = reconcileList(ranked, `the ${mode}`);
+    if (mode === "character-face-search") ranked = cutFaceView(ranked);
+    if (mode === "set-suggest-search") ranked = cutSetView(ranked);
+    const idOrder = ranked.map((r) => r.picture_id);
+    if (!idOrder.length) return [];
+    const rows = await listPicturesByIds(idOrder, { fields: "grid", signal });
+    return inRankOrder(idOrder, reconcileList(rows, "the by-ids read"));
   }
 
   async function runGridLoad(record, options, fetchStartedWithPreserveScroll) {
@@ -1007,11 +1057,22 @@ export function useGridFetch(
       backgroundBatchCount: 0,
       postProcessMs: null,
     };
+    // The view the cards on screen were read for, so a stream load can tell a
+    // re-read of the same view (keep the cards until the new rows land) from
+    // a load of another view.
+    const previousFetchKey = lastFetchKey.value;
     lastFetchKey.value = fetchKey;
     const loadId = (gridLoadEpoch.value += 1);
     // False once a newer load, a session reset or teardown has taken the grid:
     // from then on this load must not write rows or state.
     const isCurrent = () => loadId === gridLoadEpoch.value;
+    // A stream load's set of pictures removed while it runs (see
+    // streamRemovedIds). Held here so the finally below can let go of it
+    // however the load ends: done, aborted, failed or superseded.
+    let loadRemovedIds = null;
+    // This load's place, taken out of pendingScrollTop by the finally below
+    // while it is still pending, for the end-of-load restore.
+    let placeToRestore = null;
     if (typeof onGridFetchStart === "function") {
       onGridFetchStart({
         loadId,
@@ -1065,29 +1126,9 @@ export function useGridFetch(
     try {
       let images = [];
 
-      const _hasSearch = !!searchStore.searchQuery?.trim();
-      const _isLikenessSort =
-        sortStore.selectedSort === LIKENESS_GROUPS_SORT_KEY;
-      const _hasReverseImageSearch =
-        !_hasSearch && !!reverseImageSearchPictureIds?.value?.length;
-      const _hasCharacterFaceSearch =
-        !_hasSearch &&
-        !_hasReverseImageSearch &&
-        !!faceSearchCharacter?.value?.id;
-      const _hasSetSuggestSearch =
-        !_hasSearch &&
-        !_hasReverseImageSearch &&
-        !_hasCharacterFaceSearch &&
-        !!setSuggestSet?.value?.id;
-      const _hasFaceLikenessSearch =
-        !_hasSearch &&
-        !_hasReverseImageSearch &&
-        !_hasCharacterFaceSearch &&
-        !_hasSetSuggestSearch &&
-        !!faceLikenessSearchFaceId?.value;
-
-      if (_isLikenessSort) {
-        fetchMode = "likeness-groups";
+      fetchMode = currentFetchMode();
+      const foldsStacks = !viewQueryParams(_gridView()).has("only_deleted");
+      if (fetchMode === "likeness-groups") {
         const threshold = getStackThreshold(sortStore.stackThreshold);
         const likenessGroupParams = buildLikenessGroupQueryParams();
         const data = await getLikenessGroups(threshold, likenessGroupParams, {
@@ -1113,8 +1154,7 @@ export function useGridFetch(
               typeof stackIndex === "number" ? getStackColor(stackIndex) : null,
           };
         });
-      } else if (_hasCharacterFaceSearch) {
-        fetchMode = "character-face-search";
+      } else if (fetchMode === "character-face-search") {
         // "Suggest more pictures of <person>" (#636): query with the character's
         // reference faces, and let BOTH suggestion sliders re-cut the SAME
         // ranked list. The ranked refs and their picture rows are both cached
@@ -1138,15 +1178,10 @@ export function useGridFetch(
           return;
         }
         const rowsById = faceSearchRanked?.value?.rowsById ?? {};
-        images = cutFaceSuggestions(
-          ranked,
-          faceSearchThreshold?.value ?? 0,
-          faceSearchMinRefs?.value ?? 1,
-        )
+        images = cutFaceView(ranked)
           .map((r) => rowsById[r.picture_id])
           .filter(Boolean);
-      } else if (_hasSetSuggestSearch) {
-        fetchMode = "set-suggest-search";
+      } else if (fetchMode === "set-suggest-search") {
         // "Suggest more pictures for <set>" (#1489): the same cached-ranked-list
         // shape as the person search above, so neither slider costs a round
         // trip. Only a change of set (or an explicit force) refetches.
@@ -1182,84 +1217,48 @@ export function useGridFetch(
           record.key = buildGridFetchKey();
         }
         const rowsById = setSuggestRanked?.value?.rowsById ?? {};
-        images = cutSetSuggestions(
-          ranked,
-          setSuggestThreshold?.value ?? 0,
-          setSuggestMinTags?.value ?? 0,
-        )
+        images = cutSetView(ranked)
           .map((r) => rowsById[r.picture_id])
           .filter(Boolean);
-      } else if (_hasFaceLikenessSearch) {
-        fetchMode = "face-likeness-search";
+      } else if (fetchMode === "face-likeness-search") {
         // Face likeness search: POST to face-search with source_face_id.
         const queryFaceId = faceLikenessSearchFaceId.value;
         const faceResultsRaw = await faceSearch(queryFaceId, { signal });
         const faceResults = Array.isArray(faceResultsRaw) ? faceResultsRaw : [];
-        if (!faceResults.length) {
-          images = [];
-        } else {
-          const idOrder = faceResults.map((r) => r.picture_id);
-          const rows = await listPicturesByIds(idOrder, {
-            fields: "grid",
-            signal,
-          });
-          const picturesById = {};
-          for (const pic of Array.isArray(rows) ? rows : []) {
-            picturesById[pic.id] = pic;
-          }
-          images = idOrder.map((id) => picturesById[id]).filter(Boolean);
-        }
-      } else if (_hasReverseImageSearch) {
-        fetchMode = "reverse-image-search";
+        images = await rowsInRankOrder(
+          faceResults.map((r) => r.picture_id),
+          signal,
+        );
+      } else if (fetchMode === "reverse-image-search") {
         // Reverse image search: POST to likeness-search with stored CLIP embeddings.
         // Multiple IDs are combined with min similarity (must match all sources).
         const queryPicIds = reverseImageSearchPictureIds.value;
         const likenessRaw = await likenessSearch(queryPicIds, { signal });
         const likenessResults = Array.isArray(likenessRaw) ? likenessRaw : [];
-        if (!likenessResults.length) {
-          images = [];
-        } else {
-          const idOrder = likenessResults.map((r) => r.picture_id);
-          const rows = await listPicturesByIds(idOrder, {
-            fields: "grid",
-            signal,
-          });
-          const picturesById = {};
-          for (const pic of Array.isArray(rows) ? rows : []) {
-            picturesById[pic.id] = pic;
-          }
-          images = idOrder.map((id) => picturesById[id]).filter(Boolean);
-        }
-      } else if (_hasSearch) {
-        fetchMode = "text-search";
+        images = await rowsInRankOrder(
+          likenessResults.map((r) => r.picture_id),
+          signal,
+        );
+      } else if (fetchMode === "text-search") {
         // Use /pictures/search endpoint for text search
-        const params = buildPictureIdsQueryParams();
+        // The "In text" switch is the search's to apply, so the grid and an
+        // export of this view (viewExportQuery) narrow by the same rule.
+        const params = searchViewQueryParams();
         const searchText = searchStore.searchQuery.trim();
-        const cacheKey = `${searchText}\u0000${params}`;
-        // The "In text" switch narrows the response already on screen, so its
-        // re-cut reuses the rows instead of searching again. Only that re-cut
-        // does: any other fetch (a filter, an edit, a forced reload) re-searches.
-        const cached = textSearchResults?.value;
-        let rows =
-          options?.textMatchRecut === true && cached?.key === cacheKey
-            ? cached.rows
-            : null;
-        if (!rows) {
-          const body = await searchPictures(searchText, {
-            query: params,
-            signal,
-          });
-          rows = Array.isArray(body) ? body : [];
-          if (textSearchResults && isCurrent()) {
-            textSearchResults.value = { key: cacheKey, query: searchText, rows };
-          }
+        const body = await searchPictures(searchText, {
+          query: params,
+          signal,
+        });
+        const rows = Array.isArray(body) ? body : [];
+        if (textSearchResults && isCurrent()) {
+          textSearchResults.value = {
+            key: `${searchText}\u0000${params}`,
+            query: searchText,
+            rows,
+          };
         }
-        images =
-          searchStore.textMatchesOnly === true
-            ? rows.filter((row) => row?.text_match === true)
-            : rows;
+        images = rows;
       } else {
-        fetchMode = "stream";
         // Lightbox open: the streaming path rebuilds a placeholder grid and
         // re-fills allGridImages from the (now possibly narrower) filter query,
         // which would drop the picture being viewed out of the grid mid-session.
@@ -1275,6 +1274,9 @@ export function useGridFetch(
             completeSmartScoreProgress(loadId, 0, false);
           return;
         }
+        // The stream leaves the scroll where it is (each removal it makes
+        // above the view is held as it lands): none of its returns reach the
+        // end-of-load restore, and the finally below lets its place go.
         // Streaming: COUNT(*) → placeholder grid → parallel first/last batches → background fill.
         //   1. Fast SELECT COUNT(*) → total
         //   2. Pre-build placeholder grid so END key works before streaming starts
@@ -1321,6 +1323,12 @@ export function useGridFetch(
           };
         }
 
+        // The cards on screen when a re-read of the same view swapped in its
+        // placeholder grid, by picture id, or null. Their thumbnails and faces
+        // go to the same picture's new cell, wherever it now sits, so a card
+        // that stays keeps its bitmap instead of blanking and loading again.
+        let carryById = null;
+
         // Write raw picture metadata into the placeholder grid at `offset`,
         // preserving thumbnail/face data for cells already loaded. Each row
         // replaces the cell at its own index, in place, so a batch costs its
@@ -1328,33 +1336,96 @@ export function useGridFetch(
         // write reaches what reads the grid's rows, not a watcher of the grid
         // array itself, which fires only when the array is replaced. Returns
         // the rows written.
+        const writeRow = (grid, idx, pic) => {
+          const existing =
+            (pic?.id != null ? carryById?.get(String(pic.id)) : null) ??
+            grid[idx];
+          const row = {
+            ...pic,
+            idx,
+            thumbnail: existing?.thumbnail ?? null,
+            faces: existing?.faces ?? [],
+            penalised_tags: existing?.penalised_tags ?? [],
+            thumbnail_width: pic.thumbnail_width ?? existing?.thumbnail_width,
+            thumbnail_height: pic.thumbnail_height ?? existing?.thumbnail_height,
+            square_crop_x: pic.square_crop_x ?? existing?.square_crop_x,
+            square_crop_y: pic.square_crop_y ?? existing?.square_crop_y,
+            square_crop_side: pic.square_crop_side ?? existing?.square_crop_side,
+          };
+          grid[idx] = row;
+          return row;
+        };
         const splicePictures = (pictures, offset) => {
           const grid = allGridImages.value;
           const written = [];
           for (let i = 0; i < pictures.length; i++) {
             const idx = offset + i;
             if (idx >= grid.length) break;
-            const pic = pictures[i];
-            const existing = grid[idx];
-            const row = {
-              ...pic,
-              idx,
-              thumbnail: existing?.thumbnail ?? null,
-              faces: existing?.faces ?? [],
-              penalised_tags: existing?.penalised_tags ?? [],
-              thumbnail_width: pic.thumbnail_width ?? existing?.thumbnail_width,
-              thumbnail_height:
-                pic.thumbnail_height ?? existing?.thumbnail_height,
-              square_crop_x: pic.square_crop_x ?? existing?.square_crop_x,
-              square_crop_y: pic.square_crop_y ?? existing?.square_crop_y,
-              square_crop_side:
-                pic.square_crop_side ?? existing?.square_crop_side,
-            };
-            grid[idx] = row;
-            written.push(row);
+            written.push(writeRow(grid, idx, pictures[i]));
           }
           return written;
         };
+
+        // The first run of placeholders after the loaded rows, as
+        // [start, end), looking at most `span` cells into it. `hint` is where
+        // the last batch stopped: still the run's start unless something
+        // (a delete, a stack folding up) moved rows since, and then the grid
+        // is read from the top. Null when no placeholder is left.
+        const findGap = (grid, hint, span) => {
+          let start = hint;
+          const hintHolds =
+            start > 0 &&
+            start < grid.length &&
+            grid[start - 1]?.id != null &&
+            grid[start]?.id == null;
+          if (!hintHolds) {
+            start = 0;
+            while (start < grid.length && grid[start]?.id != null) start += 1;
+          }
+          if (start >= grid.length) return null;
+          const stop = Math.min(grid.length, start + span);
+          let end = start;
+          while (end < stop && grid[end]?.id == null) end += 1;
+          return { start, end };
+        };
+
+        // Take the placeholders [from, to) out of the grid: their rows are not
+        // on the server. The cells after them move up, so the thumbnail
+        // ranges from `from` on, which are by slot, are forgotten (all of
+        // them, not only the visible window's: a loaded range further down
+        // would otherwise count rows loaded that moved into it). The cells
+        // can sit above the view (a viewport batch loaded further down), so
+        // the drop goes through the grid's hold, which scrolls up by the
+        // rows they took the way a removal above the view does.
+        const dropPlaceholders = (from, to) => {
+          holdView(
+            (_img, i) => i >= from && i < to,
+            () => {
+              const grid = allGridImages.value;
+              const next = grid.slice(0, from);
+              for (let i = to; i < grid.length; i++) {
+                const img = grid[i];
+                const idx = next.length;
+                next.push(img.idx === idx ? img : { ...img, idx });
+              }
+              allGridImages.value = next;
+              if (visibleEnd.value > next.length) {
+                visibleEnd.value = next.length;
+              }
+              if (visibleStart.value > visibleEnd.value) {
+                visibleStart.value = visibleEnd.value;
+              }
+            },
+          );
+          forgetThumbnailRangesFrom(from);
+        };
+
+        // Removals are tracked from before the count: the old cards stay on
+        // screen while it is read, and a picture deleted then can still be
+        // listed by any answer the server gives before the delete commits.
+        const removedIds = new Set();
+        loadRemovedIds = removedIds;
+        streamRemovedIds = removedIds;
 
         // 1. Fast total count - single indexed SQL query.
         const countStartedAt = getNowMs();
@@ -1394,16 +1465,39 @@ export function useGridFetch(
           cols,
           _viewportItemCount0 || divisibleViewWindow.value || cols,
         );
-        resetThumbnailState();
-        allGridImages.value = Array.from({ length: total }, (_, i) => ({
-          id: null,
-          idx: i,
-        }));
-        const streamGrid = allGridImages.value;
-        if (!fetchStartedWithPreserveScroll) {
-          visibleStart.value = 0;
-          visibleEnd.value = Math.min(total, windowCount);
-        }
+        // Stale-while-revalidate: a re-read of the view already on screen (the
+        // refetch after a delete, a run's end, a realtime change) keeps its
+        // cards until the first batch has answered, then swaps in one step.
+        // Laying the placeholders down at the count blanked every card for the
+        // first batch's round trip and reloaded every thumbnail after it. A
+        // load of another view, or a view that has nothing yet, lays them down
+        // at once so its size shows before any row. An answered empty view is
+        // written at once either way: the server has said the cards are gone.
+        const revalidating =
+          previousFetchKey === fetchKey &&
+          total > 0 &&
+          allGridImages.value.some((img) => img?.id != null);
+        let streamGrid = null;
+        const writePlaceholderGrid = () => {
+          carryById = revalidating
+            ? new Map(
+                allGridImages.value
+                  .filter((img) => img?.id != null)
+                  .map((img) => [String(img.id), img]),
+              )
+            : null;
+          resetThumbnailState();
+          allGridImages.value = Array.from({ length: total }, (_, i) => ({
+            id: null,
+            idx: i,
+          }));
+          streamGrid = allGridImages.value;
+          if (!fetchStartedWithPreserveScroll) {
+            visibleStart.value = 0;
+            visibleEnd.value = Math.min(total, windowCount);
+          }
+        };
+        if (!revalidating) writePlaceholderGrid();
         gridReady.value = true; // render placeholder grid immediately
         fetchPhaseTimings.placeholderMs = Math.max(
           0,
@@ -1438,11 +1532,6 @@ export function useGridFetch(
         const TAIL_THRESHOLD = 1000;
         const shouldFetchTailEarly =
           total > FIRST_BATCH && backgroundGap > TAIL_THRESHOLD;
-        // Effective end of the background region: extends to `total` when we
-        // skip the early tail so every item is eventually fetched.
-        const lastBatchStart = shouldFetchTailEarly
-          ? potentialLastBatchStart
-          : total;
 
         // Kick off the first batch and the optional tail batch concurrently, but
         // do NOT block visible-thumbnail loading on the tail (which fills
@@ -1476,12 +1565,69 @@ export function useGridFetch(
           (error) => ({ error }),
         );
 
+        // A re-read that keeps the scroll position where the first batch does
+        // not reach (a delete's refetch at row 1,500) also asks for the rows
+        // on screen, with a viewport's margin each side, alongside the first
+        // batch, and swaps both in at once: the viewport keeps its cards
+        // across the swap instead of turning to placeholders until the
+        // background stream reaches them. The rows go in at their offsets; the
+        // stream fills the runs on either side of them, each from the loaded
+        // row before it.
+        const windowSpan = divisibleViewWindow.value || windowCount;
+        const viewStart = Math.max(
+          FIRST_BATCH,
+          Math.min(visibleStart.value, total) - windowSpan,
+        );
+        const viewEnd = Math.min(
+          total,
+          viewStart + BG_BATCH,
+          visibleEnd.value + windowSpan,
+        );
+        const viewReqPromise =
+          revalidating &&
+          fetchStartedWithPreserveScroll &&
+          visibleEnd.value > FIRST_BATCH &&
+          viewEnd > viewStart
+            ? timeRequest(
+                streamPictures(streamQuery, {
+                  offset: viewStart,
+                  batchLimit: viewEnd - viewStart,
+                  signal,
+                }),
+              ).then(
+                (result) => ({ result }),
+                (error) => ({ error }),
+              )
+            : null;
+
         const firstResTimed = await firstReqPromise;
         if (!isCurrent()) return;
         fetchPhaseTimings.firstBatchMs = firstResTimed?.elapsedMs ?? null;
+        const viewOutcome = viewReqPromise ? await viewReqPromise : null;
+        if (!isCurrent()) return;
+        if (viewOutcome?.error) throw viewOutcome.error;
 
-        const firstPics = firstResTimed?.body?.pictures ?? [];
+        // A picture taken out while these were out is not written: the server
+        // may have read it before the change committed. The cell it leaves is
+        // filled, or dropped, by the background stream.
+        const notRemoved = (pic) => !removedIds.has(String(pic?.id));
+        const firstPics = (firstResTimed?.body?.pictures ?? []).filter(
+          notRemoved,
+        );
+        if (revalidating) writePlaceholderGrid();
         splicePictures(firstPics, 0);
+        if (viewOutcome) {
+          // A row the first batch holds already is one that moved up across
+          // the join (a delete above it between the two reads): the rows after
+          // it go up with it.
+          const firstIds = new Set(firstPics.map((pic) => String(pic?.id)));
+          splicePictures(
+            (viewOutcome.result?.body?.pictures ?? []).filter(
+              (pic) => notRemoved(pic) && !firstIds.has(String(pic?.id)),
+            ),
+            viewStart,
+          );
+        }
         hasLoadedOnce.value = true;
         initialRender.value = false;
         const prefetchEnd = Math.min(
@@ -1522,8 +1668,24 @@ export function useGridFetch(
         const lastResTimed = tailOutcome.result;
         fetchPhaseTimings.tailBatchMs = lastResTimed?.elapsedMs ?? null;
         if (lastResTimed?.body) {
-          const lastPics = lastResTimed?.body?.pictures ?? [];
-          splicePictures(lastPics, potentialLastBatchStart);
+          // The tail is the end of the list in whichever state the server
+          // read it: a delete above it while it was out shortens the grid and
+          // the server's list alike, and an answer read before the delete
+          // committed still ends at the list's end. So it fills the grid's
+          // last cells, less any picture taken out since.
+          // Nor a row the grid holds already (the viewport's rows, read
+          // separately, can reach into the tail).
+          const inGrid = new Set();
+          for (const img of allGridImages.value) {
+            if (img?.id != null) inGrid.add(String(img.id));
+          }
+          const lastPics = (lastResTimed?.body?.pictures ?? []).filter(
+            (pic) => notRemoved(pic) && !inGrid.has(String(pic?.id)),
+          );
+          splicePictures(
+            lastPics,
+            Math.max(0, allGridImages.value.length - lastPics.length),
+          );
         }
 
         lastFetchSuccess.value = { key: fetchKey, at: Date.now() };
@@ -1534,29 +1696,114 @@ export function useGridFetch(
         lastFetchedGridImages.value = allGridImages.value.filter(
           (img) => img && img.id != null,
         );
+        loadFoldsStacks.value = foldsStacks;
         const streamFetched = lastFetchedGridImages.value;
 
-        // 4. Background stream: fill remaining items sequentially after first
-        // batch is rendered.  Sequential (not parallel) to avoid DB contention
-        // that would slow the already-visible first-batch response.
-        let bgOff = FIRST_BATCH;
-        while (bgOff < lastBatchStart) {
+        // 4. Background stream: fill the placeholders left between the first
+        // batch and the tail, one request at a time (in parallel they contend
+        // in the database with the first batch, which is on screen).
+        //
+        // Each request is worked out from the grid as it is when it goes, and
+        // each answer is placed by picture id, not by the offset it was asked
+        // at. A delete while a request is out takes rows from the grid and
+        // moves every cell after them up, and the server may answer from the
+        // list before the delete or after it. So each request starts one row
+        // early, at the last loaded row before the run (the anchor), and its
+        // rows go into the grid from the one after the anchor, wherever the
+        // anchor sits in the answer. An answer without it is asked again from
+        // further back. The loaded row after the run ends it: an answer that
+        // reaches that row before the run is full shows that the cells left
+        // held pictures that are gone (one removed before its row arrived), and
+        // they go, as do the cells an exhausted list cannot fill.
+        const placedIds = new Set();
+        for (const img of allGridImages.value) {
+          if (img?.id != null) placedIds.add(String(img.id));
+        }
+        let fillFrom = FIRST_BATCH;
+        let lookback = 1;
+        while (true) {
           if (!isCurrent()) return;
-          const limit = Math.min(BG_BATCH, lastBatchStart - bgOff);
+          const askGrid = allGridImages.value;
+          const ask = findGap(askGrid, fillFrom, BG_BATCH + 1);
+          if (!ask) break;
+          const back = Math.min(lookback, ask.start);
+          const reachesNext =
+            ask.end < askGrid.length && askGrid[ask.end]?.id != null ? 1 : 0;
+          const limit = Math.min(
+            BG_BATCH,
+            back + (ask.end - ask.start) + reachesNext,
+          );
           const bgResTimed = await timeRequest(
             streamPictures(streamQuery, {
-              offset: bgOff,
+              offset: ask.start - back,
               batchLimit: limit,
               signal,
             }),
           );
           if (!isCurrent()) return;
-          const bgOffset = bgOff;
-          bgOff += limit;
           const bgNetworkElapsedMs = bgResTimed.elapsedMs;
           const bgUiStartedAt = getNowMs();
           const bgPics = bgResTimed?.body?.pictures ?? [];
-          const bgRows = splicePictures(bgPics, bgOffset);
+          const grid = allGridImages.value;
+          const gap = findGap(grid, fillFrom, bgPics.length + 1);
+          if (!gap) break;
+          // Where the answer's new rows begin: after the anchor, or after the
+          // nearest loaded row before the run that the answer holds.
+          const answerAt = new Map();
+          bgPics.forEach((pic, i) => answerAt.set(String(pic?.id), i));
+          let from = gap.start === 0 && ask.start === back ? 0 : -1;
+          const lowest = Math.max(0, gap.start - back);
+          for (let k = gap.start - 1; from < 0 && k >= lowest; k -= 1) {
+            const at = answerAt.get(String(grid[k].id));
+            if (at !== undefined) from = at + 1;
+          }
+          if (from < 0) {
+            if (gap.start > 0 && (back >= gap.start || back * 2 > BG_BATCH / 2)) {
+              console.error(
+                "[useGridFetch] A background batch never lined up with the grid; the rest of the view is not loaded.",
+                { offset: ask.start - back, limit, gapStart: gap.start },
+              );
+              break;
+            }
+            lookback = back * 2 || 1;
+            continue;
+          }
+          lookback = 1;
+          const nextId =
+            gap.end < grid.length && grid[gap.end]?.id != null
+              ? String(grid[gap.end].id)
+              : null;
+          const bgOffset = gap.start;
+          const bgRows = [];
+          let reachedNext = false;
+          let w = gap.start;
+          for (let i = from; i < bgPics.length && w < gap.end; i += 1) {
+            const id = String(bgPics[i]?.id);
+            if (id === nextId) {
+              reachedNext = true;
+              break;
+            }
+            if (placedIds.has(id) || removedIds.has(id)) continue;
+            bgRows.push(writeRow(grid, w, bgPics[i]));
+            placedIds.add(id);
+            w += 1;
+          }
+          fillFrom = w;
+          const listEnded = bgPics.length < limit;
+          if (w < gap.end && (reachedNext || listEnded || w === gap.start)) {
+            // The run cannot fill any further. Its end, which `gap` may not
+            // have looked as far as when the list has run out.
+            let runEnd = gap.end;
+            while (runEnd < grid.length && grid[runEnd]?.id == null) runEnd += 1;
+            if (removedIds.size === 0) {
+              console.warn(
+                "[useGridFetch] The stream holds fewer rows than the count; dropping",
+                runEnd - w,
+                "placeholder cells.",
+              );
+            }
+            dropPlaceholders(w, runEnd);
+          }
           updateVisibleThumbnails();
           // Keep lastFetchedGridImages current so deletes during streaming work.
           // While both lists are still the ones this load wrote, the batch's
@@ -1641,6 +1888,7 @@ export function useGridFetch(
         return;
       }
       lastFetchedGridImages.value = Array.isArray(images) ? images.slice() : [];
+      loadFoldsStacks.value = foldsStacks;
       syncExpandAllStacksFromFetchedImages();
       images = collapseStackImages(images);
       const shouldHighlight = highlightNextFetch.value && hasLoadedOnce.value;
@@ -1775,6 +2023,20 @@ export function useGridFetch(
         completeSmartScoreProgress(loadId, elapsedMs, false);
       }
     } finally {
+      // The stream's batches are all in, or will never land: stop tracking
+      // removals for it, unless a newer load has put its own set there.
+      if (loadRemovedIds && streamRemovedIds === loadRemovedIds) {
+        streamRemovedIds = null;
+      }
+      // However the load ends it lets go of its place; only a load that runs
+      // to the end below puts the view back there. A place that is no longer
+      // pending was dropped (a user scroll, a newer load, a refresh that does
+      // not keep the scroll) or already put back by the load it was shared
+      // with, and is not this load's to restore.
+      if (record.place && pendingScrollTop.value === record.place) {
+        placeToRestore = record.place;
+        pendingScrollTop.value = null;
+      }
       if (typeof onGridFetchDone === "function") {
         onGridFetchDone({
           loadId,
@@ -1795,9 +2057,8 @@ export function useGridFetch(
     if (!initialRender.value) {
       updateVisibleThumbnails();
     }
-    if (pendingScrollTop.value !== null && scrollWrapper.value) {
-      const targetTop = pendingScrollTop.value;
-      pendingScrollTop.value = null;
+    if (placeToRestore && scrollWrapper.value) {
+      const targetTop = placeToRestore.top;
       nextTick(() => {
         if (!scrollWrapper.value) return;
         const maxScroll =
@@ -1916,13 +2177,20 @@ export function useGridFetch(
     lastFetchKey,
     lastFetchError,
     lastFetchSuccess,
+    loadFoldsStacks,
     smartScoreLoadingVisible,
     buildGridFetchKey,
     buildPictureIdsQueryParams,
+    buildStreamSelectionSuffix,
+    searchViewQueryParams,
     buildFilterCountBaseQuery,
     buildLikenessGroupQueryParams,
+    currentFetchMode,
+    readIdListForReconcile,
     fetchAllGridImages,
     fetchAllPicturesCount,
     debouncedFetchAllGridImages,
+    noteRemovedDuringStream,
+    recordScrollPlace,
   };
 }

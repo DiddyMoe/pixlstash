@@ -1,10 +1,10 @@
 from sqlmodel import Session
 
 from .base_task_finder import BaseTaskFinder
+from .likeness_parameters_task import LikenessParametersTask
 from .likeness_task import LikenessTask
 from pixlstash.database import DBPriority
-from pixlstash.utils.likeness.likeness_parameter_utils import LikenessParameterUtils
-from pixlstash.utils.likeness.likeness_utils import LikenessUtils, BulkCandidateArrays
+from pixlstash.utils.likeness.likeness_utils import BulkCandidateArrays
 from pixlstash.pixl_logging import get_logger
 
 logger = get_logger(__name__)
@@ -24,16 +24,24 @@ class MissingLikenessFinder(BaseTaskFinder):
         super().__init__()
         self._db = database
         self._bulk_cache: BulkCandidateArrays | None = None
+        # Whether this finder has already offered the first-sweep seed. See
+        # ``find_task``: without it a library whose candidates yield no pair
+        # would be "pending" forever.
+        self._seed_offered = False
 
     def finder_name(self) -> str:
         return "MissingLikenessFinder"
 
     def find_task(self):
-        # Block pairs until *all* findable parameter work is done.
-        has_pending = self._db.run_immediate_read_task(
-            LikenessParameterUtils.has_pending_work
+        # Block pairs until *all* findable parameter work is done: the count
+        # the parameter stage's progress row shows, so a picture that stage
+        # will never take (in the Scrapheap, or unprocessable and without a
+        # quality score) cannot hold this one back.
+        suppressed_ids = self._suppressed_picture_ids()
+        pending = self._db.run_immediate_read_task(
+            LikenessParametersTask.count_pending, suppressed_ids
         )
-        if has_pending:
+        if pending:
             return None
 
         queue_count, candidate_count, pair_count = self._db.run_immediate_read_task(
@@ -53,8 +61,19 @@ class MissingLikenessFinder(BaseTaskFinder):
         # Without this guard, the finder spams "building bulk candidate cache…"
         # every planning cycle whenever newly-enqueued pictures lack the other
         # two fields (build_bulk_arrays returns None → cache stays None → loop).
+        #
+        # Work is a queued candidate. An empty likeness table with nothing
+        # queued is ALSO work, once: it is a library's first sweep, which
+        # ``seed_queue`` fills. Only once per finder, because a sweep may write
+        # no pair at all (a single candidate has nothing to pair with, and the
+        # gap thresholds can reject every pair of a few dissimilar ones), and
+        # "no pairs" would then read as "not swept yet" on every cycle: a
+        # LikenessTask over an empty queue, forever. Every later change that
+        # needs likeness (new embeddings, a parameter reset) enqueues its
+        # pictures, so the queue alone carries the rest.
+        first_sweep = int(pair_count or 0) == 0 and not self._seed_offered
         has_work = int(candidate_count or 0) > 0 and (
-            int(queue_count or 0) > 0 or int(pair_count or 0) == 0
+            int(queue_count or 0) > 0 or first_sweep
         )
         if not has_work:
             # Sweep done - drop the cache so the next sweep gets fresh data.
@@ -65,11 +84,12 @@ class MissingLikenessFinder(BaseTaskFinder):
         if self._bulk_cache is None:
             # Seed the queue once at the start of a new sweep.
             self._db.result_or_throw(
-                self._db.submit_task(LikenessUtils.seed_queue, priority=DBPriority.LOW)
+                self._db.submit_task(LikenessTask.seed_queue, priority=DBPriority.LOW)
             )
+            self._seed_offered = True
             logger.info("MissingLikenessFinder: building bulk candidate cache…")
             self._bulk_cache = self._db.run_immediate_read_task(
-                LikenessUtils.build_bulk_arrays
+                LikenessTask.build_bulk_arrays
             )
             if self._bulk_cache is None:
                 return None

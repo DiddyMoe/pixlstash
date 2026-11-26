@@ -8,12 +8,11 @@ Phase 2 §4.6). Smart-score computation lives in the sibling
 
 import struct
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
 
 import numpy as np
-from sqlalchemy import and_, asc, desc, exists, func, or_, text
+from sqlalchemy import and_, asc, case, desc, exists, func, literal, or_, text
 from sqlalchemy.orm import aliased
+from sqlalchemy.sql import Select
 from sqlmodel import Session, select
 
 from pixlstash.database import DBPriority
@@ -28,7 +27,7 @@ from pixlstash.db_models import (
 from pixlstash.services.face_clusters import reference_cluster_faces
 from pixlstash.utils.quality.smart_score_utils import smart_score_penalised_tags
 from pixlstash.utils.service.filter_helpers import combine_likeness_scores
-from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.pixl_logging import get_logger
 
 logger = get_logger(__name__)
@@ -43,12 +42,18 @@ def select_reference_faces_for_character(
 
     With a reference cluster (``services/face_clusters.py``) the references
     are the person's faces on it, most central first. Without one: 5-star
-    pictures, then 4-star, then the rest, oldest first.
+    pictures, then 4-star, then the rest ranked by how many penalised tags
+    their picture carries, each stage oldest picture first, then picture id,
+    then face id.
 
-    The rest can be every face of a person on tens of thousands of pictures,
-    so it is ranked on face ids and picture dates alone, its tags are read
-    through a subquery rather than a list of picture ids (SQLite caps the
-    parameters one statement binds), and only the faces picked are loaded.
+    Every stage is one ``LIMIT``ed statement. SQLite (no ``ANALYZE``
+    statistics here) drives the two rated stages from the score range of
+    ``ix_picture_grid_score`` and the rest from the person's faces; measured
+    on a 60k-face person and on a library of 60k 5-star pictures, that beats
+    forcing the face-driven plan for every stage (docs/backend_architecture.md
+    §25.30). The rest is ranked in SQL with a per-picture penalised-tag
+    weight, so only the faces picked are loaded, never the person's whole
+    face list.
     No stage loads ``Picture`` rows, whose embeddings are not deferred.
 
     Args:
@@ -74,12 +79,15 @@ def select_reference_faces_for_character(
     base_query = (
         select(Face).join(Picture, Face.picture_id == Picture.id).where(*eligible)
     )
+    oldest_first = (
+        Picture.created_at.asc(),
+        Picture.id.asc(),
+        Face.id.asc(),
+    )
 
     representatives = list(
         session.exec(
-            base_query.where(Picture.score >= 5)
-            .order_by(Picture.created_at.asc(), Picture.id.asc())
-            .limit(max_refs)
+            base_query.where(Picture.score >= 5).order_by(*oldest_first).limit(max_refs)
         ).all()
     )
 
@@ -93,15 +101,13 @@ def select_reference_faces_for_character(
     if len(representatives) >= max_refs:
         return representatives
 
-    selected_face_ids = {face.id for face in representatives if face is not None}
-    selected_picture_ids = {
-        face.picture_id for face in representatives if face is not None
-    }
+    selected_face_ids = {face.id for face in representatives}
+    selected_picture_ids = {face.picture_id for face in representatives}
 
     remaining_faces = session.exec(
         base_query.where(Picture.score >= 4)
         .where(~Picture.id.in_(selected_picture_ids))
-        .order_by(Picture.created_at.asc(), Picture.id.asc())
+        .order_by(*oldest_first)
         .limit(max_refs - len(representatives))
     ).all()
     logger.debug(
@@ -111,8 +117,6 @@ def select_reference_faces_for_character(
         len(selected_picture_ids),
     )
     for face in remaining_faces:
-        if len(representatives) >= max_refs:
-            break
         if face.id in selected_face_ids:
             continue
         selected_face_ids.add(face.id)
@@ -121,83 +125,33 @@ def select_reference_faces_for_character(
     if len(representatives) >= min_refs:
         return representatives
 
-    rest = (*eligible, ~Picture.id.in_(selected_picture_ids))
-    remaining_rows = session.exec(
-        select(Face.id, Face.picture_id, Picture.created_at)
-        .join(Picture, Face.picture_id == Picture.id)
-        .where(*rest)
+    # The rest: least penalised picture first, then oldest; a picture with no
+    # date goes last. Stage 1's pictures are excluded, stage 2's faces too.
+    rest_faces = session.exec(
+        base_query.where(~Picture.id.in_(selected_picture_ids))
+        .where(~Face.id.in_(selected_face_ids))
+        .order_by(
+            _penalised_tag_weight(),
+            Picture.created_at.is_(None),
+            *oldest_first,
+        )
+        .limit(min_refs - len(representatives))
     ).all()
     logger.debug(
-        "[reference_faces] character_id=%s remaining_rows=%s selected_pictures=%s",
+        "[reference_faces] character_id=%s rest_rows=%s selected_pictures=%s",
         character_id,
-        len(remaining_rows),
+        len(rest_faces),
         len(selected_picture_ids),
     )
-    if remaining_rows:
-        penalised_tags = smart_score_penalised_tags(
-            None,
-            DEFAULT_SMART_SCORE_PENALIZED_TAGS,
-            default_weight=DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
-        )
-        penalised_tag_set = {
-            str(tag).strip().lower() for tag in penalised_tags.keys() if tag
-        }
-        tag_weights = defaultdict(float)
-        if penalised_tag_set:
-            rest_pictures = (
-                select(Face.picture_id)
-                .join(Picture, Face.picture_id == Picture.id)
-                .where(*rest)
-            )
-            tag_rows = session.exec(
-                select(Tag.picture_id, Tag.tag)
-                .where(Tag.picture_id.in_(rest_pictures))
-                .where(Tag.tag.is_not(None))
-                .where(func.lower(Tag.tag).in_(penalised_tag_set))
-            ).all()
-            for pic_id, tag in tag_rows:
-                if not tag:
-                    continue
-                tag_weights[pic_id] += penalised_tags.get(tag.strip().lower(), 0.0)
-
-        remaining_rows = sorted(
-            remaining_rows,
-            key=lambda row: (
-                tag_weights.get(row.picture_id, 0.0),
-                row.created_at or datetime.max.replace(tzinfo=timezone.utc),
-                row.picture_id,
-                row.id or 0,
-            ),
-        )
-        logger.debug(
-            "[reference_faces] character_id=%s penalised_tags=%s",
-            character_id,
-            len(tag_weights),
-        )
-        ranked = iter(remaining_rows)
-        while len(representatives) < min_refs:
-            picked = []
-            for row in ranked:
-                if row.id in selected_face_ids:
-                    continue
-                selected_face_ids.add(row.id)
-                picked.append(row.id)
-                if len(representatives) + len(picked) >= min_refs:
-                    break
-            if not picked:
-                break
-            loaded = session.exec(select(Face).where(Face.id.in_(picked))).all()
-            by_id = {face.id: face for face in loaded}
-            # A face deleted since it was ranked gives its place to the next.
-            representatives.extend(by_id[i] for i in picked if i in by_id)
+    for face in rest_faces:
+        selected_face_ids.add(face.id)
+        representatives.append(face)
 
     if len(representatives) >= min_refs:
         return representatives
 
     fallback_face = session.exec(
-        base_query.order_by(
-            desc(Picture.score), Picture.created_at.asc(), Picture.id
-        ).limit(1)
+        base_query.order_by(desc(Picture.score), *oldest_first).limit(1)
     ).first()
     if fallback_face and fallback_face.id not in selected_face_ids:
         representatives.append(fallback_face)
@@ -209,6 +163,48 @@ def select_reference_faces_for_character(
     )
 
     return representatives
+
+
+def _penalised_tag_weight():
+    """Return the per-picture sum of penalised-tag weights, as a SQL expression.
+
+    Correlated on ``Picture.id``; a picture with no penalised tag weighs 0.
+    Tags match case-insensitively on the stored text, as the smart score's
+    penalty does. The names and weights are the built-in defaults, rendered
+    into the SQL rather than bound, so the statement binds no parameter per
+    tag under SQLite's per-statement limit
+    (https://docs.sqlalchemy.org/en/20/core/sqlelement.html#sqlalchemy.sql.expression.literal).
+    """
+    penalised_tags = smart_score_penalised_tags(
+        None,
+        DEFAULT_SMART_SCORE_PENALIZED_TAGS,
+        default_weight=DEFAULT_SMART_SCORE_PENALIZED_TAG_WEIGHT,
+    )
+    weights = {
+        name: float(penalised_tags.get(name, 0.0))
+        for name in {str(tag).strip().lower() for tag in penalised_tags if tag}
+    }
+    zero = literal(0.0, literal_execute=True)
+    if not weights:
+        return zero
+    tag_name = func.lower(Tag.tag)
+    weight = case(
+        *(
+            (
+                tag_name == literal(name, literal_execute=True),
+                literal(value, literal_execute=True),
+            )
+            for name, value in sorted(weights.items())
+        ),
+        else_=zero,
+    )
+    return (
+        select(func.coalesce(func.sum(weight), zero))
+        .where(Tag.picture_id == Picture.id)
+        .where(tag_name.in_([literal(name, literal_execute=True) for name in weights]))
+        .correlate(Picture)
+        .scalar_subquery()
+    )
 
 
 def compute_character_likeness_for_faces(
@@ -396,7 +392,15 @@ def find_pictures_by_character_likeness(
         if candidate_ids is not None:
             if not candidate_ids:
                 return []
-            query = query.where(Face.picture_id.in_(candidate_ids))
+            # A candidate list (a set's members, a face cluster) has no size
+            # cap, so it is read from a temp table rather than bound per id.
+            query = query.where(
+                Face.picture_id.in_(
+                    scope_id_subquery(
+                        session, candidate_ids, name="_pixlstash_likeness_candidates"
+                    )
+                )
+            )
         return session.exec(query).all()
 
     candidate_faces = server.vault.db.run_task(
@@ -452,7 +456,13 @@ def find_pictures_by_character_likeness(
             )
             rows = session.exec(
                 select(Picture.id)
-                .where(Picture.id.in_(picture_ids))
+                .where(
+                    Picture.id.in_(
+                        scope_id_subquery(
+                            session, picture_ids, name="_pixlstash_likeness_unassigned"
+                        )
+                    )
+                )
                 .where(~assigned_faces)
                 .where(~in_set)
                 .where(Picture.deleted.is_(False))
@@ -482,13 +492,19 @@ def find_pictures_by_character_likeness(
         (timing_after_fetch - timing_start) * 1000.0,
     )
 
+    # Imported here, not at the top: the listing module imports
+    # ``pixlstash.scoring``, so a module-level import is circular.
+    from pixlstash.routes.pictures._listing import stored_picture_dict
+
     pic_map = {pic.id: pic for pic in candidate_pics}
     results = []
     for pic_id in selected_ids:
         pic = pic_map.get(pic_id)
         if not pic:
             continue
-        pic_dict = safe_model_dict(pic)
+        # Read through the column types: a stored value its column does not
+        # declare is null in its row, not a 500 for the page.
+        pic_dict = stored_picture_dict(pic)
         pic_dict["character_likeness"] = max(0.0, picture_likeness_map.get(pic_id, 0.0))
         results.append(pic_dict)
 
@@ -527,7 +543,7 @@ def pack_reference_blobs(reference_faces: list) -> bytes | None:
     return header + matrix_norm.tobytes()
 
 
-def _scoped_stack_leader_clause(character_id, candidate_ids: list[int] | None):
+def _scoped_stack_leader_clause(character_id, candidate_scope: Select | None):
     """Build the scoped-leader stack-collapse clause for CHARACTER_LIKENESS queries.
 
     Mirrors the ``id_scope`` branch of ``Picture.find`` (picture.py): a stack is
@@ -539,7 +555,7 @@ def _scoped_stack_leader_clause(character_id, candidate_ids: list[int] | None):
 
     The sibling scope is: not deleted, has a Face row satisfying the same
     character filter the outer query applies, and (when ``candidate_ids`` is
-    given) is itself in the candidate set - the candidate list carries
+    given) is itself in the candidate set - the candidate scope carries
     token-scope narrowing, so omitting it would let a share-scoped stack be
     represented by an out-of-scope sibling. Tie-break is identical to
     ``Picture.find``: ``coalesce(stack_position, 999999)`` ascending, then
@@ -547,7 +563,9 @@ def _scoped_stack_leader_clause(character_id, candidate_ids: list[int] | None):
 
     Args:
         character_id: Character filter (int, None/""/"ALL", or "UNASSIGNED").
-        candidate_ids: Optional picture-id restriction (token scope / filters).
+        candidate_scope: Optional picture-id restriction (token scope / filters),
+            as a SELECT of the ids (``scope_id_subquery``) so its length binds
+            no parameters.
 
     Returns:
         A SQLAlchemy boolean clause to apply with ``.where()``.
@@ -597,8 +615,8 @@ def _scoped_stack_leader_clause(character_id, candidate_ids: list[int] | None):
         sibling.deleted.is_not(True),
         sibling_in_scope,
     ]
-    if candidate_ids is not None:
-        conditions.append(sibling.id.in_(candidate_ids))
+    if candidate_scope is not None:
+        conditions.append(sibling.id.in_(candidate_scope))
     cur_pos = func.coalesce(Picture.stack_position, 999999)
     sib_pos = func.coalesce(sibling.stack_position, 999999)
     conditions.append(
@@ -668,6 +686,16 @@ def find_pictures_by_character_likeness_sql(
     timing_after_refs = time.perf_counter()
 
     def run_query(session: Session):
+        # The candidate list has no size cap, so it is read from a temp table:
+        # the GROUP BY, ORDER BY and LIMIT/OFFSET below then hold over the
+        # whole list, which chunking could not keep.
+        candidate_scope = (
+            scope_id_subquery(
+                session, candidate_ids, name="_pixlstash_likeness_candidates"
+            )
+            if candidate_ids is not None
+            else None
+        )
         max_likeness = func.max(
             func.character_face_likeness(Face.features, refs_blob)
         ).label("likeness_score")
@@ -688,7 +716,7 @@ def find_pictures_by_character_likeness_sql(
         )
         if stack_leaders_only:
             query = query.where(
-                _scoped_stack_leader_clause(character_id, candidate_ids)
+                _scoped_stack_leader_clause(character_id, candidate_scope)
             )
         if character_id == "UNASSIGNED":
             other_face = aliased(Face)
@@ -705,8 +733,8 @@ def find_pictures_by_character_likeness_sql(
             )
         elif character_id is not None and character_id != "" and character_id != "ALL":
             query = query.where(Face.character_id == int(character_id))
-        if candidate_ids is not None:
-            query = query.where(Face.picture_id.in_(candidate_ids))
+        if candidate_scope is not None:
+            query = query.where(Face.picture_id.in_(candidate_scope))
         return session.exec(query).all()
 
     rows = server.vault.db.run_task(run_query, priority=DBPriority.IMMEDIATE)
@@ -734,13 +762,19 @@ def find_pictures_by_character_likeness_sql(
         (timing_after_fetch - timing_start) * 1000.0,
     )
 
+    # Imported here, not at the top: the listing module imports
+    # ``pixlstash.scoring``, so a module-level import is circular.
+    from pixlstash.routes.pictures._listing import stored_picture_dict
+
     pic_map = {pic.id: pic for pic in candidate_pics}
     results = []
     for pic_id in selected_ids:
         pic = pic_map.get(pic_id)
         if not pic:
             continue
-        pic_dict = safe_model_dict(pic)
+        # Read through the column types: a stored value its column does not
+        # declare is null in its row, not a 500 for the page.
+        pic_dict = stored_picture_dict(pic)
         pic_dict["character_likeness"] = max(0.0, likeness_by_pic.get(pic_id, 0.0))
         results.append(pic_dict)
 
@@ -773,6 +807,13 @@ def count_pictures_by_character_likeness(
     """
 
     def run_count(session: Session) -> int:
+        candidate_scope = (
+            scope_id_subquery(
+                session, candidate_ids, name="_pixlstash_likeness_candidates"
+            )
+            if candidate_ids is not None
+            else None
+        )
         deleted_filter = (
             Picture.deleted.is_(True) if deleted_only else Picture.deleted.is_(False)
         )
@@ -783,7 +824,7 @@ def count_pictures_by_character_likeness(
         )
         if stack_leaders_only:
             query = query.where(
-                _scoped_stack_leader_clause(character_id, candidate_ids)
+                _scoped_stack_leader_clause(character_id, candidate_scope)
             )
         if character_id == "UNASSIGNED":
             inner_face = aliased(Face)
@@ -800,8 +841,8 @@ def count_pictures_by_character_likeness(
             )
         elif character_id is not None and character_id != "" and character_id != "ALL":
             query = query.where(Face.character_id == int(character_id))
-        if candidate_ids is not None:
-            query = query.where(Face.picture_id.in_(candidate_ids))
+        if candidate_scope is not None:
+            query = query.where(Face.picture_id.in_(candidate_scope))
         result = session.exec(query).first()
         return int(result) if result is not None else 0
 

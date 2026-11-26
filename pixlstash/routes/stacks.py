@@ -19,6 +19,7 @@ from pixlstash.services.set_lock_service import (
     enforce_stack_membership_not_locked,
 )
 from pixlstash.services.stack_membership import reconcile_stack_membership
+from pixlstash.routes.pictures._listing import stored_picture_dict
 from pixlstash.stacking import normalize_stack_positions
 from pixlstash.scoring import (
     fetch_smart_score_data,
@@ -28,6 +29,7 @@ from pixlstash.scoring import (
 from pixlstash.utils.quality.smart_score_utils import SmartScoreUtils
 from pixlstash.utils.request_origin import require_client_batch_id
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.utils.service.filter_helpers import (
     fetch_scope_allowed_picture_ids,
     narrow_picture_project_ids,
@@ -78,7 +80,7 @@ class KeepCoverOnlyRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    stack_ids: Optional[list[int]] = Field(
+    stack_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         description=(
             "Stacks to collapse, named directly. Prefer this when the client "
@@ -87,7 +89,7 @@ class KeepCoverOnlyRequest(BaseModel):
         ),
         examples=[[12, 19]],
     )
-    picture_ids: Optional[list[int]] = Field(
+    picture_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         description=(
             "Pictures whose stacks should be collapsed: normally the grid "
@@ -127,7 +129,7 @@ class KeepCoverOnlyRequest(BaseModel):
             "has something to move. Ignored without `keep_recipes`."
         ),
     )
-    expected_picture_ids: Optional[list[int]] = Field(
+    expected_picture_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         description=(
             "`picture_ids_moving` from the preview the user confirmed. The call "
@@ -591,7 +593,7 @@ def create_router(server) -> APIRouter:
         ids = []
         for raw_id in raw_ids:
             try:
-                ids.append(int(raw_id))
+                ids.append(parse_sqlite_int(raw_id))
             except (TypeError, ValueError):
                 raise HTTPException(
                     status_code=400,
@@ -726,7 +728,7 @@ def create_router(server) -> APIRouter:
         description="Returns stack metadata and ordered picture ids for a stack.",
         response_model=StackResponse,
     )
-    def get_stack(stack_id: int, request: Request):
+    def get_stack(stack_id: SqliteInt, request: Request):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
 
@@ -762,7 +764,7 @@ def create_router(server) -> APIRouter:
         response_model=list[dict],
     )
     def get_stack_pictures(
-        stack_id: int,
+        stack_id: SqliteInt,
         request: Request,
         fields: str = Query("grid"),
         include_deleted: bool = Query(False),
@@ -794,7 +796,7 @@ def create_router(server) -> APIRouter:
         ):
             stack = session.get(PictureStack, stack_id_value)
             if not stack:
-                return None, None
+                return None, None, None
 
             select_fields = (
                 Picture.grid_fields()
@@ -809,9 +811,16 @@ def create_router(server) -> APIRouter:
                 select_fields=select_fields,
                 include_deleted=include_deleted_value,
             )
-            return select_fields, pictures
+            # Every member, Scrapheap included: what GET /stacks/{id} lists, and
+            # what decides whether a scoped caller may see the stack at all.
+            member_ids = set(
+                session.exec(
+                    select(Picture.id).where(Picture.stack_id == stack_id_value)
+                ).all()
+            )
+            return select_fields, pictures, member_ids
 
-        select_fields, pictures = server.vault.db.run_task(
+        select_fields, pictures, member_ids = server.vault.db.run_task(
             fetch_stack_pictures,
             stack_id,
             fields,
@@ -821,20 +830,25 @@ def create_router(server) -> APIRouter:
         if select_fields is None:
             raise HTTPException(status_code=404, detail="Stack not found")
         # Scope guard (BOLA): restrict to stack members within the token's grant;
-        # a scoped token with no in-scope members must not see the stack.
+        # a scoped token with no in-scope members must not see the stack. That
+        # is asked of every member, as GET /stacks/{id} asks it: a stack whose
+        # granted members are all in the Scrapheap is still visible to the
+        # token, and lists [] here as it does for the owner.
         scope_allowed = fetch_scope_allowed_picture_ids(server, request)
         if scope_allowed is not None:
-            pictures = [pic for pic in pictures if pic.id in scope_allowed]
-            if not pictures:
+            if not member_ids & scope_allowed:
                 raise HTTPException(status_code=404, detail="Stack not found")
+            pictures = [pic for pic in pictures if pic.id in scope_allowed]
         # Only apply stack-position ordering when no explicit sort is active;
         # this also persists positions for stacks that haven't been ordered yet.
         if sort_mech is None:
             pictures = _ensure_stack_positions(request, stack_id, pictures)
-        rows = [
-            {field: safe_model_dict(pic).get(field) for field in select_fields}
-            for pic in pictures
-        ]
+        # Read through the column types: a stored value its column does not
+        # declare is null in its row, not a 500 for the stack.
+        rows = []
+        for pic in pictures:
+            stored = stored_picture_dict(pic)
+            rows.append({field: stored.get(field) for field in select_fields})
         # `fields=grid` never selects `project_id`; anything else goes through
         # `metadata_fields()`, which does, and the route's `list[dict]` response
         # model filters nothing (issue #719, §16.6).
@@ -847,7 +861,7 @@ def create_router(server) -> APIRouter:
         description="Returns the stack containing a picture, or null stack information when unstacked.",
         response_model=StackResponse,
     )
-    def get_stack_for_picture(picture_id: int, request: Request):
+    def get_stack_for_picture(picture_id: SqliteInt, request: Request):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
 
@@ -1064,7 +1078,7 @@ def create_router(server) -> APIRouter:
         response_model=StackOrderResponse,
     )
     def reorder_stack(
-        stack_id: int, payload: dict = Body(...), request: Request = None
+        stack_id: SqliteInt, payload: dict = Body(...), request: Request = None
     ):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
@@ -1118,7 +1132,7 @@ def create_router(server) -> APIRouter:
         response_model=StackResponse,
     )
     def add_stack_members(
-        stack_id: int, payload: dict = Body(...), request: Request = None
+        stack_id: SqliteInt, payload: dict = Body(...), request: Request = None
     ):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
@@ -1222,7 +1236,7 @@ def create_router(server) -> APIRouter:
         },
     )
     def remove_stack_members(
-        stack_id: int, payload: dict = Body(...), request: Request = None
+        stack_id: SqliteInt, payload: dict = Body(...), request: Request = None
     ):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
@@ -1327,8 +1341,8 @@ def create_router(server) -> APIRouter:
         response_model=StackOrderResponse,
     )
     def set_member_position(
-        stack_id: int,
-        picture_id: int,
+        stack_id: SqliteInt,
+        picture_id: SqliteInt,
         payload: dict = Body(...),
         request: Request = None,
     ):
@@ -1492,8 +1506,18 @@ def create_router(server) -> APIRouter:
                 _recipe_check(payload),
             )
         except KeepCoverOnlyError as exc:
-            logger.error("[keep-cover-only] preview refused: %s", exc)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            logger.error(
+                "[keep-cover-only] preview refused for %d stack id(s) and %d "
+                "picture id(s): %s",
+                len(stack_ids),
+                len(picture_ids),
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="The preview's figures did not add up, so none are shown.",
+            ) from exc
 
     @router.post(
         "/stacks/keep-cover-only",

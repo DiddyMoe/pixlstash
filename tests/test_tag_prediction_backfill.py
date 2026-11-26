@@ -19,6 +19,7 @@ from pixlstash.db_models.tag_prediction import TagPrediction
 from pixlstash.tasks.missing_tag_prediction_finder import MissingTagPredictionFinder
 from pixlstash.tasks.tag_prediction_backfill_task import TagPredictionBackfillTask
 from pixlstash.utils.tag_reset_registry import TagResetRegistry
+from pixlstash.utils.unprocessable_image_registry import UnprocessableImageRegistry
 from pixlstash.vault import Vault
 
 
@@ -54,6 +55,18 @@ def _add_picture(session, file_path, tags=(), predictions=(), deleted=False):
     return pic.id
 
 
+def _count_missing(session):
+    """Run the vault's missing-prediction count with nothing suppressed.
+
+    The count reads the vault's undecodable-image registry; an empty real one
+    stands in for the vault so the finder's own clauses decide the result.
+    """
+    vault = SimpleNamespace(
+        db=SimpleNamespace(unprocessable_images=UnprocessableImageRegistry())
+    )
+    return Vault._count_missing_tag_predictions(vault, session)
+
+
 def test_finder_selects_only_tagged_pictures_without_predictions(tmp_path):
     engine = _make_engine(tmp_path)
     with Session(engine) as session:
@@ -71,7 +84,7 @@ def test_finder_selects_only_tagged_pictures_without_predictions(tmp_path):
         found = MissingTagPredictionFinder._fetch_missing_predictions(session, 100)
         assert [p.id for p in found] == [target]
 
-        count = Vault._count_missing_tag_predictions(session)
+        count = _count_missing(session)
         assert count == 1
 
 
@@ -134,7 +147,7 @@ def test_backfill_marks_unscored_pictures_so_they_drop_out(tmp_path):
         # It now has a prediction, so the finder no longer selects it.
         found = MissingTagPredictionFinder._fetch_missing_predictions(session, 100)
         assert pic_id not in [p.id for p in found]
-        assert Vault._count_missing_tag_predictions(session) == 0
+        assert _count_missing(session) == 0
 
 
 def test_a_removed_tag_is_never_back_filled(tmp_path):
@@ -165,7 +178,7 @@ def test_a_picture_with_only_removed_tags_is_not_selected_again(tmp_path):
         for _sweep in range(2):
             found = MissingTagPredictionFinder._fetch_missing_predictions(session, 100)
             assert [p.id for p in found] == [permitted], only_removed
-        assert Vault._count_missing_tag_predictions(session) == 1
+        assert _count_missing(session) == 1
 
 
 class _RecordingWorkflow:

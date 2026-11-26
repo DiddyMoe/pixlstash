@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { ref, reactive, effectScope, customRef, toRaw } from "vue";
+import { ref, reactive, effectScope, customRef, toRaw, nextTick } from "vue";
 import { setActivePinia, createPinia } from "pinia";
 import { useSortStore } from "../stores/useSortStore.js";
 import { useFilterStore } from "../stores/useFilterStore.js";
@@ -54,6 +54,7 @@ function makeHarness({
   selectedSort = "DATE_TAKEN",
   storeOverrides = {},
   extraRefs = {},
+  callbackOverrides = {},
 } = {}) {
   // The composable reads the query's filter, sort and selection facets
   // straight from the stores, so every harness needs a live Pinia.
@@ -115,6 +116,9 @@ function makeHarness({
     resetThumbnailState: vi.fn(),
     triggerNewImageHighlight: vi.fn(),
     updateVisibleThumbnails: vi.fn(),
+    forgetThumbnailRangesFrom: vi.fn(),
+    // ImageGrid's hold scrolls; the harness has no view, so the change only.
+    holdView: vi.fn((_isLeaving, change) => change()),
     fetchThumbnailsBatch: vi.fn(),
     startSmartScoreProgress,
     completeSmartScoreProgress,
@@ -122,6 +126,7 @@ function makeHarness({
     onGridVisibleMetadataReady: vi.fn(),
     onGridFetchDone: vi.fn(),
   };
+  Object.assign(callbacks, callbackOverrides);
 
   const scope = effectScope();
   harnessScopes.push(scope);
@@ -316,6 +321,83 @@ describe("useGridFetch streaming path", () => {
     );
   });
 
+  // The stats rail's Untagged rows. The rail narrowed its own counts by
+  // tag_state while the grid beside it went on listing every picture.
+  it.each([
+    ["stream", () => {}, () => streamPictures.mock.calls[0][0]],
+    ["count", () => {}, () => getPictureCount.mock.calls[0][0]],
+    [
+      "likeness groups",
+      () => {
+        useSortStore().selectedSort = "LIKENESS_GROUPS";
+      },
+      () => getLikenessGroups.mock.calls[0][1],
+    ],
+    [
+      "text search",
+      () => {
+        useSearchStore().searchQuery = "coffee";
+      },
+      () => searchPictures.mock.calls[0][1].query,
+    ],
+  ])(
+    "sends tag_state on the %s request while an Untagged row is on",
+    async (_read, arrange, sent) => {
+      getPictureCount.mockResolvedValue({ count: 1 });
+      streamPictures.mockResolvedValue({ pictures: [{ id: 41 }] });
+      getLikenessGroups.mockResolvedValue([{ id: 41 }]);
+      searchPictures.mockResolvedValue([{ id: 41 }]);
+      const { grid } = makeHarness();
+      useFilterStore().tagStateFilter = "unprocessable";
+      arrange();
+
+      await grid.fetchAllGridImages({ force: true });
+
+      expect(sent()).toContain("tag_state=unprocessable");
+    },
+  );
+
+  // The backend narrows by tag_state in every scope, the Inbox and the
+  // unassigned view included, so an Untagged row narrows the grid there too.
+  it.each([
+    [
+      "the Inbox",
+      () => {
+        useSelectionStore().selectedFolderFilter = {
+          inbox: true,
+          label: "Inbox",
+        };
+      },
+      "inbox=14d",
+    ],
+    [
+      "the unassigned view",
+      () => {
+        useFilterStore().noCharacterFilter = true;
+      },
+      "character_id=UNASSIGNED",
+    ],
+  ])(
+    "sends tag_state with the scope's own parameter in %s",
+    async (_scope, arrange, scoped) => {
+      getPictureCount.mockResolvedValue({ count: 1 });
+      streamPictures.mockResolvedValue({ pictures: [{ id: 41 }] });
+      const { grid } = makeHarness();
+      arrange();
+      useFilterStore().tagStateFilter = "pending";
+
+      await grid.fetchAllGridImages({ force: true });
+
+      for (const url of [
+        streamPictures.mock.calls[0][0],
+        getPictureCount.mock.calls[0][0],
+      ]) {
+        expect(url).toContain(scoped);
+        expect(url).toContain("tag_state=pending");
+      }
+    },
+  );
+
   // *Show all N pictures* on a workflow card (F7). The chip is set on one
   // screen and read on another, so the half that could rot in silence is this
   // one: the strip would go on showing "Workflow: X" over the whole library.
@@ -447,9 +529,10 @@ describe("useGridFetch streaming path", () => {
 });
 
 describe("useGridFetch text search: narrowing to text matches (#1197)", () => {
+  // The server narrows: the grid sends the switch and shows what comes back,
+  // so an export of the view, which sends the same query, packages the same.
   const ROWS = [
     { id: 1, text_match: true },
-    { id: 2, text_match: false },
     { id: 3, text_match: true },
   ];
 
@@ -458,23 +541,51 @@ describe("useGridFetch text search: narrowing to text matches (#1197)", () => {
     searchPictures.mockResolvedValue(ROWS);
   });
 
-  it("narrows the fetched rows to text matches without searching again", async () => {
-    const { grid, refs } = makeHarness();
+  function sentQuery(call) {
+    return new URLSearchParams(searchPictures.mock.calls[call][1].query);
+  }
+
+  it("asks the search for text matches only while the switch is on", async () => {
+    const { grid } = makeHarness();
     const searchStore = useSearchStore();
     searchStore.searchQuery = "coffee";
 
     await grid.fetchAllGridImages({ force: true });
-    expect(refs.allGridImages.value.map((r) => r.id)).toEqual([1, 2, 3]);
-    expect(refs.textSearchResults.value.rows).toHaveLength(3);
-
     searchStore.textMatchesOnly = true;
-    await grid.fetchAllGridImages({ textMatchRecut: true });
-    expect(refs.allGridImages.value.map((r) => r.id)).toEqual([1, 3]);
-
+    await grid.fetchAllGridImages();
     searchStore.textMatchesOnly = false;
-    await grid.fetchAllGridImages({ textMatchRecut: true });
-    expect(refs.allGridImages.value.map((r) => r.id)).toEqual([1, 2, 3]);
-    expect(searchPictures).toHaveBeenCalledTimes(1);
+    await grid.fetchAllGridImages();
+
+    expect(searchPictures).toHaveBeenCalledTimes(3);
+    expect(sentQuery(0).has("text_match_only")).toBe(false);
+    expect(sentQuery(1).get("text_match_only")).toBe("true");
+    expect(sentQuery(2).has("text_match_only")).toBe(false);
+  });
+
+  it("shows the rows the search answers, without narrowing them again", async () => {
+    // A row the server sent stays even if it says no text match: the rule is
+    // the server's alone, so the grid and the export cannot disagree.
+    searchPictures.mockResolvedValue([...ROWS, { id: 2, text_match: false }]);
+    const { grid, refs } = makeHarness();
+    const searchStore = useSearchStore();
+    searchStore.searchQuery = "coffee";
+    // A new query resets the switch (useSearchStore), so it is turned on after.
+    await nextTick();
+    searchStore.textMatchesOnly = true;
+
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(sentQuery(0).get("text_match_only")).toBe("true");
+    expect(refs.allGridImages.value.map((r) => r.id)).toEqual([1, 3, 2]);
+    expect(refs.textSearchResults.value.rows).toHaveLength(3);
+  });
+
+  it("sends the switch only with a text search", () => {
+    const { grid } = makeHarness();
+    useSearchStore().textMatchesOnly = true;
+    expect(
+      new URLSearchParams(grid.searchViewQueryParams()).has("text_match_only"),
+    ).toBe(false);
   });
 
   it("any other fetch searches again", async () => {
@@ -536,6 +647,7 @@ describe("useGridFetch: the same-view key follows what the reads ask for", () =>
     ["tagConfidenceAboveFilter", ["test-hat:0.80"]],
     ["tagConfidenceBelowFilter", ["test-hat:0.80"]],
     ["faceBboxFilter", "with_face"],
+    ["tagStateFilter", "pending"],
     ["sharedOnlyFilter", true],
   ])("changes when %s changes", (name, value) => {
     const { grid } = makeHarness();
@@ -708,6 +820,39 @@ describe("useGridFetch: one load at a time", () => {
     expect(librarySignal.aborted).toBe(true);
     expect(getPictureCount.mock.calls[1][1].signal.aborted).toBe(false);
     await Promise.all([libraryLoad, personLoad]);
+  });
+
+  it("keeps the new load's removals when the load it cancelled winds down", async () => {
+    getPictureCount
+      .mockImplementationOnce((_query, { signal }) => readUntilAborted(signal))
+      .mockResolvedValueOnce({ count: 3 });
+    const firstBatch = deferred();
+    streamPictures.mockImplementation((_q, { offset, batchLimit }) =>
+      offset === 0
+        ? firstBatch.promise
+        : Promise.resolve({
+            pictures: [{ id: 70 }, { id: 72 }].slice(
+              offset,
+              offset + batchLimit,
+            ),
+          }),
+    );
+    const { grid, refs } = makeHarness();
+
+    const libraryLoad = grid.fetchAllGridImages();
+    useSelectionStore().selectedCharacter = 7;
+    const personLoad = grid.fetchAllGridImages();
+    // The cancelled library load has run its cleanup.
+    await libraryLoad;
+    await vi.waitFor(() => expect(streamPictures).toHaveBeenCalledTimes(1));
+
+    // Picture 71 is deleted while the person view's first batch is out; the
+    // batch was read before the delete committed and still lists it.
+    grid.noteRemovedDuringStream([71]);
+    firstBatch.resolve({ pictures: [{ id: 70 }, { id: 71 }, { id: 72 }] });
+    await personLoad;
+
+    expect(refs.allGridImages.value.map((img) => img.id)).toEqual([70, 72]);
   });
 
   it("a filter change during a load cancels it and never publishes its rows", async () => {
@@ -1301,7 +1446,10 @@ describe("useGridFetch: a streamed batch costs what it brings", () => {
 
 describe("useGridFetch: the fetched rows stay in step with a streaming grid", () => {
   // 12,000 pictures stream as a 200-row first batch, a 200-row early tail and
-  // background batches of 5,000, 5,000 and 1,600 rows between them.
+  // three background batches between them. Each background request starts at
+  // the last row already loaded (its anchor, which places the answer), so
+  // they ask from 199, 5,198 and 10,197 and bring 4,999, 4,999 and 1,602
+  // rows.
   const TOTAL = 12_000;
   const TAIL_START = TOTAL - 200;
 
@@ -1326,9 +1474,9 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
     const reads = [];
     let refs = null;
     streamPictures.mockImplementation((_query, { offset, batchLimit }) => {
-      if (offset > 200 && offset < TAIL_START) {
+      if (offset > 199 && offset < TAIL_START) {
         reads.push({ offset, ...readLists(refs) });
-        if (offset === 5200) refsWrite(refs);
+        if (offset === 5198) refsWrite(refs);
       }
       return Promise.resolve({ pictures: streamedRows(offset, batchLimit) });
     });
@@ -1348,10 +1496,11 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
       Array.from({ length: TOTAL }, (_, i) =>
         i < loadedEnd || i >= TAIL_START ? i + 1 : null,
       );
-    expect(reads.map((read) => read.offset)).toEqual([5200, 10200, null]);
+    expect(reads.map((read) => read.offset)).toEqual([5198, 10197, null]);
     for (const { offset, gridRows, fetchedRows } of reads) {
       const ids = gridRows.map((row) => row.id);
-      expect(ids).toEqual(expectedIds(offset ?? TOTAL));
+      // Asked at its anchor, the last row loaded.
+      expect(ids).toEqual(expectedIds(offset == null ? TOTAL : offset + 1));
       expect(gridRows.every((row, i) => row.idx === i)).toBe(true);
       expect(fetchedRows).toEqual(loaded(gridRows));
     }
@@ -1360,6 +1509,8 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
   it.each([
     [
       "a delete takes a picture out of both lists",
+      // The grid is a row shorter from there on, and so is each later anchor.
+      [5198, 10196, null],
       (refs) => {
         const kept = (row) => row.id !== 3;
         refs.allGridImages.value = refs.allGridImages.value.filter(kept);
@@ -1369,6 +1520,7 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
     ],
     [
       "a re-score rewrites a card in the grid alone",
+      [5198, 10197, null],
       (refs) => {
         const next = refs.allGridImages.value.slice();
         next[1] = { ...next[1], score: 5 };
@@ -1377,13 +1529,938 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
     ],
   ])(
     "keeps the fetched rows the grid's loaded rows after %s mid-stream",
-    async (_case, write) => {
+    async (_case, offsets, write) => {
       const reads = await streamReading(write);
 
-      expect(reads.map((read) => read.offset)).toEqual([5200, 10200, null]);
+      expect(reads.map((read) => read.offset)).toEqual(offsets);
       for (const { gridRows, fetchedRows } of reads) {
         expect(fetchedRows).toEqual(loaded(gridRows));
       }
     },
   );
+});
+
+describe("useGridFetch: a removal while the grid streams in loses no row", () => {
+  // 12,000 pictures: a 200-row first batch, a 200-row early tail and the
+  // background batches between them. A picture leaves the view while a
+  // request is out, the way ImageGrid.removeImagesById takes it out
+  // mid-stream: its cell goes, every cell after it moves up a slot, and the
+  // stream is told. The server answers the request from the list as it was
+  // when asked (before the delete committed) or as it is when it answers.
+  const TOTAL = 12_000;
+
+  beforeEach(() => {
+    getPictureCount.mockReset();
+    streamPictures.mockReset();
+    getPictureCount.mockResolvedValue({ count: TOTAL });
+  });
+
+  function removeMidStream(grid, refs, ids) {
+    const gone = new Set(ids);
+    grid.noteRemovedDuringStream(ids);
+    const remaining = refs.allGridImages.value.filter((img) => !gone.has(img.id));
+    refs.allGridImages.value = remaining.map((img, i) =>
+      img.idx === i ? img : { ...img, idx: i },
+    );
+    refs.lastFetchedGridImages.value = refs.lastFetchedGridImages.value.filter(
+      (img) => !gone.has(img.id),
+    );
+  }
+
+  // The first batch has landed (the tail may not have).
+  const firstBatchLanded = (refs) => refs.allGridImages.value[0]?.id === 1;
+
+  /**
+   * Streams the view, removing `ids` while the request `holds` picks is out,
+   * and answering that request from the list `before` or `after` the delete.
+   * The removal waits until `landed(refs)` holds.
+   */
+  async function streamWithRemoval({
+    ids,
+    answer,
+    holds,
+    landed = firstBatchLanded,
+  }) {
+    const removed = new Set();
+    const serverIds = () =>
+      Array.from({ length: TOTAL }, (_, i) => i + 1).filter(
+        (id) => !removed.has(id),
+      );
+    const page = (offset, limit) =>
+      serverIds()
+        .slice(offset, offset + limit)
+        .map((id) => ({ id }));
+    const asked = [];
+    const release = deferred();
+    let heldAsked = false;
+    streamPictures.mockImplementation((_q, { offset, batchLimit }) => {
+      asked.push({ offset, batchLimit });
+      if (!heldAsked && holds({ offset, batchLimit })) {
+        heldAsked = true;
+        const before = page(offset, batchLimit);
+        return release.promise.then(() => ({
+          pictures: answer === "before" ? before : page(offset, batchLimit),
+        }));
+      }
+      return Promise.resolve({ pictures: page(offset, batchLimit) });
+    });
+    const { grid, refs } = makeHarness();
+    const done = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(heldAsked).toBe(true));
+    await vi.waitFor(() => expect(landed(refs)).toBe(true));
+    for (const id of ids) removed.add(id);
+    removeMidStream(grid, refs, ids);
+    release.resolve();
+    await done;
+    return { refs, asked, serverIds: serverIds() };
+  }
+
+  const firstBackground = ({ offset, batchLimit }) =>
+    offset > 0 && batchLimit === 5000;
+  const tail = ({ offset }) => offset === TOTAL - 200;
+  const firstBatch = ({ offset }) => offset === 0;
+  // The count has answered and the placeholder grid is down.
+  const placeholdersDown = (refs) => refs.allGridImages.value.length === TOTAL;
+
+  function expectWholeView(refs, serverIds) {
+    const ids = refs.allGridImages.value.map((img) => img.id);
+    const holes = ids.flatMap((id, i) => (id == null ? [i] : []));
+    expect(holes.slice(0, 5)).toEqual([]);
+    expect(ids).toHaveLength(serverIds.length);
+    expect(ids).toEqual(serverIds);
+    expect(refs.allGridImages.value.every((img, i) => img.idx === i)).toBe(
+      true,
+    );
+    expect(refs.lastFetchedGridImages.value.map((img) => img.id)).toEqual(
+      serverIds,
+    );
+  }
+
+  it.each([
+    ["a loaded picture", [2], "before", firstBackground],
+    ["a loaded picture", [2], "after", firstBackground],
+    ["a picture whose row has not arrived", [7000], "before", firstBackground],
+    ["a picture whose row has not arrived", [7000], "after", firstBackground],
+    [
+      "every loaded picture above the gap",
+      Array.from({ length: 200 }, (_, i) => i + 1),
+      "after",
+      firstBackground,
+    ],
+    ["the last loaded picture, the anchor", [200], "after", firstBackground],
+    ["a loaded picture while the tail is out", [5], "before", tail],
+    ["a loaded picture while the tail is out", [5], "after", tail],
+    ["a tail picture before it arrived", [11_900], "before", tail],
+  ])(
+    "streams every remaining picture in, once, after removing %s (answered %s the delete)",
+    async (_what, ids, answer, holds) => {
+      const { refs, serverIds } = await streamWithRemoval({
+        ids,
+        answer,
+        holds,
+      });
+      expectWholeView(refs, serverIds);
+    },
+  );
+
+  it("does not write a picture removed while the first batch was out, though the batch lists it", async () => {
+    // A delete from another tab lands while the first batch is out: no card
+    // of it is in the grid yet, so only the stream hears of it.
+    const { refs, serverIds } = await streamWithRemoval({
+      ids: [5],
+      answer: "before",
+      holds: firstBatch,
+      landed: placeholdersDown,
+    });
+    expect(refs.allGridImages.value.slice(0, 6).map((img) => img.id)).toEqual(
+      [1, 2, 3, 4, 6, 7],
+    );
+    expectWholeView(refs, serverIds);
+  });
+
+  it("asks for each row once, but for one anchor row per background batch, when nothing moves", async () => {
+    const asked = [];
+    streamPictures.mockImplementation((_q, { offset, batchLimit }) => {
+      asked.push([offset, offset + batchLimit]);
+      return Promise.resolve({ pictures: streamedRows(offset, batchLimit) });
+    });
+    const { grid, refs } = makeHarness();
+    await grid.fetchAllGridImages({ force: true });
+
+    const times = new Array(TOTAL).fill(0);
+    for (const [start, end] of asked) {
+      for (let i = start; i < Math.min(end, TOTAL); i += 1) times[i] += 1;
+    }
+    const twice = times.flatMap((n, i) => (n === 2 ? [i] : []));
+    // The anchors (the last row of the first batch, then of each batch after)
+    // and the tail's first row, which the last batch reads to see it is done.
+    expect(twice).toEqual([199, 5198, 10197, 11800]);
+    expect(times.every((n) => n === 1 || n === 2)).toBe(true);
+    expectWholeView(
+      refs,
+      Array.from({ length: TOTAL }, (_, i) => i + 1),
+    );
+  });
+});
+
+describe("useGridFetch: a re-read scrolled past the first batch keeps the viewport's cards", () => {
+  // A delete's refetch keeps the scroll position. At row 1,500 of 50,000 the
+  // first batch (rows 0-199) does not reach the viewport, and the swap to the
+  // fresh grid turned every cell on screen into a placeholder until the
+  // background stream got there.
+  const TOTAL = 50000;
+  const VIEW = [1500, 1540];
+
+  beforeEach(() => {
+    getPictureCount.mockReset();
+    streamPictures.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // The library loaded whole, every card with its thumbnail, scrolled to
+  // VIEW; then a re-read that keeps the scroll, against `serverIds`: the
+  // server's list, or a function that returns it as it is when a request is
+  // answered. A held viewport request answers from the list as it was when
+  // asked, the way a read that started before a delete committed does.
+  async function rereadScrolledDeep(serverIds, { holdView = false } = {}) {
+    const listNow =
+      typeof serverIds === "function" ? serverIds : () => serverIds;
+    const page = (ids, offset, limit) =>
+      ids.slice(offset, offset + limit).map((id) => ({ id }));
+    const all = Array.from({ length: TOTAL }, (_, i) => i + 1);
+    getPictureCount.mockResolvedValueOnce({ count: TOTAL });
+    streamPictures.mockImplementation((_q, { offset, batchLimit }) =>
+      Promise.resolve({ pictures: page(all, offset, batchLimit) }),
+    );
+    const harness = makeHarness();
+    const { grid, refs } = harness;
+    await grid.fetchAllGridImages();
+    refs.allGridImages.value = refs.allGridImages.value.map((row) => ({
+      ...row,
+      thumbnail: `thumb-${row.id}`,
+    }));
+    refs.visibleStart.value = VIEW[0];
+    refs.visibleEnd.value = VIEW[1];
+    refs.preserveScrollOnNextFetch.value = true;
+
+    // The background stream is held at its first request, so what the grid
+    // shows then is what the swap left on screen.
+    const background = deferred();
+    const view = deferred();
+    let backgroundAsked = false;
+    let viewAsked = false;
+    getPictureCount.mockResolvedValueOnce({ count: listNow().length });
+    streamPictures.mockReset();
+    streamPictures.mockImplementation((_q, { offset, batchLimit }) => {
+      const answer = () => ({ pictures: page(listNow(), offset, batchLimit) });
+      if (offset === 199 && !backgroundAsked) {
+        backgroundAsked = true;
+        return background.promise.then(answer);
+      }
+      if (holdView && offset > 199 && offset < VIEW[0] && !viewAsked) {
+        viewAsked = true;
+        const asked = answer();
+        return view.promise.then(() => asked);
+      }
+      return Promise.resolve(answer());
+    });
+    const reread = grid.fetchAllGridImages({ force: true });
+    return {
+      grid,
+      refs,
+      callbacks: harness.callbacks,
+      reread,
+      background,
+      view,
+      isAsked: () => backgroundAsked,
+      isViewAsked: () => viewAsked,
+    };
+  }
+
+  const viewCells = (refs) => refs.allGridImages.value.slice(...VIEW);
+
+  // A delete while the re-read's rows are out, as removeImagesById takes it:
+  // the stream is told, and any card of it in the grid goes, the cards after
+  // it closing up.
+  function removeDuringReread(grid, refs, ids) {
+    const gone = new Set(ids);
+    grid.noteRemovedDuringStream(ids);
+    refs.allGridImages.value = refs.allGridImages.value
+      .filter((img) => !gone.has(img.id))
+      .map((img, i) => (img.idx === i ? img : { ...img, idx: i }));
+    refs.lastFetchedGridImages.value = refs.lastFetchedGridImages.value.filter(
+      (img) => !gone.has(img.id),
+    );
+  }
+
+  function expectWhole(refs, serverIds) {
+    const rows = refs.allGridImages.value;
+    expect(rows.length).toBe(serverIds.length);
+    expect(rows.every((row, i) => row.id === serverIds[i] && row.idx === i)).toBe(
+      true,
+    );
+  }
+
+  it("swaps the viewport's rows in with the first batch", async () => {
+    const serverIds = Array.from({ length: TOTAL }, (_, i) => i + 1);
+    const { refs, reread, background, isAsked } =
+      await rereadScrolledDeep(serverIds);
+    await vi.waitFor(() => expect(isAsked()).toBe(true));
+
+    // Row 1,500 is a card through the swap, and keeps its thumbnail.
+    expect(refs.allGridImages.value[1500].id).toBe(1501);
+    expect(viewCells(refs).map((row) => row.id)).toEqual(
+      serverIds.slice(...VIEW),
+    );
+    expect(viewCells(refs).every((row) => row.thumbnail === `thumb-${row.id}`)).toBe(
+      true,
+    );
+
+    background.resolve();
+    await reread;
+    expectWhole(refs, serverIds);
+  });
+
+  it("shows the server's rows there after a delete above the viewport", async () => {
+    const serverIds = Array.from({ length: TOTAL }, (_, i) => i + 1).filter(
+      (id) => id !== 50,
+    );
+    const { refs, reread, background, isAsked } =
+      await rereadScrolledDeep(serverIds);
+    await vi.waitFor(() => expect(isAsked()).toBe(true));
+
+    expect(viewCells(refs).map((row) => row.id)).toEqual(
+      serverIds.slice(...VIEW),
+    );
+
+    background.resolve();
+    await reread;
+    expectWhole(refs, serverIds);
+  });
+
+  it("keeps the old cards until the viewport's rows have answered too", async () => {
+    const serverIds = Array.from({ length: TOTAL }, (_, i) => i + 1);
+    const { refs, reread, background, view } = await rereadScrolledDeep(
+      serverIds,
+      { holdView: true },
+    );
+    // The first batch and the tail have answered; the viewport's rows not.
+    await vi.waitFor(() =>
+      expect(
+        streamPictures.mock.calls.some(([, { offset }]) => offset === 0),
+      ).toBe(true),
+    );
+    await Promise.resolve();
+    expect(refs.allGridImages.value[1500]).toMatchObject({
+      id: 1501,
+      thumbnail: "thumb-1501",
+    });
+
+    view.resolve();
+    background.resolve();
+    await reread;
+    expectWhole(refs, serverIds);
+  });
+
+  it("leaves out a picture deleted while the viewport's rows were out, though they list it", async () => {
+    const all = Array.from({ length: TOTAL }, (_, i) => i + 1);
+    let server = all;
+    const { grid, refs, reread, background, view, isAsked, isViewAsked } =
+      await rereadScrolledDeep(() => server, { holdView: true });
+    await vi.waitFor(() => expect(isViewAsked()).toBe(true));
+
+    // Picture 1,510, on screen, is deleted. The viewport's answer was read
+    // before the delete committed and still lists it.
+    server = all.filter((id) => id !== 1510);
+    removeDuringReread(grid, refs, [1510]);
+    view.resolve();
+    await vi.waitFor(() => expect(isAsked()).toBe(true));
+
+    expect(viewCells(refs).map((row) => row.id)).toEqual(
+      server.slice(...VIEW),
+    );
+
+    background.resolve();
+    await reread;
+    expectWhole(refs, server);
+  });
+
+  it("drops the cells deleted pictures left above the viewport through the grid's hold", async () => {
+    // Pictures 1,001-1,003 are deleted after the viewport's rows landed and
+    // before the background stream reached theirs. The run above the
+    // viewport then has three cells the server no longer fills: they go, and
+    // the viewport's rows move up three slots. That is above the view, so it
+    // goes through the grid's hold, which scrolls with it.
+    const all = Array.from({ length: TOTAL }, (_, i) => i + 1);
+    const gone = [1001, 1002, 1003];
+    let server = all;
+    const { grid, refs, callbacks, reread, background, isAsked } =
+      await rereadScrolledDeep(() => server);
+    await vi.waitFor(() => expect(isAsked()).toBe(true));
+    const viewStart = streamPictures.mock.calls
+      .map(([, { offset }]) => offset)
+      .find((offset) => offset > 199 && offset < VIEW[0]);
+    expect(refs.allGridImages.value[viewStart].id).toBe(viewStart + 1);
+    const left = [];
+    callbacks.holdView.mockImplementation((isLeaving, change) => {
+      refs.allGridImages.value.forEach((img, i) => {
+        if (isLeaving(img, i)) left.push({ slot: i, id: img.id });
+      });
+      change();
+    });
+
+    server = all.filter((id) => !gone.includes(id));
+    removeDuringReread(grid, refs, gone);
+    background.resolve();
+    await reread;
+
+    // The three placeholders right above the viewport's first row.
+    expect(left).toEqual(
+      [3, 2, 1].map((back) => ({ slot: viewStart - back, id: null })),
+    );
+    expectWhole(refs, server);
+  });
+});
+
+describe("useGridFetch: a re-read keeps the cards until its rows land", () => {
+  // The refetch after a delete, a run's end or a realtime change re-reads the
+  // view on screen. Laying placeholders down at its count blanked every card
+  // for the first batch's round trip and reloaded each thumbnail after it.
+  beforeEach(() => {
+    getPictureCount.mockReset();
+    streamPictures.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Load the library with pictures 1-3, each card carrying its thumbnail as
+  // the thumbnail batch would have left it.
+  async function loadedLibrary() {
+    getPictureCount.mockResolvedValueOnce({ count: 3 });
+    streamPictures.mockResolvedValueOnce({
+      pictures: [{ id: 1 }, { id: 2 }, { id: 3 }],
+    });
+    const harness = makeHarness();
+    await harness.grid.fetchAllGridImages();
+    harness.refs.allGridImages.value = harness.refs.allGridImages.value.map(
+      (row) => ({ ...row, thumbnail: `thumb-${row.id}`, faces: [row.id] }),
+    );
+    harness.callbacks.resetThumbnailState.mockClear();
+    return harness;
+  }
+
+  const ids = (refs) => refs.allGridImages.value.map((row) => row.id);
+
+  it("shows the cards it has while a re-read of the same view waits for its rows", async () => {
+    const { grid, refs, callbacks } = await loadedLibrary();
+    const firstBatch = deferred();
+    getPictureCount.mockResolvedValueOnce({ count: 2 });
+    streamPictures.mockReturnValueOnce(firstBatch.promise);
+
+    const reread = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(streamPictures).toHaveBeenCalledTimes(2));
+
+    expect(ids(refs)).toEqual([1, 2, 3]);
+    expect(refs.allGridImages.value[0].thumbnail).toBe("thumb-1");
+    expect(callbacks.resetThumbnailState).not.toHaveBeenCalled();
+
+    // Picture 2 has gone and 3 now sorts first: each card that stays keeps
+    // its own thumbnail and faces, wherever it now sits.
+    firstBatch.resolve({ pictures: [{ id: 3 }, { id: 1 }] });
+    await reread;
+
+    expect(ids(refs)).toEqual([3, 1]);
+    expect(refs.allGridImages.value.map((row) => row.thumbnail)).toEqual([
+      "thumb-3",
+      "thumb-1",
+    ]);
+    expect(refs.allGridImages.value.map((row) => row.faces)).toEqual([
+      [3],
+      [1],
+    ]);
+    expect(callbacks.resetThumbnailState).toHaveBeenCalledTimes(1);
+  });
+
+  it("lays another view's placeholders down as soon as its count answers", async () => {
+    const { grid, refs } = await loadedLibrary();
+    const firstBatch = deferred();
+    getPictureCount.mockResolvedValueOnce({ count: 1 });
+    streamPictures.mockReturnValueOnce(firstBatch.promise);
+
+    useSelectionStore().selectedCharacter = 7;
+    const personLoad = grid.fetchAllGridImages();
+    await vi.waitFor(() => expect(streamPictures).toHaveBeenCalledTimes(2));
+
+    // None of the library's cards stands in for the person's view.
+    expect(ids(refs)).toEqual([null]);
+
+    firstBatch.resolve({ pictures: [{ id: 70 }] });
+    await personLoad;
+    expect(ids(refs)).toEqual([70]);
+    expect(refs.allGridImages.value[0].thumbnail).toBeNull();
+  });
+
+  it("takes the cards away at once when a re-read finds the view empty", async () => {
+    const { grid, refs } = await loadedLibrary();
+    getPictureCount.mockResolvedValueOnce({ count: 0 });
+
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(ids(refs)).toEqual([]);
+    expect(streamPictures).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not write back a picture deleted while the count was out", async () => {
+    // The old cards stay on screen while the count is read, so a delete can
+    // land then. The first batch was read before the delete committed and
+    // still lists the picture.
+    const { grid, refs } = await loadedLibrary();
+    const count = deferred();
+    getPictureCount.mockReturnValueOnce(count.promise);
+    streamPictures.mockImplementation((_q, { offset, batchLimit }) =>
+      Promise.resolve({
+        pictures:
+          offset === 0
+            ? [{ id: 1 }, { id: 2 }, { id: 3 }]
+            : [{ id: 1 }, { id: 3 }].slice(offset, offset + batchLimit),
+      }),
+    );
+
+    const reread = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(getPictureCount).toHaveBeenCalledTimes(2));
+    grid.noteRemovedDuringStream([2]);
+    refs.allGridImages.value = refs.allGridImages.value
+      .filter((row) => row.id !== 2)
+      .map((row, i) => ({ ...row, idx: i }));
+    refs.lastFetchedGridImages.value = refs.lastFetchedGridImages.value.filter(
+      (row) => row.id !== 2,
+    );
+    count.resolve({ count: 3 });
+    await reread;
+
+    expect(ids(refs)).toEqual([1, 3]);
+  });
+});
+
+describe("useGridFetch: only the load that set a scroll place puts it back", () => {
+  // A re-read that keeps the scroll records where the view stood and puts it
+  // back once its answer is in. The place belongs to that load: a load that
+  // cancels it, or one for another view, must not inherit it.
+  beforeEach(() => {
+    searchPictures.mockReset();
+    getPictureCount.mockReset();
+    streamPictures.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // A scroller whose scrollTop writes are recorded; jsdom has no layout, so
+  // the content is tall enough that no restore is clamped.
+  function scrollView(refs, top) {
+    const view = { top, writes: [] };
+    refs.scrollWrapper.value = {
+      get scrollTop() {
+        return view.top;
+      },
+      set scrollTop(value) {
+        view.top = value;
+        view.writes.push(value);
+      },
+      scrollHeight: 1e7,
+      clientHeight: 100,
+      clientWidth: 400,
+    };
+    return view;
+  }
+
+  // A search answer that lands with the view scrolled to the top, the way a
+  // replaced list can leave it: only a restore brings it back.
+  function answerAtTop(view, rows) {
+    return () => {
+      view.top = 0;
+      return Promise.resolve(rows);
+    };
+  }
+
+  it("a load that does not keep the scroll never puts back the place of the re-read it cancels", async () => {
+    const held = deferred();
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 1200);
+    searchPictures
+      .mockReturnValueOnce(held.promise)
+      .mockImplementationOnce(answerAtTop(view, [{ id: 50 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    refs.preserveScrollOnNextFetch.value = true;
+    const reread = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(searchPictures).toHaveBeenCalledTimes(1));
+    refs.preserveScrollOnNextFetch.value = false;
+    useFilterStore().minScoreFilter = 5;
+    await grid.fetchAllGridImages({ force: true });
+    held.resolve([{ id: 1 }]);
+    await reread;
+    await nextTick();
+
+    expect(refs.allGridImages.value.map((row) => row.id)).toEqual([50]);
+    expect(view.writes).toEqual([]);
+    expect(refs.pendingScrollTop.value).toBeNull();
+  });
+
+  it("puts back the place a refresh recorded, though the refresh cleared the flag before its re-read", async () => {
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 800);
+    searchPictures.mockImplementationOnce(answerAtTop(view, [{ id: 1 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    // The gridVersion refresh: record the place, clear the flag, re-read.
+    refs.preserveScrollOnNextFetch.value = true;
+    grid.recordScrollPlace();
+    refs.preserveScrollOnNextFetch.value = false;
+    await grid.fetchAllGridImages({ force: true });
+    await nextTick();
+
+    expect(view.writes).toEqual([800]);
+    expect(refs.pendingScrollTop.value).toBeNull();
+  });
+
+  it("drops a recorded place once another view loads, so a return to its view does not jump there", async () => {
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 800);
+    searchPictures
+      .mockImplementationOnce(answerAtTop(view, [{ id: 7 }]))
+      .mockImplementationOnce(answerAtTop(view, [{ id: 1 }]));
+    useSearchStore().searchQuery = "coffee";
+    grid.recordScrollPlace();
+
+    useSearchStore().searchQuery = "tea";
+    await grid.fetchAllGridImages({ force: true });
+    await nextTick();
+    expect(view.writes).toEqual([]);
+
+    useSearchStore().searchQuery = "coffee";
+    await grid.fetchAllGridImages({ force: true });
+    await nextTick();
+    expect(view.writes).toEqual([]);
+    expect(refs.pendingScrollTop.value).toBeNull();
+  });
+
+  it("a session reset drops the place of the re-read it cancels, so the next session's first load does not put the view back there", async () => {
+    const held = deferred();
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 900);
+    searchPictures
+      .mockReturnValueOnce(held.promise)
+      .mockImplementationOnce(answerAtTop(view, [{ id: 2 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    refs.preserveScrollOnNextFetch.value = true;
+    const reread = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(searchPictures).toHaveBeenCalledTimes(1));
+    refs.preserveScrollOnNextFetch.value = false;
+    notifySessionReset("test");
+    expect(refs.pendingScrollTop.value).toBeNull();
+
+    await grid.fetchAllGridImages({ force: true });
+    await nextTick();
+    held.resolve([{ id: 1 }]);
+    await reread;
+    await nextTick();
+
+    expect(view.writes).toEqual([]);
+  });
+
+  it("a session reset also drops the place a re-read queued behind the cancelled load was to put back", async () => {
+    const held = deferred();
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 600);
+    searchPictures
+      .mockReturnValueOnce(held.promise)
+      .mockImplementationOnce(answerAtTop(view, [{ id: 2 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    // A plain load runs; a call that keeps the scroll queues a re-read
+    // behind it, and the place it records is that re-read's, not the load's.
+    const running = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(searchPictures).toHaveBeenCalledTimes(1));
+    refs.preserveScrollOnNextFetch.value = true;
+    const queued = grid.fetchAllGridImages({ force: true });
+    refs.preserveScrollOnNextFetch.value = false;
+    notifySessionReset("test");
+    expect(refs.pendingScrollTop.value).toBeNull();
+
+    held.resolve([{ id: 1 }]);
+    await Promise.all([running, queued]);
+    await grid.fetchAllGridImages({ force: true });
+    await nextTick();
+
+    expect(searchPictures).toHaveBeenCalledTimes(2);
+    expect(view.writes).toEqual([]);
+  });
+
+  it("a re-read standing for several calls puts back the place one of them recorded", async () => {
+    const first = deferred();
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 600);
+    searchPictures
+      .mockReturnValueOnce(first.promise)
+      .mockImplementationOnce(answerAtTop(view, [{ id: 1 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    const running = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(searchPictures).toHaveBeenCalledTimes(1));
+    // Two more calls for the same view while it runs: one re-read follows,
+    // started by the first, and the second, which keeps the scroll, joins it.
+    const plain = grid.fetchAllGridImages({ force: true });
+    refs.preserveScrollOnNextFetch.value = true;
+    const keeping = grid.fetchAllGridImages({ force: true });
+    first.resolve([{ id: 1 }]);
+    await Promise.all([running, plain, keeping]);
+    await nextTick();
+
+    expect(searchPictures).toHaveBeenCalledTimes(2);
+    // Put back once, at the end of the re-read whose answer moved the view;
+    // the plain load before it holds no place and puts nothing back.
+    expect(view.writes).toEqual([600]);
+    expect(view.top).toBe(600);
+  });
+
+  it("a stream that keeps the scroll leaves no place behind", async () => {
+    const { grid, refs } = makeHarness();
+    scrollView(refs, 300);
+    getPictureCount.mockResolvedValueOnce({ count: 2 });
+    streamPictures.mockResolvedValueOnce({ pictures: [{ id: 1 }, { id: 2 }] });
+
+    refs.preserveScrollOnNextFetch.value = true;
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(refs.pendingScrollTop.value).toBeNull();
+  });
+});
+
+describe("useGridFetch: the reconnect read of an id-list view", () => {
+  beforeEach(() => {
+    for (const read of [
+      getLikenessGroups,
+      searchPictures,
+      likenessSearch,
+      characterFaceSearch,
+      setLikenessSearch,
+      faceSearch,
+      listPicturesByIds,
+    ]) {
+      read.mockReset();
+    }
+  });
+
+  it("names the mode runGridLoad reads, the likeness groups first", () => {
+    const { grid, refs } = makeHarness({
+      extraRefs: { setSuggestThreshold: ref(0), setSuggestMinTags: ref(0) },
+    });
+    const sortStore = useSortStore();
+    const searchStore = useSearchStore();
+    expect(grid.currentFetchMode()).toBe("stream");
+    refs.faceLikenessSearchFaceId.value = 9;
+    expect(grid.currentFetchMode()).toBe("face-likeness-search");
+    refs.setSuggestSet.value = { id: 4 };
+    expect(grid.currentFetchMode()).toBe("set-suggest-search");
+    refs.faceSearchCharacter.value = { id: 2 };
+    expect(grid.currentFetchMode()).toBe("character-face-search");
+    refs.reverseImageSearchPictureIds.value = [5];
+    expect(grid.currentFetchMode()).toBe("reverse-image-search");
+    searchStore.searchQuery = "  ";
+    expect(grid.currentFetchMode()).toBe("reverse-image-search");
+    searchStore.searchQuery = "coffee";
+    expect(grid.currentFetchMode()).toBe("text-search");
+    sortStore.selectedSort = "LIKENESS_GROUPS";
+    expect(grid.currentFetchMode()).toBe("likeness-groups");
+  });
+
+  it("re-reads the likeness groups whole, with the signal", async () => {
+    const { grid } = makeHarness({ selectedSort: "LIKENESS_GROUPS" });
+    const signal = new AbortController().signal;
+    getLikenessGroups.mockResolvedValue([{ id: 3 }, { id: 1 }]);
+    expect(await grid.readIdListForReconcile({ signal })).toEqual([
+      { id: 3 },
+      { id: 1 },
+    ]);
+    expect(getLikenessGroups).toHaveBeenCalledTimes(1);
+    expect(getLikenessGroups.mock.calls[0][2]).toEqual({ signal });
+    expect(listPicturesByIds).not.toHaveBeenCalled();
+  });
+
+  it("re-reads a text search with its trimmed words and the view's query", async () => {
+    const { grid } = makeHarness();
+    useSearchStore().searchQuery = " coffee ";
+    const signal = new AbortController().signal;
+    searchPictures.mockResolvedValue([{ id: 2 }]);
+    expect(await grid.readIdListForReconcile({ signal })).toEqual([{ id: 2 }]);
+    expect(searchPictures).toHaveBeenCalledWith("coffee", {
+      query: grid.searchViewQueryParams(),
+      signal,
+    });
+  });
+
+  it("reads a ranked search's rows by id, in rank order, less those not listed", async () => {
+    const { grid, refs } = makeHarness();
+    refs.reverseImageSearchPictureIds.value = [5];
+    const signal = new AbortController().signal;
+    likenessSearch.mockResolvedValue([
+      { picture_id: 3 },
+      { picture_id: 8 },
+      { picture_id: 1 },
+    ]);
+    listPicturesByIds.mockResolvedValue([{ id: 1 }, { id: 3 }]);
+    expect(await grid.readIdListForReconcile({ signal })).toEqual([
+      { id: 3 },
+      { id: 1 },
+    ]);
+    expect(likenessSearch).toHaveBeenCalledWith([5], { signal });
+    expect(listPicturesByIds).toHaveBeenCalledWith([3, 8, 1], {
+      fields: "grid",
+      signal,
+    });
+  });
+
+  it("cuts a set suggestion as its sliders cut it before reading rows", async () => {
+    const { grid, refs } = makeHarness({
+      extraRefs: { setSuggestThreshold: ref(0.5), setSuggestMinTags: ref(0) },
+    });
+    refs.setSuggestSet.value = { id: 4 };
+    setLikenessSearch.mockResolvedValue([
+      { picture_id: 3, likeness: 0.9 },
+      { picture_id: 6, likeness: 0.2 },
+    ]);
+    listPicturesByIds.mockResolvedValue([{ id: 3 }]);
+    expect(await grid.readIdListForReconcile()).toEqual([{ id: 3 }]);
+    expect(listPicturesByIds.mock.calls[0][0]).toEqual([3]);
+  });
+
+  it("sends no by-id read for an empty ranked list", async () => {
+    const { grid, refs } = makeHarness();
+    refs.faceLikenessSearchFaceId.value = 9;
+    faceSearch.mockResolvedValue([]);
+    expect(await grid.readIdListForReconcile()).toEqual([]);
+    expect(listPicturesByIds).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the likeness-groups read", (refs, sortStore) => {
+      sortStore.selectedSort = "LIKENESS_GROUPS";
+      getLikenessGroups.mockResolvedValue({ detail: "x" });
+    }],
+    ["the text search", () => {
+      useSearchStore().searchQuery = "coffee";
+      searchPictures.mockResolvedValue(null);
+    }],
+    ["the character-face-search", (refs) => {
+      refs.faceSearchCharacter.value = { id: 2 };
+      characterFaceSearch.mockResolvedValue({});
+    }],
+    ["the by-ids read", (refs) => {
+      refs.faceLikenessSearchFaceId.value = 9;
+      faceSearch.mockResolvedValue([{ picture_id: 3 }]);
+      listPicturesByIds.mockResolvedValue({ pictures: [] });
+    }],
+  ])("rejects when %s answers no list, rather than read every card gone", async (read, arrange) => {
+    const { grid, refs } = makeHarness();
+    arrange(refs, useSortStore());
+    await expect(grid.readIdListForReconcile()).rejects.toThrow(
+      `readIdListForReconcile: ${read} returned no list`,
+    );
+  });
+
+  it("refuses the stream view, which is not an id-list view", async () => {
+    const { grid } = makeHarness();
+    await expect(grid.readIdListForReconcile()).rejects.toThrow(
+      "readIdListForReconcile: the stream view is not an id-list view",
+    );
+  });
+});
+
+// The server lists every scrapped picture on its own row (only_deleted), and
+// stack leaders only elsewhere. Each load records which, with its rows, so the
+// load's fold and every later rebuild (useStackOrdering's collapseStackImages)
+// follow one rule instead of each caller guessing it.
+describe("useGridFetch: records whether the load folds stacks", () => {
+  const SCRAPHEAP = "SCRAPHEAP";
+  const heapRows = [
+    { id: 1, stack_id: 7 },
+    { id: 2, stack_id: 7 },
+    { id: 3, stack_id: null },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getPictureCount.mockResolvedValue({ count: heapRows.length });
+    streamPictures.mockResolvedValue({
+      pictures: heapRows,
+      done: true,
+      next_offset: heapRows.length,
+    });
+    searchPictures.mockReset();
+    searchPictures.mockResolvedValue(heapRows);
+  });
+
+  // What the load's own fold saw: the rule must be in place before it runs.
+  function harnessSeeingFold() {
+    const seen = [];
+    const harness = makeHarness({
+      callbackOverrides: {
+        collapseStackImages: (rows) => {
+          seen.push(harness.grid.loadFoldsStacks.value);
+          return rows;
+        },
+      },
+    });
+    return Object.assign(harness, { seen });
+  }
+
+  it("keeps every row of the Scrapheap's stream, and folds a person's", async () => {
+    const { grid, refs } = makeHarness();
+    const selection = useSelectionStore();
+    selection.selectedCharacter = SCRAPHEAP;
+
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(streamPictures.mock.calls[0][0]).toContain("only_deleted=true");
+    expect(refs.lastFetchedGridImages.value.map((row) => row.id)).toEqual([
+      1, 2, 3,
+    ]);
+    expect(grid.loadFoldsStacks.value).toBe(false);
+
+    selection.selectedCharacter = "7";
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(streamPictures.mock.calls[1][0]).not.toContain("only_deleted");
+    expect(grid.loadFoldsStacks.value).toBe(true);
+  });
+
+  it("keeps every row of a search in the Scrapheap, and folds one elsewhere", async () => {
+    const { grid, seen } = harnessSeeingFold();
+    const selection = useSelectionStore();
+    useSearchStore().searchQuery = "coffee";
+    selection.selectedCharacter = SCRAPHEAP;
+
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(searchPictures.mock.calls[0][1].query).toContain(
+      "only_deleted=true",
+    );
+    expect(seen).toEqual([false]);
+    expect(grid.loadFoldsStacks.value).toBe(false);
+
+    selection.selectedCharacter = "7";
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(searchPictures.mock.calls[1][1].query).not.toContain("only_deleted");
+    expect(seen).toEqual([false, true]);
+    expect(grid.loadFoldsStacks.value).toBe(true);
+  });
 });

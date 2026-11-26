@@ -24,9 +24,13 @@ from pixlstash.utils.service.caption_utils import (
     normalize_hidden_tags,
 )
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked, in_json
+from pixlstash.utils.sqlite_ints import is_sqlite_int, parse_sqlite_int
 
 
 logger = get_logger(__name__)
+
+_ONE_PERSON_DETAIL = "face_cluster needs one person's character_id"
 
 
 _SIDECAR_TAG_PATTERN = re.compile(
@@ -66,21 +70,23 @@ def _face_cluster_ids(
         return None
     server.auth.require_unscoped_owner(request)
     if isinstance(character_id, str) and character_id.isdigit():
-        character_id = int(character_id)
-    if not isinstance(character_id, int):
-        raise HTTPException(
-            status_code=422, detail="face_cluster needs one person's character_id"
-        )
+        try:
+            character_id = parse_sqlite_int(character_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=_ONE_PERSON_DETAIL) from exc
+    if not is_sqlite_int(character_id):
+        raise HTTPException(status_code=422, detail=_ONE_PERSON_DETAIL)
     try:
         number = int(cluster_raw)
         threshold = (
             face_clusters.SAME_PERSON if threshold_raw is None else float(threshold_raw)
         )
     except (TypeError, ValueError) as exc:
+        # The raw values are not echoed: neither parsed.
         raise HTTPException(
             status_code=422,
-            detail=f"Invalid face_cluster {cluster_raw!r} or "
-            f"face_cluster_threshold {threshold_raw!r}",
+            detail="face_cluster must be a whole number and "
+            "face_cluster_threshold a number",
         ) from exc
     if number < 1 or not 0.05 <= threshold <= 0.95:
         raise HTTPException(
@@ -114,13 +120,14 @@ def _fetch_hidden_picture_ids(server, request: Request, picture_ids: list[int]):
 
     def fetch_hidden(session: Session, ids: list[int], tags: set[str]):
         # Every row of a search or listing, so possibly more ids than SQLite
-        # binds in one statement: read from a temp table instead.
+        # binds in one statement: read from a temp table instead. The owner's
+        # hidden tags have no cap either, so they bind as one JSON array.
         id_scope = scope_id_subquery(session, ids, name="_pixlstash_hidden_check_ids")
         rows = session.exec(
             select(Tag.picture_id).where(
                 Tag.picture_id.in_(id_scope),
                 Tag.tag.is_not(None),
-                func.lower(Tag.tag).in_(tags),
+                in_json(func.lower(Tag.tag), tags),
             )
         ).all()
         return {row for row in rows if row is not None}
@@ -131,10 +138,15 @@ def _fetch_hidden_picture_ids(server, request: Request, picture_ids: list[int]):
 
 
 def _create_picture_imports(
-    server, uploaded_files, dest_folder, progress_callback=None
+    server,
+    uploaded_files,
+    dest_folder,
+    progress_callback=None,
+    on_file_failed=None,
+    compared: set[int] | None = None,
 ):
     """
-    Given a list of (img_bytes, ext), create Picture objects for new images,
+    Given a list of (content, ext, name), create Picture objects for new images,
     skipping content already in the vault (live OR scrapheaped) by pixel_sha.
     Returns (fingerprints, existing_map, scrapheaped_map, new_picture_map)
 
@@ -151,10 +163,27 @@ def _create_picture_imports(
 
     Args:
         server: The server instance.
-        uploaded_files: List of (img_bytes, ext) tuples.
+        uploaded_files: List of ``(content, ext, name)`` tuples. *content*
+            is the file's bytes, or the path of a file holding them, which is
+            hashed and copied a chunk at a time and never read whole (the
+            one-shot upload route spools its uploads to disk). A path is
+            copied, not moved: the caller removes it.
         dest_folder: Destination folder for images.
         progress_callback: Optional callable invoked after each image is written
             to disk. Receives no arguments. Used for incremental progress tracking.
+        on_file_failed: Optional callable ``(index, exc)`` for a file that
+            could not be published (undecodable, unreadable, no thumbnail).
+            With it, the failure is handed over and the batch goes on: one bad
+            file does not cost the batch its other files. Without it, the
+            files this call already published are removed and the error is
+            raised, so a caller that stops does not leave files behind with
+            no row, which the next root scan would index as new pictures.
+            Either way a failed file has no entry in ``new_picture_map``.
+        compared: Optional set the ids of the candidate pictures this lookup
+            compared the files with are added to. Hand it to
+            :func:`import_publish_service.withdraw_imported_meanwhile`, so
+            the look again under the import lock reads no file for a
+            candidate already compared here.
 
     Returns:
         ``(fingerprints, existing_map, scrapheaped_map, new_picture_map)``.
@@ -163,18 +192,24 @@ def _create_picture_imports(
         one Picture per unique new file; repeated identical uploads share it.
     """
 
-    def create_fingerprint(img_bytes):
+    def create_fingerprint(content):
+        if isinstance(content, str):
+            return (
+                ImageUtils.calculate_hash_from_file_path(content),
+                os.path.getsize(content),
+                ImageUtils.calculate_full_hash_from_file_path(content),
+            )
         return (
-            ImageUtils.calculate_hash_from_bytes(img_bytes),
-            len(img_bytes),
-            ImageUtils.calculate_full_hash_from_bytes(img_bytes),
+            ImageUtils.calculate_hash_from_bytes(content),
+            len(content),
+            ImageUtils.calculate_full_hash_from_bytes(content),
         )
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         fingerprints = list(
             executor.map(
                 create_fingerprint,
-                (img_bytes for img_bytes, *_ in uploaded_files),
+                (content for content, *_ in uploaded_files),
             )
         )
 
@@ -185,6 +220,8 @@ def _create_picture_imports(
     existing_map, scrapheaped_map = import_dedup_service.partition_confirmed_matches(
         candidates, fingerprints, server.vault.image_root
     )
+    if compared is not None:
+        compared.update(row.id for rows in candidates.values() for row in rows)
 
     # Placement on write (v1.11 Phase 4b). Resolved once for the batch: every
     # file in it goes to the same folder, and `None` means this library has no
@@ -192,32 +229,69 @@ def _create_picture_imports(
     subfolder = resolve_placement(server.vault.db, dest_folder)
 
     new_picture_map = {}
-    for file_entry, fingerprint in zip(uploaded_files, fingerprints):
+    for index, (file_entry, fingerprint) in enumerate(
+        zip(uploaded_files, fingerprints)
+    ):
         if (
             fingerprint in existing_map
             or fingerprint in scrapheaped_map
             or fingerprint in new_picture_map
         ):
             continue
-        sampled_sha, _size_bytes, _full_sha = fingerprint
+        sampled_sha, size_bytes, _full_sha = fingerprint
+        content, ext, original_name = file_entry
+        pic_uuid = str(uuid.uuid4()) + ext
+        logger.debug(f"Importing picture from uploaded content as id={pic_uuid}")
         try:
-            img_bytes, ext, original_name = file_entry
-            pic_uuid = str(uuid.uuid4()) + ext
-            logger.debug(f"Importing picture from uploaded bytes as id={pic_uuid}")
-            new_picture_map[fingerprint] = ImageUtils.create_picture_from_bytes(
-                image_root_path=dest_folder,
-                image_bytes=img_bytes,
-                picture_uuid=pic_uuid,
-                pixel_sha=sampled_sha,
-                original_file_name=original_name,
-                subfolder=subfolder,
+            if isinstance(content, str):
+                picture = ImageUtils.create_picture_from_file(
+                    image_root_path=dest_folder,
+                    source_file_path=content,
+                    picture_uuid=pic_uuid,
+                    pixel_sha=sampled_sha,
+                    subfolder=subfolder,
+                    record_source_name=False,
+                )
+                # The spooled file's name is the route's; the upload's is
+                # the picture's.
+                picture.original_file_name = original_name
+            else:
+                picture = ImageUtils.create_picture_from_bytes(
+                    image_root_path=dest_folder,
+                    image_bytes=content,
+                    picture_uuid=pic_uuid,
+                    pixel_sha=sampled_sha,
+                    original_file_name=original_name,
+                    subfolder=subfolder,
+                )
+            new_picture_map[fingerprint] = picture
+        except Exception as exc:
+            if on_file_failed is None:
+                logger.error(
+                    "Import of file %d of %d (%s) failed; removing the %d file(s) "
+                    "this batch already published: %s",
+                    index + 1,
+                    len(uploaded_files),
+                    original_name,
+                    len(new_picture_map),
+                    exc,
+                )
+                for published in new_picture_map.values():
+                    ImageUtils.unpublish_picture(dest_folder, published)
+                raise
+            logger.warning(
+                "Import of file %d of %d (%s, %d bytes) failed; importing the rest: %s",
+                index + 1,
+                len(uploaded_files),
+                original_name,
+                size_bytes,
+                exc,
+                exc_info=True,
             )
-            if progress_callback is not None:
-                progress_callback()
-        except Exception:
-            # Preserve the existing failure behaviour: creation errors escape to
-            # the task wrapper, which reports the import failed.
-            raise
+            on_file_failed(index, exc)
+            continue
+        if progress_callback is not None:
+            progress_callback()
 
     return fingerprints, existing_map, scrapheaped_map, new_picture_map
 
@@ -360,12 +434,20 @@ def _enrich_stack_counts(server, pics: list[dict]) -> list[dict]:
         return pics
 
     def fetch_stack_info(session: Session, ids: list[int]):
-        id_stack_rows = session.exec(
-            select(Picture.id, Picture.stack_id).where(
-                Picture.id.in_(ids),
-                Picture.deleted.is_(False),
-            )
-        ).all()
+        # A listing page has no fixed cap (``limit`` defaults to
+        # ``sys.maxsize``), so both reads run in chunks under SQLite's
+        # bound-parameter limit. The ids and stack ids are unique, and the
+        # count groups by the chunked column, so no row or count is split.
+        id_stack_rows = [
+            row
+            for id_chunk in chunked(sorted(set(ids)))
+            for row in session.exec(
+                select(Picture.id, Picture.stack_id).where(
+                    Picture.id.in_(id_chunk),
+                    Picture.deleted.is_(False),
+                )
+            ).all()
+        ]
         stack_ids = sorted(
             {
                 int(stack_id)
@@ -375,15 +457,19 @@ def _enrich_stack_counts(server, pics: list[dict]) -> list[dict]:
         )
         if not stack_ids:
             return id_stack_rows, []
-        stack_count_rows = session.exec(
-            select(Picture.stack_id, func.count(Picture.id))
-            .where(
-                Picture.stack_id.in_(stack_ids),
-                # Not ``IS 0``, which beats the stack index from one id ("Probe cost").
-                Picture.deleted.is_not(True),
-            )
-            .group_by(Picture.stack_id)
-        ).all()
+        stack_count_rows = [
+            row
+            for stack_chunk in chunked(stack_ids)
+            for row in session.exec(
+                select(Picture.stack_id, func.count(Picture.id))
+                .where(
+                    Picture.stack_id.in_(stack_chunk),
+                    # Not ``IS 0``, which beats the stack index from one id ("Probe cost").
+                    Picture.deleted.is_not(True),
+                )
+                .group_by(Picture.stack_id)
+            ).all()
+        ]
         return id_stack_rows, stack_count_rows
 
     id_stack_rows, stack_count_rows = server.vault.db.run_immediate_read_task(

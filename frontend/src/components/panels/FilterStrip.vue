@@ -23,7 +23,13 @@
       </span>
     </div>
     <span class="filter-strip-tail">
-      <span class="filter-strip-count">{{ ofLabel }}</span>
+      <span class="filter-strip-count"
+        >{{ ofLabel
+        }}<Tooltip
+          v-if="stacksCollapsed"
+          :text="STACKS_COUNT_ONCE"
+          activator="parent"
+      /></span>
       <!-- Save these filters as a set that fills itself (#2148). -->
       <button
         v-if="onSaveSmartSet"
@@ -115,6 +121,18 @@ const ofLabel = computed(() =>
   props.ofLabel != null
     ? props.ofLabel
     : matchCountLabel(gridStore.matchCount, total.value),
+);
+
+// The grid counts a collapsed stack once, by the picture it shows, and so do
+// both numbers here; the Details panel counts every picture in the stack. Said
+// only while a stack is collapsed and only of the grid's own count.
+const STACKS_COUNT_ONCE =
+  "A collapsed stack counts once here. The Details panel counts every picture in it.";
+const stacksCollapsed = computed(
+  () =>
+    props.ofLabel == null &&
+    Number(gridStore.totalStackCount || 0) >
+      Number(gridStore.expandedStackCount || 0),
 );
 
 function clearAll() {

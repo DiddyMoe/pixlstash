@@ -1,7 +1,10 @@
 """Picture statistics aggregation utilities (/pictures/stats)."""
 
 import dataclasses
+import hashlib
+import threading
 import time
+from collections.abc import Iterable
 from datetime import datetime
 
 from fastapi import HTTPException
@@ -11,12 +14,18 @@ from sqlmodel import Session, select
 from pixlstash.db_models import Face, Picture, Tag, TagPrediction
 from pixlstash.db_models.tag import TAG_SENTINEL_LIKE_PATTERN, TAG_SENTINEL_ESCAPE_CHAR
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
+from pixlstash.utils.sql_chunking import chunked, in_json
+from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.utils.service.filter_helpers import (
     fetch_set_candidate_ids,
     project_membership_exists_clause,
     project_unassigned_clause,
 )
-from pixlstash.utils.query.predicate_filter import PredicateFilter
+from pixlstash.utils.query.predicate_filter import (
+    PredicateFilter,
+    tag_state_predicates,
+)
 
 logger = get_logger(__name__)
 
@@ -71,6 +80,28 @@ class PictureStatsParams:
     scoped_picture_ids: list[int] | None = None
     favourite_only: bool = False
     imported_since: datetime | None = None
+    # One of ``TAG_STATES`` (why a picture is untagged), or no filter.
+    tag_state: str | None = None
+    # The unprocessable registry's suppressed ids: it lives in memory, so the
+    # route reads it and hands it in. They split the untagged count.
+    unprocessable_ids: frozenset[int] = frozenset()
+    # The grid's remaining narrowing, read as the listing reads it
+    # (``select_pictures_for_listing``), so the panel counts the grid's rows.
+    # ``unassigned_by`` is one half of the unassigned view ("character" or
+    # "set"); ``None`` is both.
+    unassigned_by: str | None = None
+    comfyui_models: list[str] | None = None
+    comfyui_loras: list[str] | None = None
+    # Resolved from ``workflow`` / ``workflow_lora`` by the route: ``None`` is
+    # no filter, an empty list matches nothing.
+    workflow_structural_hashes: list[str] | None = None
+    impossible_sources: list[str] | None = None
+    # The owner's hidden tags under ``apply_tag_filter=true``.
+    hidden_tags: list[str] | None = None
+    # The ids the route resolved from ``face_cluster`` and ``shared_only``,
+    # intersected; ``None`` when neither was asked for.
+    picture_id_filter: frozenset[int] | None = None
+    reference_folder_id: int | None = None
 
 
 def _empty_stats() -> dict:
@@ -79,6 +110,7 @@ def _empty_stats() -> dict:
         "total_tags": 0,
         "tagged": 0,
         "untagged": 0,
+        "untagged_breakdown": {"pending": 0, "unprocessable": 0, "none": 0},
         "avg_tags_per_image": 0.0,
         "top_tags": [],
         "top_cooccurrences": [],
@@ -115,7 +147,15 @@ def _build_filtered_picture_subquery(session: Session, params: PictureStatsParam
     if params.scoped_picture_ids is not None:
         if not params.scoped_picture_ids:
             return None
-        pic_q = pic_q.where(Picture.id.in_(params.scoped_picture_ids))
+        pic_q = pic_q.where(
+            Picture.id.in_(
+                scope_id_subquery(
+                    session,
+                    params.scoped_picture_ids,
+                    name="_pixlstash_stats_scope_ids",
+                )
+            )
+        )
 
     if params.set_filter_ids:
         candidate_ids = fetch_set_candidate_ids(
@@ -126,13 +166,26 @@ def _build_filtered_picture_subquery(session: Session, params: PictureStatsParam
         )
         if not candidate_ids:
             return None
-        pic_q = pic_q.where(Picture.id.in_(candidate_ids))
-    elif params.character_id_list:
-        rows = session.exec(
-            select(Face.character_id, Face.picture_id).where(
-                Face.character_id.in_(params.character_id_list)
+        pic_q = pic_q.where(
+            Picture.id.in_(
+                scope_id_subquery(
+                    session, candidate_ids, name="_pixlstash_stats_candidate_ids"
+                )
             )
-        ).all()
+        )
+    elif params.character_id_list:
+        # ``character_ids`` is the caller's list and has no cap, so it is read
+        # in chunks under SQLite's bound-parameter limit. Each row names its
+        # own person; the modes below combine the merged rows in Python.
+        rows = [
+            row
+            for id_chunk in chunked(params.character_id_list)
+            for row in session.exec(
+                select(Face.character_id, Face.picture_id).where(
+                    Face.character_id.in_(id_chunk)
+                )
+            ).all()
+        ]
         members_by_char: dict[int, set[int]] = {
             cid: set() for cid in params.character_id_list
         }
@@ -174,10 +227,31 @@ def _build_filtered_picture_subquery(session: Session, params: PictureStatsParam
 
         if not candidate_ids:
             return None
-        pic_q = pic_q.where(Picture.id.in_(candidate_ids))
+        pic_q = pic_q.where(
+            Picture.id.in_(
+                scope_id_subquery(
+                    session, candidate_ids, name="_pixlstash_stats_candidate_ids"
+                )
+            )
+        )
     elif params.character_id_raw == "UNASSIGNED":
+        # "Unassigned" is relative to the project in view, as
+        # ``Picture.find_unassigned`` reads it for the grid: inside a project a
+        # picture another project's person claims is still unassigned here.
+        assignment_project_id = None
+        assignment_unassigned_project = params.project_id_raw == "UNASSIGNED"
+        if params.project_id_raw is not None and not assignment_unassigned_project:
+            try:
+                assignment_project_id = parse_sqlite_int(params.project_id_raw)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400, detail="Invalid project_id"
+                ) from exc
         unassigned_conditions = Picture.build_unassigned_conditions(
             enforce_stack_assignment=True,
+            assignment_project_id=assignment_project_id,
+            assignment_unassigned_project=assignment_unassigned_project,
+            unassigned_by=params.unassigned_by,
         )
         pic_q = pic_q.where(*unassigned_conditions)
     elif params.character_id_raw is not None and params.character_id_raw not in (
@@ -185,7 +259,7 @@ def _build_filtered_picture_subquery(session: Session, params: PictureStatsParam
         "ALL",
     ):
         try:
-            char_id_int = int(params.character_id_raw)
+            char_id_int = parse_sqlite_int(params.character_id_raw)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid character_id") from exc
         pic_q = pic_q.where(
@@ -201,15 +275,39 @@ def _build_filtered_picture_subquery(session: Session, params: PictureStatsParam
         pic_q = pic_q.where(project_unassigned_clause(Picture))
     elif params.project_id_raw is not None:
         try:
-            pid_int = int(params.project_id_raw)
+            pid_int = parse_sqlite_int(params.project_id_raw)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid project_id") from exc
         pic_q = pic_q.where(project_membership_exists_clause(pid_int, Picture))
 
+    if params.picture_id_filter is not None:
+        if not params.picture_id_filter:
+            return None
+        pic_q = pic_q.where(
+            Picture.id.in_(
+                scope_id_subquery(
+                    session,
+                    sorted(params.picture_id_filter),
+                    name="_pixlstash_stats_filter_ids",
+                )
+            )
+        )
+    if params.reference_folder_id is not None:
+        pic_q = pic_q.where(Picture.reference_folder_id == params.reference_folder_id)
+    # The checkpoint and LoRA filters as the grid applies them (one OR per list,
+    # the lists ANDed). Per picture, never through a stack: the panel counts
+    # pictures, not stack leaders, so a stack member made with the model counts
+    # itself and its leader does not.
+    for clause in Picture.comfyui_filter_clauses(
+        params.comfyui_models, params.comfyui_loras, False
+    ):
+        pic_q = pic_q.where(clause)
+
     # Intrinsic-attribute predicates via the shared compiler.  The stats sidebar
     # uppercases formats and matches a file-path prefix as a whole sub-tree (not just
-    # direct children).  The deleted lifecycle clause was already applied above, and
-    # this site never filters on import-excluded / unimported / comfyui / hidden tags.
+    # direct children: deliberate, the panel summarises the folder with its
+    # sub-folders).  The deleted lifecycle clause was already applied above, and
+    # this site never filters on import-excluded / unimported pictures.
     pic_q = PredicateFilter(
         format=[f.upper() for f in params.format_filter] or None,
         min_score=params.min_score,
@@ -226,8 +324,13 @@ def _build_filtered_picture_subquery(session: Session, params: PictureStatsParam
         tags_rejected_filter=params.rejected_tags or None,
         tags_confidence_above_filter=params.confidence_above or None,
         tags_confidence_below_filter=params.confidence_below or None,
+        hidden_tags_filter=params.hidden_tags or None,
         face_filter=params.face_filter,
         stack_state=params.stack_state,
+        impossible_sources=params.impossible_sources or None,
+        workflow_structural_hashes=params.workflow_structural_hashes,
+        tag_state=params.tag_state,
+        unprocessable_ids=params.unprocessable_ids,
         apply_deleted_filter=False,
     ).apply(pic_q)
 
@@ -242,11 +345,12 @@ def _compute_basic_counts(
     Args:
         session: Active database session.
         pic_subq: Subquery of filtered picture ids.
-        params: Filter params (used for penalised_tag_set).
+        params: Filter params (penalised_tag_set, unprocessable_ids).
 
     Returns:
-        Dict with keys: total, tagged, untagged, avg_tags_per_image,
-        total_tags, top_tags.
+        Dict with keys: total, tagged, untagged, untagged_breakdown,
+        avg_tags_per_image, total_tags, top_tags. ``untagged_breakdown`` splits
+        ``untagged`` by why (``TAG_STATES``); its three counts sum to it.
     """
     total = session.exec(select(func.count()).select_from(pic_subq)).one()
 
@@ -286,16 +390,41 @@ def _compute_basic_counts(
         Tag.tag.is_not(None),
     )
     if params.penalised_tag_set:
-        top_tags_q = top_tags_q.where(func.lower(Tag.tag).in_(params.penalised_tag_set))
+        # The owner's penalised names have no cap, and a GROUP BY ... LIMIT
+        # over chunks is not the top 20 of the whole list: one JSON array.
+        top_tags_q = top_tags_q.where(
+            in_json(func.lower(Tag.tag), params.penalised_tag_set)
+        )
     top_tags_rows = session.exec(
         top_tags_q.group_by(Tag.tag).order_by(desc("cnt")).limit(20)
     ).all()
     top_tags = [{"tag": row[0], "count": row[1]} for row in top_tags_rows]
 
+    untagged = int(total) - int(tagged)
+    untagged_breakdown = {
+        state: int(
+            session.exec(
+                select(func.count())
+                .select_from(Picture)
+                .where(
+                    Picture.id.in_(select(pic_subq.c.id)),
+                    *tag_state_predicates(state, params.unprocessable_ids),
+                )
+            ).one()
+        )
+        for state in ("pending", "unprocessable")
+    }
+    # The rest of the untagged: no sentinel, not suppressed. By subtraction, so
+    # the three always sum to ``untagged`` (both counts use the same test).
+    untagged_breakdown["none"] = (
+        untagged - untagged_breakdown["pending"] - untagged_breakdown["unprocessable"]
+    )
+
     return {
         "total": int(total),
         "tagged": int(tagged),
-        "untagged": int(total) - int(tagged),
+        "untagged": untagged,
+        "untagged_breakdown": untagged_breakdown,
         "avg_tags_per_image": round(avg_tags, 2),
         "total_tags": total_tags,
         "top_tags": top_tags,
@@ -346,18 +475,20 @@ def _compute_cooccurrences(
         )
     )
     if params.penalised_tag_set:
+        # Both sides test the same uncapped list, under a GROUP BY ... LIMIT:
+        # each binds it as one JSON array rather than one parameter per name.
         if params.penalised_cooc_both:
             cooc_base = cooc_base.where(
                 and_(
-                    func.lower(t1.c.tag).in_(params.penalised_tag_set),
-                    func.lower(t2.c.tag).in_(params.penalised_tag_set),
+                    in_json(func.lower(t1.c.tag), params.penalised_tag_set),
+                    in_json(func.lower(t2.c.tag), params.penalised_tag_set),
                 )
             )
         else:
             cooc_base = cooc_base.where(
                 or_(
-                    func.lower(t1.c.tag).in_(params.penalised_tag_set),
-                    func.lower(t2.c.tag).in_(params.penalised_tag_set),
+                    in_json(func.lower(t1.c.tag), params.penalised_tag_set),
+                    in_json(func.lower(t2.c.tag), params.penalised_tag_set),
                 )
             )
     cooc_rows = session.execute(
@@ -850,11 +981,30 @@ def compute_picture_stats(vault, params: PictureStatsParams) -> dict:
 # Centralised here (next to compute_picture_stats) so callers don't share
 # module-level mutable state across routes.
 _stats_cache: dict[str, tuple[float, dict]] = {}
+# Bumped by every clear. A compute that started before a clear read the library
+# as it was before the change that cleared it, so it must not be stored: it
+# would serve the old numbers for a whole TTL after the change was announced.
+_stats_generation = 0
+_stats_generation_lock = threading.Lock()
+
+
+def stats_cache_digest(values: Iterable) -> str:
+    """A stable digest of a set of values, for the stats cache key.
+
+    The same set gives the same digest in every process and on every run, in
+    any order. ``hash()`` of a frozenset does neither across processes and can
+    collide for two different sets.
+    """
+    joined = "\x1f".join(sorted(str(v) for v in values))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 def clear_stats_cache() -> None:
     """Discard all cached /pictures/stats results (e.g. after tag mutations)."""
-    _stats_cache.clear()
+    global _stats_generation
+    with _stats_generation_lock:
+        _stats_generation += 1
+        _stats_cache.clear()
 
 
 def get_cached_picture_stats(vault, params: PictureStatsParams, cache_key: str) -> dict:
@@ -874,6 +1024,15 @@ def get_cached_picture_stats(vault, params: PictureStatsParams, cache_key: str) 
         if now - ts < STATS_TTL:
             return data
 
+    with _stats_generation_lock:
+        generation = _stats_generation
     result = compute_picture_stats(vault, params)
-    _stats_cache[cache_key] = (time.monotonic(), result)
+    with _stats_generation_lock:
+        if generation == _stats_generation:
+            _stats_cache[cache_key] = (time.monotonic(), result)
+        else:
+            logger.debug(
+                "Not caching /pictures/stats for %r: the cache was cleared while it was computed",
+                cache_key,
+            )
     return result

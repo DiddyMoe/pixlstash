@@ -12,6 +12,7 @@ import { computed, onScopeDispose, ref } from "vue";
 import { getPictureCount } from "../api/pictures";
 import { isReadOnly, onSessionReset } from "../utils/apiClient";
 import { useProjectStore } from "./useProjectStore";
+import { useUserPrefsStore } from "./useUserPrefsStore";
 
 // `days` dates the empty Inbox's "since"; `span` words the period in "from the
 // <span> before". Any time has neither: it has no cutoff.
@@ -100,11 +101,14 @@ function savePeriod(id) {
 
 export const useInboxStore = defineStore("inbox", () => {
   const projectStore = useProjectStore();
+  const userPrefsStore = useUserPrefsStore();
 
   const period = ref(loadPeriod());
   // Period id → count, filled as each is read; a missing key is "not read yet".
-  // They belong to one project scope (`countedScope`): a read in another scope
-  // starts them over, so no row shows the previous project's number.
+  // They belong to one scope (`countedScope`: the project, and the hidden tags
+  // while that preference is on): a read in another scope starts them over, so
+  // no row shows the previous project's number, or one counted under other
+  // hidden tags.
   const counts = ref({});
   let countedScope = null;
   let epoch = 0;
@@ -126,6 +130,8 @@ export const useInboxStore = defineStore("inbox", () => {
   /**
    * What the Inbox holds for `id`, unfiltered: the grid's view without the
    * Filter menu, stack leaders as the tiles are, inside the sidebar's project.
+   * While hidden tags are on it leaves out the pictures they hide, as the grid
+   * does (`viewQueryParams`'s `apply_tag_filter`).
    */
   function countQuery(id) {
     const params = new URLSearchParams({ inbox: id, stack_leaders_only: "true" });
@@ -137,12 +143,24 @@ export const useInboxStore = defineStore("inbox", () => {
           : "UNASSIGNED",
       );
     }
+    if (userPrefsStore.applyTagFilter) params.set("apply_tag_filter", "true");
     return params.toString();
+  }
+
+  /**
+   * What the counts were read under: the query without its period, and the
+   * hidden tags, which the server reads from the user rather than the query.
+   */
+  function countScope() {
+    return JSON.stringify([
+      countQuery(""),
+      userPrefsStore.applyTagFilter ? userPrefsStore.hiddenTags : null,
+    ]);
   }
 
   async function readCounts(ids) {
     if (isReadOnly.value) return;
-    const scope = countQuery("");
+    const scope = countScope();
     if (scope !== countedScope) {
       countedScope = scope;
       epoch += 1;

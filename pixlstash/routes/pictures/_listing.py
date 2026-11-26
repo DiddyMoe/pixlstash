@@ -1,7 +1,11 @@
+import functools
+import inspect
+import math
 import re
 import sys
+import threading
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import (
     Depends,
@@ -10,13 +14,22 @@ from fastapi import (
     Request,
     Response,
 )
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import JSONResponse
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import (
     or_,
 )
-from sqlmodel import Session, select
+from sqlalchemy.types import TypeDecorator
+from sqlmodel import Session, SQLModel, select
 
-from pixlstash.database import DBPriority
+from pixlstash.database import DBPriority, VaultDatabase
 from pixlstash.hub import workflow_cards
 from pixlstash.hub.workflow_card_reads import (
     run_filed_workflow_ids,
@@ -36,13 +49,17 @@ from pixlstash.scoring import (
     find_pictures_by_character_likeness_sql,
 )
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import SQLITE_INT_MAX, SqliteInt, parse_sqlite_int
 from pixlstash.utils.service.filter_helpers import (
     collect_set_filter_ids,
     fetch_scope_allowed_picture_ids,
     fetch_set_candidate_ids,
+    is_scrapheap_view_id,
     normalize_set_mode,
     project_membership_exists_clause,
     project_unassigned_clause,
+    request_targets_scrapheap,
 )
 from pixlstash.utils.query.predicate_filter import (
     NOT_MADE_BY,
@@ -51,6 +68,7 @@ from pixlstash.utils.query.predicate_filter import (
     PredicateFilter,
     inbox_cutoff,
     is_truthy_flag,
+    parse_tag_state,
 )
 
 from ._helpers import (
@@ -63,8 +81,252 @@ from ._helpers import (
 
 logger = get_logger(__name__)
 
+# Upper bound on repeated ``id`` params per listing request. Each id is a bound
+# parameter of one IN (...) and a row of one response, so an unbounded list lets
+# one URL serialise an arbitrarily large read on the DB queue. Mirrors
+# BULK_DELETE_MAX_IDS (reject over the limit rather than truncate); the frontend
+# chunks larger id lists into several calls.
+LIST_MAX_IDS = 1000
 
-class GridPicture(BaseModel):
+# The raw query names the listing reads out of ``query_params`` by the same
+# name as a ``Picture.find`` keyword, and pops before any splat.
+_ROUTE_READ_FIND_NAMES = frozenset(
+    {
+        "file_path_prefix",
+        "limit",
+        "max_score",
+        "min_score",
+        "offset",
+        "only_deleted",
+        "resolution_bucket",
+        "smart_score_bucket",
+        "tag_state",
+        "unscored",
+    }
+)
+# Every other parameter name of ``run_immediate_read_task`` or ``Picture.find``
+# is dropped from the raw query before the route reads it. The leftovers are
+# splatted into ``run_immediate_read_task(Picture.find, <explicit kwargs>,
+# **query_params)``, so such a name would either repeat a keyword the route
+# passes itself (a TypeError: ``?select_fields=id`` was a 500) or set one no
+# client is meant to set (``include_deleted``, ``count_only``, a list filter as
+# a bare string). The route sets the derived ones (``tags_filter`` from
+# ``tag``, ``stack_state`` once validated, ...) itself afterwards. Read from
+# the signatures, so a keyword added to either is covered as well.
+_SPLAT_RESERVED_NAMES = (
+    frozenset(
+        name
+        for fn in (Picture.find.__func__, VaultDatabase.run_immediate_read_task)
+        for name, param in inspect.signature(fn).parameters.items()
+        if param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
+    )
+    - _ROUTE_READ_FIND_NAMES
+)
+
+
+def enforce_list_id_cap(request: Request) -> None:
+    """Refuse a listing request that names more than ``LIST_MAX_IDS`` ids.
+
+    Checked at the HTTP routes, not in ``select_pictures_for_listing``: a smart
+    set's stored rule may hold a longer id list, and its refresh is not a request
+    anyone is waiting on.
+    """
+    count = len(request.query_params.getlist("id"))
+    if count > LIST_MAX_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Too many id params ({count}); the maximum is {LIST_MAX_IDS} "
+                "per request"
+            ),
+        )
+
+
+def _storable_picture_ids(values) -> list[int]:
+    """The ``id`` filter values that name a picture SQLite can store.
+
+    A value that is not a digit string, or is one past SQLite's range, names
+    no picture, so it is dropped as a malformed ``id`` always has been rather
+    than bound (where a past-range one overflows in the driver).
+    """
+    return [int(i) for i in values if str(i).isdigit() and int(i) <= SQLITE_INT_MAX]
+
+
+def _reference_folder_id(query_params: dict) -> int | None:
+    """The ``reference_folder_id`` filter, for the branches that name filters.
+
+    The main listing and the Scrapheap take it out of the ``**query_params``
+    splat as a ``Picture.find`` column filter. The unassigned view (the Inbox
+    included) and the likeness sort's candidates name each filter instead, so
+    they read it here, or a reference folder's view lists the whole library
+    while the stats count the folder. A value SQLite cannot store names no
+    folder and is refused.
+    """
+    raw = query_params.get("reference_folder_id")
+    if raw in (None, ""):
+        return None
+    try:
+        return parse_sqlite_int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Refusing reference_folder_id %r: not an integer SQLite stores", raw
+        )
+        raise HTTPException(status_code=400, detail="Invalid reference_folder_id")
+
+
+# Stored values already answered null, as (table, row id, column), so a damaged
+# row the grid reads on every page is logged once and not once per request.
+# Past the cap the record starts over and a value still bad is logged once
+# more. A library switch starts it over too: the next library reuses row ids.
+_REFUSED_STORED_VALUES_LIMIT = 10_000
+_refused_stored_values: set[tuple[str, int, str]] = set()
+_refused_stored_values_lock = threading.Lock()
+
+
+def forget_refused_stored_values() -> None:
+    """Start the record of stored values answered null over."""
+    with _refused_stored_values_lock:
+        _refused_stored_values.clear()
+
+
+def _first_refusal(table: str, row_id, column: str) -> bool:
+    """Whether this is the first time *column* of this row is answered null."""
+    key = (table, row_id, column)
+    with _refused_stored_values_lock:
+        if key in _refused_stored_values:
+            return False
+        if len(_refused_stored_values) >= _REFUSED_STORED_VALUES_LIMIT:
+            _refused_stored_values.clear()
+        _refused_stored_values.add(key)
+    return True
+
+
+@functools.cache
+def _declared_type(table: str, column: str):
+    """The Python type *table*'s *column* declares, or None for no such column.
+
+    SQLite does not enforce it: a row written by a tool outside the app, or
+    before a check existed, can hold a REAL ``inf`` or a BLOB in an INTEGER
+    column, or a BLOB in a TEXT one.
+    """
+    found = SQLModel.metadata.tables[table].columns.get(column)
+    if found is None:
+        return None
+    declared = found.type
+    if isinstance(declared, TypeDecorator):
+        declared = declared.impl_instance
+    return declared.python_type
+
+
+def stored_value(value, *, table: str, row_id, column: str, picture_id, log=logger):
+    """A stored column value as the column declares it, or None.
+
+    For a response built from a row loaded from the database. An INTEGER
+    column's value that is not an integer, a REAL one's that is not a finite
+    number, or a TEXT one's that is not text fails the response model, or
+    JSON itself, and answered 500 for the whole page. Such a value is logged
+    with the picture and the column, once per row and column (a damaged row
+    the grid reads on every page does not flood the log), and answered as
+    null; the rest of the row, and every other row, is served. NULL is normal
+    and passes through. A column of another type (a date, a flag, a blob) is
+    converted by the database layer on load and is returned as it is, as is a
+    name that is not a column of *table*.
+
+    Args:
+        value: The value read from the row.
+        table: The table the row is in.
+        row_id: The row's id.
+        column: The column the value was read from.
+        picture_id: The picture the row is or belongs to, named in the log.
+        log: The logger of the route answering null.
+    """
+    declared = _declared_type(table, column)
+    if value is None or declared not in (int, float, str):
+        return value
+    if declared is str:
+        carried = isinstance(value, str)
+    elif isinstance(value, bool) or not isinstance(value, (int, float)):
+        carried = False
+    elif declared is int:
+        carried = isinstance(value, int)
+    else:
+        carried = math.isfinite(value)
+    if carried:
+        return value
+    if _first_refusal(table, row_id, column):
+        log.warning(
+            "Picture %s has a stored %s that is not a %s: %.80r; answered as null",
+            picture_id,
+            column if table == "picture" else f"{table} {row_id} {column}",
+            {int: "integer", float: "finite number", str: "text"}[declared],
+            value,
+        )
+    return None
+
+
+def stored_picture_value(value, *, picture_id, column: str):
+    """:func:`stored_value` for a ``picture`` column of picture *picture_id*."""
+    return stored_value(
+        value,
+        table="picture",
+        row_id=picture_id,
+        column=column,
+        picture_id=picture_id,
+    )
+
+
+def stored_picture_dict(pic) -> dict:
+    """``safe_model_dict`` of a loaded picture, read through the column types.
+
+    Each loaded ``picture`` column is read through :func:`stored_picture_value`
+    before ``safe_model_dict`` sees it: that writes a BLOB as base64 text, after
+    which a TEXT column's BLOB cannot be told from text, and a row's ``score``
+    is compared before any response model reads it.
+    """
+    raw = vars(pic)
+    picture_id = raw.get("id")
+    columns = Picture.__table__.columns
+    return {
+        key: None
+        if key in columns
+        and key in raw
+        and stored_picture_value(raw[key], picture_id=picture_id, column=key) is None
+        else value
+        for key, value in safe_model_dict(pic).items()
+    }
+
+
+class StoredPictureRow(BaseModel):
+    """A response model whose fields are ``picture`` columns by the same name.
+
+    Each such field, and each extra key of a model that keeps extras, is read
+    through :func:`stored_picture_value`, so a stored value its column does
+    not declare is answered as null rather than failing the response. ``id``
+    is declared first by every subclass, so it is validated before the field
+    the log line names it for.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def stored_extras_or_null(cls, data):
+        if not isinstance(data, dict):
+            return data
+        return {
+            key: value
+            if key in cls.model_fields
+            else stored_picture_value(value, picture_id=data.get("id"), column=key)
+            for key, value in data.items()
+        }
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def stored_or_null(cls, value, info: ValidationInfo):
+        return stored_picture_value(
+            value, picture_id=info.data.get("id"), column=info.field_name
+        )
+
+
+class GridPicture(StoredPictureRow):
     """A single picture row as returned by the grid listing endpoints.
 
     Fields are the projection used when ``fields=grid``; all are optional
@@ -308,10 +570,10 @@ class PictureListFilters:
         reference_character_id: str | None = Query(
             None, description="Required reference for sort=CHARACTER_LIKENESS."
         ),
-        min_score: int | None = Query(
+        min_score: SqliteInt | None = Query(
             None, description="Minimum star score.", examples=[3]
         ),
-        max_score: int | None = Query(
+        max_score: SqliteInt | None = Query(
             None, description="Maximum star score.", examples=[5]
         ),
         unscored: bool = Query(
@@ -334,7 +596,11 @@ class PictureListFilters:
             description="unknown | lt1mp | 1-4mp | 4-8mp | 8-16mp | 16plus",
         ),
         file_path_prefix: str | None = Query(
-            None, description="Restrict to file paths starting with this prefix."
+            None,
+            description=(
+                "Restrict to pictures directly in this folder (not a text "
+                "prefix; its sub-folders are not included)."
+            ),
         ),
         face_filter: str | None = Query(
             None, description="with_face | without_face", examples=["with_face"]
@@ -347,6 +613,16 @@ class PictureListFilters:
                 "carries no verdict yet."
             ),
             examples=["stacked"],
+        ),
+        tag_state: str | None = Query(
+            None,
+            description=(
+                "pending | unprocessable | none: only the untagged pictures "
+                "under that reason, the ones `GET /pictures/stats` counts in "
+                "`untagged_breakdown`, in every scope (the Inbox and "
+                "character_id=UNASSIGNED included)."
+            ),
+            examples=["unprocessable"],
         ),
         shared_only: bool = Query(
             False, description="Only pictures shared with the current user."
@@ -396,7 +672,7 @@ class PictureListFilters:
                 "several workflows, or malformed, it matches nothing."
             ),
         ),
-        reference_folder_id: str | None = Query(
+        reference_folder_id: SqliteInt | None = Query(
             None, description="Filter by reference-folder id."
         ),
         import_source_folder: str | None = Query(
@@ -414,7 +690,7 @@ class PictureListFilters:
         id: list[str] = Query(
             default=[], description="Restrict to specific picture ids (repeatable)."
         ),
-        face_cluster: int | None = Query(
+        face_cluster: SqliteInt | None = Query(
             None,
             ge=1,
             description=(
@@ -486,8 +762,9 @@ def _resolve_workflow_filter(server, query_params: dict) -> list[str] | None:
     # `PredicateFilter` as a bare string and 500 on its `List[str]`. It could
     # never widen anything - it only adds an IN, and the resolution below
     # overwrites it whenever a real filter resolves - but a reachable 500 is
-    # its own bug. (Four sibling filters here are unpopped in the same way and
-    # are the same class; this closes the one the change adds.)
+    # its own bug. (``parse_request_params`` now drops every such name before
+    # this runs, ``_SPLAT_RESERVED_NAMES``; the pop keeps this function's own
+    # contract for any other caller.)
     query_params.pop("workflow_structural_hashes", None)
     raw = query_params.pop("workflow", None)
     # Deduplicated, in order: a repeated id names the same workflow once.
@@ -575,6 +852,104 @@ def _variants_run_by(server, workflow_id: str) -> list[str]:
     )
 
 
+def parse_picture_filter(server, request: Request) -> PredicateFilter:
+    """The narrowing params of a picture request, parsed once for every route.
+
+    The listing (``select_pictures_for_listing``) and the text search
+    (``GET /pictures/search``) both read their filters here, so a filter the
+    grid sends narrows a search exactly as it narrows the listing, and a bad
+    value is refused with the same 422 on both.
+
+    The result carries the intrinsic vocabulary of
+    :meth:`PredicateFilter.from_query_params` and the two filters that need the
+    server to resolve: ``tag_state`` with the registry's suppressed ids, and
+    ``workflow`` / ``workflow_lora`` as variant keys (see
+    :func:`_resolve_workflow_filter`). Membership (people, sets, projects),
+    paging and sort are not read here; each route resolves those itself.
+
+    Args:
+        server: The running server, for the unprocessable registry and the hub.
+        request: The request whose query params are read.
+
+    Returns:
+        The parsed filter. Its deleted flags are left at their defaults; the
+        caller decides the deleted scope.
+
+    Raises:
+        HTTPException: 422 for an integer param that is not one SQLite stores,
+            a ``tag_confidence_above`` / ``tag_confidence_below`` that is not
+            ``tag:number``, or a ``tag_state`` outside ``TAG_STATES``. The
+            detail names the param, never the value sent.
+    """
+    query = request.query_params
+    parsed = PredicateFilter.from_query_params(request)
+    tag_state = parse_tag_state(query.get("tag_state"))
+    # The reasons split on the in-memory suppressed set, so read it once here,
+    # the same read the stats breakdown makes.
+    unprocessable_ids = (
+        frozenset(server.vault.db.unprocessable_images.active_suppressed_ids())
+        if tag_state is not None
+        else None
+    )
+    # Presence, not truthiness, as `_resolve_workflow_filter` reads them:
+    # `?workflow=` names a workflow no picture was made with.
+    workflow_params: dict = {}
+    if "workflow" in query:
+        workflow_params["workflow"] = query.getlist("workflow")
+    if "workflow_lora" in query:
+        workflow_params["workflow_lora"] = query.get("workflow_lora")
+    return parsed.model_copy(
+        update={
+            "tag_state": tag_state,
+            "unprocessable_ids": unprocessable_ids,
+            "workflow_structural_hashes": _resolve_workflow_filter(
+                server, workflow_params
+            ),
+        }
+    )
+
+
+def shared_picture_ids(server, request: Request) -> set[int] | None:
+    """The pictures the caller has shared, for ``shared_only=true``.
+
+    Returns:
+        The ids of the pictures with a live READ share token of the signed-in
+        user, or ``None`` when the request does not ask (``shared_only`` is
+        not ``true``) or names no user, so the caller narrows nothing.
+    """
+    if request.query_params.get("shared_only") != "true":
+        return None
+    auth_user_id = getattr(request.state, "auth_user_id", None)
+    if auth_user_id is None:
+        return None
+
+    def _fetch_shared_ids(session: Session, uid: int) -> list[int]:
+        now = datetime.now(timezone.utc)
+        return list(
+            session.exec(
+                select(UserToken.resource_id).where(
+                    UserToken.user_id == uid,
+                    UserToken.resource_type == "picture",
+                    UserToken.scope == "READ",
+                    UserToken.resource_id.is_not(None),
+                    or_(
+                        UserToken.expires_at.is_(None),
+                        UserToken.expires_at > now,
+                    ),
+                )
+            ).all()
+        )
+
+    # Tokens live in the hub, so the "what has this owner shared" lookup runs
+    # there. Reading it from the vault would silently return nothing rather
+    # than failing, which is the worse shape.
+    return set(
+        server.hub_engine.run_task(
+            _fetch_shared_ids, auth_user_id, priority=DBPriority.IMMEDIATE
+        )
+    )
+
+
 def select_pictures_for_listing(
     *,
     server,
@@ -626,7 +1001,7 @@ def select_pictures_for_listing(
     def serialize_metadata(pictures):
         result = []
         for pic in pictures:
-            pic_d = safe_model_dict(pic)
+            pic_d = stored_picture_dict(pic)
             d = {
                 field: pic_d.get(field) for field in metadata_fields if field != "tags"
             }
@@ -642,8 +1017,11 @@ def select_pictures_for_listing(
         format = None
         if request.query_params:
             format = request.query_params.getlist("format")
-            query_params = dict(request.query_params)
-            query_params.pop("format", None)
+            query_params = {
+                name: value
+                for name, value in request.query_params.items()
+                if name not in _SPLAT_RESERVED_NAMES
+            }
             if exclude_query_params:
                 for key in exclude_query_params:
                     query_params.pop(key, None)
@@ -709,10 +1087,17 @@ def select_pictures_for_listing(
         if value == "ALL":
             return None
         if value is not None and value != "" and str(value).isdigit():
-            return int(value)
+            try:
+                return parse_sqlite_int(value)
+            except ValueError:
+                logger.warning("Refusing a character_id past SQLite's range")
+                raise HTTPException(status_code=400, detail="Invalid character_id")
         return value
 
     format, query_params = parse_request_params()
+    # Read before ``character_id`` is popped: the set-candidate lookup below
+    # needs the Scrapheap scope, legacy ``character_id=SCRAPHEAP`` included.
+    only_deleted = request_targets_scrapheap(query_params)
     if project_id is not None:
         query_params["project_id"] = project_id
     sort = query_params.pop("sort", sort)
@@ -720,8 +1105,17 @@ def select_pictures_for_listing(
     descending = (
         desc_val.lower() == "true" if isinstance(desc_val, str) else bool(desc_val)
     )
-    offset = int(query_params.pop("offset", offset))
-    limit = int(query_params.pop("limit", limit))
+    try:
+        offset = parse_sqlite_int(query_params.pop("offset", offset))
+        limit = parse_sqlite_int(query_params.pop("limit", limit))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Refusing an offset or limit that is not an integer SQLite stores "
+            "(offset=%r, limit=%r)",
+            request.query_params.get("offset"),
+            request.query_params.get("limit"),
+        )
+        raise HTTPException(status_code=400, detail="Invalid offset or limit")
     character_id = _character_id(query_params.pop("character_id", None))
     unassigned_by = query_params.pop("unassigned_by", None)
     # The Inbox is the unassigned view (no person and no set, both halves)
@@ -742,7 +1136,7 @@ def select_pictures_for_listing(
             else [_character_ids_raw]
         ):
             try:
-                _cid = int(_v)
+                _cid = parse_sqlite_int(_v)
                 if _cid > 0:
                     character_id_list.append(_cid)
             except (TypeError, ValueError):
@@ -760,10 +1154,23 @@ def select_pictures_for_listing(
     set_mode_raw = query_params.pop("set_mode", "union")
     base_set_id_raw = query_params.pop("base_set_id", None)
     reference_character_id = query_params.pop("reference_character_id", None)
-    min_score_raw = query_params.pop("min_score", None)
-    min_score = int(min_score_raw) if min_score_raw is not None else None
-    max_score_raw = query_params.pop("max_score", None)
-    max_score = int(max_score_raw) if max_score_raw is not None else None
+    if reference_character_id not in (None, ""):
+        try:
+            reference_character_id = parse_sqlite_int(reference_character_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Refusing reference_character_id %r: not an integer SQLite stores",
+                reference_character_id,
+            )
+            raise HTTPException(
+                status_code=400, detail="Invalid reference_character_id"
+            )
+    # The filters the text search honours too, parsed where it parses them.
+    narrowing = parse_picture_filter(server, request)
+    query_params.pop("min_score", None)
+    min_score = narrowing.min_score
+    query_params.pop("max_score", None)
+    max_score = narrowing.max_score
     # Popped, not left in ``query_params``: the leftovers are splatted into
     # ``Picture.find(**search)``, whose ``hasattr`` fallthrough silently drops any
     # key that is not a Picture column, so the filter would do nothing at all.
@@ -776,21 +1183,26 @@ def select_pictures_for_listing(
     face_filter = query_params.pop("face_filter", None)
     stack_state = query_params.pop("stack_state", None)
     impossible_sources = query_params.pop("impossible_sources", None)
-    workflow_structural_hashes = _resolve_workflow_filter(server, query_params)
+    query_params.pop("tag_state", None)
+    tag_state = narrowing.tag_state
+    unprocessable_ids = narrowing.unprocessable_ids
+    if tag_state is not None:
+        # Back into ``query_params`` for the ``**query_params`` sites, as the
+        # workflow filter below does.
+        query_params["tag_state"] = tag_state
+        query_params["unprocessable_ids"] = unprocessable_ids
+    # Resolved by ``parse_picture_filter``; popped so no raw name reaches the
+    # ``Picture.find(**query_params)`` splat.
+    for name in ("workflow", "workflow_lora", "workflow_structural_hashes"):
+        query_params.pop(name, None)
+    workflow_structural_hashes = narrowing.workflow_structural_hashes
     if workflow_structural_hashes is not None:
         # Back into ``query_params`` under the name ``Picture.find`` declares,
         # so every ``**query_params`` site gets it; the branches that name each
         # filter instead pass it explicitly.
         query_params["workflow_structural_hashes"] = workflow_structural_hashes
-    shared_only = bool(query_params.pop("shared_only", False))
-    query_params.pop(
-        "guest_session_id", None
-    )  # handled separately; must not leak into **query_params
-    query_params.pop(
-        "stack_leaders_only", None
-    )  # already consumed as an explicit kwarg; must not leak into **query_params
-    _only_deleted_raw = query_params.pop("only_deleted", None)
-    only_deleted = _only_deleted_raw == "true" or _only_deleted_raw is True
+    query_params.pop("shared_only", None)  # read by shared_picture_ids
+    query_params.pop("only_deleted", None)  # read above
     set_mode = normalize_set_mode(set_mode_raw)
     set_filter_ids = collect_set_filter_ids(
         set_id_value=set_id_raw,
@@ -834,8 +1246,8 @@ def select_pictures_for_listing(
 
     # One of the person's face clusters, numbered as the cluster view numbers
     # them ("Cluster N" at a threshold). Narrows through ``query_params["id"]``
-    # like the scopes above; the likeness sort, which never reads it,
-    # intersects ``face_cluster_ids`` itself.
+    # like the scopes above, which every branch reads, the likeness sort
+    # included.
     face_cluster_ids = _face_cluster_ids(
         server,
         request,
@@ -852,48 +1264,22 @@ def select_pictures_for_listing(
         ]
 
     # Shared-only filter: restrict to pictures that have an active READ token for the current user.
-    if shared_only:
-        auth_user_id = getattr(request.state, "auth_user_id", None)
-        if auth_user_id is not None:
-
-            def _fetch_shared_ids(session: Session, uid: int) -> list[int]:
-                now = datetime.now(timezone.utc)
-                return list(
-                    session.exec(
-                        select(UserToken.resource_id).where(
-                            UserToken.user_id == uid,
-                            UserToken.resource_type == "picture",
-                            UserToken.scope == "READ",
-                            UserToken.resource_id.is_not(None),
-                            or_(
-                                UserToken.expires_at.is_(None),
-                                UserToken.expires_at > now,
-                            ),
-                        )
-                    ).all()
-                )
-
-            # Tokens live in the hub, so the "what has this owner shared"
-            # lookup runs there. Reading it from the vault would silently return
-            # nothing rather than failing, which is the worse shape.
-            shared_ids = server.hub_engine.run_task(
-                _fetch_shared_ids, auth_user_id, priority=DBPriority.IMMEDIATE
-            )
-            shared_id_set = set(shared_ids)
-            existing_ids = query_params.get("id")
-            # `existing_ids` may already be `[]` -- a real "nothing matches"
-            # result from scope_picture_id's own narrowing above -- which is
-            # falsy but distinct from "no id filter was ever set" (None).
-            # Checking `is not None` preserves that distinction; a plain
-            # truthiness check would treat an already-narrowed-to-empty scope
-            # as unset and hand back every shared picture, discarding the
-            # narrowing.
-            if existing_ids is not None:
-                query_params["id"] = [
-                    i for i in existing_ids if int(i) in shared_id_set
-                ]
-            else:
-                query_params["id"] = [str(i) for i in shared_id_set]
+    shared_id_set = shared_picture_ids(server, request)
+    if shared_id_set is not None:
+        existing_ids = query_params.get("id")
+        # `existing_ids` may already be `[]` -- a real "nothing matches"
+        # result from scope_picture_id's own narrowing above -- which is
+        # falsy but distinct from "no id filter was ever set" (None).
+        # Checking `is not None` preserves that distinction; a plain
+        # truthiness check would treat an already-narrowed-to-empty scope
+        # as unset and hand back every shared picture, discarding the
+        # narrowing. A malformed `id` names no picture, so it is dropped.
+        if existing_ids is not None:
+            query_params["id"] = [
+                i for i in existing_ids if str(i).isdigit() and int(i) in shared_id_set
+            ]
+        else:
+            query_params["id"] = [str(i) for i in shared_id_set]
 
     def _set_candidate_ids_for_session(session: Session):
         return fetch_set_candidate_ids(
@@ -909,7 +1295,7 @@ def select_pictures_for_listing(
         )
     except ValueError as ve:
         logger.error(f"Invalid sort mechanism: {sort} - {ve}")
-        raise HTTPException(status_code=400, detail=str(ve))
+        raise HTTPException(status_code=400, detail="Invalid sort mechanism")
 
     guest_session_id = getattr(request.state, "guest_session_id", None)
     guest_token_public_id = (
@@ -929,11 +1315,14 @@ def select_pictures_for_listing(
     hidden_tags = _get_hidden_tags_from_request(server, request) or None
 
     pics = []
-    if character_id == "SCRAPHEAP":
-        logger.warning(
-            "character_id=SCRAPHEAP is deprecated; use only_deleted=true instead"
-        )
-        only_deleted = True
+    if is_scrapheap_view_id(character_id):
+        character_id = None
+    # The Scrapheap wins over the unassigned view and the Inbox: those read
+    # live pictures only, so with ``only_deleted`` they would list pictures
+    # outside the heap. The whole heap is listed instead, as the likeness sort
+    # (``fetch_smart_score_candidate_ids``), the text search and the stats
+    # (``get_picture_stats``) read it.
+    if only_deleted and character_id == "UNASSIGNED":
         character_id = None
 
     # The scrapheap (deleted) view never collapses stacks: every deleted picture
@@ -969,6 +1358,10 @@ def select_pictures_for_listing(
         impossible_sources_value: list[str] | None = None,
         import_source_folder_value: str | None = None,
         imported_since_value: datetime | None = None,
+        tag_state_value: str | None = None,
+        unprocessable_ids_value: frozenset[int] | None = None,
+        file_path_prefix_value: str | None = None,
+        reference_folder_id_value: int | None = None,
     ):
         if deleted_only:
             query = select(Picture.id).where(
@@ -981,7 +1374,7 @@ def select_pictures_for_listing(
                 assignment_unassigned_project = True
             elif project_id_value is not None:
                 try:
-                    assignment_project_id = int(project_id_value)
+                    assignment_project_id = parse_sqlite_int(project_id_value)
                 except (TypeError, ValueError):
                     logger.warning(
                         "Invalid project_id_raw value %r for UNASSIGNED assignment scope; treating as global scope",
@@ -1023,6 +1416,10 @@ def select_pictures_for_listing(
                 and not impossible_sources_value
                 and not import_source_folder_value
                 and imported_since_value is None
+                and tag_state_value is None
+                # None means every picture, so a folder must build a list.
+                and file_path_prefix_value is None
+                and reference_folder_id_value is None
             ):
                 return None
             query = select(Picture.id).where(
@@ -1045,13 +1442,23 @@ def select_pictures_for_listing(
         elif project_id_value is not None:
             try:
                 query = query.where(
-                    project_membership_exists_clause(int(project_id_value), Picture)
+                    project_membership_exists_clause(
+                        parse_sqlite_int(project_id_value), Picture
+                    )
                 )
             except (TypeError, ValueError):
                 logger.warning(
                     "Invalid project_id_raw value %r for SMART_SCORE candidate filtering; skipping project filter",
                     project_id_value,
                 )
+        # The listing's two folder filters, in every branch: the reference
+        # folder as the column filter ``Picture.find`` and ``find_unassigned``
+        # apply here, and the folder prefix in the PredicateFilter below, on
+        # the same children-only default the listing uses.
+        if reference_folder_id_value is not None:
+            query = query.where(
+                Picture.reference_folder_id == reference_folder_id_value
+            )
 
         # Intrinsic-attribute predicates via the shared compiler.  Deleted / project
         # / character scoping is handled above (woven into the candidate branches),
@@ -1077,6 +1484,9 @@ def select_pictures_for_listing(
             impossible_sources=impossible_sources_value,
             import_source_folder=import_source_folder_value,
             imported_since=imported_since_value,
+            tag_state=tag_state_value,
+            unprocessable_ids=unprocessable_ids_value,
+            file_path_prefix=file_path_prefix_value,
             apply_deleted_filter=False,
         ).apply(query)
 
@@ -1122,6 +1532,10 @@ def select_pictures_for_listing(
             impossible_sources_value=impossible_sources,
             import_source_folder_value=query_params.get("import_source_folder"),
             imported_since_value=imported_since,
+            tag_state_value=tag_state,
+            unprocessable_ids_value=unprocessable_ids,
+            file_path_prefix_value=file_path_prefix,
+            reference_folder_id_value=_reference_folder_id(query_params),
         )
         if set_filter_ids:
             set_candidate_ids = server.vault.db.run_immediate_read_task(
@@ -1132,24 +1546,16 @@ def select_pictures_for_listing(
                 if candidate_ids is None
                 else set(candidate_ids) & set_candidate_ids
             )
-        # Token scope enforcement: a single-picture share token may only ever
-        # resolve that one picture id. Unlike set_filter_ids/character_id
-        # above, this sort branch never reads query_params["id"] (see the
-        # scope_picture_id comment earlier in this function), so
-        # scope_picture_id's narrowing has to be intersected into the
-        # candidate set here explicitly or a picture-scoped token can widen
-        # the result to every picture with a detected face.
-        if scope_picture_id is not None:
+        # The ``id`` filter, as every other sort applies it: the caller's
+        # ``id=`` list, narrowed above by a picture-scoped token, the face
+        # cluster and shared-only. A filter admits the same rows under every
+        # sort; this one only orders them. ``[]`` is a filter that matched
+        # nothing, not an absent one, and a malformed id names no picture.
+        listed_ids = query_params.get("id")
+        if listed_ids is not None:
+            listed = set(_storable_picture_ids(listed_ids))
             candidate_ids = (
-                {scope_picture_id}
-                if candidate_ids is None
-                else set(candidate_ids) & {scope_picture_id}
-            )
-        if face_cluster_ids is not None:
-            candidate_ids = (
-                face_cluster_ids
-                if candidate_ids is None
-                else set(candidate_ids) & face_cluster_ids
+                listed if candidate_ids is None else set(candidate_ids) & listed
             )
         if candidate_ids is not None and not candidate_ids:
             return _empty_result()
@@ -1213,16 +1619,20 @@ def select_pictures_for_listing(
             unassigned_project_only = True
         elif project_id_raw is not None:
             try:
-                unassigned_project_id = int(project_id_raw)
+                unassigned_project_id = parse_sqlite_int(project_id_raw)
             except (TypeError, ValueError):
                 logger.warning(
                     "Invalid project_id_raw value %r for UNASSIGNED query; skipping project filter",
                     project_id_raw,
                 )
+        unassigned_reference_folder_id = _reference_folder_id(query_params)
         if count_only:
             return server.vault.db.run_immediate_read_task(
                 Picture.find_unassigned,
                 count_only=True,
+                # Counts what the list returns: stack leaders only when the
+                # list collapses stacks, so the header matches the grid.
+                stack_leaders_only=stack_leaders_only,
                 project_id=unassigned_project_id,
                 only_unassigned_project=unassigned_project_only,
                 unassigned_by=unassigned_by,
@@ -1237,6 +1647,7 @@ def select_pictures_for_listing(
                 stack_state=stack_state,
                 impossible_sources=impossible_sources,
                 file_path_prefix=file_path_prefix,
+                reference_folder_id=unassigned_reference_folder_id,
                 import_source_folder=query_params.get("import_source_folder"),
                 imported_since=imported_since,
                 tags_filter=query_params.get("tags_filter") or None,
@@ -1253,9 +1664,11 @@ def select_pictures_for_listing(
                 comfyui_models_filter=query_params.get("comfyui_models_filter"),
                 comfyui_loras_filter=query_params.get("comfyui_loras_filter"),
                 workflow_structural_hashes=workflow_structural_hashes,
+                tag_state=tag_state,
+                unprocessable_ids=unprocessable_ids,
                 picture_ids=(
-                    [int(i) for i in query_params["id"] if str(i).isdigit()]
-                    if query_params.get("id")
+                    _storable_picture_ids(query_params["id"])
+                    if query_params.get("id") is not None
                     else None
                 ),
             )
@@ -1291,14 +1704,17 @@ def select_pictures_for_listing(
             stack_state=stack_state,
             impossible_sources=impossible_sources,
             file_path_prefix=file_path_prefix,
+            reference_folder_id=unassigned_reference_folder_id,
             import_source_folder=query_params.get("import_source_folder"),
             imported_since=imported_since,
             comfyui_models_filter=query_params.get("comfyui_models_filter"),
             comfyui_loras_filter=query_params.get("comfyui_loras_filter"),
             workflow_structural_hashes=workflow_structural_hashes,
+            tag_state=tag_state,
+            unprocessable_ids=unprocessable_ids,
             picture_ids=(
-                [int(i) for i in query_params["id"] if str(i).isdigit()]
-                if query_params.get("id")
+                _storable_picture_ids(query_params["id"])
+                if query_params.get("id") is not None
                 else None
             ),
             guest_session_id=guest_session_id,
@@ -1323,6 +1739,7 @@ def select_pictures_for_listing(
                 face_filter=face_filter,
                 stack_state=stack_state,
                 impossible_sources=impossible_sources,
+                file_path_prefix=file_path_prefix,
                 hidden_tags_filter=hidden_tags,
                 guest_session_id=guest_session_id,
                 guest_token_public_id=guest_token_public_id,
@@ -1347,6 +1764,7 @@ def select_pictures_for_listing(
             face_filter=face_filter,
             stack_state=stack_state,
             impossible_sources=impossible_sources,
+            file_path_prefix=file_path_prefix,
             hidden_tags_filter=hidden_tags,
             guest_session_id=guest_session_id,
             guest_token_public_id=guest_token_public_id,
@@ -1402,32 +1820,44 @@ def select_pictures_for_listing(
                 if project_id_raw == "UNASSIGNED":
 
                     def _get_project_unassigned_ids(session, ids):
-                        rows = session.exec(
-                            select(Picture.id).where(
-                                Picture.id.in_(ids),
-                                project_unassigned_clause(Picture),
-                            )
-                        ).all()
-                        return list(rows)
+                        # A character's pictures scale with the library, so
+                        # they are read in chunks under SQLite's
+                        # bound-parameter limit; the ids are unique.
+                        return [
+                            pic_id
+                            for id_chunk in chunked(ids)
+                            for pic_id in session.exec(
+                                select(Picture.id).where(
+                                    Picture.id.in_(id_chunk),
+                                    project_unassigned_clause(Picture),
+                                )
+                            ).all()
+                        ]
 
                     picture_ids = server.vault.db.run_immediate_read_task(
                         _get_project_unassigned_ids, picture_ids
                     )
                 else:
                     try:
-                        proj_id_int = int(project_id_raw)
+                        proj_id_int = parse_sqlite_int(project_id_raw)
                     except (TypeError, ValueError):
                         proj_id_int = None
                     if proj_id_int is not None:
 
                         def _get_project_member_ids(session, ids, pid):
-                            rows = session.exec(
-                                select(PictureProjectMember.picture_id).where(
-                                    PictureProjectMember.picture_id.in_(ids),
-                                    PictureProjectMember.project_id == pid,
-                                )
-                            ).all()
-                            return list(rows)
+                            # A character's pictures scale with the library,
+                            # so they are read in chunks under SQLite's
+                            # bound-parameter limit; the ids are unique.
+                            return [
+                                pic_id
+                                for id_chunk in chunked(ids)
+                                for pic_id in session.exec(
+                                    select(PictureProjectMember.picture_id).where(
+                                        PictureProjectMember.picture_id.in_(id_chunk),
+                                        PictureProjectMember.project_id == pid,
+                                    )
+                                ).all()
+                            ]
 
                         picture_ids = server.vault.db.run_immediate_read_task(
                             _get_project_member_ids, picture_ids, proj_id_int
@@ -1452,12 +1882,19 @@ def select_pictures_for_listing(
         elif character_id_list:
 
             def get_picture_ids_for_characters(session, ids, mode):
-                # Fetch picture_ids keyed by character for all chars
-                rows = session.exec(
-                    select(Face.character_id, Face.picture_id).where(
-                        Face.character_id.in_(ids)
-                    )
-                ).all()
+                # Fetch picture_ids keyed by character for all chars. The
+                # caller's list has no cap: read in chunks under SQLite's
+                # bound-parameter limit. Each row names its own person; the
+                # modes below combine the merged rows in Python.
+                rows = [
+                    row
+                    for id_chunk in chunked(ids)
+                    for row in session.exec(
+                        select(Face.character_id, Face.picture_id).where(
+                            Face.character_id.in_(id_chunk)
+                        )
+                    ).all()
+                ]
                 members_by_char: dict[int, set[int]] = {cid: set() for cid in ids}
                 for cid, pid in rows:
                     members_by_char.setdefault(int(cid), set()).add(int(pid))
@@ -1498,32 +1935,46 @@ def select_pictures_for_listing(
                 if project_id_raw == "UNASSIGNED":
 
                     def _get_project_unassigned_ids_multi(session, ids):
-                        rows = session.exec(
-                            select(Picture.id).where(
-                                Picture.id.in_(ids),
-                                project_unassigned_clause(Picture),
-                            )
-                        ).all()
-                        return list(rows)
+                        # A character's pictures scale with the library, so
+                        # they are read in chunks under SQLite's
+                        # bound-parameter limit; the ids are unique.
+                        return [
+                            pic_id
+                            for id_chunk in chunked(ids)
+                            for pic_id in session.exec(
+                                select(Picture.id).where(
+                                    Picture.id.in_(id_chunk),
+                                    project_unassigned_clause(Picture),
+                                )
+                            ).all()
+                        ]
 
                     picture_ids = server.vault.db.run_immediate_read_task(
                         _get_project_unassigned_ids_multi, picture_ids
                     )
                 else:
                     try:
-                        proj_id_int = int(project_id_raw)
+                        proj_id_int = parse_sqlite_int(project_id_raw)
                     except (TypeError, ValueError):
                         proj_id_int = None
                     if proj_id_int is not None:
 
                         def _get_project_member_ids_multi(session, ids, pid):
-                            rows = session.exec(
-                                select(PictureProjectMember.picture_id).where(
-                                    PictureProjectMember.picture_id.in_(ids),
-                                    PictureProjectMember.project_id == pid,
-                                )
-                            ).all()
-                            return list(rows)
+                            # A character's pictures scale with the library,
+                            # so they are read in chunks under SQLite's
+                            # bound-parameter limit; the ids are unique.
+                            # Sorted, so each chunk is a fixed id range
+                            # rather than the set's iteration order.
+                            return [
+                                pic_id
+                                for id_chunk in chunked(sorted(ids))
+                                for pic_id in session.exec(
+                                    select(PictureProjectMember.picture_id).where(
+                                        PictureProjectMember.picture_id.in_(id_chunk),
+                                        PictureProjectMember.project_id == pid,
+                                    )
+                                ).all()
+                            ]
 
                         picture_ids = server.vault.db.run_immediate_read_task(
                             _get_project_member_ids_multi, picture_ids, proj_id_int
@@ -1585,7 +2036,7 @@ def select_pictures_for_listing(
                     query_params["id"] = project_pic_ids
             else:
                 try:
-                    query_params["project_id"] = int(project_id_raw)
+                    query_params["project_id"] = parse_sqlite_int(project_id_raw)
                 except (TypeError, ValueError):
                     # If project_id_raw is not a valid integer, skip applying a project filter.
                     logger.warning(
@@ -1682,6 +2133,24 @@ def select_pictures_for_listing(
     return result
 
 
+def rows_of_listed_fields(rows: list[dict], fields: list[str]) -> list[dict]:
+    """Listing rows as :class:`GridPicture` answers them, cut to ``fields``.
+
+    For a ``fields`` comma list: the model alone would answer every key it
+    declares, the ones not asked for as null, so a two-field read cost most of
+    a ``fields=grid`` one. Each row is still validated by the model first, so
+    a name it does not declare (``project_id``, §16.6) stays out however it is
+    asked for, and a stored value its column does not declare is still null.
+    A key the server adds to a row (``stack_count``, ``smartScore``) is
+    answered only when it is asked for too.
+    """
+    include = set(fields)
+    return [
+        GridPicture.model_validate(row).model_dump(mode="json", include=include)
+        for row in rows
+    ]
+
+
 # The response header that says which library a listing's picture ids are of
 # (#1912). An id means nothing in another library, so what keeps one where it
 # may be read back somewhere else keeps this beside it: the ComfyUI-PixlStash
@@ -1714,14 +2183,18 @@ def register_routes(router, server):
         descending: bool = Query(
             True, description="Sort direction; true = newest/highest first."
         ),
-        offset: int = Query(0, description="Number of rows to skip (pagination)."),
-        limit: int = Query(
-            sys.maxsize, description="Maximum rows to return.", examples=[200]
-        ),
+        offset: Annotated[
+            SqliteInt, Query(description="Number of rows to skip (pagination).")
+        ] = 0,
+        limit: Annotated[
+            SqliteInt, Query(description="Maximum rows to return.", examples=[200])
+        ] = sys.maxsize,
         fields: str = Query(
             None,
             description="Field projection: 'grid' for the minimal grid set, a "
-            "comma-separated field list, or omit for full metadata.",
+            "comma-separated field list (each row then carries only those of "
+            "the listed fields this model declares), or omit for full "
+            "metadata.",
             examples=["grid"],
         ),
         project_id: str | None = Query(
@@ -1736,6 +2209,7 @@ def register_routes(router, server):
         ),
         filters: PictureListFilters = Depends(),
     ):
+        enforce_list_id_cap(request)
         # The owner only (ComfyUI's link key is the owner here): a share link
         # has no use for it, and two links are not told they are one library.
         library_uuid = getattr(server.vault, "library_uuid", None)
@@ -1769,7 +2243,7 @@ def register_routes(router, server):
             if token_scope is not None and token_scope.resource_type == "picture"
             else None
         )
-        return select_pictures_for_listing(
+        pictures = select_pictures_for_listing(
             server=server,
             request=request,
             sort=sort,
@@ -1784,6 +2258,14 @@ def register_routes(router, server):
             scope_character_id=scope_character_id,
             scope_picture_id=scope_picture_id,
         )
+        if fields and fields != "grid":
+            # Returned as is, the injected response's headers are not merged
+            # in: they are handed over here.
+            return JSONResponse(
+                rows_of_listed_fields(pictures, metadata_fields),
+                headers=response.headers,
+            )
+        return pictures
 
     @router.get(
         "/pictures/stream",
@@ -1810,7 +2292,10 @@ def register_routes(router, server):
             True, description="Sort direction; true = newest/highest first."
         ),
         offset: int = Query(
-            0, ge=0, description="Row offset for this batch (use next_offset)."
+            0,
+            ge=0,
+            le=SQLITE_INT_MAX,
+            description="Row offset for this batch (use next_offset).",
         ),
         batch_limit: int = Query(
             1000,
@@ -1821,7 +2306,9 @@ def register_routes(router, server):
         ),
         fields: str = Query(
             None,
-            description="Field projection: 'grid', a comma list, or omit.",
+            description="Field projection: 'grid', a comma list (each row then "
+            "carries only those of the listed fields the grid model declares), "
+            "or omit.",
             examples=["grid"],
         ),
         grid_lite: bool = Query(
@@ -1846,6 +2333,7 @@ def register_routes(router, server):
         ),
         filters: PictureListFilters = Depends(),
     ):
+        enforce_list_id_cap(request)
         if fields == "grid":
             metadata_fields = list(Picture.grid_fields())
             if grid_lite:
@@ -1899,6 +2387,14 @@ def register_routes(router, server):
         # end-of-stream.
         done = oneshot or sql_count <= batch_limit
         next_offset = offset + min(batch_limit, sql_count)
+        if fields and fields != "grid":
+            return JSONResponse(
+                {
+                    "pictures": rows_of_listed_fields(pictures, metadata_fields),
+                    "done": done,
+                    "next_offset": next_offset,
+                }
+            )
         return {
             "pictures": pictures,
             "done": done,
@@ -1944,6 +2440,7 @@ def register_routes(router, server):
         ),
         filters: PictureListFilters = Depends(),
     ):
+        enforce_list_id_cap(request)
         token_scope = getattr(request.state, "token_scope", None)
         scope_set_id = (
             token_scope.resource_id
