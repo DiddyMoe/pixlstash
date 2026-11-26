@@ -46,6 +46,7 @@ from typing import Callable
 from pixlstash.pixl_logging import get_logger
 from pixlstash.training import measurements
 from pixlstash.training.config_render import (
+    NOT_TUNABLE_MESSAGE,
     TUNABLE_KEYS,
     TunableOverrideError,
     check_value,
@@ -163,7 +164,10 @@ def check_tunable(key: str, value) -> None:
     """
     rule = TUNABLE_KEYS.get(key)
     if rule is None:
-        raise TunableOverrideError(f"'{key}' is not a tunable training parameter.")
+        # The key is the caller's text until it matches a tunable: logged, not
+        # repeated in the error a route answers with.
+        logger.info("Refused a setting that is not tunable: %r", key)
+        raise TunableOverrideError(NOT_TUNABLE_MESSAGE)
     if key == PROMPTS_KEY:
         if not isinstance(value, list) or not 1 <= len(value) <= _MAX_PROMPTS:
             raise TunableOverrideError(
@@ -177,6 +181,11 @@ def check_tunable(key: str, value) -> None:
 
 def _check_table(preset_id: str, where: str, table: dict) -> None:
     for key, value in table.items():
+        if key not in TUNABLE_KEYS:
+            # A recipe file is the server's own data: its log names the key.
+            raise PresetError(
+                f"{preset_id}: {where}: '{key}' is not a tunable training parameter."
+            )
         try:
             check_tunable(key, value)
         except TunableOverrideError as exc:
@@ -216,13 +225,18 @@ def validate_preset(preset: dict) -> dict:
         _check_table(pid, f"subject.{name}", row)
     if set(preset["effort"]) != set(EFFORTS):
         raise PresetError(f"{pid}: effort must hold exactly {', '.join(EFFORTS)}.")
+    most_steps = TUNABLE_KEYS["train.steps"].hi
     for name, row in preset["effort"].items():
         steps = [row.get(k) for k in EFFORT_STEP_KEYS]
+        # Compared, never converted: `math.isfinite` turns an int into a float
+        # first and overflows on one past the float range, an OverflowError
+        # that is no PresetError and so took every recipe read down. The
+        # ceiling is the most steps a run may be given; NaN and infinity fail
+        # the comparison as well.
         if not all(
             isinstance(v, (int, float))
             and not isinstance(v, bool)
-            and math.isfinite(v)
-            and v > 0
+            and 0 < v <= most_steps
             for v in steps
         ):
             raise PresetError(

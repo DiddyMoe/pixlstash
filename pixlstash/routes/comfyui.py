@@ -13,11 +13,12 @@ from copy import deepcopy
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 from send2trash import TrashPermissionError, send2trash
 
 from typing import Literal, Optional
 
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 from pixlstash.db_models import (
     Picture,
     User,
@@ -67,6 +68,7 @@ from pixlstash.services.comfyui_recipe_service import (
     fetch_object_info,
     plan_lora_insertion,
     preflight_prompt,
+    LORA_CHAIN_UNREADABLE,
     read_lora_chain,
     sanitize_prompt_graph,
     unchecked_preflight,
@@ -116,6 +118,12 @@ from pixlstash.services.workflow_io import (
     with_converted_graph,
 )
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.comfyui_url import (
+    SAVED_ADDRESS_INVALID,
+    SavedComfyUIAddressInvalid,
+    is_valid_saved,
+    request_base,
+)
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.trash_restore import NotInTrash, restore_from_trash
 from pixlstash.services.model_mover import publish_no_clobber
@@ -176,6 +184,14 @@ logger = get_logger(__name__)
 PLACEHOLDER_IMAGE = "{{image_path}}"
 PLACEHOLDER_CAPTION = "{{caption}}"
 DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188/"
+# Stands for "no default named" in :func:`_comfyui_url`, which then reads
+# ``DEFAULT_COMFYUI_URL`` when called rather than when this module loads: the
+# e2e start-up repoints it at a fake ComfyUI (``test_hooks.point_comfyui_default``).
+_DEFAULT_ADDRESS = object()
+# The 404 for a connection id that matched none: the id is the caller's text.
+NO_SUCH_CONNECTION = "There is no such ComfyUI connection."
+# The 404 for a pack id not on PixlStash's list, for the same reason.
+NO_SUCH_NODE_PACK = "PixlStash does not know that node pack."
 
 
 WORKFLOW_BUILTIN_DIR = os.path.abspath(
@@ -1398,7 +1414,13 @@ def _describe_lora_chain(
         }
     try:
         chain = read_lora_chain(graph, object_info)
+    except (KeyError, IndexError):
+        # Tripped over rather than refused: the lookup's text is a key of the
+        # graph, not a sentence.
+        logger.warning("This graph's LoRA chain could not be read.", exc_info=True)
+        return {**unread, "refusal": LORA_CHAIN_UNREADABLE}
     except LookupError as exc:
+        # The chain reader's own refusals, composed from the graph's nodes.
         logger.info("This graph's LoRA chain cannot be read: %s", exc)
         return {**unread, "refusal": str(exc)}
 
@@ -1505,10 +1527,21 @@ def _describe_workflow(
     }
 
 
-def _comfyui_url(user) -> str:
-    """The ComfyUI base URL a user has set, without a trailing slash."""
-    url = getattr(user, "comfyui_url", None) if user else None
-    return (url or DEFAULT_COMFYUI_URL).rstrip("/")
+def _comfyui_url(user, default: str | None | object = _DEFAULT_ADDRESS) -> str | None:
+    """The ComfyUI base URL a user has set, without a trailing slash.
+
+    Read through the normaliser (``comfyui_connections.current_base``): a saved
+    address that no longer passes it is answered 409, and nothing is sent.
+    With none saved it is *default*: ``DEFAULT_COMFYUI_URL`` when none is named,
+    or ``None`` for a caller that sends nothing without an address rather than
+    trying ComfyUI's default port.
+    """
+    if default is _DEFAULT_ADDRESS:
+        default = DEFAULT_COMFYUI_URL
+    try:
+        return comfyui_connections.current_base(user, default)
+    except SavedComfyUIAddressInvalid:
+        raise HTTPException(status_code=409, detail=SAVED_ADDRESS_INVALID) from None
 
 
 def _on_disk_name(path: str) -> str:
@@ -2276,6 +2309,17 @@ class ComfyUIConnection(BaseModel):
         description="This connection's own link key, if it is linked.",
     )
 
+    @computed_field(
+        description=(
+            "Whether `url` still passes the address check. False for an "
+            "address an older build saved that is now refused: nothing is "
+            "sent to it, and it is set again in Settings > ComfyUI."
+        )
+    )
+    @property
+    def address_valid(self) -> bool:
+        return is_valid_saved(self.url)
+
 
 class ComfyUIConnectionList(BaseModel):
     """``GET /comfyui/connections``: every connection, and which runs go to."""
@@ -2326,6 +2370,7 @@ class ComfyUIPackInstallResponse(BaseModel):
     installed_to: str
     version: Optional[str] = None
     replaced: list[str]
+    kept_links: list[str] = []
     restart: str
     detail: Optional[str] = None
 
@@ -2864,9 +2909,10 @@ def create_router(server) -> APIRouter:
             None,
         )
         if entry is None:
-            raise HTTPException(
-                status_code=404, detail=f"No ComfyUI connection {connection_id!r}."
-            )
+            # The id matched nothing, so it is the caller's text: the log has
+            # it, the answer does not.
+            logger.info("No ComfyUI connection %r.", connection_id)
+            raise HTTPException(status_code=404, detail=NO_SUCH_CONNECTION)
         return entry
 
     def _current_connection(user) -> Optional[dict]:
@@ -2874,11 +2920,25 @@ def create_router(server) -> APIRouter:
         return _connection_or_404(user, current) if current else None
 
     def _address(request: Request, connection_id: Optional[str]) -> Optional[str]:
-        """The connection's address, or ``comfyui_url`` with none named."""
+        """The connection's address, or the current one with none named;
+        ``None`` when nothing is saved.
+
+        Read through the normaliser (``request_base``, or ``_comfyui_url`` for
+        the current one): a saved address that no longer passes it is answered
+        409, and nothing is sent.
+        """
         user = server.auth.get_user_for_request(request)
-        if connection_id:
-            return _connection_or_404(user, connection_id)["url"]
-        return getattr(user, "comfyui_url", None) if user else None
+        if not connection_id:
+            if not comfyui_connections.is_configured(user):
+                return None
+            return _comfyui_url(user)
+        stored = _connection_or_404(user, connection_id)["url"]
+        if not stored:
+            return None
+        try:
+            return request_base(stored, connection_id=connection_id)
+        except SavedComfyUIAddressInvalid:
+            raise HTTPException(status_code=409, detail=SAVED_ADDRESS_INVALID) from None
 
     @router.get(
         "/comfyui/link",
@@ -2941,8 +3001,9 @@ def create_router(server) -> APIRouter:
             "with) into the saved ComfyUI's custom_nodes folder, moving any "
             "older copy to the trash, then asks ComfyUI-Manager to restart "
             "ComfyUI. Only for a ComfyUI on this computer. `restart` is "
-            "`requested`, or `manual` with `detail` saying why. 409 when it "
-            "cannot install here."
+            "`requested`, or `manual` with `detail` saying why. `kept_links` "
+            "names each link to another copy of the nodes that was left in "
+            "place, so ComfyUI may load both. 409 when it cannot install here."
         ),
         response_model=ComfyUIPackInstallResponse,
     )
@@ -2986,8 +3047,11 @@ def create_router(server) -> APIRouter:
         saved = _address(request, connection_id)
         try:
             return node_pack_install_service.install(saved, pack_id)
-        except node_pack_install_service.UnknownPack as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except node_pack_install_service.UnknownPack:
+            # The id matched no listed pack, so it is the caller's text: the
+            # log has it, the answer does not.
+            logger.info("No node pack %r to install.", pack_id)
+            raise HTTPException(status_code=404, detail=NO_SUCH_NODE_PACK) from None
         except node_pack_install_service.PackInstallRefused as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -3013,8 +3077,9 @@ def create_router(server) -> APIRouter:
         saved = _address(request, connection_id)
         try:
             return {"loaded": node_pack_install_service.loaded(saved, pack_id)}
-        except node_pack_install_service.UnknownPack as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except node_pack_install_service.UnknownPack:
+            logger.info("No node pack %r to check.", pack_id)
+            raise HTTPException(status_code=404, detail=NO_SUCH_NODE_PACK) from None
 
     @router.delete(
         "/comfyui/link",
@@ -3149,7 +3214,7 @@ def create_router(server) -> APIRouter:
             )
             raise HTTPException(
                 status_code=500,
-                detail=f"The connection's key could not be revoked, so {kept}: {exc}",
+                detail=f"The connection's key could not be revoked, so {kept}.",
             ) from exc
 
     @router.patch(
@@ -3850,7 +3915,7 @@ def create_router(server) -> APIRouter:
     )
     def get_picture_comfyui_workflow(request: Request, picture_id: str):
         try:
-            pic_id = int(picture_id)
+            pic_id = parse_sqlite_int(picture_id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -3932,7 +3997,7 @@ def create_router(server) -> APIRouter:
         ),
     ):
         try:
-            pic_id = int(picture_id)
+            pic_id = parse_sqlite_int(picture_id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 

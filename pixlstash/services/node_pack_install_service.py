@@ -33,6 +33,9 @@ import requests
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import comfyui_link_service, node_packs
 from pixlstash.services.comfyui_pack_service import restart_comfyui
+from pixlstash.services.comfyui_service import COMFYUI_ANSWER_MAX_BYTES
+from pixlstash.utils.bounded_http import BoundedResponse, bounded_request
+from pixlstash.utils.comfyui_url import SAVED_ADDRESS_INVALID, InvalidComfyUIAddress
 
 logger = get_logger(__name__)
 
@@ -48,12 +51,25 @@ POLL_EVERY_S = 2.0
 INSTALL_TIMEOUT_S = 180.0
 
 
+# The answer when the pack id matched no listed pack: the id is the caller's
+# text, so it is never repeated.
+UNKNOWN_PACK = "PixlStash does not know that node pack."
+
+
 class PackInstallRefused(Exception):
-    """The pack cannot be installed through PixlStash; the message says why."""
+    """The pack cannot be installed through PixlStash; the message says why.
+
+    The route answers the message as it is, so every message is composed here
+    from values PixlStash chose (a listed pack's name, id and version, an HTTP
+    status): never exception text, ComfyUI's own words or the caller's input.
+    """
 
 
 class UnknownPack(PackInstallRefused):
-    """The id names no pack in :data:`~pixlstash.services.node_packs.KNOWN_PACKS`."""
+    """The id names no pack in :data:`~pixlstash.services.node_packs.KNOWN_PACKS`.
+
+    The message is :data:`UNKNOWN_PACK`, which never repeats the id.
+    """
 
 
 def _yourself(pack: node_packs.NodePack) -> str:
@@ -67,19 +83,23 @@ def _call(
     *,
     body: Optional[dict] = None,
     timeout: float = 10,
-) -> Optional[requests.Response]:
+) -> Optional[BoundedResponse]:
     """One request to the pinned ComfyUI, or ``None`` when it did not answer.
 
     Never through a proxy and never after a redirect: the pinned address is the
     vetted one, and a redirect could send the request somewhere that is not.
+    The whole answer is read within *timeout* and ComfyUI's answer cap (the
+    one ``object_info``, the largest asked here, is read with elsewhere), or
+    it did not answer.
     """
     try:
-        return requests.request(
+        return bounded_request(
             method,
             f"{pinned}{path}",
             json=body,
             timeout=timeout,
-            allow_redirects=False,
+            deadline_s=timeout,
+            max_bytes=COMFYUI_ANSWER_MAX_BYTES,
             proxies=comfyui_link_service.NO_PROXY,
         )
     except requests.RequestException as exc:
@@ -299,13 +319,18 @@ def install(comfyui_url: Optional[str], pack_id: str) -> dict:
     """
     pack = node_packs.pack(pack_id)
     if pack is None:
-        raise UnknownPack(f"PixlStash does not know a node pack called {pack_id!r}.")
+        raise UnknownPack(UNKNOWN_PACK)
     if not comfyui_url:
         raise PackInstallRefused("No ComfyUI address is saved.")
     try:
         _where, pinned = comfyui_link_service.locate(comfyui_url)
-    except ValueError as exc:
-        raise PackInstallRefused(str(exc)) from exc
+    except InvalidComfyUIAddress as exc:
+        logger.warning(
+            "Saved ComfyUI address is not valid (%s); no node pack installed.",
+            exc,
+            exc_info=exc,
+        )
+        raise PackInstallRefused(SAVED_ADDRESS_INVALID) from exc
     if pinned is None:
         raise PackInstallRefused(
             "PixlStash installs node packs only into a ComfyUI on this computer "
@@ -374,7 +399,7 @@ def loaded(comfyui_url: Optional[str], pack_id: str) -> bool:
     """
     pack = node_packs.pack(pack_id)
     if pack is None:
-        raise UnknownPack(f"PixlStash does not know a node pack called {pack_id!r}.")
+        raise UnknownPack(UNKNOWN_PACK)
     if not comfyui_url:
         return False
     try:

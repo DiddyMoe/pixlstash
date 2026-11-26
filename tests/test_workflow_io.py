@@ -1578,14 +1578,22 @@ def test_every_shipped_and_fixture_workflow_is_accepted(path):
     check_comfy_workflow(_load(path))
 
 
-def test_a_refusal_names_the_node_id_and_cuts_a_long_key_short():
-    nodes = [{"id": 1, "type": "SaveImage"}, {"id": 7}]
-    with pytest.raises(NotAWorkflowError, match="node '7' has no type"):
+def test_a_refusal_names_the_entry_by_its_place_never_by_its_text():
+    # The id and the key are the document's own text, so neither is repeated.
+    nodes = [{"id": 1, "type": "SaveImage"}, {"id": "test-caller-id"}]
+    with pytest.raises(NotAWorkflowError) as refused:
         check_comfy_workflow({"nodes": nodes, "links": []})
-    graph = {**_t2i_graph(), "x" * 5000: 1}
+    assert str(refused.value) == (
+        "not a ComfyUI workflow: entry 2 of its nodes has no type"
+    )
+    # PixlStash's own keys count towards the place, so it matches the file.
+    graph = {"pixlstash_output_nodes": ["6"], **_t2i_graph(), "test-caller-key": 1}
     with pytest.raises(NotAWorkflowError) as refused:
         check_comfy_workflow(graph)
-    assert len(str(refused.value)) < 200
+    assert str(refused.value) == (
+        f"not a ComfyUI workflow: entry {len(graph)} of the graph is not a node "
+        "with a class_type and inputs"
+    )
 
 
 def test_deleting_a_workflow_removes_its_migration_backup(import_route):

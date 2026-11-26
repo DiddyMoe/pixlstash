@@ -27,10 +27,18 @@ from send2trash import send2trash
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import comfyui_link_service
 from pixlstash.services.comfyui_service import comfyui_folder_paths
+from pixlstash.utils.bounded_http import bounded_request
+from pixlstash.utils.comfyui_url import SAVED_ADDRESS_INVALID, InvalidComfyUIAddress
+from pixlstash.utils.links import is_link_or_missing
 
 logger = get_logger(__name__)
 
 PACK_FOLDER = "ComfyUI-PixlStash"
+
+# ComfyUI's queue and ComfyUI-Manager's reboot answer with a little JSON. Each
+# is read whole within its deadline and cap, never by following a redirect.
+MANAGER_ANSWER_MAX_BYTES = 4 * 1024 * 1024
+MANAGER_TIMEOUT_S = 10.0
 
 # What a copy of the nodes leaves out: the pack's own tests, screenshots, caches
 # and git plumbing. ``examples`` stays in: ComfyUI lists a node pack's
@@ -57,8 +65,23 @@ _CANDIDATES = (
 )
 
 
+# What the answer says when a step fails for a reason only the server log can
+# name: the OS's or requests' text carries paths and addresses, so it is logged
+# with the traceback and never put in the reply.
+NO_CUSTOM_NODES_ANSWER = (
+    "ComfyUI did not say where its custom nodes live. The server log says why."
+)
+RESTART_UNANSWERED = "ComfyUI-Manager did not answer the restart"
+
+
 class PackInstallRefused(Exception):
-    """The nodes cannot be installed here; the message says why."""
+    """The nodes cannot be installed here; the message says why.
+
+    The route answers the message as it is, so every message is composed here
+    from values PixlStash chose or found on this computer (the custom_nodes
+    folder it resolved, the copies it found there): never exception text,
+    ComfyUI's own words or the caller's input.
+    """
 
 
 def bundled_pack() -> Optional[Path]:
@@ -103,9 +126,13 @@ def _custom_nodes_folder(pinned_url: str) -> Path:
     try:
         folder_paths = comfyui_folder_paths(pinned_url)
     except (requests.RequestException, ValueError) as exc:
-        raise PackInstallRefused(
-            f"ComfyUI did not say where its custom nodes live: {exc}"
-        ) from exc
+        logger.warning(
+            "ComfyUI at %s did not say where its custom nodes live: %s",
+            pinned_url,
+            exc,
+            exc_info=exc,
+        )
+        raise PackInstallRefused(NO_CUSTOM_NODES_ANSWER) from exc
     paths = folder_paths.get("custom_nodes") if isinstance(folder_paths, dict) else None
     for path in paths if isinstance(paths, list) else []:
         if not isinstance(path, str) or not os.path.isdir(path):
@@ -140,11 +167,12 @@ def _plausible_custom_nodes(folder: Path) -> bool:
 def _comfyui_busy(pinned_url: str) -> Optional[str]:
     """Why ComfyUI must not restart now, or ``None`` when its queue is empty."""
     try:
-        response = requests.request(
+        response = bounded_request(
             "GET",
             f"{pinned_url}queue",
-            timeout=10,
-            allow_redirects=False,
+            timeout=MANAGER_TIMEOUT_S,
+            deadline_s=MANAGER_TIMEOUT_S,
+            max_bytes=MANAGER_ANSWER_MAX_BYTES,
             proxies=comfyui_link_service.NO_PROXY,
         )
         queue = response.json() if response.status_code == 200 else None
@@ -181,12 +209,13 @@ def restart_comfyui(pinned_url: str) -> Optional[str]:
     last = "ComfyUI-Manager is not installed"
     for method, path in attempts:
         try:
-            response = requests.request(
+            response = bounded_request(
                 method,
                 f"{pinned_url}{path}",
                 json={} if method == "POST" else None,
-                timeout=10,
-                allow_redirects=False,
+                timeout=MANAGER_TIMEOUT_S,
+                deadline_s=MANAGER_TIMEOUT_S,
+                max_bytes=MANAGER_ANSWER_MAX_BYTES,
                 proxies=comfyui_link_service.NO_PROXY,
             )
         except requests.ConnectionError:
@@ -195,7 +224,15 @@ def restart_comfyui(pinned_url: str) -> Optional[str]:
             # wait for the nodes to load tells the two apart.
             return None
         except requests.RequestException as exc:
-            last = str(exc)
+            logger.warning(
+                "ComfyUI-Manager's %s %s at %s did not answer: %s",
+                method,
+                path,
+                pinned_url,
+                exc,
+                exc_info=exc,
+            )
+            last = RESTART_UNANSWERED
             continue
         if response.status_code == 200:
             return None
@@ -206,8 +243,12 @@ def restart_comfyui(pinned_url: str) -> Optional[str]:
 
 
 def _remove_partial(partial: Path) -> None:
-    """Delete a staging copy of PixlStash's own making. Raises ``OSError``."""
-    if partial.is_symlink() or partial.is_file():
+    """Delete a staging copy of PixlStash's own making. Raises ``OSError``.
+
+    A link at the name, a junction included, is unlinked as a link: emptying it
+    would delete what it points at.
+    """
+    if is_link_or_missing(partial) or partial.is_file():
         partial.unlink()
     elif partial.exists():
         shutil.rmtree(partial)
@@ -232,8 +273,13 @@ def install(comfyui_url: Optional[str]) -> dict:
         raise PackInstallRefused("No ComfyUI address is saved.")
     try:
         where, pinned = comfyui_link_service.locate(comfyui_url)
-    except ValueError as exc:
-        raise PackInstallRefused(str(exc)) from exc
+    except InvalidComfyUIAddress as exc:
+        logger.warning(
+            "Saved ComfyUI address is not valid (%s); the nodes were not installed.",
+            exc,
+            exc_info=exc,
+        )
+        raise PackInstallRefused(SAVED_ADDRESS_INVALID) from exc
     if where != "this_computer":
         raise PackInstallRefused(
             "PixlStash only installs the nodes into a ComfyUI on this computer."
@@ -245,7 +291,7 @@ def install(comfyui_url: Optional[str]) -> dict:
 
     target = custom_nodes / PACK_FOLDER
     partial = custom_nodes / f".{PACK_FOLDER}.installing"
-    if os.path.lexists(target) and (target.is_symlink() or not target.is_dir()):
+    if os.path.lexists(target) and (is_link_or_missing(target) or not target.is_dir()):
         # Refused before anything is trashed: the move into place would fail
         # after the older copies had gone, leaving ComfyUI with none.
         raise PackInstallRefused(
@@ -258,36 +304,54 @@ def install(comfyui_url: Optional[str]) -> dict:
         _remove_partial(partial)
         shutil.copytree(source, partial, ignore=shutil.ignore_patterns(*PACK_LEFT_OUT))
     except OSError as exc:
-        logger.warning("Staging the PixlStash nodes in %s failed: %s", partial, exc)
+        logger.warning(
+            "Staging the PixlStash nodes in %s failed: %s", partial, exc, exc_info=exc
+        )
         _discard_partial(partial)
         raise PackInstallRefused(
-            f"Could not write the nodes to {target}: {exc}"
+            f"Could not write the nodes to {target}. The server log says why."
         ) from exc
 
     replaced = []
+    kept_links = []
     for folder in sorted(custom_nodes.iterdir()):
-        if folder != partial and folder.is_dir() and _is_pack(folder):
-            logger.info(
-                "Moving the older ComfyUI-PixlStash at %s to the trash.", folder
+        if folder == partial or not folder.is_dir() or not _is_pack(folder):
+            continue
+        if is_link_or_missing(folder):
+            # A link here (a development checkout linked in, say) is the
+            # owner's arrangement, and what it points at is outside ComfyUI's
+            # folder: it is kept, as a link at the pack's own name is refused.
+            logger.warning(
+                "Left %s in place: it is a link to a copy of the PixlStash nodes, "
+                "and PixlStash does not trash a link. Remove it yourself if "
+                "ComfyUI should load only the new copy.",
+                folder,
             )
-            try:
-                send2trash(str(folder))
-            except OSError as exc:
-                # Never fall back to deleting it: the trash is the undo.
-                logger.warning("Could not move %s to the trash: %s", folder, exc)
-                _discard_partial(partial)
-                raise PackInstallRefused(
-                    f"Could not move the older copy at {folder} to the trash "
-                    f"({exc}). Remove it yourself, then install again."
-                ) from exc
-            replaced.append(str(folder))
+            kept_links.append(str(folder))
+            continue
+        logger.info("Moving the older ComfyUI-PixlStash at %s to the trash.", folder)
+        try:
+            send2trash(str(folder))
+        except OSError as exc:
+            # Never fall back to deleting it: the trash is the undo.
+            logger.warning(
+                "Could not move %s to the trash: %s", folder, exc, exc_info=exc
+            )
+            _discard_partial(partial)
+            raise PackInstallRefused(
+                f"Could not move the older copy at {folder} to the trash. "
+                "Remove it yourself, then install again."
+            ) from exc
+        replaced.append(str(folder))
     try:
         os.replace(partial, target)
     except OSError as exc:
-        logger.warning("Copying the PixlStash nodes into %s failed: %s", target, exc)
+        logger.warning(
+            "Copying the PixlStash nodes into %s failed: %s", target, exc, exc_info=exc
+        )
         _discard_partial(partial)
         raise PackInstallRefused(
-            f"Could not write the nodes to {target}: {exc}"
+            f"Could not write the nodes to {target}. The server log says why."
         ) from exc
     version = pack_version(source)
     logger.info(
@@ -304,6 +368,8 @@ def install(comfyui_url: Optional[str]) -> dict:
         "installed_to": str(target),
         "version": version,
         "replaced": replaced,
+        # Named so the dialog can say ComfyUI may load both copies.
+        "kept_links": kept_links,
         "restart": "manual" if problem else "requested",
         "detail": f"{problem}, so restart ComfyUI yourself." if problem else None,
     }

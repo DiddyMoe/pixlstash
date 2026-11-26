@@ -142,8 +142,8 @@ def run(self, images, parameters=None, progress_callback=None,
         error_callback=None, captions=None) -> list[Image.Image]:
 ```
 
-- `images` are PIL images, already EXIF-oriented (`ImageOps.exif_transpose`) and
-  **converted to RGB** — there is no alpha channel on the way in, whatever the source
+- `images` are PIL images, already EXIF-oriented (`ImageUtils.apply_exif_orientation`)
+  and **converted to RGB** — there is no alpha channel on the way in, whatever the source
   file had.
 - **The returned list must be the same length as `images`, in the same order.** A
   mismatch raises and the whole run fails, so on a per-image failure append a fallback
@@ -166,6 +166,12 @@ self.report_error(error_callback, index=idx, message="Failed",
 ```
 
 Both are no-ops when the callback is `None`, so they are always safe to call.
+
+**`message` is shown to the user; `details` is not.** An error event, and the run's
+`errors` list in the response, carry only the plugin name, the image's `index` and your
+`message`. `details` goes to the server log, so put the exception text and any file path
+there, and keep `message` a short sentence of your own, never `str(exc)`. A run that
+raises is shown as a fixed "The plugin failed" sentence; what it raised is logged.
 
 `run()` executes on a worker thread (`asyncio.to_thread`), so it may block; it must not
 assume an event loop.

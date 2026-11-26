@@ -101,6 +101,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from pixlstash.db_models.adapter_attachment import ENTITY_CHARACTER, ENTITY_SET
 from pixlstash.pixl_logging import get_logger
+from pixlstash.routes.comfyui import _comfyui_url
 from pixlstash.services.comfyui_service import probe_comfyui
 from pixlstash.services.model_kind_suggestions import (
     REFILEABLE_KINDS,
@@ -161,6 +162,7 @@ from pixlstash.services.workflow_templates import (
 from pixlstash.services.workflow_set_verdicts import (
     fetch_model_marks,
     fetch_set_checks,
+    parse_combo_key,
     write_member_verdict,
     write_set_verdict,
 )
@@ -190,6 +192,7 @@ from pixlstash.utils.known_base_models import (
 )
 from pixlstash.utils.model_utils import canonical_quant, derive_model_name
 from pixlstash.utils.path_utils import path_is_within
+from pixlstash.utils.sqlite_ints import SQLITE_INT_MAX, SqliteInt
 
 logger = get_logger(__name__)
 
@@ -268,7 +271,7 @@ class ModelAttachment(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     entity_type: str = Field(description="``character`` or ``set``.")
-    entity_id: int = Field(
+    entity_id: SqliteInt = Field(
         description="Row id in this library's vault. Meaningless in another library."
     )
 
@@ -707,7 +710,7 @@ class ModelEditRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description=(
@@ -834,7 +837,7 @@ class ModelForgetRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The models to forget, by hub `model.id`.",
@@ -846,7 +849,7 @@ class ModelsHiddenRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The models to hide or show, by hub `model.id`.",
@@ -908,7 +911,7 @@ class BaseModelLookupRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_LOOKUP,
         description=(
@@ -963,7 +966,7 @@ class ModelCompanionsRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The models about to be deleted, by hub `model.id`.",
@@ -1417,7 +1420,7 @@ class WorkflowSetMemberRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model_id: Optional[int] = Field(default=None, description="Hub `model.id`.")
+    model_id: Optional[SqliteInt] = Field(default=None, description="Hub `model.id`.")
     sha256: Optional[str] = Field(
         default=None, pattern=r"^[0-9a-fA-F]{64}$", description="A full digest."
     )
@@ -1680,7 +1683,7 @@ class WorkflowSetMergeRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    set_ids: list[int] = Field(
+    set_ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The sets merged into this one and then deleted.",
@@ -2375,10 +2378,10 @@ def create_router(server) -> APIRouter:
         kind: Optional[str] = Query(
             None, description="Adapter algorithm, e.g. `lora` or `lokr`."
         ),
-        character_id: Optional[int] = Query(
+        character_id: Optional[SqliteInt] = Query(
             None, description="Only adapters attached to this character."
         ),
-        set_id: Optional[int] = Query(
+        set_id: Optional[SqliteInt] = Query(
             None, description="Only adapters attached to this picture set."
         ),
         q: Optional[str] = Query(
@@ -2590,10 +2593,10 @@ def create_router(server) -> APIRouter:
         kind: Optional[str] = Query(
             None, description="Adapter algorithm, e.g. `lora` or `lokr`."
         ),
-        character_id: Optional[int] = Query(
+        character_id: Optional[SqliteInt] = Query(
             None, description="Only models attached to this character."
         ),
-        set_id: Optional[int] = Query(
+        set_id: Optional[SqliteInt] = Query(
             None, description="Only models attached to this picture set."
         ),
         q: Optional[str] = Query(
@@ -2610,10 +2613,9 @@ def create_router(server) -> APIRouter:
         if unknown:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"file_kind must be one of {list(MODEL_LIST_FILE_KINDS)}; "
-                    f"got {unknown}."
-                ),
+                # The caller's own values are left out: a refusal names what
+                # is allowed, never echoes text it was sent.
+                detail=f"file_kind must be one of {list(MODEL_LIST_FILE_KINDS)}.",
             )
         return ModelListResponse(
             models=_build_list(
@@ -2784,10 +2786,11 @@ def create_router(server) -> APIRouter:
                 # Closed and checked here, like `file_kind`: `model_capability`
                 # carries no CHECK, and a typo stored silently would head a
                 # feature group nothing else in the app has ever heard of.
+                logger.info("Model edit refused (400): unknown features %s.", unknown)
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        f"{unknown} is not a feature; use "
+                        "One of the features named is not a feature; use "
                         f"{list(CURATABLE_CAPABILITIES)}."
                     ),
                 )
@@ -3168,7 +3171,9 @@ def create_router(server) -> APIRouter:
         server.auth.ensure_secure_when_required(request)
         found = template_rows(server.hub, _workflow_sets()["hand_made"])
         user = server.auth.get_user_for_request(request)
-        comfyui_version = _comfyui_version(getattr(user, "comfyui_url", None))
+        # None with no address saved; a saved one that no longer passes the
+        # normaliser is the 409 (SAVED_ADDRESS_INVALID), and nothing is asked.
+        comfyui_version = _comfyui_version(_comfyui_url(user, None))
         if comfyui_version:
             for row in found["rows"]:
                 for variant in row["variants"]:
@@ -3269,7 +3274,9 @@ def create_router(server) -> APIRouter:
         response_model=HandMadeSet,
     )
     def rename_workflow_set(
-        set_id: int, request: Request, payload: WorkflowSetRenameRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetRenameRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3286,7 +3293,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=WorkflowSetDeleteResponse,
     )
-    def delete_workflow_set(set_id: int, request: Request):
+    def delete_workflow_set(set_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
             snapshot = delete_set(server.hub, set_id)
@@ -3305,7 +3312,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetMembersResponse,
     )
     def add_workflow_set_members(
-        set_id: int, request: Request, payload: WorkflowSetMembersRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetMembersRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3330,7 +3339,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetRemoveResponse,
     )
     def remove_workflow_set_members(
-        set_id: int, request: Request, payload: WorkflowSetRemoveRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetRemoveRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3379,7 +3390,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetDeclinesResponse,
     )
     def put_workflow_set_declines(
-        set_id: int, request: Request, payload: WorkflowSetDeclinesRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetDeclinesRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3402,7 +3415,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetMergeResponse,
     )
     def merge_workflow_sets(
-        set_id: int, request: Request, payload: WorkflowSetMergeRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetMergeRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3432,7 +3447,7 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetSeenResponse,
     )
     def put_workflow_set_seen(
-        set_id: int, request: Request, payload: WorkflowSetSeenRequest = Body(...)
+        set_id: SqliteInt, request: Request, payload: WorkflowSetSeenRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3441,13 +3456,51 @@ def create_router(server) -> APIRouter:
             seen=sorted({sha.lower() for sha in payload.sha256})
         )
 
+    _NOT_A_COMBO_KEY = (
+        "That is not a canonical combo key: the member model ids, ascending "
+        "and without repeats, comma-joined."
+    )
+    _COMBO_KEY_TOO_LONG = (
+        f"That combo key names more than {MAX_MODELS_PER_EDIT:,} models, the "
+        "most one request may name."
+    )
+
     @contextmanager
-    def _verdict_errors():
+    def _verdict_errors(key: str):
+        """Refuse a *key* that is not canonical (422), then map the write's 404.
+
+        Checked here rather than left to the write: a member id past SQLite's
+        range passes ``parse_combo_key`` and overflows while the shelf check
+        binds it, which would answer a 500. The refusal does not repeat the
+        key; the caller sent it.
+
+        A key naming more models than one edit may (``MAX_MODELS_PER_EDIT``)
+        is refused before it is parsed: the path has no length limit, and
+        every id would otherwise be sorted and bound into the shelf check,
+        past SQLite's variable limit into a 500. The grid's sets are drawn
+        from the shelf, and that ceiling is set above the largest shelf
+        measured.
+        """
+        named = key.count(",") + 1
+        if named > MAX_MODELS_PER_EDIT:
+            logger.info(
+                "Workflow set verdict refused (422): the key names %d models.",
+                named,
+            )
+            raise HTTPException(status_code=422, detail=_COMBO_KEY_TOO_LONG)
         try:
-            yield
+            ids = parse_combo_key(key)
         except ValueError as exc:
             logger.info("Workflow set verdict refused (422): %s", exc)
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=_NOT_A_COMBO_KEY) from exc
+        if ids[-1] > SQLITE_INT_MAX:
+            logger.info(
+                "Workflow set verdict refused (422): %d is past SQLite's range.",
+                ids[-1],
+            )
+            raise HTTPException(status_code=422, detail=_NOT_A_COMBO_KEY)
+        try:
+            yield
         except WorkflowSetNotFoundError as exc:
             logger.info("Workflow set verdict answered 404: %s", exc)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -3476,7 +3529,7 @@ def create_router(server) -> APIRouter:
         combo_key: str, request: Request, payload: SetVerdictRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
-        with _verdict_errors():
+        with _verdict_errors(combo_key):
             previous = write_set_verdict(server.hub, combo_key, payload.verdict)
         return SetVerdictResponse(
             combo_key=combo_key, verdict=payload.verdict, previous=previous
@@ -3491,7 +3544,7 @@ def create_router(server) -> APIRouter:
     )
     def delete_set_verdict(combo_key: str, request: Request):
         server.auth.ensure_secure_when_required(request)
-        with _verdict_errors():
+        with _verdict_errors(combo_key):
             previous = write_set_verdict(server.hub, combo_key, None)
         return SetVerdictResponse(combo_key=combo_key, verdict=None, previous=previous)
 
@@ -3506,12 +3559,12 @@ def create_router(server) -> APIRouter:
     )
     def put_member_verdict(
         combo_key: str,
-        model_id: int,
+        model_id: SqliteInt,
         request: Request,
         payload: MemberVerdictRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
-        with _verdict_errors():
+        with _verdict_errors(combo_key):
             previous = write_member_verdict(
                 server.hub, combo_key, model_id, payload.verdict
             )
@@ -3529,9 +3582,9 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=MemberVerdictResponse,
     )
-    def delete_member_verdict(combo_key: str, model_id: int, request: Request):
+    def delete_member_verdict(combo_key: str, model_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
-        with _verdict_errors():
+        with _verdict_errors(combo_key):
             previous = write_member_verdict(server.hub, combo_key, model_id, None)
         return MemberVerdictResponse(
             combo_key=combo_key, model_id=model_id, verdict=None, previous=previous
@@ -3559,7 +3612,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=ModelOpenLocationResponse,
     )
-    def open_model_location(model_id: int, request: Request):
+    def open_model_location(model_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         if (
             server.hub.fetchone("SELECT id FROM model WHERE id = ?", (model_id,))

@@ -323,25 +323,33 @@ def test_locked_keys_are_merged_last():
 
 
 def test_training_folder_override_is_refused():
-    """A path set through overrides never reaches the rendered config."""
+    """A path set through overrides never reaches the rendered config, and the
+    refusal does not repeat the caller's key."""
     import pytest
 
-    from pixlstash.training.config_render import TunableOverrideError
+    from pixlstash.training.config_render import (
+        NOT_TUNABLE_MESSAGE,
+        TunableOverrideError,
+    )
 
-    with pytest.raises(TunableOverrideError, match="training_folder"):
+    with pytest.raises(TunableOverrideError) as refused:
         _render(
             overrides={
                 "config": {"process": [{"training_folder": "/home/you/library"}]}
             }
         )
+    assert str(refused.value) == NOT_TUNABLE_MESSAGE
 
 
 def test_dataset_folder_path_override_is_refused():
     import pytest
 
-    from pixlstash.training.config_render import TunableOverrideError
+    from pixlstash.training.config_render import (
+        NOT_TUNABLE_MESSAGE,
+        TunableOverrideError,
+    )
 
-    with pytest.raises(TunableOverrideError, match="folder_path"):
+    with pytest.raises(TunableOverrideError) as refused:
         _render(
             overrides={
                 "config": {
@@ -349,6 +357,7 @@ def test_dataset_folder_path_override_is_refused():
                 }
             }
         )
+    assert str(refused.value) == NOT_TUNABLE_MESSAGE
 
 
 def test_allowed_tunable_override_renders():
@@ -375,23 +384,36 @@ def test_allowed_tunable_override_renders():
 def test_tunable_value_out_of_range_or_wrong_type_is_refused():
     import pytest
 
-    from pixlstash.training.config_render import TunableOverrideError, validate_tunables
+    from pixlstash.training.config_render import (
+        NOT_TUNABLE_MESSAGE,
+        TunableOverrideError,
+        validate_tunables,
+    )
 
     for bad, message in (
         ({"config": {"process": [{"train": {"lr": 5}}]}}, "train.lr"),
         ({"config": {"process": [{"train": {"optimizer": "sgd"}}]}}, "optimizer"),
         ({"config": {"process": [{"train": {"steps": True}}]}}, "train.steps"),
         ({"config": {"process": [{"model": {"qtype": "fp64"}}]}}, "qtype"),
-        ({"config": {"process": [{"device": "cuda:1"}]}}, "device"),
-        (
-            {"config": {"process": [{"model": {"name_or_path": "/evil"}}]}},
-            "name_or_path",
-        ),
-        ({"config": {"process": [{"train": {}}]}}, "train"),
-        (
-            {"config": {"process": [{"train": {"steps": 5}}, {"train": {"steps": 5}}]}},
-            "process\\[1\\]",
-        ),
     ):
         with pytest.raises(TunableOverrideError, match=message):
             validate_tunables(bad)
+    # A key outside the tunables is the caller's text: refused in a fixed
+    # sentence that does not repeat it.
+    for bad in (
+        {"config": {"process": [{"device": "cuda:1"}]}},
+        {"config": {"process": [{"model": {"name_or_path": "/evil"}}]}},
+        {"config": {"process": [{"train": {}}]}},
+        {"config": {"process": [{"train": {"steps": 5}}, {"train": {"steps": 5}}]}},
+    ):
+        with pytest.raises(TunableOverrideError) as refused:
+            validate_tunables(bad)
+        assert str(refused.value) == NOT_TUNABLE_MESSAGE, bad
+    # An int past the float range is refused by the rule, not overflowed into
+    # an error the route does not catch.
+    for huge in (10**400, -(10**400)):
+        with pytest.raises(TunableOverrideError) as refused:
+            validate_tunables({"config": {"process": [{"train": {"lr": huge}}]}})
+        assert str(refused.value) == (
+            "'config.process[0].train.lr' must be a number from 1e-07 to 0.1."
+        )

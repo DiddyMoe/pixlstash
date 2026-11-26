@@ -73,6 +73,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from starlette.concurrency import run_in_threadpool
 
 from pixlstash.auth import COMFYUI_SCOPE
 from pixlstash.hub import workflow_thumbnails, workflow_versions
@@ -160,6 +161,7 @@ from pixlstash.services.comfyui_recipe_service import (
     plan_loader_rewrites,
     plan_lora_chain,
     plan_lora_insertion,
+    LORA_CHAIN_UNREADABLE,
     read_lora_chain,
     read_lora_chain_untyped,
     retype_text_encoders,
@@ -199,6 +201,7 @@ from pixlstash.services.comfyui_service import (
     unfed_picture_loaders,
 )
 from pixlstash.services import (
+    comfyui_connections,
     comfyui_pack_service,
     run_log,
     vram_history,
@@ -223,6 +226,7 @@ from pixlstash.services.edit_selection import (
     write_masked_picture,
 )
 from pixlstash.services import prompt_assist
+from pixlstash.utils.comfyui_url import SAVED_ADDRESS_INVALID
 from pixlstash.services import workflow_run_service as run_service
 from pixlstash.services.workflow_card_service import (
     BASE_MODEL_KINDS,
@@ -381,6 +385,11 @@ from pixlstash.utils.model_utils import quant_from_filename
 from pixlstash.utils.comfyui_utilities import NotAWorkflowError, check_comfy_workflow
 from pixlstash.hub.workflow_origin import FILE_ORIGIN, INBOX_ORIGIN
 from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import (
+    SQLITE_INT_MAX,
+    NotASqliteInteger,
+    SqliteInt,
+)
 from pixlstash.utils.workflow_ids import MANUAL_PREFIX, WORKFLOW_ID_PATTERN
 from send2trash import TrashPermissionError
 
@@ -1175,8 +1184,16 @@ MAX_RUN_PICTURES = MAX_RUNS_PER_REQUEST
 MAX_RUN_LORAS = 32
 # SQLite's INTEGER ceiling. An id past it is not a picture that is missing, it
 # is a request no row could answer, and the driver says so with a 500.
-MAX_PICTURE_ID = 2**63 - 1
+MAX_PICTURE_ID = SQLITE_INT_MAX
 MAX_PROMPT_LENGTH = 20000
+
+# A parameter value or a seed goes to ComfyUI's graph and is kept as TEXT
+# (``workflow_default_override.value``, ``saved_recipe.seed``), never bound as
+# a SQLite INTEGER, and a seed may legally reach ``MAX_SEED_64``.
+WidgetInt = Annotated[
+    int,
+    NotASqliteInteger("A ComfyUI widget value: sent to ComfyUI, stored as TEXT."),
+]
 
 # How deep the runnable-source resolver looks for a picture or an instance to
 # run. The tiers want the card's BEST, and one candidate is not enough: the
@@ -1328,7 +1345,7 @@ class CardDefault(ParameterAddress):
     clears it.
     """
 
-    value: bool | int | float | str
+    value: bool | WidgetInt | float | str
     name: str | None = Field(None, max_length=MAX_LABEL_LENGTH)
 
 
@@ -1667,7 +1684,7 @@ class RunModel(BaseModel):
 class RunValue(ParameterAddress):
     """One parameter this run sets, over the workflow's default recipe."""
 
-    value: bool | int | float | str
+    value: bool | WidgetInt | float | str
 
 
 class RunInput(ParameterAddress):
@@ -1684,9 +1701,9 @@ class RunInput(ParameterAddress):
 class RunDestination(BaseModel):
     """Where a run with no source picture files its output."""
 
-    set_id: int | None = None
-    project_id: int | None = None
-    character_id: int | None = None
+    set_id: SqliteInt | None = None
+    project_id: SqliteInt | None = None
+    character_id: SqliteInt | None = None
 
 
 class WorkflowChanges(BaseModel):
@@ -1874,10 +1891,10 @@ class RunRequest(BaseModel):
     rewriting it would change the identity of what is being run.
     """
 
-    picture_ids: list[Annotated[int, Field(le=MAX_PICTURE_ID)]] = Field(
+    picture_ids: list[SqliteInt] = Field(
         default_factory=list, max_length=MAX_RUN_PICTURES
     )
-    saved_recipe_id: int | None = None
+    saved_recipe_id: SqliteInt | None = None
     # A workflow (#1622): `auto:<core and families digest>` or an owner's group. It runs its
     # base topology's graph with its DEFAULT RECIPE applied by the server, and
     # this body's values, models, LoRAs and skipped stages over that. Only this
@@ -1949,7 +1966,7 @@ class RunRequest(BaseModel):
 
     count: int = Field(1, ge=1, le=MAX_RUNS_PER_REQUEST)
     seed_mode: Literal["new", "keep", "fixed"] = "new"
-    seed: int | None = Field(None, ge=0, le=MAX_SEED_64)
+    seed: WidgetInt | None = Field(None, ge=0, le=MAX_SEED_64)
     destination: RunDestination | None = None
     # Who the run's pictures are of, where its LoRAs do not say: a graph
     # loading people's LoRAs names them itself (`_lora_people`) and this is
@@ -2081,9 +2098,7 @@ class RunRequest(BaseModel):
 class UpscaleRequest(BaseModel):
     """``POST /workflows/upscale`` and its pre-flight (#1868)."""
 
-    picture_ids: list[Annotated[int, Field(le=MAX_PICTURE_ID)]] = Field(
-        min_length=1, max_length=MAX_RUN_PICTURES
-    )
+    picture_ids: list[SqliteInt] = Field(min_length=1, max_length=MAX_RUN_PICTURES)
     upscale: RunUpscale = Field(default_factory=RunUpscale)
 
     @field_validator("picture_ids")
@@ -2205,7 +2220,7 @@ class SaveRequest(BaseModel):
             "after a run."
         ),
     )
-    version: int | None = Field(
+    version: SqliteInt | None = Field(
         None,
         description=(
             "The workflow's version `changes` was made against, as "
@@ -2352,7 +2367,7 @@ class WorkflowGraphSave(BaseModel):
             "version."
         ),
     )
-    read_version: int | None = Field(
+    read_version: SqliteInt | None = Field(
         None,
         description=(
             "The version the graph was read at (`GET …/graph`'s `version`). "
@@ -2731,6 +2746,27 @@ class RunResult(BaseModel):
     )
 
 
+# Why a run was not sent, where what stopped it is not an answer this server
+# composed. The exception itself goes to the log.
+RUN_NOT_SENT_MESSAGE = (
+    "PixlStash could not send this run to ComfyUI. The server log says why."
+)
+
+
+def _run_failure_message(exc: BaseException) -> str:
+    """The sentence a run that was not sent carries, for *exc*.
+
+    An ``HTTPException`` is an answer this server composed (ComfyUI's
+    validation answer among them, bounded where it is built), the one the
+    request itself would have had, so its detail stands. Any other exception's
+    text was not composed here: the caller logs it, and the run carries
+    :data:`RUN_NOT_SENT_MESSAGE`.
+    """
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    return RUN_NOT_SENT_MESSAGE
+
+
 class RunOutcome(BaseModel):
     """``GET /workflows/runs/{run_id}``: how one submitted run stands."""
 
@@ -2801,6 +2837,13 @@ MAX_LAYOUT_DEPTH = 64
 # once. ComfyUI asks for it as its page loads, seconds after it was held.
 RUN_OPENING_SECONDS = 600
 RUN_OPENINGS_HELD = 8
+
+# Why no people loader is placed, where the planner tripped over the graph
+# rather than refused it: what it raised is not a sentence, so it is logged.
+PEOPLE_LOADER_UNREADABLE = (
+    "PixlStash could not read this workflow's graph well enough to tell where "
+    "the loader for people goes."
+)
 
 
 class PeopleLoaderPlace(BaseModel):
@@ -3458,7 +3501,7 @@ class SetCloneAsk(BaseModel):
     """One workflow set to plan a clone onto: a key of the caller's, its models."""
 
     key: str = Field(min_length=1, max_length=MAX_LABEL_LENGTH)
-    checkpoint_ids: list[int] = Field(
+    checkpoint_ids: list[SqliteInt] = Field(
         default_factory=list,
         max_length=MAX_SET_MODELS,
         description=(
@@ -3466,11 +3509,11 @@ class SetCloneAsk(BaseModel):
             "of a two-model graph, empty when none."
         ),
     )
-    model_ids: list[int] = Field(
+    model_ids: list[SqliteInt] = Field(
         max_length=MAX_SET_MODELS,
         description="Its other models: VAEs and text encoders are used.",
     )
-    picks: dict[str, int] = Field(
+    picks: dict[str, SqliteInt] = Field(
         default_factory=dict,
         max_length=MAX_SET_MODELS,
         description=(
@@ -3953,7 +3996,7 @@ def _stored_value(value: bool | int | float | str) -> str:
     if isinstance(value, str):
         try:
             json.loads(value)
-        except ValueError:
+        except (ValueError, RecursionError):
             return value
         return json.dumps(value)
     return str(value)
@@ -4562,11 +4605,17 @@ def _workflow_variants(hub, vault, workflow: Workflow) -> list[WorkflowVariant]:
 
 
 def _require_object_info(read: tuple[dict | None, str | None], why: str) -> dict:
-    """The map from :func:`_read_object_info`, or a 503 saying *why* it is needed."""
+    """The map from :func:`_read_object_info`, or a 503 saying *why* it is needed.
+
+    The reason ComfyUI could not be asked goes to the log, not the body: it can
+    name the saved ComfyUI address and the transport error.
+    """
     object_info, error = read
     if object_info is None:
+        logger.warning("Could not ask ComfyUI %s: %s", why, error)
         raise HTTPException(
-            status_code=503, detail=f"PixlStash could not ask ComfyUI {why}: {error}"
+            status_code=503,
+            detail=f"PixlStash could not ask ComfyUI {why}: ComfyUI did not answer.",
         )
     return object_info
 
@@ -5399,11 +5448,18 @@ def create_router(server) -> APIRouter:
         request: Request, workflow_id: str, file: UploadFile = File(...)
     ):
         server.auth.ensure_secure_when_required(request)
+        # One byte past the cap is enough for store_icon to refuse it.
+        data = await file.read(MAX_ICON_BYTES + 1)
+        # The hub reads and writes and the image decode wait on a worker, not
+        # on the event loop every other request shares.
+        return await run_in_threadpool(_set_thumbnail, request, workflow_id, data)
+
+    def _set_thumbnail(request: Request, workflow_id: str, data: bytes):
+        """The rest of ``upload_thumbnail``: check, store, pin."""
         hub = _hub()
         workflow_id = _require_workflow(hub, workflow_id).workflow_id
         try:
-            # One byte past the cap is enough for store_icon to refuse it.
-            digest = store_icon(hub.path, await file.read(MAX_ICON_BYTES + 1))
+            digest = store_icon(hub.path, data)
         except IconRefused as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         workflow_thumbnails.set_thumbnail(hub, workflow_id, digest, pinned=True)
@@ -5426,7 +5482,7 @@ def create_router(server) -> APIRouter:
     def lora_summary(
         request: Request,
         workflow_id: str,
-        cover: int | None = Query(
+        cover: SqliteInt | None = Query(
             None, ge=1, description="The picture on top of the workflow's cover."
         ),
     ):
@@ -6548,14 +6604,22 @@ def create_router(server) -> APIRouter:
             (str(t.get("node_id")), str(t.get("field"))): t
             for t in detect_lora_targets(graph)
         }
-        for item in loras:
+        for index, item in enumerate(loras):
             target = targets.get((item.node_id, item.field))
             if target is None:
+                # The slot named is the caller's text and matched nothing, so
+                # the body names its position instead.
+                logger.info(
+                    "Run refused (400): loras[%d] names slot %r on node %r, "
+                    "which the graph does not have.",
+                    index,
+                    item.field,
+                    item.node_id,
+                )
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        f"This workflow has no LoRA slot {item.field} on node "
-                        f"{item.node_id}."
+                        f"loras[{index}] names a LoRA slot this workflow does not have."
                     ),
                 )
             adapter = _shelf_adapter(hub, item.sha256)
@@ -7627,7 +7691,7 @@ def create_router(server) -> APIRouter:
             body = _under_defaults(body, recipe)
             if recipe_too and not recipe_loras:
                 recipe_loras = default_loras
-        configured = bool(getattr(user, "comfyui_url", None))
+        configured = comfyui_connections.is_configured(user)
         comfyui_url = _comfyui_url(user)
         if extract:
             object_info, object_info_error = (
@@ -8381,26 +8445,39 @@ def create_router(server) -> APIRouter:
             # against the card is a request error, not a reason. A picture sent
             # to an input no card here has would otherwise be a run that never
             # read it.
+            # The names are the caller's and matched nothing: logged, counted.
+            logger.info(
+                "Run refused (400): picture inputs %s are not in this workflow.",
+                unknown,
+            )
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "This workflow has no picture input "
-                    + ", ".join(f"{label}/{name}" for label, name in unknown)
-                    + "."
+                    f"{len(unknown)} of the picture inputs named are not inputs "
+                    "of this workflow."
                 ),
             )
 
         unknown_skips = [
-            f"{item.field} on node {item.node_id}"
-            for item in body.skip_loras
+            index
+            for index, item in enumerate(body.skip_loras)
             if (item.node_id, item.field) not in skips_found
         ]
         if skips_checked and unknown_skips:
+            logger.info(
+                "Run refused (400): skip_loras %s name no LoRA slot of this workflow.",
+                [
+                    (body.skip_loras[i].node_id, body.skip_loras[i].field)
+                    for i in unknown_skips
+                ],
+            )
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "This workflow has no LoRA slot "
-                    f"{', '.join(unknown_skips)} to skip."
+                    "skip_loras["
+                    + "], [".join(str(index) for index in unknown_skips)
+                    + ("] names" if len(unknown_skips) == 1 else "] name")
+                    + " no LoRA slot of this workflow."
                 ),
             )
         blocking = any(
@@ -8587,7 +8664,7 @@ def create_router(server) -> APIRouter:
                 runs=len(prompts),
                 groups=groups,
                 prompts=prompts,
-                error=str(getattr(exc, "detail", None) or exc),
+                error=_run_failure_message(exc),
             )
         _keep_run_changes(asked, groups, prompts)
         return RunResult(
@@ -8710,7 +8787,7 @@ def create_router(server) -> APIRouter:
                 status="partial",
                 runs=len(prompts),
                 prompts=prompts,
-                error=str(getattr(exc, "detail", None) or exc),
+                error=_run_failure_message(exc),
             )
         return RunResult(status="success", runs=len(prompts), prompts=prompts)
 
@@ -9088,10 +9165,17 @@ def create_router(server) -> APIRouter:
                 # ComfyUI refused it (a 502 with its validation
                 # answer) or it never got there: an ending, so
                 # its Finished row is not left going forever.
+                logger.warning(
+                    "[workflows] Run %s of %s was not sent: %s",
+                    run_id,
+                    workflow_id,
+                    getattr(exc, "detail", None) or exc,
+                    exc_info=not isinstance(exc, HTTPException),
+                )
                 record_run_outcome(
                     run_id,
                     "failed",
-                    message=str(getattr(exc, "detail", None) or exc),
+                    message=_run_failure_message(exc),
                     run_id=run_id,
                 )
                 raise
@@ -9137,7 +9221,9 @@ def create_router(server) -> APIRouter:
                     run_id,
                     workflow_id,
                 )
-                record_run_outcome(run_id, "failed", message=str(exc), run_id=run_id)
+                record_run_outcome(
+                    run_id, "failed", message=_run_failure_message(exc), run_id=run_id
+                )
                 raise
         return {
             "workflow_id": workflow_id,
@@ -9262,25 +9348,66 @@ def create_router(server) -> APIRouter:
             library_uuid=poll_kwargs["origin_library_uuid"],
             run_id=run_id,
         )
-        threading.Thread(
-            target=_process_comfyui_outputs,
-            args=(
-                server,
-                comfyui_url,
-                str(prompt_id),
-                output_node_ids,
-                stack_id,
-                source_id,
-            ),
-            kwargs={
-                **poll_kwargs,
-                "rejected": rejected,
-                "vram_lease": vram_lease,
-                "vram_model_set": model_set,
-            },
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=_process_comfyui_outputs,
+                args=(
+                    server,
+                    comfyui_url,
+                    str(prompt_id),
+                    output_node_ids,
+                    stack_id,
+                    source_id,
+                ),
+                kwargs={
+                    **poll_kwargs,
+                    "rejected": rejected,
+                    "vram_lease": vram_lease,
+                    "vram_model_set": model_set,
+                },
+                daemon=True,
+            ).start()
+        except RuntimeError as exc:
+            # No thread to wait on it: nothing would import what it draws,
+            # end it or give its lease back. Off ComfyUI's queue, then, and
+            # ended here as a refused run is.
+            _abandon_unwatched_run(str(prompt_id), run_id, vram_lease, exc)
+            return None
         return str(prompt_id)
+
+    def _abandon_unwatched_run(
+        prompt_id: str, run_id: str, vram_lease, exc: RuntimeError
+    ) -> None:
+        """End a run ComfyUI took that PixlStash cannot wait on.
+
+        Taken off ComfyUI's queue (or interrupted) by its prompt id; when
+        ComfyUI cannot be asked, the run's failure says it may still draw.
+        """
+        taken_off = cancel_runs([prompt_id]) > 0
+        vram_lease.release()
+        logger.error(
+            "[workflows] Run %s (ComfyUI prompt %s) could not be waited on, "
+            "so it was %s: %s",
+            run_id,
+            prompt_id,
+            "taken off ComfyUI's queue"
+            if taken_off
+            else "left in ComfyUI's queue (ComfyUI could not be asked to drop it)",
+            exc,
+        )
+        record_run_outcome(
+            prompt_id=prompt_id,
+            status="failed",
+            message=(
+                "PixlStash could not start waiting for this run, so it was "
+                "taken off ComfyUI's queue."
+                if taken_off
+                else "PixlStash could not start waiting for this run, and "
+                "ComfyUI could not be asked to drop it: it may still draw, "
+                "and what it makes is not imported."
+            ),
+            run_id=run_id,
+        )
 
     def _dispatch_held_run(
         comfyui_url: str,
@@ -9322,11 +9449,11 @@ def create_router(server) -> APIRouter:
             )
         except Exception as exc:
             vram_lease.release()
-            message = str(getattr(exc, "detail", None) or exc)
+            message = _run_failure_message(exc)
             logger.warning(
                 "[workflows] Held run %s could not be submitted once it had room: %s",
                 run_id,
-                message,
+                getattr(exc, "detail", None) or exc,
                 exc_info=not isinstance(exc, HTTPException),
             )
             record_run_outcome(run_id, "failed", message=message, run_id=run_id)
@@ -9658,17 +9785,31 @@ def create_router(server) -> APIRouter:
             # The recipe addresses a graph that will not reduce, which is
             # the scrub's own refusal below, and answered the same way.
             raise HTTPException(status_code=409, detail=exc.detail) from exc
-        except (WorkflowGraphError, RecursionError) as exc:
+        except WorkflowGraphError as exc:
             # Refused rather than exported unscrubbed. A graph PixlStash cannot
             # read is one it can promise nothing about, and the promise is the
-            # route. `RecursionError` is the same answer and the same class of
-            # input: an embedded graph comes out of a picture that arrived from
-            # somewhere else.
+            # route.
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "PixlStash cannot read this workflow well enough to make it "
                     f"safe to share: {exc}"
+                ),
+            ) from exc
+        except RecursionError as exc:
+            # The same answer and the same class of input: an embedded graph
+            # comes out of a picture that arrived from somewhere else. The
+            # interpreter's text is not composed here, so it goes to the log.
+            logger.warning(
+                "[workflows] Workflow %s nests too deeply to scrub for export.",
+                workflow_id,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "PixlStash cannot read this workflow well enough to make it "
+                    "safe to share: its graph nests too deeply to read."
                 ),
             ) from exc
         # Named as the grid shows it. A generated name needs the models
@@ -9937,7 +10078,19 @@ def create_router(server) -> APIRouter:
             )
         try:
             place = plan_lora_insertion(graph, object_info)
-        except (LookupError, TypeError, ValueError, RecursionError) as exc:
+        except (KeyError, IndexError, TypeError, ValueError, RecursionError):
+            # Tripped over rather than refused (KeyError and IndexError are
+            # LookupErrors too): the text names nothing the owner can act on.
+            logger.warning(
+                "[workflows] Workflow %s opens without a loader for people: "
+                "its graph could not be read.",
+                workflow_id,
+                exc_info=True,
+            )
+            return PeopleLoaderPlace(reason=PEOPLE_LOADER_UNREADABLE)
+        except LookupError as exc:
+            # The planner's own refusals: sentences it composed from the
+            # stored graph's nodes.
             logger.info(
                 "[workflows] Workflow %s opens without a loader for people: %s",
                 workflow_id,
@@ -10664,7 +10817,13 @@ def create_router(server) -> APIRouter:
             # Asked after the read, not before: a draft PixlStash can convert
             # now (a pack installed since) stores the conversion on that read
             # and opens as any workflow does.
-            if exc.status_code != 409 or not is_draft(hub, workflow.workflow_id):
+            # An invalid saved ComfyUI address is not the draft's refusal: it
+            # stays the 409 that says to set the address again.
+            if (
+                exc.status_code != 409
+                or exc.detail == SAVED_ADDRESS_INVALID
+                or not is_draft(hub, workflow.workflow_id)
+            ):
                 raise
             return _draft_opening(hub, workflow, drafts, exc)
         # A layout kept from before workflows opened with ComfyUI-PixlStash
@@ -11215,6 +11374,15 @@ def create_router(server) -> APIRouter:
             try:
                 chain = read_lora_chain(graph, object_info)
                 refusal = None
+            except (KeyError, IndexError):
+                # Tripped over rather than refused: the lookup's text is a key
+                # of the graph, not a sentence.
+                logger.warning(
+                    "Workflow %s's LoRA chain could not be read.",
+                    workflow_id,
+                    exc_info=True,
+                )
+                refusal = LORA_CHAIN_UNREADABLE
             except LookupError as exc:
                 logger.info(
                     "Workflow %s's LoRA chain is shown read-only: %s", workflow_id, exc
@@ -11240,6 +11408,11 @@ def create_router(server) -> APIRouter:
         """
         try:
             chain = read_lora_chain(graph, object_info)
+        except (KeyError, IndexError) as exc:
+            # Tripped over rather than refused: the lookup's text is a key of
+            # the graph, not a sentence.
+            logger.warning("A LoRA chain could not be read.", exc_info=True)
+            raise HTTPException(status_code=409, detail=LORA_CHAIN_UNREADABLE) from exc
         except LookupError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         _shelf_chain(hub, chain)
@@ -11893,7 +12066,7 @@ def create_router(server) -> APIRouter:
     def read_model_swap(
         request: Request,
         workflow_id: str,
-        checkpoint_id: int | None = None,
+        checkpoint_id: SqliteInt | None = None,
         replacing: str | None = Query(None, min_length=1, max_length=MAX_VALUE_LENGTH),
         slot_kind: Literal["checkpoint", "vae", "text_encoder"] | None = None,
         cached: bool = Query(
@@ -12592,13 +12765,17 @@ def create_router(server) -> APIRouter:
         if unswapped:
             # All or nothing. A clone whose checkpoint swap failed while its
             # VAE swap landed is the old model with the new model's VAE - a
-            # broken workflow saved as a success.
+            # broken workflow saved as a success. Each refused swap is named by
+            # its place in the request and the server's reason code, never by
+            # the filenames the caller sent.
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "The clone was not written, because not every new model "
                     "could go in: "
-                    + "; ".join(f"{u['now']} ({u['reason']})" for u in unswapped)
+                    + "; ".join(
+                        f"swaps[{u['swap']}] ({u['reason']})" for u in unswapped
+                    )
                 ),
             )
         for row in retype_text_encoders(graph, families, object_info):
@@ -13379,15 +13556,22 @@ def create_router(server) -> APIRouter:
                 ),
             )
         group = plan.groups[0]
-        asked = {model.address for model in changes.models}
+        asked = {model.address: index for index, model in enumerate(changes.models)}
         for flag in group.flags:
             if flag.get("code") == "model_not_applied" and flag.get("address") in asked:
+                # The file and the address are the caller's text; the body
+                # names the change's position and the planner's reason code.
+                logger.info(
+                    "Save refused (409): %s could not be loaded at %s (%s).",
+                    flag.get("now"),
+                    flag.get("address"),
+                    flag.get("reason"),
+                )
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        f"{flag.get('now')} could not be loaded at "
-                        f"{flag.get('address')} ({flag.get('reason')}), so "
-                        "nothing was saved."
+                        f"models[{asked[flag.get('address')]}] could not be "
+                        f"loaded ({flag.get('reason')}), so nothing was saved."
                     ),
                 )
         for item in changes.skip_loras:
@@ -13412,17 +13596,24 @@ def create_router(server) -> APIRouter:
         if changes.loras:
             targets = detect_lora_targets(graph)
             digests = _slot_digests(targets, adapter_digest_index(hub))
-            for item in changes.loras:
+            for index, item in enumerate(changes.loras):
                 wanted = item.sha256.strip().lower()
                 if not any(
                     node_id == item.node_id and digest == wanted
                     for (node_id, _field), digest in digests.items()
                 ):
+                    # On a graph with no LoRA loader the node id was never
+                    # matched, so the body names the change's position.
+                    logger.info(
+                        "Save refused (409): loras[%d] could not be put in loader %r.",
+                        index,
+                        item.node_id,
+                    )
                     raise HTTPException(
                         status_code=409,
                         detail=(
-                            f"The LoRA could not be put in loader {item.node_id} "
-                            "in this ComfyUI, so nothing was saved."
+                            f"loras[{index}] could not be put in its loader in "
+                            "this ComfyUI, so nothing was saved."
                         ),
                     )
 
@@ -13487,16 +13678,21 @@ def create_router(server) -> APIRouter:
                 {**(stages if every else {}), **changes.stages}.items()
             )
         ]
-        for value in changes.values:
+        for index, value in enumerate(changes.values):
             address = (
                 f"{value.slot_label}{OVERRIDE_ADDRESS_SEPARATOR}{value.input_name}"
             )
             if not is_parameter_address(address):
+                logger.info(
+                    "Save refused (422): values[%d] address %r is not a parameter.",
+                    index,
+                    address,
+                )
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        f"{address} names a model or a LoRA, not a parameter: "
-                        "change it under models or loras."
+                        f"values[{index}] names a model or a LoRA, not a "
+                        "parameter: change it under models or loras."
                     ),
                 )
             rows.append((address, _stored_value(value.value)))
@@ -14800,7 +14996,7 @@ def create_router(server) -> APIRouter:
             },
         },
     )
-    def extract_workflow(request: Request, recipe_id: int):
+    def extract_workflow(request: Request, recipe_id: SqliteInt):
         server.auth.ensure_secure_when_required(request)
         hub = _hub()
         saved = saved_recipe_service.read_recipe(server.vault, recipe_id)

@@ -286,9 +286,12 @@ class ImagePlugin(ABC):
         Args:
             error_callback: Callback to invoke, or ``None``.
             index: Zero-based index of the image that failed.
-            message: Short description of the failure.
+            message: Short description of the failure. It is shown to the
+                user, so it is the plugin's own sentence, not exception text.
             details: Optional dict with additional context (e.g. exception
-                message, crop shape, file path).
+                message, crop shape, file path). It goes to the server log
+                only: ``plugin_service`` keeps it out of the event and the
+                response.
         """
         if error_callback is None:
             return

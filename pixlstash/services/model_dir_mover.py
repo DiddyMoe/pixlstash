@@ -50,12 +50,13 @@ from typing import Callable, Optional
 
 from pixlstash.hub.db import HubDatabase
 from pixlstash.pixl_logging import get_logger
-from pixlstash.services.model_folder_scanner import _LIKE_ESCAPE, STATE_PRESENT
+from pixlstash.services.model_folder_scanner import STATE_PRESENT
 from pixlstash.services.model_mover import (
     PARTIAL_SUFFIX,
     STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_MOVED,
+    CopyNotVerified,
     MoveOutcome,
     MoveRefused,
     RepointLost,
@@ -67,9 +68,19 @@ from pixlstash.services.model_mover import (
     same_device,
 )
 from pixlstash.utils.library_layout import refusal_for_folder_name
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import path_is_within
+from pixlstash.utils.query.folder_prefix import FolderPrefix
 
 logger = get_logger(__name__)
+
+# What a failed folder move's outcome says. The exception names server paths and
+# database internals, so it goes to the log; a copy that did not verify says
+# its own sentence instead (:class:`CopyNotVerified`), as a file move does.
+FOLDER_MOVE_FAILED_DETAIL = (
+    "The folder could not be moved and the original is untouched. "
+    "The server log says why."
+)
 
 
 @dataclass(frozen=True)
@@ -155,18 +166,21 @@ def rows_under(fetchall, folder_id: int, subpath: str) -> list:
     *fetchall* is ``hub.fetchall``, or the transaction's own reader, so the same
     query serves the plan and the repoint.
 
-    LIKE folds ASCII case, so ``Flux/`` would match a listing of ``flux/``; the
-    exact prefix is checked here, as the folder listing does.
+    Below *subpath* and nowhere else, as the folder listing reads it: the
+    range :class:`FolderPrefix` builds takes no sibling that only starts with
+    the name (``sd`` never takes ``sd_xl``), has no LIKE wildcards to escape,
+    and folds case only where the platform's paths do.
     """
-    prefix = subpath_prefix(subpath)
-    rows = fetchall(
+    below, bounds = FolderPrefix.of(subpath.replace("/", os.sep)).under_sql(
+        "mf.relpath"
+    )
+    return fetchall(
         "SELECT mf.relpath AS relpath, mf.model_id AS model_id, mf.state AS state, "
         "m.sha256 AS sha256, COALESCE(m.file_size, 0) AS file_size "
         "FROM model_file mf JOIN model m ON m.id = mf.model_id "
-        "WHERE mf.model_folder_id = ? AND mf.relpath LIKE ? ESCAPE '\\'",
-        (folder_id, prefix.translate(_LIKE_ESCAPE) + "%"),
+        f"WHERE mf.model_folder_id = ? AND {below}",
+        (folder_id, *bounds),
     )
-    return [row for row in rows if row["relpath"].startswith(prefix)]
 
 
 def _disk_usage(path: str) -> tuple[int, int]:
@@ -192,12 +206,16 @@ def _disk_usage(path: str) -> tuple[int, int]:
 def _tree_listing(path: str) -> dict[str, int]:
     """``{relpath: size}`` of every file under *path*, not following links.
 
-    A link to a directory is listed as an entry of its own: ``os.walk`` puts it
-    among the directories and does not enter it, and the copy holds it as a link.
+    A link to a directory, a junction included, is listed as an entry of its
+    own. ``os.walk`` does not enter a symlink, and the copy holds it as a link;
+    it does enter a junction, which the copy materialises as a folder, so the
+    two listings differ and the source is kept.
     """
     listing: dict[str, int] = {}
     for root, dirs, names in os.walk(path):
-        for name in names + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+        for name in names + [
+            d for d in dirs if is_link_or_missing(os.path.join(root, d))
+        ]:
             full = os.path.join(root, name)
             try:
                 listing[os.path.relpath(full, path)] = os.lstat(full).st_size
@@ -264,9 +282,11 @@ def plan_directory_move(
             "That is the registered folder itself. Move or stop watching it from "
             "Manage model folders."
         )
+    # The refusals below name what the hub registered or the server found, never
+    # a path or name the caller sent: an absent path was the caller's guess.
     if not os.path.isdir(source_path):
         raise MoveRefused(
-            f"There is no folder {source_subpath!r} in that model folder.",
+            "There is no folder at that path in the model folder.",
             status_code=404,
         )
     destination_folder = model_folder_row(hub, destination_folder_id, "destination")
@@ -275,7 +295,7 @@ def plan_directory_move(
     )
     if not os.path.isdir(parent_path):
         raise MoveRefused(
-            f"There is no folder {destination_subpath!r} to move into.",
+            "There is no folder at that path in the destination to move into.",
             status_code=409,
         )
 
@@ -297,17 +317,17 @@ def plan_directory_move(
         source_path, destination_path
     ):
         raise MoveRefused(
-            f"{new_subpath!r} already exists there. Folders are never merged; "
-            "rename one of them first.",
+            "A folder with that name already exists there. Folders are never "
+            "merged; rename one of them first.",
             status_code=409,
         )
 
     for row in hub.fetchall("SELECT id, path FROM model_folder"):
         if path_is_within(row["path"], source_path):
             raise MoveRefused(
-                f"{row['path']} is a registered model folder inside "
-                f"{source_subpath!r}. Moving it would move that folder's files "
-                "out from under it; stop watching it first.",
+                f"{row['path']} is a registered model folder inside that folder. "
+                "Moving it would move that folder's files out from under it; "
+                "stop watching it first.",
                 status_code=409,
             )
 
@@ -333,9 +353,16 @@ def plan_directory_move(
     same_drive = same_device(source_path, parent_path)
     if not same_drive:
         if os.path.lexists(destination_path + PARTIAL_SUFFIX):
+            # Its name is the caller's new name with the suffix on, so the
+            # refusal points at the log, which has the whole path.
+            logger.warning(
+                "Refused a folder move: %s is left over from an interrupted move.",
+                destination_path + PARTIAL_SUFFIX,
+            )
             raise MoveRefused(
-                f"{destination_path + PARTIAL_SUFFIX} is left over from an "
-                "interrupted move. Remove it first.",
+                f"A {PARTIAL_SUFFIX} folder left over from an interrupted move is "
+                "in the way in the destination; the server log names it. Remove "
+                "it first.",
                 status_code=409,
             )
         require_space(parent_path, total)
@@ -424,7 +451,9 @@ def _verify(
         if entry.sha256 is not None:
             arrived = file_digest(copied, on_bytes=on_bytes)
             if arrived != entry.sha256:
-                raise OSError(
+                # Every value here is the hub's or a digest the server took, so
+                # this sentence is the one failure text a folder move answers.
+                raise CopyNotVerified(
                     f"{entry.relpath} arrived as {arrived} but is registered as "
                     f"{entry.sha256}; nothing was moved. Try again once its "
                     "folder's next scan has re-read it."
@@ -432,7 +461,9 @@ def _verify(
         elif os.path.getsize(copied) != os.path.getsize(
             os.path.join(plan.source_path, entry.relpath[len(old_prefix) :])
         ):
-            raise OSError(f"{entry.relpath} did not copy whole; nothing was moved.")
+            raise CopyNotVerified(
+                f"{entry.relpath} did not copy whole; nothing was moved."
+            )
 
 
 def _rename(hub: HubDatabase, plan: DirectoryMovePlan) -> None:
@@ -566,8 +597,12 @@ def _copy(
             plan.source_path,
             plan.destination_path,
             exc,
+            exc_info=True,
         )
-        return f"Moved, but the original could not be removed: {exc}"
+        return (
+            "Moved, but the original could not be removed; what is left there is "
+            "a duplicate. The server log says why."
+        )
     # Only directories the copy has: an empty one made in the source during the
     # move holds no file to compare, and is as much the owner's as a file is.
     copied_dirs = {
@@ -633,8 +668,11 @@ def execute_directory_move(
             exc,
             exc_info=True,
         )
+        detail = (
+            str(exc) if isinstance(exc, CopyNotVerified) else FOLDER_MOVE_FAILED_DETAIL
+        )
         return MoveOutcome(
-            plan.source_folder_id, plan.source_subpath, STATUS_FAILED, str(exc)
+            plan.source_folder_id, plan.source_subpath, STATUS_FAILED, detail
         )
     logger.info(
         "Moved folder %s to %s (%d catalogued file(s), %s).",

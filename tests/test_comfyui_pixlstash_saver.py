@@ -12,7 +12,10 @@ dedups to nothing and so loses the stack placement, the source lineage and the
 import event. Both are covered here.
 """
 
+import ast
+import inspect
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -25,8 +28,10 @@ from PIL import Image
 from sqlalchemy.orm import configure_mappers
 
 import pixlstash.services.comfyui_service as comfyui_service
+from pixlstash.database import DatabaseUnavailableError
 from pixlstash.services import comfyui_recipe_service
 from pixlstash.services import workflow_run_service
+from pixlstash.utils.bounded_http import BoundedResponse
 from pixlstash.event_types import EventType
 
 CKPT = "PixlStashCheckpointLoader"
@@ -54,6 +59,12 @@ def _raising(exc: BaseException):
         raise exc
 
     return raises
+
+
+def _answered(status_code: int, body: bytes) -> BoundedResponse:
+    """ComfyUI's answer of *status_code* carrying *body*, as ``_ask_comfyui``
+    returns it once read."""
+    return BoundedResponse("http://comfy", status_code, body)
 
 
 def _comfyui_answers(monkeypatch, histories: list, queues: list) -> list[str]:
@@ -820,44 +831,29 @@ _MIB = 1024 * 1024
 
 
 class _StreamedView:
-    """ComfyUI's ``GET /view`` as ``requests`` returns it with ``stream=True``.
+    """ComfyUI's ``GET /view`` as ``_ask_comfyui`` hands it over with a sink.
 
-    The body arrives in three pieces, and ``content`` refuses: taking the
-    whole body at once is what holds every output of a run in memory until
-    its import ends. With *cut_after*, the stream ends after that many pieces
-    with the error a dropped connection raises.
+    The body goes to the sink in three pieces, and nothing comes back in the
+    answer: holding the whole body is what kept every output of a run in
+    memory until its import ended. With *cut_after*, the body ends after that
+    many pieces with the error a dropped connection raises.
     """
 
     def __init__(self, body: bytes, cut_after: int | None = None):
-        self.status_code = 200
-        self.text = ""
-        self.chunk_sizes = []
-        self.closed = False
+        self.pieces = 0
         self._body = body
         self._cut_after = cut_after
 
-    @property
-    def content(self):
-        raise AssertionError("the whole body was taken at once")
-
-    def iter_content(self, chunk_size=1):
-        self.chunk_sizes.append(chunk_size)
+    def send(self, url: str, sink) -> BoundedResponse:
         piece = max(1, -(-len(self._body) // 3))
         for n, start in enumerate(range(0, len(self._body), piece)):
             if n == self._cut_after:
                 raise comfyui_service.requests.exceptions.ChunkedEncodingError(
                     "test-cut-off"
                 )
-            yield self._body[start : start + piece]
-
-    def close(self):
-        self.closed = True
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info):
-        self.close()
+            sink(self._body[start : start + piece])
+            self.pieces += 1
+        return BoundedResponse(url, 200, b"")
 
 
 def _serve_views(monkeypatch, bodies: dict, cut_after: int | None = None) -> list:
@@ -865,12 +861,13 @@ def _serve_views(monkeypatch, bodies: dict, cut_after: int | None = None) -> lis
     ``(url, keyword arguments, response)`` for each request."""
     asked = []
 
-    def get(url, **kwargs):
+    def request(method, url, **kwargs):
+        assert method == "GET"
         view = _StreamedView(bodies[kwargs["params"]["filename"]], cut_after)
         asked.append((url, kwargs, view))
-        return view
+        return view.send(url, kwargs["sink"])
 
-    monkeypatch.setattr(comfyui_service.requests, "get", get)
+    monkeypatch.setattr(comfyui_service, "bounded_request", request)
     return asked
 
 
@@ -912,20 +909,20 @@ class TestFetchingOutputs:
             assert handle.read() == body
         ((url, kwargs, view),) = asked
         assert url == "http://comfy/view"
+        sink = kwargs.pop("sink")
+        assert callable(sink)
         assert kwargs == {
             "params": {
                 "filename": "out_00001.png",
                 "subfolder": "test-sub",
                 "type": "output",
             },
-            "stream": True,
-            "timeout": 30,
-            "allow_redirects": False,
+            "deadline_s": comfyui_service.COMFYUI_FILE_DEADLINE_S,
+            "max_bytes": comfyui_service.COMFYUI_FILE_MAX_BYTES,
+            "timeout": comfyui_service.COMFYUI_ASK_TIMEOUT_S,
             "proxies": comfyui_service.NO_PROXY,
         }
-        (chunk_size,) = view.chunk_sizes
-        assert chunk_size is not None and 0 < chunk_size <= _MIB
-        assert view.closed
+        assert view.pieces == 3
 
     @pytest.mark.parametrize("kind", ["relative", "absolute"])
     def test_a_fetched_file_stays_in_the_runs_folder(self, monkeypatch, tmp_path, kind):
@@ -960,7 +957,7 @@ class TestFetchingOutputs:
             502,
             "ComfyUI image fetch failed",
         )
-        assert asked[0][2].closed
+        assert asked[0][2].pieces == 1
 
     def test_an_output_is_imported_without_being_read_whole(self, tmp_path):
         """A ~14 MiB output is fingerprinted and copied into the library with
@@ -1014,7 +1011,7 @@ class TestOutputProcessing:
         """Process a run's outputs with everything past ComfyUI stood in for.
 
         With *fetch*, the real download runs (the test stands in for
-        ``requests.get``); *import_outputs* replaces the stand-in import.
+        ``bounded_request``); *import_outputs* replaces the stand-in import.
         """
         server = _FakeServer()
         calls = {
@@ -1237,17 +1234,21 @@ class TestOutputProcessing:
 
     @pytest.mark.parametrize("fails", ["the import", "the fetch"])
     def test_the_fetched_files_go_with_a_run_that_fails(
-        self, monkeypatch, tmp_path, fails
+        self, monkeypatch, tmp_path, caplog, fails
     ):
+        """The run's folder is gone whichever step failed, and a failed import
+        ends the run with the server's sentence: the OS's text, which can name
+        paths, goes to the log with its traceback."""
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         _serve_views(
             monkeypatch,
             {"out_00001.png": b"test-output-" * 20000},
             cut_after=1 if fails == "the fetch" else None,
         )
+        cause = OSError(28, "test-no-space-left")
 
         def import_outputs(srv, entries, **kwargs):
-            raise OSError(28, "test-no-space-left")
+            raise cause
 
         server, _calls = self._run(
             monkeypatch,
@@ -1261,10 +1262,16 @@ class TestOutputProcessing:
         payload = server.vault.events[-1][1]
         assert (payload["status"], payload["message"]) == (
             "failed",
-            "[Errno 28] test-no-space-left"
+            comfyui_service.OUTPUT_IMPORT_FAILED
             if fails == "the import"
             else "ComfyUI image fetch failed",
         )
+        assert "test-no-space-left" not in repr(server.vault.events)
+        logged = any(
+            record.exc_info is not None and record.exc_info[1] is cause
+            for record in caplog.records
+        )
+        assert logged is (fails == "the import")
 
 
 class TestVideoSavers:
@@ -1384,9 +1391,9 @@ class TestWaitingOutARun:
             monkeypatch.setattr(comfyui_service, registry, {})
         log = _comfyui_answers(monkeypatch, [{}], [RUNNING, GONE])
         monkeypatch.setattr(
-            comfyui_service.requests,
-            "post",
-            lambda *a, **k: SimpleNamespace(status_code=200, text=""),
+            comfyui_service,
+            "bounded_request",
+            lambda *a, **k: _answered(200, b""),
         )
 
         # While the wait sleeps, the listener reads the queue (it still holds
@@ -1412,9 +1419,9 @@ class TestWaitingOutARun:
         """A clear ComfyUI refused emptied nothing, so there is nothing new
         for a poller to learn from the queue."""
         monkeypatch.setattr(
-            comfyui_service.requests,
-            "post",
-            lambda *a, **k: type("R", (), {"status_code": status, "text": ""})(),
+            comfyui_service,
+            "bounded_request",
+            lambda *a, **k: _answered(status, b""),
         )
         before = comfyui_service._queue_cleared
         assert (
@@ -1422,11 +1429,53 @@ class TestWaitingOutARun:
         )
         assert (comfyui_service._queue_cleared != before) is cleared
 
+    def test_the_cleared_count_changes_only_under_its_lock(self):
+        """``_queue_cleared`` is what tells a waiter a read is stale; a bump
+        racing a read's ``answers`` check could let a waiter go by a queue
+        read from before a clear. Every write to it is inside
+        ``with _run_outcomes_lock``."""
+        tree = ast.parse(inspect.getsource(comfyui_service))
+        unlocked = []
+
+        def visit(node, locked):
+            if isinstance(node, ast.With):
+                locked = locked or any(
+                    isinstance(item.context_expr, ast.Name)
+                    and item.context_expr.id == "_run_outcomes_lock"
+                    for item in node.items
+                )
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets = [node.target]
+            if not isinstance(node, ast.Module) and any(
+                isinstance(t, ast.Name) and t.id == "_queue_cleared" for t in targets
+            ):
+                if not locked:
+                    unlocked.append(node.lineno)
+            for child in ast.iter_child_nodes(node):
+                # The module-level initial value is not a change.
+                if isinstance(node, ast.Module) and isinstance(child, ast.Assign):
+                    continue
+                visit(child, locked)
+
+        visit(tree, False)
+        writes = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AugAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "_queue_cleared"
+        ]
+        assert writes, "the sweep found no bump of _queue_cleared at all"
+        assert unlocked == [], f"_queue_cleared written outside its lock: {unlocked}"
+
     def test_a_clear_that_never_reached_comfyui_sends_nobody(self, monkeypatch):
         def refuse(*a, **k):
             raise comfyui_service.requests.ConnectionError("refused")
 
-        monkeypatch.setattr(comfyui_service.requests, "post", refuse)
+        monkeypatch.setattr(comfyui_service, "bounded_request", refuse)
         before = comfyui_service._queue_cleared
         comfyui_service._comfyui_abort("http://comfy")
         assert comfyui_service._queue_cleared == before
@@ -1484,45 +1533,31 @@ class TestWaitingOutARun:
     def test_the_queue_is_read_for_its_prompts(self, monkeypatch, queue, answer):
         asked = []
 
-        def get(url, timeout=None, allow_redirects=True, proxies=None):
-            asked.append((url, allow_redirects, proxies))
-            return SimpleNamespace(
-                status_code=200, raise_for_status=lambda: None, json=lambda: queue
-            )
+        def get(method, url, proxies=None, **kwargs):
+            asked.append((method, url, kwargs.get("redirects", 0), proxies))
+            return _answered(200, json.dumps(queue).encode())
 
-        monkeypatch.setattr(comfyui_service.requests, "get", get)
+        monkeypatch.setattr(comfyui_service, "bounded_request", get)
         assert comfyui_service._read_comfyui_queue("http://comfy") == answer
         # Straight to the address asked, never through an environment proxy,
         # and never on to wherever a redirect points.
-        assert asked == [("http://comfy/queue", False, comfyui_service.NO_PROXY)]
+        assert asked == [("GET", "http://comfy/queue", 0, comfyui_service.NO_PROXY)]
 
     @pytest.mark.parametrize(
         "get",
         [
             _raising(comfyui_service.requests.ConnectionError("refused")),
-            lambda *a, **k: SimpleNamespace(
-                status_code=503,
-                raise_for_status=_raising(
-                    comfyui_service.requests.HTTPError("503 Server Error")
-                ),
-                json=dict,
-            ),
+            lambda *a, **k: _answered(503, b"{}"),
             # Another host's address, whatever the body says.
-            lambda *a, **k: SimpleNamespace(
-                status_code=302,
-                raise_for_status=lambda: None,
-                json=lambda: {"queue_running": [], "queue_pending": []},
+            lambda *a, **k: _answered(
+                302, b'{"queue_running": [], "queue_pending": []}'
             ),
-            lambda *a, **k: SimpleNamespace(
-                status_code=200,
-                raise_for_status=lambda: None,
-                json=_raising(ValueError("Expecting value")),
-            ),
+            lambda *a, **k: _answered(200, b"<html>not json</html>"),
         ],
         ids=["refused", "error-status", "redirect", "not-json"],
     )
     def test_a_queue_that_cannot_be_read_is_no_answer(self, monkeypatch, get):
-        monkeypatch.setattr(comfyui_service.requests, "get", get)
+        monkeypatch.setattr(comfyui_service, "bounded_request", get)
         assert comfyui_service._read_comfyui_queue("http://comfy") is None
 
     def test_a_queue_that_cannot_be_read_does_not_abandon_the_run(self, monkeypatch):
@@ -1679,7 +1714,7 @@ class _Rounds:
 
 
 class _FakeComfyUI:
-    """A ComfyUI's queue and history, answered in process as ``requests.get``.
+    """A ComfyUI's queue and history, answered in process as ``bounded_request``.
     Notes each request made of it with whether a redirect would be followed
     and the proxies it was sent with."""
 
@@ -1693,10 +1728,13 @@ class _FakeComfyUI:
         # (exception, how many other waiters share the read before it raises)
         self.queue_failure: tuple[BaseException, int] | None = None
 
-    def get(self, url, timeout=None, allow_redirects=True, proxies=None):
+    def get(self, method, url, proxies=None, **kwargs):
+        """``bounded_request`` at this ComfyUI: the queue and the histories."""
+        assert method == "GET"
         failure = None
         with self._lock:
-            self._asked.append((url, allow_redirects, proxies))
+            # (where, whether a redirect would be followed, the proxies)
+            self._asked.append((url, bool(kwargs.get("redirects", 0)), proxies))
             if url == f"{COMFY}/queue":
                 failure, self.queue_failure = self.queue_failure, None
                 body = {
@@ -1713,9 +1751,7 @@ class _FakeComfyUI:
             exc, sharers = failure
             self._rounds.joined(sharers)
             raise exc
-        return SimpleNamespace(
-            status_code=200, text="", raise_for_status=lambda: None, json=lambda: body
-        )
+        return _answered(200, json.dumps(body).encode())
 
     def taken(self) -> list[tuple[str, object, object]]:
         """The requests made since this was last asked, in order."""
@@ -1734,7 +1770,7 @@ def comfyui(monkeypatch):
     monkeypatch.setattr(comfyui_service, "_queue_waits", {})
     monkeypatch.setattr(comfyui_service, "_QueueRead", rounds.read_type())
     monkeypatch.setattr(comfyui_service, "time", SimpleNamespace(sleep=rounds.sleep))
-    monkeypatch.setattr(comfyui_service.requests, "get", fake.get)
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake.get)
     yield fake, rounds
     rounds.stop()
 
@@ -1815,7 +1851,7 @@ class TestOneQueueReadForEveryRun:
         assert rounds.asleep() == {"test-later"}
         outcomes = rounds.outcomes
         assert outcomes["test-done"] == _collected("test-done")
-        assert type(outcomes["test-failed"]) is RuntimeError
+        assert type(outcomes["test-failed"]) is comfyui_service.ComfyUIRunFailed
         assert "(UNETLoader) failed: KeyError" in str(outcomes["test-failed"])
         assert type(outcomes["test-gone"]) is comfyui_service.ComfyUIRunStopped
         assert "no longer has this run" in str(outcomes["test-gone"])
@@ -1925,6 +1961,34 @@ class TestOneQueueReadForEveryRun:
         assert [type(exc) for exc in outcomes] == [_TestOver]
         assert comfyui_service._queue_reads == {}
         assert comfyui_service._queue_waits == {}
+
+    def test_a_waiter_does_not_wait_for_ever_on_a_read_another_sent(self, monkeypatch):
+        """The read is bounded, but the waiter sharing it must not rest its
+        whole wait on that: past the read's bound it reads the prompt's
+        history instead, as for a queue that could not be read."""
+        stuck = comfyui_service._QueueRead(1, comfyui_service._queue_cleared)
+        monkeypatch.setattr(comfyui_service, "_queue_reads", {COMFY: stuck})
+        monkeypatch.setattr(comfyui_service, "QUEUE_READ_WAIT_S", 0.05)
+
+        def never_sent(_url):
+            raise AssertionError("a waiter sent a second read beside the first")
+
+        monkeypatch.setattr(comfyui_service, "_read_comfyui_queue", never_sent)
+        answers = []
+        waiter = threading.Thread(
+            target=lambda: answers.append(comfyui_service._shared_queue_read(COMFY, 0)),
+            name="waiter-test-stuck-read",
+            daemon=True,
+        )
+        waiter.start()
+        waiter.join(GUARD_S)
+        stuck.done.set()
+        assert not waiter.is_alive(), "the waiter waited on the read for ever"
+        [read] = answers
+        assert read.finished and read.done.is_set()
+        assert read.listed is None and read.running is None
+        # The read still in flight is the sender's to end, not the waiter's.
+        assert comfyui_service._queue_reads == {COMFY: stuck}
 
 
 ERROR_EVENT = {
@@ -2050,18 +2114,44 @@ class TestHowARunEnded:
             ],
             [GONE, GONE],
         )
-        with pytest.raises(RuntimeError, match="UNETLoader\\) failed") as failed:
+        with pytest.raises(
+            comfyui_service.ComfyUIRunFailed, match="UNETLoader\\) failed"
+        ) as failed:
             comfyui_service._wait_for_comfyui_outputs("http://comfy", "prompt-1", None)
         assert not isinstance(failed.value, comfyui_service.ComfyUIRunStopped)
 
         with pytest.raises(comfyui_service.ComfyUIRunStopped, match="at KSampler"):
             comfyui_service._wait_for_comfyui_outputs("http://comfy", "prompt-1", None)
 
+    def test_an_error_without_a_failed_status_is_still_a_failed_run(self, monkeypatch):
+        """A history carrying ComfyUI's error but no failed status (none at all
+        here) ends as a ``ComfyUIRunFailed``, the one class whose text the run
+        handler shows; any other ``RuntimeError`` it answers with a fixed
+        sentence."""
+        _comfyui_answers(
+            monkeypatch,
+            [
+                {
+                    "prompt-1": {
+                        "outputs": {},
+                        "status": {},
+                        "error": "Prompt outputs failed validation",
+                    }
+                }
+            ],
+            [GONE],
+        )
+        with pytest.raises(
+            comfyui_service.ComfyUIRunFailed,
+            match="^Prompt outputs failed validation$",
+        ):
+            comfyui_service._wait_for_comfyui_outputs("http://comfy", "prompt-1", None)
+
     def test_comfyui_going_away_says_so(self, monkeypatch):
         def refuse(*a, **k):
             raise comfyui_service.requests.ConnectionError("refused")
 
-        monkeypatch.setattr(comfyui_service.requests, "get", refuse)
+        monkeypatch.setattr(comfyui_service, "bounded_request", refuse)
         with pytest.raises(comfyui_service.HTTPException) as gone:
             comfyui_service._fetch_comfyui_history("http://comfy", "prompt-1")
         assert gone.value.detail == "ComfyUI stopped answering before the run finished"
@@ -2090,7 +2180,9 @@ class TestTheEndingIsToldAndKept:
         payload, outcome = self._end(
             monkeypatch,
             "ending-failed",
-            self._raises(RuntimeError("UNETLoader failed: KeyError 'x'")),
+            self._raises(
+                comfyui_service.ComfyUIRunFailed("UNETLoader failed: KeyError 'x'")
+            ),
             workflow_id="manual:" + "a" * 32,
         )
         assert (
@@ -2109,6 +2201,44 @@ class TestTheEndingIsToldAndKept:
             "run_id": None,
             "code": None,
         }
+
+    def test_a_library_fault_during_the_import_is_logged_not_shown(
+        self, monkeypatch, caplog
+    ):
+        """Only ComfyUI's account of a failed run is the ending's text. A
+        ``RuntimeError`` met while the outputs are imported is a fault of the
+        import: ``DatabaseUnavailableError`` is one, and its text names the
+        writer's failure. The ending used to show any ``RuntimeError``.
+
+        Wrong if ``test-leak`` is in the event or the kept outcome, or if the
+        log does not hold the cause with its traceback.
+        """
+        cause = DatabaseUnavailableError(
+            "VaultDatabase writer has failed (test-leak disk I/O error); task refused."
+        )
+
+        def write_fails(*_args):
+            raise cause
+
+        monkeypatch.setattr(
+            comfyui_service, "_set_source_picture_id_on_pictures", write_fails
+        )
+        with caplog.at_level(logging.ERROR, logger=comfyui_service.__name__):
+            payload, outcome = self._end(
+                monkeypatch, "ending-writer-failed", lambda *a, **k: ([], [41])
+            )
+        assert (payload["status"], payload["message"], payload["stopped"]) == (
+            "failed",
+            comfyui_service.OUTPUT_IMPORT_FAILED,
+            False,
+        )
+        assert outcome["message"] == comfyui_service.OUTPUT_IMPORT_FAILED
+        assert "test-leak" not in repr(payload)
+        assert "test-leak" not in repr(outcome)
+        assert any(
+            record.exc_info is not None and record.exc_info[1] is cause
+            for record in caplog.records
+        )
 
     def test_a_stopped_run_is_marked_stopped(self, monkeypatch):
         payload, outcome = self._end(

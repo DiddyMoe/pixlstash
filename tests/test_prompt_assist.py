@@ -183,16 +183,26 @@ def test_choices_pick_skip_or_type_and_typed_text_is_only_flagged():
 
 
 @pytest.mark.parametrize(
-    "choices, field",
+    "choices, field, message",
     [
-        ({"lens": "none"}, "prompt_assist.choices.lens"),
-        ({"camera": {"id": "webcam"}}, "prompt_assist.choices.camera"),
+        (
+            {"test_lens": "none"},
+            "prompt_assist.choices.test_lens",
+            "The photo presets have no such category.",
+        ),
+        (
+            {"camera": {"id": "test_webcam"}},
+            "prompt_assist.choices.camera",
+            "Camera has no such option.",
+        ),
     ],
 )
-def test_an_unknown_category_or_option_names_the_field(choices, field):
+def test_an_unknown_category_or_option_names_the_field(choices, field, message):
     with pytest.raises(PromptAssistError) as caught:
         assemble(FAMILY, "photo", choices, "A man.")
     assert caught.value.field == field
+    # The field locates it; the sentence repeats none of the caller's text.
+    assert str(caught.value) == message
 
 
 def test_a_sentence_the_prompt_already_holds_is_not_added_again():

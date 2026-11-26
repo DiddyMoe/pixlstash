@@ -8,7 +8,11 @@ import os
 import pytest
 
 from pixlstash.training import presets
-from pixlstash.training.config_render import TUNABLE_KEYS, TunableOverrideError
+from pixlstash.training.config_render import (
+    NOT_TUNABLE_MESSAGE,
+    TUNABLE_KEYS,
+    TunableOverrideError,
+)
 
 _ZIT = presets.get_preset("zimage-turbo")
 
@@ -428,8 +432,10 @@ def test_captions_encoded_once_report_no_caption_dropout():
 def test_pins_refuse_locked_and_unknown_keys_by_name():
     with pytest.raises(TunableOverrideError, match="'model.arch' is fixed"):
         presets.validate_pins(_ZIT, {"model.arch": "flux"})
-    with pytest.raises(TunableOverrideError, match="'device'"):
+    # A key outside the tunables is the caller's text: refused, not repeated.
+    with pytest.raises(TunableOverrideError) as refused:
         presets.validate_pins(_ZIT, {"device": "cuda:1"})
+    assert str(refused.value) == NOT_TUNABLE_MESSAGE
     with pytest.raises(TunableOverrideError, match="train.steps"):
         presets.validate_pins(_ZIT, {"train.steps": -1})
     with pytest.raises(TunableOverrideError, match="prompts"):
@@ -440,6 +446,16 @@ def test_pins_refuse_locked_and_unknown_keys_by_name():
     assert presets.validate_pins(_ZIT, None) == {}
     assert presets.validate_pins(_ZIT, {}) == {}
     assert presets.validate_pins(_ZIT, {"train.steps": 10}) == {"train.steps": 10}
+
+
+def test_a_pin_past_the_float_range_is_refused_in_the_rules_sentence():
+    # JSON carries 10**400 as an exact int. Converting it to a float to test
+    # it overflowed, and an OverflowError is no refusal: the route answered
+    # 500 where it answers every other bad pin with 422.
+    for huge in (10**400, -(10**400)):
+        with pytest.raises(TunableOverrideError) as refused:
+            presets.validate_pins(_ZIT, {"train.lr": huge})
+        assert str(refused.value) == "'train.lr' must be a number from 1e-07 to 0.1."
 
 
 def test_to_patch_nests_flat_keys_under_process_zero():

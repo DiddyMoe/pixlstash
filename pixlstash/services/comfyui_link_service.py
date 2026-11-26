@@ -36,6 +36,7 @@ builds kept (:data:`LINK_CONFIG_KEY`) onto its connection.
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import os
 import socket
@@ -60,6 +61,7 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models import UserToken
 from pixlstash.pixl_logging import get_logger
 from pixlstash.server_config_io import persist_server_config
+from pixlstash.utils.bounded_http import bounded_request
 from pixlstash.services import comfyui_connections
 from pixlstash.services.comfyui_service import (
     NO_PROXY,
@@ -67,6 +69,7 @@ from pixlstash.services.comfyui_service import (
     normalize_comfyui_url,
     probe_comfyui,
 )
+from pixlstash.utils.comfyui_url import SAVED_ADDRESS_INVALID, InvalidComfyUIAddress
 
 logger = get_logger(__name__)
 
@@ -84,11 +87,49 @@ SETTING_CA = "PixlStash.CACertificate"
 
 STEP_IDS = ("reach", "nodes", "link", "check")
 
+# The sentences a step answers with when something below it failed. Fixed:
+# the certificate's path, the OS's or ``requests``' text and whatever ComfyUI
+# said are logged with the connection, never put in the reply.
+CERT_UNREADABLE = (
+    "PixlStash could not read its HTTPS certificate. The server log names the "
+    "file and says why."
+)
+NO_ROUTE_TO_COMFYUI = "This computer has no route to the address ComfyUI is at."
+CHECK_UNANSWERED = "ComfyUI did not answer the check. The server log says why."
+SETTINGS_REFUSED = (
+    "ComfyUI refused the settings, so it was not linked. The server log says why."
+)
+
+# Both answers are a few hundred bytes of JSON (``{}`` from ComfyUI's
+# settings write; the sort mechanisms PixlStash lists, through the pack's
+# proxy). Each is read whole within its deadline and cap, or not at all.
+LINK_ANSWER_MAX_BYTES = 1024 * 1024
+LINK_WRITE_TIMEOUT_S = 10.0
+LINK_CHECK_TIMEOUT_S = 30.0
+
 # One link or unlink at a time: two concurrent links would each mint a token and
 # the second record would orphan the first.
 # ponytail: one lock for every connection; per-connection locks if links are
 # ever automated.
 _LINK_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def link_lock():
+    """Hold the link lock: no link or unlink starts, and none is part done,
+    until the block ends.
+
+    For a change to the current connection's address that checks no link is
+    bound to it and then saves (the config PATCH): held across both, a
+    link cannot land between the check and the save and leave its key bound
+    to an address that is gone.
+
+    Lock order: ``routes.config``'s ``patch_me_config_lock`` first, then this.
+    Nothing holding this takes that lock.
+    """
+    with _LINK_LOCK:
+        yield
+
 
 # ``(connection_id, token_public_id, url)`` per ComfyUI told this session.
 _told_this_session: set[tuple] = set()
@@ -208,11 +249,10 @@ def _read_cert(server) -> bytes:
         with open(certfile, "rb") as handle:
             return handle.read()
     except OSError as exc:
-        logger.warning("Could not read the HTTPS certificate %s: %s", certfile, exc)
-        raise LinkRefused(
-            "certificate_missing",
-            f"PixlStash could not read its HTTPS certificate at {certfile}: {exc}",
-        ) from exc
+        logger.warning(
+            "Could not read the HTTPS certificate %s: %s", certfile, exc, exc_info=exc
+        )
+        raise LinkRefused("certificate_missing", CERT_UNREADABLE) from exc
 
 
 def _is_desktop() -> bool:
@@ -324,7 +364,8 @@ def link_target(server, where: str, pinned_url: str) -> tuple[str, Optional[str]
     comfy_port = comfy.port or (443 if comfy.scheme == "https" else 80)
     address = _address_toward(comfy_host, comfy_port)
     if address is None:
-        raise LinkRefused("not_local", f"This computer has no route to {comfy_host}.")
+        # `_address_toward` has logged the host and the OS's reason.
+        raise LinkRefused("not_local", NO_ROUTE_TO_COMFYUI)
     cert = _read_cert(server)
     if not _cert_covers(cert, address):
         raise LinkRefused(
@@ -421,11 +462,13 @@ def _write_settings(pinned_url: str, settings: dict) -> None:
     to whatever ``Location`` names, and that host was never checked. Only a
     200 is success.
     """
-    response = requests.post(
+    response = bounded_request(
+        "POST",
         f"{pinned_url}settings",
         json=settings,
-        timeout=10,
-        allow_redirects=False,
+        timeout=LINK_WRITE_TIMEOUT_S,
+        deadline_s=LINK_WRITE_TIMEOUT_S,
+        max_bytes=LINK_ANSWER_MAX_BYTES,
         proxies=NO_PROXY,
     )
     if response.status_code != 200:
@@ -457,29 +500,35 @@ def _check_round_trip(pinned_url: str, token: str) -> Optional[str]:
     written reach PixlStash and PixlStash accepts the token.
     """
     try:
-        response = requests.get(
+        response = bounded_request(
+            "GET",
             f"{pinned_url}pixlstash/sort_mechanisms",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-            allow_redirects=False,
+            timeout=LINK_CHECK_TIMEOUT_S,
+            deadline_s=LINK_CHECK_TIMEOUT_S,
+            max_bytes=LINK_ANSWER_MAX_BYTES,
             proxies=NO_PROXY,
         )
     except requests.RequestException as exc:
-        logger.warning("ComfyUI link check at %s failed: %s", pinned_url, exc)
-        return f"ComfyUI did not answer the check: {exc}"
+        logger.warning(
+            "ComfyUI link check at %s failed: %s", pinned_url, exc, exc_info=exc
+        )
+        return CHECK_UNANSWERED
     if response.status_code == 200:
         return None
+    # What the pack's proxy said is ComfyUI's text, not PixlStash's: logged,
+    # and the reply names the status only.
     try:
         said = response.json().get("error")
     except (ValueError, AttributeError):
         said = None
     logger.warning(
-        "ComfyUI link check at %s: HTTP %s (%s)",
+        "ComfyUI link check at %s: HTTP %s (%r)",
         pinned_url,
         response.status_code,
         said,
     )
-    return said or f"ComfyUI answered the check with HTTP {response.status_code}."
+    return f"ComfyUI answered the check with HTTP {response.status_code}."
 
 
 def link(server, request: Request, connection: Optional[dict]) -> dict:
@@ -520,8 +569,16 @@ def _link(server, request: Request, connection: Optional[dict]) -> dict:
     try:
         probe = probe_comfyui(saved_url)
         where, pinned = locate(saved_url)
-    except ValueError as exc:
-        steps["reach"] = _step("failed", str(exc))
+    except InvalidComfyUIAddress as exc:
+        # Saved before the normaliser was strict, or by hand: the saved
+        # address, which the reply does not repeat.
+        logger.warning(
+            "Saved ComfyUI address of connection %s is not valid (%s); not linked",
+            connection_id,
+            exc,
+            exc_info=exc,
+        )
+        steps["reach"] = _step("failed", SAVED_ADDRESS_INVALID)
         return reply()
     if not probe["reachable"]:
         steps["reach"] = _step("failed", probe["detail"])
@@ -630,11 +687,14 @@ def _link(server, request: Request, connection: Optional[dict]) -> dict:
             },
         )
     except requests.RequestException as exc:
-        logger.warning("Writing PixlStash settings into ComfyUI failed: %s", exc)
-        _revoke(server, request, public_id)
-        steps["link"] = _step(
-            "failed", f"ComfyUI refused the settings: {exc}", "write_failed"
+        logger.warning(
+            "Writing PixlStash settings into ComfyUI at %s failed: %s",
+            pinned,
+            exc,
+            exc_info=exc,
         )
+        _revoke(server, request, public_id)
+        steps["link"] = _step("failed", SETTINGS_REFUSED, "write_failed")
         return reply()
     old_record = _records(server).get(connection_id)
     old_token = (old_record or {}).get("token_public_id")

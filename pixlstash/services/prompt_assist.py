@@ -94,7 +94,7 @@ def is_layout_prompt(prompt: Optional[str]) -> bool:
         return False
     try:
         return isinstance(json.loads(text), (dict, list))
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
 
 
@@ -284,9 +284,11 @@ def assemble(family: Optional[str], context: str, choices: dict, prompt: str) ->
     known = {category["id"] for category in categories}
     for name in choices:
         if name not in known:
+            # The field names the key; the sentence repeats none of the
+            # caller's text.
             raise PromptAssistError(
                 f"prompt_assist.choices.{name}",
-                f"The {context} presets have no {name!r} category.",
+                f"The {context} presets have no such category.",
             )
     picked, finishes = [], []
     for category in categories:
@@ -303,7 +305,7 @@ def assemble(family: Optional[str], context: str, choices: dict, prompt: str) ->
             if option is None:
                 raise PromptAssistError(
                     f"prompt_assist.choices.{category['id']}",
-                    f"{category['label']} has no option {choice['id']!r}.",
+                    f"{category['label']} has no such option.",
                 )
             if option.get("text"):
                 picked.append({**part, "id": option["id"], "text": option["text"]})

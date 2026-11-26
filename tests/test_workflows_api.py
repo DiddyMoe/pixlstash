@@ -150,12 +150,19 @@ from pixlstash.services.workflow_run_service import (
     replace_missing_text_nodes,
     skip_requested_loras,
 )
+from pixlstash.utils.bounded_http import BoundedResponse
+from pixlstash.utils.comfyui_url import SAVED_ADDRESS_INVALID, InvalidComfyUIAddress
 from pixlstash.utils.comfyui_utilities import extract_generation_info
 from pixlstash.utils.known_base_models import family_of, fold, identify
 import pixlstash.routes.config as config_routes
 import pixlstash.routes.workflows as workflows_routes
 from pixlstash.routes.comfyui import MAX_RUNS_PER_REQUEST
-from pixlstash.routes.workflows import MAX_PROMPT_LENGTH, RunRequest, UNNAMED_CARD
+from pixlstash.routes.workflows import (
+    MAX_PROMPT_LENGTH,
+    RunRequest,
+    UNNAMED_CARD,
+    _stored_value,
+)
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.services.model_downloads import digest_source
 from pixlstash.services.workflow_templates import load_templates
@@ -978,6 +985,26 @@ def fresh_library(workflow_env):
     yield workflow_env
 
 
+@pytest.fixture(autouse=True)
+def comfyui_refuses_its_node_map(monkeypatch):
+    """ComfyUI's ``/object_info`` is refused, as CI's absent ComfyUI refuses it.
+
+    The plan, export, form-input, clone and editor routes read that map, and a
+    test on the bare ``workflow_env`` would otherwise ask the default ComfyUI
+    address for it: the connect guard in tests/conftest.py lists each such read
+    at session end. The refusal is raised at the HTTP call, so the product's
+    own handling (the shared GET, the routes' one-minute cache, the "Could not
+    reach ComfyUI" answer) runs as it does with nothing listening. A test that
+    wants a map patches ``_read_object_info`` or ``fetch_object_info`` over
+    this, as ``runnable`` does.
+    """
+
+    def refused(url, **_kwargs):
+        raise requests.ConnectionError(f"{url}: refused, no ComfyUI in this suite")
+
+    monkeypatch.setattr(comfyui_recipe_service, "bounded_get", refused)
+
+
 # ===========================================================================
 # Declarations — the registry entry is the route's only authorization
 # ===========================================================================
@@ -1474,39 +1501,28 @@ def _extensions_answer(monkeypatch, answer, loader=None):
     ``GET /object_info/PixlStashCheckpointLoader`` (*loader*; ``{}``, no such
     class, by default)."""
 
-    def fake_get(url, timeout, allow_redirects=True, proxies=None):
+    def fake_request(method, url, proxies=None, **kwargs):
         # Straight to ComfyUI: no environment proxy, no redirect followed.
-        assert allow_redirects is False
+        assert method == "GET"
+        assert kwargs.get("redirects", 0) == 0
         assert proxies == comfyui_service.NO_PROXY
         got = answer
         if "/object_info/" in url:
             got = {} if loader is None else loader
         if isinstance(got, Exception):
             raise got
-        if isinstance(got, SimpleNamespace):
+        if isinstance(got, BoundedResponse):
             # An answer other than a 200, given whole.
             return got
-        return SimpleNamespace(
-            status_code=200, raise_for_status=lambda: None, json=lambda: got
-        )
+        return BoundedResponse(url, 200, json.dumps(got).encode())
 
-    monkeypatch.setattr(
-        comfyui_service,
-        "requests",
-        SimpleNamespace(
-            get=fake_get,
-            RequestException=requests.RequestException,
-            HTTPError=requests.HTTPError,
-        ),
-    )
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake_request)
 
 
 def _redirected(body):
     """ComfyUI's address answering with a redirect that carries *body*, which
-    ``raise_for_status`` lets through."""
-    return SimpleNamespace(
-        status_code=302, raise_for_status=lambda: None, json=lambda: body
-    )
+    is not followed."""
+    return BoundedResponse("http://comfy.invalid", 302, json.dumps(body).encode())
 
 
 def test_the_node_check_is_owner_only(workflow_env, monkeypatch):
@@ -1648,27 +1664,23 @@ def _system_stats_answer(monkeypatch, answer) -> list[str]:
     """Stand in for ComfyUI's ``GET /system_stats``; returns the URLs asked."""
     asked: list[str] = []
 
-    def fake_get(url, timeout, allow_redirects=True, proxies=None):
+    def fake_request(method, url, proxies=None, **kwargs):
         asked.append(url)
         if url.endswith("/extensions"):
             # The node check, asked once ComfyUI has answered: no nodes.
-            return SimpleNamespace(
-                status_code=200, raise_for_status=lambda: None, json=lambda: []
-            )
-        assert allow_redirects is False, "a redirect names a host nobody probed"
+            return BoundedResponse(url, 200, b"[]")
+        assert kwargs.get("redirects", 0) == 0, "a redirect names a host nobody probed"
         assert proxies == comfyui_service.NO_PROXY
         if isinstance(answer, Exception):
             raise answer
         status, body = answer
+        # A body that is an exception stands for one that is not JSON.
+        content = (
+            b"<html>" if isinstance(body, Exception) else json.dumps(body).encode()
+        )
+        return BoundedResponse(url, status, content)
 
-        def json():
-            if isinstance(body, Exception):
-                raise body
-            return body
-
-        return SimpleNamespace(ok=status < 400, status_code=status, json=json)
-
-    monkeypatch.setattr(comfyui_service.requests, "get", fake_get)
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake_request)
     return asked
 
 
@@ -1780,7 +1792,7 @@ def test_the_probe_names_the_card_comfyui_runs_on(
         ((200, {"status": "ok"}), "but it is not ComfyUI"),
         # A redirect is somewhere else answering, even with ComfyUI's body.
         ((302, {"system": {}}), "but it is not ComfyUI"),
-        (requests.ConnectionError("refused"), "Nothing answered at 127.0.0.1:8189"),
+        (requests.ConnectionError("refused"), "Nothing answered at that address"),
         (requests.Timeout("slow"), "did not answer within 2 seconds"),
         (requests.exceptions.SSLError("self-signed"), "certificate could not be"),
     ],
@@ -1796,6 +1808,52 @@ def test_the_probe_says_why_an_address_is_not_comfyui(
     assert r.status_code == 200, r.text
     assert r.json()["reachable"] is False
     assert says in r.json()["detail"], r.json()
+
+
+@pytest.mark.parametrize(
+    "answer, says",
+    [
+        (
+            (200, {"status": "ok"}),
+            "Something answered at that address, but it is not ComfyUI.",
+        ),
+        (
+            requests.ConnectionError("example-refused-text"),
+            "Nothing answered at that address. Check that ComfyUI is running "
+            "and that the port matches the one in its console.",
+        ),
+        (
+            requests.Timeout("example-slow-text"),
+            "That address did not answer within 2 seconds.",
+        ),
+        (
+            requests.exceptions.SSLError("example-self-signed-text"),
+            "That address answered, but its HTTPS certificate could not be checked.",
+        ),
+    ],
+)
+def test_the_probe_reason_does_not_repeat_the_address_or_the_error(
+    workflow_env, monkeypatch, caplog, answer, says
+):
+    """``detail`` is a fixed sentence: the address typed and the transport's
+    error go to the log, which names the address beside the reason."""
+    _system_stats_answer(monkeypatch, answer)
+    with caplog.at_level(logging.INFO, logger=comfyui_service.logger.name):
+        r = workflow_env.owner.post(
+            f"{API}/comfyui/probe", json={"url": "http://192.0.2.77:8189/"}
+        )
+    assert r.status_code == 200, r.text
+    detail = r.json()["detail"]
+    assert detail == says, r.json()
+    assert "192.0.2.77" not in detail
+    assert "example-" not in detail
+    probe_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == comfyui_service.logger.name
+        and record.getMessage().startswith("ComfyUI probe of ")
+    ]
+    assert any("192.0.2.77:8189" in message for message in probe_logs), probe_logs
 
 
 @pytest.mark.parametrize(
@@ -1926,6 +1984,7 @@ def test_a_single_saved_address_upgrades_to_one_current_connection(
                 "id": comfyui_connections.SAVED_ADDRESS_ID,
                 "name": "This PC",
                 "url": _THIS_PC,
+                "address_valid": True,
                 "status": None,
                 "gpu": None,
                 "vram_mb": None,
@@ -2092,6 +2151,23 @@ def test_a_connection_must_be_a_plain_http_address(workflow_env, saved_address, 
     assert len(_connections(workflow_env)["connections"]) == 1
 
 
+def test_moving_a_connection_onto_a_taken_address_does_not_repeat_it(
+    workflow_env, saved_address
+):
+    """The address is the caller's text: the 409 is the server's one sentence."""
+    other = _add_connection(workflow_env.owner, "http://127.0.0.1:18194/")
+    r = workflow_env.owner.patch(
+        f"{API}/comfyui/connections/{other}", json={"url": "HTTP://127.0.0.1:8188"}
+    )
+    assert (r.status_code, r.json()) == (
+        409,
+        {"detail": comfyui_connections.ADDRESS_TAKEN},
+    ), r.text
+    assert "8188" not in r.text
+    urls = {c["id"]: c["url"] for c in _connections(workflow_env)["connections"]}
+    assert urls[other] == "http://127.0.0.1:18194/", "a refused move moved it"
+
+
 # ===========================================================================
 # Linking ComfyUI: a full-access token written into ComfyUI's settings
 # ===========================================================================
@@ -2125,6 +2201,9 @@ class _FakeComfyUI:
         pack: bool = True,
         settings_status: int = 200,
         check_status: int | None = None,
+        check_said: str = "unreachable",
+        check_raises: Exception | None = None,
+        settings_raises: Exception | None = None,
         argv: list | None = None,
         steal_from: str | None = None,
     ):
@@ -2136,8 +2215,13 @@ class _FakeComfyUI:
         # uses it before ComfyUI's own check does.
         self.steal_from = steal_from
         self.settings_status = settings_status
-        # Answer the check with this instead of calling PixlStash.
+        # Answer the check with this instead of calling PixlStash, ComfyUI's
+        # error text being *check_said*; or fail it with *check_raises*.
         self.check_status = check_status
+        self.check_said = check_said
+        self.check_raises = check_raises
+        # Fail the settings write with this, as a dropped connection would.
+        self.settings_raises = settings_raises
         self.settings: dict = {}
         self.writes: list[dict] = []
         # What a client that follows redirects would have re-sent to the
@@ -2163,8 +2247,10 @@ class _FakeComfyUI:
             assert self.settings.get(comfyui_link_service.SETTING_URL), (
                 "the link was checked before ComfyUI was told where PixlStash is"
             )
+            if self.check_raises is not None:
+                raise self.check_raises
             if self.check_status is not None:
-                return _http_answer(self.check_status, {"error": "unreachable"})
+                return _http_answer(self.check_status, {"error": self.check_said})
             token = headers["Authorization"].split(" ", 1)[1]
             if self.steal_from is not None:
                 stolen = bearer_client(self.server, token).get(
@@ -2182,12 +2268,37 @@ class _FakeComfyUI:
             "the settings write carries the token and must not go through a proxy"
         )
         self.writes.append(json)
+        if self.settings_raises is not None:
+            raise self.settings_raises
         if 300 <= self.settings_status < 400 and allow_redirects:
             self.followed.append(json)
         if self.settings_status != 200:
             return _http_answer(self.settings_status, None)
         self.settings.update(json)
         return _http_answer(200, None)
+
+
+def _serve_comfyui(monkeypatch, get=None, post=None) -> None:
+    """Answer every bounded request to ComfyUI (the link's, and the probe's in
+    ``comfyui_service``) with the ``requests``-style *get* and *post*.
+
+    Each request must refuse redirects and carry a deadline and a cap; the
+    handlers see ``allow_redirects=False``, which is what ``bounded_request``
+    with ``redirects=0`` does on the wire.
+    """
+
+    def request(method, url, proxies=None, **kwargs):
+        assert kwargs.pop("redirects", 0) == 0, "a ComfyUI redirect is never followed"
+        assert kwargs.pop("deadline_s") > 0 and kwargs.pop("max_bytes") > 0
+        handler = get if method == "GET" else post
+        assert handler is not None, f"unexpected {method} {url}"
+        answer = handler(url, proxies=proxies, allow_redirects=False, **kwargs)
+        return BoundedResponse(
+            url, answer.status_code, json.dumps(answer.json()).encode()
+        )
+
+    monkeypatch.setattr(comfyui_link_service, "bounded_request", request)
+    monkeypatch.setattr(comfyui_service, "bounded_request", request)
 
 
 def _link_tokens(server) -> list[int]:
@@ -2226,8 +2337,7 @@ def comfy_at(workflow_env, monkeypatch):
     def at(url: str, **kwargs) -> _FakeComfyUI:
         fake = _FakeComfyUI(workflow_env.server, **kwargs)
         fakes.append(fake)
-        monkeypatch.setattr(comfyui_link_service.requests, "get", fake.get)
-        monkeypatch.setattr(comfyui_link_service.requests, "post", fake.post)
+        _serve_comfyui(monkeypatch, fake.get, fake.post)
         r = workflow_env.owner.patch(
             f"{API}/users/me/config", json={"comfyui_url": url}
         )
@@ -2356,7 +2466,7 @@ def test_a_link_reads_none_of_comfyuis_saved_workflows(
         asked.append(urlsplit(url).path)
         return fake.get(url, **kwargs)
 
-    monkeypatch.setattr(comfyui_link_service.requests, "get", get)
+    _serve_comfyui(monkeypatch, get, fake.post)
     hub = workflow_env.server.hub
     before = manual_workflow_ids(hub)
     assert workflow_env.owner.post(f"{API}/comfyui/link").json()["linked"] is True
@@ -3381,13 +3491,63 @@ def test_a_redirect_never_carries_the_token_to_another_host(workflow_env, comfy_
     ],
 )
 def test_an_address_parsers_disagree_on_is_never_linked(workflow_env, comfy_at, url):
-    fake = comfy_at(url)
-    steps = _steps(workflow_env.owner.post(f"{API}/comfyui/link").json())
-    assert steps["reach"]["state"] == "failed", steps
+    """Refused where it is typed, so it is never saved to be
+    linked: the save is a 400 with fixed text and the saved address stays."""
+    fake = comfy_at("http://127.0.0.1:18188/")
+    r = workflow_env.owner.patch(f"{API}/users/me/config", json={"comfyui_url": url})
+    assert r.status_code == 400, r.text
+    # The refusal is composed, never the typed address echoed back.
+    detail = r.json()["detail"]
+    for part in ("evil.example", "user@", "#frag"):
+        assert part not in detail, detail
+    assert workflow_env.server.auth.get_user().comfyui_url == "http://127.0.0.1:18188/"
     assert fake.writes == []
     assert _link_tokens(workflow_env.server) == []
     r = workflow_env.owner.post(f"{API}/comfyui/probe", json={"url": url})
     assert r.status_code == 400, r.text
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        # Read through routes/comfyui.py's _comfyui_url.
+        ("GET", "/comfyui/pixlstash-node"),
+        # Read through its _address, with no connection named.
+        ("POST", "/comfyui/pack/install"),
+        # Read through routes/resources.py.
+        ("POST", "/resources/comfyui/free"),
+    ],
+)
+def test_a_saved_address_the_normaliser_now_refuses_is_a_409_and_never_asked(
+    workflow_env, saved_address, monkeypatch, caplog, method, path
+):
+    """An address saved before the normaliser was strict is not
+    sent to: the read answers 409 with fixed text, and the log names the
+    connection so the owner's entry can be found."""
+    asked = []
+
+    def refuse(method, url, **kwargs):
+        asked.append(url)
+        raise AssertionError(f"{method} {url} was asked")
+
+    monkeypatch.setattr(comfyui_service, "bounded_request", refuse)
+    monkeypatch.setattr(comfyui_pack_service, "bounded_request", refuse)
+    server = workflow_env.server
+    # Every case refuses the same value under the same connection id, and the
+    # refusal is logged once per change (comfyui_url.request_base): the suite's
+    # autouse ``no_logged_refusal_outlives_its_test`` makes each case's the first.
+
+    def legacy(user):
+        user.comfyui_url = "http://evil.example\\@127.0.0.1:18188/"
+        return True
+
+    comfyui_connections.save(server, server.auth.get_user().id, legacy)
+    with caplog.at_level(logging.ERROR, logger="pixlstash.utils.comfyui_url"):
+        r = workflow_env.owner.request(method, f"{API}{path}")
+    assert (r.status_code, r.json()["detail"]) == (409, SAVED_ADDRESS_INVALID)
+    assert asked == []
+    assert comfyui_connections.SAVED_ADDRESS_ID in caplog.text
+    assert "evil" not in r.text
 
 
 def test_every_address_a_host_resolves_to_must_be_local(
@@ -3422,28 +3582,153 @@ def test_an_unscoped_read_token_cannot_see_the_link(workflow_env):
     assert client.get(f"{API}/comfyui/link").status_code == 403
 
 
+def _logged_with_traceback(caplog, exc: BaseException) -> bool:
+    """Whether *exc* itself was logged with its traceback, not only its text."""
+    return any(
+        record.exc_info is not None and record.exc_info[1] is exc
+        for record in caplog.records
+    )
+
+
 def test_a_refused_settings_write_leaves_no_token_behind(workflow_env, comfy_at):
     comfy_at("http://127.0.0.1:18188/", settings_status=403)
     reply = workflow_env.owner.post(f"{API}/comfyui/link").json()
     steps = _steps(reply)
-    assert (steps["link"]["state"], steps["link"]["reason"]) == (
-        "failed",
-        "write_failed",
-    )
+    assert steps["link"] == {
+        "id": "link",
+        "state": "failed",
+        "detail": comfyui_link_service.SETTINGS_REFUSED,
+        "reason": "write_failed",
+    }
     assert reply["linked"] is False
     assert _link_tokens(workflow_env.server) == []
     assert workflow_env.owner.get(f"{API}/comfyui/link").json()["linked"] is False
 
 
-def test_a_failed_check_undoes_the_link_and_leaves_no_token(workflow_env, comfy_at):
+def test_a_settings_write_that_fails_is_a_fixed_sentence_and_logged(
+    workflow_env, comfy_at, caplog
+):
+    """The ``requests`` text names ComfyUI's address and the OS's reason: it is
+    logged with its traceback and never put in the reply (CWE-209)."""
+    cause = requests.ConnectionError("example-leak-write: connection refused")
+    comfy_at("http://127.0.0.1:18188/", settings_raises=cause)
+    with caplog.at_level(logging.WARNING, logger=comfyui_link_service.__name__):
+        r = workflow_env.owner.post(f"{API}/comfyui/link")
+    assert r.status_code == 200, r.text
+    assert _steps(r.json())["link"] == {
+        "id": "link",
+        "state": "failed",
+        "detail": comfyui_link_service.SETTINGS_REFUSED,
+        "reason": "write_failed",
+    }
+    assert "example-leak-write" not in r.text
+    assert _logged_with_traceback(caplog, cause)
+    assert _link_tokens(workflow_env.server) == []
+
+
+def test_a_check_comfyui_never_answers_is_a_fixed_sentence_and_logged(
+    workflow_env, comfy_at, caplog
+):
+    cause = requests.ConnectionError("example-leak-check: connection reset")
+    comfy_at("http://127.0.0.1:18188/", check_raises=cause)
+    with caplog.at_level(logging.WARNING, logger=comfyui_link_service.__name__):
+        r = workflow_env.owner.post(f"{API}/comfyui/link")
+    assert r.status_code == 200, r.text
+    assert _steps(r.json())["check"] == {
+        "id": "check",
+        "state": "failed",
+        "detail": comfyui_link_service.CHECK_UNANSWERED,
+        "reason": "check_failed",
+    }
+    assert "example-leak-check" not in r.text
+    assert _logged_with_traceback(caplog, cause)
+    assert _link_tokens(workflow_env.server) == []
+
+
+def test_a_saved_address_the_normaliser_refuses_is_never_linked(
+    workflow_env, saved_address, caplog
+):
+    """The link reads the saved address itself (no ``request_base`` in front),
+    so its own catch answers: fixed text, the cause logged with the
+    connection."""
+    server = workflow_env.server
+
+    def legacy(user):
+        user.comfyui_url = "http://evil.example\\@127.0.0.1:18188/"
+        return True
+
+    comfyui_connections.save(server, server.auth.get_user().id, legacy)
+    with caplog.at_level(logging.WARNING, logger=comfyui_link_service.__name__):
+        r = workflow_env.owner.post(f"{API}/comfyui/link")
+    assert r.status_code == 200, r.text
+    assert _steps(r.json())["reach"] == {
+        "id": "reach",
+        "state": "failed",
+        "detail": SAVED_ADDRESS_INVALID,
+        "reason": None,
+    }
+    assert "evil" not in r.text
+    [record] = [
+        record
+        for record in caplog.records
+        if record.name == comfyui_link_service.__name__ and record.exc_info
+    ]
+    assert isinstance(record.exc_info[1], InvalidComfyUIAddress)
+    assert "not linked" in record.getMessage()
+    assert _link_tokens(server) == []
+
+
+def test_an_unreadable_certificate_is_named_in_the_log_not_the_reply(
+    workflow_env, comfy_at, monkeypatch, tmp_path, caplog
+):
+    server = workflow_env.server
+    comfy_at("http://127.0.0.1:18188/")
+    missing = tmp_path / "example-missing-cert.pem"
+    monkeypatch.setitem(server._server_config, "require_ssl", True)
+    monkeypatch.setitem(server._server_config, "ssl_certfile", str(missing))
+    monkeypatch.setattr(server.auth, "_get_real_client_ip", lambda r: "127.0.0.1")
+    with caplog.at_level(logging.WARNING, logger=comfyui_link_service.__name__):
+        r = workflow_env.owner.post(f"{API}/comfyui/link")
+    assert r.status_code == 200, r.text
+    assert _steps(r.json())["link"] == {
+        "id": "link",
+        "state": "needs_you",
+        "detail": comfyui_link_service.CERT_UNREADABLE,
+        "reason": "certificate_missing",
+    }
+    for part in ("example-missing-cert", "No such file", str(tmp_path)):
+        assert part not in r.text, part
+    [record] = [
+        record
+        for record in caplog.records
+        if record.exc_info and isinstance(record.exc_info[1], FileNotFoundError)
+    ]
+    assert str(missing) in record.getMessage()
+    assert _link_tokens(server) == []
+
+
+def test_a_failed_check_undoes_the_link_and_leaves_no_token(
+    workflow_env, comfy_at, caplog
+):
     """ComfyUI cannot use the key it was handed: the reply, the link status and
-    the token table must all say "not linked", and ComfyUI's copy is blanked."""
-    fake = comfy_at("http://127.0.0.1:18188/", check_status=502)
-    reply = workflow_env.owner.post(f"{API}/comfyui/link").json()
+    the token table must all say "not linked", and ComfyUI's copy is blanked.
+    What ComfyUI said is its text, not PixlStash's: logged, never answered."""
+    fake = comfy_at(
+        "http://127.0.0.1:18188/", check_status=502, check_said="example-comfyui-said"
+    )
+    with caplog.at_level(logging.WARNING, logger=comfyui_link_service.__name__):
+        r = workflow_env.owner.post(f"{API}/comfyui/link")
+    reply = r.json()
     steps = _steps(reply)
-    assert (steps["check"]["state"], steps["check"]["reason"]) == (
-        "failed",
-        "check_failed",
+    assert steps["check"] == {
+        "id": "check",
+        "state": "failed",
+        "detail": "ComfyUI answered the check with HTTP 502.",
+        "reason": "check_failed",
+    }
+    assert "example-comfyui-said" not in r.text
+    assert any(
+        "example-comfyui-said" in record.getMessage() for record in caplog.records
     )
     assert reply["linked"] is False
     assert reply["link"]["linked"] is False, reply
@@ -3486,7 +3771,7 @@ def test_the_link_and_probe_refuse_remote_plaintext_under_require_ssl(
         asked.append(url)
         return fake.get(url, **kwargs)
 
-    monkeypatch.setattr(comfyui_link_service.requests, "get", recording_get)
+    _serve_comfyui(monkeypatch, recording_get, fake.post)
     monkeypatch.setitem(server.auth._server_config, "require_ssl", True)
     client_ip = ["8.8.8.8"]
     monkeypatch.setattr(server.auth, "_get_real_client_ip", lambda r: client_ip[0])
@@ -3638,7 +3923,7 @@ def test_a_local_network_link_hands_over_the_certificate_that_covers_it(
 
 @pytest.mark.parametrize("certfile", [None, "missing.pem"])
 def test_https_without_a_readable_certificate_is_a_refusal(
-    tmp_path, monkeypatch, certfile
+    tmp_path, monkeypatch, caplog, certfile
 ):
     monkeypatch.delenv("PIXLSTASH_INSTALL_TYPE", raising=False)
     config = {"host": "0.0.0.0", "port": 9537, "require_ssl": True}
@@ -3650,9 +3935,29 @@ def test_https_without_a_readable_certificate_is_a_refusal(
         ("this_computer", "http://127.0.0.1:8188/"),
         ("local_network", f"http://{LAN_IPV4}:8188/"),
     ):
+        caplog.clear()
         with pytest.raises(comfyui_link_service.LinkRefused) as refused:
             comfyui_link_service.link_target(server, where, url)
         assert refused.value.reason == "certificate_missing"
+        if certfile:
+            # The path and the OS's reason are logged, never the refusal.
+            assert str(refused.value) == comfyui_link_service.CERT_UNREADABLE
+            assert _logged_with_traceback(caplog, refused.value.__cause__)
+            assert config["ssl_certfile"] in caplog.text
+
+
+def test_no_route_to_comfyui_is_a_fixed_refusal(monkeypatch):
+    monkeypatch.delenv("PIXLSTASH_INSTALL_TYPE", raising=False)
+    server = SimpleNamespace(
+        _server_config={"host": "0.0.0.0", "port": 9537, "require_ssl": True}
+    )
+    monkeypatch.setattr(comfyui_link_service, "_address_toward", lambda h, p: None)
+    with pytest.raises(comfyui_link_service.LinkRefused) as refused:
+        comfyui_link_service.link_target(
+            server, "local_network", f"http://{LAN_IPV4}:8188/"
+        )
+    assert refused.value.reason == "not_local"
+    assert str(refused.value) == comfyui_link_service.NO_ROUTE_TO_COMFYUI
 
 
 def test_an_ipv6_comfyui_is_routed_over_ipv6_on_the_scheme_port(tmp_path, monkeypatch):
@@ -3794,7 +4099,7 @@ def test_each_linked_comfyui_here_is_told_once_a_session(monkeypatch):
         writes.append((url, json))
         return _http_answer(200, None)
 
-    monkeypatch.setattr(comfyui_link_service.requests, "post", fake_post)
+    _serve_comfyui(monkeypatch, post=fake_post)
     told = {
         comfyui_link_service.SETTING_URL: "http://127.0.0.1:61002",
         comfyui_link_service.SETTING_SSL: True,
@@ -3826,7 +4131,7 @@ def test_each_linked_comfyui_here_is_told_once_a_session(monkeypatch):
             comfyui_link_service._save_record(server, "a", relinked)
         return _http_answer(200, None)
 
-    monkeypatch.setattr(comfyui_link_service.requests, "post", relink_meanwhile)
+    _serve_comfyui(monkeypatch, post=relink_meanwhile)
     comfyui_link_service.reannounce(server)
     assert comfyui_link_service.link_record(server, "a") == relinked
 
@@ -3925,10 +4230,11 @@ def test_removing_a_linked_connection_revokes_its_key_and_hands_over(
 
 
 def test_a_connection_whose_key_cannot_be_revoked_is_kept(
-    workflow_env, comfy_at, monkeypatch
+    workflow_env, comfy_at, monkeypatch, caplog
 ):
     """No removal without revocation: the request fails and both the row and
-    its record stay, so the live key keeps an owner."""
+    its record stay, so the live key keeps an owner. The 500 is a fixed
+    sentence; the cause goes to the log with its traceback."""
     server = workflow_env.server
     fake = comfy_at("http://127.0.0.1:18188/")
     first = comfyui_connections.current_id(server.auth.get_user())
@@ -3939,11 +4245,24 @@ def test_a_connection_whose_key_cannot_be_revoked_is_kept(
         raise RuntimeError("database is locked")
 
     # Undone before the fixture unlinks what the test left.
-    with monkeypatch.context() as patched:
+    with (
+        monkeypatch.context() as patched,
+        caplog.at_level(logging.ERROR, logger=comfyui_module.logger.name),
+    ):
         patched.setattr(comfyui_link_service, "_revoke", refuse)
         r = workflow_env.owner.delete(f"{API}/comfyui/connections/{first}")
     assert r.status_code == 500, r.text
-    assert "database is locked" in r.json()["detail"]
+    assert r.json()["detail"] == (
+        "The connection's key could not be revoked, so it was kept."
+    )
+    assert "database is locked" not in r.text
+    logged = [
+        rec
+        for rec in caplog.records
+        if rec.getMessage().startswith("Could not revoke the link key")
+    ]
+    assert logged and first in logged[0].getMessage(), "the refusal was not logged"
+    assert logged[0].exc_info and "database is locked" in str(logged[0].exc_info[1])
     assert first in [c["id"] for c in _connections(workflow_env)["connections"]]
     assert comfyui_link_service.link_record(server, first) == record
     assert _token_works(server, key)
@@ -3969,7 +4288,10 @@ def test_a_connection_whose_key_cannot_be_revoked_is_not_moved(
             json={"url": "http://127.0.0.1:18190/"},
         )
     assert r.status_code == 500, r.text
-    assert "address was not changed" in r.json()["detail"]
+    assert r.json()["detail"] == (
+        "The connection's key could not be revoked, so its address was not changed."
+    )
+    assert "database is locked" not in r.text
     entry = next(
         c for c in _connections(workflow_env)["connections"] if c["id"] == first
     )
@@ -4001,8 +4323,13 @@ def test_moving_a_linked_connection_revokes_its_key_and_renaming_does_not(
     ):
         r = workflow_env.owner.patch(path, json=body)
         assert r.status_code == status, (body, r.text)
-    r = workflow_env.owner.patch(f"{API}/comfyui/connections/nope", json={"name": "x"})
+    r = workflow_env.owner.patch(
+        f"{API}/comfyui/connections/test-secret-id", json={"name": "x"}
+    )
     assert r.status_code == 404, r.text
+    # The id matched nothing, so it is not repeated.
+    assert r.json()["detail"] == "There is no such ComfyUI connection."
+    assert "test-secret" not in r.text
     assert _token_works(server, key)
 
     moved = "http://127.0.0.1:18190/"
@@ -4018,6 +4345,40 @@ def test_moving_a_linked_connection_revokes_its_key_and_renaming_does_not(
     assert server.auth.get_user().comfyui_url == moved, "runs did not follow"
     assert r.json()["current"] == first
     assert [c["id"] for c in r.json()["connections"]] == [first, second]
+
+
+def test_a_connection_is_saved_in_its_one_spelling(workflow_env, comfy_at):
+    """The connection routes store what the normaliser makes of an address,
+    and refuse one it does not accept without echoing it."""
+    comfy_at("http://127.0.0.1:18188/")
+    owner = workflow_env.owner
+    r = owner.post(
+        f"{API}/comfyui/connections", json={"url": "  HTTP://LocalHost:18191 "}
+    )
+    assert r.status_code == 200, r.text
+    added = next(
+        c for c in r.json()["connections"] if c["url"] == "http://localhost:18191/"
+    )
+    r = owner.patch(
+        f"{API}/comfyui/connections/{added['id']}",
+        json={"url": "http://LOCALHOST:18192"},
+    )
+    assert r.status_code == 200, r.text
+    entry = next(c for c in r.json()["connections"] if c["id"] == added["id"])
+    assert entry["url"] == "http://localhost:18192/"
+    for url in (
+        "http://evil.example\\@127.0.0.1:18193/",
+        "http://user@127.0.0.1:18193/",
+    ):
+        for r in (
+            owner.post(f"{API}/comfyui/connections", json={"url": url}),
+            owner.patch(f"{API}/comfyui/connections/{added['id']}", json={"url": url}),
+        ):
+            assert r.status_code == 400, (url, r.text)
+            assert "evil" not in r.text and "user@" not in r.text
+    urls = [c["url"] for c in _connections(workflow_env)["connections"]]
+    assert "http://localhost:18192/" in urls
+    assert not any("18193" in u for u in urls)
 
 
 def test_the_config_patch_cannot_orphan_a_linked_key(workflow_env, comfy_at):
@@ -4044,6 +4405,121 @@ def test_the_config_patch_cannot_orphan_a_linked_key(workflow_env, comfy_at):
     # Not linked, so the new current one may be cleared as before.
     r = workflow_env.owner.patch(config, json={"comfyui_url": None})
     assert r.status_code == 200, r.text
+
+
+def test_the_config_patch_refuses_an_ambiguous_address_before_the_link_check(
+    workflow_env, comfy_at
+):
+    """A linked current connection: an address the normaliser refuses is a 400
+    with its fixed text, not a 409 about the link, and nothing moves; a listed
+    address in another spelling (default port, case) is that address."""
+    server = workflow_env.server
+    fake = comfy_at("http://127.0.0.1:18188/")
+    first = comfyui_connections.current_id(server.auth.get_user())
+    _link_connection(workflow_env, fake, first)
+    _add_connection(workflow_env.owner, "http://127.0.0.1/")
+    config = f"{API}/users/me/config"
+    r = workflow_env.owner.patch(
+        config, json={"comfyui_url": "http://example-evil.invalid\\@127.0.0.1:18188"}
+    )
+    assert r.status_code == 400, r.text
+    assert "example-evil" not in r.json()["detail"]
+    assert server.auth.get_user().comfyui_url == "http://127.0.0.1:18188/"
+    r = workflow_env.owner.patch(config, json={"comfyui_url": "HTTP://127.0.0.1:80"})
+    assert r.status_code == 200, r.text
+    assert server.auth.get_user().comfyui_url == "http://127.0.0.1/"
+
+
+_RACE_GUARD_S = 10.0
+"""How long the race test waits on either request before calling it stuck."""
+
+
+class _WatchedLock:
+    """A ``threading.Lock`` that says when anyone had to wait for it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.waited = threading.Event()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if self._lock.acquire(blocking=False):
+            return True
+        self.waited.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self):
+        self._lock.release()
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def test_a_link_cannot_land_between_the_patch_check_and_its_save(
+    workflow_env, comfy_at, monkeypatch
+):
+    """The config PATCH checks the current connection is not linked,
+    then saves its new address. A link of that connection started in between
+    waits for the save, so no key is left bound to an address that is gone.
+
+    Deterministic: the PATCH is held after its check and before its save until
+    the link has either finished or been seen waiting on the link lock."""
+    server = workflow_env.server
+    comfy_at("http://127.0.0.1:18188/")
+    first = comfyui_connections.current_id(server.auth.get_user())
+    assert not comfyui_link_service.link_record(server, first)
+    watched = _WatchedLock()
+    monkeypatch.setattr(comfyui_link_service, "_LINK_LOCK", watched)
+    checked, go = threading.Event(), threading.Event()
+    run_task = server.hub_engine.run_task
+
+    def held_before_the_save(func, *args, **kwargs):
+        if getattr(func, "__name__", "") == "update_user" and not go.is_set():
+            checked.set()
+            assert go.wait(_RACE_GUARD_S), "the test never let the save go"
+        return run_task(func, *args, **kwargs)
+
+    monkeypatch.setattr(server.hub_engine, "run_task", held_before_the_save)
+    moved = "http://127.0.0.1:18190/"
+    answers = {}
+
+    def patch():
+        answers["patch"] = workflow_env.owner.patch(
+            f"{API}/users/me/config", json={"comfyui_url": moved}
+        )
+
+    def link():
+        answers["link"] = workflow_env.owner.post(
+            f"{API}/comfyui/connections/{first}/link"
+        )
+
+    patching = threading.Thread(target=patch)
+    patching.start()
+    try:
+        assert checked.wait(_RACE_GUARD_S), "the PATCH never reached its save"
+        linking = threading.Thread(target=link)
+        linking.start()
+        stop = time.monotonic() + _RACE_GUARD_S
+        while linking.is_alive() and not watched.waited.is_set():
+            assert time.monotonic() < stop, "the link neither ran nor waited"
+            linking.join(0.01)
+    finally:
+        go.set()
+        patching.join(_RACE_GUARD_S)
+    linking.join(_RACE_GUARD_S)
+    assert not patching.is_alive() and not linking.is_alive()
+    assert answers["patch"].status_code == 200, answers["patch"].text
+    assert answers["link"].status_code == 200, answers["link"].text
+
+    assert server.auth.get_user().comfyui_url == moved
+    record = comfyui_link_service.link_record(server, first)
+    # The link ran after the save, so it read the connection at its new
+    # address: whatever it recorded is bound there. A link that ran inside the
+    # gap would record the old address, which the save then left behind.
+    assert not record or record["comfyui_url"] == moved, record
+    assert watched.waited.is_set(), "the link did not wait for the save"
 
 
 def test_start_up_moves_the_single_record_onto_its_connection(workflow_env, comfy_at):
@@ -4254,23 +4730,32 @@ def _fake_pack(root: Path) -> Path:
     return pack
 
 
-def test_a_failed_copy_leaves_the_older_nodes_in_place(install_env, monkeypatch):
+def test_a_failed_copy_leaves_the_older_nodes_in_place(
+    install_env, monkeypatch, caplog
+):
     """The new copy is staged before anything is trashed: a copy that fails
-    half way must not leave ComfyUI without PixlStash nodes."""
+    half way must not leave ComfyUI without PixlStash nodes. The route answers
+    the refusal as it is, so the OS's words go to the log, not into it."""
     older = install_env.custom_nodes / "ComfyUI-PixlStash"
     older.mkdir()
     (older / "__init__.py").write_text("# the working install\n")
     real_copytree = shutil.copytree
+    cause = OSError("example-leak-staging: disk full")
 
     def half_a_copy(src, dst, *args, **kwargs):
         real_copytree(src, dst, *args, **kwargs)
         if Path(dst).parent == install_env.custom_nodes:
-            raise OSError("disk full")
+            raise cause
 
     monkeypatch.setattr(comfyui_pack_service.shutil, "copytree", half_a_copy)
     install_env.with_comfy({"POST v2/manager/reboot": 200})
-    with pytest.raises(comfyui_pack_service.PackInstallRefused):
-        comfyui_pack_service.install("http://127.0.0.1:18188/")
+    with caplog.at_level(logging.WARNING, logger=comfyui_pack_service.__name__):
+        with pytest.raises(comfyui_pack_service.PackInstallRefused) as refused:
+            comfyui_pack_service.install("http://127.0.0.1:18188/")
+    assert str(refused.value) == (
+        f"Could not write the nodes to {older}. The server log says why."
+    )
+    assert _logged_with_traceback(caplog, cause)
     assert install_env.trashed == []
     assert (older / "__init__.py").read_text() == "# the working install\n"
     assert [p.name for p in install_env.custom_nodes.iterdir()] == [
@@ -4303,6 +4788,24 @@ class _FakeComfyForInstall:
             return _http_answer(200, self.queue)
         return _http_answer(self.reboot.get(key, 404), None)
 
+    def bounded(self, method, url, proxies=None, **kwargs):
+        """``bounded_request`` for the pack service and ``comfyui_service``:
+        never a redirect followed, always a deadline and a cap."""
+        assert kwargs.pop("redirects", 0) == 0, "a ComfyUI redirect is never followed"
+        assert kwargs.pop("deadline_s") > 0 and kwargs.pop("max_bytes") > 0
+        kwargs.update(proxies=proxies, allow_redirects=False)
+        if method == "GET" and urlsplit(url).path.endswith("/internal/folder_paths"):
+            answer = self.get(url, **kwargs)
+        else:
+            answer = self.request(method, url, **kwargs)
+        return BoundedResponse(
+            url, answer.status_code, json.dumps(answer.json()).encode()
+        )
+
+    def serve(self, monkeypatch) -> None:
+        monkeypatch.setattr(comfyui_pack_service, "bounded_request", self.bounded)
+        monkeypatch.setattr(comfyui_service, "bounded_request", self.bounded)
+
 
 @pytest.fixture
 def install_env(tmp_path, monkeypatch):
@@ -4320,8 +4823,7 @@ def install_env(tmp_path, monkeypatch):
 
     def with_comfy(reboot):
         fake = _FakeComfyForInstall(custom_nodes, reboot)
-        monkeypatch.setattr(comfyui_pack_service.requests, "get", fake.get)
-        monkeypatch.setattr(comfyui_pack_service.requests, "request", fake.request)
+        fake.serve(monkeypatch)
         return fake
 
     return SimpleNamespace(
@@ -4381,21 +4883,76 @@ def test_without_comfyui_manager_the_restart_is_left_to_the_person(install_env):
 
 
 def test_a_failed_move_to_the_trash_installs_nothing_and_deletes_nothing(
-    install_env, monkeypatch
+    install_env, monkeypatch, caplog
 ):
     older = install_env.custom_nodes / "ComfyUI-PixlStash-main"
     older.mkdir()
     (older / "__init__.py").write_text("# a zip install\n")
+    cause = PermissionError("example-leak-trash: no trash here")
 
     def no_trash(path):
-        raise PermissionError("no trash here")
+        raise cause
 
     monkeypatch.setattr(comfyui_pack_service, "send2trash", no_trash)
     install_env.with_comfy({"POST v2/manager/reboot": 200})
-    with pytest.raises(comfyui_pack_service.PackInstallRefused):
-        comfyui_pack_service.install("http://127.0.0.1:18188/")
+    with caplog.at_level(logging.WARNING, logger=comfyui_pack_service.__name__):
+        with pytest.raises(comfyui_pack_service.PackInstallRefused) as refused:
+            comfyui_pack_service.install("http://127.0.0.1:18188/")
+    assert str(refused.value) == (
+        f"Could not move the older copy at {older} to the trash. "
+        "Remove it yourself, then install again."
+    )
+    assert _logged_with_traceback(caplog, cause)
     assert (older / "__init__.py").is_file(), "the older copy must survive"
     assert [p.name for p in install_env.custom_nodes.iterdir()] == [older.name]
+
+
+def test_a_failed_move_into_place_is_refused_in_the_servers_words(
+    install_env, monkeypatch, caplog
+):
+    """The staged copy is renamed into place last; the OS's refusal of that
+    rename goes to the log, and the answer names only the folder."""
+    target = install_env.custom_nodes / "ComfyUI-PixlStash"
+    cause = OSError("example-leak-rename: cross-device link")
+    real_replace = os.replace
+
+    def no_rename_into_place(src, dst, *args, **kwargs):
+        if Path(dst) == target:
+            raise cause
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(comfyui_pack_service.os, "replace", no_rename_into_place)
+    install_env.with_comfy({"POST v2/manager/reboot": 200})
+    with caplog.at_level(logging.WARNING, logger=comfyui_pack_service.__name__):
+        with pytest.raises(comfyui_pack_service.PackInstallRefused) as refused:
+            comfyui_pack_service.install("http://127.0.0.1:18188/")
+    assert str(refused.value) == (
+        f"Could not write the nodes to {target}. The server log says why."
+    )
+    assert _logged_with_traceback(caplog, cause)
+
+
+def test_a_restart_that_errors_is_left_to_the_person_in_the_servers_words(
+    install_env, monkeypatch, caplog
+):
+    """ComfyUI-Manager's error text stays in the log; the answer is fixed."""
+    cause = requests.Timeout("example-leak-restart: read timed out")
+    fake = install_env.with_comfy({})
+
+    def timing_out(method, url, *args, **kwargs):
+        if url.endswith("manager/reboot"):
+            raise cause
+        return fake.bounded(method, url, *args, **kwargs)
+
+    monkeypatch.setattr(comfyui_pack_service, "bounded_request", timing_out)
+    with caplog.at_level(logging.WARNING, logger=comfyui_pack_service.__name__):
+        result = comfyui_pack_service.install("http://127.0.0.1:18188/")
+    assert (result["restart"], result["detail"]) == (
+        "manual",
+        f"{comfyui_pack_service.RESTART_UNANSWERED}, so restart ComfyUI yourself.",
+    )
+    assert "example-leak-restart" not in result["detail"]
+    assert _logged_with_traceback(caplog, cause)
 
 
 @pytest.mark.parametrize("occupant", ["file", "dangling link"])
@@ -4443,8 +5000,7 @@ def test_a_build_without_the_nodes_says_so(install_env, monkeypatch):
 def _point_comfy_at(monkeypatch, folder: Path) -> _FakeComfyForInstall:
     """A ComfyUI (or whatever holds its port) naming *folder* as custom_nodes."""
     fake = _FakeComfyForInstall(folder, {"POST v2/manager/reboot": 200})
-    monkeypatch.setattr(comfyui_pack_service.requests, "get", fake.get)
-    monkeypatch.setattr(comfyui_pack_service.requests, "request", fake.request)
+    fake.serve(monkeypatch)
     return fake
 
 
@@ -4548,6 +5104,51 @@ def test_the_install_route_is_loopback_only_and_refuses_with_409(workflow_env):
     assert "No ComfyUI address" in r.json()["detail"]
 
 
+def test_the_install_route_answers_a_silent_comfyui_in_the_servers_words(
+    workflow_env, saved_address, install_env, monkeypatch, caplog
+):
+    """requests' text names the address and the socket error: it goes to the
+    log with its traceback, and the 409 is a sentence the server wrote."""
+    cause = requests.ConnectionError("example-leak-folders: connection refused")
+
+    def no_answer(pinned_url):
+        raise cause
+
+    monkeypatch.setattr(comfyui_pack_service, "comfyui_folder_paths", no_answer)
+    with caplog.at_level(logging.WARNING, logger=comfyui_pack_service.__name__):
+        r = workflow_env.owner.post(f"{API}/comfyui/pack/install")
+    assert (r.status_code, r.json()) == (
+        409,
+        {"detail": comfyui_pack_service.NO_CUSTOM_NODES_ANSWER},
+    ), r.text
+    assert "example-leak" not in r.text
+    assert _logged_with_traceback(caplog, cause)
+    assert list(install_env.custom_nodes.iterdir()) == []
+
+
+def test_the_install_route_names_a_link_it_kept(
+    workflow_env, saved_address, install_env, tmp_path
+):
+    """The response model drops a key it does not declare, so the service's
+    ``kept_links`` reaches the dialog only through the route. Wrong if a link
+    the install left in place is missing from the JSON: the dialog could not
+    say ComfyUI may load both copies."""
+    checkout = tmp_path / "test-dev-checkout"
+    checkout.mkdir()
+    linked = install_env.custom_nodes / f"{comfyui_pack_service.PACK_FOLDER}-dev"
+    try:
+        linked.symlink_to(checkout, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"cannot make a symlink here: {exc}")
+    install_env.with_comfy({"POST v2/manager/reboot": 200})
+
+    r = workflow_env.owner.post(f"{API}/comfyui/pack/install")
+
+    assert r.status_code == 200, r.text
+    assert r.json()["kept_links"] == [str(linked)]
+    assert linked.is_symlink(), "the kept link must still be there"
+
+
 def test_the_node_pack_routes_know_only_the_listed_packs(workflow_env):
     install = f"{API}/comfyui/node-packs/{{pack_id}}/install"
     check = f"{API}/comfyui/node-packs/{{pack_id}}"
@@ -4560,11 +5161,13 @@ def test_the_node_pack_routes_know_only_the_listed_packs(workflow_env):
     assert_real_route(
         workflow_env.server.api, "GET", check.format(pack_id=known), check
     )
+    # The id is the caller's text, so the 404 does not repeat it.
+    refused = (404, {"detail": "PixlStash does not know that node pack."})
     for unknown in ("not-a-pack", f"{known}@nightly", known.upper()):
         r = workflow_env.owner.post(install.format(pack_id=unknown))
-        assert r.status_code == 404, r.text
+        assert (r.status_code, r.json()) == refused, r.text
         r = workflow_env.owner.get(check.format(pack_id=unknown))
-        assert r.status_code == 404, r.text
+        assert (r.status_code, r.json()) == refused, r.text
     # No ComfyUI address saved: a refusal the notice can show, not a 500.
     workflow_env.owner.patch(f"{API}/users/me/config", json={"comfyui_url": None})
     r = workflow_env.owner.post(install.format(pack_id=known))
@@ -4573,6 +5176,33 @@ def test_the_node_pack_routes_know_only_the_listed_packs(workflow_env):
     r = workflow_env.owner.get(check.format(pack_id=known))
     assert r.status_code == 200, r.text
     assert r.json() == {"loaded": False}
+
+
+def test_the_node_pack_check_asks_the_address_the_connection_saved(
+    workflow_env, saved_address, monkeypatch
+):
+    """The current connection's address is read through ``_comfyui_url`` and a
+    named one's through its own entry, both normalised; an id that matches no
+    connection is a 404 that does not repeat it."""
+    asked = []
+
+    def loaded(comfyui_url, pack_id):
+        asked.append(comfyui_url)
+        return False
+
+    monkeypatch.setattr(comfyui_module.node_pack_install_service, "loaded", loaded)
+    check = f"{API}/comfyui/node-packs/comfyui-inpaint-cropandstitch"
+    second = _add_connection(workflow_env.owner, _SECOND)
+    for params in ({}, {"connection_id": second}):
+        r = workflow_env.owner.get(check, params=params)
+        assert (r.status_code, r.json()) == (200, {"loaded": False}), r.text
+    assert asked == [_THIS_PC.rstrip("/"), _SECOND.rstrip("/")]
+    r = workflow_env.owner.get(check, params={"connection_id": "test-secret-id"})
+    assert (r.status_code, r.json()["detail"]) == (
+        404,
+        "There is no such ComfyUI connection.",
+    )
+    assert "test-secret" not in r.text
 
 
 def test_the_link_reply_offers_the_install_only_for_this_computer(
@@ -8891,6 +9521,39 @@ def test_a_workflows_defaults_pins_and_inputs_are_written_whole(workflow_env):
     )
 
 
+def test_a_default_nested_past_the_parser_reads_as_its_text(workflow_env):
+    """A stored default too deep for the JSON parser is the text it is.
+
+    The read side takes a row that does not read as JSON for a string, and
+    deep nesting is one more such row - not a 500 on the workflow it is on.
+    """
+    owner, hub = workflow_env.owner, workflow_env.server.hub
+    deep = "[" * 100_000 + "]" * 100_000
+    with hub.transaction() as conn:
+        conn.execute(
+            "INSERT INTO workflow_group_default (workflow_id, address, value) "
+            "VALUES (?, ?, ?)",
+            (BUSY_WF, "slot-a/steps", deep),
+        )
+    r = owner.get(f"{API}/workflows/{BUSY_WF}")
+    assert r.status_code == 200, r.text[:500]
+    defaults = {
+        (default["slot_label"], default["input_name"]): default["value"]
+        for default in r.json()["card"]["defaults"]
+    }
+    assert defaults[("slot-a", "steps")] == deep
+
+
+def test_a_value_nested_past_the_parser_is_stored_as_its_text():
+    """Text too deep for the JSON parser is not JSON, so it is kept verbatim.
+
+    Every route that writes a parameter bounds it at ``MAX_VALUE_LENGTH``,
+    far short of the depth the parser gives up at, so this is the function.
+    """
+    deep = "[" * 100_000 + "]" * 100_000
+    assert _stored_value(deep) == deep
+
+
 _ADA = asset_reference("character_ada.safetensors")
 _BO = asset_reference("character_bo.safetensors")
 
@@ -10075,6 +10738,17 @@ def runnable(workflow_env, monkeypatch):
         "_read_object_info",
         lambda url: (json.loads(json.dumps(RUN_OBJECT_INFO)), None),
     )
+
+    # A ComfyUI that answers /object_info but serves no template list: what
+    # CI's absent ComfyUI answers. A missing model's download links then come
+    # from the committed list alone, and the preflight never waits out the
+    # listing read's timeouts on the default ComfyUI address.
+    def no_template_listing(base_url, object_info=None, *, refresh=False):
+        raise comfyui_templates.TemplatesUnavailable(
+            f"the runnable fixture serves no template list for {base_url}"
+        )
+
+    monkeypatch.setattr(comfyui_templates, "read_listing", no_template_listing)
     return SimpleNamespace(
         env=workflow_env,
         owner=workflow_env.owner,
@@ -12403,11 +13077,16 @@ def test_a_lora_addressed_to_a_slot_the_graph_does_not_have_is_refused(runnable)
         f"{API}/workflows/run/preflight",
         json={
             "workflow_id": RUN_WF,
-            "loras": [{"node_id": "99", "sha256": RUN_ADAPTER_DIGEST}],
+            "loras": [
+                {"node_id": "example-no-such-node", "sha256": RUN_ADAPTER_DIGEST}
+            ],
         },
     )
     assert r.status_code == 400, r.text
-    assert "no LoRA slot" in r.json()["detail"]
+    # Its position, never the caller's own text back.
+    assert r.json()["detail"] == (
+        "loras[0] names a LoRA slot this workflow does not have."
+    )
 
 
 def test_a_lora_is_placed_in_its_own_slot_with_its_own_strengths(runnable):
@@ -13343,12 +14022,18 @@ def test_a_picture_input_the_card_does_not_have_is_a_400(i2i):
         json={
             "workflow_id": RUN_WF,
             "inputs": [
-                {"slot_label": "nope", "input_name": "image", "picture_id": picture}
+                {
+                    "slot_label": "example-nope",
+                    "input_name": "image",
+                    "picture_id": picture,
+                }
             ],
         },
     )
     assert r.status_code == 400, r.text
-    assert "nope/image" in r.json()["detail"]
+    assert r.json()["detail"] == (
+        "1 of the picture inputs named are not inputs of this workflow."
+    )
 
 
 def test_a_binned_picture_cannot_fill_an_input(i2i):
@@ -14707,6 +15392,23 @@ def test_a_json_layout_prompt_is_never_given_the_prompt_assist(runnable):
         },
     )
     assert r.status_code == 422, r.text
+
+
+def test_a_prompt_nested_past_the_parser_is_prose_not_a_layout(runnable):
+    """JSON nested deeper than the parser recurses raises RecursionError, not
+    ValueError. 12000 brackets is past that depth and under the prompt's
+    length cap: it is not a layout, so the assist is applied as to prose."""
+    _assist_runnable(runnable, "minimax_h3_image")
+    deep = "[" * 12_000
+    r = runnable.owner.post(
+        f"{API}/workflows/run",
+        json={"workflow_id": RUN_WF, "prompt": deep, "prompt_assist": {}},
+    )
+    assert r.status_code == 200, r.text
+    group = r.json()["groups"][0]
+    assert group["prompt"]["assist"]["applied"] is True
+    assert not [f for f in group["flags"] if f["code"] == "prompt_assist_not_applied"]
+    assert runnable.submitted.pop()["graph"]["5"]["inputs"]["text"].startswith(deep)
 
 
 def test_a_blank_prompt_near_the_limit_is_not_refused_for_lines_it_never_gets(runnable):
@@ -16133,6 +16835,55 @@ def test_a_failure_part_way_through_still_reports_what_was_queued(runnable):
     assert r.json()["error"] == "ComfyUI prompt request failed"
 
 
+def _failed_endings(monkeypatch) -> list:
+    """The message of every run ending recorded as failed, in order."""
+    endings: list = []
+    record = workflows_routes.record_run_outcome
+
+    def recording(*args, **kwargs):
+        status = args[1] if len(args) > 1 else kwargs.get("status")
+        if status == "failed":
+            endings.append(kwargs.get("message"))
+        return record(*args, **kwargs)
+
+    monkeypatch.setattr(workflows_routes, "record_run_outcome", recording)
+    return endings
+
+
+def test_a_failure_part_way_through_this_server_did_not_word_is_not_repeated(
+    runnable, caplog
+):
+    """What stopped the third run goes to the log, not into the answer.
+
+    Wrong if the partial answer or the run's own ending carries the
+    exception's text: unlike the HTTPException above, nothing here composed it.
+    """
+    calls = {"n": 0}
+
+    def flaky(base_url, workflow_instance, client_id=None):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise ConnectionResetError("/home/me/test-run-cause")
+        return {"prompt_id": f"prompt-{calls['n']}"}
+
+    runnable.monkeypatch.setattr(workflows_routes, "_submit_comfyui_prompt", flaky)
+    endings = _failed_endings(runnable.monkeypatch)
+    with caplog.at_level("WARNING", logger=workflows_routes.logger.name):
+        r = runnable.owner.post(
+            f"{API}/workflows/run", json={"workflow_id": RUN_WF, "count": 5}
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "partial", r.json()
+    assert r.json()["error"] == workflows_routes.RUN_NOT_SENT_MESSAGE
+    assert endings == [workflows_routes.RUN_NOT_SENT_MESSAGE]
+    # The run's own line must carry it. The whole log text would pass without
+    # it, since the partial answer logs the cause too.
+    not_sent = [r for r in caplog.records if "was not sent" in r.getMessage()]
+    assert not_sent and "test-run-cause" in not_sent[0].getMessage(), (
+        "the cause did not reach the run's log line"
+    )
+
+
 def test_a_queued_run_is_followed_and_its_ending_can_be_read(runnable):
     """``GET /workflows/runs/{prompt_id}`` (#1839): what MCP's run_workflow
     answers with. Known from the moment the run is queued, and the poller is
@@ -16381,6 +17132,60 @@ def test_a_held_run_comfyui_refuses_on_grant_fails_with_comfyuis_words(held):
     assert not held.arbiter.leases(Tenant.COMFYUI), "the failed run kept its lease"
 
 
+def test_a_held_run_that_fails_on_grant_unworded_ends_with_a_fixed_sentence(
+    held, caplog
+):
+    """Not ComfyUI's answer, so not repeated: the ending says a fixed sentence
+    and the log keeps what was raised."""
+    blocker = _hold_the_card(held.arbiter)
+
+    def broken(base_url, workflow_instance, client_id=None):
+        raise ConnectionResetError("/home/me/test-held-cause")
+
+    held.runnable.monkeypatch.setattr(
+        workflows_routes, "_submit_comfyui_prompt", broken
+    )
+    with caplog.at_level("WARNING", logger=workflows_routes.logger.name):
+        r = held.owner.post(f"{API}/workflows/run", json={"workflow_id": RUN_WF})
+        run_id = r.json()["prompts"][0]["run_id"]
+        blocker.release()
+        assert _until(
+            lambda: (
+                held.owner.get(f"{API}/workflows/runs/{run_id}").json()["status"]
+                == "failed"
+            )
+        )
+    outcome = held.owner.get(f"{API}/workflows/runs/{run_id}").json()
+    assert outcome["message"] == workflows_routes.RUN_NOT_SENT_MESSAGE
+    assert "test-held-cause" in caplog.text, "the cause did not reach the log"
+
+
+def test_a_run_that_cannot_be_held_ends_with_a_fixed_sentence(held, caplog):
+    """The second run cannot be parked for the GPU: the first is answered, and
+    the second's ending and the partial answer carry no exception text."""
+    _hold_the_card(held.arbiter)
+    hold = workflows_routes.hold_run
+    calls = {"n": 0}
+
+    def flaky_hold(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("/home/me/test-hold-cause")
+        return hold(*args, **kwargs)
+
+    held.runnable.monkeypatch.setattr(workflows_routes, "hold_run", flaky_hold)
+    endings = _failed_endings(held.runnable.monkeypatch)
+    with caplog.at_level("WARNING", logger=workflows_routes.logger.name):
+        r = held.owner.post(
+            f"{API}/workflows/run", json={"workflow_id": RUN_WF, "count": 2}
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "partial", r.json()
+    assert r.json()["error"] == workflows_routes.RUN_NOT_SENT_MESSAGE
+    assert endings == [workflows_routes.RUN_NOT_SENT_MESSAGE]
+    assert "test-hold-cause" in caplog.text, "the cause did not reach the log"
+
+
 def test_a_run_comfyui_takes_without_naming_a_prompt_answers_failed(held):
     held.runnable.monkeypatch.setattr(
         workflows_routes,
@@ -16396,15 +17201,55 @@ def test_a_run_comfyui_takes_without_naming_a_prompt_answers_failed(held):
     assert not held.arbiter.leases(Tenant.COMFYUI), "the failed run kept its lease"
 
 
+def test_a_run_nobody_can_wait_on_is_taken_off_comfyuis_queue(held):
+    """ComfyUI took the prompt, but the thread that waits on it and imports
+    what it draws could not start. Left in ComfyUI's queue it would draw for
+    nobody, keep its lease and stay listed as going; it is taken off the queue
+    and answered failed, saying so."""
+
+    def never_runs(*_args, **_kwargs):
+        raise AssertionError("the wait thread was refused; nothing runs this")
+
+    held.runnable.monkeypatch.setattr(
+        workflows_routes, "_process_comfyui_outputs", never_runs
+    )
+    real_start = threading.Thread.start
+
+    def start(thread):
+        if getattr(thread, "_target", None) is never_runs:
+            raise RuntimeError("can't start new thread")
+        return real_start(thread)
+
+    held.runnable.monkeypatch.setattr(threading.Thread, "start", start)
+    taken_off: list[list[str]] = []
+
+    def cancel(ids):
+        taken_off.append(list(ids))
+        return len(ids)
+
+    held.runnable.monkeypatch.setattr(workflows_routes, "cancel_runs", cancel)
+    r = held.owner.post(f"{API}/workflows/run", json={"workflow_id": RUN_WF})
+    assert r.status_code == 200, r.text
+    (prompt,) = r.json()["prompts"]
+    assert prompt["status"] == "failed", prompt
+    submitted_as = f"prompt-{len(held.runnable.submitted)}"
+    assert taken_off == [[submitted_as]], taken_off
+    outcome = held.owner.get(f"{API}/workflows/runs/{prompt['run_id']}").json()
+    assert outcome["status"] == "failed", outcome
+    assert "taken off ComfyUI's queue" in outcome["message"], outcome
+    assert submitted_as not in comfyui_service._live_runs
+    assert not held.arbiter.leases(Tenant.COMFYUI), "the unwatched run kept its lease"
+
+
 def test_abort_cancels_the_runs_waiting_for_the_gpu(held):
     blocker = _hold_the_card(held.arbiter)
     r = held.owner.post(f"{API}/workflows/run", json={"workflow_id": RUN_WF})
     run_id = r.json()["prompts"][0]["run_id"]
     # Never the ComfyUI on the default address: a development box runs one.
     held.runnable.monkeypatch.setattr(
-        comfyui_service.requests,
-        "post",
-        lambda *a, **k: SimpleNamespace(status_code=200, text=""),
+        comfyui_service,
+        "bounded_request",
+        lambda method, url, **k: BoundedResponse(url, 200, b""),
     )
     r = held.owner.post(f"{API}/comfyui/abort")
     assert r.status_code == 200, r.text
@@ -16432,12 +17277,12 @@ def test_abort_reaches_comfyui_off_the_event_loop(workflow_env, monkeypatch):
     server = workflow_env.server
     posted = []
 
-    def fake_post(url, *args, **kwargs):
+    def fake_post(method, url, **kwargs):
         posted.append((urlsplit(url).path, _on_event_loop()))
-        return SimpleNamespace(status_code=200, text="")
+        return BoundedResponse(url, 200, b"")
 
     # Never the ComfyUI on the default address: a development box runs one.
-    monkeypatch.setattr(comfyui_service.requests, "post", fake_post)
+    monkeypatch.setattr(comfyui_service, "bounded_request", fake_post)
     reads = []
     real_read = server.hub_engine.run_immediate_read_task
 
@@ -16528,11 +17373,11 @@ def test_stopping_the_drawing_run_interrupts_it_and_no_other(held):
     sent = []
     # Never the ComfyUI on the default address: a development box runs one.
     held.runnable.monkeypatch.setattr(
-        comfyui_service.requests,
-        "post",
-        lambda url, json=None, **k: (
+        comfyui_service,
+        "bounded_request",
+        lambda method, url, json=None, **k: (
             sent.append((url.rsplit("/", 1)[-1], json))
-            or SimpleNamespace(status_code=200, text="")
+            or BoundedResponse(url, 200, b"")
         ),
     )
     with comfyui_service._run_outcomes_lock:
@@ -17021,6 +17866,47 @@ def test_a_run_with_no_outputs_records_its_peak_as_failed(held):
             )
 
 
+def _run_ending(held, prompt_id: str, failure: Exception):
+    """End *prompt_id* with *failure* raised while its outputs are fetched, and
+    answer ``GET /workflows/runs/{prompt_id}`` for it."""
+    server = held.runnable.server
+
+    def fails(*args, **kwargs):
+        raise failure
+
+    held.runnable.monkeypatch.setattr(
+        comfyui_service, "_wait_for_comfyui_outputs", fails
+    )
+    comfyui_service._process_comfyui_outputs(
+        server, "http://comfy.invalid", prompt_id, None, None, None
+    )
+    r = held.owner.get(f"{API}/workflows/runs/{prompt_id}")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "failed", r.text
+    return r
+
+
+def test_a_run_whose_import_fails_ends_with_a_fixed_sentence(held, caplog):
+    """The exception can name files on this computer: it is logged with its
+    traceback, and the run's ending the owner reads is a fixed sentence."""
+    cause = OSError("example-leak: /example/private/output.png")
+    with caplog.at_level(logging.ERROR, logger=comfyui_service.__name__):
+        r = _run_ending(held, "prompt-import-fault", cause)
+    assert r.json()["message"] == comfyui_service.OUTPUT_IMPORT_FAILED
+    assert "example-leak" not in r.text
+    assert _logged_with_traceback(caplog, cause)
+
+
+def test_a_run_comfyui_stops_answering_ends_with_this_module_s_sentence(held):
+    """An HTTPException of this module carries a sentence composed here: the
+    ending is that sentence, never the ``502: ...`` text of the exception."""
+    detail = "ComfyUI stopped answering before the run finished"
+    r = _run_ending(
+        held, "prompt-unanswered", HTTPException(status_code=502, detail=detail)
+    )
+    assert r.json()["message"] == detail
+
+
 class _NoPeak:
     room_mb = None
 
@@ -17064,7 +17950,7 @@ def test_a_run_out_of_memory_fails_once_and_runs_alone_after_a_streak(
     held.runnable.monkeypatch.setattr(comfyui_service, "ledger", lambda: held.card)
 
     def out_of_memory(*args, **kwargs):
-        raise RuntimeError(
+        raise comfyui_service.ComfyUIRunFailed(
             "KSampler (KSampler) failed: torch.OutOfMemoryError Allocation on "
             "device 0 would exceed allowed memory."
         )
@@ -17609,6 +18495,23 @@ def test_an_export_refuses_a_graph_it_cannot_read_rather_than_publishing_it(
     )
     r = runnable.owner.get(f"{API}/workflows/{RUN_WF}/export")
     assert r.status_code == 409, r.text
+
+
+def test_an_export_too_deep_to_scrub_answers_a_sentence_not_the_interpreter(
+    exportable, caplog
+):
+    def too_deep(graph, **kwargs):
+        raise RecursionError("test-depth-cause")
+
+    exportable.monkeypatch.setattr(workflows_routes, "scrub_for_export", too_deep)
+    with caplog.at_level("WARNING", logger=workflows_routes.logger.name):
+        r = exportable.owner.get(f"{API}/workflows/{RUN_WF}/export")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"] == (
+        "PixlStash cannot read this workflow well enough to make it safe to "
+        "share: its graph nests too deeply to read."
+    )
+    assert "test-depth-cause" in caplog.text, "the cause did not reach the log"
 
 
 def test_exporting_a_card_with_no_graph_at_all_says_so(workflow_env):
@@ -18240,10 +19143,17 @@ def test_a_clone_that_cannot_take_every_model_is_not_written(cloneable):
         cloneable,
         {
             _SHELF_FILENAME: CLONE_CHECKPOINT,
-            FORGOTTEN_LORA: "not-on-comfyui.safetensors",
+            FORGOTTEN_LORA: "test-not-on-comfyui.safetensors",
         },
     )
     assert r.status_code == 409, r.text
+    # The refused swap is named by its place in the request and the reason
+    # code, never by a filename the caller sent.
+    assert r.json()["detail"] == (
+        "The clone was not written, because not every new model could go in: "
+        "swaps[1] (not_on_comfyui)"
+    )
+    assert "test-not-on-comfyui" not in r.text
     assert _manual_ids(cloneable) == []
 
 
@@ -22063,6 +22973,42 @@ def test_the_chain_is_read_in_apply_order_with_the_unknown_loader_flagged(chaine
     assert chain["added_loader_class"] == "LoraLoader"
 
 
+@pytest.mark.parametrize(
+    "tripped", [KeyError("test-secret-key"), IndexError("test-secret-index")]
+)
+def test_a_chain_the_reader_trips_over_answers_a_fixed_sentence(
+    chained, caplog, tripped
+):
+    """A lookup the chain reader trips over is not one of its refusals.
+
+    Both are LookupErrors, and the routes answered either with its text: for a
+    KeyError, that is the graph's key and nothing more.
+    """
+
+    def trip(*_args, **_kwargs):
+        raise tripped
+
+    chained.monkeypatch.setattr(workflows_routes, "read_lora_chain", trip)
+    with caplog.at_level(logging.WARNING, logger=workflows_routes.logger.name):
+        shown = chained.owner.get(f"{API}/workflows/{RUN_WF}/lora-chain")
+        edited = _chain_edit(chained.owner)
+    unreadable = (
+        "PixlStash could not read this workflow's graph well enough to tell how "
+        "its LoRAs are wired."
+    )
+    assert shown.status_code == 200, shown.text
+    assert shown.json()["refusal"] == unreadable
+    assert edited.status_code == 409, edited.text
+    assert edited.json()["detail"] == unreadable
+    assert "test-secret" not in shown.text + edited.text
+    logged = [
+        record
+        for record in caplog.records
+        if record.exc_info and record.exc_info[1] is tripped
+    ]
+    assert len(logged) == 2
+
+
 def test_the_chain_is_still_shown_when_comfyui_is_down(chained):
     """Read-only, with the reason, rather than a 503 the inspector cannot draw."""
     chained.monkeypatch.setattr(
@@ -22779,10 +23725,13 @@ def test_a_loader_the_recipe_leaves_out_is_not_reported_as_a_missing_file(runnab
 def test_skipping_a_slot_no_graph_has_is_a_400(runnable):
     r = runnable.owner.post(
         f"{API}/workflows/run/preflight",
-        json={"workflow_id": RUN_WF, "skip_loras": [{"node_id": "99"}]},
+        json={
+            "workflow_id": RUN_WF,
+            "skip_loras": [{"node_id": "2"}, {"node_id": "example-no-such-node"}],
+        },
     )
     assert r.status_code == 400, r.text
-    assert "99" in r.json()["detail"]
+    assert r.json()["detail"] == "skip_loras[1] names no LoRA slot of this workflow."
 
 
 def test_a_slot_both_filled_and_skipped_is_refused(runnable):
@@ -23039,6 +23988,44 @@ def test_upscale_stacks_each_result_on_its_picture(i2i):
     assert all(stack for stack, _source in stacked), stacked
 
 
+def test_an_upscale_that_stops_part_way_answers_a_fixed_sentence(i2i, caplog):
+    """The picture already queued is answered; what stopped the next one goes
+    to the log, since nothing here composed its text.
+
+    Wrong if ``error`` carries the exception's text.
+    """
+    first = _add_picture(i2i.server, i2i.tmp_path, "part-1.png")
+    second = _add_picture(i2i.server, i2i.tmp_path, "part-2.png")
+    del i2i.submitted[:]
+    uploads = {"n": 0}
+
+    def flaky_upload(base_url, path, upload_name=None):
+        uploads["n"] += 1
+        if uploads["n"] == 2:
+            raise ConnectionResetError("/home/me/test-upscale-cause")
+        return upload_name
+
+    i2i.monkeypatch.setattr(workflows_routes, "_upload_image_to_comfyui", flaky_upload)
+    with caplog.at_level("ERROR", logger=workflows_routes.logger.name):
+        r = i2i.owner.post(
+            f"{API}/workflows/upscale",
+            json={"picture_ids": [first, second], "upscale": {"factor": 2}},
+        )
+    assert r.status_code == 200, r.text
+    assert (r.json()["status"], r.json()["runs"]) == ("partial", 1), r.json()
+    assert r.json()["error"] == workflows_routes.RUN_NOT_SENT_MESSAGE
+    # The line itself must carry it. The traceback alone would pass a check
+    # on the whole log text.
+    stopped = [
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("[workflows] Upscale stopped")
+    ]
+    assert stopped and "test-upscale-cause" in stopped[0].getMessage(), (
+        "the cause did not reach the upscale's log line"
+    )
+
+
 def test_upscale_of_a_binned_picture_uploads_nothing(i2i):
     kept = _add_picture(i2i.server, i2i.tmp_path, "kept.png")
     binned = _add_picture(i2i.server, i2i.tmp_path, "binned.png")
@@ -23131,8 +24118,73 @@ def test_a_stacker_slot_whose_neighbour_is_live_is_not_skipped():
     )
     assert skipped == []
     assert [r.code for r in reasons] == ["lora_not_skippable"]
-    assert "b.safetensors" in reasons[0].as_dict()["message"]
+    # The neighbour is said, never named: its slot holds text a caller wrote.
+    message = reasons[0].as_dict()["message"]
+    assert message == "Removing node 2 would also remove another LoRA it loads."
+    assert "b.safetensors" not in message
     assert "2" in graph, "the stacker was taken out anyway"
+
+
+def test_a_skip_comfyui_cannot_answer_for_names_no_text_of_the_graph():
+    """The node is named as `_node_named` rewrites it: an id that is no
+    ComfyUI node id, and a class this ComfyUI was not asked about, are text the
+    graph's author chose."""
+    graph = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {}},
+        "example-leak-id": {
+            "class_type": "example-leak-class",
+            "inputs": {"lora_name": "example-leak-file", "model": ["1", 0]},
+        },
+    }
+    skipped, reasons, _ = skip_requested_loras(
+        graph, [("example-leak-id", "lora_name")], None
+    )
+    assert skipped == []
+    message = reasons[0].as_dict()["message"]
+    assert message == (
+        "PixlStash could not reach ComfyUI, so it cannot tell what to wire in "
+        "place of a node."
+    )
+    assert "example-leak" not in message
+
+
+def test_a_stacker_the_run_cannot_skip_is_refused_in_the_server_s_words(
+    runnable, monkeypatch
+):
+    """At the answer: the preflight's reason names the node as the server
+    words it, never the file the stacker's other slot holds."""
+    embedded = json.loads(json.dumps(RUN_DOCUMENT))
+    embedded["1"]["inputs"]["ckpt_name"] = "realvisxl.safetensors"
+    embedded["2"] = {
+        "class_type": "LoraStack",
+        "inputs": {
+            "lora_name_1": "add_detail.safetensors",
+            "lora_name_2": "example-leak-neighbour.safetensors",
+            "model": ["1", 0],
+        },
+    }
+    monkeypatch.setattr(
+        workflows_routes,
+        "_load_embedded_api_prompt",
+        lambda server, picture_id, object_info=None: (
+            json.loads(json.dumps(embedded)),
+            [],
+        ),
+    )
+    payload = _preflight(
+        runnable.owner,
+        workflow_id=RUN_WF,
+        skip_loras=[{"node_id": "2", "field": "lora_name_1"}],
+    )
+    refused = [
+        reason
+        for group in payload["groups"]
+        for reason in group["reasons"]
+        if reason["code"] == "lora_not_skippable"
+    ]
+    assert [reason["message"] for reason in refused] == [
+        "Removing node 2 would also remove another LoRA it loads."
+    ], payload
 
 
 def test_a_skip_is_not_undone_by_the_saved_recipes_loras(chained):
@@ -24277,7 +25329,9 @@ def test_a_save_refuses_a_change_it_could_not_make(saving):
         },
     )
     assert r.status_code == 409, r.text
-    assert "could not be loaded" in r.json()["detail"]
+    detail = r.json()["detail"]
+    assert detail.startswith("models[0] could not be loaded ("), detail
+    assert "some-vae" not in detail and "vae_name" not in detail
     assert [row[0] for row in _versions_of(saving, saving.manual)] == [1]
 
 
@@ -28137,6 +29191,50 @@ def test_a_person_slot_the_graph_does_not_hold_is_refused_not_passed_over():
     ]
 
 
+def test_a_refused_person_slot_names_no_text_the_saved_graph_chose():
+    """A save hands its own graph in, so a refusal (the 409 a save answers)
+    names the node as ComfyUI numbers it, never the caller's id, class, slot
+    or the other LoRA's file name."""
+    graph = {
+        "test-caller-id": {
+            "class_type": "test-Caller-Class",
+            "inputs": {"lora_name": "person.safetensors"},
+        },
+        "5": {
+            "class_type": "test-Caller-Stacker",
+            "inputs": {
+                "lora_name_1": "person.safetensors",
+                "lora_name_2": "test-other-lora.safetensors",
+            },
+        },
+        "6": {
+            "class_type": "test-Caller-Loader",
+            "inputs": {"lora_name": "person.safetensors"},
+        },
+    }
+    _taken, refused = run_service.take_out_person_loras(
+        graph,
+        [
+            ("test-caller-id", "test-caller-slot"),
+            ("5", "lora_name_1"),
+            ("6", "lora_name"),
+        ],
+        None,
+    )
+    messages = {entry["node_id"]: entry["message"] for entry in refused}
+    assert messages == {
+        "test-caller-id": "PixlStash finds no LoRA slot it can empty on a node.",
+        "5": (
+            "PixlStash cannot take the LoRA out of node 5: it also loads another "
+            "LoRA, and has no empty slot PixlStash can leave in its place."
+        ),
+        "6": (
+            "PixlStash could not reach ComfyUI, so it cannot tell what to wire "
+            "in place of node 6."
+        ),
+    }
+
+
 def test_a_row_with_no_strength_of_its_own_does_not_take_the_removed_rows():
     """The style row moved up under the person's strength."""
     graph = _with_people_loader(("a" * 64, 0.8), ("b" * 64, 0.4))
@@ -28656,6 +29754,31 @@ def test_no_people_loader_where_nobody_has_a_lora(saving):
     assert (
         _opened(saving, saving.manual, pixlstash_nodes="true")["people_loader"] is None
     )
+
+
+@pytest.mark.parametrize(
+    ("raised", "reason"),
+    [
+        (ValueError("test-trip-value"), None),
+        (KeyError("test-trip-key"), None),
+        (RecursionError("test-trip-depth"), None),
+        # The positive control: the planner's own refusal is its sentence.
+        (LookupError("test-planner-refusal"), "test-planner-refusal"),
+    ],
+)
+def test_a_graph_the_people_planner_trips_over_gives_a_fixed_reason(
+    a_persons_lora, monkeypatch, caplog, raised, reason
+):
+    def planner(graph, object_info):
+        raise raised
+
+    monkeypatch.setattr(workflows_routes, "plan_lora_insertion", planner)
+    with caplog.at_level("INFO", logger=workflows_routes.logger.name):
+        place = _opened(a_persons_lora, a_persons_lora.manual, pixlstash_nodes="true")[
+            "people_loader"
+        ]
+    assert place["reason"] == (reason or workflows_routes.PEOPLE_LOADER_UNREADABLE)
+    assert str(raised.args[0]) in caplog.text, "the cause did not reach the log"
 
 
 def test_an_export_from_comfyui_goes_without_a_persons_lora(a_persons_lora):
@@ -29721,6 +30844,51 @@ def test_a_workflow_takes_an_uploaded_thumbnail_and_the_owner_unpins_it(
         assert r.json()["card"]["thumbnail"]["pinned"] is False
         assert _card(owner, BUSY_WF)["thumbnail"]["pinned"] is False
     finally:
+        with hub.transaction() as conn:
+            conn.execute(
+                "DELETE FROM workflow_thumbnail WHERE workflow_id = ?", (BUSY_WF,)
+            )
+
+
+def test_a_thumbnail_upload_decodes_and_writes_off_the_event_loop(
+    workflow_env, monkeypatch
+):
+    """The image decode and the hub reads and writes behind a thumbnail upload
+    wait on a worker, not on the loop every other request shares.
+
+    Wrong if any of them records True: an upload then stalls every request
+    for as long as Pillow and SQLite take.
+    """
+    hub = workflow_env.server.hub
+    seen = []
+
+    def spy(name, real):
+        def wrapped(*args, **kwargs):
+            seen.append((name, _on_event_loop()))
+            return real(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(
+        workflows_routes, "store_icon", spy("store_icon", workflows_routes.store_icon)
+    )
+    monkeypatch.setattr(
+        workflow_thumbnails,
+        "set_thumbnail",
+        spy("set_thumbnail", workflow_thumbnails.set_thumbnail),
+    )
+    monkeypatch.setattr(hub, "transaction", spy("transaction", hub.transaction))
+    try:
+        r = workflow_env.owner.post(
+            f"{API}/workflows/{BUSY_WF}/thumbnail",
+            files={"file": ("cover.webp", _THUMBNAIL_WEBP, "image/webp")},
+        )
+        assert r.status_code == 200, r.text
+        names = {name for name, _ in seen}
+        assert {"store_icon", "set_thumbnail", "transaction"} <= names, seen
+        assert [name for name, on_loop in seen if on_loop] == [], seen
+    finally:
+        monkeypatch.undo()
         with hub.transaction() as conn:
             conn.execute(
                 "DELETE FROM workflow_thumbnail WHERE workflow_id = ?", (BUSY_WF,)

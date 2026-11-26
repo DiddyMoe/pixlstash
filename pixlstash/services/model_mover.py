@@ -112,6 +112,7 @@ from typing import Callable, Optional
 from pixlstash.hub.db import HubDatabase
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.model_folder_scanner import STATE_PRESENT, TAKEN_FROM_KINDS
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import resolve_path_within
 
 logger = get_logger(__name__)
@@ -135,6 +136,15 @@ STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 
+# A failed file's ``detail`` when the cause is the disk or the hub: the
+# exception names server paths and database internals, so it goes to the log
+# and the outcome a client polls carries this. A copy that did not verify says
+# its own sentence instead (:class:`CopyNotVerified`).
+MOVE_FAILED_DETAIL = (
+    "The file could not be moved and the original is untouched. "
+    "The server log says why."
+)
+
 # **One shelf file operation at a time, machine-wide - a move and an import
 # included.** They used to hold separate locks, which serialized each against
 # itself and *nothing* against the other: a move planned at 12:00 and an import
@@ -154,9 +164,16 @@ SHELF_IO_LOCK = threading.Lock()
 class MoveRefused(ValueError):
     """The batch was refused before anything was written.
 
-    Raised only by :meth:`ModelMover.plan`, which runs entirely before the first
-    byte, so a refusal means the disk was not touched at all. The route maps it
-    to a 4xx; ``status_code`` says which.
+    Raised by the planning steps (:meth:`ModelMover.plan`,
+    :func:`resolve_subfolder`, and the folder verbs' and the run import's own
+    checks), which run before the first byte, so a refusal means
+    the disk was not touched at all. The route maps it to a 4xx;
+    ``status_code`` says which.
+
+    Its text reaches the owner verbatim, as the response's ``detail``, so it
+    is a sentence the raise site writes: a raise site never formats a caught
+    exception into it. A ``from exc`` site writes a fixed sentence, at most
+    with the caller's own subpath or the owner's registered folder in it.
     """
 
     def __init__(self, message: str, status_code: int = 400) -> None:
@@ -180,6 +197,17 @@ class RepointLost(RuntimeError):
     Deliberately **not** a ``sqlite3`` error: nothing is wrong with the
     database, and the two undo paths need to tell this apart from the UNIQUE
     violation they already handle, whose diagnosis and log line are different.
+    """
+
+
+class CopyNotVerified(OSError):
+    """A copy whose bytes did not prove to be the file its row names.
+
+    An ``OSError``, so the cleanup that discards a partial treats it as any
+    failed write. A class of its own because its sentence is the server's,
+    written for the owner from registered values, and is the one failure text
+    that reaches a move's outcome; every other cause is logged and the outcome
+    carries :data:`MOVE_FAILED_DETAIL`.
     """
 
 
@@ -268,8 +296,10 @@ def subpath_segments(subpath: str) -> list[str]:
         return []
     segments = subpath.split("/")
     if "\\" in subpath or any(segment in ("", ".", "..") for segment in segments):
+        # The subpath is the caller's text until it resolves to a folder, so
+        # a refusal does not repeat it.
         raise MoveRefused(
-            f"{subpath!r} is not a folder inside the destination: name it "
+            "That path is not a folder inside the destination: name it "
             "relative to the folder, with '/' between the parts."
         )
     return segments
@@ -278,17 +308,20 @@ def subpath_segments(subpath: str) -> list[str]:
 def resolve_subfolder(
     folder_path: str, subpath: str, where: str = "the folder"
 ) -> tuple[str, str]:
-    """Resolve a POSIX subpath inside a registered folder, refusing what the tree hides.
+    """Resolve a POSIX subpath inside a registered folder, refusing links and dot-names.
 
     Shared by a move's destination, the folder verbs' source and destination,
     and creating a folder (#2206), so every route that names a directory inside
-    a folder accepts exactly what ``GET /model-folders/{id}/dirs`` offers.
+    a folder accepts exactly the places ``GET /model-folders/{id}/dirs``
+    offers: never a dot-name, and never a link or a junction, which the listing
+    shows only as a read-only ``link`` node.
 
-    The folder listing never offers a link, a junction or a dot-name, and the
-    scanner does not walk through a link, so a file moved through one would be
-    registered at a path no rescan finds. Whether the directory exists is the
-    caller's question: a missing destination and a missing source answer with
-    different statuses.
+    The scanner follows a link to a directory and registers the models behind
+    it under the link's name, but a move through one would write wherever the
+    link points: outside the folder, or into another registered folder whose
+    rows the move does not touch. So a path through a link is refused here.
+    Whether the directory exists is the caller's question: a missing
+    destination and a missing source answer with different statuses.
 
     Returns:
         ``(subpath, path)``: the normalised POSIX subpath (``""`` for the root)
@@ -299,16 +332,11 @@ def resolve_subfolder(
             way, or one that resolves outside the folder.
     """
     segments = subpath_segments(subpath)
-    is_junction = getattr(os.path, "isjunction", lambda _path: False)
     for depth in range(1, len(segments) + 1):
         here = os.path.join(folder_path, *segments[:depth])
-        if (
-            segments[depth - 1].startswith(".")
-            or os.path.islink(here)
-            or is_junction(here)
-        ):
+        if segments[depth - 1].startswith(".") or is_link_or_missing(here):
             raise MoveRefused(
-                f"{subpath!r} goes through a link or a hidden folder, which the "
+                "That path goes through a link or a hidden folder, which the "
                 "shelf does not move into."
             )
     try:
@@ -320,7 +348,7 @@ def resolve_subfolder(
             folder_path,
             exc,
         )
-        raise MoveRefused(f"{subpath!r} is outside {where}.") from exc
+        raise MoveRefused(f"That path is outside {where}.") from exc
     return "/".join(segments), path
 
 
@@ -501,13 +529,17 @@ def publish_no_clobber(temporary_path: str, destination_path: str) -> None:
 
 
 def _destination_taken(destination_path: str) -> FileExistsError:
-    """The refusal, worded for the owner rather than for a syscall.
+    """The refusal :func:`publish_no_clobber` raises when the name is taken.
 
     Built the three-argument way so ``errno`` and ``filename`` survive for any
     handler that has to tell EEXIST from the EPERM a filesystem without hard
-    links raises; ``str(exc)`` - what the outcome detail and the HTTP body carry
-    - then reads ``[Errno 17] <sentence>: '<path>'``, so the path is not
-    repeated inside the sentence.
+    links raises; ``str(exc)`` then reads ``[Errno 17] <sentence>: '<path>'``,
+    so the path is not repeated inside the sentence.
+
+    That text names a server path, so it goes to the log only. A model move's
+    outcome carries :data:`MOVE_FAILED_DETAIL` instead (``_move_one``), a
+    download's entry ``model_downloads.DOWNLOAD_FAILED``, and the layout move
+    and the train-longer rename log it beside their own sentence.
     """
     return FileExistsError(
         errno.EEXIST,
@@ -759,7 +791,12 @@ def carry_samples(
             exc,
             exc_info=True,
         )
-        return f"Samples were not carried from {os.path.basename(source_dir)}: {exc}"
+        # The cause names server paths: the log above has it, the receipt
+        # says only that the previews stayed.
+        return (
+            f"Samples were not carried from {os.path.basename(source_dir)}; "
+            "the server log says why."
+        )
     return None
 
 
@@ -902,8 +939,8 @@ class ModelMover:
         )
         if not os.path.isdir(destination_path):
             raise MoveRefused(
-                f"There is no folder {destination_subpath!r} in the destination. "
-                "Create it first; a move does not make folders.",
+                "There is no such folder in the destination. Create it first; "
+                "a move does not make folders.",
                 status_code=409,
             )
 
@@ -992,8 +1029,9 @@ class ModelMover:
             (folder_id, relpath),
         )
         if row is None:
+            # The relpath matched no row, so it is still the caller's text.
             raise MoveRefused(
-                f"No registered copy at {relpath!r} in folder {folder_id}.",
+                f"No registered copy at that path in folder {folder_id}.",
                 status_code=404,
             )
         # **Two values, and the pair is the point.** `root_only` says the folder
@@ -1271,6 +1309,17 @@ class ModelMover:
             return self._copy_verify_repoint_unlink(
                 move, plan, delete_source=delete_source, on_bytes=on_bytes
             )
+        except CopyNotVerified as exc:
+            logger.error(
+                "Moving %s -> %s failed: %s",
+                move.source_path,
+                move.destination_path,
+                exc,
+                exc_info=True,
+            )
+            return MoveOutcome(
+                move.source_folder_id, move.source_relpath, STATUS_FAILED, str(exc)
+            )
         except (OSError, sqlite3.IntegrityError, RepointLost) as exc:
             logger.error(
                 "Moving %s -> %s failed: %s. The source is untouched.",
@@ -1280,7 +1329,10 @@ class ModelMover:
                 exc_info=True,
             )
             return MoveOutcome(
-                move.source_folder_id, move.source_relpath, STATUS_FAILED, str(exc)
+                move.source_folder_id,
+                move.source_relpath,
+                STATUS_FAILED,
+                MOVE_FAILED_DETAIL,
             )
 
     def _rename(self, move: PlannedMove, plan: MovePlan) -> MoveOutcome:
@@ -1366,8 +1418,8 @@ class ModelMover:
             # verifying a copy rather than trusting the write.
             arrived = file_digest(partial, on_bytes=on_bytes)
             if arrived != written:
-                raise OSError(
-                    f"Copy of {move.source_path} verified as {arrived} but "
+                raise CopyNotVerified(
+                    f"The copy of {move.source_relpath} verified as {arrived} but "
                     f"{written} was read from the source; the destination copy "
                     "was discarded and the original is untouched."
                 )
@@ -1375,7 +1427,7 @@ class ModelMover:
                 # The row's hash no longer names the bytes on disk. Moving would
                 # carry the wrong identity to the new path, where the Civitai
                 # lookup and the public {sha256}/file route both resolve on it.
-                raise OSError(
+                raise CopyNotVerified(
                     f"{move.source_relpath} hashes as {written} but is "
                     f"registered as {move.sha256}; try again once its folder's "
                     "next scan has re-read it."

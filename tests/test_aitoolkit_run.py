@@ -9,10 +9,13 @@ come from filenames, so a broken or absent ``config.yaml`` costs the base model,
 triggers and rank, and nothing else.
 """
 
+import logging
 import os
+import sys
 
 import pytest
 
+from pixlstash.utils import aitoolkit_run
 from pixlstash.utils.aitoolkit_run import (
     Checkpoint,
     TrainingRun,
@@ -183,12 +186,61 @@ class TestConfig:
         assert run.steps == [250, 2750]
         assert len(run.samples) == 4
 
-    def test_malformed_yaml_is_recorded_not_raised(self, tmp_path):
+    def test_malformed_yaml_is_recorded_not_raised(self, tmp_path, caplog):
         run_dir = _run_folder(tmp_path)
-        (run_dir / "config.yaml").write_text("a: [unclosed\n", encoding="utf-8")
-        run = read_run(str(run_dir))
-        assert run.config_error is not None
+        (run_dir / "config.yaml").write_text(
+            "test-secret: [unclosed\n", encoding="utf-8"
+        )
+        with caplog.at_level(logging.WARNING, logger=aitoolkit_run.logger.name):
+            run = read_run(str(run_dir))
+        # config_error goes to the client as it is. The parser's message quotes
+        # the file's own lines, so it stays in the log.
+        assert run.config_error == "could not parse config.yaml"
         assert run.steps == [250, 2750]
+        logged = [r for r in caplog.records if "Could not parse" in r.getMessage()]
+        assert logged and logged[0].exc_info
+
+    def test_an_unreadable_config_names_the_file_not_the_error(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        run_dir = _run_folder(tmp_path)
+        (run_dir / "config.yaml").write_text(CONFIG, encoding="utf-8")
+
+        def refuse(*_args, **_kwargs):
+            raise PermissionError(13, "Permission denied", "/home/me/test-run/x")
+
+        monkeypatch.setattr(aitoolkit_run, "open", refuse, raising=False)
+        with caplog.at_level(logging.WARNING, logger=aitoolkit_run.logger.name):
+            run = read_run(str(run_dir))
+        assert run.config_error == "could not read config.yaml"
+        logged = [r for r in caplog.records if "Could not read" in r.getMessage()]
+        assert logged and logged[0].exc_info
+
+    def test_without_pyyaml_the_run_says_so_in_a_fixed_sentence(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        run_dir = _run_folder(tmp_path)
+        (run_dir / "config.yaml").write_text(CONFIG, encoding="utf-8")
+        # A None entry in sys.modules makes `import yaml` raise ImportError.
+        monkeypatch.setitem(sys.modules, "yaml", None)
+        with caplog.at_level(logging.WARNING, logger=aitoolkit_run.logger.name):
+            run = read_run(str(run_dir))
+        assert run.config_error == "PyYAML is not installed, so the config was not read"
+        logged = [r for r in caplog.records if "PyYAML" in r.getMessage()]
+        assert logged and logged[0].exc_info
+
+    def test_a_folder_that_cannot_be_listed_keeps_its_path_out(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        def refuse(*_args, **_kwargs):
+            raise PermissionError(13, "Permission denied", "/home/me/test-run/x")
+
+        monkeypatch.setattr(aitoolkit_run, "_read_samples", refuse)
+        with caplog.at_level(logging.WARNING, logger=aitoolkit_run.logger.name):
+            run = read_run(str(_run_folder(tmp_path)))
+        assert run.config_error == "could not list the run folder"
+        logged = [r for r in caplog.records if "Could not list" in r.getMessage()]
+        assert logged and logged[0].exc_info
 
     def test_linear_true_is_not_read_as_rank_one(self, tmp_path):
         # bool is a subclass of int, so a naive isinstance check invents rank 1.

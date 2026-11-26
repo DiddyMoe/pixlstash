@@ -6,6 +6,7 @@ inert, ``detach`` never touches files, and the hub file is not group- or
 world-readable.
 """
 
+import logging
 import os
 import shutil
 import sqlite3
@@ -14,6 +15,7 @@ import uuid
 
 import pytest
 
+from pixlstash.hub import registry as registry_module
 from pixlstash.hub.db import HUB_FILE_MODE, HubDatabase
 from pixlstash.hub.engine import HubEngine
 from pixlstash.hub.registry import (
@@ -23,7 +25,9 @@ from pixlstash.hub.registry import (
     LibraryExistsError,
     LibraryNotFoundError,
     LibraryRegistry,
+    TEMP_VAULT_FILENAME,
     NotAVaultError,
+    read_vault_folder_roots,
     validate_vault_folder,
 )
 from pixlstash.hub.schema import CURRENT_SCHEMA_VERSION, read_schema_version
@@ -270,6 +274,108 @@ class TestVaultValidation:
         with pytest.raises(NotAVaultError):
             validate_vault_folder(str(tmp_path / "nope"))
 
+    def test_no_refusal_repeats_the_folder(self, tmp_path):
+        """These messages reach HTTP answers and the recovery screen verbatim.
+
+        So they name no path: the folder is what the caller already sent, and
+        repeating it back (resolved, symlinks followed) tells a remote client
+        about the host's layout.
+        """
+        empty = tmp_path / "test-empty"
+        empty.mkdir()
+        impostor = tmp_path / "test-impostor"
+        impostor.mkdir()
+        conn = sqlite3.connect(str(impostor / "vault.db"))
+        conn.execute("CREATE TABLE something_else (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        for folder in (tmp_path / "test-missing", empty, impostor):
+            with pytest.raises(NotAVaultError) as caught:
+                validate_vault_folder(str(folder))
+            assert str(tmp_path) not in str(caught.value), folder.name
+        assert str(caught.value).startswith("The vault.db in that folder ")
+
+    def test_an_unreadable_file_is_refused_in_words_and_logged_with_its_cause(
+        self, tmp_path, caplog
+    ):
+        """SQLite's own words and the path go to the log, not the message.
+
+        The cause is chained as well, which is what start-up reads to tell "this
+        machine could not read it" from "this is not a vault".
+        """
+        folder = tmp_path / "test-garbage"
+        folder.mkdir()
+        (folder / "vault.db").write_bytes(b"test-not-a-database " * 64)
+
+        with caplog.at_level(logging.ERROR, logger="pixlstash.hub.registry"):
+            with pytest.raises(NotAVaultError) as caught:
+                validate_vault_folder(str(folder))
+
+        assert str(caught.value) == (
+            "The vault.db in that folder is not a readable SQLite database."
+        )
+        cause = caught.value.__cause__
+        assert isinstance(cause, sqlite3.DatabaseError)
+        logged = [
+            record
+            for record in caplog.records
+            if record.exc_info and str(folder) in record.getMessage()
+        ]
+        assert logged, "the path and the cause belong in the log"
+        assert logged[0].exc_info[1] is cause
+
+    def test_a_file_that_will_not_open_is_refused_in_words_and_logged(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        folder = tmp_path / "test-unopenable"
+        folder.mkdir()
+        (folder / "vault.db").write_bytes(b"test-never-read")
+
+        def refuse(*args, **kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(registry_module.sqlite3, "connect", refuse)
+        with caplog.at_level(logging.ERROR, logger="pixlstash.hub.registry"):
+            with pytest.raises(NotAVaultError) as caught:
+                validate_vault_folder(str(folder))
+
+        assert str(caught.value) == "The vault.db in that folder could not be opened."
+        cause = caught.value.__cause__
+        assert isinstance(cause, sqlite3.OperationalError)
+        logged = [
+            record
+            for record in caplog.records
+            if record.exc_info and str(folder) in record.getMessage()
+        ]
+        assert logged, "the path and the cause belong in the log"
+        assert logged[0].exc_info[1] is cause
+
+    def test_an_unreadable_neighbour_is_not_named_by_path(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The overlap check reads every registered library's folders.
+
+        One that is locked right now refuses the add, and the refusal is shown
+        to whoever is adding: it must not tell them where the other library is.
+        """
+        folder = make_vault_folder(tmp_path, "test-locked-neighbour")
+
+        def locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(registry_module.sqlite3, "connect", locked)
+        with caplog.at_level(logging.WARNING, logger="pixlstash.hub.registry"):
+            with pytest.raises(LibraryError) as caught:
+                read_vault_folder_roots(folder)
+
+        assert folder not in str(caught.value)
+        assert "Try again in a moment." in str(caught.value)
+        assert any(
+            record.exc_info and folder in record.getMessage()
+            for record in caplog.records
+        ), "the log names the library whose folders could not be read"
+
 
 class TestAttachAndList:
     def test_first_attached_library_becomes_active(self, registry, tmp_path):
@@ -299,6 +405,43 @@ class TestAttachAndList:
         registry.attach(folder)
         with pytest.raises(LibraryExistsError):
             registry.attach(folder)
+
+    def test_a_folder_already_registered_is_named_by_its_library(
+        self, registry, tmp_path
+    ):
+        folder = make_vault_folder(tmp_path, "test-twice")
+        registry.attach(folder, "Client work")
+
+        with pytest.raises(LibraryExistsError) as caught:
+            registry.attach(folder)
+
+        assert str(caught.value) == (
+            'That folder is already registered as "Client work".'
+        )
+
+    def test_creating_over_an_existing_vault_names_no_path(self, registry, tmp_path):
+        folder = make_vault_folder(tmp_path, "test-has-a-vault")
+
+        with pytest.raises(LibraryExistsError) as caught:
+            registry.create(folder)
+
+        assert str(tmp_path) not in str(caught.value)
+        assert "already contains a vault.db" in str(caught.value)
+
+    def test_an_import_already_in_the_folder_is_refused_without_its_path(
+        self, registry, tmp_path
+    ):
+        folder = tmp_path / "test-importing"
+        folder.mkdir()
+        (folder / TEMP_VAULT_FILENAME).write_bytes(b"test-another-import")
+
+        with pytest.raises(LibraryExistsError) as caught:
+            registry.create(str(folder), "Importing", pending_import=True)
+
+        assert str(caught.value) == (
+            f"That folder is already being imported, or holds a {TEMP_VAULT_FILENAME} "
+            "left by an import that did not finish."
+        )
 
     def test_attaching_through_a_symlink_is_refused_as_a_duplicate(
         self, registry, tmp_path
@@ -461,6 +604,31 @@ class TestActiveLibrary:
         registry.attach(make_vault_folder(tmp_path))
         with pytest.raises(LibraryNotFoundError):
             registry.set_active("does-not-exist")
+
+    def test_what_was_typed_is_not_repeated_back(self, registry, tmp_path):
+        """The lookup takes anything, a path included; the refusal echoes none."""
+        registry.attach(make_vault_folder(tmp_path))
+        typed = "/home/me/test-not-a-library"
+
+        with pytest.raises(LibraryNotFoundError) as caught:
+            registry.get(typed)
+
+        assert typed not in str(caught.value)
+        assert "`list`" in str(caught.value)
+
+    def test_an_ambiguous_name_is_named_as_stored(self, registry, tmp_path):
+        registry.attach(make_vault_folder(tmp_path, "first"), "Library 1")
+        registry.attach(
+            make_vault_folder(tmp_path, "second"), "library 1", unique_name=False
+        )
+
+        with pytest.raises(LibraryNotFoundError) as caught:
+            registry.get("LIBRARY 1")
+
+        message = str(caught.value)
+        assert "LIBRARY 1" not in message
+        assert message.startswith("2 libraries are named ")
+        assert '"Library 1"' in message or '"library 1"' in message
 
 
 class TestDetach:
@@ -744,8 +912,10 @@ class TestRelocate:
         second_folder = make_vault_folder(tmp_path, "second")
         registry.attach(second_folder)
 
-        with pytest.raises(LibraryExistsError):
+        with pytest.raises(LibraryExistsError) as caught:
             registry.relocate(first.id, second_folder)
+        assert second_folder not in str(caught.value)
+        assert str(caught.value) == 'That folder is already registered as "second".'
 
     def test_relocate_to_a_non_vault_is_refused(self, registry, tmp_path):
         library = registry.attach(make_vault_folder(tmp_path))
@@ -765,8 +935,12 @@ class TestRelocate:
         other = make_vault_folder(tmp_path, "someone-elses")
         set_vault_uuid(other, "00000000-0000-4000-8000-0000000000bb")
 
-        with pytest.raises(ForeignLibraryError):
+        with pytest.raises(ForeignLibraryError) as caught:
             registry.relocate(library.id, other, require_same_library=True)
+        assert other not in str(caught.value)
+        assert str(caught.value).startswith(
+            'That folder holds a different library, not "mine".'
+        )
 
         assert registry.get(library.id).path == library.path
         # Without the flag the explicit move still goes ahead, as it always has.
@@ -809,6 +983,16 @@ class TestRename:
         library = registry.attach(make_vault_folder(tmp_path))
         with pytest.raises(LibraryError):
             registry.rename(library.id, "   ")
+
+    def test_a_name_clash_names_the_library_that_holds_it(self, registry, tmp_path):
+        """As stored, not as requested: the request is the caller's text."""
+        registry.attach(make_vault_folder(tmp_path, "first"), "Client Work")
+        other = registry.attach(make_vault_folder(tmp_path, "second"), "Other")
+
+        with pytest.raises(LibraryExistsError) as caught:
+            registry.rename(other.id, "client work")
+
+        assert str(caught.value) == 'Another library is already named "Client Work".'
 
 
 class TestCli:

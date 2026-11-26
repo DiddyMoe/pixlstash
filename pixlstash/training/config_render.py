@@ -133,6 +133,12 @@ class TunableOverrideError(ValueError):
     """A config override names a key outside the tunables, or breaks its rule."""
 
 
+#: The refusal of a key outside :data:`TUNABLE_KEYS`. It does not repeat the
+#: key: until it matches a tunable, it is the caller's text, and a route
+#: answers with this message.
+NOT_TUNABLE_MESSAGE = "A setting given is not a tunable training parameter."
+
+
 def _parse_key(key: str) -> tuple:
     """Turn ``datasets[*].resolution`` into ``("datasets", "*", "resolution")``."""
     tokens: list = []
@@ -201,10 +207,14 @@ def check_value(rule: _Rule, name: str, value: Any) -> None:
         )
         detail = f"must be an integer from {rule.lo} to {rule.hi}"
     elif rule.kind == "float":
+        # An int is compared as it is, never converted: Python compares int
+        # and float exactly, while `math.isfinite` turns an int into a float
+        # first and overflows on one past the float range, such as the
+        # 10**400 a JSON body carries without complaint.
         ok = (
             isinstance(value, (int, float))
             and not isinstance(value, bool)
-            and math.isfinite(value)
+            and (isinstance(value, int) or math.isfinite(value))
             and rule.lo <= value <= rule.hi
         )
         detail = f"must be a number from {rule.lo} to {rule.hi}"
@@ -249,8 +259,9 @@ def validate_tunables(overrides: dict | None) -> dict:
         A deep copy of *overrides* (``{}`` when none were given).
 
     Raises:
-        TunableOverrideError: If a key is not tunable (the message names it) or
-            a value fails its check.
+        TunableOverrideError: If a key is not tunable (:data:`NOT_TUNABLE_MESSAGE`,
+            the key logged) or a value fails its check (the message names the
+            matched key and its rule).
     """
     if not overrides:
         return {}
@@ -266,7 +277,8 @@ def validate_tunables(overrides: dict | None) -> dict:
                     rule = candidate
                     break
         if rule is None:
-            raise TunableOverrideError(f"'{name}' is not a tunable training parameter.")
+            logger.info("Refused a config override that is not tunable: %r", name)
+            raise TunableOverrideError(NOT_TUNABLE_MESSAGE)
         check_value(rule, name, value)
     return copy.deepcopy(overrides)
 

@@ -248,26 +248,32 @@ def _apply_config(run: TrainingRun) -> None:
     # may be local.
     try:
         import yaml
-    except ImportError as exc:
-        run.config_error = f"PyYAML unavailable, config not read ({exc})"
+    except ImportError:
+        # config_error goes out to the client as it is, so it is a fixed
+        # sentence and the import error stays in the log.
+        run.config_error = "PyYAML is not installed, so the config was not read"
         logger.warning(
             "PyYAML is unavailable, so %s was not read. The run still lists its "
             "checkpoints and samples; only base model, trigger words and rank "
             "are missing.",
             path,
+            exc_info=True,
         )
         return
 
     try:
         with open(path, "r", encoding="utf-8") as handle:
             parsed = yaml.safe_load(handle)
-    except (OSError, UnicodeDecodeError) as exc:
-        run.config_error = f"could not read {os.path.basename(path)}: {exc}"
-        logger.warning("Could not read ai-toolkit config %s: %s", path, exc)
+    except (OSError, UnicodeDecodeError):
+        # The name is one of CONFIG_NAMES, so it is the server's own text. The
+        # error is not: an OSError carries the full path, and a YAMLError
+        # quotes the file's lines.
+        run.config_error = f"could not read {os.path.basename(path)}"
+        logger.warning("Could not read ai-toolkit config %s.", path, exc_info=True)
         return
-    except yaml.YAMLError as exc:
-        run.config_error = f"could not parse {os.path.basename(path)}: {exc}"
-        logger.warning("Could not parse ai-toolkit config %s: %s", path, exc)
+    except yaml.YAMLError:
+        run.config_error = f"could not parse {os.path.basename(path)}"
+        logger.warning("Could not parse ai-toolkit config %s.", path, exc_info=True)
         return
 
     base_model = _find_key(parsed, "name_or_path")
@@ -356,11 +362,14 @@ def read_run(run_dir: str) -> TrainingRun:
     try:
         run.checkpoints = _read_checkpoints(run_dir, run.name)
         run.samples = _read_samples(run_dir)
-    except OSError as exc:
+    except OSError:
         # A run folder that becomes unreadable mid-scan is worth surfacing, but
-        # it must not take the whole output listing down with it.
-        run.config_error = f"could not list {run_dir}: {exc}"
-        logger.warning("Could not list ai-toolkit run folder %s: %s", run_dir, exc)
+        # it must not take the whole output listing down with it. The folder
+        # and the error go to the log; the run already carries its name.
+        run.config_error = "could not list the run folder"
+        logger.warning(
+            "Could not list ai-toolkit run folder %s.", run_dir, exc_info=True
+        )
         return run
 
     _apply_config(run)

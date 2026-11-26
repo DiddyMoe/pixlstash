@@ -56,6 +56,7 @@ from pixlstash.services.model_mover import (
     PARTIAL_SUFFIX,
     STATUS_CANCELLED,
     STATUS_FAILED,
+    CopyNotVerified,
     MoveRefused,
     copy_and_digest,
     discard_partial,
@@ -75,6 +76,18 @@ logger = get_logger(__name__)
 PROVENANCE_TRAINED = "trained"
 
 STATUS_IMPORTED = "imported"
+
+# A file's outcome when its import failed for a reason only the server log can
+# name: the exception text is logged, never put in the outcome (CWE-209).
+IMPORT_FAILED_DETAIL = (
+    "The file could not be imported and the run's file is untouched. "
+    "The server log says why."
+)
+# A file's outcome when a scan registered its destination name mid-copy.
+IMPORT_NAME_TAKEN_DETAIL = (
+    "A scan registered a file at this name in the destination folder while it "
+    "was imported, so the copy was discarded. Try again once that scan is done."
+)
 
 
 @dataclass
@@ -181,9 +194,11 @@ class RunImporter:
         run = read_run(run_dir)
         wanted = self._select(run.checkpoints, steps)
         if not wanted:
+            # The run's name is the folder found on disk; the steps are the
+            # caller's, so they are not repeated.
             raise MoveRefused(
                 f"{run.name} has no checkpoint to import"
-                + (f" at step(s) {steps}." if steps else "."),
+                + (" at the steps asked for." if steps else "."),
                 status_code=404,
             )
 
@@ -353,9 +368,9 @@ class RunImporter:
         try:
             written = copy_and_digest(checkpoint.path, partial)
             if file_digest(partial) != written:
-                raise OSError(
-                    f"Copy of {checkpoint.path} did not verify; the copy was "
-                    "discarded and the original is untouched."
+                raise CopyNotVerified(
+                    f"The copy of {checkpoint.filename} did not verify; the copy "
+                    "was discarded and the run's file is untouched."
                 )
             # Published rather than replaced, for the same reason the mover
             # publishes: the plan ran in the POST and this runs minutes later on
@@ -375,8 +390,13 @@ class RunImporter:
                 exc,
                 exc_info=True,
             )
+            # Only a CopyNotVerified sentence is the server's own; any other
+            # OSError text names paths and system errors, so it stays in the log.
+            detail = (
+                str(exc) if isinstance(exc, CopyNotVerified) else IMPORT_FAILED_DETAIL
+            )
             return ImportOutcome(
-                checkpoint.filename, checkpoint.step, STATUS_FAILED, detail=str(exc)
+                checkpoint.filename, checkpoint.step, STATUS_FAILED, detail=detail
             )
 
         try:
@@ -391,7 +411,7 @@ class RunImporter:
                 destination_folder_id=destination_folder_id,
                 training_run_id=training_run_id,
             )
-        except sqlite3.IntegrityError as exc:
+        except sqlite3.IntegrityError:
             # The destination key was registered between ``_resolve_targets``
             # and this commit - a rescan, which is deliberately not under
             # ``SHELF_IO_LOCK``. Fail closed, exactly as the mover does: the
@@ -410,8 +430,12 @@ class RunImporter:
                 exc_info=True,
             )
             discard_partial(target)
+            # SQLite's text names the table and columns: logged above, not shown.
             return ImportOutcome(
-                checkpoint.filename, checkpoint.step, STATUS_FAILED, detail=str(exc)
+                checkpoint.filename,
+                checkpoint.step,
+                STATUS_FAILED,
+                detail=IMPORT_NAME_TAKEN_DETAIL,
             )
         if delete_source:
             unlink_source(checkpoint.path)

@@ -21,19 +21,33 @@ from urllib.parse import urlsplit
 from pixlstash.database import DBPriority
 from pixlstash.db_models import User
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.comfyui_url import (
+    InvalidComfyUIAddress,
+    is_loopback_host,
+    normalize_comfyui_url,
+    request_base,
+)
 
 logger = get_logger(__name__)
 
 # The id the saved address's entry reads as, and keeps once stored.
 SAVED_ADDRESS_ID = "saved"
-
-_LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+# The refusal of a move onto an address another connection has. The route
+# answers it as it is, so it never repeats the address (the caller's text).
+ADDRESS_TAKEN = "Another connection already has that address."
 
 
 def _key(url: str | None) -> str:
-    # ``comfyui_url`` PATCHed through the API is stored as typed, so the same
-    # address may arrive in another case or without its trailing slash.
-    return (url or "").strip().rstrip("/").lower()
+    # Every write stores the normalised form, so two spellings of one address
+    # have one key. A value saved before the normaliser was strict may not
+    # pass it; it still needs a key to be found by (to be removed or set
+    # again), so it keeps the loose one it was always matched by. Nothing is
+    # sent to it: every request goes through ``current_base``.
+    text = (url or "").strip()
+    try:
+        return normalize_comfyui_url(text)
+    except InvalidComfyUIAddress:
+        return text.rstrip("/").lower()
 
 
 def is_listed(user, url: str | None) -> bool:
@@ -44,7 +58,7 @@ def is_listed(user, url: str | None) -> bool:
 def default_name(url: str) -> str:
     """ "This PC" for a loopback address, else its host."""
     host = urlsplit(url).hostname or ""
-    return "This PC" if host in _LOOPBACK else host or "ComfyUI"
+    return "This PC" if host and is_loopback_host(host) else host or "ComfyUI"
 
 
 def _entry(entry_id: str, name: str, url: str) -> dict:
@@ -123,6 +137,35 @@ def current_id(user) -> str | None:
     return next(
         (e["id"] for e in read(user) if saved and _key(e["url"]) == saved), None
     )
+
+
+def is_configured(user) -> bool:
+    """Whether the owner has saved a ComfyUI address at all, valid or not.
+
+    For a route that only asks "is there one" before it reads it through
+    ``current_base``: it never builds a request on the answer.
+    """
+    return bool(getattr(user, "comfyui_url", None)) if user else False
+
+
+def current_base(user, default: str | None) -> str | None:
+    """The address requests to the current ComfyUI are built on, without the
+    trailing slash: ``comfyui_url``, or *default* with none saved (``None``
+    when the caller has no default and sends nothing without an address).
+
+    The one read path for the saved address (``request_base``): one saved
+    before the normaliser was strict is refused, not sent.
+
+    Raises:
+        SavedComfyUIAddressInvalid: the saved address does not pass the
+            normaliser; logged with the connection's id.
+    """
+    stored = getattr(user, "comfyui_url", None) if user else None
+    if not stored:
+        if default is None:
+            return None
+        return request_base(default, connection_id=None)
+    return request_base(stored, connection_id=current_id(user))
 
 
 def _store(user, entries: list[dict]) -> None:
@@ -216,7 +259,8 @@ def set_address(user, connection_id: str, url: str) -> bool:
     if _key(entry["url"]) == _key(url):
         return False
     if any(_key(e["url"]) == _key(url) for e in entries):
-        raise ValueError(f"Another connection already has the address {url}.")
+        # Not repeated: *url* is the caller's, and the route answers this text.
+        raise ValueError(ADDRESS_TAKEN)
     if _key(user.comfyui_url) == _key(entry["url"]):
         user.comfyui_url = url
     if entry["name"] == default_name(entry["url"]):
