@@ -1669,6 +1669,8 @@ def register_routes(router, server):
     def preview_scrapheap_delete(request: Request, payload: dict | None = Body(None)):
         lease = request.state.library_lease
         ids = _parse_scrapheap_ids(payload)
+        # Stamped before the read: whatever the read sees was binned by now.
+        as_of = datetime.now(timezone.utc)
         rows = scrapheap_service.fetch_scrapheap_rows(server.vault, ids)
         if not rows:
             return {
@@ -1681,6 +1683,7 @@ def register_routes(router, server):
                 "confirm_token": scrapheap_confirmations.issue(
                     ids,
                     0,
+                    deleted_before=as_of,
                     library_uuid=lease.library_uuid,
                     generation=lease.generation,
                 ),
@@ -1710,6 +1713,7 @@ def register_routes(router, server):
         preview["confirm_token"] = scrapheap_confirmations.issue(
             ids,
             preview["total_count"],
+            deleted_before=as_of,
             library_uuid=lease.library_uuid,
             generation=lease.generation,
         )
@@ -1717,7 +1721,7 @@ def register_routes(router, server):
 
     def _redeem_delete_confirmation(
         request: Request, token: Optional[str], ids: Optional[list[int]]
-    ) -> None:
+    ) -> scrapheap_service.DeleteConfirmation:
         """Spend a delete-forever confirmation, or refuse the request.
 
         A server-side intent check, NOT an authorization check (the AuthzGate
@@ -1727,18 +1731,21 @@ def register_routes(router, server):
         ``DELETE /pictures/scrapheap`` and a purge run, so neither can destroy
         anything the preview was not fetched for.
 
+        Returns:
+            The spent confirmation; its ``deleted_before`` bounds the purge.
+
         Raises:
             HTTPException: 400 when the token is missing; 409 when it is
                 unknown, spent, expired or minted for another selection.
         """
-        confirmed, reason = scrapheap_confirmations.redeem(
+        record, reason = scrapheap_confirmations.redeem(
             token,
             ids,
             library_uuid=request.state.library_lease.library_uuid,
             generation=request.state.library_lease.generation,
         )
-        if confirmed:
-            return
+        if record is not None:
+            return record
         if reason == scrapheap_service.CONFIRM_MISSING:
             raise HTTPException(
                 status_code=400,
@@ -1802,7 +1809,7 @@ def register_routes(router, server):
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         ids = _parse_scrapheap_ids(payload)
-        _redeem_delete_confirmation(
+        confirmation = _redeem_delete_confirmation(
             request,
             payload.get("confirm_token") if isinstance(payload, dict) else None,
             ids,
@@ -1822,6 +1829,7 @@ def register_routes(router, server):
             # Files are removed after the response is sent so a large purge never
             # blocks the request; the DB rows + ledger are already committed.
             schedule_file_removal=background_tasks.add_task,
+            deleted_before=confirmation.deleted_before,
         )
         picture_ids = outcome.purged_ids
         if picture_ids:
@@ -1916,11 +1924,13 @@ def register_routes(router, server):
         request: Request, response: Response, payload: ScrapheapRunRequest
     ):
         include_protected = False
+        deleted_before = None
         if payload.kind == scrapheap_run_service.KIND_PURGE:
-            _redeem_delete_confirmation(
+            confirmation = _redeem_delete_confirmation(
                 request, payload.confirm_token, payload.picture_ids
             )
             include_protected = payload.include_protected
+            deleted_before = confirmation.deleted_before
         # §21 origin discipline, read in the handler. A restore run mints its
         # own History batches (one per segment), so the ambient gesture batch
         # is not used.
@@ -1932,6 +1942,7 @@ def register_routes(router, server):
                 payload.kind,
                 picture_ids=payload.picture_ids,
                 include_protected=include_protected,
+                deleted_before=deleted_before,
                 **context,
             )
         except ScrapheapRunError as exc:

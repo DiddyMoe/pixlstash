@@ -140,6 +140,9 @@ class ScrapheapRun:
         kind: :data:`KIND_PURGE` or :data:`KIND_RESTORE`.
         include_protected: A purge's choice to destroy protected
             reference-folder originals too. Always ``False`` for a restore.
+        deleted_before: A purge's consent bound, the confirming preview's
+            time: no slice destroys a picture binned after it. ``None`` for a
+            restore.
         status: One of the ``STATUS_*`` values.
         total: Pictures the run set out to handle, fixed when it starts.
         processed: Pictures handled so far, whatever the outcome.
@@ -171,6 +174,7 @@ class ScrapheapRun:
 
     kind: str
     include_protected: bool = False
+    deleted_before: Optional[datetime] = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: str = STATUS_PENDING
     total: int = 0
@@ -393,14 +397,19 @@ class ScrapheapRunRegistry:
 
 
 def scrapheap_ids_in_session(
-    session: Session, picture_ids: Optional[list[int]]
+    session: Session,
+    picture_ids: Optional[list[int]],
+    deleted_before: Optional[datetime] = None,
 ) -> list[int]:
     """The ids of *picture_ids* still in the Scrapheap, oldest first.
 
     ``None`` means the whole Scrapheap. A temp-table scope, so a selection of
-    any size binds no per-id parameters.
+    any size binds no per-id parameters. ``deleted_before`` keeps only
+    pictures binned by then (see :func:`scrapheap_service.binned_by`).
     """
     query = select(Picture.id).where(Picture.deleted.is_(True))
+    if deleted_before is not None:
+        query = query.where(scrapheap_service.binned_by(deleted_before))
     if picture_ids is not None:
         scope = scope_id_subquery(
             session, picture_ids, name="_pixlstash_scrapheap_run_ids"
@@ -415,6 +424,7 @@ def start_run(
     kind: str,
     picture_ids: Optional[list[int]] = None,
     include_protected: bool = False,
+    deleted_before: Optional[datetime] = None,
     actor: Optional[str] = None,
     source: Optional[str] = None,
     origin_client_id: Optional[str] = None,
@@ -430,6 +440,9 @@ def start_run(
         kind: :data:`KIND_PURGE` or :data:`KIND_RESTORE`.
         picture_ids: The selection, or ``None`` for the whole Scrapheap.
         include_protected: A purge's choice to destroy protected originals.
+        deleted_before: A purge's consent bound, from its redeemed
+            confirmation; pictures binned after it are neither selected nor
+            destroyed.
         actor: Who asked, from ``request_context``.
         source: WS-envelope source, likewise.
         origin_client_id: WS-envelope per-tab origin, likewise.
@@ -450,8 +463,10 @@ def start_run(
     registry = vault.scrapheap_runs
     run_id = registry.reserve(kind, include_protected, actor, source, origin_client_id)
     try:
-        ids = vault.db.run_immediate_read_task(scrapheap_ids_in_session, picture_ids)
-        registry.mutate(run_id, lambda run: _record_selection(run, ids))
+        ids = vault.db.run_immediate_read_task(
+            scrapheap_ids_in_session, picture_ids, deleted_before
+        )
+        registry.mutate(run_id, lambda run: _record_selection(run, ids, deleted_before))
     except BaseException:
         registry.discard(run_id)
         raise
@@ -563,11 +578,15 @@ def purge_slice(vault: "Vault", run_id: str, chunk: list[int]) -> list[int]:
     Returns:
         The ids this slice destroyed.
     """
-    include_protected = vault.scrapheap_runs.mutate(
-        run_id, lambda run: run.include_protected
+    include_protected, deleted_before = vault.scrapheap_runs.mutate(
+        run_id, lambda run: (run.include_protected, run.deleted_before)
     )
     outcome = scrapheap_service.purge_scrapheap_pictures(
-        vault, list(chunk), include_protected, priority=DBPriority.LOW
+        vault,
+        list(chunk),
+        include_protected,
+        priority=DBPriority.LOW,
+        deleted_before=deleted_before,
     )
     vault.scrapheap_runs.mutate(
         run_id, lambda run: _absorb_purge(run, outcome, len(chunk))
@@ -669,8 +688,11 @@ def close_run(
         )
 
 
-def _record_selection(run: ScrapheapRun, ids: list[int]) -> None:
+def _record_selection(
+    run: ScrapheapRun, ids: list[int], deleted_before: Optional[datetime]
+) -> None:
     run.picture_ids = list(ids)
+    run.deleted_before = deleted_before
     run.total = len(ids)
     run.updated_at = _now()
 

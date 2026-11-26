@@ -2971,8 +2971,10 @@ forever on a selection, Restore all and Restore on a selection. A purge at about
 0.7 ms a picture held the writer past the 60 s timeout on a 50,000-picture heap.
 The body is `{kind: "purge" | "restore", picture_ids?, include_protected,
 confirm_token}` (unknown fields are 422). An omitted `picture_ids` means the
-whole heap **as it is when the run starts**, so a picture scrapheaped after the
-confirm is not destroyed by it. A purge requires the `confirm_token` that
+whole heap **as it is when the run starts**. A purge, run or `DELETE`, destroys
+only pictures binned by the time the confirming preview read the heap (the
+token's `deleted_before`, applied again by each slice), so a picture binned
+after the preview is not destroyed by it. A purge requires the `confirm_token` that
 `POST /pictures/scrapheap/delete-preview` minted for the same selection, with the
 same refusals as `DELETE /pictures/scrapheap`: 400 when it is missing, and 409
 when it is spent, expired or for another selection. The token is spent even if
