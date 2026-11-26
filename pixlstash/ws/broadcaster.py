@@ -20,6 +20,7 @@ import asyncio
 import json
 
 from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.websockets import WebSocketState
 
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
@@ -533,7 +534,10 @@ class WsBroadcasterMixin:
             if client is None:
                 return
             try:
-                while True:
+                # Until the server closes the socket: a restore can close it
+                # while the handler is between two receives, and a receive
+                # after that raises instead of reporting the disconnect.
+                while websocket.application_state == WebSocketState.CONNECTED:
                     message = await websocket.receive_text()
                     if not message:
                         continue

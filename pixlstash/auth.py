@@ -766,6 +766,11 @@ class AuthService:
         self._active_restore_http_leases: set[int] = set()
         self._active_restore_websockets: dict[int, tuple] = {}
         self._RESTORE_DRAIN_TIMEOUT_SECONDS = 30.0
+        # How long the restore gives one socket to close and its handler to
+        # end by itself, together, before it cancels the handler. uvicorn hands
+        # the handler its disconnect as it sends the close, so this is only
+        # waited out by a client that stopped reading or a handler that is stuck.
+        self._RESTORE_SOCKET_EXIT_SECONDS = 2.0
         # In-memory guest session tracking: session_id → last_active_at (monotonic seconds).
         # Entries expire after _GUEST_SESSION_INACTIVE_TTL (30 days) and are pruned lazily
         # in record_guest_activity().  When the cache reaches _guest_max_tracked_sessions
@@ -826,21 +831,68 @@ class AuthService:
             self._active_restore_websockets.pop(lease, None)
             self._restore_admission_condition.notify_all()
 
-    @staticmethod
-    async def _terminate_authenticated_websocket(websocket, handler_task) -> None:
-        """Close one established socket, then cancel its owning handler."""
+    async def _terminate_authenticated_websocket(
+        self, lease: int, websocket, handler_task
+    ) -> None:
+        """Close one established socket and see its handler end.
+
+        uvicorn queues the handler's disconnect as it sends the close, so the
+        handler leaves its receive loop by itself. Cancelling it straight away
+        raced that disconnect and ended the handler in a CancelledError, which
+        uvicorn logs as an exception. The restore must not wait on a socket,
+        so the close and the handler's exit share
+        ``_RESTORE_SOCKET_EXIT_SECONDS``: a client that has stopped reading can
+        hold the close itself, and a handler still running when the time is
+        up is cancelled.
+
+        Args:
+            lease: The socket's admission lease, named in the log.
+            websocket: The handler's server-side socket.
+            handler_task: The task running the handler, or None when there is
+                no task to end.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._RESTORE_SOCKET_EXIT_SECONDS
         try:
-            await websocket.close(
-                code=WS_CLOSE_SERVICE_RESTART, reason=DATABASE_RESTORE_IN_PROGRESS
+            await asyncio.wait_for(
+                websocket.close(
+                    code=WS_CLOSE_SERVICE_RESTART, reason=DATABASE_RESTORE_IN_PROGRESS
+                ),
+                timeout=self._RESTORE_SOCKET_EXIT_SECONDS,
+            )
+        except TimeoutError:
+            self._logger.warning(
+                "Closing WebSocket lease %s from %s for the restore did not "
+                "finish within %.1f s.",
+                lease,
+                websocket.client,
+                self._RESTORE_SOCKET_EXIT_SECONDS,
+            )
+        except Exception as exc:
+            # Logged and not raised: nothing reads the scheduled termination's
+            # result, and the handler below is ended either way.
+            self._logger.warning(
+                "Could not close WebSocket lease %s from %s for the restore: %s",
+                lease,
+                websocket.client,
+                exc,
             )
         finally:
             current = asyncio.current_task()
-            if (
-                handler_task is not None
-                and handler_task is not current
-                and not handler_task.done()
-            ):
-                handler_task.cancel()
+            if handler_task is not None and handler_task is not current:
+                await asyncio.wait(
+                    {handler_task}, timeout=max(0.0, deadline - loop.time())
+                )
+                if not handler_task.done():
+                    self._logger.warning(
+                        "The handler of WebSocket lease %s from %s had not "
+                        "ended %.1f s after the restore closed its socket; "
+                        "cancelling it.",
+                        lease,
+                        websocket.client,
+                        self._RESTORE_SOCKET_EXIT_SECONDS,
+                    )
+                    handler_task.cancel()
 
     def close_auth_for_restore(
         self, restore_request_lease: Optional[int] = None
@@ -870,7 +922,7 @@ class AuthService:
                 self.unregister_authenticated_websocket(lease)
                 continue
             termination = self._terminate_authenticated_websocket(
-                websocket, handler_task
+                lease, websocket, handler_task
             )
             try:
                 asyncio.run_coroutine_threadsafe(termination, loop)

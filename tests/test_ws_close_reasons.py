@@ -10,6 +10,7 @@ literals and both sites to the module.
 import asyncio
 import re
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from pixlstash.auth import AuthService
 from pixlstash.ws.broadcaster import WsBroadcasterMixin
@@ -56,5 +57,8 @@ def test_a_library_switch_closes_with_the_switch_reason():
 
 def test_the_restore_barrier_closes_with_the_restore_reason():
     socket = _Socket()
-    asyncio.run(AuthService._terminate_authenticated_websocket(socket, None))
+    auth = AuthService(
+        db=None, server_config={}, server_config_path="", logger=MagicMock()
+    )
+    asyncio.run(auth._terminate_authenticated_websocket(1, socket, None))
     assert socket.closed == (1012, DATABASE_RESTORE_IN_PROGRESS)
