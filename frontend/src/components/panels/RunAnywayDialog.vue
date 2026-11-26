@@ -51,6 +51,11 @@
         {{ formatGb(segment.mb) }}
       </li>
     </ul>
+    <!-- The figures above are the last the GPU gave (`resources.stale`): said
+         plainly, as the task manager's GPU block says it, not as an alarm. -->
+    <p v-if="stale" class="ra-stale" data-testid="ra-stale">
+      These figures may be out of date: the GPU did not answer in time.
+    </p>
 
     <template #footer>
       <AppButton
@@ -88,6 +93,8 @@ const props = defineProps({
   device: { type: Object, default: null },
   /** `resources.holders`. */
   holders: { type: Array, default: () => [] },
+  /** `resources.stale`: the GPU did not answer, so the figures are its last. */
+  stale: { type: Boolean, default: false },
   busy: { type: Boolean, default: false },
 });
 
@@ -229,6 +236,12 @@ function pct(value) {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2) var(--space-5);
+  font-size: var(--text-xs);
+  color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
+}
+
+.ra-stale {
+  margin: var(--space-3) 0 0;
   font-size: var(--text-xs);
   color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
 }

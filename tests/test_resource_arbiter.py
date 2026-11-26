@@ -2640,3 +2640,172 @@ def test_the_driver_suspends_and_restores_a_real_context():
     if done.returncode == 0 and done.stdout.strip() == "not supported":
         pytest.skip("this driver exports the CUDA checkpoint API but refuses it")
     assert done.returncode == 0 and done.stdout.strip() == "ok", done.stderr[-2000:]
+
+
+# ── a hung ComfyUI does not hold up the snapshot ───────────────────────────
+# ``GET /workers/progress`` and the lease routes read ``snapshot()``. Its probe
+# read used to run inline, so a ComfyUI that accepts connections and never
+# answers held every poll for its HTTP timeouts.
+
+
+class HungComfy(FakeComfy):
+    """Answers its first read, then hangs on every read until released."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.hang = threading.Event()
+        self.release = threading.Event()
+        self.reads = 0
+
+    def usage_mb(self):
+        self.reads += 1
+        if self.hang.is_set():
+            self.release.wait(10)
+        return self.usage
+
+
+@pytest.mark.parametrize("read", ["snapshot", "training_room"])
+def test_a_hung_comfyui_does_not_hold_up_the_snapshot(read):
+    arb, _fake, _ = make(used_mb=12000, thread=False)
+    comfy = HungComfy(usage=7000)
+    arb.register_probe(Tenant.COMFYUI, comfy)
+
+    def take():
+        return arb.snapshot() if read == "snapshot" else arb.training_room(CARD)
+
+    take()  # answered: the reading is stored
+    comfy.hang.set()
+    try:
+        started = time.monotonic()
+        first = take()
+        second = take()
+        took = time.monotonic() - started
+        assert took < 2 * arbiter_module.SNAPSHOT_PROBE_WAIT_S + 0.5, took
+        if read == "snapshot":
+            # The last reading stands while the new one is outstanding.
+            assert first["comfyui"]["held_mb"] == 7000
+            assert second["comfyui"]["held_mb"] == 7000
+        # One read outstanding, not one more per poll.
+        assert comfy.reads == 2
+    finally:
+        comfy.release.set()
+    comfy.hang.clear()
+    comfy.usage = 5000
+    assert _wait_for(
+        lambda: (arb.snapshot()["comfyui"] or {}).get("held_mb") == 5000
+    ), "a ComfyUI that answers again is read again"
+
+
+def test_a_snapshot_read_that_fails_reaches_the_caller():
+    arb, fake, _ = make(thread=False)
+
+    def broken(max_age_s=1.0, strict=False):
+        raise RuntimeError("test-ledger-failure")
+
+    fake.devices = broken
+    with pytest.raises(RuntimeError, match="test-ledger-failure"):
+        arb.snapshot()
+
+
+def test_a_lease_row_is_read_without_the_tenants():
+    arb, _fake, _ = make(thread=False)
+    comfy = HungComfy(usage=0)
+    arb.register_probe(Tenant.COMFYUI, comfy)
+    lease = arb.try_light("TagTask", need_mb=1000, worker_type="TagTask")
+    comfy.hang.set()
+    try:
+        started = time.monotonic()
+        row = arb.lease_row(lease.id)
+        assert time.monotonic() - started < 0.5
+        assert row["id"] == lease.id and row["state"] == "granted"
+        assert arb.lease_row("no-such-lease") is None
+        assert comfy.reads == 0
+    finally:
+        comfy.release.set()
+        lease.release()
+
+
+def _wait_for(condition, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return condition()
+
+
+# ── a lock the driver refuses is not asked for again and again ─────────────
+# WSL's libcuda exports the checkpoint API but answers the lock with 801
+# (CUDA_ERROR_NOT_SUPPORTED). That was taken for "not now", so every poll of a
+# training run asked again, for as long as it ran.
+
+
+def _refusing_driver(monkeypatch, lock_code):
+    calls = []
+
+    def lock(*args):
+        calls.append("lock")
+        return lock_code
+
+    lib = SimpleNamespace(
+        cuCheckpointProcessLock=lock,
+        cuCheckpointProcessCheckpoint=lambda *args: calls.append("checkpoint") or 0,
+        cuCheckpointProcessUnlock=lambda *args: calls.append("unlock") or 0,
+        cuCheckpointProcessRestore=lambda *args: calls.append("restore") or 0,
+    )
+    monkeypatch.setattr(cuda_checkpoint, "_cuda", lambda: lib)
+    monkeypatch.setattr(cuda_checkpoint, "_suspended", False)
+    monkeypatch.setattr(cuda_checkpoint, "_in_flight", 0)
+    monkeypatch.setattr(cuda_checkpoint, "_failed", False)
+    monkeypatch.setattr(cuda_checkpoint, "_unsupported", False, raising=False)
+    # available() asks torch whether there is a context to suspend.
+    torch_stub = SimpleNamespace(cuda=SimpleNamespace(is_initialized=lambda: True))
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+    return calls
+
+
+def test_a_driver_that_does_not_support_checkpoints_is_not_asked_again(monkeypatch):
+    calls = _refusing_driver(monkeypatch, _CHECKPOINT_NOT_SUPPORTED)
+    assert cuda_checkpoint.available()
+    cuda_checkpoint.begin()
+    assert cuda_checkpoint.suspend() is False, "not supported is a failure"
+    assert not cuda_checkpoint.suspended()
+    assert not cuda_checkpoint.available(), "so the arbiter does not ask again"
+    assert calls == ["lock"]
+
+
+def test_a_lock_that_times_out_may_be_tried_again(monkeypatch):
+    # CUDA_ERROR_TIMEOUT: CUDA work in flight did not finish within the lock's
+    # timeout. That one is "not now".
+    _refusing_driver(monkeypatch, 909)
+    cuda_checkpoint.begin()
+    assert cuda_checkpoint.suspend() is None
+    assert not cuda_checkpoint.suspended()
+    assert cuda_checkpoint.available()
+
+
+@pytest.mark.parametrize("not_now", ["lock", "drain"])
+def test_a_suspend_never_possible_is_asked_for_a_bounded_number_of_times(not_now):
+    arb, _fake, ckpt, asked = _suspend_scene()
+    if not_now == "lock":
+        ckpt.suspend_result = None
+    else:
+        ckpt.drains = False
+    lease = _train(arb)
+    answered = 0
+    for _ in range(arbiter_module.SUSPEND_ATTEMPTS + 3):
+        arb._suspend_step()
+        if len(asked) > answered:
+            answered += 1
+            assert arb.suspend_pixlstash("SuspendCuda") is False
+    assert len(asked) == arbiter_module.SUSPEND_ATTEMPTS
+    assert not ckpt.suspended()
+    lease.release()
+    # A new run is asked for again, with attempts of its own: the count of
+    # the run before does not carry over.
+    lease = _train(arb)
+    for _ in range(arbiter_module.SUSPEND_ATTEMPTS + 3):
+        arb._suspend_step()
+        if len(asked) > answered:
+            answered += 1
+            assert arb.suspend_pixlstash("SuspendCuda") is False
+    assert len(asked) == 2 * arbiter_module.SUSPEND_ATTEMPTS
+    lease.release()

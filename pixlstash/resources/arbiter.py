@@ -61,6 +61,16 @@ LEDGER_WAKE_MB = 256
 #: loading): soon, but never a spin.
 MOVED_POLL_S = 0.25
 
+#: How long ``snapshot`` and ``training_room`` wait for a fresh reading of the
+#: cards and tenants before answering from the last one. A ComfyUI that takes
+#: connections and never answers costs each read its HTTP timeouts; the
+#: progress poll must not wait them out.
+SNAPSHOT_PROBE_WAIT_S = 0.25
+
+#: How many times one exclusive lease asks for a suspend that cannot be done
+#: now (CUDA work in flight that does not finish) before it is not asked again.
+SUSPEND_ATTEMPTS = 3
+
 
 class Tenant(str, Enum):
     PIXLSTASH = "pixlstash"
@@ -226,6 +236,20 @@ class Lease:
             self._arbiter.allow_comfyui_quit(self)
 
 
+class _DisplayRead:
+    """One ``_read_for_display`` read: set when done, with what it raised.
+
+    ``deadline`` (``time.monotonic()``) is when every caller of this read
+    stops waiting for it: the caller that started it and any that arrive
+    while it runs share it, so two pollers get the same answer.
+    """
+
+    def __init__(self, deadline: float) -> None:
+        self.done = threading.Event()
+        self.error: BaseException | None = None
+        self.deadline = deadline
+
+
 def safety_margin_mb(total_mb: int) -> int:
     """What is kept free on a card of *total_mb*."""
     return max(SAFETY_MARGIN_MB, int(total_mb * SAFETY_MARGIN_SHARE))
@@ -291,6 +315,11 @@ class ResourceArbiter:
         self._suspended_mb: int | None = None
         # The lease a suspend failed for: not asked again while it holds.
         self._suspend_failed_for: str | None = None
+        # The lease and how many of its suspends could not be done now.
+        self._suspend_deferrals: tuple[str, int] | None = None
+        # The display read in flight (``_read_for_display``), or None. Under
+        # ``_lock``.
+        self._display_read: _DisplayRead | None = None
 
     # ── configuration ────────────────────────────────────────────────────
 
@@ -608,6 +637,16 @@ class ResourceArbiter:
             return None
         return lease
 
+    def lease_row(self, lease_id: str) -> dict | None:
+        """*lease_id*'s row as ``snapshot`` gives it, or None if there is none.
+
+        From the stored readings: no card or tenant is read, so the lease
+        routes answer whatever ComfyUI is doing.
+        """
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            return None if lease is None else self._lease_row(lease)
+
     def leases(self, tenant: Tenant | None = None) -> list[Lease]:
         with self._lock:
             return [
@@ -634,8 +673,14 @@ class ResourceArbiter:
     # ── snapshot ─────────────────────────────────────────────────────────
 
     def snapshot(self) -> dict:
-        """The ``resources`` block of ``GET /workers/progress``."""
-        self._refresh(cached=True)
+        """The ``resources`` block of ``GET /workers/progress``.
+
+        Waits at most ``SNAPSHOT_PROBE_WAIT_S`` for the cards and tenants to
+        be read (``_read_for_display``); past that it answers from the last
+        reading, and says so with ``stale`` True: the card figures and the
+        tenants' alike may be as old as the read still outstanding.
+        """
+        fresh = self._read_for_display()
         with self._lock:
             devices = []
             holders = []
@@ -672,6 +717,9 @@ class ResourceArbiter:
             comfy = self._probe_state.get(Tenant.COMFYUI) or {}
             return {
                 "enforcing": self.enforcing,
+                # True when the cards and tenants did not answer in time and
+                # every reading here is the last one stored.
+                "stale": not fresh,
                 "devices": devices,
                 # The ComfyUI PixlStash submits to, for its row in Tasks: what
                 # it holds and whether it can be cleared now. None until read.
@@ -707,9 +755,10 @@ class ResourceArbiter:
         finished AI-toolkit run's memory are given back before it is granted,
         so neither counts against it. ``vram_mb`` is None for a card that
         cannot be measured; ``ram_mb`` is available physical RAM (swap never
-        counts), None when unreadable.
+        counts), None when unreadable. Read as ``snapshot`` is: never held up
+        by a tenant that does not answer.
         """
-        self._refresh(cached=True)
+        self._read_for_display()
         with self._lock:
             reading = next((d for d in self._devices if d.uuid == device), None)
             vram = None
@@ -982,6 +1031,91 @@ class ResourceArbiter:
                 for tenant, state in states.items():
                     if tenant in self._probes:
                         self._probe_state[tenant] = state
+
+    def _read_for_display(self) -> bool:
+        """Refresh for a reader that answers a person, waiting a bounded time.
+
+        The read runs on a thread of its own and is waited for up to
+        ``SNAPSHOT_PROBE_WAIT_S``. Past that the caller answers from the last
+        reading, and the read goes on: its answer is stored when it comes. A
+        read still outstanding is not waited for again nor started again, so
+        a tenant that hangs holds one thread, not one per poll. A read that
+        fails within the wait raises here, as the inline read did.
+
+        A caller that arrives while a read runs joins it: it waits until that
+        read's own deadline, not a fresh one and not zero, so a second poller
+        (two tabs, or the progress poll beside the training room) gets the
+        same answer as the first instead of flapping between fresh and stale.
+        If the read it joined failed, it answers from the last reading (False);
+        the error was raised to the caller that started the read and logged
+        with its traceback (``_run_display_read``).
+
+        Returns:
+            True when this call's reading is in; False when the caller answers
+            from the last one, because the read is still outstanding at its
+            deadline or because the read this call joined failed.
+        """
+        with self._lock:
+            flight = self._display_read
+            leading = flight is None
+            if leading:
+                flight = _DisplayRead(time.monotonic() + SNAPSHOT_PROBE_WAIT_S)
+                self._display_read = flight
+        if not leading:
+            if not flight.done.wait(max(0.0, flight.deadline - time.monotonic())):
+                logger.debug(
+                    "A display read is still outstanding at its deadline; "
+                    "using the last reading"
+                )
+                return False
+            if flight.error is not None:
+                logger.debug(
+                    "The display read this call joined failed (%s: %s); using "
+                    "the last reading",
+                    type(flight.error).__name__,
+                    flight.error,
+                )
+                return False
+            return True
+        try:
+            threading.Thread(
+                target=self._run_display_read,
+                args=(flight,),
+                name="vram-arbiter-read",
+                daemon=True,
+            ).start()
+        except BaseException:
+            with self._lock:
+                self._display_read = None
+            raise
+        if not flight.done.wait(max(0.0, flight.deadline - time.monotonic())):
+            logger.info(
+                "The cards and tenants did not answer within %.2fs; answering "
+                "from the last reading",
+                SNAPSHOT_PROBE_WAIT_S,
+            )
+            return False
+        if flight.error is not None:
+            raise flight.error
+        return True
+
+    def _run_display_read(self, flight: "_DisplayRead") -> None:
+        try:
+            self._refresh(cached=True)
+        except BaseException as exc:
+            # Raised to the caller still waiting (``_read_for_display``);
+            # logged for the case where it stopped waiting first.
+            flight.error = exc
+            logger.warning(
+                "Could not read the cards and tenants for the snapshot: %s",
+                exc,
+                exc_info=True,
+            )
+        finally:
+            with self._lock:
+                if self._display_read is flight:
+                    self._display_read = None
+            flight.done.set()
 
     def _tenant_usage_locked(self, tenant: Tenant, device: str) -> int | None:
         if tenant is Tenant.PIXLSTASH:
@@ -1641,13 +1775,16 @@ class ResourceArbiter:
         # away by now, so this one comes from nvidia-smi.
         if not self._checkpoint.drain():
             self._checkpoint.abandon()
+            self._defer_suspend(holder)
             return False
         held = max(held, self._ledger.own_mb(device) or 0)
         suspended = self._checkpoint.suspend()
+        if suspended is None:
+            self._defer_suspend(holder)
+            return False
         if not suspended:
-            if suspended is False:
-                with self._lock:
-                    self._suspend_failed_for = holder.id
+            with self._lock:
+                self._suspend_failed_for = holder.id
             return False
         with self._lock:
             self._suspended_mb = held
@@ -1661,6 +1798,24 @@ class ResourceArbiter:
         )
         self._ensure_thread()
         return True
+
+    def _defer_suspend(self, holder: Lease) -> None:
+        """Count a suspend for *holder* that could not be done now; past
+        ``SUSPEND_ATTEMPTS`` it is not asked for again while *holder* holds."""
+        with self._lock:
+            lease_id, count = self._suspend_deferrals or (holder.id, 0)
+            count = count + 1 if lease_id == holder.id else 1
+            self._suspend_deferrals = (holder.id, count)
+            if count < SUSPEND_ATTEMPTS:
+                return
+            self._suspend_failed_for = holder.id
+        logger.warning(
+            "PixlStash's CUDA context could not be suspended for %s (%s) in %d "
+            "attempts; it keeps its context until that lease ends",
+            holder.id,
+            holder.label,
+            count,
+        )
 
     def _suspend_step(self) -> None:
         """Ask for a suspend while an exclusive lease holds PixlStash's card,

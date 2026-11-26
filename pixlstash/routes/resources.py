@@ -9,7 +9,6 @@ these act on is the ``resources`` block of ``GET /workers/progress``; see
 from __future__ import annotations
 
 import os
-import sys
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -21,10 +20,16 @@ from pixlstash.resources.arbiter import LeaseState, Tenant, arbiter
 from pixlstash.resources.comfyui_tenant import probe as comfyui_probe
 from pixlstash.resources.ledger import ledger
 from pixlstash.server_config_io import persist_server_config
+from pixlstash.services import comfyui_connections
 from pixlstash.services.comfyui_service import (
     RUN_CLIENT_ID,
     cancel_held_runs,
 )
+from pixlstash.utils.comfyui_url import (
+    SAVED_ADDRESS_INVALID,
+    SavedComfyUIAddressInvalid,
+)
+from pixlstash.utils.model_utils import loaded_module
 
 logger = get_logger(__name__)
 
@@ -99,8 +104,8 @@ def create_router(server) -> APIRouter:
         return lease
 
     def _row(lease_id: str) -> dict | None:
-        snapshot = arbiter().snapshot()
-        return next((row for row in snapshot["leases"] if row["id"] == lease_id), None)
+        # The stored readings only: the answer must not wait on ComfyUI.
+        return arbiter().lease_row(lease_id)
 
     @router.post(
         "/resources/leases/{lease_id}/run-anyway",
@@ -158,9 +163,13 @@ def create_router(server) -> APIRouter:
     )
     def free_comfyui(request: Request):
         server.auth.ensure_secure_when_required(request)
-        url = (getattr(server._user, "comfyui_url", None) or "").rstrip("/")
-        if not url:
+        if not comfyui_connections.is_configured(server._user):
             raise HTTPException(status_code=409, detail="No ComfyUI is configured.")
+        try:
+            # The one read path for the saved address.
+            url = comfyui_connections.current_base(server._user, "")
+        except SavedComfyUIAddressInvalid:
+            raise HTTPException(status_code=409, detail=SAVED_ADDRESS_INVALID) from None
         probe = comfyui_probe(RUN_CLIENT_ID, url)
         if probe.stats(max_age_s=0.0) is None:
             raise HTTPException(status_code=503, detail="ComfyUI is not reachable.")
@@ -174,7 +183,7 @@ def create_router(server) -> APIRouter:
         return FreeAnswer(freed_mb=freed)
 
     def _torch_cuda() -> bool:
-        torch = sys.modules.get("torch")
+        torch = loaded_module("torch")
         try:
             return bool(
                 torch is not None

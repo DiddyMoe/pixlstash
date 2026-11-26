@@ -74,6 +74,7 @@
   },
   "resources": {
     "enforcing": true,
+    "stale": false,
     "comfyui": null,
     "devices": [
       {
