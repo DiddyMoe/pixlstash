@@ -2,8 +2,10 @@
 Pytest configuration and fixtures for test suite.
 """
 
+import errno
 import gc
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -17,6 +19,7 @@ import warnings
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pixlstash
 import pytest
@@ -658,6 +661,132 @@ def no_object_info_map_outlives_its_test():
     comfyui_routes._forget_cached_object_info()
     yield
     comfyui_routes._forget_cached_object_info()
+
+
+# The hosts CI's model cache is filled from (scripts/prefetch_ci_models.py): the
+# HuggingFace hub and its CDNs, a leading dot taking in every subdomain, and the
+# GitHub release delivery InsightFace's face pack comes from. A CI shard fetches
+# a model its restored cache lacks mid-test, so the connect guard lets these by.
+_MODEL_HOSTS = (
+    ".huggingface.co",
+    ".hf.co",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+
+# Every address a model host resolved to this session, as `_ip_of` spells it.
+_model_host_addresses: set = set()
+
+
+def _is_model_host(name: str) -> bool:
+    name = name.lower().rstrip(".")
+    return any(
+        name == host.lstrip(".") or (host.startswith(".") and name.endswith(host))
+        for host in _MODEL_HOSTS
+    )
+
+
+def _ip_of(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The IP ``host`` spells, an IPv4-mapped IPv6 one as its IPv4, else None."""
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])  # drop an IPv6 zone index
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _connect_refusal(address: tuple, comfyui_port: int) -> str | None:
+    """Why the connect guard refuses a TCP connect to ``address``, else None.
+
+    No name is resolved here, since a lookup already reaches the network:
+    ``localhost`` is loopback, an IP literal is judged by ``ipaddress``, and any
+    other name counts as off this machine. The HTTP clients resolve before they
+    connect, so a real request arrives here as a literal.
+    """
+    host, port = address[0], address[1]
+    if isinstance(host, (bytes, bytearray)):
+        host = bytes(host).decode("ascii", "replace")
+    ip = _ip_of(host)
+    loopback = host.lower() == "localhost" if ip is None else ip.is_loopback
+    if not loopback:
+        if ip in _model_host_addresses:
+            return None
+        return "not a loopback address"
+    if port == comfyui_port:
+        return "the default ComfyUI address"
+    return None
+
+
+@pytest.fixture(autouse=True, scope="session")
+def no_test_connects_to_comfyui_or_off_this_machine():
+    """No test opens a TCP connection to the default ComfyUI or off this machine.
+
+    Every ``connect`` and ``connect_ex`` on an IPv4/IPv6 stream socket is judged
+    before it reaches the OS. Loopback on the default ComfyUI port, or any
+    address that is not loopback, is refused with ``ConnectionRefusedError`` and
+    a warning. Loopback servers a test binds itself, UDP and Unix sockets, and
+    the addresses ``_MODEL_HOSTS`` resolved to pass. Session-scoped so module-
+    and session-scoped server fixtures are covered too.
+    """
+    from pixlstash.routes import comfyui as comfyui_routes
+
+    comfyui_port = urlsplit(comfyui_routes.DEFAULT_COMFYUI_URL).port
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_getaddrinfo = socket.getaddrinfo
+
+    def noting_getaddrinfo(host, port, *args, **kwargs):
+        # Notes where a model host resolved to, so its connect can pass.
+        found = real_getaddrinfo(host, port, *args, **kwargs)
+        if isinstance(host, (bytes, bytearray)):
+            host = bytes(host).decode("ascii", "replace")
+        if isinstance(host, str) and _is_model_host(host):
+            noted = {_ip_of(str(info[4][0])) for info in found}
+            _model_host_addresses.update(noted - {None})
+        return found
+
+    def refusal(sock, address):
+        if sock.type != socket.SOCK_STREAM or sock.family not in (
+            socket.AF_INET,
+            socket.AF_INET6,
+        ):
+            return None
+        if not isinstance(address, tuple) or len(address) < 2:
+            # Not an address the real connect accepts either: let it raise.
+            return None
+        reason = _connect_refusal(address, comfyui_port)
+        if reason is None:
+            return None
+        message = (
+            f"Connection refused by the test connect guard ({reason}): "
+            f"{address[0]}:{address[1]}"
+        )
+        warnings.warn(message, stacklevel=3)
+        return ConnectionRefusedError(errno.ECONNREFUSED, message)
+
+    def guarded_connect(sock, address):
+        refused = refusal(sock, address)
+        if refused is not None:
+            raise refused
+        return real_connect(sock, address)
+
+    def guarded_connect_ex(sock, address):
+        refused = refusal(sock, address)
+        if refused is not None:
+            return refused.errno
+        return real_connect_ex(sock, address)
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(socket.socket, "connect", guarded_connect)
+    patch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    patch.setattr(socket, "getaddrinfo", noting_getaddrinfo)
+    try:
+        yield
+    finally:
+        patch.undo()
 
 
 class _NoGpusLedger:
