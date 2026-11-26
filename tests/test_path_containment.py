@@ -18,6 +18,7 @@ refusal presents to a desktop user as their pictures failing to load.
 """
 
 import json
+import ntpath
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -39,9 +40,11 @@ from pixlstash.utils.path_utils import LibraryRootsUnavailable
 from pixlstash.utils.caption_file_utils import SIDECAR_TYPE_TAGS, writeback_path
 from pixlstash.utils.image_processing.orientation import read_orientation
 from pixlstash.utils.media_files import has_hidden_component
+from pixlstash.utils import path_utils, reference_folder_validator
 from pixlstash.utils.path_utils import (
     _without_added_prefix,
     path_is_within,
+    plain_spelling,
 )
 from pixlstash.utils.reference_folder_validator import (
     canonical_path,
@@ -344,6 +347,168 @@ def test_canonical_path_folds_case_where_the_filesystem_does(tmp_path, monkeypat
     monkeypatch.setattr(reference_folder_validator, "os", _CaseFoldingOs())
 
     assert canonical_path(str(real)) == canonical_path(shouted)
+
+
+class _PatchedNtPath:
+    """``ntpath`` with its ``realpath`` replaced; everything else falls through."""
+
+    def __init__(self, realpath):
+        self.realpath = realpath
+
+    def __getattr__(self, attr):
+        return getattr(ntpath, attr)
+
+
+class _WindowsOs:
+    """``os`` as it is on Windows, for the two modules that compare paths.
+
+    Swapped in for each module's own ``os`` name, for the reason
+    :class:`_CaseFoldingOs` gives. On POSIX ``ntpath.realpath`` is ``abspath``
+    and resolves nothing, which is what these tests need: a prefix the caller
+    wrote reaches the comparison as Windows' ``realpath`` leaves it, since
+    Windows keeps a ``\\\\?\\`` prefix it was given.
+    """
+
+    name = "nt"
+    path = ntpath
+    sep = "\\"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+
+class _PosixOs:
+    """``os`` reporting POSIX, so the POSIX branch is asserted on Windows CI too."""
+
+    name = "posix"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+
+@pytest.fixture
+def windows_paths(monkeypatch):
+    """Both comparing modules on Windows path rules, with the Windows blocklist."""
+    monkeypatch.setattr(path_utils, "os", _WindowsOs())
+    monkeypatch.setattr(reference_folder_validator, "os", _WindowsOs())
+    monkeypatch.setattr(
+        reference_folder_validator,
+        "_get_blocklist",
+        lambda: reference_folder_validator._WINDOWS_BLOCKLIST,
+    )
+
+
+@pytest.mark.parametrize(
+    "given, expected",
+    [
+        (_EXTENDED + "C:\\a", "C:\\a"),
+        ("//?/C:/a", "C:\\a"),
+        ("\\\\.\\C:\\a", "C:\\a"),
+        (_EXTENDED + "UNC\\host\\share\\a", "\\\\host\\share\\a"),
+        (_EXTENDED + "unc\\host\\share\\a", "\\\\host\\share\\a"),
+        ("\\\\.\\UNC\\host\\share", "\\\\host\\share"),
+        # No plain spelling exists for these, so they are compared as given.
+        (_EXTENDED + "Volume{0}\\a", _EXTENDED + "Volume{0}\\a"),
+        ("\\\\.\\pipe\\x", "\\\\.\\pipe\\x"),
+        ("C:\\a", "C:\\a"),
+    ],
+    ids=[
+        "drive",
+        "drive-slashes",
+        "device-drive",
+        "share",
+        "share-lowercase",
+        "device-share",
+        "volume-guid",
+        "pipe",
+        "plain",
+    ],
+)
+def test_plain_spelling_drops_a_namespace_prefix_only_where_one_exists(
+    given, expected, monkeypatch
+):
+    """Wrong if a prefixed drive or share keeps its prefix, so a comparison
+    reads it as a different folder, or if a path with no plain spelling is
+    rewritten into one it does not have."""
+    monkeypatch.setattr(path_utils, "os", _WindowsOs())
+    assert plain_spelling(given) == expected
+
+
+def test_plain_spelling_leaves_a_posix_path_alone(monkeypatch):
+    """Only Windows reads the prefix: ``//?/C:/a`` is an ordinary POSIX path."""
+    monkeypatch.setattr(path_utils, "os", _PosixOs())
+    assert plain_spelling("//?/C:/a") == "//?/C:/a"
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        _EXTENDED + "C:\\Windows\\System32",
+        "//?/C:/Windows/System32",
+        "\\\\.\\C:\\Windows",
+        _EXTENDED + "c:\\program files\\App",
+    ],
+    ids=["extended", "extended-slashes", "device", "extended-lowercase"],
+)
+def test_windows_blocklist_refuses_a_system_folder_spelled_with_a_prefix(
+    given, windows_paths
+):
+    """Wrong if ``\\\\?\\C:\\Windows`` passes: it is ``C:\\Windows``, and
+    Windows' ``realpath`` keeps a prefix it was given, so a literal compare
+    matched no entry and the route behind the check went on to scan it."""
+    assert validate_reference_folder_path(given) is not None
+
+
+def test_windows_blocklist_still_accepts_an_ordinary_prefixed_folder(windows_paths):
+    """Over-blocking is its own regression: a prefix is not itself a refusal,
+    and dropping it must not turn a sibling of an entry into a match."""
+    assert validate_reference_folder_path(_EXTENDED + "C:\\Pictures") is None
+    assert validate_reference_folder_path(_EXTENDED + "C:\\Windowsill") is None
+    assert validate_reference_folder_path("C:\\Windows") is not None
+
+
+def test_path_is_within_reads_a_prefixed_spelling_as_the_folder(windows_paths):
+    """Wrong if ``\\\\?\\C:\\lib\\x`` reads as outside ``C:\\lib``: an overlap
+    refusal asking whether a folder lies in a library then answers no."""
+    assert path_is_within(_EXTENDED + "C:\\lib\\x", "C:\\lib")
+    assert path_is_within("C:\\lib\\x", _EXTENDED + "C:\\lib")
+    assert path_is_within(
+        _EXTENDED + "UNC\\host\\share\\lib\\x", "\\\\host\\share\\lib"
+    )
+    # The prefix changes the spelling, never what is inside what.
+    assert not path_is_within(_EXTENDED + "C:\\libx", "C:\\lib")
+    assert not path_is_within(_EXTENDED + "D:\\lib\\x", "C:\\lib")
+
+
+def test_path_is_within_compares_a_resolved_path_raced_twice_plainly(
+    windows_paths, monkeypatch
+):
+    """The resolved check, reached only when the lexical one says no.
+
+    ``C:\\link`` is a junction to ``C:\\lib``, and a folder made under it
+    while ``realpath`` ran, twice, leaves the resolved path prefixed (see
+    :func:`_without_added_prefix`). Wrong if that reads as outside the root.
+    """
+
+    def _junction_raced(path):
+        # Both walks of the folder being made, the plain one included, race.
+        resolved = ntpath.normpath(path).replace("link", "lib")
+        if resolved.endswith("\\x"):
+            return _EXTENDED + resolved
+        return resolved
+
+    monkeypatch.setattr(_WindowsOs, "path", _PatchedNtPath(_junction_raced))
+    assert path_is_within("C:\\link\\x", "C:\\lib")
+    assert not path_is_within("C:\\link\\x", "C:\\other")
+
+
+def test_canonical_path_compares_a_prefixed_spelling_equal(windows_paths):
+    """Wrong if ``\\\\?\\C:\\Photos`` and ``C:\\Photos`` compare unequal: a
+    second reference folder over the same files is then accepted as free."""
+    assert canonical_path(_EXTENDED + "C:\\Photos") == canonical_path("C:\\Photos")
+    assert canonical_path(_EXTENDED + "UNC\\host\\share\\Photos") == (
+        canonical_path("\\\\host\\share\\Photos")
+    )
 
 
 # ---------------------------------------------------------------------------

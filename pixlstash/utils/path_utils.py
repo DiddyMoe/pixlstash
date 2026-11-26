@@ -8,6 +8,10 @@ import re
 _EXTENDED_PREFIX = "\\\\?\\"
 _EXTENDED_UNC_PREFIX = "\\\\?\\UNC\\"
 _DRIVE_PATH = re.compile(r"[A-Za-z]:\\")
+# The file and the device namespace prefix. Either, in front of a drive or a
+# share, names the same folder as the plain spelling.
+_NAMESPACE_PREFIXES = (_EXTENDED_PREFIX, "\\\\.\\")
+_UNC_PART = "unc\\"
 
 
 class LibraryRootsUnavailable(RuntimeError):
@@ -43,7 +47,8 @@ def _without_added_prefix(path: str, resolved: str) -> str:
     spelling is resolved again: with nothing racing it, ``realpath`` strips the
     prefix as designed, and a folder or file that appeared in between (a
     junction included) resolves to where it now points. A path raced a second
-    time keeps the prefix, and containment refuses it. A volume GUID path
+    time keeps the prefix: ``resolve_path_within`` refuses it, and
+    ``path_is_within`` compares its plain spelling. A volume GUID path
     (``\\\\?\\Volume{...}``) has no plain spelling and is kept.
 
     Args:
@@ -65,6 +70,43 @@ def _without_added_prefix(path: str, resolved: str) -> str:
     else:
         return resolved
     return os.path.realpath(plain)
+
+
+def plain_spelling(path: str) -> str:
+    """*path* without a Windows namespace prefix in front of a drive or a share.
+
+    ``\\\\?\\C:\\Windows`` and ``\\\\.\\C:\\Windows`` name ``C:\\Windows``, and
+    ``realpath`` keeps a ``\\\\?\\`` prefix it was given. A check comparing
+    strings therefore walked past a folder a caller spelled that way: the
+    system-folder blocklist matched no entry, and ``commonpath`` would not
+    compare the path with a plain one, so an overlap read as none. The
+    comparison helpers compare this spelling instead. It is for comparing
+    only: a path that is acted on keeps the spelling it was given.
+
+    A share's ``UNC\\`` becomes the leading ``\\\\`` it stands for. A volume
+    GUID path and any other device path have no plain spelling and are
+    returned as they are. Only a Windows path can carry the prefix, so nothing
+    changes on POSIX.
+
+    Args:
+        path: A path, in any case and with either slash.
+
+    Returns:
+        The plain spelling, normalised, or *path* unchanged.
+    """
+    if os.name != "nt":
+        return path
+    normalized = ntpath.normpath(path)
+    for prefix in _NAMESPACE_PREFIXES:
+        if not normalized.startswith(prefix):
+            continue
+        rest = normalized[len(prefix) :]
+        if rest[: len(_UNC_PART)].lower() == _UNC_PART:
+            return "\\\\" + rest[len(_UNC_PART) :]
+        if _DRIVE_PATH.match(rest):
+            return rest
+        break
+    return path
 
 
 def real_path(path: str | os.PathLike[str]) -> str:
@@ -139,6 +181,10 @@ def path_is_within(path: str, base: str) -> bool:
     outside it is therefore accepted: planting one requires filesystem write
     access, which is a bigger problem than this check is for.
 
+    Both checks compare :func:`plain_spelling`, so ``\\\\?\\C:\\lib\\x`` is
+    within ``C:\\lib``: it is the same folder, and a refusal asking whether a
+    path lies inside a library must not read it as outside.
+
     Args:
         path: The path to test. An empty value is never within anything.
         base: The directory *path* must be under.
@@ -149,12 +195,12 @@ def path_is_within(path: str, base: str) -> bool:
     if not path or not base:
         return False
     try:
-        norm_path = os.path.normcase(os.path.normpath(path))
-        norm_base = os.path.normcase(os.path.normpath(base))
+        norm_path = os.path.normcase(plain_spelling(os.path.normpath(path)))
+        norm_base = os.path.normcase(plain_spelling(os.path.normpath(base)))
         if os.path.commonpath([norm_path, norm_base]) == norm_base:
             return True
-        resolved_path = os.path.normcase(real_path(path))
-        resolved_base = os.path.normcase(real_path(base))
+        resolved_path = os.path.normcase(plain_spelling(real_path(path)))
+        resolved_base = os.path.normcase(plain_spelling(real_path(base)))
         return os.path.commonpath([resolved_path, resolved_base]) == resolved_base
     except ValueError:
         # Mixed absolute/relative paths or different drives: not within.
