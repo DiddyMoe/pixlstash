@@ -20,17 +20,14 @@ import { useNoticeStore } from "../stores/useNoticeStore";
 import { addModelFile } from "../api/modelFiles";
 import { useModelShelfStore } from "../stores/useModelShelfStore";
 import { useModelFoldersStore } from "../stores/useModelFoldersStore";
-import { listAdapters, listCheckpoints } from "../api/modelShelf";
+import { listModels } from "../api/modelShelf";
 import {
   modelDropChoice,
   settleModelDropChoice,
 } from "./useModelDropTarget";
 
 vi.mock("../api/modelFiles", () => ({ addModelFile: vi.fn() }));
-vi.mock("../api/modelShelf", () => ({
-  listAdapters: vi.fn(),
-  listCheckpoints: vi.fn(),
-}));
+vi.mock("../api/modelShelf", () => ({ listModels: vi.fn() }));
 
 const startLocalImport = vi.fn();
 
@@ -321,6 +318,16 @@ describe("useWindowFileImport", () => {
     ]);
   });
 
+  it("says only that the items could not be read when none of them could", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await dropFolderWithUnreadable("shoot", [], ["gone.jpg", "lost.jpg"]);
+    expect(startLocalImport).not.toHaveBeenCalled();
+    const warnings = notices.notices.filter((n) => n.level === "warning");
+    expect(warnings.map((n) => [n.key, n.text])).toEqual([
+      ["import-unreadable-items", "2 items could not be read and were skipped"],
+    ]);
+  });
+
   it("does not hold the pictures of a mixed drop behind the model copy", async () => {
     // A multi-gigabyte copy runs for minutes; the photos must not queue.
     let finishCopy;
@@ -401,22 +408,45 @@ describe("useWindowFileImport", () => {
       const folders = useModelFoldersStore();
       folders.folders = FOLDERS;
       folders.loaded = true;
-      listCheckpoints.mockResolvedValue([
-        { id: 5, sha256: null, locations: [at(3)] },
-      ]);
-      // One answer per kind, as the route gives: a VAE is only in its own.
-      listAdapters.mockImplementation(async ({ fileKind } = {}) => {
-        if (fileKind === "vae") {
-          return [{ id: 11, sha256: "e".repeat(64), locations: [at(4)] }];
-        }
-        if (fileKind) return [];
-        return [
-          { id: 6, sha256: "a".repeat(64), locations: [at(3), at(9)] },
-          { id: 7, sha256: "b".repeat(64), locations: [at(1)] },
-          { id: 8, sha256: "c".repeat(64), locations: [at(3, "missing")] },
-          { id: 10, sha256: "d".repeat(64), locations: [at(4)] },
-        ];
-      });
+      const rows = [
+        { id: 5, file_kind: "checkpoint", sha256: null, locations: [at(3)] },
+        {
+          id: 6,
+          file_kind: "adapter",
+          sha256: "a".repeat(64),
+          locations: [at(3), at(9)],
+        },
+        {
+          id: 7,
+          file_kind: "adapter",
+          sha256: "b".repeat(64),
+          locations: [at(1)],
+        },
+        {
+          id: 8,
+          file_kind: "adapter",
+          sha256: "c".repeat(64),
+          locations: [at(3, "missing")],
+        },
+        {
+          id: 10,
+          file_kind: "adapter",
+          sha256: "d".repeat(64),
+          locations: [at(4)],
+        },
+        {
+          id: 11,
+          file_kind: "vae",
+          sha256: "e".repeat(64),
+          locations: [at(4)],
+        },
+      ];
+      listModels.mockReset();
+      // Only the kinds asked for, as the route answers: a VAE is found only
+      // when the read names its kind.
+      listModels.mockImplementation(async (kinds) =>
+        rows.filter((row) => kinds.includes(row.file_kind)),
+      );
       withDesktopShell({ "lora.safetensors": "/home/me/Downloads/lora.safetensors" });
       target = document.createElement("div");
       target.appendChild(document.createElement("span"));
@@ -501,6 +531,21 @@ describe("useWindowFileImport", () => {
       expect(addModelFile).not.toHaveBeenCalled();
       // Said, not silent: the file was dropped and nothing happened to it.
       expect(notices.notices.at(-1).text).toBe("lora.safetensors not added.");
+    });
+
+    it("reads every kind a card can name in one request", async () => {
+      target.dataset.modelDropModels = "5";
+      await dropOn(target.firstChild, "lora.safetensors");
+      await settle();
+      expect(listModels).toHaveBeenCalledTimes(1);
+      expect([...listModels.mock.calls[0][0]].sort()).toEqual([
+        "adapter",
+        "checkpoint",
+        "controlnet",
+        "text_encoder",
+        "upscaler",
+        "vae",
+      ]);
     });
 
     it("counts a card's VAE, not only its checkpoint and LoRAs", async () => {

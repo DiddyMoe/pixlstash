@@ -61,12 +61,19 @@ export function useWindowFileImport({ sidebarRef }) {
   const noticeStore = useNoticeStore();
   const selectionStore = useSelectionStore();
 
-  function isInsideImageGrid(event) {
+  /**
+   * Whether the drop landed on a zone that imports the pictures itself: the
+   * grid (and the arriving tiles above it), or a zone marked
+   * `data-owns-file-drop`, such as the import dialog's. This listener runs
+   * first, in the capture phase, and would import the same pictures again.
+   */
+  function isOnPictureDropZone(event) {
     const target = event?.target;
     if (!(target instanceof Element)) return false;
-    // The arriving tiles above the grid are the grid's drop target too.
     return Boolean(
-      target.closest(".image-grid, .grid-scroll-wrapper, .grid-arriving"),
+      target.closest(
+        ".image-grid, .grid-scroll-wrapper, .grid-arriving, [data-owns-file-drop]",
+      ),
     );
   }
 
@@ -111,16 +118,22 @@ export function useWindowFileImport({ sidebarRef }) {
    * silently while importing the samples.
    */
   async function partitionDrop(dataTransfer) {
+    const reportUnreadable = unreadableDropReporter(dataTransfer);
+    let hadUnreadable = false;
     const all = await extractSupportedImportFilesFromDataTransfer(
       dataTransfer,
       {
         accept: (file) => isSupportedImportFile(file) || isModelFile(file),
-        onUnreadable: unreadableDropReporter(dataTransfer),
+        onUnreadable: (report) => {
+          hadUnreadable = true;
+          reportUnreadable(report);
+        },
       },
     );
     return {
       modelFiles: all.filter(isModelFile),
       pictureFiles: all.filter((file) => !isModelFile(file)),
+      hadUnreadable,
     };
   }
 
@@ -333,22 +346,23 @@ export function useWindowFileImport({ sidebarRef }) {
     const dropped = Array.from(event.dataTransfer?.files || []);
     const allModels = dropped.length > 0 && dropped.every(isModelFile);
     if (allModels) event.stopPropagation();
-    const insideGrid = isInsideImageGrid(event);
+    const onDropZone = isOnPictureDropZone(event);
     // Read now: the walk below awaits, and the target is the drop's to name.
     const modelDropTarget = modelDropTargetOf(event.target);
 
     // One walk, and it takes the pictures AND the model files: the flat list
     // reports a dropped folder as one unreadable entry, so a trainer's output
     // directory used to import its samples and drop the adapter in silence.
-    const { modelFiles, pictureFiles } = await partitionDrop(
+    const { modelFiles, pictureFiles, hadUnreadable } = await partitionDrop(
       event.dataTransfer,
     );
 
     // Started BEFORE the shelf work and never awaited with it: a model copy
     // runs for minutes, and the pictures of a mixed drop must not queue behind
-    // it. Inside the grid there is nothing to start - its own handler has the
-    // pictures already, with the character context this one lacks.
-    if (!insideGrid && pictureFiles.length) {
+    // it. On a zone that imports there is nothing to start - its own handler
+    // has the pictures already (the grid's with the character context this one
+    // lacks), and says itself when none of them are supported.
+    if (!onDropZone && pictureFiles.length) {
       const projectId = sidebarRef.value?.currentProjectId ?? null;
       sidebarRef.value?.startLocalImport?.(pictureFiles, projectId);
     }
@@ -357,7 +371,8 @@ export function useWindowFileImport({ sidebarRef }) {
       await addDroppedModelFiles(modelFiles, modelDropTarget);
       return;
     }
-    if (insideGrid || pictureFiles.length) return;
+    // The unreadable-items warning already said why nothing came in.
+    if (onDropZone || pictureFiles.length || hadUnreadable) return;
     noticeStore.warning(
       "None of those files are a supported image, video or archive.",
       { key: "import-unsupported-files" },

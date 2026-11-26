@@ -1,8 +1,13 @@
 <template>
   <div class="pf-wrapper">
-    <!-- Header bar: always visible, also acts as drop target when collapsed -->
+    <!-- Header bar: always visible, also acts as drop target when collapsed.
+         Both drop targets take the files as attachments themselves, so they
+         carry `data-owns-file-drop`: the window's capture handler
+         (useWindowFileImport) then leaves the pictures alone rather than also
+         importing them into the library. -->
     <div
       class="pf-header"
+      data-owns-file-drop
       :class="{ 'pf-drag-active': dragOver && !expanded }"
       @click="toggleExpanded"
       @dragover.prevent="onDragOver"
@@ -22,6 +27,7 @@
     <div
       v-if="expanded"
       class="pf-panel"
+      data-owns-file-drop
       :class="{ 'pf-drag-active': dragOver }"
       @dragover.prevent="onDragOver"
       @dragleave="onDragLeave"
@@ -106,15 +112,13 @@
           v-model="urlInput"
           class="pf-url-input"
           placeholder="https://..."
-          @keydown.enter="addUrl"
-          @keydown.escape="showUrlForm = false"
+          @keydown="onUrlKeydown"
         />
         <input
           v-model="urlTitle"
           class="pf-url-input"
           placeholder="Label (optional)"
-          @keydown.enter="addUrl"
-          @keydown.escape="showUrlForm = false"
+          @keydown="onUrlKeydown"
         />
         <div class="pf-url-form-actions">
           <AppButton size="sm" @click="showUrlForm = false"> Cancel </AppButton>
@@ -146,16 +150,20 @@ import {
   addProjectAttachmentUrl,
   deleteProjectAttachment,
 } from "../../api/projects";
+import { useConfirm } from "../../composables/useConfirm";
 import { useSubmitGuard } from "../../composables/useSubmitGuard";
 import { errorDetail } from "../../utils/apiError";
 import AppButton from "../widgets/AppButton.vue";
 import Tooltip from "../widgets/Tooltip.vue";
 import { API_BASE_URL } from "../../utils/apiClient";
 import { isOwnShareCopyDrop } from "../../utils/shareDrag.js";
+import { isImeComposing } from "../../utils/imeComposition.js";
 const props = defineProps({
   projectId: { type: Number, required: true },
   backendUrl: { type: String, default: () => API_BASE_URL },
 });
+
+const { confirm } = useConfirm();
 
 const expanded = ref(false);
 const files = ref([]);
@@ -277,7 +285,23 @@ function downloadFile(file) {
 }
 
 async function deleteFile(file) {
-  if (!window.confirm(`Remove "${file.original_filename}"?`)) return;
+  // An uploaded file is deleted from disk with its row; a link is only a row.
+  const ok = await confirm(
+    file.url
+      ? {
+          title: `Remove the link to "${urlLabel(file)}"?`,
+          message: "The page it points to is not affected.",
+          confirmLabel: "Remove link",
+        }
+      : {
+          title: `Delete "${file.original_filename}"?`,
+          message: "The file is removed from this project and deleted from disk.",
+          warning: "There is no undo for this.",
+          confirmLabel: "Delete file",
+          danger: true,
+        },
+  );
+  if (!ok) return;
   try {
     await deleteProjectAttachment(props.projectId, file.id);
     files.value = files.value.filter((f) => f.id !== file.id);
@@ -307,6 +331,15 @@ async function submitUrl() {
 // fields are only cleared after the await, so without this a second Enter or a
 // double-click on Add posts the same URL twice.
 const { pending: addingUrl, run: addUrl } = useSubmitGuard(submitUrl);
+
+// Enter in either field adds the link, Escape closes the form. The Enter that
+// commits an input method's composition, and the Escape that cancels it, are
+// the IME's.
+function onUrlKeydown(event) {
+  if (isImeComposing(event)) return;
+  if (event.key === "Enter") addUrl();
+  else if (event.key === "Escape") showUrlForm.value = false;
+}
 
 function urlLabel(file) {
   const name = file.original_filename || "";
