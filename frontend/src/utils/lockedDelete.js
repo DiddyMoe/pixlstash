@@ -15,6 +15,11 @@
 //
 // Every message names the LEVER. "These are locked" is a dead end; "unlock the
 // set and try again" is something the user can act on.
+//
+// Counts read as grouped figures ("1,200"), like every other count the user
+// sees; singular/plural is chosen on the raw number.
+
+import { DEFAULT_TIMEOUTS } from "../stores/useNoticeStore";
 
 /** Outcome kinds, in the order of how much the user needs to care. */
 export const LOCKED_DELETE_PARTIAL = "partial";
@@ -65,7 +70,7 @@ export function buildLockedDeleteMessage({
       kind: LOCKED_DELETE_ALL_LOCKED,
       title: "Nothing was deleted",
       body:
-        `All ${locked} selected ${lockedNoun} ${lockedIsAre} in ${lockedSet}, ` +
+        `All ${locked.toLocaleString()} selected ${lockedNoun} ${lockedIsAre} in ${lockedSet}, ` +
         `so ${plural(locked, "it was", "they were")} kept.`,
       hint: LOCKED_DELETE_HINT,
     };
@@ -75,9 +80,9 @@ export function buildLockedDeleteMessage({
     kind: LOCKED_DELETE_PARTIAL,
     title: "Some pictures were kept",
     body:
-      `${deleted} ${plural(deleted, "picture", "pictures")} ` +
+      `${deleted.toLocaleString()} ${plural(deleted, "picture", "pictures")} ` +
       `${forever ? "deleted forever" : "moved to the scrapheap"}; ` +
-      `${locked} ${lockedIsAre} in ${lockedSet} and ${plural(locked, "was", "were")} kept.`,
+      `${locked.toLocaleString()} ${lockedIsAre} in ${lockedSet} and ${plural(locked, "was", "were")} kept.`,
     hint: LOCKED_DELETE_HINT,
   };
 }
@@ -135,7 +140,49 @@ export function buildLockedPurgeNote(lockedCount = 0) {
   const set = plural(locked, "a locked set", "locked sets");
   const itThem = plural(locked, "it", "them");
   return (
-    `${locked} ${noun} ${isAre} in ${set} and will be kept - ` +
+    `${locked.toLocaleString()} ${noun} ${isAre} in ${set} and will be kept - ` +
     `neither action below deletes ${itThem}.`
   );
+}
+
+/**
+ * Report a delete's locked-set outcome: one warning with a Help action whose
+ * follow-up says how to unlock. Shared by the grid's soft delete and the run
+ * store's Delete forever, which may end while no grid is mounted.
+ *
+ * @param {Object} noticeStore - `useNoticeStore()`.
+ * @param {{title: string, body: string, hint: string}|null} message - from
+ *   `buildLockedDeleteMessage`; `null` means nothing was skipped, so stay quiet.
+ * @returns {boolean} whether a notice was raised.
+ */
+export function raiseLockedDeleteNotice(noticeStore, message) {
+  if (!message) return false;
+  noticeStore.warning(message.body, {
+    // One key for both the pre-flight block and the post-response outcome: a
+    // user retrying a locked selection gets one card with a count, not a stack.
+    key: "delete-skipped-locked",
+    // The ordinary `warning` window, restated explicitly for one reason: to opt
+    // out of the action⇒sticky default (§6 rule 1). This card reports what just
+    // happened to the current selection; it is not a companion to the unlock,
+    // which is several clicks deep in a sidebar context menu and will outlast
+    // any sane notice. It should be long gone by then. The reading-time floor
+    // still applies, and hover/focus still pauses it for a slow reader.
+    timeout: DEFAULT_TIMEOUTS.warning,
+    action: {
+      label: "Help",
+      handler: () => {
+        // Follow-up carrying the lever (how to unlock), too long for the
+        // one-sentence rule on the first card. No explicit window: the `info`
+        // default raised by the reading-time floor is exactly the right rule for
+        // a long sentence, and the same copy lives on the lock badge tooltip, so
+        // nothing is lost when it goes.
+        noticeStore.push({
+          level: "info",
+          text: message.hint,
+          key: "delete-skipped-locked-help",
+        });
+      },
+    },
+  });
+  return true;
 }

@@ -19,6 +19,7 @@ import { mount } from "@vue/test-utils";
 import { setActivePinia, createPinia } from "pinia";
 import { useSelectionStore } from "../../stores/useSelectionStore.js";
 import { useDedupStore } from "../../stores/useDedupStore.js";
+import { useNoticeStore } from "../../stores/useNoticeStore";
 import { ref } from "vue";
 
 const { dedupStoreMock } = vi.hoisted(() => ({
@@ -278,6 +279,74 @@ describe("completing the person suggestion search", () => {
     ).toBe(true);
 
     wrapper.unmount();
+  });
+});
+
+// A server fault on the assignment may still have committed it, so the grid
+// re-reads the suggestions; the notice says they were reloaded only when that
+// re-read landed.
+describe("an assignment whose answer was a server fault", () => {
+  async function assignWithFault({ reloadFails }) {
+    let suggestionRequestCount = 0;
+    apiPost.mockImplementation((url) => {
+      const requestUrl = String(url ?? "");
+      if (requestUrl.includes("/characters/9/faces")) {
+        const fault = new Error("Request failed with status code 500");
+        fault.response = { status: 500, data: {} };
+        return Promise.reject(fault);
+      }
+      if (requestUrl.includes("/pictures/face-search")) {
+        suggestionRequestCount += 1;
+        if (reloadFails && suggestionRequestCount > 1) {
+          return Promise.reject(new Error("Network Error"));
+        }
+        return Promise.resolve({
+          data: [
+            {
+              picture_id: 101,
+              face_id: 201,
+              likeness: 0.91,
+              reference_likeness: [0.91],
+            },
+          ],
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    apiGet.mockImplementation((url) => {
+      if (String(url ?? "").includes("/pictures?id=101")) {
+        return Promise.resolve({
+          data: [{ id: 101, format: "JPG", width: 100, height: 100 }],
+        });
+      }
+      return Promise.resolve({ data: { pictures: [], count: 0, total: 0 } });
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wrapper = mountGrid();
+    await wrapper.vm.$nextTick();
+    await armSuggestion(wrapper);
+    expect(wrapper.vm.faceSearchAssignIds).toEqual([101]);
+
+    await wrapper.vm.handleAssignFaceSearchResults();
+
+    expect(suggestionRequestCount).toBe(2);
+    const texts = useNoticeStore()
+      .notices.filter((n) => n.key === "character-face-search-assign-uncertain")
+      .map((n) => n.text);
+    wrapper.unmount();
+    return texts;
+  }
+
+  it("says the suggestions were reloaded when the re-read landed", async () => {
+    expect(await assignWithFault({ reloadFails: false })).toEqual([
+      "The assignment outcome is uncertain. Suggestions were reloaded from the server before you retry.",
+    ]);
+  });
+
+  it("says they could not be reloaded when the re-read failed too", async () => {
+    expect(await assignWithFault({ reloadFails: true })).toEqual([
+      "The assignment outcome is uncertain and the suggestions could not be reloaded, so reload the page before you retry.",
+    ]);
   });
 });
 

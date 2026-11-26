@@ -63,7 +63,7 @@ function requestConfirm() {
   <!-- Destructive: no @accept, Enter never schedules the deletion. -->
   <AppDialog
     :open="open"
-    role="alertdialog"
+    alert
     :title="props.title"
     size="sm"
     :persistent="busy"

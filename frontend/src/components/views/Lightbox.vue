@@ -1267,6 +1267,7 @@ import {
   rotateSkipNote,
 } from "../../utils/rotate.js";
 import { errorDetail } from "../../utils/apiError";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 // Failures report through the notice surface instead of a blocking native
 // alert() (docs/design/notice-surface.md §1).
@@ -2970,22 +2971,137 @@ function showPrevImage() {
   return navigateLightboxImage(-1);
 }
 
+// A step onto a slot the grid is still streaming in (a placeholder,
+// `id == null`) waits for its row instead of showing nothing: the snapshot
+// frozen on open keeps the placeholder while the stream writes the live row in
+// place, so the step first copies any filled slots in, and otherwise holds
+// `{fromId, direction, idx}` here until the live slot fills. A pick of the
+// slot itself (a filmstrip click, a delete moving on) holds `{fromId, idx}`,
+// with no direction, and shows that slot's row. A move elsewhere in the
+// meantime, or closing, drops it.
+const pendingLightboxStep = ref(null);
+
+/**
+ * Copy rows the stream has since written into the snapshot's placeholders, by
+ * the slot (`idx`) each placeholder holds; a slot past the live list's end is
+ * one the stream ended short of, so it leaves. Rows already in the snapshot
+ * are never copied twice. Real rows stay as frozen.
+ * @returns {boolean} whether the snapshot changed.
+ */
+function fillFrozenPlaceholders() {
+  const frozen = frozenAllImages.value;
+  if (!Array.isArray(frozen)) return false;
+  const live = Array.isArray(allImages.value) ? allImages.value : [];
+  const held = new Set(
+    frozen.filter((item) => item?.id != null).map((item) => String(item.id)),
+  );
+  let changed = false;
+  const next = [];
+  for (const item of frozen) {
+    if (item?.id != null || !Number.isInteger(item?.idx)) {
+      next.push(item);
+      continue;
+    }
+    if (item.idx >= live.length) {
+      changed = true;
+      continue;
+    }
+    const row = live[item.idx];
+    if (row?.id != null && !held.has(String(row.id))) {
+      held.add(String(row.id));
+      next.push(row);
+      changed = true;
+      continue;
+    }
+    next.push(item);
+  }
+  if (changed) frozenAllImages.value = next;
+  return changed;
+}
+
 function navigateLightboxImage(direction) {
+  pendingLightboxStep.value = null;
   const sorted = filmstripImages.value;
   if (!image.value || !sorted.length) return;
-  const idx = filmstripIndexById.value.get(String(image.value.id)) ?? -1;
+  const fromId = String(image.value.id);
+  const idx = filmstripIndexById.value.get(fromId) ?? -1;
   if (idx === -1) return;
   const nextIdx = (idx + direction + sorted.length) % sorted.length;
-  setLightboxImageById(sorted[nextIdx]?.id ?? null);
+  const target = sorted[nextIdx];
+  if (target?.id != null) {
+    setLightboxImageById(target.id);
+    return;
+  }
+  // Each pass fills at least one slot, so this ends.
+  if (fillFrozenPlaceholders()) {
+    navigateLightboxImage(direction);
+    return;
+  }
+  pendingLightboxStep.value = { fromId, direction, idx: target?.idx };
+}
+
+watch(
+  () => {
+    const step = pendingLightboxStep.value;
+    if (!open.value || !step || !Number.isInteger(step.idx)) return null;
+    const live = Array.isArray(allImages.value) ? allImages.value : [];
+    if (step.idx >= live.length) return "ended";
+    return live[step.idx]?.id ?? null;
+  },
+  (slot) => {
+    const step = pendingLightboxStep.value;
+    if (slot == null || !step) return;
+    if (String(image.value?.id ?? "") !== step.fromId) {
+      pendingLightboxStep.value = null;
+      return;
+    }
+    if (step.direction == null) showFrozenSlot(step.idx);
+    else navigateLightboxImage(step.direction);
+  },
+);
+
+/**
+ * Show the row of grid slot `slot`, which the snapshot holds as a placeholder:
+ * copy in what the stream has written, and otherwise wait on the current
+ * picture until the slot fills. A slot the stream ended short of has no row:
+ * the current picture stays, unless a delete took it out of the sequence, and
+ * then the last picture before the slot shows (only trailing slots end short,
+ * so that is the previous survivor).
+ * @param {number} slot - the placeholder's `idx`.
+ */
+function showFrozenSlot(slot) {
+  pendingLightboxStep.value = null;
+  if (!Number.isInteger(slot)) return;
+  fillFrozenPlaceholders();
+  const live = Array.isArray(allImages.value) ? allImages.value : [];
+  if (slot >= live.length) {
+    if (filmstripIndexById.value.has(String(image.value?.id ?? ""))) return;
+    const previous = filmstripImages.value.findLast((item) => item?.id != null);
+    if (previous) setLightboxImageById(previous.id);
+    return;
+  }
+  const row = live[slot];
+  if (row?.id != null && allImageById.value.has(String(row.id))) {
+    setLightboxImageById(row.id);
+    return;
+  }
+  pendingLightboxStep.value = {
+    fromId: String(image.value?.id ?? ""),
+    idx: slot,
+  };
 }
 
 function selectImageByIndex(idx) {
+  pendingLightboxStep.value = null;
   const list = filmstripImages.value;
   if (!Array.isArray(list)) return;
   const target = list[idx];
-  if (target) {
-    setLightboxImageById(target.id ?? null);
+  if (!target) return;
+  if (target.id != null) {
+    setLightboxImageById(target.id);
+    return;
   }
+  showFrozenSlot(target.idx);
 }
 
 function showNextImage() {
@@ -2999,6 +3115,7 @@ let deletedHere = [];
 
 watch(open, () => {
   deletedHere = [];
+  pendingLightboxStep.value = null;
 });
 
 const ARRIVED_CLASSES = [
@@ -3019,15 +3136,23 @@ function playArrival(from) {
   el.classList.add(`lightbox-media-inner--arrived-${from}`);
 }
 
-/** The next survivor after `currentId` in `list`, else the previous one. */
+/**
+ * The next survivor after `currentId` in `list`, else the previous one. A
+ * survivor may be a slot still streaming in: it then carries its `slot` and
+ * no `id`, and the caller waits on it (`showFrozenSlot`).
+ */
 function pickSurvivor(list, currentId, gone) {
   const at = list.findIndex((item) => String(item?.id) === currentId);
   if (at === -1) return null;
+  const survivor = (item, from) =>
+    item?.id != null
+      ? { id: item.id, from }
+      : { id: null, slot: item?.idx, from };
   for (let i = at + 1; i < list.length; i += 1) {
-    if (!gone.has(String(list[i]?.id))) return { id: list[i].id, from: "next" };
+    if (!gone.has(String(list[i]?.id))) return survivor(list[i], "next");
   }
   for (let i = at - 1; i >= 0; i -= 1) {
-    if (!gone.has(String(list[i]?.id))) return { id: list[i].id, from: "prev" };
+    if (!gone.has(String(list[i]?.id))) return survivor(list[i], "prev");
   }
   return null;
 }
@@ -3047,6 +3172,9 @@ function removePictures(ids) {
   // The reader may have stepped on while the delete was in flight: then the
   // picture on screen stays, and only the sequence loses the deleted one.
   const stays = !gone.has(currentId);
+  // Rows the stream wrote since open take their slots first, so the move
+  // lands on them rather than waiting on a slot already filled.
+  fillFrozenPlaceholders();
   const list = filmstripImages.value;
   const stackId = getPictureStackId(image.value);
   const stackList =
@@ -3103,6 +3231,11 @@ function removePictures(ids) {
   lightboxStackSignatures.value = signatures;
 
   if (stays) return true;
+  if (target.id == null) {
+    // A slot still streaming in: wait on it as a step onto one does.
+    showFrozenSlot(target.slot);
+    return true;
+  }
   setLightboxImageById(target.id);
   playArrival(target.from);
   void ensureLightboxFilmstripForImage();
@@ -3151,12 +3284,21 @@ function handleKeydown(e) {
   // its handler runs first; without this, ImageGrid would process the same
   // keypress (e.g. Escape) after the lightbox has already handled it.
   e.stopImmediatePropagation();
+  // A key an input method's composition takes (Enter commits the candidate,
+  // Escape cancels it, the arrows walk its list) belongs to the field it is
+  // composing in: no shortcut below acts on it, and nothing is prevented.
+  if (isImeComposing(e)) return;
   // The Run popup the Edit tab opened sits over the lightbox: its keys are its
   // own, and an arrow or Escape must not step or close the lightbox below.
   if (runDialogStore.source || runDialogStore.makeMore) return;
   // So does a dialog over it (the Scrapheap's Delete forever confirm): an
   // arrow under it would move the picture its confirm is about.
   if (document.querySelector(".v-overlay--active.v-dialog")) return;
+  // And a key pressed inside an open menu or popover (the rating, the
+  // Filters, the title bar's) is that menu's, under the WAI-ARIA menu
+  // pattern: Delete or an arrow on a menu item must not delete or step the
+  // picture behind it.
+  if (e.target?.closest?.(".v-overlay__content")) return;
   if (filmstripMenu.value) {
     if (e.key === "Escape") closeFilmstripMenu();
     return;
@@ -3358,7 +3500,7 @@ function handleKeydown(e) {
         // Nothing is typed into a slider or a checkbox: a Refine slider
         // just let go of must not stop Escape clearing the selection.
         target.blur();
-      } else if (target.closest(".edit-pane") && !e.isComposing) {
+      } else if (target.closest(".edit-pane")) {
         // A text field in the Edit tab (the instruction box) lets go on Escape
         // and nothing more: the next Escape carries on down the order below.
         e.preventDefault();
@@ -5442,6 +5584,10 @@ async function openCreatePersonForFace(face, query) {
  */
 function onCreatePersonKeydownCapture(e) {
   if (!createPersonOpen.value || e.key !== "Escape") return;
+  // Escape that cancels an input method's composition in one of the dialog's
+  // fields closes nothing. Left to bubble: the dialog stops it short of
+  // Vuetify's overlay and of this component's window handler.
+  if (isImeComposing(e)) return;
   e.stopImmediatePropagation();
   e.preventDefault();
   handleCreatePersonClose();

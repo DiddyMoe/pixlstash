@@ -52,6 +52,7 @@ export function useGridScoring({
   triggerNewImageHighlight,
   updateVisibleThumbnails,
   removeImagesById,
+  rowFitsMediaFilter,
 }) {
   const sortStore = useSortStore();
   const filterStore = useFilterStore();
@@ -438,6 +439,10 @@ export function useGridScoring({
   // `options.highlight` (default true) drives the new-picture flash. A scrapheap
   // comeback passes false: the flash means "this was not here before", which is
   // the wrong story for a picture the user just undid the removal of.
+  // A row the Images/Videos filter would not show is not inserted
+  // (`rowFitsMediaFilter`): the grid renders a window of the filtered list by
+  // unfiltered index, so a row it holds but the filter drops moves every card
+  // after it one slot early.
   async function insertGridImagesById(ids, options = {}) {
     const highlight = options?.highlight !== false;
     const wanted = (Array.isArray(ids) ? ids : [])
@@ -503,22 +508,34 @@ export function useGridScoring({
     const base = Array.isArray(lastFetchedGridImages.value)
       ? lastFetchedGridImages.value.slice()
       : [];
+    // Read again after the await: the grid may have changed while the rows
+    // were on the wire.
+    const held = new Set(base.map((img) => getPictureId(img?.id)));
+    const sortsAfter = (img, key) => {
+      const otherKey = gridImageSortKey(img);
+      return descending ? otherKey < key : otherKey > key;
+    };
     const inserted = [];
     for (const pic of fetched) {
       const picId = getPictureId(pic?.id);
-      if (
-        picId === null ||
-        base.some((img) => getPictureId(img?.id) === picId)
-      ) {
+      if (picId === null || !rowFitsMediaFilter(pic) || held.has(picId)) {
         continue;
       }
+      // The grid is in sort order, so the first row that sorts after the new
+      // one is found by halving, and a row goes after the rows it ties with.
+      // A scan read every row's key per insert: a run restoring 1,000
+      // pictures into a 50,000-row grid held the page for about 8 s, against
+      // about 10 ms this way.
       const key = gridImageSortKey(pic);
-      let insertIndex = base.findIndex((img) => {
-        const otherKey = gridImageSortKey(img);
-        return descending ? otherKey < key : otherKey > key;
-      });
-      if (insertIndex === -1) insertIndex = base.length;
-      base.splice(insertIndex, 0, pic);
+      let low = 0;
+      let high = base.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (sortsAfter(base[mid], key)) high = mid;
+        else low = mid + 1;
+      }
+      base.splice(low, 0, pic);
+      held.add(picId);
       inserted.push(picId);
     }
     if (!inserted.length) return;

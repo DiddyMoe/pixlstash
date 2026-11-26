@@ -4,9 +4,11 @@
 // once. What is pinned is that a pane whose tab is not showing reads nothing,
 // that the first showing reads the list, the restore status and the daily
 // setting, and that coming back to the tab does not read them again. Also that
-// the Automatic snapshots switch takes no toggle until that setting is read.
+// the Automatic snapshots switch takes no toggle until that setting is read,
+// and that deleting a snapshot asks in the app's dialog and deletes nothing on
+// no.
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import { nextTick } from "vue";
 
@@ -32,6 +34,7 @@ const store = vi.hoisted(() => ({
   fetchSnapshots: vi.fn(),
   fetchStatus: vi.fn(),
   fetchSnapshotSettings: vi.fn(),
+  deleteSnapshot: vi.fn(),
 }));
 // Reactive, so a change of the read flag reaches a mounted section the way the
 // Pinia store's does.
@@ -43,6 +46,12 @@ vi.mock("../../stores/useSnapshotsStore", async () => {
 
 import SnapshotsSection from "./SnapshotsSection.vue";
 import { useSnapshotsStore } from "../../stores/useSnapshotsStore";
+import {
+  activeConfirm,
+  registerConfirmHost,
+  resolveConfirm,
+  unregisterConfirmHost,
+} from "../../composables/useConfirm";
 
 /** How many times each of the section's three reads has run. */
 function reads() {
@@ -58,6 +67,13 @@ beforeEach(() => {
   store.fetchSnapshots.mockReset().mockResolvedValue(undefined);
   store.fetchStatus.mockReset().mockResolvedValue(undefined);
   store.fetchSnapshotSettings.mockReset().mockResolvedValue(undefined);
+  store.deleteSnapshot.mockReset().mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  unregisterConfirmHost();
+  store.snapshots = [];
+  vi.restoreAllMocks();
 });
 
 describe("a hidden snapshots section reads nothing until it is shown", () => {
@@ -103,6 +119,53 @@ describe("the Automatic snapshots switch waits for the saved setting", () => {
     useSnapshotsStore().snapshotSettingsLoading = false;
     await nextTick();
     expect(toggle.props("disabled")).toBe(false);
+
+    wrapper.unmount();
+  });
+});
+
+describe("deleting a snapshot asks first", () => {
+  it("asks in the app's dialog, and deletes nothing on no", async () => {
+    registerConfirmHost();
+    const nativeConfirm = vi.spyOn(window, "confirm");
+    store.snapshots = [
+      {
+        id: 41,
+        kind: "manual",
+        label: "before the cleanup",
+        created_at: "2026-11-20T10:00:00Z",
+        is_compatible: true,
+        picture_count: 3,
+        byte_size: 2048,
+      },
+    ];
+    const wrapper = mount(SnapshotsSection, {
+      props: { open: true, active: true },
+    });
+    await flushPromises();
+    const del = wrapper.find('.snapshot-row-actions button[aria-label="Delete"]');
+    expect(del.exists()).toBe(true);
+
+    await del.trigger("click");
+    await flushPromises();
+    expect(activeConfirm.value.options).toMatchObject({
+      title: 'Delete snapshot "before the cleanup"?',
+      message: "The library can no longer be restored to this point.",
+      warning: "There is no undo for this.",
+      confirmLabel: "Delete snapshot",
+      danger: true,
+    });
+    resolveConfirm(false);
+    await flushPromises();
+    expect(store.deleteSnapshot).not.toHaveBeenCalled();
+
+    await del.trigger("click");
+    await flushPromises();
+    expect(store.deleteSnapshot).not.toHaveBeenCalled();
+    resolveConfirm(true);
+    await flushPromises();
+    expect(store.deleteSnapshot).toHaveBeenCalledWith(41);
+    expect(nativeConfirm).not.toHaveBeenCalled();
 
     wrapper.unmount();
   });

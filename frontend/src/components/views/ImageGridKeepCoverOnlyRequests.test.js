@@ -269,10 +269,39 @@ describe("Keep cover only over a selection of 1,201 stacks", () => {
     );
     // The second request may have committed, so totals are not claimed...
     expect(noteNextReceipt).not.toHaveBeenCalled();
-    // ...and the grid is read again instead of trusted.
-    await vi.waitFor(() => expect(gridQueryCount()).toBeGreaterThan(0), {
-      timeout: 2500,
+    // ...and the grid is read again instead of trusted, before the notice
+    // says it was.
+    expect(gridQueryCount()).toBeGreaterThan(0);
+    expect(noticeTexts()[0]).toContain(
+      "The grid has been reloaded to show where things stand.",
+    );
+  });
+
+  it("says the grid could not be reloaded when that re-read fails too", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await selectEveryStack();
+    await openDialog();
+    let runs = 0;
+    apiPost.mockImplementation(async (url, body) => {
+      runs += 1;
+      if (runs === 2) {
+        // The connection is gone, so the grid's re-read fails with it.
+        apiGet.mockImplementation(() => Promise.reject(lostAnswer()));
+        throw lostAnswer();
+      }
+      return { data: resultFor(body.stack_ids) };
     });
+
+    await setup.runKeepCoverOnly();
+    await flushPromises();
+
+    expect(gridQueryCount()).toBeGreaterThan(0);
+    expect(noticeTexts()).toHaveLength(1);
+    expect(noticeTexts()[0]).toContain(
+      "The grid could not be reloaded either, so reload the page to see where things stand.",
+    );
+    expect(noticeTexts()[0]).not.toContain("has been reloaded");
   });
 
   it("asks again when the first request finds the plan grew", async () => {

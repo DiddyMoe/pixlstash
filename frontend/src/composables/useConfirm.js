@@ -4,14 +4,9 @@ import { readonly, ref } from "vue";
 // hand-rolled "Are you sure" dialogs (and the scattered `window.confirm` calls)
 // with a single awaited promise.
 //
-// SCAFFOLD STATUS: this is the request/resolve state machine plus the host-facing
-// API a future `ConfirmDialog.vue` will consume. The visible dialog surface is
-// NOT built here - that is the maintainer's design pass. Until a host registers
-// itself, `confirm()` PROGRESSIVELY FALLS BACK to the native `window.confirm`,
-// so adoption sites keep their exact current behaviour today and upgrade to the
-// styled dialog automatically once the host mounts. This is a documented default
-// state, not a bug-masking fallback: it is the intended behaviour until Phase 2
-// lands the host, and the fallback path is explicit and logged in tests.
+// Host: ConfirmDialog.vue, mounted once in App.vue; with no host mounted
+// (tests, early boot) confirm() falls back to window.confirm(message || title),
+// so put every material fact in `message`.
 
 // The single in-flight request the host renders: { id, options, resolve } | null.
 const activeRequest = ref(null);

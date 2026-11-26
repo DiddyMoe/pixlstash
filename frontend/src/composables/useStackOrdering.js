@@ -66,6 +66,7 @@ export function useStackOrdering(
     setStackReorderHoverSide,
     selectedImageIds,
     preserveScrollOnNextFetch,
+    loadFoldsStacks,
   },
   props,
   emit,
@@ -79,6 +80,7 @@ export function useStackOrdering(
     clearSelection,
     getPendingRanges,
     setPendingRanges,
+    rowFitsMediaFilter,
   },
 ) {
   const sortStore = useSortStore();
@@ -153,8 +155,13 @@ export function useStackOrdering(
   }
 
   // ── Grid data mapping (used by stack expand/collapse) ─────────────────────
+  // Folds each stack to one card, unless the load that fetched the rows kept
+  // every row (useGridFetch's loadFoldsStacks: the Scrapheap). The load and
+  // every rebuild from lastFetchedGridImages fold through here, so a removal
+  // or a facet refresh shows the same cards the load showed.
   function collapseStackImages(images) {
     if (!Array.isArray(images) || images.length === 0) return [];
+    if (!loadFoldsStacks.value) return images;
     const counts = new Map();
     for (const img of images) {
       const stackId = getPictureStackId(img);
@@ -319,6 +326,12 @@ export function useStackOrdering(
       if (!img || img.id == null) return;
       const key = String(img.id);
       if (seen.has(key)) return;
+      // The members list is read unfiltered (`listStackPictures`), so a member
+      // the Images/Videos filter would not show stays out, as the stream and
+      // the by-id inserts keep it out: the grid renders a window of the
+      // filtered list by unfiltered index, and a held row the filter drops
+      // moves every card after it one slot early.
+      if (!rowFitsMediaFilter(img)) return;
       seen.add(key);
       const withStack =
         img.stack_id !== undefined || img.stackId !== undefined
@@ -889,6 +902,10 @@ export function useStackOrdering(
     if (!stackId || !expandedStackIds.value.has(stackId)) return null;
     const count = getStackReorderCount(stackId, getStackBadgeCount(source));
     if (count <= 1) return null;
+    // The order route refuses a list that misses a member, so a stack the
+    // grid holds only part of (the Images/Videos filter keeps a member out)
+    // offers no drag to reorder, as it offers no Move earlier/later.
+    if (getRenderedStackMemberIds(stackId).length < count) return null;
     return { stackId, imageId: String(sourceId) };
   }
 

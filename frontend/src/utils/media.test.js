@@ -503,6 +503,18 @@ describe('unreadableDropReporter', () => {
     )
   })
 
+  it("groups a large count the way the locale does", () => {
+    const notices = useNoticeStore();
+    unreadableDropReporter({})({ count: 1200, examples: [] });
+
+    expect(notices.notices.at(-1).text).toBe(
+      `${(1200).toLocaleString()} items could not be read and were skipped`,
+    );
+    expect(notices.notices.at(-1).text).toBe(
+      "1,200 items could not be read and were skipped",
+    );
+  });
+
   it('warns once per drop, however many handlers walk it', () => {
     const notices = useNoticeStore()
     const drop = {}

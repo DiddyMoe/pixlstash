@@ -4,14 +4,17 @@
        called back, so nothing may look like a cancel then. -->
   <AppDialog
     :open="open"
-    role="alertdialog"
+    alert
+    :aria-describedby="leadId"
     title="Remove folder"
     :subtitle="subtitle"
     size="lg"
     :persistent="working"
     @close="dismiss"
   >
-    <p class="srf-lead" data-testid="remove-folder-lead">{{ lead }}</p>
+    <p :id="leadId" class="srf-lead" data-testid="remove-folder-lead">
+      {{ lead }}
+    </p>
     <p v-if="changed" class="srf-note" role="status">
       The folder changed since it was read. This is what is in it now.
     </p>
@@ -109,7 +112,7 @@
 // Permanently delete, and the click's own `shiftKey` is what decides: the
 // tracked key only changes the label, as on the selection pill.
 
-import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref, useId, watch } from "vue";
 
 import AppButton from "../widgets/AppButton.vue";
 import AppDialog from "../widgets/AppDialog.vue";
@@ -132,6 +135,10 @@ const props = defineProps({
 
 /** `removed` comes just before the `close` of a removal that went through. */
 const emit = defineEmits(["close", "removed", "move-models"]);
+
+// The dialog is described by its lead sentence: the columns and the typed
+// field are detail, not the message (APG alertdialog).
+const leadId = useId();
 
 const EMPTY = { files: [], models: [], copies: [], breaks: {}, pictures: 0, name: "" };
 

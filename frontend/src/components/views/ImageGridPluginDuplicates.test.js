@@ -189,6 +189,23 @@ describe("ImageGrid - plugin run whose output already exists", () => {
     wrapper.unmount();
   });
 
+  it("groups a large count as a person reads it", async () => {
+    const ids = Array.from({ length: 1200 }, (_, i) => 1000 + i);
+    pluginResponses.auto_crop = {
+      status: "success",
+      created_picture_ids: [],
+      duplicate_picture_ids: ids,
+      output_picture_ids: ids,
+    };
+    const wrapper = mountGrid();
+    await runPlugin(wrapper, "auto_crop", [42, 43, 44]);
+
+    expect(notices()[0].text).toBe(
+      "Auto Crop: 1,200 images are already in your library",
+    );
+    wrapper.unmount();
+  });
+
   it("says nothing when every output was new", async () => {
     pluginResponses.auto_crop = {
       status: "success",

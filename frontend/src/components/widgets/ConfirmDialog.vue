@@ -43,8 +43,10 @@ onBeforeUnmount(unregisterConfirmHost);
 </script>
 
 <template>
+  <!-- An alertdialog: the question stops the work until it is answered. -->
   <AppDialog
     :open="Boolean(activeConfirm)"
+    alert
     :title="activeConfirm?.options.title ?? ''"
     @close="settle(false)"
     @accept="settle(true)"

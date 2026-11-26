@@ -184,10 +184,22 @@ export function isDestructiveOpType(opType) {
   return DESTRUCTIVE_RULES.some((pattern) => pattern.test(key));
 }
 
+// Operations whose server summary already states what it counted. Their
+// `target_count` is every picture in the diff, which also counts a cover that
+// only gained metadata from its copies, so a suffix put a second, larger
+// number beside the summary's own: "Kept the cover of 6 stacks · 12 pictures
+// to the Scrapheap · 13" (X-4). See keep_cover_only_summary and
+// keep_recipes_only_summary in pixlstash/services/operation_log_service.py.
+const SUMMARY_STATES_ITS_COUNTS = new Set([
+  "stack.keep_cover_only",
+  "stack.keep_recipes_only",
+]);
+
 /**
  * Human label for an operation. The server's `summary` is the single source of
  * truth for the wording; the target count is appended so one glance answers
- * "how much would this undo?" - the design's `Add tag "portrait" · 12` shape.
+ * "how much would this undo?" - the design's `Add tag "portrait" · 12` shape -
+ * except where the summary already gives its counts (SUMMARY_STATES_ITS_COUNTS).
  *
  * Falls back to the dotted `op_type`, de-dotted, when a lane records a row
  * without a summary: an unlabelled step is still better than a blank row.
@@ -199,6 +211,7 @@ export function summarizeOperation(operation) {
   if (!operation) return "";
   const raw = String(operation.summary ?? "").trim();
   const base = raw || humanizeOpType(operation.op_type);
+  if (raw && SUMMARY_STATES_ITS_COUNTS.has(operation.op_type)) return raw;
   const count = Number(operation.target_count);
   // Grouped, like every other count in the product: "2,700", not "2700".
   if (Number.isFinite(count) && count > 1) {

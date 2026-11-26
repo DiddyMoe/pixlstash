@@ -6,6 +6,7 @@ import {
   buildLockedDeleteMessage,
   buildLockedPurgeNote,
   deleteForeverDestroyCounts,
+  raiseLockedDeleteNotice,
 } from "./lockedDelete.js";
 
 describe("buildLockedDeleteMessage - nothing locked", () => {
@@ -184,5 +185,64 @@ describe("deleteForeverDestroyCounts", () => {
         lockedCount: undefined,
       }),
     ).toEqual({ deleteAll: 0, deleteUnprotectedOnly: 0, kept: 0 });
+  });
+});
+
+// Counts read as grouped figures, as everywhere else; the plural is chosen on
+// the raw number.
+describe("locked-set copy - grouped figures", () => {
+  it("groups the counts in all three messages", () => {
+    expect(
+      buildLockedDeleteMessage({ lockedCount: 1200, deletedCount: 0 }).body,
+    ).toBe(
+      "All 1,200 selected pictures are in locked sets, so they were kept.",
+    );
+    expect(
+      buildLockedDeleteMessage({ lockedCount: 1200, deletedCount: 3400 }).body,
+    ).toBe(
+      "3,400 pictures moved to the scrapheap; 1,200 are in locked sets and were kept.",
+    );
+    expect(buildLockedPurgeNote(1200)).toBe(
+      "1,200 pictures are in locked sets and will be kept - neither action below deletes them.",
+    );
+  });
+});
+
+describe("raiseLockedDeleteNotice", () => {
+  function fakeNoticeStore() {
+    const raised = [];
+    return {
+      raised,
+      warning: (text, options) =>
+        raised.push({ level: "warning", text, ...options }),
+      push: (notice) => raised.push(notice),
+    };
+  }
+
+  it("stays quiet when nothing was skipped", () => {
+    const store = fakeNoticeStore();
+    expect(raiseLockedDeleteNotice(store, null)).toBe(false);
+    expect(store.raised).toEqual([]);
+  });
+
+  it("raises one keyed warning whose Help says how to unlock", () => {
+    const store = fakeNoticeStore();
+    const message = buildLockedDeleteMessage({
+      lockedCount: 2,
+      deletedCount: 1,
+    });
+    expect(raiseLockedDeleteNotice(store, message)).toBe(true);
+    expect(store.raised).toHaveLength(1);
+    expect(store.raised[0]).toMatchObject({
+      level: "warning",
+      text: message.body,
+      key: "delete-skipped-locked",
+    });
+    store.raised[0].action.handler();
+    expect(store.raised[1]).toMatchObject({
+      level: "info",
+      text: LOCKED_DELETE_HINT,
+      key: "delete-skipped-locked-help",
+    });
   });
 });

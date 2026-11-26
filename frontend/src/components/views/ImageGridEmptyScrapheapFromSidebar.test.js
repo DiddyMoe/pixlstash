@@ -61,6 +61,8 @@ vi.mock("../../utils/apiClient", async () => {
     logout: vi.fn(),
     sessionContext,
     setRequestClientId: vi.fn(),
+    // A Scrapheap run start carries the gesture's request id.
+    newOperationBatchId: () => "cli-test-gesture",
     API_BASE_URL: "/api/v1",
   };
 });
@@ -157,6 +159,8 @@ async function emptyScrapheapFromSidebar(wrapper) {
 
 beforeEach(() => {
   setActivePinia(createPinia());
+  // The runs a tab started outlive its store, as they do a reload.
+  sessionStorage.clear();
   apiGet.mockReset();
   apiPost.mockReset();
   apiPatch.mockReset();
@@ -219,6 +223,11 @@ describe('sidebar "Empty Scrapheap" opens the delete-forever confirm', () => {
     // Authoritative "nothing to delete" - never open a destructive confirm on it.
     await vi.waitFor(() => expect(wrapper.vm.deleteForeverLoading).toBe(false));
     expect(wrapper.vm.deleteForeverOpen).toBe(false);
+    // ...and never end the gesture in silence.
+    expect(noticeWithKey("scrapheap-delete-preview")).toMatchObject({
+      level: "info",
+      text: "The Scrapheap is already empty, so there was nothing to delete.",
+    });
 
     wrapper.unmount();
   });
@@ -269,7 +278,10 @@ describe('sidebar "Empty Scrapheap" opens the delete-forever confirm', () => {
           kind: "purge",
           include_protected: false,
           confirm_token: "test-confirmation",
+          // The gesture's request id, resent unchanged on a lost answer.
+          request_id: "cli-test-gesture",
         },
+        { headers: { Prefer: "wait=1" } },
       ],
     ]);
     // The one-request purge that timed out on a large heap is not used.
@@ -315,6 +327,147 @@ describe('sidebar "Empty Scrapheap" opens the delete-forever confirm', () => {
         "grid. This can start once it ends.",
     });
 
+    wrapper.unmount();
+  });
+});
+
+/** The grid's reads of the Scrapheap listing (its count opens every fetch). */
+function scrapheapListingReads() {
+  return apiGet.mock.calls.filter(([url]) => {
+    const text = String(url ?? "");
+    return (
+      text.startsWith("/pictures/count?") && text.includes("only_deleted=true")
+    );
+  });
+}
+
+// A Scrapheap Delete forever against pictures that already left the heap (a
+// purge that committed after its request timed out, or another tab) used to
+// end in silence twice over: the zero-count preview returned without a word,
+// and a second click while the preview was out was dropped without one.
+describe("Scrapheap Delete forever never ends in silence", () => {
+  const EMPTY_PREVIEW = {
+    data: {
+      confirm_token: "tok-0",
+      total_count: 0,
+      protected_count: 0,
+      unprotected_count: 0,
+      locked_count: 0,
+      protected: [],
+    },
+  };
+
+  it("says the pictures are gone and re-reads the heap and the sidebar", async () => {
+    apiPost.mockResolvedValue(EMPTY_PREVIEW);
+    const wrapper = mountGrid({ selectedCharacter: SCRAPHEAP_PICTURES_ID });
+    // Let the view's own first read of the heap land, so the one counted
+    // below can only be the re-read.
+    await vi.waitFor(() =>
+      expect(scrapheapListingReads().length).toBeGreaterThan(0),
+    );
+    await vi.waitFor(() => expect(wrapper.vm.imagesLoading).toBe(false));
+    apiPost.mockClear();
+    const readsBefore = scrapheapListingReads().length;
+
+    wrapper.vm.openDeleteForeverForSelection([11, 12, 13]);
+    await vi.waitFor(() => expect(wrapper.vm.deleteForeverLoading).toBe(false));
+
+    expect(previewCalls()).toHaveLength(1);
+    expect(wrapper.vm.deleteForeverOpen).toBe(false);
+    expect(noticeWithKey("scrapheap-delete-preview")).toMatchObject({
+      level: "info",
+      text: "Those pictures are no longer in the Scrapheap, so there was nothing to delete.",
+    });
+    expect(wrapper.emitted("refresh-sidebar")).toHaveLength(1);
+    // The stale tiles are the only way to reach this state, so they go too.
+    await vi.waitFor(
+      () => expect(scrapheapListingReads().length).toBeGreaterThan(readsBefore),
+      { timeout: 3000 },
+    );
+    wrapper.unmount();
+  });
+
+  it("says the first check is still running when a second Delete arrives", async () => {
+    let release;
+    apiPost.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const wrapper = mountGrid({ selectedCharacter: SCRAPHEAP_PICTURES_ID });
+    await nextTick();
+    apiPost.mockClear();
+
+    wrapper.vm.openDeleteForeverForSelection([11]);
+    await nextTick();
+    expect(wrapper.vm.deleteForeverLoading).toBe(true);
+    wrapper.vm.openDeleteForeverForSelection([12, 13]);
+    await nextTick();
+
+    expect(previewCalls()).toHaveLength(1);
+    expect(noticeWithKey("scrapheap-delete-preview")).toMatchObject({
+      level: "info",
+      text: "Still checking what Delete forever would destroy…",
+    });
+    // The refused gesture must not retarget the pending one: the confirm acts
+    // on the ids the preview (and its token) was asked about.
+    expect(wrapper.vm.deleteForeverIds).toEqual([11]);
+    expect(wrapper.vm.deleteForeverMode).toBe("selection");
+
+    release({
+      data: {
+        confirm_token: "tok-11",
+        total_count: 1,
+        protected_count: 0,
+        unprotected_count: 1,
+        locked_count: 0,
+        protected: [],
+      },
+    });
+    await vi.waitFor(() => expect(wrapper.vm.deleteForeverOpen).toBe(true));
+    expect(wrapper.vm.deleteForeverIds).toEqual([11]);
+    wrapper.unmount();
+  });
+
+  it("refuses an Empty while a selection's check is out, without retargeting it", async () => {
+    apiPost.mockImplementation(() => new Promise(() => {}));
+    const wrapper = mountGrid({ selectedCharacter: SCRAPHEAP_PICTURES_ID });
+    await nextTick();
+    apiPost.mockClear();
+
+    wrapper.vm.openDeleteForeverForSelection([11]);
+    await nextTick();
+    wrapper.vm.confirmEmptyScrapheap();
+    await nextTick();
+
+    expect(previewCalls()).toHaveLength(1);
+    expect(wrapper.vm.deleteForeverMode).toBe("selection");
+    expect(noticeWithKey("scrapheap-delete-preview")?.text).toBe(
+      "Still checking what Delete forever would destroy…",
+    );
+    wrapper.unmount();
+  });
+
+  it("shows the bar that the check is under way, by what it was asked about", async () => {
+    let release;
+    apiPost.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const wrapper = mountGrid({ selectedCharacter: SCRAPHEAP_PICTURES_ID });
+    await nextTick();
+    const bar = () => wrapper.findComponent({ name: "EmptyScrapHeap" });
+    expect(bar().props("checking")).toBe(null);
+
+    wrapper.vm.openDeleteForeverForAll();
+    await nextTick();
+    expect(bar().props("checking")).toBe("all");
+
+    release(EMPTY_PREVIEW);
+    await vi.waitFor(() => expect(bar().props("checking")).toBe(null));
     wrapper.unmount();
   });
 });

@@ -66,8 +66,10 @@ function onClose() {
 
 <template>
   <!--
-    `role` and `aria-describedby` fall through AppDialog to Vuetify's overlay
-    root, which already carries aria-modal; AppDialog names it from the title.
+    `alert` makes it an alertdialog; the `aria-describedby` passed here falls
+    through AppDialog to Vuetify's overlay root (which already carries
+    aria-modal) and wins over the body AppDialog would name. AppDialog names it
+    from the title.
     The switch in flight has no sane close, so the dialog is persistent then and
     close is a no-op; once it has failed, closing means staying.
   -->
@@ -77,7 +79,7 @@ function onClose() {
     :title="title"
     size="md"
     :persistent="phase === 'switching'"
-    role="alertdialog"
+    alert
     :aria-describedby="describedBy"
     @keydown="blockEscape"
     @close="onClose"

@@ -13,12 +13,14 @@ import {
   VProgressCircular,
   VIcon,
 } from "vuetify/components";
+import { useConfirm } from "../../composables/useConfirm";
 import { useSnapshotsStore } from "../../stores/useSnapshotsStore";
 import { formatUserDate } from "../../utils/utils";
 import { relativeDate } from "../../utils/snapshots";
 import AppInput from "../widgets/AppInput.vue";
 import AppButton from "../widgets/AppButton.vue";
 import Tooltip from "../widgets/Tooltip.vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import SettingsSection from "./SettingsSection.vue";
 import { errorDetail } from "../../utils/apiError";
 
@@ -29,6 +31,7 @@ const props = defineProps({
 });
 
 const store = useSnapshotsStore();
+const { confirm } = useConfirm();
 
 // ── Local UI state ─────────────────────────────────────────────────────────
 const createLabel = ref("");
@@ -157,13 +160,14 @@ const deletingId = ref(null);
 const deleteError = ref("");
 
 async function handleDelete(cp) {
-  if (
-    !window.confirm(
-      `Delete snapshot "${cp.label || cp.kind + " " + relativeDate(cp.created_at)}"? This cannot be undone.`,
-    )
-  ) {
-    return;
-  }
+  const ok = await confirm({
+    title: `Delete snapshot "${cp.label || cp.kind + " " + relativeDate(cp.created_at)}"?`,
+    message: "The library can no longer be restored to this point.",
+    warning: "There is no undo for this.",
+    confirmLabel: "Delete snapshot",
+    danger: true,
+  });
+  if (!ok) return;
   deletingId.value = cp.id;
   deleteError.value = "";
   try {
@@ -300,7 +304,7 @@ function handleRestore(cp) {
               aria-label="Snapshot label"
               class="snapshot-edit-field"
               @enter="saveLabel(cp.id)"
-              @keydown.esc="cancelEditing(cp.id)"
+              @keydown.esc="!isImeComposing($event) && cancelEditing(cp.id)"
               @blur="saveLabel(cp.id)"
             />
             <div v-if="saveLabelError[cp.id]" class="snapshot-inline-error">

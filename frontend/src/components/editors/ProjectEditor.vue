@@ -22,10 +22,10 @@ const props = defineProps({
 
 const emit = defineEmits(["close", "saved", "deleted"]);
 
-// First adoption of the Phase 2 scaffolds. `useConfirm().confirm()` falls back
-// to the native window.confirm until the design pass mounts a ConfirmDialog
-// host, so behaviour is identical today; a delete failure now also raises a
-// central notice (a no-op on screen until the notice host lands).
+// Host: ConfirmDialog.vue, mounted once in App.vue; with no host mounted
+// (tests, early boot) confirm() falls back to window.confirm(message || title),
+// so put every material fact in `message`. A delete failure also raises a
+// central notice, shown by NoticeHost in App.vue.
 const { confirm } = useConfirm();
 const noticeStore = useNoticeStore();
 

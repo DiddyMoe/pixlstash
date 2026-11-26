@@ -197,6 +197,24 @@ describe("summarizeOperation", () => {
     );
   });
 
+  it("adds no second count to a Keep cover only or Keep recipes only summary", () => {
+    for (const [opType, summary] of [
+      [
+        "stack.keep_cover_only",
+        "Kept the cover of 6 stacks · 12 pictures to the Scrapheap",
+      ],
+      [
+        "stack.keep_recipes_only",
+        "Kept recipes only for 6 stacks · 12 pictures to the Scrapheap",
+      ],
+    ]) {
+      // 13: the 12 moved copies and a cover that gained their metadata.
+      expect(
+        summarizeOperation(op({ op_type: opType, summary, target_count: 13 })),
+      ).toBe(summary);
+    }
+  });
+
   it("humanises the op type when the server recorded no summary", () => {
     expect(summarizeOperation(op({ summary: null, target_count: 1 }))).toBe(
       "Pictures tags add",

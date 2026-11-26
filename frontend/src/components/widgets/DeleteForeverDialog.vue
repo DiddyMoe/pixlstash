@@ -18,11 +18,12 @@
  *  - true  → DELETE with include_protected:true  (destroys the protected originals on disk)
  *  - false → DELETE with include_protected:false (purges only the unprotected subset)
  */
-import { computed, ref, watch } from "vue";
+import { computed, ref, useId, watch } from "vue";
 import {
   buildLockedPurgeNote,
   deleteForeverDestroyCounts,
 } from "../../utils/lockedDelete.js";
+import { formatCount } from "../../utils/filterChips.js";
 import AppButton from "./AppButton.vue";
 import AppDialog from "./AppDialog.vue";
 
@@ -73,6 +74,16 @@ const typedOk = computed(() => confirmInput.value.trim() === CONFIRM_WORD);
 const hasLocked = computed(() => props.lockedCount > 0);
 const lockedNote = computed(() => buildLockedPurgeNote(props.lockedCount));
 
+// ── The dialog's description ────────────────────────────────────────────────
+// What is spared, then what is destroyed: the sentences a screen reader reads
+// with the title. The path list and the type-to-confirm field are read when
+// reached, not announced up front.
+const lockNoteId = useId();
+const bodyId = useId();
+const describedBy = computed(() =>
+  hasLocked.value ? `${lockNoteId} ${bodyId}` : bodyId,
+);
+
 // What each action ACTUALLY destroys. The preview's locked / protected /
 // unprotected buckets are disjoint and sum to `totalCount`, so these are sums of
 // the server's own classification - never `totalCount` minus something. See
@@ -93,7 +104,7 @@ const standardBody = computed(() => {
   const many = count !== 1;
   const noun = many ? "pictures" : "picture";
   const file = many ? "their files" : "its file";
-  return `This permanently deletes ${count} ${noun}, including ${file} on disk. This cannot be undone.`;
+  return `This permanently deletes ${formatCount(count)} ${noun}, including ${file} on disk. This cannot be undone.`;
 });
 
 const protectedBody = computed(() => {
@@ -107,7 +118,7 @@ const protectedBody = computed(() => {
       : "are reference-folder originals";
   const itThem = p === 1 ? "it" : "them";
   const fileFiles = p === 1 ? "file" : "files";
-  return `This permanently deletes ${count} pictures. ${p} of ${itThem} ${isAre} - deleting ${itThem} also destroys the original ${fileFiles} on disk. This cannot be undone.`;
+  return `This permanently deletes ${formatCount(count)} pictures. ${formatCount(p)} of ${itThem} ${isAre} - deleting ${itThem} also destroys the original ${fileFiles} on disk. This cannot be undone.`;
 });
 
 const refWarnTitle = computed(() =>
@@ -123,23 +134,23 @@ const moreCount = computed(() =>
 );
 const moreText = computed(
   () =>
-    `+ ${moreCount.value} more protected original ${moreCount.value === 1 ? "file" : "files"}`,
+    `+ ${formatCount(moreCount.value)} more protected original ${moreCount.value === 1 ? "file" : "files"}`,
 );
 
 const typeHint = computed(
   () =>
-    `Type ${CONFIRM_WORD} to permanently destroy the ${props.protectedCount} protected original${props.protectedCount === 1 ? "" : "s"}.`,
+    `Type ${CONFIRM_WORD} to permanently destroy the ${formatCount(props.protectedCount)} protected original${props.protectedCount === 1 ? "" : "s"}.`,
 );
 
 const deleteAllLabel = computed(
-  () => `Delete all - incl. ${props.protectedCount} protected`,
+  () => `Delete all - incl. ${formatCount(props.protectedCount)} protected`,
 );
 // `unprotectedCount` is already the exact destroyable figure: the preview's
 // buckets are disjoint (locked-first), so a locked picture is never counted as
 // unprotected and no subtraction is needed.
 const deleteUnprotectedLabel = computed(
   () =>
-    `Delete unprotected only (${destroyCounts.value.deleteUnprotectedOnly})`,
+    `Delete unprotected only (${formatCount(destroyCounts.value.deleteUnprotectedOnly)})`,
 );
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -165,25 +176,29 @@ function confirmDeleteUnprotected() {
 <template>
   <!-- Destructive: no @accept, Enter never deletes. Escape, the scrim and the
        close button cancel; the parent closes the dialog on confirm. -->
+  <!-- Described by what it destroys, not by the path list and the field. -->
   <AppDialog
     :open="open"
-    role="alertdialog"
+    alert
+    :aria-describedby="describedBy"
     title="Delete forever?"
     size="sm"
     @close="requestCancel"
   >
     <!-- Pictures a locked set freezes: destroyed by neither action below. -->
-    <div v-if="hasLocked" class="lock-note">
+    <div v-if="hasLocked" :id="lockNoteId" class="lock-note">
       <v-icon size="18">mdi-lock-outline</v-icon>
       <span>{{ lockedNote }}</span>
     </div>
 
     <!-- ── Standard case: no protected originals ─────────────────────────── -->
-    <p v-if="!hasProtected" class="confirm-body">{{ standardBody }}</p>
+    <p v-if="!hasProtected" :id="bodyId" class="confirm-body">
+      {{ standardBody }}
+    </p>
 
     <!-- ── Protected case: three-way confirmation ────────────────────────── -->
     <template v-else>
-      <p class="confirm-body">{{ protectedBody }}</p>
+      <p :id="bodyId" class="confirm-body">{{ protectedBody }}</p>
 
       <div class="ref-warn">
         <div class="ref-warn-head">

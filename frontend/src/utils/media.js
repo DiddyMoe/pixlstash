@@ -320,7 +320,7 @@ export function unreadableDropReporter(dataTransfer) {
     useNoticeStore().warning(
       count === 1
         ? "1 item could not be read and was skipped"
-        : `${count} items could not be read and were skipped`,
+        : `${count.toLocaleString()} items could not be read and were skipped`,
       { key: "import-unreadable-items" },
     );
   };

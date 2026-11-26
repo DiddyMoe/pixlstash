@@ -20,6 +20,13 @@ import { useProjectStore } from "../../stores/useProjectStore.js";
 import { useSortStore } from "../../stores/useSortStore.js";
 import { useScrapheapRunStore } from "../../stores/useScrapheapRunStore.js";
 import { useNoticeStore } from "../../stores/useNoticeStore.js";
+import { useUserPrefsStore } from "../../stores/useUserPrefsStore.js";
+import {
+  activeConfirm,
+  registerConfirmHost,
+  resolveConfirm,
+  unregisterConfirmHost,
+} from "../../composables/useConfirm";
 import { ref, nextTick } from "vue";
 
 const apiGet = vi.fn();
@@ -55,6 +62,9 @@ vi.mock("../../utils/apiClient", async () => {
     sessionContext,
     setRequestClientId: vi.fn(),
     API_BASE_URL: "/api/v1",
+    newOperationBatchId: () => "cli-test-gesture",
+    operationBatchHeaders: (batchId) =>
+      batchId ? { headers: { "X-Operation-Batch-Id": batchId } } : undefined,
   };
 });
 
@@ -67,9 +77,10 @@ vi.mock("vuetify/components", async () => {
 
 vi.mock("vue-router", () => ({
   useRoute: () => ({ query: {}, params: {}, path: "/", name: "grid" }),
+  // Navigation resolves, as the router's does: closing the lightbox waits on it.
   useRouter: () => ({
-    push: vi.fn(),
-    replace: vi.fn(),
+    push: vi.fn(() => Promise.resolve()),
+    replace: vi.fn(() => Promise.resolve()),
     currentRoute: ref({ query: {} }),
   }),
 }));
@@ -77,6 +88,8 @@ vi.mock("vue-router", () => ({
 import ImageGrid from "./ImageGrid.vue";
 
 const RUNS_URL = "/pictures/scrapheap/runs";
+/** A start asks the server to answer a short run at once. */
+const START_OPTIONS = { headers: { Prefer: "wait=1" } };
 
 function mountGrid(view = "SCRAPHEAP") {
   const selectionStore = useSelectionStore();
@@ -154,6 +167,8 @@ let consoleWarn;
 
 beforeEach(() => {
   setActivePinia(createPinia());
+  // The runs a tab started outlive its store, as they do a reload.
+  sessionStorage.clear();
   apiGet.mockReset();
   apiPost.mockReset();
   apiPatch.mockReset();
@@ -166,6 +181,7 @@ beforeEach(() => {
 
 afterEach(() => {
   consoleWarn.mockRestore();
+  unregisterConfirmHost();
 });
 
 describe("a Scrapheap run this tab started", () => {
@@ -194,7 +210,11 @@ describe("a Scrapheap run this tab started", () => {
           kind: "purge",
           include_protected: false,
           confirm_token: "test-confirmation",
+          // The gesture's own id: an unanswered start is resent as the same
+          // request, and the server answers it with the run it started.
+          request_id: "cli-test-gesture",
         },
+        START_OPTIONS,
       ],
     ]);
     await vi.waitFor(() =>
@@ -205,11 +225,73 @@ describe("a Scrapheap run this tab started", () => {
           "1 reference-folder original was kept.",
       }),
     );
-    expect(wrapper.vm.snapshotsWithDeletedOpen).toBe(true);
-    expect(wrapper.vm.snapshotsWithDeleted).toEqual([snapshot]);
+    // The store offers it (App.vue mounts the dialog), so it survives a
+    // change of view.
+    expect(useScrapheapRunStore().snapshotsWithDeletedOpen).toBe(true);
+    expect(useScrapheapRunStore().snapshotsWithDeleted).toEqual([snapshot]);
     expect(wrapper.emitted("refresh-sidebar")).toHaveLength(1);
     // Acted on once: the store holds no outcome for a second watcher run.
     expect(useScrapheapRunStore().outcome).toBeNull();
+
+    wrapper.unmount();
+  });
+
+  it("keeps the heap's cards up until the re-read after an Empty answers", async () => {
+    // A run can leave pictures behind (locked, protected, a Stop). Clearing
+    // the grid before the re-read blanked the whole heap for its round trip.
+    startAnswers(
+      endedRun({
+        total: 2,
+        processed: 2,
+        deleted_count: 1,
+        skipped_locked_count: 1,
+        skipped_locked: [2],
+      }),
+    );
+    const wrapper = mountGrid();
+    // The view's first read has run, so the re-read is of the view on screen.
+    await vi.waitFor(() =>
+      expect(
+        apiGet.mock.calls.some(([url]) =>
+          String(url).startsWith("/pictures/count?"),
+        ),
+      ).toBe(true),
+    );
+    await vi.waitFor(() => expect(wrapper.vm.imagesLoading).toBe(false));
+    wrapper.vm.allGridImages = [
+      { id: 1, idx: 0, thumbnail: "thumb-1" },
+      { id: 2, idx: 1, thumbnail: "thumb-2" },
+    ];
+    wrapper.vm.selectedImageIds = [1, 2];
+    let answerCount;
+    const heldCount = new Promise((resolve) => {
+      answerCount = resolve;
+    });
+    apiGet.mockImplementation((url) => {
+      const path = String(url);
+      if (path.startsWith("/pictures/count?")) return heldCount;
+      if (path.startsWith("/pictures/stream?")) {
+        return Promise.resolve({ data: { pictures: [{ id: 2 }] } });
+      }
+      return Promise.resolve({ data: { pictures: [], count: 0, total: 0 } });
+    });
+    wrapper.vm.deleteForeverMode = "all";
+    wrapper.vm.deleteForeverConfirmToken = "test-confirmation";
+
+    await wrapper.vm.confirmDeleteForever({ includeProtected: false });
+    await vi.waitFor(() =>
+      expect(noticeWithKey("scrapheap-run")).toBeDefined(),
+    );
+
+    expect(wrapper.vm.selectedImageIds).toEqual([]);
+    expect(wrapper.vm.allGridImages.map((row) => row.id)).toEqual([1, 2]);
+
+    answerCount({ data: { count: 1 } });
+    await vi.waitFor(() =>
+      expect(wrapper.vm.allGridImages.map((row) => row.id)).toEqual([2]),
+    );
+    // The card that stayed kept its thumbnail through the swap.
+    expect(wrapper.vm.allGridImages[0].thumbnail).toBe("thumb-2");
 
     wrapper.unmount();
   });
@@ -239,6 +321,7 @@ describe("a Scrapheap run this tab started", () => {
       picture_ids: [1, 2],
       include_protected: false,
       confirm_token: "test-confirmation",
+      request_id: "cli-test-gesture",
     });
     await vi.waitFor(() =>
       expect(noticeWithKey("delete-skipped-locked")).toMatchObject({
@@ -266,6 +349,8 @@ describe("a Scrapheap run this tab started", () => {
         segment_batch_ids: ["b1", "b2", "b3"],
       }),
     );
+    // App.vue mounts the app's confirm host; the browser's box never opens.
+    registerConfirmHost();
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const wrapper = mountGrid();
     await nextTick();
@@ -273,9 +358,25 @@ describe("a Scrapheap run this tab started", () => {
     wrapper.vm.allGridImages = [{ id: 1, name: "test-1.png" }];
     await nextTick();
 
-    await wrapper.vm.confirmRestoreScrapheap();
+    const asked = wrapper.vm.confirmRestoreScrapheap();
+    await nextTick();
+    expect(activeConfirm.value?.options).toMatchObject({
+      title: "Restore all pictures?",
+      confirmLabel: "Restore all",
+      danger: false,
+    });
+    expect(runStarts()).toEqual([]);
+    resolveConfirm(true);
+    await asked;
 
-    expect(runStarts()).toEqual([[RUNS_URL, { kind: "restore" }]]);
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(runStarts()).toEqual([
+      [
+        RUNS_URL,
+        { kind: "restore", request_id: "cli-test-gesture" },
+        START_OPTIONS,
+      ],
+    ]);
     await vi.waitFor(() =>
       expect(noticeWithKey("scrapheap-run")).toMatchObject({
         level: "success",
@@ -286,6 +387,41 @@ describe("a Scrapheap run this tab started", () => {
     );
 
     confirmSpy.mockRestore();
+    wrapper.unmount();
+  });
+
+  it("asks Restore all with the heap's count only when the count is the whole heap's", async () => {
+    registerConfirmHost();
+    const wrapper = mountGrid();
+    await nextTick();
+    wrapper.vm.allGridImages = [{ id: 1, name: "test-1.png" }];
+    // The Scrapheap summary; the one loaded card is no count of the heap.
+    wrapper.vm.totalCurrentCategoryCount = 12000;
+    await nextTick();
+
+    const counted = wrapper.vm.confirmRestoreScrapheap();
+    await nextTick();
+    expect(activeConfirm.value?.options.message).toBe(
+      `Restore all ${(12000).toLocaleString()} pictures in the Scrapheap? ` +
+        "They return to the library.",
+    );
+    resolveConfirm(false);
+    await counted;
+
+    // With hidden tags applied the summary leaves those pictures out, and
+    // Restore all restores them too: no number rather than a wrong one.
+    useUserPrefsStore().applyTagFilter = true;
+    await nextTick();
+    wrapper.vm.totalCurrentCategoryCount = 12000;
+    const uncounted = wrapper.vm.confirmRestoreScrapheap();
+    await nextTick();
+    expect(activeConfirm.value?.options.message).toBe(
+      "Restore every picture in the Scrapheap? They return to the library.",
+    );
+    resolveConfirm(false);
+    await uncounted;
+
+    expect(runStarts()).toEqual([]);
     wrapper.unmount();
   });
 
@@ -399,33 +535,30 @@ describe("a Scrapheap run another tab or an earlier visit started", () => {
     startedHere: false,
   });
 
-  it("is reported in the Scrapheap, without claiming this tab's gesture", async () => {
+  // The store raises the notice when it takes the run, in any view
+  // (useScrapheapRunStore.test.js, "announcing an end, in any view"). The
+  // outcome is set by hand here, so what is left is the grid's own part.
+  it("is let go in the Scrapheap, leaving the notice to the store", async () => {
     const wrapper = mountGrid();
     await nextTick();
 
     useScrapheapRunStore().outcome = elsewhere();
 
-    await vi.waitFor(() =>
-      expect(noticeWithKey("scrapheap-run")).toMatchObject({
-        level: "success",
-        text: "Deleted 4 pictures forever.",
-      }),
-    );
-    expect(wrapper.vm.snapshotsWithDeletedOpen).toBe(false);
-    expect(useScrapheapRunStore().outcome).toBeNull();
+    await vi.waitFor(() => expect(useScrapheapRunStore().outcome).toBeNull());
+    expect(noticeWithKey("scrapheap-run")).toBeUndefined();
+    expect(useScrapheapRunStore().snapshotsWithDeletedOpen).toBe(false);
+    expect(wrapper.emitted("refresh-sidebar")).toHaveLength(1);
 
     wrapper.unmount();
   });
 
-  it("is let go quietly anywhere else", async () => {
+  it("is let go anywhere else", async () => {
     const wrapper = mountGrid("ALL");
     await nextTick();
 
     useScrapheapRunStore().outcome = elsewhere();
 
-    await vi.waitFor(() =>
-      expect(useScrapheapRunStore().outcome).toBeNull(),
-    );
+    await vi.waitFor(() => expect(useScrapheapRunStore().outcome).toBeNull());
     expect(noticeWithKey("scrapheap-run")).toBeUndefined();
     expect(wrapper.emitted("refresh-sidebar")).toHaveLength(1);
 
@@ -475,6 +608,167 @@ describe("Stop", () => {
     });
 
     useScrapheapRunStore().forget();
+    wrapper.unmount();
+  });
+});
+
+describe("a restore from the lightbox", () => {
+  // A restore run's slices are minted by the server (`srv-`); the lightbox's
+  // own id is what keeps its pill from being taken for one of them.
+  it("sends its own gesture id", async () => {
+    const wrapper = mountGrid();
+    await nextTick();
+    wrapper.vm.lightboxCtxImage = { id: 7, name: "test-7.png" };
+
+    await wrapper.vm.handleLightboxScrapheapRestore();
+
+    expect(apiPost).toHaveBeenCalledWith(
+      "/pictures/scrapheap/restore",
+      { picture_ids: [7] },
+      { headers: { "X-Operation-Batch-Id": "cli-test-gesture" } },
+    );
+    wrapper.unmount();
+  });
+
+  it("keeps the picture and the lightbox when the restore fails", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const wrapper = mountGrid();
+    await nextTick();
+    wrapper.vm.allGridImages = [{ id: 7, name: "test-7.png" }];
+    wrapper.vm.lightboxOpen = true;
+    wrapper.vm.lightboxCtxImage = { id: 7, name: "test-7.png" };
+    apiPost.mockRejectedValueOnce(served(500, "disk full"));
+
+    await wrapper.vm.handleLightboxScrapheapRestore();
+    await nextTick();
+
+    expect(noticeWithKey("scrapheap-restore-lightbox")).toMatchObject({
+      level: "error",
+    });
+    expect(wrapper.vm.allGridImages.map((row) => row.id)).toEqual([7]);
+    expect(wrapper.vm.lightboxOpen).toBe(true);
+    expect(wrapper.emitted("refresh-sidebar")).toBeUndefined();
+    errorSpy.mockRestore();
+    wrapper.unmount();
+  });
+});
+
+describe("a key pressed in a confirm over the Scrapheap", () => {
+  // The confirm dialogs keep only Escape and Enter for themselves, so every
+  // other key reaches the window, where the grid's shortcuts listen. Delete on
+  // the confirm's own "Delete forever" button used to start a second delete
+  // preview, which blanks the confirm token first: the confirm then sent no
+  // token, the server refused it, and nothing was deleted. The DOM the dialog
+  // puts up is what Vuetify renders for an open dialog (an active overlay with a
+  // scrim); AppDialog.keys.test.js pins that against the real components.
+  const PREVIEW_URL = "/pictures/scrapheap/delete-preview";
+
+  function previews() {
+    return apiPost.mock.calls.filter(([url]) => String(url) === PREVIEW_URL);
+  }
+
+  function openModal() {
+    const overlay = document.createElement("div");
+    overlay.className = "v-overlay v-overlay--active v-dialog";
+    overlay.innerHTML =
+      '<div class="v-overlay__scrim"></div>' +
+      '<div class="v-overlay__content"><button type="button">Delete forever</button></div>';
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+
+  function pressOn(target, key) {
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+    );
+  }
+
+  it("leaves Delete forever's token alone, and the confirm still deletes", async () => {
+    let minted = 0;
+    apiPost.mockImplementation((url) => {
+      if (String(url) === PREVIEW_URL) {
+        minted += 1;
+        return Promise.resolve({
+          data: {
+            confirm_token: `test-preview-${minted}`,
+            total_count: 2,
+            protected_count: 0,
+            unprotected_count: 2,
+            protected: [],
+            locked_count: 0,
+          },
+        });
+      }
+      if (String(url) === RUNS_URL) {
+        return Promise.resolve({
+          data: endedRun({ total: 2, processed: 2, deleted_count: 2 }),
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const wrapper = mountGrid();
+    await nextTick();
+    wrapper.vm.allGridImages = [
+      { id: 1, idx: 0, name: "test-1.png" },
+      { id: 2, idx: 1, name: "test-2.png" },
+    ];
+    wrapper.vm.selectedImageIds = [1, 2];
+    await nextTick();
+
+    // Delete on the grid asks what Delete forever would destroy.
+    pressOn(document.body, "Delete");
+    await vi.waitFor(() => expect(wrapper.vm.deleteForeverOpen).toBe(true));
+    expect(previews()).toHaveLength(1);
+    expect(wrapper.vm.deleteForeverConfirmToken).toBe("test-preview-1");
+
+    // The confirm is up, focus on its button: Delete and Backspace are its.
+    const overlay = openModal();
+    const button = overlay.querySelector("button");
+    button.focus();
+    pressOn(button, "Delete");
+    pressOn(button, "Backspace");
+    await nextTick();
+
+    expect(previews()).toHaveLength(1);
+    expect(wrapper.vm.deleteForeverConfirmToken).toBe("test-preview-1");
+
+    await wrapper.vm.confirmDeleteForever({ includeProtected: false });
+    overlay.remove();
+
+    expect(runStarts()).toHaveLength(1);
+    expect(runStarts()[0][1]).toMatchObject({
+      kind: "purge",
+      picture_ids: [1, 2],
+      confirm_token: "test-preview-1",
+    });
+
+    wrapper.unmount();
+  });
+
+  it("does not open Delete forever behind another confirm", async () => {
+    registerConfirmHost();
+    const wrapper = mountGrid();
+    await nextTick();
+    wrapper.vm.allGridImages = [{ id: 1, idx: 0, name: "test-1.png" }];
+    wrapper.vm.selectedImageIds = [1];
+    wrapper.vm.totalCurrentCategoryCount = 1;
+    await nextTick();
+
+    // Restore all asks first; its dialog is the one on screen.
+    const asked = wrapper.vm.confirmRestoreScrapheap();
+    await nextTick();
+    expect(activeConfirm.value).not.toBeNull();
+    const overlay = openModal();
+    pressOn(overlay.querySelector("button"), "Delete");
+    await nextTick();
+    await nextTick();
+
+    expect(previews()).toEqual([]);
+    expect(wrapper.vm.deleteForeverOpen).toBe(false);
+
+    resolveConfirm(false);
+    await asked;
+    overlay.remove();
     wrapper.unmount();
   });
 });
