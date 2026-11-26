@@ -4,7 +4,8 @@
 // subtree so no page-level Escape owner is consulted first. Enter is inert
 // wherever the key already has a meaning: multiline fields, buttons and links
 // (native activation must win, so Enter on a focused Cancel cancels), selects,
-// summaries, and anything that already handled the event.
+// summaries, anything that already handled the event, and the Enter that ends
+// an input method's composition.
 
 import { describe, it, expect, vi } from "vitest";
 import { mount } from "@vue/test-utils";
@@ -35,10 +36,11 @@ const BodyStub = {
   `,
 };
 
-function mountDialog(props = {}) {
+function mountDialog(props = {}, options = {}) {
   return mount(AppDialog, {
     props: { open: true, title: "T", ...props },
     slots: { default: BodyStub },
+    ...options,
   });
 }
 
@@ -87,6 +89,43 @@ describe("AppDialog keyboard contract", () => {
     expect(w.emitted("accept")).toBeFalsy();
   });
 
+  it("leaves the Enter that ends an input method's composition to the input method", async () => {
+    const w = mountDialog();
+    await w
+      .find(".txt")
+      .trigger("keydown", { key: "Enter", isComposing: true });
+    expect(w.emitted("accept")).toBeFalsy();
+  });
+
+  it("leaves Safari's composition-ending Enter (keyCode 229) to the input method", async () => {
+    const w = mountDialog();
+    await w.find(".txt").trigger("keydown", { key: "Enter", keyCode: 229 });
+    expect(w.emitted("accept")).toBeFalsy();
+  });
+
+  it.each([
+    ["isComposing", { isComposing: true }],
+    ["Safari's keyCode 229", { keyCode: 229 }],
+  ])(
+    "leaves the Escape that cancels a composition (%s) to the input method",
+    async (_name, init) => {
+      // In the document, so an event that is not stopped reaches the window.
+      const w = mountDialog({}, { attachTo: document.body });
+      // Vuetify's overlay closes on any Escape that reaches the window.
+      const onWindow = vi.fn();
+      window.addEventListener("keydown", onWindow);
+      try {
+        await w.find(".txt").trigger("keydown", { key: "Escape", ...init });
+        // Before unmount: unmounting clears the wrapper's emitted history.
+        expect(w.emitted("close")).toBeFalsy();
+        expect(onWindow).not.toHaveBeenCalled();
+      } finally {
+        window.removeEventListener("keydown", onWindow);
+        w.unmount();
+      }
+    },
+  );
+
   it("ignores modified Enter - Ctrl+Enter stays a dialog-local shortcut", async () => {
     const w = mountDialog();
     await w.find(".txt").trigger("keydown", { key: "Enter", ctrlKey: true });
@@ -122,7 +161,9 @@ describe("AppDialog keyboard contract", () => {
   });
 
   it("sizes by step, md by default", () => {
-    expect(mountDialog().find(".app-dialog").classes()).toContain("app-dialog--md");
+    expect(mountDialog().find(".app-dialog").classes()).toContain(
+      "app-dialog--md",
+    );
     expect(mountDialog({ size: "lg" }).find(".app-dialog").classes()).toContain(
       "app-dialog--lg",
     );

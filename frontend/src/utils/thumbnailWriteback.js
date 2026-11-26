@@ -83,3 +83,34 @@ export function writeThumbnailBatch(grid, batch, start) {
   }
   return written;
 }
+
+/**
+ * The slots a thumbnail batch can count as loaded, as `[start, end)` runs.
+ *
+ * Slot `start + i` counts only when row `i` of `batch` was a picture (a
+ * placeholder has no id, so nothing was asked for it) and the slot still holds
+ * that picture (a removal above can move the rows while the batch is out).
+ * Counting a placeholder's slot made the fetch for the picture that later
+ * landed there look done already, and its card stayed blank for good.
+ *
+ * @param {Array<{id?: unknown}|undefined>} grid The grid's rows now.
+ * @param {Array<{id?: unknown}>} batch The batch's rows, in slice order.
+ * @param {number} start The slot the batch was sliced from.
+ * @returns {Array<[number, number]>} The runs, in slot order.
+ */
+export function loadedSlotRuns(grid, batch, start) {
+  const runs = [];
+  let runStart = null;
+  for (let i = 0; i < batch.length; i += 1) {
+    const id = batch[i]?.id;
+    const held = id != null && String(grid[start + i]?.id) === String(id);
+    if (held) {
+      runStart ??= start + i;
+    } else if (runStart != null) {
+      runs.push([runStart, start + i]);
+      runStart = null;
+    }
+  }
+  if (runStart != null) runs.push([runStart, start + batch.length]);
+  return runs;
+}

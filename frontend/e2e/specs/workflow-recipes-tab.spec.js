@@ -438,7 +438,7 @@ test("deleting the last workflow leaves its recipes listed under the empty state
     await expect(row).toBeVisible({ timeout: 15_000 });
     await row.click();
     await page.keyboard.press("Delete");
-    const ask = page.getByRole("dialog", { name: "Delete this workflow?" });
+    const ask = page.getByRole("alertdialog", { name: "Delete this workflow?" });
     await expect(ask).toContainText(workflowName);
     await ask.getByRole("button", { name: "Delete", exact: true }).click();
 

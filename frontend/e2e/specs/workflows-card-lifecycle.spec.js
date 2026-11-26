@@ -30,7 +30,8 @@ const COVER_IMAGE = resolve(
   "../../../test-data/images/041514da-7779-4544-8e9b-e1dbe19540a4.jpg",
 );
 
-const deleteDialog = (page, title) => page.getByRole("dialog", { name: title });
+/** The delete confirm: an alertdialog, named by its title. */
+const deleteDialog = (page, title) => page.getByRole("alertdialog", { name: title });
 const selectedKeys = (page) =>
   page
     .locator('.wfv-row[aria-selected="true"]')
@@ -121,9 +122,15 @@ test.describe("delete", () => {
     await expect(page.locator(".wfv-row").first()).toBeVisible({ timeout: 15_000 });
     await expect(workflows.row(id)).toHaveCount(0);
     expect((await apiContext.get(workflowPath(id))).status()).toBe(404);
-    for (const pictureId of pictures) {
-      expect((await apiContext.get(`${API}/pictures/${pictureId}`)).status()).toBe(200);
-    }
+    // Still in the library and not in the Scrapheap: a read by id leaves a
+    // soft-deleted picture out, and there is no plain GET /pictures/{id}.
+    const kept = await ok(
+      await apiContext.get(
+        `${API}/pictures?${pictures.map((pictureId) => `id=${pictureId}`).join("&")}&fields=grid`,
+      ),
+      "read its pictures",
+    );
+    expect(kept.map((row) => row.id).sort()).toEqual([...pictures].sort());
     await expect(
       page.locator(".wfv-unfiled .wfrt-card").filter({ hasText: recipeName }),
     ).toBeVisible();

@@ -341,17 +341,30 @@ test.describe('deleting pictures and the Scrapheap', () => {
     // Restore all restores the whole heap, so it must hold only this test's.
     expect((await scrapheapIds(apiContext)).sort()).toEqual([...mine].sort())
 
-    page.once('dialog', (dialog) => dialog.accept())
-    // Restore all starts a background run; the 202 only says it was accepted.
+    // Restore all starts a background run. The start asks the server to wait a
+    // second for it (Prefer: wait=1, RFC 7240): a run that ended by then comes
+    // back as 200 with Preference-Applied, one still working as 202.
     const started = page.waitForResponse(
       (response) =>
         new URL(response.url()).pathname === `${API}/pictures/scrapheap/runs` &&
         response.request().method() === 'POST',
     )
     await page.getByRole('button', { name: 'Restore all' }).click()
+    // It asks first, in the app's own dialog.
+    const ask = page.getByRole('alertdialog', { name: 'Restore all pictures?', exact: true })
+    await expect(ask).toContainText('They return to the library.')
+    await ask.getByRole('button', { name: 'Restore all', exact: true }).click()
+    await expect(ask).toBeHidden()
     const start = await started
-    expect(start.status(), await start.text()).toBe(202)
-    expect(start.request().postDataJSON()).toEqual({ kind: 'restore' })
+    const run = await start.json()
+    expect(start.request().headers().prefer).toBe('wait=1')
+    expect(start.status(), JSON.stringify(run)).toBe(run.active ? 202 : 200)
+    expect(start.headers()['preference-applied']).toBe(run.active ? undefined : 'wait=1')
+    // The whole heap (no picture_ids), under the gesture's own request id.
+    expect(start.request().postDataJSON()).toEqual({
+      kind: 'restore',
+      request_id: expect.any(String),
+    })
     // The grid reloads once the run has ended, so an empty grid is its end.
     await expect(grid.thumbnails).toHaveCount(0)
 

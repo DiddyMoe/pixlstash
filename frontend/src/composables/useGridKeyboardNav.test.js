@@ -164,6 +164,75 @@ describe("useGridKeyboardNav - review-overlay guard (F1)", () => {
   });
 });
 
+// A key pressed in a modal dialog is the dialog's. AppDialog keeps only Escape
+// and Enter for itself, so the rest reach the window; with focus on a dialog
+// button (not a typing surface) Delete used to re-run the Scrapheap's delete
+// preview behind its own confirm and blank the confirm token.
+describe("useGridKeyboardNav - behind a modal dialog", () => {
+  /** What Vuetify renders for an open dialog: an active overlay with a scrim. */
+  function openModal() {
+    const overlay = document.createElement("div");
+    overlay.className = "v-overlay v-overlay--active v-dialog";
+    overlay.innerHTML =
+      '<div class="v-overlay__scrim"></div><div class="v-overlay__content"><button>Delete forever</button></div>';
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+
+  it("leaves every grid key to the dialog", () => {
+    const {
+      handleKeyDown,
+      deps,
+      deleteSelected,
+      applyScoresForSelection,
+      openLightbox,
+      toggleFavourite,
+    } = makeNav({ cursorIdx: 0 });
+    const overlay = openModal();
+    const button = overlay.querySelector("button");
+    try {
+      for (const key of ["Delete", "Backspace", "3", "Enter", "h", "ArrowRight"]) {
+        handleKeyDown(keyEvent({ key, target: button }));
+      }
+      handleKeyDown(keyEvent({ key: "a", ctrlKey: true, target: button }));
+      handleKeyDown(keyEvent({ key: "Escape", target: button }));
+    } finally {
+      overlay.remove();
+    }
+
+    expect(deleteSelected).not.toHaveBeenCalled();
+    expect(applyScoresForSelection).not.toHaveBeenCalled();
+    expect(openLightbox).not.toHaveBeenCalled();
+    expect(toggleFavourite).not.toHaveBeenCalled();
+    expect(deps.selectedImageIds.value).toEqual(["a", "b"]);
+    expect(deps.cursorIdx.value).toBe(0);
+  });
+
+  it("takes the keys again once the dialog has closed", () => {
+    const { handleKeyDown, deleteSelected } = makeNav();
+    openModal().remove();
+
+    handleKeyDown(keyEvent({ key: "Delete" }));
+
+    expect(deleteSelected).toHaveBeenCalledTimes(1);
+  });
+
+  it("is not held back by a menu or a tooltip, which have no scrim", () => {
+    const { handleKeyDown, deleteSelected } = makeNav();
+    const menu = document.createElement("div");
+    menu.className = "v-overlay v-overlay--active v-menu";
+    menu.innerHTML = '<div class="v-overlay__content"></div>';
+    document.body.appendChild(menu);
+    try {
+      handleKeyDown(keyEvent({ key: "Delete" }));
+    } finally {
+      menu.remove();
+    }
+
+    expect(deleteSelected).toHaveBeenCalledTimes(1);
+  });
+});
+
 // ---- Justified-mode vertical navigation ------------------------------------
 // Same hand-built layout as useJustifiedLayout.test.js (gap 4):
 //   row 0: widths [100, 300, 100] → centers 50, 254, 458
@@ -780,5 +849,82 @@ describe("useGridKeyboardNav - Ctrl/Cmd+C copies the selection as files (#2419)"
       p.remove();
     }
     expect(copyPicturesAsFiles).not.toHaveBeenCalled();
+  });
+});
+
+// A key pressed on an item of an open menu is the menu's (WAI-ARIA APG menu
+// pattern: an open menu owns the keyboard). A menu has no scrim, so the dialog
+// guard above misses it, and Vuetify lets its keys bubble to the window: Delete
+// on a menu item used to delete the grid's selection, Enter to open the
+// lightbox on the picture under the cursor.
+describe("useGridKeyboardNav - keys pressed inside an open menu", () => {
+  /** What Vuetify renders for an open menu: an active overlay, no scrim. */
+  function openMenu() {
+    const menu = document.createElement("div");
+    menu.className = "v-overlay v-overlay--active v-menu";
+    menu.innerHTML =
+      '<div class="v-overlay__content"><div class="v-list" role="menu">' +
+      '<button type="button" role="menuitem">Add to set</button></div></div>';
+    document.body.appendChild(menu);
+    return menu;
+  }
+
+  const MENU_KEYS = [
+    ["Delete", { key: "Delete" }],
+    ["Backspace", { key: "Backspace" }],
+    ["Enter", { key: "Enter" }],
+    ["Space", { key: " " }],
+    ["ArrowRight", { key: "ArrowRight" }],
+    ["Ctrl+A", { key: "a", ctrlKey: true }],
+  ];
+
+  it.each(MENU_KEYS)("leaves %s on a focused menu item to the menu", (_, key) => {
+    const { handleKeyDown, deps, deleteSelected, openLightbox } = makeNav({
+      cursorIdx: 0,
+    });
+    const menu = openMenu();
+    const item = menu.querySelector('[role="menuitem"]');
+    item.focus();
+    try {
+      handleKeyDown(keyEvent({ ...key, target: item }));
+    } finally {
+      menu.remove();
+    }
+
+    expect(deleteSelected).not.toHaveBeenCalled();
+    expect(openLightbox).not.toHaveBeenCalled();
+    expect(deps.cursorIdx.value).toBe(0);
+    expect(deps.selectedImageIds.value).toEqual(["a", "b"]);
+  });
+
+  // The control: the same menu stays open, and the same keys pressed on the
+  // grid still act, so the guard reads where the key was pressed, not whether
+  // a menu exists.
+  const GRID_EFFECTS = {
+    Delete: ({ deleteSelected }) => expect(deleteSelected).toHaveBeenCalledTimes(1),
+    Backspace: ({ deleteSelected }) =>
+      expect(deleteSelected).toHaveBeenCalledTimes(1),
+    Enter: ({ openLightbox }) => expect(openLightbox).toHaveBeenCalledWith({ id: "a" }),
+    Space: ({ deps }) => expect(deps.selectedImageIds.value).toEqual(["b"]),
+    ArrowRight: ({ deps }) => expect(deps.cursorIdx.value).toBe(1),
+    "Ctrl+A": ({ deps }) =>
+      expect(deps.selectedImageIds.value).toEqual(["a", "b", "c"]),
+  };
+
+  it.each(MENU_KEYS)("still acts on %s pressed on the grid with a menu open", (name, key) => {
+    const nav = makeNav({ cursorIdx: 0 });
+    const menu = openMenu();
+    const card = document.createElement("div");
+    card.tabIndex = 0;
+    document.body.appendChild(card);
+    card.focus();
+    try {
+      nav.handleKeyDown(keyEvent({ ...key, target: card }));
+    } finally {
+      menu.remove();
+      card.remove();
+    }
+
+    GRID_EFFECTS[name](nav);
   });
 });

@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { useGridRealtimeSync } from "./useGridRealtimeSync.js";
+import { nextTick, reactive } from "vue";
+import {
+  diffViewAgainstIdRead,
+  settleGoneCards,
+  useGridRealtimeSync,
+} from "./useGridRealtimeSync.js";
+import { notifySessionReset } from "../utils/apiClient";
 
 const MY_ID = "my-tab-uuid";
 const OTHER_ID = "other-tab-uuid";
@@ -20,11 +26,12 @@ function makeHarness(overrides = {}) {
     markLightboxDeferredRefresh: vi.fn(),
     hasPendingGridImages: vi.fn(() => overrides.pendingGridImages === true),
   };
-  const wsStore = {
+  // Reactive, as the Pinia store is: the end of an upload is watched.
+  const wsStore = reactive({
     isUploadInProgress: false,
     addPendingExternalImportIds: vi.fn(),
     addSortChangedExternalIds: vi.fn(),
-  };
+  });
   const reload = vi.fn();
   const refreshSidebar = vi.fn();
   // Mirror App.vue's pictureChangeAffectsView: empty/absent fields => affects
@@ -56,6 +63,8 @@ function makeHarness(overrides = {}) {
     logger: { warn: vi.fn() },
     reload,
     refreshSidebar,
+    isScrapheapView: () => overrides.scrapheapView === true,
+    scheduler: overrides.scheduler,
   });
 
   return { sync, grid, wsStore, reload, refreshSidebar, selectedSort };
@@ -844,6 +853,7 @@ function makeCoalescingHarness(overrides = {}) {
     logger: { warn: vi.fn() },
     reload,
     refreshSidebar,
+    isScrapheapView: () => overrides.scrapheapView === true,
     scheduler,
   });
 
@@ -1309,5 +1319,615 @@ describe("useGridRealtimeSync - a rotate's pixels changed", () => {
     // refresh and must not take the rotate applier's decode-then-commit path.
     expect(h.grid.refreshGridImage).toHaveBeenCalledWith(15);
     expect(h.grid.applyRotatedCards).not.toHaveBeenCalled();
+  });
+});
+
+// A purge from the Scrapheap is never applied optimistically: a run settles by
+// re-reading the heap, and a purge request that timed out after the server
+// committed has no local step at all. So this tab's own `removed` echo is what
+// takes the destroyed pictures off the screen. Outside the Scrapheap the echo
+// follows a soft delete whose tiles stay ghosted for the undo window, so there
+// it must stay suppressed.
+describe("useGridRealtimeSync - this tab's own removals", () => {
+  function removed(overrides = {}) {
+    return {
+      type: "pictures_changed",
+      source: "ui",
+      origin_client_id: MY_ID,
+      change_kind: "removed",
+      picture_ids: [1, 2],
+      ...overrides,
+    };
+  }
+
+  it("removes the purged pictures from the Scrapheap as the server confirms them", () => {
+    const h = makeCoalescingHarness({ scrapheapView: true });
+    const res = h.sync.handleMessage(removed());
+    expect(res).toEqual({
+      action: "targeted",
+      reason: "own-origin-removed-scrapheap",
+    });
+    h.tick();
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([1, 2]);
+    expect(h.reload).not.toHaveBeenCalled();
+  });
+
+  it("keeps the soft-deleted tiles outside the Scrapheap, where the undo window holds them", () => {
+    const h = makeCoalescingHarness();
+    const res = h.sync.handleMessage(removed());
+    expect(res).toEqual({ action: "suppressed", reason: "own-origin-echo" });
+    h.tick();
+    expect(h.grid.removeImagesById).not.toHaveBeenCalled();
+  });
+
+  it("lets a restore that lands in the same window win over the removal before it", () => {
+    // Outside the Scrapheap a restore brings the picture back, so of a delete
+    // and its undo in one window the undo is what the grid must end on.
+    const h = makeCoalescingHarness();
+    const other = { origin_client_id: OTHER_ID };
+    h.sync.handleMessage(removed({ ...other, picture_ids: [5] }));
+    h.sync.handleMessage(
+      removed({ ...other, change_kind: "restored", picture_ids: [5] }),
+    );
+    h.tick();
+    for (const [ids] of h.grid.removeImagesById.mock.calls) {
+      expect(ids).not.toContain(5);
+    }
+    expect(h.grid.insertGridImagesById).toHaveBeenCalledWith([5], {
+      highlight: false,
+    });
+  });
+});
+
+describe("useGridRealtimeSync - a restored picture leaves the Scrapheap", () => {
+  function restored(overrides = {}) {
+    return {
+      type: "pictures_changed",
+      source: "ui",
+      origin_client_id: OTHER_ID,
+      change_kind: "restored",
+      picture_ids: [3],
+      ...overrides,
+    };
+  }
+
+  it("takes another tab's restored card out of the Scrapheap and inserts nothing", () => {
+    const h = makeCoalescingHarness({ scrapheapView: true });
+    const res = h.sync.handleMessage(restored());
+    expect(res).toEqual({
+      action: "targeted",
+      reason: "foreign-ui-restored-left-scrapheap",
+    });
+    h.tick();
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([3]);
+    expect(h.grid.insertGridImagesById).not.toHaveBeenCalled();
+    expect(h.reload).not.toHaveBeenCalled();
+  });
+
+  it("takes this tab's own restored card out of the Scrapheap too", () => {
+    const h = makeCoalescingHarness({ scrapheapView: true });
+    const res = h.sync.handleMessage(restored({ origin_client_id: MY_ID }));
+    expect(res.reason).toBe("own-origin-restored-left-scrapheap");
+    h.tick();
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([3]);
+    expect(h.grid.insertGridImagesById).not.toHaveBeenCalled();
+  });
+
+  it("takes an external restore out of the Scrapheap instead of raising the pill", () => {
+    const h = makeCoalescingHarness({ scrapheapView: true });
+    const res = h.sync.handleMessage(
+      restored({ source: "external", origin_client_id: null }),
+    );
+    expect(res).toEqual({
+      action: "targeted",
+      reason: "external-restored-left-scrapheap",
+    });
+    h.tick();
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([3]);
+    expect(h.wsStore.addSortChangedExternalIds).not.toHaveBeenCalled();
+  });
+
+  it("ends a removal and a restore of one picture in one window with it gone", () => {
+    const h = makeCoalescingHarness({ scrapheapView: true });
+    h.sync.handleMessage(
+      restored({ change_kind: "removed", picture_ids: [5] }),
+    );
+    h.sync.handleMessage(restored({ picture_ids: [5] }));
+    h.tick();
+    const removedIds = h.grid.removeImagesById.mock.calls.flatMap(
+      ([ids]) => ids,
+    );
+    expect(removedIds).toContain(5);
+    expect(h.grid.insertGridImagesById).not.toHaveBeenCalled();
+  });
+});
+
+describe("useGridRealtimeSync - a Scrapheap run's events (run_id)", () => {
+  function runEvent(overrides = {}) {
+    return {
+      type: "pictures_changed",
+      source: "ui",
+      origin_client_id: MY_ID,
+      run_id: "run-1",
+      run_kind: "restore",
+      change_kind: "removed",
+      picture_ids: [7, 8],
+      ...overrides,
+    };
+  }
+
+  it("applies this tab's own run removal outside the Scrapheap, where no op ghosted it", () => {
+    const h = makeCoalescingHarness();
+    const res = h.sync.handleMessage(runEvent({ run_kind: "undo" }));
+    expect(res).toEqual({ action: "targeted", reason: "foreign-ui-removed" });
+    h.tick();
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([7, 8]);
+  });
+
+  // A restore run's slices and an undo's comebacks put cards back as a
+  // comeback, never with the new-picture flash.
+  it("puts a run's restored pictures back without the new-picture highlight", () => {
+    for (const runKind of ["restore", "undo"]) {
+      const h = makeCoalescingHarness();
+      const res = h.sync.handleMessage(
+        runEvent({ run_kind: runKind, change_kind: "restored" }),
+      );
+      expect(res).toEqual({ action: "targeted", reason: "foreign-ui-restored" });
+      h.tick();
+      expect(h.grid.insertGridImagesById).toHaveBeenCalledWith([7, 8], {
+        highlight: false,
+      });
+    }
+  });
+
+  it("takes a restore run's pictures off the Scrapheap as they leave it", () => {
+    const h = makeCoalescingHarness({ scrapheapView: true });
+    const res = h.sync.handleMessage(runEvent({ change_kind: "restored" }));
+    expect(res.reason).toBe("foreign-ui-restored-left-scrapheap");
+    h.tick();
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([7, 8]);
+    expect(h.grid.insertGridImagesById).not.toHaveBeenCalled();
+  });
+
+  it("still suppresses this tab's own removal echo when no run sent it", () => {
+    const h = makeCoalescingHarness();
+    const event = runEvent();
+    delete event.run_id;
+    delete event.run_kind;
+    const res = h.sync.handleMessage(event);
+    expect(res).toEqual({ action: "suppressed", reason: "own-origin-echo" });
+    h.tick();
+    expect(h.grid.removeImagesById).not.toHaveBeenCalled();
+  });
+
+  it("reads run_id at the top of the message, not inside data", () => {
+    const h = makeCoalescingHarness();
+    const event = runEvent();
+    delete event.run_id;
+    const res = h.sync.handleMessage({ ...event, data: { run_id: "run-1" } });
+    expect(res.action).toBe("suppressed");
+  });
+});
+
+describe("useGridRealtimeSync - a sidebar refresh held back by an upload", () => {
+  const foreignRemoval = (id) => ({
+    type: "pictures_changed",
+    source: "ui",
+    origin_client_id: OTHER_ID,
+    picture_ids: [id],
+    change_kind: "removed",
+  });
+  const foreignRestore = (id) => ({
+    type: "pictures_changed",
+    source: "ui",
+    origin_client_id: OTHER_ID,
+    picture_ids: [id],
+    change_kind: "restored",
+  });
+
+  it("runs once when the upload ends, for every change it held back", async () => {
+    const h = makeHarness();
+    h.wsStore.isUploadInProgress = true;
+    await nextTick();
+    // Another tab deletes two pictures and restores one mid-upload.
+    h.sync.handleMessage(foreignRemoval(7));
+    h.sync.handleMessage(foreignRestore(8));
+    h.sync.handleMessage(foreignRemoval(9));
+    await nextTick();
+    expect(h.refreshSidebar).not.toHaveBeenCalled();
+
+    h.wsStore.isUploadInProgress = false;
+    await nextTick();
+    expect(h.refreshSidebar).toHaveBeenCalledTimes(1);
+    // A deletion moved the counts the way any change does: it flashes.
+    expect(h.refreshSidebar).toHaveBeenCalledWith(true);
+
+    // Owed once, paid once: the next upload, with nothing held, owes nothing.
+    h.wsStore.isUploadInProgress = true;
+    await nextTick();
+    h.wsStore.isUploadInProgress = false;
+    await nextTick();
+    expect(h.refreshSidebar).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a held restore from flashing", async () => {
+    const h = makeHarness();
+    h.wsStore.isUploadInProgress = true;
+    await nextTick();
+    h.sync.handleMessage(foreignRestore(8));
+    h.wsStore.isUploadInProgress = false;
+    await nextTick();
+    expect(h.refreshSidebar).toHaveBeenCalledTimes(1);
+    expect(h.refreshSidebar).toHaveBeenCalledWith(false);
+  });
+
+  it("owes nothing when no change touched the counts", async () => {
+    const h = makeHarness();
+    h.wsStore.isUploadInProgress = true;
+    await nextTick();
+    h.sync.handleMessage({
+      type: "pictures_changed",
+      source: "external",
+      origin_client_id: null,
+      picture_ids: [70],
+      change_kind: "updated",
+      fields: ["smart_score"],
+    });
+    h.wsStore.isUploadInProgress = false;
+    await nextTick();
+    expect(h.refreshSidebar).not.toHaveBeenCalled();
+  });
+
+  it("drops what it owes at sign-out, which also ends the upload", async () => {
+    const h = makeHarness();
+    h.wsStore.isUploadInProgress = true;
+    await nextTick();
+    h.sync.handleMessage(foreignRemoval(7));
+    // As useWsStore does in its own session-reset handler.
+    notifySessionReset("logout");
+    h.wsStore.isUploadInProgress = false;
+    await nextTick();
+    expect(h.refreshSidebar).not.toHaveBeenCalled();
+  });
+});
+
+// The grid's base list: a number is a lone picture, [id, stackId] a stack row.
+function gridRows(...specs) {
+  return specs.map((spec) =>
+    Array.isArray(spec)
+      ? { id: spec[0], stackId: String(spec[1]) }
+      : { id: spec, stackId: null },
+  );
+}
+
+// The stream read's rows, as the server sends them.
+function readRows(...specs) {
+  return specs.map((spec) =>
+    Array.isArray(spec)
+      ? { id: spec[0], stack_id: spec[1] }
+      : { id: spec, stack_id: null },
+  );
+}
+
+// A read of the whole list that saw no local change while it was out, in a
+// view that shows a stack as one card.
+function wholeRead(grid, answer, extra = {}) {
+  return {
+    before: grid,
+    after: grid,
+    answer,
+    fromStart: true,
+    toEnd: true,
+    stacked: true,
+    ...extra,
+  };
+}
+
+describe("diffViewAgainstIdRead - what a reconnect's gap changed", () => {
+  it("finds nothing when the read matches the grid", () => {
+    const grid = gridRows(1, 2, [3, 30], 4);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, 2, [3, 30], 4))),
+    ).toEqual({ gone: [], added: [], moved: [], goneCards: [] });
+  });
+
+  it("names a card the read no longer lists as gone", () => {
+    const grid = gridRows(1, 2, 3, 4, 5);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, 2, 4, 5))),
+    ).toEqual({ gone: [3], added: [], moved: [], goneCards: [[3]] });
+  });
+
+  it("judges only the stretch of the grid the read covers", () => {
+    // The read covers pictures 4..7; 1-3 and 8-10 lie outside it, and their
+    // absence from the answer says nothing about them.
+    const grid = gridRows(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+    expect(
+      diffViewAgainstIdRead({
+        ...wholeRead(grid, readRows(4, 5, 7)),
+        fromStart: false,
+        toEnd: false,
+      }),
+    ).toEqual({ gone: [6], added: [], moved: [], goneCards: [[6]] });
+  });
+
+  it("judges the grid's head and tail when the read reached the list's ends", () => {
+    const grid = gridRows(1, 2, 3, 4, 5);
+    expect(diffViewAgainstIdRead(wholeRead(grid, readRows(2, 3, 4)))).toEqual(
+      { gone: [1, 5], added: [], moved: [], goneCards: [[1], [5]] },
+    );
+  });
+
+  it("names a listed picture the grid does not hold as new", () => {
+    const grid = gridRows(1, 2, 3);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, 9, 2, 3))),
+    ).toEqual({ gone: [], added: [9], moved: [], goneCards: [] });
+  });
+
+  it("names the fewest pictures that explain a reorder as moved", () => {
+    const grid = gridRows(1, 2, 3, 4, 5, 6);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, 2, 5, 3, 4, 6))),
+    ).toEqual({ gone: [], added: [], moved: [5], goneCards: [] });
+  });
+
+  it("calls a stack whose cover changed moved, not a removal and an arrival", () => {
+    const grid = gridRows(1, [2, 20], 3);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, [5, 20], 3))),
+    ).toEqual({ gone: [], added: [], moved: [5], goneCards: [] });
+  });
+
+  it("compares a stack whose members the grid's list holds as one card", () => {
+    // A local reorder writes a stack's members into the base list; the read
+    // lists the stack once, by its cover.
+    const grid = gridRows(1, [2, 20], [3, 20], [4, 20], 5);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, [2, 20], 5))),
+    ).toEqual({ gone: [], added: [], moved: [], goneCards: [] });
+    expect(diffViewAgainstIdRead(wholeRead(grid, readRows(1, 5)))).toEqual({
+      gone: [2, 3, 4],
+      added: [],
+      moved: [],
+      goneCards: [[2, 3, 4]],
+    });
+  });
+
+  it("calls a picture that joined a stack as its cover moved, once", () => {
+    const grid = gridRows(1, 2, [3, 30]);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, [2, 30]))),
+    ).toEqual({ gone: [], added: [], moved: [2], goneCards: [] });
+  });
+
+  it("calls a lone picture that became a new stack's cover moved, not new", () => {
+    const grid = gridRows(1, 2, 3);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, [2, 40], 3))),
+    ).toEqual({ gone: [], added: [], moved: [2], goneCards: [] });
+  });
+
+  it("in the Scrapheap, compares each picture of a stack on its own", () => {
+    // The Scrapheap lists a scrapped stack's members one by one, and so does
+    // its grid: a member that left, or arrived, is a card of its own.
+    const grid = gridRows(1, [2, 20], [3, 20], 4);
+    const scrapheap = { stacked: false };
+    expect(
+      diffViewAgainstIdRead(
+        wholeRead(grid, readRows(1, [2, 20], 4), scrapheap),
+      ),
+    ).toEqual({ gone: [3], added: [], moved: [], goneCards: [[3]] });
+    expect(
+      diffViewAgainstIdRead(
+        wholeRead(grid, readRows(1, [2, 20], [3, 20], [5, 20], 4), scrapheap),
+      ),
+    ).toEqual({ gone: [], added: [5], moved: [], goneCards: [] });
+  });
+
+  it("leaves alone a picture the grid keeps on purpose (a ghost)", () => {
+    const grid = gridRows(1, 2, 3);
+    expect(
+      diffViewAgainstIdRead(
+        wholeRead(grid, readRows(1, 3), { skipIds: ["2"] }),
+      ),
+    ).toEqual({ gone: [], added: [], moved: [], goneCards: [] });
+  });
+
+  it("leaves alone a picture this tab took out or put in during the read", () => {
+    // The read was answered before this tab removed 2 and inserted 7.
+    expect(
+      diffViewAgainstIdRead({
+        before: gridRows(1, 2, 3, 4),
+        after: gridRows(1, 3, 7, 4),
+        answer: readRows(1, 2, 3, 4),
+        fromStart: true,
+        toEnd: true,
+        stacked: true,
+      }),
+    ).toEqual({ gone: [], added: [], moved: [], goneCards: [] });
+  });
+
+  it("with nothing in common, judges a whole-list read card by card", () => {
+    const grid = gridRows(1, 2);
+    expect(diffViewAgainstIdRead(wholeRead(grid, readRows(3, 4)))).toEqual({
+      gone: [1, 2],
+      added: [3, 4],
+      moved: [],
+      goneCards: [[1], [2]],
+    });
+  });
+
+  it("with nothing in common, removes nothing on a partial read and offers the refresh", () => {
+    const grid = gridRows(1, 2);
+    expect(
+      diffViewAgainstIdRead({
+        ...wholeRead(grid, readRows(3, 4)),
+        toEnd: false,
+      }),
+    ).toEqual({ gone: [], added: [], moved: [3, 4], goneCards: [] });
+  });
+
+  it("takes a search's first row of a stack as its card, as the grid's collapse does", () => {
+    // An id-list view (a text search) lists every member of a stack, and so
+    // does the grid's list behind its one card.
+    const grid = gridRows(1, [2, 20], [3, 20], 4);
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, [2, 20], [3, 20], 4))),
+    ).toEqual({ gone: [], added: [], moved: [], goneCards: [] });
+    expect(
+      diffViewAgainstIdRead(wholeRead(grid, readRows(1, [3, 20], [2, 20], 4))),
+    ).toEqual({ gone: [], added: [], moved: [3], goneCards: [] });
+  });
+});
+
+describe("settleGoneCards - a partial read's gone cards, asked again by id", () => {
+  // Pictures 1..10 in the grid; the read covered 4..7 and no longer lists 6.
+  function partialDiff(grid = gridRows(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)) {
+    return diffViewAgainstIdRead({
+      ...wholeRead(grid, readRows(4, 5, 7)),
+      fromStart: false,
+      toEnd: false,
+    });
+  }
+
+  it("calls a card the view still lists moved, out of the stretch read", () => {
+    expect(settleGoneCards(partialDiff(), new Set(["6"]))).toEqual({
+      gone: [],
+      added: [],
+      moved: [6],
+    });
+  });
+
+  it("calls a card the view no longer lists gone", () => {
+    expect(settleGoneCards(partialDiff(), new Set())).toEqual({
+      gone: [6],
+      added: [],
+      moved: [],
+    });
+  });
+
+  it("keeps a stack any of whose pictures the view lists, by the card it shows", () => {
+    const diff = partialDiff(
+      gridRows(1, 2, 3, 4, 5, [6, 60], [61, 60], 7, [8, 80], [81, 80], 9),
+    );
+    expect(diff.goneCards).toEqual([[6, 61]]);
+    expect(settleGoneCards(diff, new Set(["61"]))).toEqual({
+      gone: [],
+      added: [],
+      moved: [6],
+    });
+    expect(settleGoneCards(diff, new Set(["81"]))).toEqual({
+      gone: [6, 61],
+      added: [],
+      moved: [],
+    });
+  });
+
+  it("keeps the diff's own news and names a picture moved once", () => {
+    const diff = {
+      gone: [6],
+      added: [9],
+      moved: [6, 5],
+      goneCards: [[6]],
+    };
+    expect(settleGoneCards(diff, new Set(["6"]))).toEqual({
+      gone: [],
+      added: [9],
+      moved: [6, 5],
+    });
+  });
+});
+
+describe("useGridRealtimeSync - applyReconnectDiff", () => {
+  it("takes gone pictures out of the grid, without a reload or a pill", () => {
+    const h = makeHarness();
+    const res = h.sync.applyReconnectDiff({ gone: [3], added: [], moved: [] });
+    expect(res).toEqual({ action: "targeted", reason: "reconnect-removed" });
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([3]);
+    expect(h.wsStore.addPendingExternalImportIds).not.toHaveBeenCalled();
+    expect(h.wsStore.addSortChangedExternalIds).not.toHaveBeenCalled();
+    expect(h.reload).not.toHaveBeenCalled();
+  });
+
+  it("puts new pictures on the New pictures pill and moves on the View changed pill", () => {
+    const h = makeHarness();
+    const res = h.sync.applyReconnectDiff({
+      gone: [3],
+      added: [9],
+      moved: [5],
+    });
+    expect(res).toEqual({ action: "pill", reason: "reconnect-pills" });
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([3]);
+    expect(h.wsStore.addPendingExternalImportIds).toHaveBeenCalledWith([9]);
+    expect(h.wsStore.addSortChangedExternalIds).toHaveBeenCalledWith([5]);
+    expect(h.grid.insertGridImagesById).not.toHaveBeenCalled();
+    expect(h.reload).not.toHaveBeenCalled();
+  });
+
+  it("under the lightbox, still takes gone pictures out but holds the pills for its close", () => {
+    const h = makeHarness({ lightboxOpen: true });
+    const res = h.sync.applyReconnectDiff({
+      gone: [3],
+      added: [9],
+      moved: [5],
+    });
+    expect(res).toEqual({
+      action: "targeted",
+      reason: "reconnect-lightbox-deferred",
+    });
+    expect(h.grid.removeImagesById).toHaveBeenCalledWith([3]);
+    expect(h.grid.markLightboxDeferredRefresh).toHaveBeenCalledTimes(1);
+    expect(h.wsStore.addPendingExternalImportIds).not.toHaveBeenCalled();
+    expect(h.wsStore.addSortChangedExternalIds).not.toHaveBeenCalled();
+    expect(h.reload).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when the gap changed nothing", () => {
+    const h = makeHarness();
+    const res = h.sync.applyReconnectDiff({ gone: [], added: [], moved: [] });
+    expect(res).toEqual({ action: "ignored", reason: "reconnect-unchanged" });
+    expect(h.grid.removeImagesById).not.toHaveBeenCalled();
+    expect(h.grid.markLightboxDeferredRefresh).not.toHaveBeenCalled();
+  });
+
+  it("does not offer a picture this tab is already about to insert", () => {
+    const flushes = [];
+    const h = makeHarness({
+      scheduler: { schedule: (flush) => flushes.push(flush), cancel() {} },
+    });
+    h.sync.handleMessage({
+      type: "pictures_changed",
+      source: "ui",
+      origin_client_id: OTHER_ID,
+      picture_ids: [9],
+      change_kind: "added",
+    });
+    const res = h.sync.applyReconnectDiff({ gone: [], added: [9], moved: [] });
+    expect(res).toEqual({ action: "ignored", reason: "reconnect-unchanged" });
+    flushes.forEach((flush) => flush());
+    expect(h.grid.insertGridImagesById).toHaveBeenCalledWith([9]);
+    expect(h.wsStore.addPendingExternalImportIds).not.toHaveBeenCalled();
+  });
+
+  it("nor one it is already about to put back from the Scrapheap", () => {
+    const flushes = [];
+    const h = makeHarness({
+      scheduler: { schedule: (flush) => flushes.push(flush), cancel() {} },
+    });
+    h.sync.handleMessage({
+      type: "pictures_changed",
+      source: "ui",
+      origin_client_id: OTHER_ID,
+      picture_ids: [4],
+      change_kind: "restored",
+    });
+    const res = h.sync.applyReconnectDiff({ gone: [], added: [4], moved: [] });
+    expect(res).toEqual({ action: "ignored", reason: "reconnect-unchanged" });
+    flushes.forEach((flush) => flush());
+    expect(h.grid.insertGridImagesById).toHaveBeenCalledWith([4], {
+      highlight: false,
+    });
+    expect(h.wsStore.addPendingExternalImportIds).not.toHaveBeenCalled();
   });
 });

@@ -20,6 +20,9 @@
 // live Pinia instance. The default `schedule` flushes synchronously so unit
 // tests see side-effects immediately; App.vue passes a real debounce.
 
+import { getCurrentScope, onScopeDispose, watch } from "vue";
+import { onSessionReset } from "../utils/apiClient";
+
 const TARGETED = "targeted";
 const PILL = "pill";
 const SUPPRESSED = "suppressed";
@@ -133,6 +136,212 @@ function createSyncScheduler() {
 }
 
 /**
+ * Positions (indices into `values`) of one longest strictly increasing run,
+ * in order. Patience sorting, O(n log n).
+ *
+ * @param {number[]} values
+ * @returns {number[]}
+ */
+function longestIncreasingRun(values) {
+  const tails = []; // tails[k]: index of the smallest last value of a run of k + 1
+  const previous = new Array(values.length);
+  for (let i = 0; i < values.length; i += 1) {
+    let lo = 0;
+    let hi = tails.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (values[tails[mid]] < values[i]) lo = mid + 1;
+      else hi = mid;
+    }
+    previous[i] = lo > 0 ? tails[lo - 1] : -1;
+    tails[lo] = i;
+  }
+  const run = [];
+  let k = tails.length ? tails[tails.length - 1] : -1;
+  while (k >= 0) {
+    run.push(k);
+    k = previous[k];
+  }
+  return run.reverse();
+}
+
+/**
+ * What a reconnect's gap changed in the grid, recovered from ids: the grid's
+ * cards against a fresh read of one contiguous range of the same list
+ * (`/pictures/stream?fields=id,stack_id&stack_leaders_only=true`). The server
+ * does not replay the events it sent while the socket was down, so this is
+ * the only account of them there is.
+ *
+ * A card is a stack or a lone picture. The grid's list can hold a stack's
+ * members as well as its cover (a local reorder writes them all in), and the
+ * read lists one row per stack, so the two are compared card by card. An
+ * id-list view's read (a search) lists every member, as its load did: the
+ * first row of a stack is the card, as the grid's collapse takes it. The
+ * Scrapheap is the exception: the server lists every scrapped picture on its
+ * own there, stack or not, and so does the grid, so each picture is a card.
+ *
+ * The cards both hold line the two lists up: the longest run of them still in
+ * grid order stays put, and any other card both hold has moved. The first and
+ * last of that run bound the stretch of the grid the read covers (or the
+ * list's own ends, where the read reached them); a card inside it that the
+ * read no longer lists is gone. A listed card the grid does not hold is new,
+ * since a grid that has finished loading holds its whole list. A card whose
+ * cover changed, or a picture that changed card (it joined or left a stack),
+ * counts as moved, never as a removal and an arrival.
+ *
+ * @param {Object} read - what ImageGrid's `readViewForReconcile` resolves to.
+ * @param {Array<{id: *, stackId: *}>} read.before - the grid's base list, in
+ *   grid order, when the read went out.
+ * @param {Array<{id: *, stackId: *}>} read.after - the same list when the
+ *   answer came back.
+ * @param {Array<{id: *, stack_id: *}>} read.answer - the server's rows.
+ * @param {boolean} read.fromStart - the read began at the list's first row.
+ * @param {boolean} read.toEnd - the read reached the list's last row.
+ * @param {boolean} read.stacked - the list shows a stack as one card; false
+ *   in the Scrapheap, which lists each picture on its own.
+ * @param {Array<*>} [read.skipIds] - pictures the grid keeps on purpose
+ *   although the server no longer lists them (ghosts of a send to the
+ *   Scrapheap that can still be undone).
+ * @returns {{gone: Array, added: Array, moved: Array, goneCards: Array}}
+ *   picture ids, as the grid or the server gave them. `gone` names every row
+ *   of a gone card; `goneCards` holds the same rows card by card, the shown
+ *   one first, for `settleGoneCards`.
+ */
+export function diffViewAgainstIdRead({
+  before,
+  after,
+  answer,
+  fromStart,
+  toEnd,
+  stacked,
+  skipIds = [],
+}) {
+  const key = (id) => String(id);
+  const cardKey = (id, stackId) =>
+    !stacked || stackId == null
+      ? `picture:${key(id)}`
+      : `stack:${key(stackId)}`;
+  // A picture this tab took out or put in while the read was out is that
+  // change's, and the answer may have been read either side of it.
+  const beforeIds = new Set(before.map((row) => key(row.id)));
+  const afterIds = new Set(after.map((row) => key(row.id)));
+  const skip = new Set(skipIds.map(key));
+  for (const id of beforeIds) if (!afterIds.has(id)) skip.add(id);
+  for (const id of afterIds) if (!beforeIds.has(id)) skip.add(id);
+
+  // The grid's cards in order; a card's first row is the one it shows.
+  const cards = [];
+  const cardAt = new Map();
+  const gridIds = new Set();
+  for (const row of after) {
+    if (skip.has(key(row.id))) continue;
+    gridIds.add(key(row.id));
+    const ck = cardKey(row.id, row.stackId);
+    const at = cardAt.get(ck);
+    if (at === undefined) {
+      cardAt.set(ck, cards.length);
+      cards.push({ key: ck, id: row.id, ids: [row.id] });
+    } else {
+      cards[at].ids.push(row.id);
+    }
+  }
+  const listed = [];
+  const listedKeys = new Set();
+  const listedIds = new Set();
+  for (const pic of answer) {
+    if (pic?.id == null || skip.has(key(pic.id))) continue;
+    const ck = cardKey(pic.id, pic.stack_id);
+    listedIds.add(key(pic.id));
+    if (listedKeys.has(ck)) continue;
+    listedKeys.add(ck);
+    listed.push({ key: ck, id: pic.id });
+  }
+
+  const common = listed.filter((card) => cardAt.has(card.key));
+  const run = longestIncreasingRun(common.map((card) => cardAt.get(card.key)));
+
+  if (!run.length && !(fromStart && toEnd) && cards.length) {
+    // Nothing both hold lines the read up with the grid, so where it sits in
+    // the grid is unknown and no card can be judged gone: the view changed
+    // past what ids can place. Offer the refresh, not a pill of thousands.
+    return {
+      gone: [],
+      added: [],
+      moved: listed.length
+        ? listed.map((card) => card.id)
+        : cards.map((card) => card.id),
+      goneCards: [],
+    };
+  }
+
+  const gone = [];
+  const goneCards = [];
+  const added = [];
+  const moved = [];
+  const inRun = new Set(run.map((i) => common[i].key));
+  for (const card of common) {
+    const shown = cards[cardAt.get(card.key)];
+    if (!inRun.has(card.key) || key(shown.id) !== key(card.id)) {
+      moved.push(card.id);
+    }
+  }
+  for (const card of listed) {
+    if (cardAt.has(card.key)) continue;
+    if (gridIds.has(key(card.id))) moved.push(card.id);
+    else added.push(card.id);
+  }
+
+  const from = fromStart || !run.length ? 0 : cardAt.get(common[run[0]].key);
+  const to =
+    toEnd || !run.length
+      ? cards.length - 1
+      : cardAt.get(common[run[run.length - 1]].key);
+  for (let i = from; i <= to; i += 1) {
+    const card = cards[i];
+    if (listedKeys.has(card.key)) continue;
+    if (card.ids.some((id) => listedIds.has(key(id)))) moved.push(card.id);
+    else {
+      gone.push(...card.ids);
+      goneCards.push(card.ids);
+    }
+  }
+  return { gone, added, moved: uniqueIds(moved), goneCards };
+}
+
+// A picture that joined a stack as its cover is moved twice over: once as the
+// stack's new face, once as the lone card it no longer is.
+function uniqueIds(ids) {
+  return [...new Map(ids.map((id) => [String(id), id])).values()];
+}
+
+/**
+ * Settle the cards a reconnect read called gone when that read covered only
+ * part of a long view. Inside the stretch it covered, a card it does not list
+ * has either left the view or moved out of that stretch, and ids alone cannot
+ * tell which: a second read of the same view, narrowed to those cards' ids,
+ * can. A card any of whose pictures it lists is still in the view, so it has
+ * moved; the rest are gone.
+ *
+ * @param {{gone: Array, added: Array, moved: Array, goneCards: Array<Array>}} diff
+ *   `diffViewAgainstIdRead`'s answer.
+ * @param {Set<string>} listedIds - the ids, as strings, that the narrowed
+ *   read lists.
+ * @returns {{gone: Array, added: Array, moved: Array}}
+ */
+export function settleGoneCards({ added, moved, goneCards }, listedIds) {
+  const gone = [];
+  const settledMoved = [...moved];
+  for (const ids of goneCards) {
+    if (ids.some((id) => listedIds.has(String(id)))) {
+      settledMoved.push(ids[0]);
+    } else {
+      gone.push(...ids);
+    }
+  }
+  return { gone, added, moved: uniqueIds(settledMoved) };
+}
+
+/**
  * @param {Object} deps
  * @param {() => string|null} deps.getMyClientId   Active tab's client id.
  * @param {Object} deps.grid                        Imperative grid API (the ImageGrid template-ref's exposed methods, or spies in tests). Expected: insertGridImagesById, refreshGridImage, refreshStackFacets, repositionImageByScore, repositionImageBySmartScore, removeImagesById, isImagesLoading.
@@ -142,6 +351,7 @@ function createSyncScheduler() {
  * @param {Object} [deps.logger]                    console-like; defaults to console.
  * @param {() => void} [deps.reload]                Full-reload fallback.
  * @param {() => void} [deps.refreshSidebar]        Sidebar picture-count refresh.
+ * @param {() => boolean} [deps.isScrapheapView]    True while the grid shows the Scrapheap; defaults to false.
  * @param {{schedule: (flush: () => void) => void, cancel: () => void}} [deps.scheduler]  Coalescing scheduler; defaults to synchronous flush (unit tests). App.vue passes a debounce.
  */
 export function useGridRealtimeSync(deps) {
@@ -154,8 +364,34 @@ export function useGridRealtimeSync(deps) {
     logger = console,
     reload = () => {},
     refreshSidebar = () => {},
+    isScrapheapView = () => false,
     scheduler = createSyncScheduler(),
   } = deps;
+
+  // --- Sidebar refresh held back by an upload ------------------------------
+  // While this tab uploads, the import dialog drives the counts and a refresh
+  // per imported picture would churn them, so handleMessage holds the refresh
+  // back. A change from elsewhere in that time (another tab deletes, or sends
+  // pictures to the Scrapheap) still moved the counts, and nothing else replays
+  // it: the refresh is owed, and runs once when the upload ends. The value is
+  // the flash it owes (any held refresh that would have flashed makes it
+  // flash); null when none is owed.
+  let owedSidebarFlash = null;
+  watch(
+    () => wsStore.isUploadInProgress,
+    (uploading) => {
+      if (uploading || owedSidebarFlash === null) return;
+      const flash = owedSidebarFlash;
+      owedSidebarFlash = null;
+      refreshSidebar(flash);
+    },
+  );
+  // Sign-out also ends an upload (the store drops the flag), but the counts
+  // owed then belong to the session that is going away.
+  const stopSessionReset = onSessionReset(() => {
+    owedSidebarFlash = null;
+  });
+  if (getCurrentScope()) onScopeDispose(stopSessionReset);
 
   // --- Coalescing buffers -------------------------------------------------
   // Accumulated across one window, then applied once per category on flush.
@@ -449,6 +685,16 @@ export function useGridRealtimeSync(deps) {
       // and the comeback would never show.
       return reloadOrDefer(`${originLabel}-restored-untargetable-empty-ids`);
     }
+    // In the Scrapheap a restored picture has LEFT the view, so its card goes.
+    // The insert below would be a no-op here (the id is still in the base
+    // list), which is what kept a restore run's cards on screen until it ended.
+    if (isScrapheapView()) {
+      enqueueRemoved(pictureIds);
+      return {
+        action: TARGETED,
+        reason: `${originLabel}-restored-left-scrapheap`,
+      };
+    }
     if (deferWhileLightboxOpen()) {
       // Same contract as an add (§9.1): never restructure the grid under the
       // frozen filmstrip. closeLightbox() reconciles.
@@ -471,6 +717,13 @@ export function useGridRealtimeSync(deps) {
 
   // --- Echo of this tab's own optimistic op -------------------------------
   function handleOwnOrigin(payload, changeKind, fields, pictureIds) {
+    // A Scrapheap run's events (`run_id` on the message) follow
+    // no optimistic op: the run works on the server, slice by slice, and
+    // nothing in this tab applied any of it. So none of them is an echo, and
+    // each is applied as another tab's would be, as it arrives.
+    if (payload?.run_id) {
+      return handleForeignUi(payload, changeKind, fields, pictureIds);
+    }
     // The one own-origin echo that must NOT be suppressed. Suppression assumes
     // an optimistic local op already applied the change, and for a scrapheap
     // undo there may be none: the tiles may have collapsed when the receipt
@@ -504,6 +757,18 @@ export function useGridRealtimeSync(deps) {
     // was switched away and back.
     if (changeKind === "added") {
       return applyAdded("own-origin", pictureIds);
+    }
+    // A removal from the Scrapheap is a purge, and no purge removes a tile
+    // optimistically: a run settles by re-reading the heap, and a request that
+    // timed out after the server committed has no local step at all. So this
+    // echo is the only thing that takes the destroyed pictures off the screen
+    // as the server confirms them. Idempotent: an id no longer in the grid is a
+    // no-op. Outside the Scrapheap the echo stays suppressed, because there it
+    // follows a soft delete whose tiles the grid holds ghosted for the undo
+    // window, and removing them would take the one-click undo with them.
+    if (changeKind === "removed" && isScrapheapView()) {
+      enqueueRemoved(pictureIds);
+      return { action: TARGETED, reason: "own-origin-removed-scrapheap" };
     }
     return { action: SUPPRESSED, reason: "own-origin-echo" };
   }
@@ -563,6 +828,12 @@ export function useGridRealtimeSync(deps) {
       if (!pictureIds.length) {
         return reloadOrDefer("external-restored-untargetable-empty-ids");
       }
+      // Leaving the Scrapheap moves nothing under the user that a removal
+      // does not, and an external removal is applied silently too.
+      if (isScrapheapView()) {
+        enqueueRemoved(pictureIds);
+        return { action: TARGETED, reason: "external-restored-left-scrapheap" };
+      }
       if (deferWhileLightboxOpen()) {
         return {
           action: TARGETED,
@@ -610,6 +881,36 @@ export function useGridRealtimeSync(deps) {
     // in the view (a fetch storm on a full-library recompute) to update a value
     // that isn't even displayed under the current sort/filter.
     return { action: IGNORED, reason: "external-updated-invisible-field" };
+  }
+
+  // --- What a reconnect's gap changed ---------------------------------------
+  /**
+   * Apply `diffViewAgainstIdRead`'s account of the changes made while the
+   * socket was down, on the external contract: gone pictures leave silently
+   * (as an external removal does, lightbox or not), new ones go on the "New
+   * pictures" pill and moved ones on the "View changed externally" pill. It
+   * never reloads the grid. Returns a `{ action, reason }` descriptor.
+   *
+   * @param {{gone: Array, added: Array, moved: Array}} diff
+   */
+  function applyReconnectDiff({ gone, added, moved }) {
+    // A picture this tab is already about to insert is not news.
+    const arriving = added.filter(
+      (id) => !addedIds.has(id) && !restoredIds.has(id),
+    );
+    if (!gone.length && !arriving.length && !moved.length) {
+      return { action: IGNORED, reason: "reconnect-unchanged" };
+    }
+    if (gone.length) enqueueRemoved(gone);
+    if (!arriving.length && !moved.length) {
+      return { action: TARGETED, reason: "reconnect-removed" };
+    }
+    if (deferWhileLightboxOpen()) {
+      return { action: TARGETED, reason: "reconnect-lightbox-deferred" };
+    }
+    if (arriving.length) enqueueAddPill(arriving);
+    if (moved.length) enqueueSortPill(moved);
+    return { action: PILL, reason: "reconnect-pills" };
   }
 
   /**
@@ -796,8 +1097,13 @@ export function useGridRealtimeSync(deps) {
       changeKind === "added" ||
       changeKind === "removed" ||
       changeKind === "restored";
-    if (!wsStore.isUploadInProgress && touchesSidebar) {
-      refreshSidebar(changeKind !== "restored");
+    if (touchesSidebar) {
+      const flash = changeKind !== "restored";
+      if (wsStore.isUploadInProgress) {
+        owedSidebarFlash = owedSidebarFlash === true || flash;
+      } else {
+        refreshSidebar(flash);
+      }
     }
 
     return handlePictureEvent(payload);
@@ -807,6 +1113,7 @@ export function useGridRealtimeSync(deps) {
     handleMessage,
     // Exposed for finer-grained tests and reuse.
     handlePictureEvent,
+    applyReconnectDiff,
     // Force any pending coalesced side-effects to apply now (e.g. on unmount).
     flushNow: flushCoalesced,
   };

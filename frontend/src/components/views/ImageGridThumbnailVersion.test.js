@@ -85,16 +85,21 @@ let holdThumbnailPost = false;
 // When true the server reports no thumbnail for the picture (still generating).
 let serverHasThumbnail = true;
 let thumbnailPostCount = 0;
+// The ids each thumbnails POST asked for, in order.
+let thumbnailPostIds = [];
 
-function thumbnailsPayload() {
+function thumbnailsPayload(ids) {
   if (!serverHasThumbnail) return {};
-  return {
-    7: {
-      thumbnail: `/pictures/thumbnails/7.webp?v=${thumbnailVersion}`,
-      thumbnail_width: 1600,
-      thumbnail_height: 1200,
-    },
-  };
+  return Object.fromEntries(
+    ids.map((id) => [
+      id,
+      {
+        thumbnail: `/pictures/thumbnails/${id}.webp?v=${thumbnailVersion}`,
+        thumbnail_width: 1600,
+        thumbnail_height: 1200,
+      },
+    ]),
+  );
 }
 
 function mountGrid() {
@@ -146,6 +151,18 @@ function seedCard(wrapper, overrides = {}) {
   thumbnailPostCount = 0;
 }
 
+/** A picture row as the stream lands it, before any thumbnail work. */
+function card(id, idx) {
+  return {
+    id,
+    idx,
+    format: "jpg",
+    imported_at: "2026-08-01T10:00:00",
+    thumbnail: null,
+    tags: [],
+  };
+}
+
 function thumbnailOf(wrapper, id = 7) {
   return wrapper.vm.allGridImages.find((img) => img.id === id)?.thumbnail;
 }
@@ -157,6 +174,7 @@ beforeEach(() => {
   holdThumbnailPost = false;
   serverHasThumbnail = true;
   thumbnailPostCount = 0;
+  thumbnailPostIds = [];
   apiGet.mockReset();
   apiPost.mockReset();
   apiPatch.mockReset();
@@ -164,15 +182,17 @@ beforeEach(() => {
   apiDelete.mockReset();
   apiGet.mockResolvedValue({ data: { pictures: [], count: 0, total: 0 } });
   apiPatch.mockResolvedValue({ data: {} });
-  apiPost.mockImplementation(async (url) => {
+  apiPost.mockImplementation(async (url, body) => {
     if (String(url ?? "").includes("/pictures/thumbnails")) {
+      const ids = (body?.ids ?? []).map(String);
       thumbnailPostCount += 1;
+      thumbnailPostIds.push(ids);
       if (holdThumbnailPost) {
         return new Promise((resolve) => {
-          heldThumbnailPost = () => resolve({ data: thumbnailsPayload() });
+          heldThumbnailPost = () => resolve({ data: thumbnailsPayload(ids) });
         });
       }
-      return { data: thumbnailsPayload() };
+      return { data: thumbnailsPayload(ids) };
     }
     return { data: {} };
   });
@@ -273,6 +293,96 @@ describe("ImageGrid - the server owns the thumbnail URL", () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(thumbnailPostCount).toBe(1);
+    wrapper.unmount();
+  });
+});
+
+// A slot counts as loaded only once a picture in it has been asked for. The
+// grid lays out placeholders before the stream fills them, and a visible-window
+// fetch can run in between; counting those slots made the fetch for the
+// pictures that landed there look done already, and their cards stayed blank.
+describe("ImageGrid - a range counts as loaded only where its slots held pictures", () => {
+  it("asks again for a slot that was still a placeholder", async () => {
+    const wrapper = mountGrid();
+    await settle(wrapper);
+    wrapper.vm.allGridImages = [{ id: null, idx: 0 }];
+
+    await wrapper.vm.fetchThumbnailsBatch(0, 1);
+    expect(thumbnailPostCount).toBe(0);
+
+    seedCard(wrapper);
+    await wrapper.vm.fetchThumbnailsBatch(0, 1);
+
+    expect(thumbnailPostCount).toBe(1);
+    expect(thumbnailOf(wrapper)).toBe(
+      "/api/v1/pictures/thumbnails/7.webp?v=1600x1200&st=tok",
+    );
+    wrapper.unmount();
+  });
+
+  it("asks for the picture that filled a placeholder, and only for it", async () => {
+    const wrapper = mountGrid();
+    await settle(wrapper);
+    wrapper.vm.allGridImages = [card(7, 0), { id: null, idx: 1 }];
+
+    await wrapper.vm.fetchThumbnailsBatch(0, 2);
+    expect(thumbnailPostIds).toEqual([["7"]]);
+
+    // The stream fills the placeholder.
+    wrapper.vm.allGridImages[1] = card(8, 1);
+    await wrapper.vm.fetchThumbnailsBatch(0, 2);
+
+    expect(thumbnailPostIds).toEqual([["7"], ["8"]]);
+    expect(thumbnailOf(wrapper, 8)).toBe(
+      "/api/v1/pictures/thumbnails/8.webp?v=1600x1200&st=tok",
+    );
+
+    // Both slots count now.
+    await wrapper.vm.fetchThumbnailsBatch(0, 2);
+    expect(thumbnailPostIds).toHaveLength(2);
+    wrapper.unmount();
+  });
+
+  it("keeps what landed on a row it did not ask for", async () => {
+    // The batch slices every row of its range, but only the rows it asked for
+    // carry an answer; writing the others back would put their sliced fields
+    // over whatever reached the card while the request was out.
+    const wrapper = mountGrid();
+    await settle(wrapper);
+    wrapper.vm.allGridImages = [card(7, 0), { id: null, idx: 1 }];
+    await wrapper.vm.fetchThumbnailsBatch(0, 2);
+    wrapper.vm.allGridImages[1] = card(8, 1);
+
+    holdThumbnailPost = true;
+    const batch = wrapper.vm.fetchThumbnailsBatch(0, 2);
+    wrapper.vm.allGridImages[0] = {
+      ...wrapper.vm.allGridImages[0],
+      penalised_tags: ["test-tag"],
+    };
+    heldThumbnailPost();
+    await batch;
+
+    expect(thumbnailPostIds.at(-1)).toEqual(["8"]);
+    expect(wrapper.vm.allGridImages[0].penalised_tags).toEqual(["test-tag"]);
+    wrapper.unmount();
+  });
+
+  it("leaves the grid and the bookkeeping alone when every picture already counts", async () => {
+    // In justified mode a write to a row repacks the layout, and the repack
+    // asks for the visible window again: a call with nothing to ask for that
+    // still wrote would go round for ever.
+    const wrapper = mountGrid();
+    await settle(wrapper);
+    wrapper.vm.allGridImages = [card(7, 0), { id: null, idx: 1 }];
+    await wrapper.vm.fetchThumbnailsBatch(0, 2);
+    const row = wrapper.vm.allGridImages[0];
+    const ranges = wrapper.vm.loadedRanges.map((range) => [...range]);
+
+    await wrapper.vm.fetchThumbnailsBatch(0, 2);
+
+    expect(thumbnailPostCount).toBe(1);
+    expect(wrapper.vm.allGridImages[0]).toBe(row);
+    expect(wrapper.vm.loadedRanges).toEqual(ranges);
     wrapper.unmount();
   });
 });

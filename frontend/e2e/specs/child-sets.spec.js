@@ -91,14 +91,17 @@ async function addToSet(ctx, setId, ids) {
   )
 }
 
-function acceptConfirm(page) {
-  return new Promise((resolve) => {
-    page.once('dialog', async (d) => {
-      const message = d.message()
-      await d.accept()
-      resolve(message)
-    })
-  })
+/**
+ * Answer the app's confirm dialog with that title: check what it tells the
+ * person, then press its confirm button. The sidebar asks there, in an
+ * alertdialog, never in the browser's own confirm box.
+ */
+async function acceptConfirm(page, { title, says = [], button }) {
+  const dialog = page.getByRole('alertdialog', { name: title, exact: true })
+  await expect(dialog).toBeVisible()
+  for (const text of says) await expect(dialog).toContainText(text)
+  await dialog.getByRole('button', { name: button, exact: true }).click()
+  await expect(dialog).toBeHidden()
 }
 
 const pathname = (page) => new URL(page.url()).pathname
@@ -315,11 +318,12 @@ test.describe('deleting', () => {
     await expect(row).toHaveClass(/active/)
 
     await openCtx(sidebar, row)
-    const confirmed = acceptConfirm(page)
     await sidebar.ctxButton('Delete').click()
-    expect(await confirmed).toBe(
-      `Delete picture set "${child.name}"? This will unassign all their images.`,
-    )
+    await acceptConfirm(page, {
+      title: `Delete picture set "${child.name}"?`,
+      says: ['Its pictures leave the set and stay in the library.'],
+      button: 'Delete set',
+    })
 
     await expect(row).toHaveCount(0)
     // Not left on the dead set's route (#2340).
@@ -351,9 +355,11 @@ test.describe('deleting', () => {
     await expect(setRow(sidebar, child.name)).toHaveClass(/sidebar-tree-kid/)
 
     await openCtx(sidebar, setRow(sidebar, parent.name))
-    const confirmed = acceptConfirm(page)
     await sidebar.ctxButton('Delete').click()
-    await confirmed
+    await acceptConfirm(page, {
+      title: `Delete picture set "${parent.name}"?`,
+      button: 'Delete set',
+    })
 
     await expect(setRow(sidebar, parent.name)).toHaveCount(0)
     await expect(setRow(sidebar, child.name)).toBeVisible()
@@ -385,9 +391,14 @@ test.describe('deleting', () => {
     ).toBeVisible()
 
     await openCtx(sidebar, personRow(sidebar, person.name))
-    const confirmed = acceptConfirm(page)
     await sidebar.ctxButton('Delete').click()
-    expect(await confirmed).toBe(`Delete character "${person.name}"?`)
+    await acceptConfirm(page, {
+      title: `Delete character "${person.name}"?`,
+      says: [
+        'Their pictures stay in the library, and the faces named as them go back to unnamed.',
+      ],
+      button: 'Delete character',
+    })
 
     await expect(personRow(sidebar, person.name)).toHaveCount(0)
     await expect(setRow(sidebar, child.name)).toBeVisible()

@@ -52,6 +52,8 @@ vi.mock("../../utils/apiClient", async () => {
     logout: vi.fn(),
     sessionContext,
     setRequestClientId: vi.fn(),
+    // A Scrapheap run start carries the gesture's request id.
+    newOperationBatchId: () => "cli-test-gesture",
     API_BASE_URL: "/api/v1",
     // Reached back through the module so a test can flip the session scope.
     __readOnly: readOnly,
@@ -286,15 +288,19 @@ describe("the Images/Videos filter", () => {
     rendered.forEach((img, i) => expect(img.idx).toBe(start + i));
   });
 
-  it("still drops a loaded row of the other kind", async () => {
+  // The window is sliced by unfiltered slot, so a loaded row of the other kind
+  // is shown as an empty slot, never taken out: taken out, every card after it
+  // would sit one slot early and the window would end on a card it never asked
+  // for.
+  it("shows a loaded row of the other kind as an empty slot", async () => {
     const rows = [picture(0), video(1), placeholder(2), picture(3)];
     const wrapper = await mountWithRows("images", rows);
     await scrollTo(wrapper, 0);
 
     expect(wrapper.vm.filteredGridCount).toBe(3);
-    expect(wrapper.vm.gridImagesToRender.map((img) => img.idx)).toEqual([
-      0, 2, 3,
-    ]);
+    const rendered = wrapper.vm.gridImagesToRender;
+    expect(rendered.map((img) => img.idx)).toEqual([0, 1, 2, 3]);
+    expect(rendered.map((img) => img.id)).toEqual([1, null, null, 4]);
   });
 
   it("keeps only videos in Videos", async () => {
@@ -302,7 +308,36 @@ describe("the Images/Videos filter", () => {
     const wrapper = await mountWithRows("videos", rows);
     await scrollTo(wrapper, 0);
 
-    expect(wrapper.vm.gridImagesToRender.map((img) => img.idx)).toEqual([1, 2]);
+    const rendered = wrapper.vm.gridImagesToRender;
+    expect(rendered.map((img) => img.idx)).toEqual([0, 1, 2]);
+    expect(rendered.map((img) => img.id)).toEqual([null, 2, null]);
+  });
+
+  // All streamed in mixed rows, then the user picks
+  // Images, and the refetch's count has not answered. The switch empties the
+  // grid at once (_resetGridState), so no row of the other kind is left to
+  // show; were one left, the filter above would show it as an empty slot.
+  it("shows no card of the other kind while the switch's count is out", async () => {
+    const rows = Array.from({ length: 200 }, (_, i) =>
+      i % 2 ? video(i) : picture(i),
+    );
+    const wrapper = await mountWithRows("all", rows);
+    await scrollTo(wrapper, 100);
+    expect(wrapper.vm.gridImagesToRender.some((img) => img.id != null)).toBe(
+      true,
+    );
+
+    useFilterStore().mediaTypeFilter = "images";
+    await nextTick();
+    await scrollTo(wrapper, 100);
+
+    const start = wrapper.vm.renderStart;
+    const rendered = wrapper.vm.gridImagesToRender;
+    rendered.forEach((img, i) => expect(img.idx).toBe(start + i));
+    for (const img of rendered.filter((row) => row.id != null)) {
+      expect(img.name).toMatch(/\.png$/);
+      expect(img.id).toBe(img.idx + 1);
+    }
   });
 
   it("passes the grid through untouched in All", async () => {
@@ -461,11 +496,17 @@ describe("emptying the scrapheap refreshes the grid", () => {
   async function purge(wrapper) {
     wrapper.vm.deleteForeverConfirmToken = "test-confirmation";
     await wrapper.vm.runEmptyScrapheap(false);
-    expect(apiPost).toHaveBeenCalledWith("/pictures/scrapheap/runs", {
-      kind: "purge",
-      include_protected: false,
-      confirm_token: "test-confirmation",
-    });
+    expect(apiPost).toHaveBeenCalledWith(
+      "/pictures/scrapheap/runs",
+      {
+        kind: "purge",
+        include_protected: false,
+        confirm_token: "test-confirmation",
+        // The gesture's request id, resent unchanged on a lost answer.
+        request_id: "cli-test-gesture",
+      },
+      { headers: { Prefer: "wait=1" } },
+    );
   }
 
   it("re-reads after a purge that lands while the grid is still reading", async () => {
@@ -516,8 +557,9 @@ describe("emptying the scrapheap refreshes the grid", () => {
 
 describe("stack counts while a view streams in", () => {
   // 12,000 pictures: a 200-row first batch, a 200-row early tail, then
-  // background batches from offset 200. Row 300, in the first background
-  // batch, is a stack of two; the request at offset 5200 is held.
+  // background batches, each asked from the last row already loaded (199,
+  // 5,198, ...). Row 300, in the first background batch, is a stack of two;
+  // the second background request, at offset 5,198, is held.
   const TOTAL = 12_000;
   function streamWithHeldBatch() {
     let rejectLater;
@@ -537,7 +579,7 @@ describe("stack counts while a view streams in", () => {
         const params = new URL(u, "http://test").searchParams;
         const offset = Number(params.get("offset"));
         const limit = Number(params.get("batch_limit"));
-        if (offset === 5200) {
+        if (offset === 5198) {
           laterAsked = true;
           return later;
         }

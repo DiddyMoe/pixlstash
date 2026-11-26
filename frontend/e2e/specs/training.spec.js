@@ -332,8 +332,12 @@ test.describe('training a LoRA of a person', () => {
     await expect
       .poll(async () => (await liveStep(training)) ?? -1, { timeout: 30_000 })
       .toBeGreaterThan(0)
-    page.once('dialog', (d) => d.accept())
     await training.liveStop.click()
+    // A stopped run cannot resume, so Stop asks first, in the app's own dialog.
+    const ask = page.getByRole('alertdialog', { name: /^Stop training ".+"\?$/ })
+    await expect(ask).toContainText('keeps the checkpoints it saved.')
+    await ask.getByRole('button', { name: 'Stop training', exact: true }).click()
+    await expect(ask).toBeHidden()
     await expect(training.liveStatus).toContainText(/Stopped at step [\d,]+/, { timeout: 20_000 })
 
     const stopped = await job(apiContext, id)

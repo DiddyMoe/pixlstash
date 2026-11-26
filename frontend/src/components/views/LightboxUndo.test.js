@@ -294,3 +294,81 @@ describe("Lightbox - the narration on this surface", () => {
     expect(store.receipt).not.toBeNull();
   });
 });
+
+describe("Lightbox - keys pressed inside an open menu", () => {
+  // The WAI-ARIA menu pattern: while a menu is open it owns the keyboard. The
+  // lightbox's menus (the rating, the plugin Filters) have no scrim, so the
+  // dialog check misses them, and Vuetify lets their keys bubble to this
+  // window listener: Delete or an arrow on a menu item acted on the picture.
+  async function openOnTwo() {
+    const wrapper = mount(Lightbox, {
+      props: {
+        open: false,
+        initialImageId: 7,
+        allImages: [
+          { id: 7, format: "jpg", tags: [] },
+          { id: 8, format: "jpg", tags: [] },
+        ],
+        backendUrl: "http://test",
+        tagUpdate: { key: 0, pictureIds: [] },
+        descriptionUpdate: { key: 0, pictureIds: [] },
+        smartScoreUpdate: { key: 0, pictureIds: [] },
+      },
+      global: { stubs: STUBS },
+      attachTo: document.body,
+    });
+    await wrapper.setProps({ open: true });
+    await flush();
+    await flush();
+    return wrapper;
+  }
+
+  function openMenu() {
+    const menu = document.createElement("div");
+    menu.className = "v-overlay v-overlay--active v-menu";
+    menu.innerHTML =
+      '<div class="v-overlay__content"><div class="v-list" role="menu">' +
+      '<button type="button" role="menuitem">Filters</button>' +
+      "</div></div>";
+    document.body.appendChild(menu);
+    return { menu, item: menu.querySelector('[role="menuitem"]') };
+  }
+
+  const shownId = (wrapper) => wrapper.vm.$.setupState.image?.id;
+
+  it.each(["Delete", "Backspace", "ArrowRight", "ArrowLeft"])(
+    "leaves %s on a menu item to the menu",
+    async (key) => {
+      const wrapper = await openOnTwo();
+      const { menu, item } = openMenu();
+      try {
+        item.focus();
+        const event = press(key, { target: item });
+        await flush();
+
+        expect(wrapper.emitted("delete-picture")).toBeUndefined();
+        expect(shownId(wrapper)).toBe(7);
+        expect(event.defaultPrevented).toBe(false);
+      } finally {
+        menu.remove();
+      }
+    },
+  );
+
+  it.each([
+    ["Delete", (w) => expect(w.emitted("delete-picture")).toHaveLength(1)],
+    ["Backspace", (w) => expect(w.emitted("delete-picture")).toHaveLength(1)],
+    ["ArrowRight", (w) => expect(shownId(w)).toBe(8)],
+    ["ArrowLeft", (w) => expect(shownId(w)).toBe(8)],
+  ])("still acts on %s pressed outside an open menu", async (key, effect) => {
+    const wrapper = await openOnTwo();
+    const { menu } = openMenu();
+    try {
+      press(key);
+      await flush();
+      effect(wrapper);
+    } finally {
+      menu.remove();
+    }
+  });
+});

@@ -62,6 +62,8 @@ const lorasDialog = (page) => page.locator(".app-dialog").filter({ hasText: "Edi
 /** The chain editor, which Add a LoRA or reorder… opens in its place. */
 const chainDialog = (page) => page.locator(".app-dialog").filter({ has: page.getByTestId("eld-primary") });
 const notices = (page) => page.locator(".notice-message");
+/** Any dialog at all, a confirm (an alertdialog) included. */
+const anyDialog = (page) => page.getByRole("dialog").or(page.getByRole("alertdialog"));
 
 /** Open the Workflows screen on the stubbed library and select a card. */
 async function selectWorkflow(page, index = 0) {
@@ -628,7 +630,7 @@ test.describe("the bar", () => {
     await bar(page).getByRole("button", { name: "Discard" }).click();
     await expect(bar(page)).toBeHidden();
     expect(net.discards).toEqual([WF]);
-    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(anyDialog(page)).toHaveCount(0);
     await expect(runButton(page)).toBeFocused();
     // The rows read as saved again.
     await expect(rail(page).getByTestId("wftab-stages-edited")).toBeHidden();
@@ -714,7 +716,7 @@ test("changes stay with the workflow when another card is selected, and nothing 
   await cardRow(page, 1).click();
   await expect(rail(page).getByTestId("wftab-title")).toHaveText("Landscape, golden hour");
   await expect(bar(page)).toBeHidden();
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(anyDialog(page)).toHaveCount(0);
   await expect(rail(page).getByTestId("wftab-stages-edited")).toBeHidden();
 
   // While the other card is shown, one of the three is taken back somewhere

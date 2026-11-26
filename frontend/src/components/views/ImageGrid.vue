@@ -285,19 +285,12 @@
       :run="scrapheapRunStore.run"
       :run-unreachable="scrapheapRunStore.unreachable"
       :run-action="scrapheapRunStore.action"
+      :checking="deleteForeverLoading ? deleteForeverMode : null"
       :retention-label="scrapheapRetentionLabel"
       @empty-scrapheap="confirmEmptyScrapheap"
       @restore-scrapheap="confirmRestoreScrapheap"
       @stop-run="stopScrapheapRun"
       @open-retention-settings="emit('open-settings', 'scrapheap')"
-    />
-    <SnapshotsWithDeletedDialog
-      v-model="snapshotsWithDeletedOpen"
-      :snapshots="snapshotsWithDeleted"
-      :dont-show-again="userPrefsStore.hidePurgeSnapshotWarning"
-      @update:dont-show-again="
-        userPrefsStore.setHidePurgeSnapshotWarning($event)
-      "
     />
     <DeleteForeverDialog
       v-model:open="deleteForeverOpen"
@@ -376,8 +369,8 @@
       <span class="multi-select-toolbar__label">
         {{
           isMultiCharacterView
-            ? `${normalizedSelectedCharacterIds.length} people selected`
-            : `${normalizedSelectedSetIds.length} sets selected`
+            ? `${formatCount(normalizedSelectedCharacterIds.length)} people selected`
+            : `${formatCount(normalizedSelectedSetIds.length)} sets selected`
         }}
       </span>
       <span class="multi-select-toolbar__spacer"></span>
@@ -438,6 +431,9 @@
       class="grid-scroll-wrapper"
       ref="scrollWrapper"
       @scroll="onGridScroll"
+      @wheel.passive="dropPendingScrollPlace"
+      @touchmove.passive="dropPendingScrollPlace"
+      @pointerdown="dropScrollPlaceOnScrollbarPress"
       @dragenter.prevent="handleGridDragEnter"
       @dragover.prevent="handleGridDragOver"
       @dragleave.prevent="handleGridDragLeave"
@@ -459,7 +455,7 @@
           data-testid="pending-imports-pill"
           @click="emit('load-pending-imports')"
         >
-          {{ wsStore.pendingExternalImportCount }}
+          {{ formatCount(wsStore.pendingExternalImportCount) }}
           {{
             wsStore.pendingExternalImportCount === 1
               ? "new picture"
@@ -586,7 +582,8 @@
         ></div>
         <div
           v-for="(img, idx) in gridImagesToRender"
-          :key="img.id ? `img-${img.id}-${img.idx}` : `placeholder-${img.idx}`"
+          :key="img.id ? `img-${img.id}` : `placeholder-${img.idx}`"
+          :data-picture-id="img.id ?? undefined"
           :style="[getStackCardStyle(img), getJustifiedCardStyle(img, idx)]"
           :class="[
             'image-card',
@@ -608,7 +605,7 @@
               'image-card--ghost': isImageGhosted(img),
             },
           ]"
-          :ref="(element) => setImageCardRef(img.idx, element)"
+          :ref="(element) => setImageCardRef(img.id, element)"
           :role="img.id && !isImageGhosted(img) ? 'row' : 'presentation'"
           :tabindex="imageCardTabIndex(img)"
           :aria-label="img.id ? imageCardAriaLabel(img) : undefined"
@@ -702,7 +699,7 @@
                       getOpenStackPlace(img).position === 0,
                   }"
                   ><Tooltip
-                    :text="`${stackOrdinal(getOpenStackPlace(img).position + 1)} of ${getOpenStackPlace(img).count} in this stack`"
+                    :text="`${stackOrdinal(getOpenStackPlace(img).position + 1)} of ${formatCount(getOpenStackPlace(img).count)} in this stack`"
                     activator="parent" /><v-icon
                     v-if="getOpenStackPlace(img).position === 0"
                     class="stack-position-chip__star"
@@ -1308,6 +1305,7 @@ import {
   ref,
   watch,
   nextTick,
+  onBeforeUnmount,
   onUnmounted,
 } from "vue";
 import { useRoute, useRouter } from "vue-router";
@@ -1335,8 +1333,9 @@ import {
   GHOST_PENDING,
   useOperationStore,
 } from "../../stores/useOperationStore";
-import { useNoticeStore, DEFAULT_TIMEOUTS } from "../../stores/useNoticeStore";
+import { useNoticeStore } from "../../stores/useNoticeStore";
 import { confirmRetag } from "../../composables/confirmRetag";
+import { useConfirm } from "../../composables/useConfirm";
 import { useBreadcrumb } from "../../composables/useBreadcrumb";
 import {
   useAnchorHeight,
@@ -1347,9 +1346,15 @@ import { lightboxCloseTarget } from "../../utils/lightboxRoute";
 import { markEnd, markStart } from "../../utils/perfMarks";
 import { useScopedNotice } from "../../composables/useScopedNotice";
 import { buildPurgeBadge } from "../../utils/retention.js";
-import { buildLockedDeleteMessage } from "../../utils/lockedDelete.js";
+import {
+  buildLockedDeleteMessage,
+  raiseLockedDeleteNotice,
+} from "../../utils/lockedDelete.js";
 import { buildLibraryMoveMessage } from "../../utils/libraryMove.js";
-import { writeThumbnailBatch } from "../../utils/thumbnailWriteback.js";
+import {
+  loadedSlotRuns,
+  writeThumbnailBatch,
+} from "../../utils/thumbnailWriteback.js";
 import {
   cutFaceSuggestions,
   referenceFaceCount,
@@ -1368,7 +1373,6 @@ import { errorMessage, requestFailure } from "../../utils/apiError.js";
 import {
   SCRAPHEAP_GESTURES,
   scrapheapRunFailureSentence,
-  scrapheapRunOutcomeNotice,
 } from "../../utils/scrapheapRun.js";
 import {
   isSupportedImageFile,
@@ -1389,7 +1393,7 @@ import Lightbox from "./Lightbox.vue";
 import EmptyScrapHeap from "../widgets/EmptyScrapHeap.vue";
 import { inboxEmptyState, useInboxStore } from "../../stores/useInboxStore";
 import FilterStrip from "../panels/FilterStrip.vue";
-import { filterChips } from "../../utils/filterChips";
+import { filterChips, formatCount } from "../../utils/filterChips";
 import Toolbar from "../panels/Toolbar.vue";
 import SelectionBar from "../panels/SelectionBar.vue";
 import GridActionPill from "../panels/GridActionPill.vue";
@@ -1407,7 +1411,6 @@ import StackEdgeTicks from "../widgets/StackEdgeTicks.vue";
 import { useGridComfyuiRuns } from "../../composables/useGridComfyuiRuns";
 import ProgressOverlay from "../widgets/ProgressOverlay.vue";
 import ShareDialog from "../io/ShareDialog.vue";
-import SnapshotsWithDeletedDialog from "../widgets/SnapshotsWithDeletedDialog.vue";
 import DeleteForeverDialog from "../widgets/DeleteForeverDialog.vue";
 import KeepCoverOnlyDialog from "../widgets/KeepCoverOnlyDialog.vue";
 import {
@@ -1434,11 +1437,16 @@ import {
   clearImpossibleTags,
   restoreImpossibleTags,
   startExport,
+  startExportByIds,
   startFolderExport,
+  startFolderExportByIds,
   getExportStatus,
   downloadExport,
   listPicturesByIds,
   rotatePictures,
+  streamPictures,
+  streamPicturesAmongIds,
+  SEARCH_CHANCE_CEILING,
 } from "../../api/pictures";
 import { getStack, removeStackMembers } from "../../api/stacks";
 import {
@@ -1519,6 +1527,7 @@ import {
 } from "../../utils/stack.js";
 import { useVirtualScroll } from "../../composables/useVirtualScroll.js";
 import {
+  rowAtOffset,
   rowOfIndex,
   JUSTIFIED_ROW_GAP,
 } from "../../composables/useJustifiedLayout.js";
@@ -1529,6 +1538,7 @@ import { useGridFetch } from "../../composables/useGridFetch.js";
 import { useGridScoring } from "../../composables/useGridScoring.js";
 import { useGridKeyboardNav } from "../../composables/useGridKeyboardNav.js";
 import { debounce } from "../../utils/utils";
+import { isTypingTarget } from "../../utils/dom.js";
 import { useSelectionStore } from "../../stores/useSelectionStore";
 import { useSortStore } from "../../stores/useSortStore";
 import { useProjectStore } from "../../stores/useProjectStore";
@@ -1786,8 +1796,7 @@ const {
   clear: clearSetSuggestSearch,
 } = setSuggest;
 // The last text search's response, { key, query, rows }: each row carries
-// `text_match`, so the result pill's "In text" switch can narrow the grid
-// without searching again.
+// `text_match`, which the result pill counts to offer its "In text" switch.
 const textSearchResults = ref(null);
 const sharedPictureIds = ref(new Set());
 const revokeSharesDialogOpen = ref(false);
@@ -1879,7 +1888,7 @@ async function handleClearImpossibleTags() {
     lastImpossibleRemoved.value = removed;
     impossibleSnackbarText.value =
       count > 0
-        ? `Removed ${count} tag${count === 1 ? "" : "s"}`
+        ? `Removed ${formatCount(count)} tag${count === 1 ? "" : "s"}`
         : "No impossible tags found";
     impossibleSnackbarVisible.value = true;
     debouncedFetchAllGridImages({ force: true });
@@ -2124,7 +2133,7 @@ async function runPluginWithParameters(
         availablePlugins.value.find((plugin) => plugin?.name === pluginName)
           ?.display_name || pluginName;
       noticeStore.info(
-        `${label}: ${duplicateCount} ${subject} already in your library`,
+        `${label}: ${formatCount(duplicateCount)} ${subject} already in your library`,
         // Keyed per plugin, not globally: a second run of the SAME filter is a
         // repeat of this sentence and should coalesce, while a run of a
         // DIFFERENT one is its own report and must not overwrite this text and
@@ -2215,6 +2224,8 @@ const lastWsUpdateKey = ref(0);
 const lastWsTagUpdateKey = ref(0);
 const lastWsDescriptionUpdateKey = ref(0);
 const preserveScrollOnNextFetch = ref(false);
+// The scroll place a re-read that keeps the scroll puts back at its end, owned
+// by one load (useGridFetch's claimScrollPlace); a user scroll drops it.
 const pendingScrollTop = ref(null);
 const skipNextWsRefresh = ref(false);
 const pauseGridAutoUpdates = ref(false);
@@ -2645,6 +2656,7 @@ onMounted(() => {
   window.addEventListener("drop", clearGridDragOverlay, true);
   window.addEventListener("dragend", clearGridDragOverlay, true);
   window.addEventListener("keydown", handleKeyDown);
+  window.addEventListener("keydown", dropScrollPlaceOnScrollKey);
 
   // Restore lightbox from URL on initial page load (e.g. after a page refresh).
   const lightboxIdFromUrl = _lightboxRoute.query.overlay;
@@ -2711,6 +2723,7 @@ onUnmounted(() => {
   window.removeEventListener("drop", clearGridDragOverlay, true);
   window.removeEventListener("dragend", clearGridDragOverlay, true);
   window.removeEventListener("keydown", handleKeyDown);
+  window.removeEventListener("keydown", dropScrollPlaceOnScrollKey);
   if (gridResizeObserver) {
     gridResizeObserver.disconnect();
     gridResizeObserver = null;
@@ -2949,12 +2962,17 @@ function scheduleThumbnailRetry(id, index, requestEpoch) {
   const timer = setTimeout(() => {
     thumbnailRetryTimers.delete(id);
     if (requestEpoch !== thumbnailRequestEpoch.value) return;
-    const current = allGridImages.value[index];
-    if (!current || current.id !== id) return;
-    if (current.thumbnail) return;
+    // By picture, as writeThumbnailBatch writes: a removal or an insert above
+    // moves the row without starting a new request epoch.
+    const grid = allGridImages.value;
+    const slot =
+      grid[index]?.id === id ? index : grid.findIndex((row) => row?.id === id);
+    // The picture has left the grid.
+    if (slot < 0) return;
+    if (grid[slot].thumbnail) return;
     thumbnailRetryCounts[id] = (thumbnailRetryCounts[id] || 0) + 1;
-    invalidateThumbnailIndex(index);
-    fetchThumbnailsBatch(index, index + 1, {
+    invalidateThumbnailIndex(slot);
+    fetchThumbnailsBatch(slot, slot + 1, {
       reason: "retry-missing-thumbnail",
       triggerId: id,
     });
@@ -3423,6 +3441,9 @@ const operationStore = useOperationStore();
 // native alert() is unstyled, blocking and focus-stealing; a bare `catch` that
 // only logs is worse, because the user is never told at all.
 const noticeStore = useNoticeStore();
+// A question before a mutation stays a dialog: the app's own (ConfirmDialog in
+// App.vue), not the browser's unstyled, thread-blocking window.confirm.
+const { confirm: askConfirm } = useConfirm();
 
 /**
  * Human-readable reason from an axios/HTTP error, for a one-sentence notice.
@@ -3963,7 +3984,7 @@ async function handleCreatePersonSaved(savedCharacter) {
     const n = pending.ids.length;
     const unit = pending.mode === "faces" ? "face" : "picture";
     noticeStore.success(
-      `Created ${name}, assigned ${n} ${unit}${n === 1 ? "" : "s"}.`,
+      `Created ${name}, assigned ${formatCount(n)} ${unit}${n === 1 ? "" : "s"}.`,
       { key: "create-person-assign" },
     );
     // Standard post-assign bookkeeping: prunes the Unassigned view when
@@ -4085,7 +4106,7 @@ async function handleCreateSetSaved(savedSet) {
     // One bulk call: one operation-log entry and one Undo.
     await bulkAddPicturesToSet(savedSet.id, ids);
     noticeStore.success(
-      `Created ${name}, added ${ids.length} picture${ids.length === 1 ? "" : "s"}.`,
+      `Created ${name}, added ${formatCount(ids.length)} picture${ids.length === 1 ? "" : "s"}.`,
       { key: "create-set-add" },
     );
     operationStore.refresh();
@@ -4148,34 +4169,7 @@ function handleRemoveFromCharacter(payload) {
  *   `buildLockedDeleteMessage`; `null` means nothing was skipped, so stay quiet.
  */
 function showLockedDeleteNotice(message) {
-  if (!message) return;
-  noticeStore.warning(message.body, {
-    // One key for both the pre-flight block and the post-response outcome: a
-    // user retrying a locked selection gets one card with a count, not a stack.
-    key: "delete-skipped-locked",
-    // The ordinary `warning` window, restated explicitly for one reason: to opt
-    // out of the action⇒sticky default (§6 rule 1). This card reports what just
-    // happened to the current selection; it is not a companion to the unlock,
-    // which is several clicks deep in a sidebar context menu and will outlast
-    // any sane notice. It should be long gone by then. The reading-time floor
-    // still applies, and hover/focus still pauses it for a slow reader.
-    timeout: DEFAULT_TIMEOUTS.warning,
-    action: {
-      label: "Help",
-      handler: () => {
-        // Follow-up carrying the lever (how to unlock), too long for the
-        // one-sentence rule on the first card. No explicit window: the `info`
-        // default raised by the reading-time floor is exactly the right rule for
-        // a long sentence, and the same copy lives on the lock badge tooltip, so
-        // nothing is lost when it goes.
-        noticeStore.push({
-          level: "info",
-          text: message.hint,
-          key: "delete-skipped-locked-help",
-        });
-      },
-    },
-  });
+  if (!raiseLockedDeleteNotice(noticeStore, message)) return;
   // After the flush this operation's own selection edit schedules - see
   // useScopedNotice: arming any earlier would let the delete dismiss its own
   // report.
@@ -4444,18 +4438,21 @@ async function deleteSelected(
     return removedIds;
   } catch (err) {
     console.error(moveTo ? "Move to library failed" : "Bulk delete failed", err);
+    // Earlier chunks may have committed, and even the failed request may have
+    // committed before its response was lost. The realtime sync suppresses
+    // this tab's own `removed` echo outside the Scrapheap (it guards the ghost
+    // window of a delete that succeeded), so nothing else would take those
+    // tiles away: re-read the grid and sidebar for the actual state.
     if (moveTo) {
-      // Earlier chunks may have committed, and even the failed request may
-      // have committed before its response was lost. Drop confirmed moves
-      // immediately and re-read the grid and sidebar for the actual state.
+      // Drop confirmed moves at once rather than waiting for the re-read.
       removeImagesById([...movedIds]);
       if (movedIds.has(String(lastSelectedImageId.value))) {
         lastSelectedImageId.value = null;
       }
-      preserveScrollOnNextFetch.value = true;
-      debouncedFetchAllGridImages();
-      emit("refresh-sidebar");
     }
+    preserveScrollOnNextFetch.value = true;
+    debouncedFetchAllGridImages();
+    emit("refresh-sidebar");
     noticeStore.error(
       moveTo
         ? `Couldn't move those pictures to ${moveTo.name}. ${errorDetail(err)}`
@@ -4638,7 +4635,7 @@ async function runKeepCoverOnly() {
     // and a second tab converge through exactly the same path.
     closeKeepCoverOnly();
   } catch (err) {
-    reportKeepCoverOnlyFailure(err, requests);
+    await reportKeepCoverOnlyFailure(err, requests);
   } finally {
     keepCoverOnlyBusy.value = false;
     keepCoverOnlyProgress.value = null;
@@ -4658,13 +4655,14 @@ async function runKeepCoverOnly() {
  *     one Ctrl+Z away, so their copies are ghosted, their stacks leave the
  *     selection and the rest stay selected to run again;
  *   * the answer was lost: the failed request may have committed, so the grid
- *     is re-read rather than trusted, at the cost of the ghosts.
+ *     is re-read rather than trusted, at the cost of the ghosts, and the
+ *     notice waits for that re-read so it can say whether it landed.
  *
  * @param {*} err - `KeepCoverOnlyIncompleteError`, or anything the walk threw
  *   before sending a request.
  * @param {Array<{stackIds: number[]}>} requests - what was being sent.
  */
-function reportKeepCoverOnlyFailure(err, requests) {
+async function reportKeepCoverOnlyFailure(err, requests) {
   const stackIds = requests.flatMap((request) => request.stackIds);
   console.error(
     `Keep cover only failed for ${stackIds.length} stacks [${stackIds.join(", ")}]`,
@@ -4678,14 +4676,16 @@ function reportKeepCoverOnlyFailure(err, requests) {
   }
   const { result, stacksDone, stacksTotal, operations, outcomeUnknown } = err;
   const failure = requestFailure(err.cause);
-  const message = keepCoverOnlyIncompleteMessage({
-    stacksDone,
-    stacksTotal,
-    detail: failure.detail,
-    outcomeUnknown,
-  });
+  const messageFor = (reloaded) =>
+    keepCoverOnlyIncompleteMessage({
+      stacksDone,
+      stacksTotal,
+      detail: failure.detail,
+      outcomeUnknown,
+      reloaded,
+    });
   if (stacksDone === 0 && !outcomeUnknown) {
-    noticeStore.error(message, { key: "keep-cover-only" });
+    noticeStore.error(messageFor(false), { key: "keep-cover-only" });
     if (failure.kind === "conflict" && keepCoverOnlyOpen.value) {
       loadKeepCoverOnlyPreview();
     }
@@ -4715,12 +4715,26 @@ function reportKeepCoverOnlyFailure(err, requests) {
   }
   operationStore.refresh();
   emit("refresh-sidebar");
+  closeKeepCoverOnly();
+  let reloaded = false;
   if (outcomeUnknown) {
     preserveScrollOnNextFetch.value = true;
-    debouncedFetchAllGridImages();
+    reloaded = await reloadGridAfterUncertainWrite();
   }
-  closeKeepCoverOnly();
-  noticeStore.error(message, { key: "keep-cover-only" });
+  noticeStore.error(messageFor(reloaded), { key: "keep-cover-only" });
+}
+
+/**
+ * Re-read the grid after a write whose outcome nobody saw, and say whether the
+ * re-read landed, so the notice that follows claims a reload only when there
+ * was one. A load a newer one overtook is not a failure: the newer
+ * load owns the rows and shows its own error if it fails.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function reloadGridAfterUncertainWrite() {
+  const outcome = await fetchAllGridImages({ force: true });
+  return outcome?.success !== false;
 }
 
 // ── Rotate in place ─────────────────────────────────────────────────────────
@@ -5393,7 +5407,7 @@ const searchStatus = computed(() => {
   if (reverseImageSearchPictureIds.value.length > 1) {
     return {
       count: total,
-      label: `matches for ${reverseImageSearchPictureIds.value.length} pictures`,
+      label: `matches for ${formatCount(reverseImageSearchPictureIds.value.length)} pictures`,
     };
   }
   if (reverseImageSearchPictureIds.value.length) {
@@ -5423,12 +5437,13 @@ const textMatchCount = computed(() => {
   return cached.rows.filter((row) => row?.text_match === true).length;
 });
 
-/** The result pill's All / In text switch: re-cut the rows already fetched. */
+/**
+ * The result pill's All / In text switch: search again, the server narrowing
+ * to text matches when it is on (useGridFetch's searchViewQueryParams).
+ */
 function handleTextMatchesOnly(value) {
   searchStore.textMatchesOnly = value === true;
-  fetchAllGridImages({ textMatchRecut: true }).then(() =>
-    updateVisibleThumbnails(),
-  );
+  fetchAllGridImages().then(() => updateVisibleThumbnails());
 }
 
 /**
@@ -5510,7 +5525,7 @@ const selectionLockReason = computed(() => {
   const joined = [...names].join(", ");
   const noun = lockedIds.length === 1 ? "picture is" : "pictures are";
   return (
-    `Locked - ${lockedIds.length} selected ${noun} in the locked set ` +
+    `Locked - ${formatCount(lockedIds.length)} selected ${noun} in the locked set ` +
     `'${joined}'. Unlock the set to edit: right-click it in the sidebar and ` +
     `choose Unlock.`
   );
@@ -5727,12 +5742,6 @@ const scrapheapRestoreDisabled = computed(() => {
   );
 });
 
-// After a permanent purge the backend reports which snapshots still hold the
-// deleted pictures' metadata (the archives are not scrubbed). Surface that so
-// the user can delete those snapshots if the deletion was for privacy.
-const snapshotsWithDeleted = ref([]);
-const snapshotsWithDeletedOpen = ref(false);
-
 // ── Delete-forever confirm (Scrapheap DAM 1.1) ────────────────────────────────
 // The tokenized destructive confirm that replaces the native window.confirm on
 // the two scrapheap purge paths. Its counts and the exact on-disk paths of the
@@ -5764,7 +5773,23 @@ const deleteForeverScoped = ref(false);
 // new preview and after every attempt - a stale one must never be replayed.
 const deleteForeverConfirmToken = ref("");
 
+/**
+ * One delete preview at a time. Its confirm token is minted for exactly the set
+ * it was asked about, so a second gesture must neither start another preview
+ * nor retarget the pending one (mode, ids and scope are what the confirm acts
+ * on). Say the first is still running rather than letting the click look like
+ * it did nothing.
+ */
+function refuseWhileDeletePreviewPending() {
+  if (!deleteForeverLoading.value) return false;
+  noticeStore.info("Still checking what Delete forever would destroy…", {
+    key: "scrapheap-delete-preview",
+  });
+  return true;
+}
+
 function openDeleteForeverForSelection(ids, scoped = false) {
+  if (refuseWhileDeletePreviewPending()) return;
   if (refuseWhileScrapheapRunBusy(SCRAPHEAP_GESTURES.PURGE_SELECTION)) return;
   deleteForeverMode.value = "selection";
   deleteForeverScoped.value = scoped;
@@ -5773,6 +5798,7 @@ function openDeleteForeverForSelection(ids, scoped = false) {
 }
 
 function openDeleteForeverForAll() {
+  if (refuseWhileDeletePreviewPending()) return;
   if (refuseWhileScrapheapRunBusy(SCRAPHEAP_GESTURES.EMPTY)) return;
   deleteForeverMode.value = "all";
   deleteForeverScoped.value = false;
@@ -5786,7 +5812,6 @@ function openDeleteForeverForAll() {
  * Fails SAFE: on any error the destructive confirm is NOT opened.
  */
 async function loadDeletePreview(ids) {
-  if (deleteForeverLoading.value) return;
   deleteForeverLoading.value = true;
   deleteForeverConfirmToken.value = "";
   try {
@@ -5801,7 +5826,18 @@ async function loadDeletePreview(ids) {
       : [];
     deleteForeverLockedCount.value = Number(d.locked_count) || 0;
     if (deleteForeverTotalCount.value === 0) {
-      // Nothing to delete (e.g. the scrapheap was emptied concurrently).
+      // Nothing to delete: the pictures left the Scrapheap since the grid last
+      // read it (another tab restored or purged them, or a run already did).
+      // Say so, and re-read the heap so the stale cards go too.
+      noticeStore.info(
+        deleteForeverMode.value === "all"
+          ? "The Scrapheap is already empty, so there was nothing to delete."
+          : "Those pictures are no longer in the Scrapheap, so there was nothing to delete.",
+        { key: "scrapheap-delete-preview" },
+      );
+      emit("refresh-sidebar");
+      preserveScrollOnNextFetch.value = true;
+      debouncedFetchAllGridImages();
       return;
     }
     if (
@@ -5866,14 +5902,6 @@ async function runScrapheapSelectionPurge(idsToRemove, includeProtected) {
   );
 }
 
-function showSnapshotsWithDeleted(snaps) {
-  if (userPrefsStore.hidePurgeSnapshotWarning) return;
-  if (Array.isArray(snaps) && snaps.length) {
-    snapshotsWithDeleted.value = snaps;
-    snapshotsWithDeletedOpen.value = true;
-  }
-}
-
 // Only a run already under way blocks this. It must NOT be gated on
 // `scrapheapEmptyDisabled`'s grid terms: `imagesLoading || filteredGridCount ===
 // 0` describe the loaded grid, not the heap. The sidebar context menu navigates
@@ -5901,12 +5929,31 @@ async function runEmptyScrapheap(includeProtected) {
   );
 }
 
+/**
+ * The question Restore all asks. It names the heap's size only when the count
+ * held is the whole heap's: the Scrapheap summary, read without the hidden-tag
+ * filter (with it, the summary leaves hidden pictures out, and Restore all
+ * restores them too). The loaded grid is no count at all, it can undercount.
+ */
+function restoreAllQuestion() {
+  const heapCount = totalCurrentCategoryCount.value;
+  const known =
+    isScrapheapView.value && !userPrefsStore.applyTagFilter && heapCount > 0;
+  const which = known
+    ? `all ${formatCount(heapCount)} pictures`
+    : "every picture";
+  return `Restore ${which} in the Scrapheap? They return to the library.`;
+}
+
 async function confirmRestoreScrapheap() {
   if (refuseWhileScrapheapRunBusy(SCRAPHEAP_GESTURES.RESTORE_ALL)) return;
   if (scrapheapRestoreDisabled.value) return;
-  const confirmed = confirm(
-    "Restore all scrapheap pictures? This will make them visible again.",
-  );
+  // Not `danger`: a restore is undone from History.
+  const confirmed = await askConfirm({
+    title: "Restore all pictures?",
+    message: restoreAllQuestion(),
+    confirmLabel: "Restore all",
+  });
   if (!confirmed) return;
   await beginScrapheapRun(
     { kind: "restore" },
@@ -5978,8 +6025,8 @@ async function beginScrapheapRun(options, context) {
     context.gesture,
   );
   if (!message) return false;
-  // A run that is going (somebody else's, or this one, unanswered) is on the
-  // bar already: a caution, not a failure.
+  // A run that is going (the one a refusal named) is on the bar already: a
+  // caution, not a failure.
   const level = result.error?.run?.active ? "warning" : "error";
   noticeStore[level](message, { key: SCRAPHEAP_FAILURE_KEYS[context.gesture] });
   return false;
@@ -6001,8 +6048,10 @@ async function beginScrapheapPurge(options, context) {
       context,
     );
   } finally {
-    // The server spends the confirmation on the first attempt, so a retry must
-    // go back through the preview rather than replaying a dead token.
+    // A retry goes back through the preview rather than replaying the token.
+    // The server spends it on most answers; a refusal because a run is going
+    // or runs are unavailable (409 scrapheap_run_active, 503) keeps it, but by
+    // the time a retry could work the preview's counts may no longer hold.
     deleteForeverConfirmToken.value = "";
     deleteForeverBusy.value = false;
     deleteForeverOpen.value = false;
@@ -6017,13 +6066,18 @@ async function stopScrapheapRun() {
   if (message) noticeStore.error(message, { key: "scrapheap-run-stop" });
 }
 
-/** Clear the grid and read the heap again from the top. */
+/**
+ * Clear the selection and read the heap again. The cards stay until the
+ * re-read answers (the grid fetch swaps them in one step), so a run that left
+ * pictures behind - locked ones, protected originals, a Stop - never blanks
+ * the heap in between. A purge's pictures have mostly left already, as each
+ * of its `removed` events arrived; the re-read settles the rest.
+ */
 function reloadScrapheapGrid() {
-  allGridImages.value = [];
   selectedImageIds.value = [];
   selectedFaceIds.value = [];
   lastSelectedImageId.value = null;
-  updateVisibleThumbnails();
+  preserveScrollOnNextFetch.value = true;
   fetchAllGridImages().then(() => {
     updateVisibleThumbnails();
   });
@@ -6060,16 +6114,15 @@ function settleScrapheapSelection(run, context) {
 }
 
 /**
- * Act on a followed run that has ended. Every one re-reads the counts and, in
- * the Scrapheap view, the heap. One this tab started also gets what its
- * gesture's answer used to bring: the selection settled, the snapshots that
- * still hold what was destroyed, the restore's receipt, and a notice saying
- * how it ended. One started elsewhere (another tab, before a reload) gets the
- * notice only where its progress was on show, the Scrapheap's bar.
+ * Do the grid's part when a followed run has ended: re-read the counts and, in
+ * the Scrapheap view, the heap; for a selection run this tab started, settle
+ * the selection. Saying how the run ended is the store's part
+ * (`useScrapheapRunStore`), so the notice, the receipt and the snapshots
+ * dialog reach the user in whatever view they are in, mounted grid or not.
  *
  * @param {{run: Object, context: (Object|null), startedHere: boolean}} ended
  */
-async function settleScrapheapRun({ run, context, startedHere }) {
+function settleScrapheapRun({ run, context, startedHere }) {
   scrapheapRunStore.acknowledgeOutcome(run.id);
   emit("refresh-sidebar");
   const gesture = startedHere ? (context?.gesture ?? null) : null;
@@ -6078,6 +6131,11 @@ async function settleScrapheapRun({ run, context, startedHere }) {
     gesture === SCRAPHEAP_GESTURES.RESTORE_SELECTION
   ) {
     settleScrapheapSelection(run, context);
+    // The store's locked-set card speaks of this selection: retire it when
+    // the selection, the view or the lock moves on, as a soft delete's does.
+    if (noticeStore.notices.some((n) => n.key === "delete-skipped-locked")) {
+      lockedDeleteNotice.arm();
+    }
   }
   if (isScrapheapView.value) {
     if (
@@ -6091,44 +6149,12 @@ async function settleScrapheapRun({ run, context, startedHere }) {
       updateVisibleThumbnails();
     }
   }
-  if (!gesture) {
-    if (!isScrapheapView.value) return;
-    const { level, message } = scrapheapRunOutcomeNotice(run, null);
-    noticeStore[level](message, { key: "scrapheap-run" });
-    return;
-  }
-  if (run.kind === "purge") {
-    showSnapshotsWithDeleted(run.snapshots_with_deleted);
-    const lockedCount = Number(run.skipped_locked_count) || 0;
-    if (
-      gesture === SCRAPHEAP_GESTURES.PURGE_SELECTION &&
-      run.status === "complete" &&
-      lockedCount > 0
-    ) {
-      // The locked-set notice carries the lever (how to unlock).
-      showLockedDeleteNotice(
-        buildLockedDeleteMessage({
-          lockedCount,
-          deletedCount: Number(run.deleted_count) || 0,
-          forever: true,
-        }),
-      );
-      return;
-    }
-  } else if (
-    run.status === "complete" &&
-    (await scrapheapRunStore.raiseRestoreReceipt(run))
-  ) {
-    return;
-  }
-  const { level, message } = scrapheapRunOutcomeNotice(run, gesture);
-  noticeStore[level](message, { key: "scrapheap-run" });
 }
 
 watch(
   () => scrapheapRunStore.outcome,
   (ended) => {
-    if (ended) void settleScrapheapRun(ended);
+    if (ended) settleScrapheapRun(ended);
   },
   { immediate: true },
 );
@@ -6176,7 +6202,7 @@ const imageImporterRef = ref(null);
 async function handleImagesUploaded(payload) {
   pauseGridAutoUpdates.value = false;
   pendingGridRefreshAfterImport.value = false;
-  emit("import-ended");
+  endImport();
   const results = Array.isArray(payload?.results) ? payload.results : [];
   const pictureIds = Array.from(
     new Set(
@@ -6269,11 +6295,29 @@ async function handleArrivingGridDrop(event) {
   }
 }
 
+// Whether this grid has told App an import started and not yet that it
+// ended. App holds `wsStore.isUploadInProgress` on that word, and while it is
+// held the socket drops every `picture_imported` as this upload's echo.
+let importAnnounced = false;
+
 function handleImportStarted() {
   pauseGridAutoUpdates.value = true;
   pendingGridRefreshAfterImport.value = false;
+  importAnnounced = true;
   emit("import-started");
 }
+
+function endImport() {
+  importAnnounced = false;
+  emit("import-ended");
+}
+
+// The importer is this grid's child: once the grid goes, nothing it uploads
+// can say it ended. Said here, before unmount, since Vue drops an emit from
+// an unmounted component.
+onBeforeUnmount(() => {
+  if (importAnnounced) endImport();
+});
 
 function runDeferredGridRefreshAfterImport() {
   if (!pendingGridRefreshAfterImport.value) {
@@ -6287,13 +6331,13 @@ function runDeferredGridRefreshAfterImport() {
 
 function handleImportCancelled() {
   pauseGridAutoUpdates.value = false;
-  emit("import-ended");
+  endImport();
   runDeferredGridRefreshAfterImport();
 }
 
 function handleImportErrored() {
   pauseGridAutoUpdates.value = false;
-  emit("import-ended");
+  endImport();
   runDeferredGridRefreshAfterImport();
 }
 
@@ -6363,7 +6407,9 @@ watch(
     gridReady.value = false;
     emptyStateDelayPassed.value = false;
     if (preserveScrollOnNextFetch.value && scrollWrapper.value) {
-      pendingScrollTop.value = scrollWrapper.value.scrollTop;
+      // The flag is cleared below, before the debounced re-read runs: the
+      // place recorded here is what tells that re-read to keep the scroll.
+      recordScrollPlace();
     } else {
       pendingScrollTop.value = null;
     }
@@ -6496,6 +6542,7 @@ const {
   visibleStart,
   visibleEnd,
   rowHeight,
+  squareRowTop,
   renderStart,
   renderEnd,
   topSpacerHeight,
@@ -6825,8 +6872,20 @@ function onGridVisibleMetadataReady(payload) {
   }
 }
 
+// The load whose rows the grid holds, and the read it made (useGridFetch's
+// `currentFetchMode`), when that read ran to the end; null otherwise. The
+// reconnect reconcile reads the same list again, and only a grid holding all
+// of it can be compared with that.
+let lastCompleteLoad = null;
+
 function onGridFetchDone(payload) {
   const loadId = Number(payload?.loadId) || 0;
+  if (loadId === gridLoadEpoch.value) {
+    lastCompleteLoad =
+      payload?.success === true
+        ? { loadId, fetchMode: payload.fetchMode }
+        : null;
+  }
   const record = gridFetchTelemetryByLoadId.get(loadId);
   if (record) {
     Object.assign(record, payload || {}, {
@@ -6950,15 +7009,21 @@ const {
   totalAllPicturesCountLoaded,
   totalCurrentCategoryCount,
   gridReady,
-  lastFetchError,
-  lastFetchSuccess,
+  gridLoadEpoch,
   smartScoreLoadingVisible,
+  loadFoldsStacks,
   buildGridFetchKey,
   buildPictureIdsQueryParams,
+  buildStreamSelectionSuffix,
+  searchViewQueryParams,
   buildFilterCountBaseQuery,
+  currentFetchMode,
+  readIdListForReconcile,
   fetchAllGridImages,
   fetchAllPicturesCount,
   debouncedFetchAllGridImages,
+  noteRemovedDuringStream,
+  recordScrollPlace,
 } = useGridFetch(
   {
     allGridImages,
@@ -7011,6 +7076,8 @@ const {
     resetThumbnailState,
     triggerNewImageHighlight,
     updateVisibleThumbnails,
+    forgetThumbnailRangesFrom,
+    holdView,
     fetchThumbnailsBatch,
     startSmartScoreProgress,
     completeSmartScoreProgress,
@@ -7162,6 +7229,7 @@ const {
     setStackReorderHoverSide,
     selectedImageIds,
     preserveScrollOnNextFetch,
+    loadFoldsStacks,
   },
   props,
   emit,
@@ -7180,6 +7248,7 @@ const {
     setPendingRanges: (v) => {
       pendingRanges = v;
     },
+    rowFitsMediaFilter,
   },
 );
 
@@ -7209,7 +7278,7 @@ async function updateSelectedGroupName() {
     }
   } else if (hasSetSelection.value) {
     if (isSetOverlapView.value) {
-      selectedGroupName.value = `Set Overlap (${normalizedSelectedSetIds.value.length})`;
+      selectedGroupName.value = `Set Overlap (${formatCount(normalizedSelectedSetIds.value.length)})`;
       return;
     }
     try {
@@ -7277,6 +7346,7 @@ const {
   triggerNewImageHighlight,
   updateVisibleThumbnails,
   removeImagesById,
+  rowFitsMediaFilter,
 });
 
 // The lightbox flips its own copy at once; a refused change puts it back there
@@ -7352,6 +7422,29 @@ function invalidateThumbnailIndex(index) {
   loadedRanges.value = loadedRanges.value.filter(
     ([rangeStart, rangeEnd]) => index < rangeStart || index >= rangeEnd,
   );
+}
+
+/**
+ * Forget the thumbnail ranges from `index` on, after the rows there moved.
+ *
+ * The ranges are by slot, so a removal or a dropped placeholder leaves them
+ * describing rows that now sit elsewhere: counted loaded, rows that moved up
+ * into a slot would never be asked for. Everything keyed by picture (the
+ * thumbnail URLs on the rows, the readiness maps, the retry counts) still holds,
+ * and so does an answer in flight, which is written by picture; that is why
+ * this is not resetThumbnailState.
+ */
+function forgetThumbnailRangesFrom(index) {
+  loadedRanges.value = loadedRanges.value
+    .filter(([rangeStart]) => rangeStart < index)
+    .map(([rangeStart, rangeEnd]) => [rangeStart, Math.min(rangeEnd, index)]);
+  // A pending range is dropped whole, not cut: the request that owns it takes
+  // it out by its exact bounds when it settles, so a cut one would never leave.
+  pendingRanges = pendingRanges.filter(([, rangeEnd]) => rangeEnd <= index);
+  if (suppressVisibleThumbFetch.value.end > index) {
+    suppressVisibleThumbFetch.value = { until: 0, start: 0, end: 0 };
+  }
+  updateVisibleThumbnails();
 }
 
 async function refreshGridImage(imageId, options = {}) {
@@ -7629,8 +7722,6 @@ function closeLightbox(returnToOrigin = true) {
   } else if (pendingTagFilterRefresh.value || pendingLightboxGridRefresh.value) {
     pendingTagFilterRefresh.value = false;
     pendingLightboxGridRefresh.value = false;
-    lastFetchSuccess.value = { key: "", at: 0 };
-    lastFetchError.value = { key: "", at: 0 };
     // Preserve scroll, exactly as the non-deferred siblings of this refresh do
     // (see the fields.stack / smart-score branches in handlePictureChanged).
     // Those set the flag right before fetching, but when the lightbox is open they
@@ -7768,6 +7859,7 @@ watch(
     () => filterStore.faceBboxFilter,
     () => filterStore.impossibleSources,
     () => filterStore.stackStateFilter,
+    () => filterStore.tagStateFilter,
     () => filterStore.sharedOnlyFilter,
     () => filterStore.importedFromFilter,
     () => filterStore.noCharacterFilter,
@@ -7956,24 +8048,61 @@ function rowMatchesMedia(img, accept) {
   return candidates.some((val) => accept(val));
 }
 
+/** The Images/Videos filter's file test; null in All. */
+function mediaFilterAccept() {
+  const mode = filterStore.mediaTypeFilter;
+  if (mode === "images") return isSupportedImageFile;
+  if (mode === "videos") return isSupportedVideoFile;
+  return null;
+}
+
+/**
+ * Whether a fetched row belongs in the grid under the Images/Videos filter.
+ * The inserts that read rows by id (a realtime add or restore, the new-pictures
+ * pill, an open stack's members) ask this before splicing one in, so the grid
+ * only ever holds rows the filtered stream would have sent (see
+ * mediaFilteredGridImages).
+ */
+function rowFitsMediaFilter(img) {
+  const accept = mediaFilterAccept();
+  return !accept || rowMatchesMedia(img, accept);
+}
+
 // The grid narrowed to the Images/Videos filter: filtered once per change of
 // the grid or the filter, never per scroll. "All" passes the grid through as
-// is. A placeholder (a slot the stream has not filled yet, `id == null`) is
-// kept: the stream is already narrowed by format on the server, and keeping it
-// leaves every row at its `idx`, the slot the render window and the card
-// layout both index by.
-const mediaFilteredGridImages = computed(() => {
+// is. The window is sliced from this list by unfiltered indices (the slot the
+// render window and the card layout both index by), so every slot stays: a
+// row of the other kind is shown as an empty slot at its own `idx`, never
+// taken out, which would move every card after it one slot early and end the
+// window on a card it never asked for. The grid holds such rows
+// only between an Images/Videos switch and the refetch that answers it: the
+// stream is narrowed by format on the server, and the by-id inserts and an
+// open stack's members (read unfiltered by `listStackPictures`, sifted in
+// useStackOrdering.js `buildExpandedStackImages`) all go through
+// rowFitsMediaFilter. A placeholder the stream has not filled yet
+// (`id == null`) stays as it is.
+//
+// `count` is the slots the filter shows: the matching rows and the stream's
+// own placeholders, not the stand-ins for rows of the other kind.
+const mediaFilteredGrid = computed(() => {
   const images = allGridImages.value;
-  if (!images) return [];
-  const mode = filterStore.mediaTypeFilter;
-  if (mode !== "images" && mode !== "videos") return images;
-  const accept = mode === "images" ? isSupportedImageFile : isSupportedVideoFile;
-  return images.filter(
-    (img) => img && (img.id == null || rowMatchesMedia(img, accept)),
-  );
+  if (!images) return { cells: [], count: 0 };
+  const accept = mediaFilterAccept();
+  if (!accept) return { cells: images, count: images.length };
+  let count = 0;
+  const cells = images.map((img, i) => {
+    if (img && (img.id == null || rowMatchesMedia(img, accept))) {
+      count += 1;
+      return img;
+    }
+    return { id: null, idx: i };
+  });
+  return { cells, count };
 });
 
-const filteredGridCount = computed(() => mediaFilteredGridImages.value.length);
+const mediaFilteredGridImages = computed(() => mediaFilteredGrid.value.cells);
+
+const filteredGridCount = computed(() => mediaFilteredGrid.value.count);
 
 const EMPTY_STATE_DELAY_MS = 350;
 const emptyStateDelayPassed = ref(false);
@@ -8234,6 +8363,13 @@ const gridImagesToRender = computed(() => {
   return mediaFilteredGridImages.value.slice(renderStart.value, renderEnd.value);
 });
 
+// A card is keyed by its picture (`img-<id>`), not by its slot, so a removal
+// or an insert that moves the cards after it moves their elements instead of
+// tearing them down and building them again (thumbnail, readiness, overlays).
+// Its element is filed under the picture for the same reason: Vue calls a
+// function ref again when the card's slot changes but never clears the old
+// one, so a slot-keyed map would keep a card under a slot another card now
+// holds, and an unmount would clear a slot another card had just taken.
 const imageCardRefs = new Map();
 const firstFocusableRenderedIndex = computed(
   () =>
@@ -8242,11 +8378,11 @@ const firstFocusableRenderedIndex = computed(
     )?.idx ?? -1,
 );
 
-function setImageCardRef(index, element) {
-  const normalizedIndex = Number(index);
-  if (!Number.isFinite(normalizedIndex)) return;
-  if (element) imageCardRefs.set(normalizedIndex, element);
-  else imageCardRefs.delete(normalizedIndex);
+function setImageCardRef(pictureId, element) {
+  if (pictureId == null) return;
+  const key = String(pictureId);
+  if (element) imageCardRefs.set(key, element);
+  else imageCardRefs.delete(key);
 }
 
 function imageCardTabIndex(image) {
@@ -8263,7 +8399,9 @@ function imageCardAriaLabel(image) {
 
 async function focusGridCursor(index) {
   await nextTick();
-  imageCardRefs.get(Number(index))?.focus({ preventScroll: true });
+  const pictureId = allGridImages.value[Number(index)]?.id;
+  if (pictureId == null) return;
+  imageCardRefs.get(String(pictureId))?.focus({ preventScroll: true });
 }
 
 function handleImageCardFocus(image) {
@@ -8318,6 +8456,27 @@ async function fetchThumbnailsBatch(start, end, meta = {}) {
       square_crop_y: img?.square_crop_y,
       square_crop_side: img?.square_crop_side,
     }));
+    // Ask only for the pictures whose slots are not counted loaded yet (all of
+    // them when forced). A range can be partly loaded: a placeholder's slot is
+    // never counted, so a window the stream is still filling is asked for
+    // again as its rows land. With nothing to ask for this returns without
+    // writing to the grid; in justified mode a write repacks the layout, which
+    // asks for the visible window again, so a write per call would never stop.
+    const loadedNearby = meta?.force
+      ? []
+      : loadedRanges.value.filter(
+          ([rangeStart, rangeEnd]) => rangeStart < end && rangeEnd > start,
+        );
+    const askedRows = new Set(
+      gridImages.filter(
+        (gridImg) =>
+          gridImg.id != null &&
+          !rangeCovers(loadedNearby, gridImg.idx, gridImg.idx + 1),
+      ),
+    );
+    if (!askedRows.size) {
+      return;
+    }
     // Synchronously pre-fill thumbnail URLs from imported_at so <img> elements
     // render immediately without waiting for the POST round trip. This is a
     // placeholder with a placeholder's lifetime: the POST below replaces it
@@ -8326,6 +8485,7 @@ async function fetchThumbnailsBatch(start, end, meta = {}) {
     // enriches face overlays and penalised-tag hints.
     for (let i = 0; i < gridImages.length; i++) {
       const gridImg = gridImages[i];
+      if (!askedRows.has(gridImg)) continue;
       if (!gridImg.thumbnail && gridImg.id && gridImg.imported_at) {
         const v = Math.floor(new Date(gridImg.imported_at).getTime() / 1000);
         const rawUrl = `/pictures/thumbnails/${gridImg.id}.webp?v=${v}`;
@@ -8338,13 +8498,7 @@ async function fetchThumbnailsBatch(start, end, meta = {}) {
         };
       }
     }
-    ids = Array.from(
-      new Set(
-        gridImages
-          .filter((img) => img.id !== null && img.id !== undefined)
-          .map((img) => String(img.id)),
-      ),
-    );
+    ids = Array.from(new Set(Array.from(askedRows, (img) => String(img.id))));
     let overlayNeedsRedraw = false;
     if (ids.length) {
       const thumbData = await getThumbnails(ids);
@@ -8449,7 +8603,16 @@ async function fetchThumbnailsBatch(start, end, meta = {}) {
     // thumbnailRequestEpoch, so the epoch guard cannot see the move. Adding a
     // penalised tag does exactly that; a positional write would land the
     // refreshed penalised_tags on whichever picture now holds the slot.
-    const written = writeThumbnailBatch(allGridImages.value, gridImages, start);
+    // Only the rows asked for go back: another row's fields are as they were
+    // sliced, before the await, and would undo a change made since. The writer
+    // skips a row without an id.
+    const written = writeThumbnailBatch(
+      allGridImages.value,
+      gridImages.map((gridImg) =>
+        askedRows.has(gridImg) ? gridImg : { idx: gridImg.idx, id: null },
+      ),
+      start,
+    );
     for (const { row, slot } of written) {
       if (row.thumbnail) {
         clearThumbnailRetry(row.id);
@@ -8457,7 +8620,10 @@ async function fetchThumbnailsBatch(start, end, meta = {}) {
         scheduleThumbnailRetry(row.id, slot, requestEpoch);
       }
     }
-    loadedRanges.value.push([start, end]);
+    // By slot, and only the slots that held a picture and still hold it.
+    for (const run of loadedSlotRuns(allGridImages.value, gridImages, start)) {
+      loadedRanges.value.push(run);
+    }
     if (overlayNeedsRedraw) {
       triggerFaceOverlayRedraw();
     }
@@ -8788,12 +8954,20 @@ async function handleLightboxScrapheapRestore() {
   const id = lightboxCtxImage.value?.id;
   if (id == null) return;
   try {
-    await restoreScrapheap([id]);
+    // Its own gesture id, so a restore run going at the same time does not
+    // take its History step for one of the run's slices and hide its pill.
+    await restoreScrapheap([id], { batchId: newOperationBatchId() });
   } catch (err) {
-    console.error("Failed to restore picture from the scrapheap", err);
+    console.error("Failed to restore picture from the scrapheap", {
+      pictureId: id,
+      error: err,
+    });
     noticeStore.error(`Couldn't restore that picture. ${errorDetail(err)}`, {
       key: "scrapheap-restore-lightbox",
     });
+    // It is still in the Scrapheap: its card stays, and so does the lightbox
+    // showing it, so the user can try again or delete it instead.
+    return;
   }
   removeImagesById([id]);
   closeLightbox(false);
@@ -8840,6 +9014,11 @@ async function confirmSegment() {
     tasksStore.nudge();
   } catch (err) {
     console.error("Object detection request failed:", err);
+    // A restore refuses the task up front (409) and nothing is queued, so
+    // say why here, where the run was asked for.
+    noticeStore.error(`Couldn't start object detection. ${errorDetail(err)}`, {
+      key: "detect-objects",
+    });
   }
 }
 
@@ -8948,32 +9127,201 @@ function updateDescriptionForImage(imageId, description) {
 watch(
   () => gridStore.thumbnailSize,
   () => {
-    // Recalculate visibleStart and visibleEnd after rowHeight update
+    // Re-measure, then let the virtualizer derive the range in either mode; it
+    // owns the row origin and calls updateVisibleThumbnails itself.
     nextTick(() => {
       updateRowHeightFromGrid();
-      if (isJustifiedMode.value) {
-        // Justified rows don't follow the uniform cols/rowHeight arithmetic
-        // below - let the virtualizer derive the range from the packed model.
-        recalculateVisibleRange();
-        return;
-      }
-      const el = scrollWrapper.value;
-      if (!el) return;
-      let cardHeight = rowHeight.value;
-      const scrollTop = el.scrollTop;
-      const cols = gridStore.columns;
-      // First visible row (may be partially visible)
-      const firstVisibleRow = scrollTop / cardHeight;
-      // Last visible row (may be partially visible)
-      const lastVisibleRow = (scrollTop + el.clientHeight - 1) / cardHeight;
-      const newVisibleStart = Math.floor(firstVisibleRow) * cols;
-      const newVisibleEnd = Math.ceil(lastVisibleRow) * cols;
-      visibleStart.value = newVisibleStart;
-      visibleEnd.value = newVisibleEnd;
-      updateVisibleThumbnails();
+      recalculateVisibleRange();
     });
   },
 );
+
+// ============================================================
+// RECONNECT RECONCILE
+// ============================================================
+
+// The most rows one reconnect re-reads: GET /pictures/stream caps
+// `batch_limit` at 5000. A longer view is re-read around the viewport, where
+// a change would be seen.
+const RECONCILE_READ_LIMIT = 5000;
+
+/** The grid's base list as ids, in grid order. */
+function reconcileRows() {
+  return lastFetchedGridImages.value.map((img) => ({
+    id: img.id,
+    stackId: getPictureStackId(img),
+  }));
+}
+
+/** The view as a reconnect read found it, to tell when it has changed. */
+function reconcileViewChanged(epoch, fetchKey) {
+  return gridLoadEpoch.value !== epoch || buildGridFetchKey() !== fetchKey;
+}
+
+/**
+ * Re-read the ids of the current view, for the reconnect reconcile
+ * (useUpdatesSocket), which compares the answer with the grid in
+ * `diffViewAgainstIdRead`. An id-list view (a search, a suggestion list, the
+ * likeness groups) makes its own read again, whole; a stream view reads the
+ * same stream query it loaded from, asking for ids alone (`fields` only
+ * narrows the columns read, never the rows), around the viewport when the
+ * view is longer than one read. Resolves to null when there is nothing to
+ * compare: the grid is not a finished read of the view it shows (a load
+ * running or about to), or the view changed while the read was out.
+ *
+ * @param {{signal?: AbortSignal}} [options]
+ * @returns {Promise<Object|null>} the read, shaped for `diffViewAgainstIdRead`,
+ *   plus `readListed` when it covered only part of the view.
+ */
+async function readViewForReconcile({ signal } = {}) {
+  // A load still running has bumped the epoch past the last finished one, and
+  // a refresh still waiting out its debounce has marked the grid not ready
+  // (the gridVersion watcher): either way the whole view is about to be read
+  // again, and this read would compare a list on its way out. A view that
+  // now needs another kind of read than its load made is on its way out too.
+  const fetchMode = currentFetchMode();
+  if (
+    lastCompleteLoad?.loadId !== gridLoadEpoch.value ||
+    lastCompleteLoad.fetchMode !== fetchMode ||
+    !gridReady.value
+  ) {
+    console.debug(
+      "[ImageGrid] reconnect reconcile skipped: the grid is not a finished read of its view",
+      {
+        lastCompleteLoad,
+        fetchMode,
+        gridLoadEpoch: gridLoadEpoch.value,
+        gridReady: gridReady.value,
+      },
+    );
+    return null;
+  }
+  const epoch = gridLoadEpoch.value;
+  const fetchKey = buildGridFetchKey();
+  const before = reconcileRows();
+  if (fetchMode !== "stream") {
+    const answer = await readIdListForReconcile({ signal });
+    if (reconcileViewChanged(epoch, fetchKey)) {
+      console.debug(
+        "[ImageGrid] reconnect reconcile dropped: the view changed during the read",
+        { epoch, fetchKey },
+      );
+      return null;
+    }
+    // The load folded each stack to one card unless its view lists every row
+    // (useGridFetch's loadFoldsStacks: false in the Scrapheap, a search there
+    // included).
+    return {
+      before,
+      after: reconcileRows(),
+      answer,
+      fromStart: true,
+      toEnd: true,
+      stacked: loadFoldsStacks.value,
+      skipIds: [...(ghostedIdSet.value ?? [])],
+      readListed: null,
+    };
+  }
+  let offset = 0;
+  if (before.length > RECONCILE_READ_LIMIT) {
+    // Centre the read on the first card in view: the nearest base-list row at
+    // or above the top of the viewport (an open stack's members are not in
+    // the base list until a reorder writes them in).
+    const indexById = new Map(before.map((row, i) => [String(row.id), i]));
+    let centre = 0;
+    const cards = allGridImages.value;
+    for (
+      let i = Math.min(visibleStart.value, cards.length - 1);
+      i >= 0;
+      i -= 1
+    ) {
+      const at = indexById.get(String(cards[i].id));
+      if (at !== undefined) {
+        centre = at;
+        break;
+      }
+    }
+    offset = Math.max(
+      0,
+      Math.min(
+        centre - RECONCILE_READ_LIMIT / 2,
+        before.length - RECONCILE_READ_LIMIT,
+      ),
+    );
+  }
+  const query = `fields=id,stack_id&stack_leaders_only=true${buildStreamSelectionSuffix()}`;
+  const body = await streamPictures(query, {
+    offset,
+    batchLimit: RECONCILE_READ_LIMIT,
+    signal,
+  });
+  // A newer load (which also bumps the epoch when it starts), or a view
+  // change whose load has not started yet: a setting such as the tag filter
+  // reaches the grid through the throttled gridVersion refresh.
+  if (reconcileViewChanged(epoch, fetchKey)) {
+    console.debug(
+      "[ImageGrid] reconnect reconcile dropped: the view changed during the read",
+      { epoch, fetchKey },
+    );
+    return null;
+  }
+  if (!Array.isArray(body?.pictures)) {
+    throw new Error(
+      `reconnect reconcile: the stream read at offset ${offset} returned no pictures list`,
+    );
+  }
+  const fromStart = offset === 0;
+  const toEnd = body.done === true;
+  return {
+    before,
+    after: reconcileRows(),
+    answer: body.pictures,
+    fromStart,
+    toEnd,
+    // The server never folds a stack in the Scrapheap (the listing route's
+    // `only_deleted` branch), and the load kept its rows as they came
+    // (useGridFetch's loadFoldsStacks).
+    stacked: loadFoldsStacks.value,
+    skipIds: [...(ghostedIdSet.value ?? [])],
+    readListed:
+      fromStart && toEnd
+        ? null
+        : (ids, options) =>
+            readListedForReconcile(query, epoch, fetchKey, ids, options),
+  };
+}
+
+/**
+ * Which of `ids` the view a partial reconnect read covered still lists,
+ * anywhere in it (`settleGoneCards`): the same stream query, narrowed by id,
+ * which the listing honours under every sort. Resolves to null when the view
+ * changed since that read.
+ *
+ * @param {string} query - that read's stream query.
+ * @param {number} epoch - the grid load that read compared with.
+ * @param {string} fetchKey - the view that read was for.
+ * @param {Array<*>} ids
+ * @param {{signal?: AbortSignal}} [options]
+ * @returns {Promise<{listedIds: Set<string>}|null>}
+ */
+async function readListedForReconcile(
+  query,
+  epoch,
+  fetchKey,
+  ids,
+  { signal } = {},
+) {
+  if (reconcileViewChanged(epoch, fetchKey)) return null;
+  const rows = await streamPicturesAmongIds(query, ids, { signal });
+  if (reconcileViewChanged(epoch, fetchKey)) {
+    console.debug(
+      "[ImageGrid] reconnect reconcile dropped: the view changed during the read of gone cards",
+      { epoch, fetchKey },
+    );
+    return null;
+  }
+  return { listedIds: new Set(rows.map((row) => String(row.id))) };
+}
 
 // Expose the grid DOM node to parent
 defineExpose({
@@ -9008,6 +9356,8 @@ defineExpose({
   isImagesLoading: () => imagesLoading.value,
   isLightboxOpen: () => lightboxOpen.value,
   markLightboxDeferredRefresh,
+  // The reconnect reconcile's id read (useUpdatesSocket).
+  readViewForReconcile,
   hasPendingGridImages,
   clearFaceSelection,
   // Lets the sidebar's Scrapheap context menu reach the same consent-gated
@@ -9182,8 +9532,10 @@ function gridItemTopOffset(index) {
     const top = layout.rowOffsets[row];
     return typeof top === "number" ? top : null;
   }
+  // The virtualizer's own row origin (top spacer plus row-gap), so the anchor
+  // is a card's real top and not one origin above it.
   const cols = Math.max(1, gridStore.columns || 1);
-  return Math.floor(index / cols) * rowHeight.value;
+  return squareRowTop(Math.floor(index / cols));
 }
 
 /**
@@ -9192,53 +9544,210 @@ function gridItemTopOffset(index) {
  * The collapse is on a timer, which is the one thing the grid's own rules never
  * do (the pills exist so nothing reshuffles under the user unprompted). What
  * makes it acceptable is that content the user is actually looking at does not
- * move: anchor on the topmost item still on screen, remove, then put that item
- * back under the same pixel. Ghosts below the fold move nothing; ghosts on
- * screen close their gap in plain sight, which is the expected consequence of
- * the sentence the receipt just read out; ghosts scrolled off the top would
- * otherwise drag the whole view up under someone who has moved on.
+ * move, which removeImagesById holds for every removal.
  */
-async function collapseGhostedImages(ids) {
-  const wrapper = scrollWrapper.value;
-  const scrollTop = wrapper ? wrapper.scrollTop : 0;
-  let anchorId = null;
-  let anchorOffset = 0;
-  if (wrapper && scrollTop > 0) {
-    const doomed = new Set(
-      ids.map((id) => String(getPictureId(id))).filter((id) => id !== "null"),
-    );
-    const list = allGridImages.value || [];
-    for (let i = 0; i < list.length; i += 1) {
-      const pictureId = getPictureId(list[i]?.id);
-      if (pictureId === null || doomed.has(String(pictureId))) continue;
-      const top = gridItemTopOffset(i);
-      if (top === null) break;
-      if (top >= scrollTop) {
-        anchorId = pictureId;
-        anchorOffset = top - scrollTop;
-        break;
-      }
-    }
-  }
-
+function collapseGhostedImages(ids) {
   removeImagesById(ids);
+}
 
-  if (anchorId === null || !wrapper) return;
-  await nextTick();
-  const newIndex = (allGridImages.value || []).findIndex(
-    (img) => getPictureId(img?.id) === anchorId,
-  );
+/**
+ * Where the view stands before cells leave the grid, for restoreScrollAnchor to
+ * hold it after. `isLeaving(img, index)` names the cells that go. The change
+ * keeps every other cell in its order: a plain filter, or the rebuild
+ * removeImagesById runs, which can only add a collapsed stack's next member.
+ *
+ * Null when there is nothing to hold: the view is at the top, nothing leaves
+ * above the top row on screen (the rows above it stay put, so the cards on
+ * screen move only to close gaps on screen, in plain sight), or no cell from
+ * that row on stays (the grid now ends above the view, and the browser pulls
+ * the scroll back to the new end). In justified mode also when no card on
+ * screen stays, since the pixel hold needs one to measure by.
+ */
+function captureScrollAnchor(isLeaving) {
+  const wrapper = scrollWrapper.value;
+  if (!wrapper || !(wrapper.scrollTop > 0)) return null;
+  const list = allGridImages.value || [];
+  const scrollTop = wrapper.scrollTop;
+  const justified = isJustifiedMode.value;
+  const cols = Math.max(1, gridStore.columns || 1);
+  const pitch = rowHeight.value;
+  // The first slot of the top row on screen, the one whose bottom is below
+  // the top edge (partly scrolled off or not).
+  let firstSlot;
+  if (justified) {
+    const layout = justifiedLayout.value;
+    if (!layout?.rowHeights?.length) return null;
+    let row = rowAtOffset(layout.rowOffsets, scrollTop);
+    if (layout.rowOffsets[row] + layout.rowHeights[row] <= scrollTop) row += 1;
+    if (row >= layout.rowHeights.length) return null;
+    firstSlot = layout.rowStarts[row];
+  } else {
+    const topRow = Math.max(
+      0,
+      Math.floor((scrollTop - squareRowTop(0)) / pitch),
+    );
+    firstSlot = Math.min(topRow * cols, list.length);
+  }
+  let leavingAbove = 0;
+  for (let i = 0; i < firstSlot; i += 1) {
+    if (isLeaving(list[i], i)) leavingAbove += 1;
+  }
+  if (leavingAbove === 0) return null;
+  let stay = firstSlot;
+  while (stay < list.length && isLeaving(list[stay], stay)) stay += 1;
+  if (stay >= list.length) return null;
+  const anchor = {
+    justified,
+    firstSlot,
+    stay,
+    // A cell with no picture yet has nothing to find it by afterwards. Only a
+    // plain filter runs while the grid has such cells, so its new slot is
+    // its old one less the cells that left before it.
+    pictureId: getPictureId(list[stay]?.id),
+    leavingBeforeStay: leavingAbove + (stay - firstSlot),
+    cols,
+    pitch,
+    offset: null,
+  };
+  if (justified) {
+    const top = gridItemTopOffset(stay);
+    if (top === null || top >= scrollTop + wrapper.clientHeight) return null;
+    anchor.offset = top - scrollTop;
+  }
+  return anchor;
+}
+
+/**
+ * Hold the view captureScrollAnchor described, under the grid the change left.
+ *
+ * Square mode keeps whole rows. When n cells leave above the top row on
+ * screen, the cards below them move n slots back. Scrolling up r rows turns
+ * that into n - r*cols slots back (or r*cols - n forward), and r =
+ * round(n / cols) makes it the least: every card on screen moves fewer than
+ * half a row of slots, and only the ones that wrap change row. A pixel anchor
+ * on one card held that card and dropped the rest of the screen a row when n
+ * was not a whole number of rows. n is where the top row's first staying
+ * cell is now against where the row began, so a stack member the rebuild
+ * promoted above the view counts as a cell that stayed.
+ *
+ * Justified mode re-packs every row after the first cell that left, so no
+ * slot arithmetic holds; the topmost staying card on screen is put back under
+ * the same pixel instead.
+ */
+function restoreScrollAnchor(anchor) {
+  const wrapper = scrollWrapper.value;
+  if (!anchor || !wrapper) return;
+  const newIndex =
+    anchor.pictureId === null
+      ? anchor.stay - anchor.leavingBeforeStay
+      : (allGridImages.value || []).findIndex(
+          (img) => getPictureId(img?.id) === anchor.pictureId,
+        );
+  // The rebuild dropped the picture (an expanded stack's member whose stack
+  // collapsed with its leader): there is no card left to measure the change
+  // by, so the scroll stays where it is.
   if (newIndex < 0) return;
-  const newTop = gridItemTopOffset(newIndex);
-  if (newTop === null) return;
-  const target = Math.max(0, newTop - anchorOffset);
-  // Sub-pixel churn is not worth a scroll write (and would fight momentum).
-  if (Math.abs(target - wrapper.scrollTop) > 1) {
-    wrapper.scrollTop = target;
+  let target;
+  if (anchor.justified) {
+    const newTop = gridItemTopOffset(newIndex);
+    if (newTop === null) return;
+    target = Math.max(0, newTop - anchor.offset);
+    // Sub-pixel churn is not worth a scroll write (and would fight momentum).
+    if (Math.abs(target - wrapper.scrollTop) <= 1) return;
+  } else {
+    const rows = Math.round((anchor.firstSlot - newIndex) / anchor.cols);
+    if (rows === 0) return;
+    target = wrapper.scrollTop - rows * anchor.pitch;
+  }
+  const moved = target - wrapper.scrollTop;
+  wrapper.scrollTop = target;
+  // A re-read that keeps the scroll puts it back where it stood when the
+  // re-read began, once the re-read is over (useGridFetch). A hold while it
+  // runs moves that spot with the view, or the re-read's end would undo it.
+  if (pendingScrollTop.value !== null) pendingScrollTop.value.top += moved;
+}
+
+// Keys that scroll the grid outside a text field: the browser's own scroll
+// keys, and Home/End/PageUp/PageDown, which App hands to onGlobalKeyPress.
+const GRID_SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
+
+/**
+ * The user scrolled the grid: drop the place a running re-read was going to
+ * put the view back to, so its end leaves the view where they took it.
+ *
+ * Driven by the input that scrolls (wheel, touch, a scroll key, the
+ * scrollbar), never by the scroll event: the grid writes scrollTop itself
+ * (removal holds, re-anchoring, keyboard paging, this restore), and the
+ * platform has no flag that tells a user's scroll from a script's. The HTML
+ * standard's own restore gives way the same way once "the user scrolls the
+ * document"
+ * (https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-scroll-position-data),
+ * and TanStack Virtual retires a pending scroll on any scroll it did not make
+ * itself (https://github.com/TanStack/virtual, scroll-classifier.ts). Input
+ * that ends up not moving the view costs nothing: with the old cards kept
+ * until the new ones land, the view is still where the place would put it.
+ */
+function dropPendingScrollPlace() {
+  if (pendingScrollTop.value !== null) pendingScrollTop.value = null;
+}
+
+// The scrollbar, or the grid's empty margin, is the wrapper itself as the
+// target; a card never is. A middle-button press starts autoscroll.
+function dropScrollPlaceOnScrollbarPress(event) {
+  if (event.target === event.currentTarget || event.button === 1) {
+    dropPendingScrollPlace();
   }
 }
 
-// Remove images by ID (for event-driven removal)
+// A key pressed inside an open menu, popover or dialog moves that overlay's
+// list or scrolls that overlay, never the grid behind it.
+function dropScrollPlaceOnScrollKey(event) {
+  if (!GRID_SCROLL_KEYS.has(event.key)) return;
+  if (lightboxOpen.value || isTypingTarget(event.target)) return;
+  if (event.target?.closest?.(".v-overlay__content")) return;
+  dropPendingScrollPlace();
+}
+
+/**
+ * Run `change`, which takes the cells `isLeaving(img, index)` names out of
+ * the grid by a plain filter, holding the view the way removeImagesById does.
+ * The stream drops its unfilled cells through it (useGridFetch).
+ */
+function holdView(isLeaving, change) {
+  const anchor = captureScrollAnchor(isLeaving);
+  change();
+  restoreScrollAnchor(anchor);
+  if (scrollWrapper.value?.clientHeight > 0) recalculateVisibleRange();
+}
+
+/**
+ * Remove pictures from the grid without moving what is on screen.
+ *
+ * Every removal comes through here: a delete from another tab, a Scrapheap
+ * purge's echo (once per slice), a ghost collapse, a filter a picture stopped
+ * matching. Cards are keyed by picture, so the ones that stay keep their
+ * elements. The grid turns the browser's scroll anchoring off
+ * (`overflow-anchor: none`, see the scroll wrapper's style), so it anchors by
+ * hand (captureScrollAnchor, restoreScrollAnchor): removals above the top row
+ * on screen scroll the view up by the whole rows they took (in justified
+ * mode, the topmost card on screen keeps its pixel). Removals below the fold
+ * move nothing; removals on screen close their gap in plain sight; removals
+ * above it would otherwise drag the view up under someone who has moved on.
+ * The scroll is written before Vue renders, so the window the render draws is
+ * already the anchored one, not the old index's window over different
+ * pictures.
+ *
+ * The thumbnail state is not reset: what is keyed by picture stays true, and
+ * only the ranges by slot from the first moved row on are forgotten.
+ */
 function removeImagesById(imageIds) {
   if (!Array.isArray(imageIds) || !imageIds.length) {
     return;
@@ -9247,7 +9756,16 @@ function removeImagesById(imageIds) {
     imageIds.map((id) => getPictureId(id)).filter((id) => id !== null),
   );
   const removeId = (img) => dIds.has(getPictureId(img?.id));
-  allGridImages.value = allGridImages.value.filter((img) => !removeId(img));
+  const before = allGridImages.value;
+  const anchor = captureScrollAnchor(removeId);
+  const cursorPictureId =
+    cursorIdx.value === null ? null : getPictureId(before[cursorIdx.value]?.id);
+  // A batch still to land may list them: the server can have read it before
+  // the change committed.
+  noteRemovedDuringStream([...dIds]);
+  for (const id of dIds) clearThumbnailRetry(id);
+  const remaining = before.filter((img) => !removeId(img));
+  allGridImages.value = remaining;
   if (Array.isArray(lastFetchedGridImages.value)) {
     lastFetchedGridImages.value = lastFetchedGridImages.value.filter(
       (img) => !removeId(img),
@@ -9267,9 +9785,56 @@ function removeImagesById(imageIds) {
   selectedImageIds.value = selectedImageIds.value.filter(
     (id) => !dIds.has(getPictureId(id)),
   );
-  resetThumbnailState();
-  rebuildGridImagesFromLastFetch();
-  void refreshExpandedStacksAfterFetch();
+  // A stream still filling the grid (cells with no picture yet) writes each
+  // batch into the placeholder cells after the last loaded row. The rebuild
+  // lays the grid out from the rows loaded so far, which drops every unfilled
+  // cell, so the stream would have nowhere to write the rest. Mid-stream the
+  // removed rows leave in place instead and every cell after them moves up a
+  // slot. The stream places each batch by picture id, so it lines up with the
+  // moved cells whichever list the server read; a removed picture whose row
+  // had not arrived leaves one cell too many, which the stream drops when its
+  // rows reach the next loaded one.
+  if (remaining.some((img) => img?.id == null)) {
+    allGridImages.value = remaining.map((img, i) =>
+      img.idx === i ? img : { ...img, idx: i },
+    );
+    if (visibleStart.value >= remaining.length) {
+      const cols = Math.max(1, gridStore.columns || 1);
+      const windowCount = Math.max(cols, divisibleViewWindow.value || cols);
+      visibleStart.value = 0;
+      visibleEnd.value = Math.min(remaining.length, windowCount);
+    } else if (visibleEnd.value > remaining.length) {
+      visibleEnd.value = remaining.length;
+    }
+  } else {
+    rebuildGridImagesFromLastFetch();
+    void refreshExpandedStacksAfterFetch();
+  }
+  const after = allGridImages.value;
+  if (cursorPictureId !== null) {
+    const cursorIndex = after.findIndex(
+      (img) => getPictureId(img?.id) === cursorPictureId,
+    );
+    if (cursorIndex >= 0) cursorIdx.value = cursorIndex;
+  }
+  if (cursorIdx.value !== null && cursorIdx.value >= after.length) {
+    cursorIdx.value = after.length ? after.length - 1 : null;
+  }
+  restoreScrollAnchor(anchor);
+  // The window follows the restored scroll, read the way a scroll reads it,
+  // so it holds the pictures that were on screen rather than their old slots.
+  // A viewport with no height (the grid not laid out) has nothing on screen to
+  // hold; the clamps above keep its window inside the grid.
+  if (scrollWrapper.value?.clientHeight > 0) recalculateVisibleRange();
+  let firstMoved = 0;
+  while (
+    firstMoved < after.length &&
+    firstMoved < before.length &&
+    getPictureId(after[firstMoved]?.id) === getPictureId(before[firstMoved]?.id)
+  ) {
+    firstMoved += 1;
+  }
+  forgetThumbnailRangesFrom(firstMoved);
 }
 
 function getExportCount() {
@@ -9307,19 +9872,15 @@ function selectionCoversView() {
 }
 
 /**
- * The pictures an export sends: the selected ids, or the view's own query when
- * nothing is selected or the selection is the whole view - which is what the
- * toolbar's whole-grid export sent, collapsed stack members and the unloaded
- * tail included.
+ * The selected pictures an export names, in selection order; null when the
+ * export is the view's instead, because nothing is selected or the selection
+ * is the whole view - which is what the toolbar's whole-grid export sent,
+ * collapsed stack members and the unloaded tail included.
  */
-function exportPictureParams() {
+function exportSelectedPictureIds() {
   const selectedIds = selectedImageIds.value;
-  if (!selectedIds?.length || selectionCoversView()) {
-    return buildPictureIdsQueryParams();
-  }
-  const params = new URLSearchParams();
-  for (const id of selectedIds) params.append("id", getPictureId(id));
-  return params.toString();
+  if (!selectedIds?.length || selectionCoversView()) return null;
+  return selectedIds.map((id) => getPictureId(id));
 }
 
 // An export is followed until the server says it is over, however long that
@@ -9413,6 +9974,24 @@ function endUnsettledExport(followed, key, texts) {
   return false;
 }
 
+/**
+ * The query of an export of the whole view, ZIP or folder: the view's own
+ * query, then the export's options. A search view's export sends what the
+ * grid's search sends, its "In text" switch included, and the threshold that
+ * search uses, so it packages the pictures the search shows.
+ */
+function viewExportQuery(exportOptions) {
+  const params = new URLSearchParams(searchViewQueryParams());
+  if (params.has("query")) {
+    params.append("threshold", String(SEARCH_CHANCE_CEILING));
+  }
+  for (const [name, value] of Object.entries(exportOptions)) {
+    if (value === false) continue;
+    params.append(name, String(value));
+  }
+  return params.toString();
+}
+
 async function exportCurrentViewToZip(options = {}) {
   const exportType = options.exportType || "full";
   const captionMode = options.captionMode || "description";
@@ -9422,35 +10001,33 @@ async function exportCurrentViewToZip(options = {}) {
   const resolution = options.resolution || "original";
   const bboxMode = options.bboxMode || "none";
   const keepGenerationData = options.keepGenerationData === true;
-  const params = exportPictureParams();
-  const extraParams = new URLSearchParams();
-  if (exportType) {
-    extraParams.append("export_type", exportType);
-  }
-  if (captionMode) {
-    extraParams.append("caption_mode", captionMode);
-  }
+  // The options as the server names them, for the body and the query alike.
+  const exportOptions = {
+    export_type: exportType,
+    caption_mode: captionMode,
+    include_character_name: includeCharacterName,
+    use_original_file_names: useOriginalFileNames,
+    resolution,
+    // Stripped unless the Share panel and Export row says keep (#2417).
+    keep_generation_data: keepGenerationData,
+  };
   if (captionMode === "tags" && tagFormat === "underscores") {
-    extraParams.append("tag_format", "underscores");
-  }
-  if (includeCharacterName) {
-    extraParams.append("include_character_name", "true");
-  }
-  if (useOriginalFileNames) {
-    extraParams.append("use_original_file_names", "true");
-  }
-  if (resolution) {
-    extraParams.append("resolution", resolution);
+    exportOptions.tag_format = "underscores";
   }
   if (bboxMode && bboxMode !== "none") {
-    extraParams.append("bbox_mode", bboxMode);
+    exportOptions.bbox_mode = bboxMode;
   }
-  // Stripped unless the Share panel and Export row says keep (#2417).
-  if (keepGenerationData) {
-    extraParams.append("keep_generation_data", "true");
-  }
-  const extraParamString = extraParams.toString();
-  const exportQuery = [params, extraParamString].filter(Boolean).join("&");
+  // A selection goes in the request body: as `?id=` parameters a large one is
+  // a URL the server or a proxy in front of it refuses. Its Scrapheap flag
+  // goes with it, as the view's query carries its own.
+  const pictureIds = exportSelectedPictureIds();
+  const startRequest = pictureIds
+    ? () =>
+        startExportByIds(pictureIds, {
+          ...exportOptions,
+          only_deleted: isScrapheapView.value,
+        })
+    : () => startExport(viewExportQuery(exportOptions));
 
   const texts = {
     left:
@@ -9478,7 +10055,7 @@ async function exportCurrentViewToZip(options = {}) {
     exportProgress.message = "Preparing export...";
     exportProgress.cancelRequested = false;
 
-    const startBody = await startExport(exportQuery);
+    const startBody = await startRequest();
     const taskId = startBody?.task_id;
     if (!taskId) {
       throw new Error("Missing task_id from export response.");
@@ -9561,36 +10138,34 @@ async function exportCurrentViewToFolder(options = {}) {
   const resolution = options.resolution || "original";
   const bboxMode = options.bboxMode || "none";
   const keepGenerationData = options.keepGenerationData === true;
-  const params = exportPictureParams();
-  const extraParams = new URLSearchParams();
-  extraParams.append("destination", destination);
-  if (exportType) {
-    extraParams.append("export_type", exportType);
-  }
-  if (captionMode) {
-    extraParams.append("caption_mode", captionMode);
-  }
+  // The options as the server names them, for the body and the query alike.
+  const exportOptions = {
+    export_type: exportType,
+    caption_mode: captionMode,
+    include_character_name: includeCharacterName,
+    use_original_file_names: useOriginalFileNames,
+    resolution,
+    // Stripped unless the Share panel and Export row says keep (#2417).
+    keep_generation_data: keepGenerationData,
+  };
   if (captionMode === "tags" && tagFormat === "underscores") {
-    extraParams.append("tag_format", "underscores");
-  }
-  if (includeCharacterName) {
-    extraParams.append("include_character_name", "true");
-  }
-  if (useOriginalFileNames) {
-    extraParams.append("use_original_file_names", "true");
-  }
-  if (resolution) {
-    extraParams.append("resolution", resolution);
+    exportOptions.tag_format = "underscores";
   }
   if (bboxMode && bboxMode !== "none") {
-    extraParams.append("bbox_mode", bboxMode);
+    exportOptions.bbox_mode = bboxMode;
   }
-  // Stripped unless the Share panel and Export row says keep (#2417).
-  if (keepGenerationData) {
-    extraParams.append("keep_generation_data", "true");
-  }
-  const extraParamString = extraParams.toString();
-  const exportQuery = [params, extraParamString].filter(Boolean).join("&");
+  // As for the ZIP: a selection goes in the request body with its Scrapheap
+  // flag, never as `?id=` parameters; the view goes as the view's query, with
+  // the search threshold the grid's own search uses.
+  const pictureIds = exportSelectedPictureIds();
+  const startRequest = pictureIds
+    ? () =>
+        startFolderExportByIds(destination, pictureIds, {
+          ...exportOptions,
+          only_deleted: isScrapheapView.value,
+        })
+    : () =>
+        startFolderExport(viewExportQuery({ ...exportOptions, destination }));
 
   const texts = {
     left:
@@ -9621,7 +10196,7 @@ async function exportCurrentViewToFolder(options = {}) {
     exportProgress.message = "Preparing export...";
     exportProgress.cancelRequested = false;
 
-    const startBody = await startFolderExport(exportQuery);
+    const startBody = await startRequest();
     const taskId = startBody?.task_id;
     if (!taskId) {
       throw new Error("Missing task_id from export response.");
@@ -9651,13 +10226,13 @@ async function exportCurrentViewToFolder(options = {}) {
     const resolvedDestination = destination;
     if (completedBody.opened === false) {
       noticeStore.warning(
-        `Exported ${count} picture${count === 1 ? "" : "s"} to ${resolvedDestination}, ` +
+        `Exported ${formatCount(count)} picture${count === 1 ? "" : "s"} to ${resolvedDestination}, ` +
           `but couldn't open it - no desktop file manager found on the machine running PixlStash.`,
         { key: "export-folder" },
       );
     } else {
       noticeStore.success(
-        `Exported ${count} picture${count === 1 ? "" : "s"} to ${resolvedDestination}.`,
+        `Exported ${formatCount(count)} picture${count === 1 ? "" : "s"} to ${resolvedDestination}.`,
         { key: "export-folder" },
       );
     }
@@ -9933,6 +10508,19 @@ const suggestBar = computed(() => {
 });
 
 /**
+ * The notice after an assignment whose answer was a server fault: it may have
+ * committed. Says the suggestions were reloaded only when the re-read landed.
+ *
+ * @param {boolean} reloaded - whether `reloadGridAfterUncertainWrite` landed.
+ * @returns {string}
+ */
+function uncertainAssignmentSentence(reloaded) {
+  return reloaded
+    ? "The assignment outcome is uncertain. Suggestions were reloaded from the server before you retry."
+    : "The assignment outcome is uncertain and the suggestions could not be reloaded, so reload the page before you retry.";
+}
+
+/**
  * Assign the suggested (or selected) pictures to the searched person.
  *
  * Sends the exact picture/face pairs the search returned. A suggestion is an
@@ -9989,15 +10577,15 @@ async function handleAssignFaceSearchResults() {
     emit("refresh-sidebar");
   } catch (e) {
     const status = Number(e?.response?.status);
+    let reloaded = false;
     if (status >= 500 || status === 422) {
       faceSearchRanked.value = null;
-      await fetchAllGridImages({ force: true });
+      reloaded = await reloadGridAfterUncertainWrite();
     }
     if (status >= 500) {
-      noticeStore.error(
-        `The assignment outcome is uncertain. Suggestions were reloaded from the server before you retry.`,
-        { key: "character-face-search-assign-uncertain" },
-      );
+      noticeStore.error(uncertainAssignmentSentence(reloaded), {
+        key: "character-face-search-assign-uncertain",
+      });
       return;
     }
     noticeStore.error(
@@ -10049,8 +10637,8 @@ async function handleAddSetSuggestions() {
 watch(
   () => searchStore.searchQuery,
   (newVal) => {
-    // The cached response is for the old query; the "In text" re-cut only
-    // ever reuses the current query's, which the fetch writes after this.
+    // The cached response is for the old query; the fetch writes the current
+    // query's after this.
     textSearchResults.value = null;
     if (newVal && newVal.trim()) {
       resetFaceAndImageSearches();

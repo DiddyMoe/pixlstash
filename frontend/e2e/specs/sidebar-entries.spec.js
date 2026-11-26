@@ -97,15 +97,17 @@ async function addToSet(ctx, setId, ids) {
   )
 }
 
-/** Accept the next native confirm and hand back its text. */
-function acceptConfirm(page) {
-  return new Promise((resolve) => {
-    page.once('dialog', async (d) => {
-      const message = d.message()
-      await d.accept()
-      resolve(message)
-    })
-  })
+/**
+ * Answer the app's confirm dialog with that title: check what it tells the
+ * person, then press its confirm button. The sidebar asks there, in an
+ * alertdialog, never in the browser's own confirm box.
+ */
+async function acceptConfirm(page, { title, says = [], button }) {
+  const dialog = page.getByRole('alertdialog', { name: title, exact: true })
+  await expect(dialog).toBeVisible()
+  for (const text of says) await expect(dialog).toContainText(text)
+  await dialog.getByRole('button', { name: button, exact: true }).click()
+  await expect(dialog).toBeHidden()
 }
 
 const pathname = (page) => new URL(page.url()).pathname
@@ -243,9 +245,14 @@ test.describe('people', () => {
     await expect.poll(() => pathname(page)).toBe(`/character/${person.id}`)
 
     await personRow(sidebar, person.name).click({ button: 'right' })
-    const confirmed = acceptConfirm(page)
     await sidebar.ctxButton('Delete').click()
-    expect(await confirmed).toBe(`Delete character "${person.name}"?`)
+    await acceptConfirm(page, {
+      title: `Delete character "${person.name}"?`,
+      says: [
+        'Their pictures stay in the library, and the faces named as them go back to unnamed.',
+      ],
+      button: 'Delete character',
+    })
 
     await expect(personRow(sidebar, person.name)).toHaveCount(0)
     await expect.poll(() => pathname(page)).toBe('/')
@@ -347,11 +354,12 @@ test.describe('picture sets', () => {
     await expect.poll(() => pathname(page)).toBe(`/set/${doomed.id}`)
 
     await setRow(sidebar, doomed.name).click({ button: 'right' })
-    const confirmed = acceptConfirm(page)
     await sidebar.ctxButton('Delete').click()
-    expect(await confirmed).toBe(
-      `Delete picture set "${doomed.name}"? This will unassign all their images.`,
-    )
+    await acceptConfirm(page, {
+      title: `Delete picture set "${doomed.name}"?`,
+      says: ['Its pictures leave the set and stay in the library.'],
+      button: 'Delete set',
+    })
 
     await expect(setRow(sidebar, doomed.name)).toHaveCount(0)
     await expect.poll(() => pathname(page)).toBe('/')
@@ -385,11 +393,12 @@ test.describe('picture sets', () => {
     await expect(grid.multiSelectLabel).toContainText(/2 sets selected/i)
 
     await setRow(sidebar, second.name).click({ button: 'right' })
-    const confirmed = acceptConfirm(page)
     await sidebar.ctxButton('Delete 2 sets').click()
-    expect(await confirmed).toBe(
-      'Delete 2 picture sets? This will unassign all their images.',
-    )
+    await acceptConfirm(page, {
+      title: 'Delete 2 picture sets?',
+      says: ['Their pictures leave the sets and stay in the library.'],
+      button: 'Delete 2 sets',
+    })
 
     await expect(setRow(sidebar, first.name)).toHaveCount(0)
     await expect(setRow(sidebar, second.name)).toHaveCount(0)
@@ -422,9 +431,8 @@ test.describe('picture sets', () => {
 
     // Delete is gated on the row right-clicked, so the unlocked one offers it.
     await setRow(sidebar, open.name).click({ button: 'right' })
-    const confirmed = acceptConfirm(page)
     await sidebar.ctxButton('Delete 2 sets').click()
-    await confirmed
+    await acceptConfirm(page, { title: 'Delete 2 picture sets?', button: 'Delete 2 sets' })
 
     await expect(notices.messages).toContainText("Couldn't delete those sets")
     await expect(setRow(sidebar, open.name)).toHaveCount(0)
@@ -565,11 +573,12 @@ test.describe('projects', () => {
     // Right-click on the slot opens the current project's own menu.
     await sidebar.scopeButton.click({ button: 'right' })
     await expect(sidebar.ctxMenu).toBeVisible()
-    const confirmed = acceptConfirm(page)
     await sidebar.ctxButton('Delete').click()
-    expect(await confirmed).toBe(
-      `Delete project "${project.name}"? Its people, sets and pictures stay in the library; its attachments are deleted.`,
-    )
+    await acceptConfirm(page, {
+      title: `Delete project "${project.name}"?`,
+      says: ['Its people, sets and pictures stay in the library.', 'Its attachments are deleted.'],
+      button: 'Delete project',
+    })
 
     await expect(sidebar.scopeButton).toContainText('Any project')
     await expect.poll(() => pathname(page)).not.toContain('/project/')

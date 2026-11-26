@@ -16,6 +16,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { SHELF_NO_UNDO_KEY, useGlobalKeydown } from "./useGlobalKeydown";
 import { useNoticeStore } from "../stores/useNoticeStore";
 import { useOperationStore } from "../stores/useOperationStore";
+import { useSearchStore } from "../stores/useSearchStore";
 
 /** A host component whose only job is to install the listener. */
 const Host = {
@@ -162,5 +163,217 @@ describe("Escape and the sidebar's Find in library (#2448)", () => {
     document.body.appendChild(overlay);
     press("Escape", { ctrlKey: false });
     expect(sidebar.clearFind).not.toHaveBeenCalled();
+  });
+});
+
+// A key pressed in a modal dialog is the dialog's: AppDialog keeps only Escape
+// and Enter for itself, so the rest reach the window. Behind a dialog, Home or
+// PageDown used to scroll the grid (and swallow the dialog's own scrolling), F
+// moved focus to the search field, and ? opened the shortcuts sheet on top.
+describe("the app's shortcuts behind a modal dialog", () => {
+  let grid;
+  let shortcutsDialogOpen;
+  let host;
+  let searchFocus;
+
+  beforeEach(() => {
+    grid = { onGlobalKeyPress: vi.fn() };
+    shortcutsDialogOpen = ref(false);
+    host = mount(
+      {
+        setup() {
+          useGlobalKeydown({
+            gridContainer: ref(grid),
+            sidebarRef: ref(null),
+            shortcutsDialogOpen,
+          });
+          return () => null;
+        },
+      },
+      { attachTo: document.body },
+    );
+    searchFocus = vi.spyOn(useSearchStore(), "requestSearchFocus");
+  });
+
+  afterEach(() => host.unmount());
+
+  /** What Vuetify renders for an open dialog: an active overlay with a scrim. */
+  function openModal() {
+    const overlay = document.createElement("div");
+    overlay.className = "v-overlay v-overlay--active v-dialog";
+    overlay.innerHTML = '<div class="v-overlay__scrim"></div>';
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+
+  function pressPlain(key) {
+    const event = new KeyboardEvent("keydown", {
+      key,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+    return event;
+  }
+
+  it("leaves Home, End, PageUp, PageDown, F and ? to the dialog", () => {
+    openModal();
+    const presses = ["Home", "End", "PageUp", "PageDown", "f", "?", "F1"].map(
+      pressPlain,
+    );
+
+    expect(grid.onGlobalKeyPress).not.toHaveBeenCalled();
+    expect(searchFocus).not.toHaveBeenCalled();
+    expect(shortcutsDialogOpen.value).toBe(false);
+    // The dialog keeps the browser's own handling of its keys too.
+    expect(presses.some((event) => event.defaultPrevented)).toBe(false);
+  });
+
+  it("still closes the shortcuts sheet with its own key", () => {
+    shortcutsDialogOpen.value = true;
+    openModal();
+    pressPlain("?");
+    expect(shortcutsDialogOpen.value).toBe(false);
+  });
+
+  it("acts on the same keys with no dialog open", () => {
+    pressPlain("PageDown");
+    pressPlain("f");
+    pressPlain("?");
+    expect(grid.onGlobalKeyPress).toHaveBeenCalledWith(
+      "PageDown",
+      expect.any(KeyboardEvent),
+    );
+    // (The file's own host is mounted too, so the count is not this one's.)
+    expect(searchFocus).toHaveBeenCalled();
+    expect(shortcutsDialogOpen.value).toBe(true);
+  });
+});
+
+// A key pressed on an item of an open menu is the menu's (WAI-ARIA APG menu
+// pattern: an open menu owns the keyboard). A menu has no scrim, so the dialog
+// checks above miss it, and Vuetify lets its keys bubble to the window: Home
+// on a menu item scrolled the grid, F moved focus to the search field, Ctrl+Z
+// undid a library change, Escape cleared Find as well as closing the menu.
+describe("the app's shortcuts inside an open menu", () => {
+  let grid;
+  let sidebar;
+  let shortcutsDialogOpen;
+  let host;
+  let searchFocus;
+
+  beforeEach(() => {
+    // Only this host listens: the file's own one has no sidebar, and its F2
+    // would claim the key before this one could open the editor.
+    wrapper.unmount();
+    wrapper = null;
+    grid = { onGlobalKeyPress: vi.fn() };
+    sidebar = {
+      clearFind: vi.fn(() => true),
+      openCurrentSelectionEditor: vi.fn(),
+    };
+    shortcutsDialogOpen = ref(false);
+    host = mount(
+      {
+        setup() {
+          useGlobalKeydown({
+            gridContainer: ref(grid),
+            sidebarRef: ref(sidebar),
+            shortcutsDialogOpen,
+          });
+          return () => null;
+        },
+      },
+      { attachTo: document.body },
+    );
+    searchFocus = vi.spyOn(useSearchStore(), "requestSearchFocus");
+  });
+
+  afterEach(() => host.unmount());
+
+  /** An open Vuetify overlay holding one item; a menu has no scrim. */
+  function openOverlay(className, { scrim = false } = {}) {
+    const overlay = document.createElement("div");
+    overlay.className = `v-overlay v-overlay--active ${className}`;
+    overlay.innerHTML =
+      (scrim ? '<div class="v-overlay__scrim"></div>' : "") +
+      '<div class="v-overlay__content"><button type="button" role="menuitem">Item</button></div>';
+    document.body.appendChild(overlay);
+    return overlay.querySelector("button");
+  }
+
+  function pressOn(target, key, init = {}) {
+    const event = new KeyboardEvent("keydown", {
+      key,
+      bubbles: true,
+      cancelable: true,
+      ...init,
+    });
+    target.dispatchEvent(event);
+    return event;
+  }
+
+  const MENU_KEYS = [
+    ["Home", { key: "Home" }],
+    ["PageDown", { key: "PageDown" }],
+    ["F", { key: "f" }],
+    ["?", { key: "?" }],
+    ["F2", { key: "F2" }],
+    ["Ctrl+Z", { key: "z", ctrlKey: true }],
+    ["Escape", { key: "Escape" }],
+  ];
+
+  it.each(MENU_KEYS)("leaves %s on a menu item to the menu", (_, { key, ...init }) => {
+    const item = openOverlay("v-menu");
+    const event = pressOn(item, key, init);
+
+    expect(grid.onGlobalKeyPress).not.toHaveBeenCalled();
+    expect(searchFocus).not.toHaveBeenCalled();
+    expect(shortcutsDialogOpen.value).toBe(false);
+    expect(sidebar.openCurrentSelectionEditor).not.toHaveBeenCalled();
+    expect(store.undo).not.toHaveBeenCalled();
+    expect(sidebar.clearFind).not.toHaveBeenCalled();
+    // The menu keeps the browser's own handling of its keys too.
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  // The control: the same menu stays open, and the same keys pressed outside
+  // it still act, so the guard reads where the key was pressed, not whether a
+  // menu exists.
+  const APP_EFFECTS = {
+    Home: () =>
+      expect(grid.onGlobalKeyPress).toHaveBeenCalledWith(
+        "Home",
+        expect.any(KeyboardEvent),
+      ),
+    PageDown: () =>
+      expect(grid.onGlobalKeyPress).toHaveBeenCalledWith(
+        "PageDown",
+        expect.any(KeyboardEvent),
+      ),
+    F: () => expect(searchFocus).toHaveBeenCalled(),
+    "?": () => expect(shortcutsDialogOpen.value).toBe(true),
+    F2: () => expect(sidebar.openCurrentSelectionEditor).toHaveBeenCalled(),
+    "Ctrl+Z": () => expect(store.undo).toHaveBeenCalled(),
+  };
+
+  it.each(MENU_KEYS.filter(([name]) => name in APP_EFFECTS))(
+    "still acts on %s pressed outside an open menu",
+    (name, { key, ...init }) => {
+      openOverlay("v-menu");
+      const button = document.createElement("button");
+      document.body.appendChild(button);
+      pressOn(button, key, init);
+
+      APP_EFFECTS[name]();
+    },
+  );
+
+  it("still closes the keyboard-help sheet with ? pressed inside it", () => {
+    shortcutsDialogOpen.value = true;
+    const button = openOverlay("v-dialog", { scrim: true });
+    pressOn(button, "?");
+
+    expect(shortcutsDialogOpen.value).toBe(false);
   });
 });

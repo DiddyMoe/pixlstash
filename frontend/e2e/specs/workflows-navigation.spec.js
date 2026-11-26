@@ -660,14 +660,14 @@ test.describe("keyboard", () => {
     // An automatic workflow cannot be deleted: the key does nothing at all.
     await row(page, LANDSCAPE).click();
     await page.keyboard.press("Delete");
-    await expect(page.getByRole("dialog", { name: "Delete this workflow?" })).toHaveCount(0);
+    await expect(page.getByRole("alertdialog", { name: "Delete this workflow?" })).toHaveCount(0);
 
     // A manual one asks, and Cancel sends nothing. Had the Delete above opened
     // a confirm late, there would now be two dialogs of this name, and the
     // strict locator below fails on that.
     await row(page, PORTRAIT).click();
     await page.keyboard.press("Delete");
-    const ask = page.getByRole("dialog", { name: "Delete this workflow?" });
+    const ask = page.getByRole("alertdialog", { name: "Delete this workflow?" });
     await expect(ask).toBeVisible();
     await expect(ask).toContainText(NAMES[PORTRAIT]);
     await ask.getByRole("button", { name: "Cancel" }).click();

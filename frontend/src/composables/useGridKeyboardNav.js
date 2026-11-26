@@ -277,15 +277,14 @@ export function useGridKeyboardNav(
   }
 
   /**
-   * Whether Ctrl+V may paste. Not on auto-repeat, and not behind a modal
-   * dialog, where its result could not be seen; that is the same
-   * Vuetify-scrim test the global undo key uses.
+   * Whether a modal dialog is open over the grid. Every dialog is an
+   * AppDialog, which Vuetify renders with a scrim; menus and tooltips are
+   * overlays without one. The global undo key uses the same test.
    */
-  function canWriteFromKeys(event) {
-    if (event.repeat) return false;
+  function modalDialogOpen() {
     return (
-      typeof document === "undefined" ||
-      document.querySelector(".v-overlay--active .v-overlay__scrim") == null
+      typeof document !== "undefined" &&
+      document.querySelector(".v-overlay--active .v-overlay__scrim") != null
     );
   }
 
@@ -323,6 +322,15 @@ export function useGridKeyboardNav(
     // Ctrl+A, arrows, Enter, T) must not fire on the grid behind it.
     if (reviewOverlayOpen?.value) return;
     if (toolbarSelectionMenuOpen?.value) return; // Ignore when selection menu is open
+    // A key pressed while a dialog is open is the dialog's, wherever focus
+    // is: Delete in a confirm must not open Delete forever behind it, nor
+    // Delete forever's own preview again under its open dialog.
+    if (modalDialogOpen()) return;
+    // A key pressed inside an open menu or popover is that overlay's (the
+    // WAI-ARIA menu pattern: an open menu owns the keyboard). A menu has no
+    // scrim and Vuetify lets its keys bubble, so Delete or Enter on a menu
+    // item must not delete or open the grid's selection behind it.
+    if (target?.closest?.(".v-overlay__content")) return;
     if (event.key === "Escape") {
       if (overlayOwnsEscape()) return;
       const target = escapeTarget();
@@ -611,9 +619,11 @@ export function useGridKeyboardNav(
       !event.altKey &&
       selectedImageIds.value.length > 0 &&
       !isReadOnly.value &&
-      canWriteFromKeys(event)
+      !event.repeat
     ) {
-      // Ctrl+V pastes the copied tags onto the selection.
+      // Ctrl+V pastes the copied tags onto the selection, once per press.
+      // Behind a modal dialog it never gets here: handleKeyDown returns
+      // early while one is open.
       event.preventDefault();
       pasteOnSelection(selectedImageIds.value.slice());
     } else if (

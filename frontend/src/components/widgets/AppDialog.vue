@@ -9,6 +9,7 @@
     :persistent="persistent"
     :transition="reducedMotion ? false : undefined"
     :aria-labelledby="title ? titleId : undefined"
+    v-bind="alertAttrs"
     @update:model-value="(v) => !v && emit('close')"
   >
     <div
@@ -36,6 +37,7 @@
         </div>
       </header>
       <div
+        :id="bodyId"
         :class="['app-dialog__body', { 'app-dialog__body--flush': !padBody }]"
       >
         <slot />
@@ -48,9 +50,10 @@
 </template>
 
 <script setup>
-import { useId } from "vue";
+import { computed, useId } from "vue";
 import { VDialog } from "vuetify/components";
 import AppBarButton from "./AppBarButton.vue";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -70,6 +73,11 @@ const props = defineProps({
   // Near-viewport-sized dialog for working surfaces (Compare) where the
   // content is the point and a fixed width would waste the screen.
   fullscreen: { type: Boolean, default: false },
+  // A confirmation that interrupts the work: role="alertdialog", described by
+  // the body (WAI-ARIA APG, https://www.w3.org/WAI/ARIA/apg/patterns/alertdialog/).
+  // A caller whose message is only part of the body passes its own
+  // aria-describedby, which wins over the body's.
+  alert: { type: Boolean, default: false },
 });
 
 const emit = defineEmits(["close", "accept"]);
@@ -77,6 +85,13 @@ const emit = defineEmits(["close", "accept"]);
 // The dialog names itself: Vuetify puts role="dialog" on the overlay root but
 // wires no name, so the heading's id is passed through as aria-labelledby.
 const titleId = useId();
+const bodyId = useId();
+
+// Vuetify sets role="dialog" itself; an attribute passed to it overrides that
+// in place. Nothing is bound for a plain dialog, so its role stays Vuetify's.
+const alertAttrs = computed(() =>
+  props.alert ? { role: "alertdialog", "aria-describedby": bodyId } : {},
+);
 
 // Vuetify's default dialog transition is a Web Animations call, which the
 // global CSS reduce rule cannot reach, so reduced motion turns it off here.
@@ -107,10 +122,17 @@ function onKeydown(e) {
   if (e.key === "Escape") {
     if (props.persistent) return;
     e.stopPropagation();
+    // Escape that cancels an input method's composition is the IME's: it
+    // closes nothing. Stopped above all the same, or Vuetify's overlay,
+    // which listens for Escape on the window, would close the dialog.
+    if (isImeComposing(e)) return;
     emit("close");
     return;
   }
   if (e.key !== "Enter" || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  // Enter that commits an input method's composition (Japanese, Chinese,
+  // Korean) is the IME's, not an accept.
+  if (isImeComposing(e)) return;
   if (props.persistent) return;
   // A descendant that handled Enter itself (e.g. a role="radio" row) has
   // already preventDefault-ed; respect that instead of double-acting.
