@@ -314,7 +314,9 @@ def test_a_launcher_spelled_subfolder_for_the_role_takes_the_file(
     assert named["status"] == STATUS_DONE, named
     assert (chosen / subfolder / "component.safetensors").is_file()
     assert (chosen / subfolder / "named.safetensors").is_file()
-    assert not (chosen / directory).exists()
+    # By name: on a case-insensitive disk (Windows, macOS) ``chosen / "vae"``
+    # is the ``VAE`` folder itself, so exists() is true whatever was made.
+    assert directory not in os.listdir(chosen)
 
 
 def test_with_no_marked_folder_the_default_folder_takes_it(
