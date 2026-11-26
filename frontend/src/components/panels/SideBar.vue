@@ -117,6 +117,7 @@ import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useSetTreeExpansion } from "../../composables/useSetTreeExpansion";
 import { useSectionCollapse } from "../../composables/useSectionCollapse";
 import { useSidebarWidth } from "../../composables/useSidebarWidth";
+import { useConfirm } from "../../composables/useConfirm";
 import { useRoute } from "vue-router";
 import { useDedupStore, scopeKey } from "../../stores/useDedupStore";
 import { useMovesStore } from "../../stores/useMovesStore";
@@ -136,6 +137,8 @@ import { buildLine, liveBuildRuns } from "../../utils/trainingSetBuild";
 import { smartSetDescription } from "../../utils/smartSets";
 import { useTasksStore } from "../../stores/useTasksStore";
 import { activateOnEnterOrSpace } from "../../utils/keyboardActivation.js";
+import { formatCount } from "../../utils/filterChips.js";
+import { isImeComposing } from "../../utils/imeComposition.js";
 import {
   ALL_PICTURES_ID,
   SCRAPHEAP_PICTURES_ID,
@@ -155,6 +158,7 @@ const lockedSetsStore = useLockedSetsStore();
 // Failures and outcomes report through the notice surface rather than a
 // blocking native alert() (docs/design/notice-surface.md §1).
 const noticeStore = useNoticeStore();
+const { confirm } = useConfirm();
 
 /**
  * Human-readable reason from an axios/HTTP error, for a one-sentence notice.
@@ -329,7 +333,6 @@ const sortOptions = ref([]);
 const characters = computed(() => entityLists.characters);
 const categoryCounts = ref({
   [ALL_PICTURES_ID]: 0,
-  [UNASSIGNED_PICTURES_ID]: 0,
   [SCRAPHEAP_PICTURES_ID]: 0,
 });
 // Per-project picture counts, keyed by project id. Populated from the shared
@@ -529,6 +532,10 @@ const settingsDialogOpen = ref(false);
 // Nav entry the settings dialog should land on. Set by `openSettingsDialog(tab)`
 // so a caller can deep-link (e.g. the scrapheap header's "change" link).
 const settingsDialogInitialTab = ref("");
+// Bumped by every `openSettingsDialog` call. Asking again for the tab already
+// named leaves `settingsDialogInitialTab` unchanged, and the open dialog would
+// then stay wherever the user has clicked to since.
+const settingsDialogTabRequest = ref(0);
 // --- Reference and import folders ---
 // The sidebar no longer lists them, but a folder view is still reached by URL
 // (an old link, Back, a library insight), and it needs the folder's label and
@@ -571,8 +578,10 @@ const searchStore = useSearchStore();
 //      with no folder id - it stays absolute, since nothing else names it.
 //      `selectedFolderSubPath` is the sidebar's copy of what it last wrote.
 //   4. Grid filter  `selectedFolderFilter.pathPrefix`, which reaches the
-//      listing as `file_path_prefix`: a literal LIKE against the stored
-//      `file_path`, so it MUST be in the server's spelling.
+//      listing as `file_path_prefix`: a separator-bounded range compare on
+//      the stored `file_path` (`utils/query/folder_prefix.py`). Either
+//      separator may follow the folder on Windows, but the folder's own text
+//      is compared as written, so it MUST be in the server's spelling.
 //   5. Tree path    `entry.path` from the browse listing. Server spelling.
 //
 // Five crossings are legitimate, and each has one owner:
@@ -700,13 +709,16 @@ function _isAbsolutePath(p) {
  *
  * **The path handed back is re-spelled in `root`'s own separator, not the
  * URL's.** It becomes `selectedFolderFilter.pathPrefix` and travels to the
- * listing API as `file_path_prefix`, which is a literal `LIKE` against the
- * stored `file_path` (`utils/query/predicate_filter.py`) - it does not
- * normalise anything. So on a Windows library a slash-spelled link would
- * select the right row and return an EMPTY grid, and the tree row's own key
- * (built from the browse listing's spelling) would not match the highlight
- * either. Rebuilding the tail off the root fixes both, and is a no-op on a
- * POSIX library, where the two spellings already agree.
+ * listing API as `file_path_prefix`, which the server turns into a
+ * separator-bounded half-open range on the stored `file_path`
+ * (`FolderPrefix` in `utils/query/folder_prefix.py`; ASCII case-folded on
+ * Windows). On Windows that range accepts `\` or `/` AFTER the folder, but
+ * the folder's own text is compared as written: nothing re-spells the
+ * separators inside it. So on a Windows library a slash-spelled link would
+ * still select the right row and return an EMPTY grid, and the tree row's
+ * own key (built from the browse listing's spelling) would not match the
+ * highlight either. Rebuilding the tail off the root fixes both, and is a
+ * no-op on a POSIX library, where the two spellings already agree.
  *
  * @param {string} root the reference folder's own path
  * @returns {{pathPrefix: string, label: string}|null}
@@ -1363,12 +1375,14 @@ async function projectDeleted(deletedId) {
 }
 
 async function deleteProjectById(project) {
-  if (
-    !window.confirm(
-      `Delete project "${project.name}"? Its people, sets and pictures stay in the library; its attachments are deleted.`,
-    )
-  )
-    return;
+  const ok = await confirm({
+    title: `Delete project "${project.name}"?`,
+    message: "Its people, sets and pictures stay in the library.",
+    warning: "Its attachments are deleted.",
+    confirmLabel: "Delete project",
+    danger: true,
+  });
+  if (!ok) return;
   try {
     await deleteProject(project.id);
     await projectDeleted(project.id);
@@ -1780,6 +1794,7 @@ let settingsReturnPath = [];
  */
 function openSettingsDialog(tab = "") {
   settingsDialogInitialTab.value = typeof tab === "string" ? tab : "";
+  settingsDialogTabRequest.value += 1;
   // Settings opens from a prop, so Vuetify has no activator to hand focus back
   // to on close; the control that was focused when it opened takes it instead.
   settingsReturnPath = [];
@@ -1995,10 +2010,16 @@ async function deleteCharactersByIds(ids) {
   const charName = single
     ? characters.value.find((c) => Number(c.id) === ids[0])?.name
     : null;
-  const msg = single
-    ? `Delete character "${charName}"?`
-    : `Delete ${ids.length} characters?`;
-  if (!window.confirm(msg)) return;
+  const ok = await confirm({
+    title: single
+      ? `Delete character "${charName}"?`
+      : `Delete ${ids.length} characters?`,
+    message:
+      "Their pictures stay in the library, and the faces named as them go back to unnamed.",
+    confirmLabel: single ? "Delete character" : `Delete ${ids.length} characters`,
+    danger: true,
+  });
+  if (!ok) return;
   const viewed = new Set(selectedCharacterIdSet.value);
   viewed.add(Number(selectionStore.selectedCharacter));
   const { deleted, failure } = await settleDeletes(ids, apiDeleteCharacter);
@@ -2076,13 +2097,20 @@ async function deleteSetsByIds(ids) {
     : null;
   // A training set still being built takes its sheet runs with it.
   const runs = setRunsStopped(normalizedIds);
-  const stops = runs
-    ? ` This stops ${runs} sheet ${runs === 1 ? "run" : "runs"}; the sheets drawn so far stay in the Scrapheap.`
-    : "";
-  const msg = single
-    ? `Delete picture set "${setName}"? This will unassign all their images.${stops}`
-    : `Delete ${normalizedIds.length} picture sets? This will unassign all their images.${stops}`;
-  if (!window.confirm(msg)) return;
+  const ok = await confirm({
+    title: single
+      ? `Delete picture set "${setName}"?`
+      : `Delete ${normalizedIds.length} picture sets?`,
+    message: single
+      ? "Its pictures leave the set and stay in the library."
+      : "Their pictures leave the sets and stay in the library.",
+    warning: runs
+      ? `This stops ${runs} sheet ${runs === 1 ? "run" : "runs"}; the sheets drawn so far stay in the Scrapheap.`
+      : "",
+    confirmLabel: single ? "Delete set" : `Delete ${normalizedIds.length} sets`,
+    danger: true,
+  });
+  if (!ok) return;
 
   const { deleted, failure } = await settleDeletes(
     normalizedIds,
@@ -2406,6 +2434,17 @@ function onReviewEndClosed() {
 const scrapheapIsEmpty = computed(
   () => !categoryCounts.value[SCRAPHEAP_PICTURES_ID],
 );
+// The badge leaves out pictures the hidden tags hide (`categorySummaryParams`),
+// as the grid does, so with the preference on a 0 can mean "everything here is
+// hidden" rather than "empty". The item stays disabled either way, matching the
+// grid's own Empty button (`scrapheapEmptyDisabled` reads the filtered grid);
+// only the reason has to stay true.
+const scrapheapEmptyHint = computed(() => {
+  if (!scrapheapIsEmpty.value) return "";
+  return userPrefsStore.applyTagFilter
+    ? "No pictures to empty while hidden tags are on"
+    : "Scrapheap is already empty";
+});
 
 // Empty Scrapheap from the sidebar context menu. Navigate into the scrapheap
 // first so the grid's post-confirm refetch reconciles the right view, then hand
@@ -3081,11 +3120,16 @@ const libraryBranches = computed(() => [makeLibraryList(libraryScope.value)]);
 const scopeWashStyle = computed(() => washStyle(scopedProjectObj.value?.id));
 
 // What the dropdown shows: Any project's and Not in a project's numbers, and
-// each project's.
+// each project's. `stale` says which of the first two last failed to refresh,
+// so the dropdown marks them as the rows below do (`isCountStale`).
 const scopeCounts = computed(() => ({
   any: categoryCounts.value[ALL_PICTURES_ID],
   none: notInProjectCount.value,
   byId: projectCounts.value,
+  stale: {
+    any: isCountStale(ALL_PICTURES_ID),
+    none: isCountStale(NOT_IN_PROJECT_COUNT),
+  },
 }));
 
 // Folders mode (#2458): the folders pictures are filed in, from the server.
@@ -3241,6 +3285,13 @@ function matchCountLabel(n) {
 }
 
 function onFindKeydown(event) {
+  // The Enter that commits an input method's composition, and the Escape that
+  // cancels it, are the IME's: nothing opens and nothing clears. That Escape is
+  // stopped, as a clearing one is, so nothing behind the field answers it.
+  if (isImeComposing(event)) {
+    if (event.key === "Escape") event.stopPropagation();
+    return;
+  }
   if (event.key === "Escape") {
     if (!findQuery.value) return;
     event.preventDefault();
@@ -3627,13 +3678,81 @@ function setCategoryCount(id, value, shouldFlash) {
 // --- Sidebar & Character Data ---
 let sidebarCountEpoch = 0;
 
+// A count whose last read failed keeps the number it last had, marked so
+// nobody takes it for current ("Couldn't refresh this count"), and the
+// sidebar reads again on a capped exponential backoff until every count has
+// come back. Keep last-good data on screen with a non-blocking stale cue
+// rather than blanking it:
+// https://cursa.app/en/page/resilient-ux-stale-indicators-queued-actions-and-graceful-degradation
+// and retry with backoff before treating it as an error:
+// https://tkdodo.eu/status-checks-in-react-query
+const NOT_IN_PROJECT_COUNT = "NOT_IN_PROJECT";
+const FAVOURITES_COUNT = "FAVOURITES";
+const COUNT_RETRY_BASE_MS = 2000;
+const COUNT_RETRY_MAX_MS = 60000;
+const staleCounts = ref(new Set());
+let countRetryTimer = null;
+let countRetryAttempt = 0;
+
+function isCountStale(key) {
+  return staleCounts.value.has(key);
+}
+
+// The All not in a project row shows the not-in-a-project count; All of a
+// project shows that project's, which arrives on the project list.
+const notInProjectRowStale = computed(
+  () => libraryScope.value === null && isCountStale(NOT_IN_PROJECT_COUNT),
+);
+
+function scheduleCountRetry() {
+  clearTimeout(countRetryTimer);
+  countRetryTimer = null;
+  if (!staleCounts.value.size) {
+    countRetryAttempt = 0;
+    return;
+  }
+  const delay = Math.min(
+    COUNT_RETRY_BASE_MS * 2 ** countRetryAttempt,
+    COUNT_RETRY_MAX_MS,
+  );
+  countRetryAttempt += 1;
+  countRetryTimer = setTimeout(() => {
+    countRetryTimer = null;
+    fetchSidebarData();
+  }, delay);
+}
+
+// The epoch moves too, so a pass still in flight ends neither current nor
+// latest: it writes nothing, schedules no retry and starts no pass.
+onBeforeUnmount(() => {
+  sidebarCountEpoch += 1;
+  clearTimeout(countRetryTimer);
+});
+
 function sidebarCountRequestKey() {
   return JSON.stringify({
     mode: projectViewMode.value,
     projectId: selectedProjectId.value,
     characters: characters.value.map((char) => [char.id, char.project_id]),
     projects: projects.value.map((project) => project.id),
+    // The place counts leave hidden pictures out while the preference is on,
+    // so a read made under the other setting, or under the hidden tags before
+    // an edit, is not this pass's to write.
+    hidden: userPrefsStore.applyTagFilter ? userPrefsStore.hiddenTags : null,
   });
+}
+
+/**
+ * The hidden-tags preference for the place counts (All media, Scrapheap, Not
+ * in a project and Favourites), as the grid and the Details panel send it
+ * (`useGridFetch`'s `fetchAllPicturesCount`, `utils/viewQueryParams`), so each
+ * badge counts what its grid shows. The Inbox's own reads send it too
+ * (`useInboxStore.countQuery`). Turning it on, or editing the hidden tags while
+ * it is on, reads again through App.vue's `onTagFilterChanged`
+ * (`useAppEntityActions`).
+ */
+function categorySummaryParams() {
+  return userPrefsStore.applyTagFilter ? { apply_tag_filter: true } : undefined;
 }
 
 // Per-project counts arrive ON the shared project list (`include_counts`), so
@@ -3654,6 +3773,9 @@ watch(
 
 async function fetchSidebarData() {
   const requestEpoch = (sidebarCountEpoch += 1);
+  // This pass reads every count, so a retry still waiting is superseded.
+  clearTimeout(countRetryTimer);
+  countRetryTimer = null;
   // The per-character counts arrive ON the shared people list
   // (`include_counts`), so this pass has to hold that list before it can read
   // a count off it, and both the people and the project lists before it can
@@ -3694,30 +3816,30 @@ async function fetchSidebarData() {
   // Fetch total image count for END key logic
   try {
     // All images summary
-    const data = await getCharacterSummary(ALL_PICTURES_ID, undefined);
-    if (isCurrentRequest())
+    const data = await getCharacterSummary(
+      ALL_PICTURES_ID,
+      categorySummaryParams(),
+    );
+    if (isCurrentRequest()) {
       setCategoryCount(ALL_PICTURES_ID, data.image_count, shouldFlash);
+      staleCounts.value.delete(ALL_PICTURES_ID);
+    }
   } catch (e) {
     console.warn("Error fetching all images summary:", e);
+    if (isCurrentRequest()) staleCounts.value.add(ALL_PICTURES_ID);
   }
   try {
-    // The Folders tree's Unassigned: in no project, and no person or set
-    // of the ones in no project either, so every picture in Global is under
-    // one of its folders or here.
-    const data = await getCharacterSummary(UNASSIGNED_PICTURES_ID, {
-      project_id: "UNASSIGNED",
-    });
-    if (isCurrentRequest())
-      setCategoryCount(UNASSIGNED_PICTURES_ID, data.image_count, shouldFlash);
-  } catch (e) {
-    console.warn("Error fetching unassigned images summary:", e);
-  }
-  try {
-    const data = await getCharacterSummary(SCRAPHEAP_PICTURES_ID, undefined);
-    if (isCurrentRequest())
+    const data = await getCharacterSummary(
+      SCRAPHEAP_PICTURES_ID,
+      categorySummaryParams(),
+    );
+    if (isCurrentRequest()) {
       setCategoryCount(SCRAPHEAP_PICTURES_ID, data.image_count, shouldFlash);
+      staleCounts.value.delete(SCRAPHEAP_PICTURES_ID);
+    }
   } catch (e) {
     console.warn("Error fetching scrapheap images summary:", e);
+    if (isCurrentRequest()) staleCounts.value.add(SCRAPHEAP_PICTURES_ID);
   }
   // Pictures in no project: the Not in a project and Global rows. Only where
   // a project tree renders, since for
@@ -3726,11 +3848,21 @@ async function fetchSidebarData() {
   // showed.
   if (!scopedResourceType.value) {
     try {
-      const data = await getProjectSummary("UNASSIGNED");
-      if (isCurrentRequest()) notInProjectCount.value = data.image_count;
+      const data = await getProjectSummary(
+        "UNASSIGNED",
+        categorySummaryParams(),
+      );
+      if (isCurrentRequest()) {
+        notInProjectCount.value = data.image_count;
+        staleCounts.value.delete(NOT_IN_PROJECT_COUNT);
+      }
     } catch (e) {
       console.warn("Error fetching the not-in-a-project count:", e);
+      if (isCurrentRequest()) staleCounts.value.add(NOT_IN_PROJECT_COUNT);
     }
+  } else if (isCurrentRequest()) {
+    // Not read in this session, so not retried either.
+    staleCounts.value.delete(NOT_IN_PROJECT_COUNT);
   }
   // The Inbox row's number, inside the sidebar's project like the grid it
   // opens. Owner only, as the row is.
@@ -3739,13 +3871,35 @@ async function fetchSidebarData() {
   // `/pictures/count` query the grid's filter makes. Owner only, as the row is.
   if (!isReadOnly.value) {
     try {
-      const data = await getPictureCount("favourite=1");
-      if (isCurrentRequest()) favouriteCount.value = data.count;
+      const data = await getPictureCount(
+        new URLSearchParams({
+          favourite: "1",
+          ...categorySummaryParams(),
+        }).toString(),
+      );
+      if (isCurrentRequest()) {
+        favouriteCount.value = data.count;
+        staleCounts.value.delete(FAVOURITES_COUNT);
+      }
     } catch (e) {
       console.warn("Error fetching the favourites count:", e);
+      if (isCurrentRequest()) staleCounts.value.add(FAVOURITES_COUNT);
     }
+  } else if (isCurrentRequest()) {
+    staleCounts.value.delete(FAVOURITES_COUNT);
   }
-  if (isCurrentRequest()) flashCountsNextFetch.value = false;
+  if (isCurrentRequest()) {
+    flashCountsNextFetch.value = false;
+    scheduleCountRetry();
+  } else if (requestEpoch === sidebarCountEpoch) {
+    // The people or project list moved under this pass and no newer pass
+    // started: another surface refetched it (the add-to control, the run
+    // dialog, the picture picker). Every number this pass read was discarded
+    // and the retry timer was cleared when it began, so without a pass now a
+    // stale mark would stay up with nothing reading it again. Not a loop: the
+    // next pass computes its key after both lists have landed.
+    void fetchSidebarData();
+  }
 }
 
 async function fetchCharacters() {
@@ -4123,6 +4277,8 @@ async function handleDropOnSet(setId, event) {
     if (!files.length) return;
     // Thread the drop target into the staging session so the backend associates
     // every imported picture with this set on commit (no client-side results[]).
+    // The row carries `data-owns-file-drop`, so the window's importer
+    // (useWindowFileImport) leaves these files to this import alone.
     const targetSet = pictureSets.value.find((s) => s.id === setId);
     const options = { setId };
     if (targetSet?.project_id != null) options.projectId = targetSet.project_id;
@@ -4245,6 +4401,8 @@ async function onCharacterDrop(characterId, event) {
     if (!files.length) return;
     // Thread the drop target into the staging session so the backend associates
     // every imported picture with this character on commit (no client results[]).
+    // The row carries `data-owns-file-drop`, so the window's importer
+    // (useWindowFileImport) leaves these files to this import alone.
     const options = { characterId };
     if (selectedProjectId.value != null)
       options.projectId = selectedProjectId.value;
@@ -4553,7 +4711,7 @@ watch(projectViewMode, () => {
   void fetchPictureSets();
   void fetchSidebarData();
 });
-watch(selectedProjectId, (v) => {
+watch(selectedProjectId, () => {
   if (_initializing) return;
   // Display-only (see watch(projectViewMode) above): no emit to App.
   // Navigation to a project happens via the explicit `view-project`
@@ -4810,6 +4968,7 @@ defineExpose({
     :thumbnail-mode="gridStore.thumbnailMode"
     @update:thumbnail-mode="(value) => gridStore.setThumbnailMode(value)"
     :initial-tab="settingsDialogInitialTab"
+    :tab-request="settingsDialogTabRequest"
     @update:hidden-tags="(value) => userPrefsStore.setHiddenTags(value)"
     @update:apply-tag-filter="
       (value) => userPrefsStore.setApplyTagFilter(value)
@@ -5190,9 +5349,17 @@ defineExpose({
                 ><v-icon size="16">mdi-image-multiple-outline</v-icon></span
               >
               <span class="sidebar-list-label">All media</span>
-              <span class="sidebar-list-count">{{
-                categoryCounts[ALL_PICTURES_ID] ?? ""
-              }}</span>
+              <span
+                :class="[
+                  'sidebar-list-count',
+                  { 'sidebar-list-count--stale': isCountStale(ALL_PICTURES_ID) },
+                ]"
+                >{{ formatCount(categoryCounts[ALL_PICTURES_ID])
+                }}<Tooltip
+                  v-if="isCountStale(ALL_PICTURES_ID)"
+                  text="Couldn't refresh this count"
+                  activator="parent"
+              /></span>
             </button>
             <!-- Favourites is the `favourite=1` filter (#2155) on All media,
                  not a container: the filter chip still says so, and the
@@ -5209,9 +5376,17 @@ defineExpose({
                 ><v-icon size="16">mdi-heart-outline</v-icon></span
               >
               <span class="sidebar-list-label">Favourites</span>
-              <span class="sidebar-list-count">{{
-                favouriteCount ?? ""
-              }}</span>
+              <span
+                :class="[
+                  'sidebar-list-count',
+                  { 'sidebar-list-count--stale': isCountStale(FAVOURITES_COUNT) },
+                ]"
+                >{{ formatCount(favouriteCount)
+                }}<Tooltip
+                  v-if="isCountStale(FAVOURITES_COUNT)"
+                  text="Couldn't refresh this count"
+                  activator="parent"
+              /></span>
             </button>
           </template>
           <button
@@ -5230,10 +5405,19 @@ defineExpose({
                  and 0 is an answer, so it renders. Only a count that has
                  not arrived yet is blank. This is the same distinction
                  `utils/sidebarCounts.js` is a module to protect, and every
-                 sibling badge here already reads this way. -->
-            <span class="sidebar-list-count">{{
-              categoryCounts[SCRAPHEAP_PICTURES_ID] ?? ""
-            }}</span>
+                 sibling badge here already reads this way (`formatCount` is
+                 `?? ""` plus the thousands separator). -->
+            <span
+              :class="[
+                'sidebar-list-count',
+                { 'sidebar-list-count--stale': isCountStale(SCRAPHEAP_PICTURES_ID) },
+              ]"
+              >{{ formatCount(categoryCounts[SCRAPHEAP_PICTURES_ID])
+              }}<Tooltip
+                v-if="isCountStale(SCRAPHEAP_PICTURES_ID)"
+                text="Couldn't refresh this count"
+                activator="parent"
+            /></span>
           </button>
 
           <!-- Review: the queues whose number goes down as you work. -->
@@ -5495,11 +5679,22 @@ defineExpose({
                 <span class="sidebar-list-label">
                   <span class="sidebar-list-label-text">{{ allOfScopeLabel }}</span>
                 </span>
-                <span class="sidebar-list-count">{{
-                  (libraryScope === null
-                    ? scopeCounts.none
-                    : scopeCounts.byId?.[libraryScope]) ?? ""
-                }}</span>
+                <span
+                  :class="[
+                    'sidebar-list-count',
+                    { 'sidebar-list-count--stale': notInProjectRowStale },
+                  ]"
+                  >{{
+                    formatCount(
+                      libraryScope === null
+                        ? scopeCounts.none
+                        : scopeCounts.byId?.[libraryScope],
+                    )
+                  }}<Tooltip
+                    v-if="notInProjectRowStale"
+                    text="Couldn't refresh this count"
+                    activator="parent"
+                /></span>
               </button>
               <div>
               <div
@@ -5629,6 +5824,7 @@ defineExpose({
                       "
                       @dragover="handleDragOverCharacter(char.id, $event)"
                       @dragleave="handleDragLeaveCharacter($event)"
+                      data-owns-file-drop
                       @drop.prevent="
                         handleDropOnCharacter({
                           characterId: char.id,
@@ -5689,7 +5885,7 @@ defineExpose({
                                 )
                               "
                               class="sidebar-list-label-text"
-                              ><template v-for="part in [findParts(char.name.charAt(0).toUpperCase() + char.name.slice(1))]" :key="0"
+                              ><template v-for="(part, i) in [findParts(char.name.charAt(0).toUpperCase() + char.name.slice(1))]" :key="i"
                             >{{ part.before
                             }}<mark v-if="part.match" class="sidebar-find-mark">{{
                               part.match
@@ -5773,6 +5969,7 @@ defineExpose({
                       "
                       @dragover="dragOverSetItem(row.set.id, $event)"
                       @dragleave="dragLeaveSetItem($event)"
+                      data-owns-file-drop
                       @drop.prevent="handleDropOnSet(row.set.id, $event)"
                     >
                       <Tooltip
@@ -5861,7 +6058,7 @@ defineExpose({
                                 )
                               "
                               class="sidebar-list-label-text"
-                              ><template v-for="part in [findParts(row.set.name)]" :key="0"
+                              ><template v-for="(part, i) in [findParts(row.set.name)]" :key="i"
                             >{{ part.before
                             }}<mark v-if="part.match" class="sidebar-find-mark">{{
                               part.match
@@ -6055,6 +6252,7 @@ defineExpose({
                       "
                       @dragover="dragOverSetItem(row.set.id, $event)"
                       @dragleave="dragLeaveSetItem($event)"
+                      data-owns-file-drop
                       @drop.prevent="handleDropOnSet(row.set.id, $event)"
                     >
                       <Tooltip
@@ -6143,7 +6341,7 @@ defineExpose({
                                 )
                               "
                               class="sidebar-list-label-text"
-                              ><template v-for="part in [findParts(row.set.name)]" :key="0"
+                              ><template v-for="(part, i) in [findParts(row.set.name)]" :key="i"
                             >{{ part.before
                             }}<mark v-if="part.match" class="sidebar-find-mark">{{
                               part.match
@@ -6281,6 +6479,9 @@ defineExpose({
                     ? dragLeaveSetItem($event)
                     : undefined
               "
+              :data-owns-file-drop="
+                row.kind === 'character' || row.kind === 'set' ? '' : undefined
+              "
               @drop.prevent="
                 row.kind === 'character'
                   ? handleDropOnCharacter({ characterId: row.entity.id, event: $event })
@@ -6349,7 +6550,7 @@ defineExpose({
               </span>
               <span class="sidebar-list-label">
                 <span class="sidebar-list-label-text"
-                  ><template v-for="part in [findParts(row.name)]" :key="0"
+                  ><template v-for="(part, i) in [findParts(row.name)]" :key="i"
                             >{{ part.before
                             }}<mark v-if="part.match" class="sidebar-find-mark">{{
                               part.match
@@ -6717,7 +6918,7 @@ defineExpose({
           @click="emptyScrapheapFromCtx()"
         >
           <Tooltip
-            :text="scrapheapIsEmpty ? 'Scrapheap is already empty' : ''"
+            :text="scrapheapEmptyHint"
             activator="parent"
           />
           <v-icon class="ctx-icon">mdi-trash-can-outline</v-icon>

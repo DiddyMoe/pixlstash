@@ -13,6 +13,7 @@ import {
   useTagGroupsStore,
 } from "../stores/useTagGroupsStore";
 import { UNKNOWN_FIGURE } from "./keepCoverOnly";
+import { UNTAGGED_STATES } from "./untaggedStates";
 
 // Pick-one Picture kinds. "Any" is deliberately not a choice: removing the chip
 // is how you get back to any.
@@ -303,6 +304,16 @@ export function filterChips(store, { allPicturesView = true } = {}) {
   if (faces) {
     push("faces", "Faces", faces.chip, () => {
       store.faceBboxFilter = null;
+    });
+  }
+  // Set from the stats rail's Untagged rows, which have no menu row: without a
+  // chip the grid would be narrowed with nothing on it saying so.
+  const untagged = UNTAGGED_STATES.find(
+    (o) => o.state === store.tagStateFilter,
+  );
+  if (untagged) {
+    push("untagged", "Untagged", untagged.chip, () => {
+      store.tagStateFilter = null;
     });
   }
   // "unresolved" is not offered in the menu but can arrive from a URL; it still

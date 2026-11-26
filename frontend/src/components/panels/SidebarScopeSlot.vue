@@ -61,7 +61,13 @@
             aria-hidden="true"
           ></span>
           <span class="ctx-label-text">{{ row.name }}</span>
-          <span class="ctx-meta">{{ row.count ?? "" }}</span>
+          <span :class="['ctx-meta', { 'ctx-meta--stale': row.stale }]"
+            >{{ formatCount(row.count)
+            }}<Tooltip
+              v-if="row.stale"
+              text="Couldn't refresh this count"
+              activator="parent"
+          /></span>
         </button>
         <template v-if="!readOnly">
           <div class="ctx-sep" role="separator"></div>
@@ -93,6 +99,8 @@
 <script setup>
 import { computed, ref } from "vue";
 import { VIcon, VMenu } from "vuetify/components";
+import Tooltip from "../widgets/Tooltip.vue";
+import { formatCount } from "../../utils/filterChips.js";
 import { onMenuKeydown } from "../../utils/menuKeyboard.js";
 import { projectColor } from "../../utils/setAppearance";
 
@@ -102,7 +110,9 @@ const props = defineProps({
   // "global" (Any project) | "project" (a project, or none when projectId is null).
   mode: { type: String, default: "global" },
   projectId: { type: Number, default: null },
-  // { any, none, byId: { [projectId]: n } }; a missing number shows blank.
+  // { any, none, byId: { [projectId]: n }, stale: { any, none } }; a missing
+  // number shows blank. A `stale` one failed its last refresh and keeps the
+  // number it had, marked as the sidebar's own counts are.
   counts: { type: Object, default: () => ({}) },
   readOnly: { type: Boolean, default: false },
 });
@@ -149,6 +159,7 @@ const rows = computed(() => [
     scope: "any",
     name: "Any project",
     count: props.counts.any,
+    stale: props.counts.stale?.any === true,
     checked: scope.value === "any",
   },
   ...props.projects.map((p) => ({
@@ -165,6 +176,7 @@ const rows = computed(() => [
     scope: "none",
     name: "Not in a project",
     count: props.counts.none,
+    stale: props.counts.stale?.none === true,
     checked: scope.value === "none",
   },
 ]);
@@ -192,6 +204,14 @@ function onTriggerContext(event) {
 </script>
 
 <style scoped>
+/* A count whose last refresh failed, as the sidebar marks its own
+   (SidebarNav.css `.sidebar-list-count--stale`): the last number, underlined
+   dotted in the warning hue. `.ctx-meta` already sets the secondary ink. */
+.ctx-meta--stale {
+  text-decoration: underline dotted rgb(var(--v-theme-surface-warning));
+  text-underline-offset: var(--space-1);
+}
+
 .scope-slot {
   /* A full-width bar-height band heading the box it scopes, its tile on the
      rows' icon line. With no project there is no box, so hairlines frame it. */

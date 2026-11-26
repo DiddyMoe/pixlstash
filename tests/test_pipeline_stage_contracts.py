@@ -24,17 +24,43 @@ from PIL import Image
 from sqlmodel import Session, select
 
 from pixlstash.database import DBPriority
-from pixlstash.db_models import Face, Picture, Tag
-from pixlstash.db_models.tag import make_tag_sentinel
+from pixlstash.db_models import (
+    Face,
+    Picture,
+    PictureSet,
+    PictureSetMember,
+    Quality,
+    Tag,
+)
+from pixlstash.db_models.picture import LikenessParameter
+from pixlstash.db_models.picture_likeness import PictureLikenessQueue
+from pixlstash.db_models.tag import make_description_sentinel, make_tag_sentinel
+from pixlstash.tagger_plugins.pixlstash_tagger import (
+    TaggerLoadFailure,
+    TaggerUnavailableError,
+)
 from pixlstash.tasks.face_extraction_task import FaceExtractionTask
+from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
+from pixlstash.tasks.missing_description_finder import MissingDescriptionFinder
 from pixlstash.tasks.missing_face_extraction_finder import MissingFaceExtractionFinder
 from pixlstash.tasks.missing_face_model_refresh_finder import (
     MissingFaceModelRefreshFinder,
 )
+from pixlstash.tasks.likeness_task import LikenessTask
+from pixlstash.tasks.missing_likeness_finder import MissingLikenessFinder
+from pixlstash.tasks.missing_likeness_parameters_finder import (
+    MissingLikenessParametersFinder,
+)
 from pixlstash.tasks.missing_tag_finder import MissingTagFinder
 from pixlstash.tasks.missing_tag_prediction_finder import MissingTagPredictionFinder
+from pixlstash.tasks.missing_thumbnail_finder import MissingThumbnailFinder
+from pixlstash.tasks.orientation_task import OrientationTask
+from pixlstash.tasks.quality_task import QualityTask
+from pixlstash.tasks.base_task_finder import BaseTaskFinder
 from pixlstash.tasks.tag_task import TagTask
+from pixlstash.tasks.task_outcome import RetryHold
 from pixlstash.tasks.task_type import TaskType
+from pixlstash.tasks.text_score_task import TextScoreTask
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.vault import Vault
 
@@ -643,9 +669,15 @@ def test_face_export_crops_only_faces_measured_on_frame_0(tmp_path):
 
     from pixlstash.utils.service.export_utils import ExportUtils
 
+    # ``bbox_`` is the stored column (JSON text) that the export reads
+    # through ``read_stored_bbox``, as on a real ``Face`` row.
     faces = [
-        SimpleNamespace(id=1, face_index=0, frame_index=0, bbox=[0, 0, 8, 8]),
-        SimpleNamespace(id=2, face_index=1, frame_index=2, bbox=[8, 8, 16, 16]),
+        SimpleNamespace(
+            id=1, picture_id=5, face_index=0, frame_index=0, bbox_="[0, 0, 8, 8]"
+        ),
+        SimpleNamespace(
+            id=2, picture_id=5, face_index=1, frame_index=2, bbox_="[8, 8, 16, 16]"
+        ),
     ]
     with zipfile.ZipFile(tmp_path / "out.zip", "w") as zf:
         ExportUtils._export_features_to_zip(
@@ -745,6 +777,459 @@ def test_a_scrapheaped_picture_leaves_the_tag_window_and_the_tag_count(tmp_path)
         )
 
 
+def test_tagging_progress_counts_only_what_the_finder_will_hand_out(tmp_path):
+    """The "pictures tagged" bar counts the tag finder's own work.
+
+    It counted every pending sentinel: scrapheaped, locked and unreadable
+    pictures too. The finder never hands those out, and an unreadable picture
+    keeps its sentinel for good, so one corrupt file held the bar short of done
+    for ever. A picture still waiting for its faces is real work, and counts.
+    """
+    with Vault(image_root=str(tmp_path)) as vault:
+        live, waiting, gone, locked, broken = _seed_pending(
+            vault,
+            tmp_path,
+            ["live.png", "waiting.png", "gone.png", "locked.png", "broken.png"],
+        )
+
+        def arrange(session: Session):
+            for pid in (live, gone, locked, broken):
+                session.add(Face(picture_id=pid, face_index=-1))
+            session.get(Picture, gone).deleted = True
+            frozen = PictureSet(name="test-locked-set", locked=True)
+            session.add(frozen)
+            session.flush()
+            session.add(PictureSetMember(set_id=frozen.id, picture_id=locked))
+            session.commit()
+
+        vault.db.run_task(arrange)
+        # The registry marks only bytes that do not decode.
+        (tmp_path / "broken.png").write_bytes(b"test-not-a-png")
+        assert vault.db.unprocessable_images.mark_unprocessable(
+            broken, str(tmp_path / "broken.png"), reason="test-corrupt fixture"
+        )
+
+        # The finder's view: only the live picture with its faces known.
+        suppressed = vault.db.unprocessable_images.active_suppressed_ids()
+        window = vault.db.run_immediate_read_task(
+            lambda s: MissingTagFinder._fetch_missing_tags(s, 64, suppressed)
+        )
+        assert {p.id for p in window} == {live}
+        tagger = vault._build_worker_progress_snapshot()[TaskType.TAGGER.value]
+        assert tagger["remaining"] == 2  # live, and waiting on its faces
+
+
+# ── progress counts what the finder works on ────────────────────────────────
+#
+# Every per-picture stage holds the Scrapheap out of its finder and counts its
+# progress over the same pictures (``pixlstash/tasks/pipeline_scope.py``). A
+# total that counted the Scrapheap read "1500 / 1500" over a library of 500
+# live pictures, and a finder that kept it spent the GPU on deleted pictures.
+#
+# The fixture holds one live picture of each kind below and a Scrapheap twin of
+# each in exactly the same state, so a count or a finder that lets the
+# Scrapheap in doubles, and a twin turns up among the finder's pictures.
+#
+# The two "unreadable" kinds are marked unprocessable, as TagTask and its
+# siblings mark a file they cannot decode. Every stage skips them (likeness
+# parameters wait on a quality score they never get), so a count that forgot
+# to subtract them would stop one short of done for ever. One is described, so
+# the text-embedding count meets one as well.
+
+_PIPELINE_KINDS = (
+    "fresh",
+    "faced",
+    "described",
+    "quality_done",
+    "likeness_ready",
+    "unreadable",
+    "unreadable_described",
+)
+_UNREADABLE_KINDS = ("unreadable", "unreadable_described")
+
+
+def _seed_pipeline_library(vault, root) -> dict[str, dict[str, int]]:
+    """``{"live": {kind: id}, "heap": {kind: id}}``, every picture with a file."""
+
+    def seed(session: Session):
+        ids = {"live": {}, "heap": {}}
+        for side in ("live", "heap"):
+            for kind in _PIPELINE_KINDS:
+                picture = Picture(
+                    file_path=f"{side}-{kind}.png",
+                    format="png",
+                    width=40,
+                    height=30,
+                    deleted=side == "heap",
+                )
+                if kind in ("described", "unreadable_described"):
+                    picture.description = "a cat on a mat"
+                if kind == "likeness_ready":
+                    blank = np.zeros(8, dtype=np.float32).tobytes()
+                    picture.image_embedding = blank
+                    picture.likeness_parameters = blank
+                    picture.perceptual_hash = "0" * 16
+                    picture.size_bin_index = 1
+                session.add(picture)
+                session.flush()
+                if kind in ("faced", "unreadable"):
+                    session.add(Tag(picture_id=picture.id, tag=make_tag_sentinel()))
+                else:
+                    session.add(Tag(picture_id=picture.id, tag="cat"))
+                if kind not in ("fresh", *_UNREADABLE_KINDS):
+                    session.add(Face(picture_id=picture.id, face_index=-1))
+                if kind in ("quality_done", "likeness_ready"):
+                    session.add(Quality(picture_id=picture.id, sharpness=0.4))
+                ids[side][kind] = picture.id
+            PictureLikenessQueue.enqueue(session, [ids[side]["likeness_ready"]])
+        session.commit()
+        return ids
+
+    ids = vault.db.run_task(seed)
+    for side in ("live", "heap"):
+        for kind in _UNREADABLE_KINDS:
+            # The registry pins a mark to the file's signature, so the file
+            # has to exist.
+            path = root / f"{side}-{kind}.png"
+            path.write_bytes(b"test-not-a-png")
+            assert vault.db.unprocessable_images.mark_unprocessable(
+                ids[side][kind], str(path), reason="test-undecodable fixture"
+            )
+    return ids
+
+
+@pytest.fixture(scope="module")
+def pipeline_library(tmp_path_factory):
+    root = tmp_path_factory.mktemp("pipeline-scope")
+    with Vault(image_root=str(root)) as vault:
+        yield vault, _seed_pipeline_library(vault, root)
+
+
+def _likeness_work(vault) -> list:
+    """The queue rows a LikenessTask takes, put back afterwards: taking them
+    deletes them."""
+
+    def take(session: Session):
+        rows = LikenessTask.fetch_work_batch(session, 10_000)
+        taken = [int(row[0]) for row in rows]
+        PictureLikenessQueue.enqueue(session, taken)
+        session.commit()
+        return taken
+
+    return vault.db.run_task(take)
+
+
+def _ids(rows) -> set[int]:
+    return {int(row[0]) if isinstance(row, (tuple, list)) else row.id for row in rows}
+
+
+_WIDE = 10_000
+
+# stage -> (what its finder hands out, the live kinds its total counts, the
+# live kinds counted as remaining that the finder is waiting on). Every other
+# live picture of the total is either the finder's work or done.
+_PER_PICTURE_STAGES = {
+    TaskType.DESCRIPTION: (
+        lambda v, s, x: MissingDescriptionFinder._fetch_missing_descriptions(
+            s, _WIDE, x
+        ),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.TAGGER: (
+        lambda v, s, x: MissingTagFinder._fetch_missing_tags(s, _WIDE, x),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.TAG_PREDICTION_BACKFILL: (
+        lambda v, s, x: MissingTagPredictionFinder._fetch_missing_predictions(
+            s, _WIDE, x
+        ),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.QUALITY: (
+        lambda v, s, x: QualityTask._find_pictures_missing_quality(s, _WIDE, x),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.FACE_EXTRACTION: (
+        lambda v, s, x: MissingFaceExtractionFinder._fetch_missing_features(
+            s, _WIDE, x
+        ),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.TEXT_EMBEDDING: (
+        lambda v, s, x: v._planner_work_finders[
+            TaskType.TEXT_EMBEDDING
+        ]._fetch_candidates(s, _WIDE, x),
+        ("described", "unreadable_described"),
+        (),
+    ),
+    TaskType.IMAGE_EMBEDDING: (
+        lambda v, s, x: ImageEmbeddingTask.fetch_work(
+            session=s, limit=_WIDE, suppressed_ids=x
+        ),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.LIKENESS_PARAMETERS: (
+        lambda v, s, x: MissingLikenessParametersFinder._fetch_pending(s, _WIDE),
+        _PIPELINE_KINDS,
+        # Parameters are written once, with real quality values, so a picture
+        # still waiting for its quality score is pending but not offered. The
+        # unreadable ones never get a score (quality skips them), so they are
+        # not counted.
+        ("fresh", "faced", "described"),
+    ),
+    TaskType.LIKENESS: (
+        None,  # the queue the task drains: see _likeness_work
+        ("likeness_ready",),
+        (),
+    ),
+    TaskType.COMFYUI_EXTRACTION: (
+        lambda v, s, x: v._planner_work_finders[
+            TaskType.COMFYUI_EXTRACTION
+        ]._fetch_candidates(s, _WIDE, x),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.TEXT_SCORE: (
+        lambda v, s, x: TextScoreTask.find_pictures_missing_text_score(s, _WIDE, x),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.ORIENTATION: (
+        lambda v, s, x: OrientationTask.find_pictures_missing_orientation(s, _WIDE, x),
+        _PIPELINE_KINDS,
+        (),
+    ),
+    TaskType.THUMBNAIL_GENERATION: (
+        lambda v, s, x: MissingThumbnailFinder._fetch_missing(s, _WIDE, x),
+        _PIPELINE_KINDS,
+        (),
+    ),
+}
+
+# Finders whose progress row is not counted in pictures of the pipeline, each
+# with the reason. A new finder must land in one table or the other.
+_NOT_PER_PICTURE_PROGRESS = {
+    TaskType.FACE_MODEL_REFRESH: "a repair sweep with no progress row of its own",
+    TaskType.SOURCE_FACE_LIKENESS: "counted in characters, no progress row",
+    TaskType.PROMPT_MATCH: "no progress row of its own",
+    TaskType.PIXEL_SHA: "no progress row of its own",
+    TaskType.OCR: "its own count_progress, over the pictures that qualify",
+    TaskType.SMART_SCORE: "its own count_progress, over the pictures that qualify",
+    TaskType.WATCH_FOLDERS: "counts files in watched folders",
+    TaskType.MISSING_FILE_PURGE: "removes rows, no progress row",
+    TaskType.SNAPSHOT_IDENTITY_SCRUB: "counted in snapshot archives",
+    TaskType.REFERENCE_FOLDER_SCAN: "counts files on disk",
+    TaskType.DEDUP_SCAN: "counted in scan phases",
+    TaskType.DEDUP_AUTO_STACK: "counted in planned groups",
+    TaskType.STACK_COHESION: "counted in stacks",
+    TaskType.LAYOUT_MOVE: "counted in files to move",
+    TaskType.GFS_SNAPSHOT: "counted in snapshots",
+    TaskType.SCRAPHEAP_RETENTION_PURGE: "works on the Scrapheap itself",
+    TaskType.TAG_HEALTH_AUTO_REBUILD: "a library-wide rebuild",
+    TaskType.PENDING_SCORE_INVALIDATION: "a library-wide invalidation",
+    TaskType.GHOST_CASCADE: "counted in ghost rows",
+    TaskType.CHECKPOINT_HASH: "counted in model files",
+    TaskType.DOWNLOADS_INTAKE: "counts downloaded files",
+    TaskType.MODEL_FOLDER_SCAN: "counted in model files",
+    TaskType.WORKFLOW_CARD_BACKFILL: "counted in the hub's recipes",
+    TaskType.SAVED_RECIPE_CONVERT: "counted in the hub's recipes",
+    TaskType.TRAINING_PREVIEW_FACES: "counted in training previews",
+}
+
+
+def test_every_finder_is_classified_for_its_progress_scope(pipeline_library):
+    vault, _ = pipeline_library
+    unclassified = (
+        set(vault._planner_work_finders)
+        - set(_PER_PICTURE_STAGES)
+        - set(_NOT_PER_PICTURE_PROGRESS)
+    )
+    assert unclassified == set(), sorted(t.value for t in unclassified)
+    assert set(_PER_PICTURE_STAGES) <= set(vault._planner_work_finders)
+
+
+@pytest.mark.parametrize("stage", list(_PER_PICTURE_STAGES), ids=lambda t: t.value)
+def test_a_progress_total_counts_only_live_pictures(pipeline_library, stage):
+    vault, ids = pipeline_library
+    _, counted_kinds, _ = _PER_PICTURE_STAGES[stage]
+    row = vault._build_worker_progress_snapshot()[stage.value]
+    # Its Scrapheap twins would double it.
+    assert row["total"] == len(counted_kinds), row
+
+
+@pytest.mark.parametrize("stage", list(_PER_PICTURE_STAGES), ids=lambda t: t.value)
+def test_remaining_is_the_pictures_the_finder_works_on(pipeline_library, stage):
+    vault, ids = pipeline_library
+    fetch, _, waiting_kinds = _PER_PICTURE_STAGES[stage]
+    suppressed = vault.db.unprocessable_images.active_suppressed_ids()
+    if fetch is None:
+        offered = set(_likeness_work(vault))
+    else:
+        offered = _ids(
+            vault.db.run_immediate_read_task(lambda s: fetch(vault, s, suppressed))
+        )
+    heap = set(ids["heap"].values())
+    live = set(ids["live"].values())
+    unreadable = {ids["live"][kind] for kind in _UNREADABLE_KINDS}
+    assert unreadable <= suppressed
+    # Negative and positive control: no twin is offered, no unreadable picture
+    # is, and the stage has live work.
+    assert offered & heap == set(), sorted(offered & heap)
+    assert offered & unreadable == set(), sorted(offered & unreadable)
+    assert offered and offered <= live, sorted(offered)
+    row = vault._build_worker_progress_snapshot()[stage.value]
+    assert row["remaining"] == len(offered) + len(waiting_kinds), (row, offered)
+
+
+def _likeness_candidate(**fields) -> Picture:
+    """A picture likeness compares: embedding, parameters and hash set."""
+    blank = np.zeros(len(LikenessParameter), dtype=np.float32).tobytes()
+    return Picture(
+        format="png",
+        width=40,
+        height=30,
+        image_embedding=np.ones(8, dtype=np.float32).tobytes(),
+        likeness_parameters=blank,
+        perceptual_hash="0" * 16,
+        size_bin_index=1,
+        **fields,
+    )
+
+
+def test_likeness_seeds_compares_and_takes_only_live_pictures(tmp_path):
+    """The seed, the bulk candidates and the work fetch all leave out a
+    Scrapheap picture and one without a file, and a queue row the fetch leaves
+    is kept, not dropped."""
+    with Vault(image_root=str(tmp_path)) as vault:
+
+        def seed(session: Session):
+            pictures = {
+                "live": _likeness_candidate(file_path="live.png"),
+                "heap": _likeness_candidate(file_path="heap.png", deleted=True),
+                "no_file": _likeness_candidate(file_path=None),
+            }
+            for picture in pictures.values():
+                session.add(picture)
+            session.commit()
+            return {name: picture.id for name, picture in pictures.items()}
+
+        ids = vault.db.run_task(seed)
+
+        def queued(session: Session) -> set[int]:
+            return set(session.exec(select(PictureLikenessQueue.picture_id)).all())
+
+        vault.db.run_task(LikenessTask.seed_queue)
+        assert vault.db.run_immediate_read_task(queued) == {ids["live"]}
+
+        bulk = vault.db.run_immediate_read_task(LikenessTask.build_bulk_arrays)
+        assert [int(pid) for pid in bulk.ids] == [ids["live"]]
+
+        def queue_all(session: Session):
+            PictureLikenessQueue.enqueue(session, list(ids.values()))
+            session.commit()
+
+        vault.db.run_task(queue_all)
+        taken = vault.db.run_task(LikenessTask.fetch_work_batch, 10)
+        assert [item[0] for item in taken] == [ids["live"]]
+        assert vault.db.run_immediate_read_task(queued) == {
+            ids["heap"],
+            ids["no_file"],
+        }
+
+
+def test_likeness_waits_only_on_parameter_work_it_can_get(tmp_path):
+    """An unprocessable picture without a quality score never gets likeness
+    parameters: the parameter count leaves it out and the likeness finder does
+    not wait on it. One marked after its score was done is still offered, so
+    it is still counted, and likeness waits for it."""
+    with Vault(image_root=str(tmp_path)) as vault:
+
+        def seed(session: Session):
+            ready = _likeness_candidate(file_path="ready.png")
+            unscored = Picture(
+                file_path="unscored.png", format="png", width=4, height=3
+            )
+            scored = Picture(file_path="scored.png", format="png", width=4, height=3)
+            for picture in (ready, unscored, scored):
+                session.add(picture)
+            session.flush()
+            session.add(Quality(picture_id=scored.id, sharpness=0.4))
+            PictureLikenessQueue.enqueue(session, [ready.id])
+            session.commit()
+            return ready.id, unscored.id, scored.id
+
+        ready, unscored, scored = vault.db.run_task(seed)
+        for pid, name in ((unscored, "unscored.png"), (scored, "scored.png")):
+            (tmp_path / name).write_bytes(b"test-not-a-png")
+            assert vault.db.unprocessable_images.mark_unprocessable(
+                pid, str(tmp_path / name), reason="test-undecodable fixture"
+            )
+
+        def offered(session: Session) -> set[int]:
+            return {
+                pid
+                for pid, _w, _h in MissingLikenessParametersFinder._fetch_pending(
+                    session, _WIDE
+                )
+            }
+
+        assert vault.db.run_immediate_read_task(offered) == {scored}
+        assert (
+            vault.db.run_immediate_read_task(vault._count_pending_likeness_parameters)
+            == 1
+        )
+        finder = MissingLikenessFinder(vault.db)
+        assert finder.find_task() is None
+
+        def give_scored_its_parameters(session: Session):
+            session.get(Picture, scored).size_bin_index = 1
+            session.commit()
+
+        vault.db.run_task(give_scored_its_parameters)
+        assert (
+            vault.db.run_immediate_read_task(vault._count_pending_likeness_parameters)
+            == 0
+        )
+        assert isinstance(finder.find_task(), LikenessTask)
+
+
+def test_likeness_goes_idle_after_a_first_sweep_that_writes_no_pair(tmp_path):
+    """An empty likeness table is the first sweep's cue, once. A single
+    candidate has nothing to pair with, so its sweep writes no pair; the
+    finder must then go idle instead of reading "no pairs" as "not swept yet"
+    and handing out a task over an empty queue on every cycle."""
+    with Vault(image_root=str(tmp_path)) as vault:
+
+        def seed(session: Session):
+            session.add(_likeness_candidate(file_path="only.png"))
+            session.commit()
+
+        vault.db.run_task(seed)
+        finder = MissingLikenessFinder(vault.db)
+        task = finder.find_task()
+        assert isinstance(task, LikenessTask)
+        assert task._run_task()["pairs_written"] == 0
+        assert vault.db.run_immediate_read_task(LikenessTask.count_queue) == 0
+        assert vault.db.run_immediate_read_task(LikenessTask.count_total_pairs) == 0
+        assert finder.find_task() is None
+        assert finder.find_task() is None
+
+        def queue_it_again(session: Session):
+            PictureLikenessQueue.enqueue(
+                session, list(session.exec(select(Picture.id)).all())
+            )
+            session.commit()
+
+        vault.db.run_task(queue_it_again)
+        assert isinstance(finder.find_task(), LikenessTask)
+
+
 def test_undecodable_pictures_do_not_crowd_the_tag_candidate_window(tmp_path):
     """Tagging must not starve behind a run of corrupt files.
 
@@ -772,6 +1257,7 @@ def test_undecodable_pictures_do_not_crowd_the_tag_candidate_window(tmp_path):
         # suggested_task_size * (TAGGER_MAX_INFLIGHT + 1) = 4 rows, so the
         # five suppressed ones fill it completely.
         for pid, name in zip(ids[:-1], names[:-1]):
+            (tmp_path / name).write_bytes(b"test-not-a-png")
             assert vault.db.unprocessable_images.mark_unprocessable(
                 pid, str(tmp_path / name), reason="test-corrupt fixture"
             )
@@ -785,6 +1271,63 @@ def test_undecodable_pictures_do_not_crowd_the_tag_candidate_window(tmp_path):
             "behind the suppressed rows"
         )
         assert task.params["picture_ids"] == [good]
+
+
+@pytest.mark.parametrize(
+    "held_engine, waiting_engine",
+    [
+        # A retag requested with a plugin that will not load: the configured
+        # plugin's work behind it still runs.
+        ("test-held-plugin", None),
+        # The configured plugin is held. Its pictures carry the generic
+        # sentinel (or one naming it), and a retag named for another plugin
+        # still runs.
+        ("wd14", "test-other-plugin"),
+    ],
+)
+def test_a_held_plugin_does_not_fill_the_tag_window(
+    tmp_path, held_engine, waiting_engine
+):
+    """A held plugin's pictures are left out at the query.
+
+    The window is ordered by id and the held groups were skipped only after it
+    was read. With the held plugin's pictures below everyone else's, every
+    sweep read them, skipped them, and returned None, so the plugins that work
+    waited out a hold that was not theirs.
+    """
+    with Vault(image_root=str(tmp_path)) as vault:
+        names = [f"h{index}.png" for index in range(6)]
+        ids = _seed_pending(vault, tmp_path, names)
+        # The engine-less sentinel loads the configured plugin, so it counts
+        # as held with it; one picture names that plugin outright.
+        crowd = [held_engine if held_engine != "wd14" else None] * 4 + [held_engine]
+        good = ids[-1]
+
+        def arrange(session: Session):
+            for pid in ids:
+                session.add(Face(picture_id=pid, face_index=-1))
+            for pid, engine_name in zip(ids, crowd + [waiting_engine]):
+                for tag in session.exec(select(Tag).where(Tag.picture_id == pid)):
+                    tag.tag = make_tag_sentinel(engine_name)
+            session.commit()
+
+        vault.db.run_task(arrange)
+
+        # The window is suggested_task_size * (TAGGER_MAX_INFLIGHT + 1) = 4
+        # rows, so the five held pictures fill it completely.
+        finder = MissingTagFinder(vault.db, _TagEngine)
+        finder._backend_hold.hold(held_engine)
+        task = finder.find_task()
+
+        assert task is not None, (
+            "tagging returned no work while a picture for a plugin that is not "
+            "held waited behind the held one's"
+        )
+        assert task.params["picture_ids"] == [good]
+        # Positive control: the hold lifted, the held pictures come back.
+        finder._backend_hold.clear(held_engine)
+        BaseTaskFinder.on_task_complete(finder, task, None)
+        assert finder.find_task().params["picture_ids"] == [ids[0]]
 
 
 def test_an_unreachable_picture_is_held_out_of_the_window_not_retired(tmp_path):
@@ -896,8 +1439,8 @@ def test_the_tag_finder_captures_the_reset_generation_before_its_read(
         vault.db.run_task(add_face_row)
         fetch = MissingTagFinder._fetch_missing_tags
 
-        def fetch_then_retag(session, *args):
-            pictures = fetch(session, *args)
+        def fetch_then_retag(session, *args, **kwargs):
+            pictures = fetch(session, *args, **kwargs)
             vault.db.tag_resets.mark_reset([pid])
             return pictures
 
@@ -983,3 +1526,305 @@ def test_transient_batch_failures_keep_pending_tag_sentinels_for_retry(tmp_path)
         nxt = finder.find_task()
         assert nxt is not None, "transient failure should leave the picture pending"
         assert nxt.params["picture_ids"] == [pid]
+
+
+class _ManualClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class _UnavailableWorkflow(_StubWorkflow):
+    """The PixlStash tagger in its load backoff: it refuses every batch."""
+
+    def __init__(self, failure):
+        self.failure = failure
+
+    def tag_images(self, image_paths, out_raw_scores=None, **_kwargs):
+        raise TaggerUnavailableError(self.failure)
+
+
+def _sweep(finder):
+    """The picture ids of the batch *finder* builds now, its claims released."""
+    task = finder.find_task()
+    if task is None:
+        return None
+    BaseTaskFinder.on_task_complete(finder, task, None)
+    return task.params["picture_ids"]
+
+
+def test_m038_an_unloadable_tagger_holds_its_plugin_for_the_tagger_s_own_wait(
+    tmp_path,
+):
+    """A tagger that cannot load never leaves a picture tagged with
+    nothing, and is not asked again before it will try.
+
+    The tagger turns every caller away until ``failure.retry_in_s`` has passed
+    (up to ten minutes); the finder's own backoff ran out after 2 s, so it
+    built a batch every few seconds only to have it refused. The batch fails
+    with the tagger's error and leaves every sentinel in place.
+    """
+    failure = TaggerLoadFailure(
+        failures=4, retry_in_s=240.0, error="test-tagger weights unreadable"
+    )
+    with Vault(image_root=str(tmp_path)) as vault:
+        first, second, other = _seed_pending(
+            vault, tmp_path, ["m0.png", "m1.png", "m2.png"]
+        )
+
+        def arrange(session: Session):
+            for pid in (first, second, other):
+                session.add(Face(picture_id=pid, face_index=-1))
+            for tag in session.exec(select(Tag).where(Tag.picture_id == other)):
+                tag.tag = make_tag_sentinel("test-other-plugin")
+            session.commit()
+
+        vault.db.run_task(arrange)
+
+        clock = _ManualClock()
+        engine = SimpleNamespace(
+            tagger_settings={"active_tag_plugin": "pixlstash_tagger"},
+            tagging_workflow=_UnavailableWorkflow(failure),
+        )
+        finder = MissingTagFinder(
+            vault.db,
+            lambda: engine,
+            backend_hold=RetryHold(cap_s=60.0, clock=clock, rng=lambda: 1.0),
+            clock=clock,
+        )
+        start = clock.now
+
+        task = finder.find_task()
+        assert task.params["picture_ids"] == [first]
+        with pytest.raises(TaggerUnavailableError) as raised:
+            task._tag_pictures_batch()
+        finder.on_task_complete(task, raised.value)
+
+        def pending(session: Session) -> set:
+            return set(
+                session.exec(
+                    select(Tag.picture_id).where(Tag.tag == make_tag_sentinel())
+                ).all()
+            )
+
+        assert vault.db.run_immediate_read_task(pending) == {first, second}, (
+            "a batch the tagger refused cleared its pictures' sentinels"
+        )
+        # Another plugin's request is not held with it.
+        assert _sweep(finder) == [other]
+        clock.now = start + 61.0
+        assert _sweep(finder) == [other], (
+            "the plugin came back on the finder's own backoff, while the "
+            "tagger still turns every batch away"
+        )
+        clock.now = start + 239.9
+        assert _sweep(finder) == [other]
+        clock.now = start + 240.01
+        assert _sweep(finder) == [first], "the probe is built once the tagger tries"
+
+        # Two batches in flight: one is refused, the other tagged (the tagger
+        # loaded in between); the success lifts the wait at once.
+        refused, tagged = finder.find_task(), finder.find_task()
+        assert (refused.params["picture_ids"], tagged.params["picture_ids"]) == (
+            [first],
+            [second],
+        )
+        finder.on_task_complete(refused, TaggerUnavailableError(failure))
+        assert _sweep(finder) == [other]
+        finder.on_task_complete(tagged, None)
+        assert _sweep(finder) == [first], "a success lifts the tagger's wait"
+
+        # A refusal that says nothing about when the tagger tries again takes
+        # the finder's own backoff (4 s at its second step here).
+        task = finder.find_task()
+        finder.on_task_complete(task, TaggerUnavailableError(None))
+        assert _sweep(finder) == [other]
+        clock.now += 4.01
+        assert _sweep(finder) == [first]
+
+        # A refusal whose wait has already run out says nothing useful either:
+        # it takes the finder's own backoff (8 s at its third step), not a wait
+        # of nothing that sends the next batch straight back to be refused.
+        task = finder.find_task()
+        finder.on_task_complete(
+            task,
+            TaggerUnavailableError(
+                TaggerLoadFailure(
+                    failures=5, retry_in_s=0.0, error="test-tagger weights unreadable"
+                )
+            ),
+        )
+        assert _sweep(finder) == [other], (
+            "a tagger due to try again at once was asked again at once"
+        )
+        clock.now += 8.01
+        assert _sweep(finder) == [first]
+
+
+class _CaptionWorkflow:
+    """A description workflow whose engines in *broken* caption nobody.
+
+    ``None`` in *broken* stands for the active engine: a batch that names no
+    engine runs on it.
+    """
+
+    def __init__(self, *broken):
+        self.broken = set(broken)
+
+    def generate_batch(self, pictures, engine_override=None, stop_event=None):
+        if engine_override in self.broken:
+            return {}
+        return {pic.id: f"fake-caption-{pic.id}" for pic in pictures}
+
+    def estimate_vram_mb(self, image_count, plugin_name=None):
+        return 0
+
+
+def _describe(finder):
+    """Find a description batch, run it, and report it complete."""
+    task = finder.find_task()
+    if task is None:
+        return None
+    error = None
+    try:
+        task.run()
+    except Exception as exc:
+        error = exc
+    finder.on_task_complete(task, error)
+    return task.params["picture_ids"]
+
+
+def test_m108_one_captioner_that_captions_nobody_holds_only_its_own_work(
+    tmp_path,
+):
+    """The backend hold had one key for every engine.
+
+    A request for a caption from an engine that is down held back every other
+    engine's requests and the whole backlog behind them, for as long as it
+    stayed down. The held engine's pictures are also left out of the read, or
+    they would fill the window the others are waiting in.
+    """
+    broken = "test-broken-captioner"
+    with Vault(image_root=str(tmp_path)) as vault:
+        names = [f"d{index}.png" for index in range(7)]
+        (
+            broken_a,
+            broken_b,
+            working,
+            backlog,
+            generic,
+            backlog_late,
+            working_late,
+        ) = _seed_pending(vault, tmp_path, names)
+        descriptions = {
+            broken_a: make_description_sentinel(broken),
+            broken_b: make_description_sentinel(broken),
+            working: make_description_sentinel("test-working-captioner"),
+            backlog: None,
+            generic: "test-caption already written",
+            backlog_late: "test-caption already written",
+            working_late: "test-caption already written",
+        }
+
+        def describe(values):
+            def write(session: Session):
+                for pid, text in values.items():
+                    picture = session.get(Picture, pid)
+                    picture.description = text
+                    session.add(picture)
+                session.commit()
+
+            vault.db.run_task(write)
+
+        describe(descriptions)
+        clock = _ManualClock()
+        engine = SimpleNamespace(
+            tagger_settings={"active_description_plugin": "test-active-captioner"},
+            description_batch_size=lambda: 1,
+            description_workflow=_CaptionWorkflow(broken),
+        )
+        finder = MissingDescriptionFinder(
+            vault.db,
+            lambda: engine,
+            retry_hold=RetryHold(clock=clock, rng=lambda: 1.0),
+            backend_hold=RetryHold(cap_s=60.0, clock=clock, rng=lambda: 1.0),
+        )
+
+        assert _describe(finder) == [broken_a]
+        assert _describe(finder) == [working], (
+            "one engine captioning nobody held back a request for another"
+        )
+        assert _describe(finder) == [backlog], (
+            "the held engine's requests filled the window ahead of the backlog"
+        )
+
+        # The active engine is the one that is down: the backlog and the
+        # requests that name no engine wait with it; a named request does not.
+        engine.tagger_settings = {"active_description_plugin": broken}
+        describe(
+            {
+                generic: make_description_sentinel(None),
+                backlog_late: None,
+                working_late: make_description_sentinel("test-working-captioner"),
+            }
+        )
+        assert _describe(finder) == [working_late]
+        assert finder.find_task() is None, (
+            "the backlog was handed to the engine that is held"
+        )
+        clock.now += 4.01
+        assert _describe(finder) == [broken_a], "the probe once the hold is over"
+
+
+def test_m108_a_backlog_batch_the_active_captioner_fails_holds_that_engine(
+    tmp_path,
+):
+    """A batch that names no engine runs on the active one, so its
+    failure holds the active engine, and with it the rest of the backlog.
+
+    A request that names another engine still runs while it is held.
+    """
+    down = "test-down-captioner"
+    with Vault(image_root=str(tmp_path)) as vault:
+        working, backlog_a, backlog_b = _seed_pending(
+            vault, tmp_path, ["b0.png", "b1.png", "b2.png"]
+        )
+
+        def describe(values):
+            def write(session: Session):
+                for pid, text in values.items():
+                    picture = session.get(Picture, pid)
+                    picture.description = text
+                    session.add(picture)
+                session.commit()
+
+            vault.db.run_task(write)
+
+        named = make_description_sentinel("test-working-captioner")
+        describe({working: named, backlog_a: None, backlog_b: None})
+        clock = _ManualClock()
+        engine = SimpleNamespace(
+            tagger_settings={"active_description_plugin": down},
+            description_batch_size=lambda: 1,
+            description_workflow=_CaptionWorkflow(None),
+        )
+        finder = MissingDescriptionFinder(
+            vault.db,
+            lambda: engine,
+            retry_hold=RetryHold(clock=clock, rng=lambda: 1.0),
+            backend_hold=RetryHold(cap_s=60.0, clock=clock, rng=lambda: 1.0),
+        )
+
+        assert _describe(finder) == [working]
+        assert _describe(finder) == [backlog_a]
+        assert finder.find_task() is None, (
+            "the backlog went on to the active engine that had just failed it"
+        )
+        describe({working: named})
+        assert _describe(finder) == [working], (
+            "the active engine's hold held a request for another engine"
+        )
+        clock.now += 4.01
+        assert _describe(finder) == [backlog_a], "the probe once the hold is over"

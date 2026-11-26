@@ -16,7 +16,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { setActivePinia, createPinia } from "pinia";
 import { mount, flushPromises } from "@vue/test-utils";
-import { ref } from "vue";
+import { defineComponent, ref } from "vue";
 
 const apiGet = vi.fn();
 const apiPost = vi.fn();
@@ -71,6 +71,7 @@ import {
   resetShareDragForTests,
   runShareDrag,
 } from "../../utils/shareDrag.js";
+import { useWindowFileImport } from "../../composables/useWindowFileImport.js";
 import SideBar from "./SideBar.vue";
 
 /**
@@ -457,4 +458,137 @@ describe("sidebar rows say how many dropped items could not be read", () => {
       wrapper.unmount();
     });
   }
+});
+
+// A file dropped on a person or set row is imported into that person or set
+// by the row's own handler. The window's capture handler (useWindowFileImport)
+// runs first and imports anything dropped outside a zone that owns its drop,
+// so each such row carries `data-owns-file-drop`, or the pictures come in
+// twice: once filed, once loose.
+describe("a picture dropped on a person or set row is imported once", () => {
+  const NESTED = { id: 12, name: "Ada refs", image_count: 1, parent_character_id: ADA.id };
+  // GET /library/folders: a folder for Ada, one for Shoot, and Global, which
+  // is no person or set and so leaves the files to the window's importer.
+  const FOLDERS = [
+    { path: "Ada", name: "Ada", kind: "character", entity_id: ADA.id, project_id: null, count: 3 },
+    { path: "Shoot", name: "Shoot", kind: "set", entity_id: SET.id, project_id: null, count: 2 },
+    { path: "Global", name: "Global", kind: "global", entity_id: null, project_id: null, count: 1 },
+  ];
+  const windowImport = vi.fn();
+  const startImport = vi.fn();
+  const WindowImporter = defineComponent({
+    setup() {
+      useWindowFileImport({
+        sidebarRef: ref({ startLocalImport: windowImport, currentProjectId: null }),
+      });
+      return () => null;
+    },
+  });
+
+  function pictureDrop() {
+    const file = new File(["x"], "reference.jpg", { type: "image/jpeg" });
+    const entry = {
+      isFile: true,
+      isDirectory: false,
+      name: file.name,
+      fullPath: `/${file.name}`,
+      file: (ok) => ok(file),
+    };
+    return {
+      types: ["Files"],
+      dropEffect: "",
+      effectAllowed: "copy",
+      files: [file],
+      items: [{ kind: "file", webkitGetAsEntry: () => entry, getAsFile: () => file }],
+      getData: () => "",
+    };
+  }
+
+  let windowHost;
+  let wrapper;
+  beforeEach(async () => {
+    apiGet.mockImplementation((url) => {
+      const u = String(url ?? "");
+      if (u.includes("/library/folders")) return Promise.resolve({ data: { folders: FOLDERS } });
+      if (u.includes("/picture_sets")) return Promise.resolve({ data: [SET, NESTED] });
+      return Promise.resolve(respond(url));
+    });
+    windowImport.mockClear();
+    startImport.mockClear();
+    window.localStorage.clear();
+    // Attached, so the drop travels up to the window's capture listener.
+    windowHost = mount(WindowImporter, { attachTo: document.body });
+    wrapper = mount(SideBar, {
+      shallow: true,
+      attachTo: document.body,
+      props: { backendUrl: "/api/v1" },
+      global: {
+        stubs: { ImageImporter: { render: () => null, methods: { startImport } } },
+        config: {
+          compilerOptions: { isCustomElement: (tag) => tag.startsWith("v-") },
+        },
+      },
+    });
+    wrapper.vm.refreshSidebar();
+    for (let i = 0; i < 5; i += 1) await flushPromises();
+  });
+  afterEach(() => {
+    wrapper.unmount();
+    windowHost.unmount();
+    window.localStorage.clear();
+  });
+
+  /** Drop the picture on `row`, then let both handlers' walks finish. */
+  async function dropPicture(row) {
+    await fire(row, "drop", pictureDrop());
+    for (let i = 0; i < 4; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  const imported = () => startImport.mock.calls.map(([files, options]) => [files.map((f) => f.name), options]);
+
+  it("on a person row in the People list", async () => {
+    await dropPicture(rowByTitle(wrapper, `${ADA.name} (`));
+    expect(imported()).toEqual([[["reference.jpg"], { characterId: ADA.id }]]);
+    expect(windowImport).not.toHaveBeenCalled();
+  });
+
+  it("on a set row filed under a person", async () => {
+    wrapper.vm.expandTreeKeys([`c:${ADA.id}`]);
+    await flushPromises();
+    await dropPicture(rowByTitle(wrapper, `${NESTED.name} (`));
+    expect(imported()).toEqual([[["reference.jpg"], { setId: NESTED.id }]]);
+    expect(windowImport).not.toHaveBeenCalled();
+  });
+
+  it("on a set row in the Sets list", async () => {
+    await dropPicture(rowByTitle(wrapper, `${SET.name} (`));
+    expect(imported()).toEqual([[["reference.jpg"], { setId: SET.id }]]);
+    expect(windowImport).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["person", "sidebar-folder-character", { characterId: ADA.id }],
+    ["set", "sidebar-folder-set", { setId: SET.id }],
+  ])("on a %s row in the Folders tree", async (_kind, testid, options) => {
+    wrapper.vm.setTreeMode("folders");
+    for (let i = 0; i < 3; i += 1) await flushPromises();
+    await dropPicture(wrapper.find(`[data-testid="${testid}"]`));
+    expect(imported()).toEqual([[["reference.jpg"], options]]);
+    expect(windowImport).not.toHaveBeenCalled();
+  });
+
+  // The control: a folder row that is no person or set imports nothing
+  // itself, so the window's importer must still take the drop there.
+  it("but leaves a drop on another folder row to the window's importer", async () => {
+    wrapper.vm.setTreeMode("folders");
+    for (let i = 0; i < 3; i += 1) await flushPromises();
+    const row = wrapper.find('[data-testid="sidebar-folder-global"]');
+    expect(row.attributes()).not.toHaveProperty("data-owns-file-drop");
+    await dropPicture(row);
+    expect(startImport).not.toHaveBeenCalled();
+    expect(windowImport.mock.calls.map(([files]) => files.map((f) => f.name))).toEqual([
+      ["reference.jpg"],
+    ]);
+  });
 });

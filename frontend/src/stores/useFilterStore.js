@@ -23,6 +23,11 @@ export const useFilterStore = defineStore("filter", () => {
   const tagConfidenceAboveFilter = ref([]);
   const tagConfidenceBelowFilter = ref([]);
   const faceBboxFilter = ref(null);
+  // Why a picture has no tags (`tag_state`): "pending" (waiting for the
+  // tagger), "unprocessable" (the tagger could not read the file) or "none"
+  // (tagged, and nothing applied). Null for any picture. Set from the Details
+  // panel's Untagged rows.
+  const tagStateFilter = ref(null);
   const sharedOnlyFilter = ref(false);
   // "Imported from": an import folder's path, or null for any picture.
   const importedFromFilter = ref(null);
@@ -101,6 +106,7 @@ export const useFilterStore = defineStore("filter", () => {
     tagConfidenceAboveFilter.value = [];
     tagConfidenceBelowFilter.value = [];
     faceBboxFilter.value = null;
+    tagStateFilter.value = null;
     sharedOnlyFilter.value = false;
     importedFromFilter.value = null;
     noCharacterFilter.value = false;
@@ -126,6 +132,7 @@ export const useFilterStore = defineStore("filter", () => {
     tagConfidenceAboveFilter,
     tagConfidenceBelowFilter,
     faceBboxFilter,
+    tagStateFilter,
     sharedOnlyFilter,
     importedFromFilter,
     noCharacterFilter,

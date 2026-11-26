@@ -1,5 +1,6 @@
-from sqlmodel import Session
+from sqlmodel import Session, select
 
+from pixlstash.db_models import Picture
 from pixlstash.utils.likeness.likeness_parameter_utils import LikenessParameterUtils
 from pixlstash.worker_config import LIKENESS_PARAMETERS_MAX_INFLIGHT
 
@@ -32,8 +33,8 @@ class MissingLikenessParametersFinder(BaseTaskFinder):
         # Quality metrics are likeness parameters (brightness, contrast, ...),
         # and each picture's row is written once, with its real values: the
         # candidate query only offers a picture whose own Quality row is done
-        # (LikenessParameterUtils.find_next_work), so no stage-wide gate is
-        # needed and a picture flows here the moment its quality is in.
+        # (_fetch_pending), so no stage-wide gate is needed and a picture flows
+        # here the moment its quality is in.
         #
         # Discover work and pre-fetch all required data inside a single
         # immediate read session - no write-queue involvement.
@@ -54,11 +55,31 @@ class MissingLikenessParametersFinder(BaseTaskFinder):
             payload=payload,
         )
 
+    @staticmethod
+    def _fetch_pending(session: Session, limit: int) -> list[tuple[int, int, int]]:
+        """Up to *limit* ``(id, width, height)`` of the pending pictures whose
+        quality is done, in id order: the task's pending clauses
+        (``LikenessParametersTask.pending_parameter_clauses``, the ones the
+        progress row counts) and the quality wait. ``ix_picture_size_bin_index``
+        drives the probe.
+
+        Each picture gets its own size bin from its dimensions, so a flat batch
+        needs no grouping by resolution.
+        """
+        rows = session.exec(
+            select(Picture.id, Picture.width, Picture.height)
+            .where(
+                *LikenessParametersTask.pending_parameter_clauses(),
+                LikenessParametersTask.quality_done_clause(),
+            )
+            .order_by(Picture.id)
+            .limit(limit)
+        ).all()
+        return [(int(pid), int(w), int(h)) for pid, w, h in rows]
+
     def _find_and_prefetch(self, session: Session, image_root: str):
         """Run inside a read session: find next work batch and pre-fetch all data."""
-        id_wh_list = LikenessParameterUtils.find_next_work(
-            session, LikenessParametersTask.SCAN_LIMIT
-        )
+        id_wh_list = self._fetch_pending(session, LikenessParametersTask.SCAN_LIMIT)
         if not id_wh_list:
             return None
 

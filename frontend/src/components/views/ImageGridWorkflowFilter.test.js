@@ -18,6 +18,7 @@ import { setActivePinia, createPinia } from "pinia";
 import { ref } from "vue";
 
 import { useFilterStore } from "../../stores/useFilterStore.js";
+import { filterChips } from "../../utils/filterChips.js";
 
 const { dedupStoreMock } = vi.hoisted(() => ({
   dedupStoreMock: { scan: { status: "idle" } },
@@ -158,6 +159,55 @@ describe("the workflow chip and the grid's filter watcher", () => {
     const urls = gridUrls();
     expect(urls.length).toBeGreaterThan(0);
     expect(urls.some((url) => url.includes("workflow="))).toBe(false);
+    wrapper.unmount();
+  });
+});
+
+// The stats rail's Untagged rows, held at the same place: the watcher is
+// the only thing that turns setting or clearing `tagStateFilter` into a fetch.
+describe("the Untagged filter and the grid's filter watcher", () => {
+  it("refetches on the filtered pictures when an Untagged row is set", async () => {
+    const wrapper = mountGrid();
+    await settle(wrapper);
+    apiGet.mockClear();
+
+    useFilterStore().tagStateFilter = "pending";
+    await settle(wrapper);
+
+    const urls = gridUrls();
+    expect(urls.length).toBeGreaterThan(0);
+    expect(urls.every((url) => url.includes("tag_state=pending"))).toBe(true);
+    wrapper.unmount();
+  });
+
+  it.each([
+    [
+      "the chip's x",
+      () =>
+        filterChips(useFilterStore())
+          .find((chip) => chip.key === "untagged")
+          .remove(),
+    ],
+    [
+      "the rail's toggle",
+      () => {
+        // What StatsSidebar's toggleTagStateFilter does on the active row.
+        useFilterStore().tagStateFilter = null;
+      },
+    ],
+  ])("refetches the unfiltered grid when %s clears it", async (_how, clear) => {
+    const wrapper = mountGrid();
+    await settle(wrapper);
+    useFilterStore().tagStateFilter = "pending";
+    await settle(wrapper);
+    apiGet.mockClear();
+
+    clear();
+    await settle(wrapper);
+
+    const urls = gridUrls();
+    expect(urls.length).toBeGreaterThan(0);
+    expect(urls.some((url) => url.includes("tag_state="))).toBe(false);
     wrapper.unmount();
   });
 });

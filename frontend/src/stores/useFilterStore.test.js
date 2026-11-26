@@ -39,3 +39,13 @@ describe("useFilterStore unscored filter", () => {
     expect(s.unscoredOnlyFilter).toBe(false);
   });
 });
+
+describe("useFilterStore tag-state filter", () => {
+  it("is off by default and resetFilters clears it", () => {
+    const s = useFilterStore();
+    expect(s.tagStateFilter).toBe(null);
+    s.tagStateFilter = "pending";
+    s.resetFilters();
+    expect(s.tagStateFilter).toBe(null);
+  });
+});

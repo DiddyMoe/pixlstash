@@ -27,6 +27,7 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models.picture import Picture
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
+from pixlstash.tasks.pipeline_scope import pipeline_picture_clauses
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.orientation import read_orientation
 from pixlstash.utils.sql_chunking import not_in_json
@@ -101,6 +102,16 @@ class OrientationTask(BaseTask):
         return changed
 
     @staticmethod
+    def missing_orientation_clauses() -> tuple:
+        """WHERE terms for the pictures still owed an orientation: the
+        finder's and the progress count's (``Vault._count_missing_orientations``),
+        so the two count the same pictures."""
+        return (
+            Picture.orientation.is_(None),
+            *pipeline_picture_clauses(deleted_index=True),
+        )
+
+    @staticmethod
     def find_pictures_missing_orientation(
         session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
     ) -> list:
@@ -110,9 +121,7 @@ class OrientationTask(BaseTask):
         """
         return session.exec(
             select(Picture)
-            .where(Picture.orientation.is_(None))
-            .where(Picture.deleted.is_(False))
-            .where(Picture.file_path.is_not(None))
+            .where(*OrientationTask.missing_orientation_clauses())
             .where(not_in_json(Picture.id, exclude_ids))
             .order_by(Picture.id)
             .limit(limit)

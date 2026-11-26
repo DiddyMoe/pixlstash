@@ -27,6 +27,7 @@ from pixlstash.hub.workflow_card_reads import (
     run_filed_workflow_ids,
     variant_workflows,
 )
+from pixlstash.image_plugins.service import PictureNotFoundError
 from pixlstash.pixl_logging import get_logger
 from pixlstash.scoring import (
     fetch_smart_score_data,
@@ -42,29 +43,40 @@ from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.utils.library_roots import refuse_path_inside_a_library
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.quality.smart_score_utils import SmartScoreUtils
-from pixlstash.utils.serialization_utils import safe_model_dict
-from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked, in_json
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.services import plugin_service
 from pixlstash.services.model_shelf_service import recipe_asset_index
 from pixlstash.services.workflow_hash import normalized_filename
 from pixlstash.utils.service.picture_stats import (
     PictureStatsParams,
     get_cached_picture_stats,
+    stats_cache_digest,
 )
 from pixlstash.utils.service.filter_helpers import (
     collect_set_filter_ids,
     fetch_scope_allowed_picture_ids,
     fetch_set_candidate_ids,
+    is_scrapheap_view_id,
     narrow_picture_project_ids,
     normalize_set_mode,
     project_membership_exists_clause,
     project_unassigned_clause,
+    request_targets_scrapheap,
 )
-from pixlstash.utils.query.predicate_filter import PredicateFilter
+from pixlstash.utils.query.predicate_filter import PredicateFilter, parse_tag_state
 
 from ._helpers import (
     _face_cluster_ids,
     _fetch_hidden_picture_ids,
+    _get_hidden_tags_from_request,
+)
+from ._listing import (
+    StoredPictureRow,
+    parse_picture_filter,
+    shared_picture_ids,
+    stored_picture_dict,
 )
 
 
@@ -91,7 +103,7 @@ class PicturePluginRunResponse(BaseModel):
     status: str
 
 
-class LikenessGroupResponse(BaseModel):
+class LikenessGroupResponse(StoredPictureRow):
     """A picture row belonging to a computed likeness group.
 
     Picture metadata is large and dynamic; common fields are enumerated and
@@ -113,6 +125,8 @@ class PictureStatsResponse(BaseModel):
     total_tags: Optional[int] = None
     tagged: Optional[int] = None
     untagged: Optional[int] = None
+    # ``untagged`` split by why: {"pending", "unprocessable", "none"}.
+    untagged_breakdown: Optional[dict[str, int]] = None
     avg_tags_per_image: Optional[float] = None
     top_tags: Optional[list] = None
     top_cooccurrences: Optional[list] = None
@@ -245,7 +259,7 @@ class OpenWithRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    picture_id: int
+    picture_id: SqliteInt
     app_id: Optional[str] = None
     other: bool = False
 
@@ -299,7 +313,9 @@ def register_routes(router, server):
 
         try:
             picture_ids = [
-                int(pic_id) for pic_id in raw_picture_ids if pic_id is not None
+                parse_sqlite_int(pic_id)
+                for pic_id in raw_picture_ids
+                if pic_id is not None
             ]
         except (TypeError, ValueError):
             raise HTTPException(
@@ -358,10 +374,25 @@ def register_routes(router, server):
                 origin_client_id=origin_client_id,
                 stack=stack,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
+        except plugin_service.PluginNotFoundError as exc:
+            logger.warning("Plugin %r not run: %s", name, exc)
+            raise HTTPException(status_code=404, detail="Plugin not found") from exc
+        except PictureNotFoundError as exc:
+            # The service has logged it. The id is one of the parsed
+            # ``picture_ids``, so naming it echoes nothing unvalidated.
+            raise HTTPException(
+                status_code=404, detail=f"Picture not found: {exc.picture_id}"
+            ) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=f"Plugin failed: {exc}")
+            logger.error(
+                "Plugin %r failed on %d picture(s)",
+                name,
+                len(picture_ids),
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500, detail="The plugin failed; the log says why."
+            ) from exc
 
     @router.get(
         "/pictures/comfyui_models",
@@ -523,9 +554,9 @@ def register_routes(router, server):
     def get_likeness_groups(
         request: Request,
         threshold: float = 0.0,
-        min_group_size: int = 2,
-        set_id: int = Query(None),
-        set_ids: list[int] = Query(None),
+        min_group_size: SqliteInt = 2,
+        set_id: Optional[SqliteInt] = Query(None),
+        set_ids: Optional[list[SqliteInt]] = Query(None),
         set_mode: str = Query("union"),
         character_id: str = Query(None),
         unassigned_by: Literal["character", "set"] | None = Query(None),
@@ -537,13 +568,19 @@ def register_routes(router, server):
         tag_confidence_below: list[str] = Query(None),
         comfyui_model: list[str] = Query(None),
         comfyui_lora: list[str] = Query(None),
-        min_score: int = Query(None),
-        max_score: int = Query(None),
+        min_score: Optional[SqliteInt] = Query(None),
+        max_score: Optional[SqliteInt] = Query(None),
         unscored: bool = Query(False),
         favourite: bool = Query(False),
     ):
+        # The term lists, read where the listing reads them: a list past
+        # ``MAX_FILTER_TERMS`` or a confidence entry that is not ``tag:number``
+        # is a 422 here too, not a 500 from the post-filter below.
+        terms = PredicateFilter.from_query_params(request)
         candidate_ids = None
-        only_deleted = character_id == "SCRAPHEAP"
+        only_deleted = request_targets_scrapheap(request.query_params)
+        if is_scrapheap_view_id(character_id):
+            character_id = None
         set_filter_ids = collect_set_filter_ids(
             set_id_value=set_id,
             set_ids_values=set_ids,
@@ -568,7 +605,7 @@ def register_routes(router, server):
                         assignment_unassigned_project = True
                     elif project_id is not None:
                         try:
-                            assignment_project_id = int(project_id)
+                            assignment_project_id = parse_sqlite_int(project_id)
                         except (TypeError, ValueError):
                             logger.warning(
                                 "Invalid project_id %r for UNASSIGNED stack assignment scope; treating as global scope",
@@ -591,20 +628,15 @@ def register_routes(router, server):
                 )
             elif character_id == "ALL" or character_id == "":
                 candidate_ids = None
-            elif character_id == "SCRAPHEAP":
-
-                def fetch_deleted_ids(session):
-                    rows = session.exec(
-                        select(Picture.id).where(
-                            Picture.deleted.is_(True),
-                        )
-                    ).all()
-                    return list(rows)
-
-                candidate_ids = set(
-                    server.vault.db.run_immediate_read_task(fetch_deleted_ids)
-                )
             elif character_id.isdigit():
+                try:
+                    character_id_value = parse_sqlite_int(character_id)
+                except ValueError:
+                    logger.warning(
+                        "Refusing a character_id past SQLite's range in "
+                        "/pictures/likeness-groups"
+                    )
+                    raise HTTPException(status_code=400, detail="Invalid character_id")
 
                 def fetch_character_ids(session, character_id):
                     faces = session.exec(
@@ -613,17 +645,22 @@ def register_routes(router, server):
                     picture_ids = {face.picture_id for face in faces}
                     if not picture_ids:
                         return []
-                    rows = session.exec(
-                        select(Picture.id).where(
-                            Picture.id.in_(picture_ids),
-                            Picture.deleted.is_(False),
-                        )
-                    ).all()
-                    return list(rows)
+                    # A character's pictures scale with the library, so they
+                    # are read in chunks under SQLite's bound-parameter limit.
+                    return [
+                        pic_id
+                        for id_chunk in chunked(sorted(picture_ids))
+                        for pic_id in session.exec(
+                            select(Picture.id).where(
+                                Picture.id.in_(id_chunk),
+                                Picture.deleted.is_(False),
+                            )
+                        ).all()
+                    ]
 
                 candidate_ids = set(
                     server.vault.db.run_immediate_read_task(
-                        fetch_character_ids, int(character_id)
+                        fetch_character_ids, character_id_value
                     )
                 )
 
@@ -655,7 +692,7 @@ def register_routes(router, server):
                     query = query.where(project_unassigned_clause(Picture))
                 else:
                     try:
-                        parsed_project_id = int(project_id_value)
+                        parsed_project_id = parse_sqlite_int(project_id_value)
                     except (TypeError, ValueError):
                         raise HTTPException(
                             status_code=400,
@@ -685,9 +722,8 @@ def register_routes(router, server):
         if format:
 
             def fetch_format_ids(session, format, deleted_only: bool):
-                query = select(Picture.id).where(
-                    Picture.format.in_(format),
-                )
+                # One JSON array: ``format`` is a query list with no cap.
+                query = select(Picture.id).where(in_json(Picture.format, format))
                 if deleted_only:
                     query = query.where(Picture.deleted.is_(True))
                 else:
@@ -789,14 +825,20 @@ def register_routes(router, server):
         if groups:
 
             def fetch_stack_map(session, ids, deleted_only: bool):
-                query = select(Picture.id, Picture.stack_id).where(
-                    Picture.id.in_(ids),
-                )
-                if deleted_only:
-                    query = query.where(Picture.deleted.is_(True))
-                else:
-                    query = query.where(Picture.deleted.is_(False))
-                return list(session.exec(query).all())
+                # Every grouped picture, with no group or row cap, so the
+                # rows are read in chunks under SQLite's bound-parameter
+                # limit; the groups are disjoint, so the ids are unique.
+                rows = []
+                for id_chunk in chunked(sorted(set(ids))):
+                    query = select(Picture.id, Picture.stack_id).where(
+                        Picture.id.in_(id_chunk),
+                    )
+                    if deleted_only:
+                        query = query.where(Picture.deleted.is_(True))
+                    else:
+                        query = query.where(Picture.deleted.is_(False))
+                    rows.extend(session.exec(query).all())
+                return rows
 
             group_ids = [pic_id for group in groups for pic_id in group]
             stack_rows = server.vault.db.run_immediate_read_task(
@@ -818,11 +860,15 @@ def register_routes(router, server):
                 # lifecycle to find the stacks' few. Alone, the ids search
                 # ``ix_picture_stack_id`` (backend_architecture.md, "Probe
                 # cost").
-                rows = session.exec(
-                    select(Picture.id, Picture.stack_id, Picture.deleted).where(
-                        Picture.stack_id.in_(stack_ids),
-                    )
-                ).all()
+                rows = [
+                    row
+                    for stack_chunk in chunked(sorted(set(stack_ids)))
+                    for row in session.exec(
+                        select(Picture.id, Picture.stack_id, Picture.deleted).where(
+                            Picture.stack_id.in_(stack_chunk),
+                        )
+                    ).all()
+                ]
                 return [
                     (pic_id, stack_id)
                     for pic_id, stack_id, deleted in rows
@@ -909,7 +955,18 @@ def register_routes(router, server):
                 comfyui_loras_filter_value,
                 favourite_only_value=False,
             ):
-                query = select(Picture.id).where(Picture.id.in_(candidate_ids_list))
+                # Every grouped picture, and the predicates bind parameters of
+                # their own, so the ids come from a temp table: no chunk size
+                # leaves room for tag lists of any length.
+                query = select(Picture.id).where(
+                    Picture.id.in_(
+                        scope_id_subquery(
+                            session,
+                            candidate_ids_list,
+                            name="_pixlstash_likeness_group_ids",
+                        )
+                    )
+                )
                 # This post-filter narrows an already-id-bounded set; only the
                 # deleted lifecycle clause plus score/comfyui/tag predicates apply
                 # (no format/buckets/face - those were handled when the candidate
@@ -936,12 +993,12 @@ def register_routes(router, server):
                 min_score,
                 max_score,
                 unscored,
-                tag or None,
-                rejected_tag or None,
-                tag_confidence_above or None,
-                tag_confidence_below or None,
-                comfyui_model or None,
-                comfyui_lora or None,
+                terms.tags_filter,
+                terms.tags_rejected_filter,
+                terms.tags_confidence_above_filter,
+                terms.tags_confidence_below_filter,
+                terms.comfyui_models_filter,
+                terms.comfyui_loras_filter,
                 favourite_only_value=favourite,
             )
             # Determine which group indices have at least one matching picture.
@@ -1018,7 +1075,7 @@ def register_routes(router, server):
 
         stacks_by_index = defaultdict(list)
         for pic in ordered_pics:
-            pic_dict = safe_model_dict(pic)
+            pic_dict = stored_picture_dict(pic)
             pic_dict["stack_index"] = stack_index_map.get(pic.id)
             if pic.id in smart_score_by_id:
                 pic_dict["smartScore"] = smart_score_by_id[pic.id]
@@ -1056,7 +1113,7 @@ def register_routes(router, server):
     )
     def open_picture_location(id: str):
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -1121,7 +1178,7 @@ def register_routes(router, server):
         ),
         response_model=OpenWithListResponse,
     )
-    def list_open_with_apps(request: Request, picture_id: int):
+    def list_open_with_apps(request: Request, picture_id: SqliteInt):
         _picture, source = _open_with_picture(request, picture_id)
         if VideoUtils.is_video_file(source):
             return {"apps": [], "other": False}
@@ -1225,10 +1282,13 @@ def register_routes(router, server):
         character_id_list: list[int] = []
         for _v in character_ids_raw:
             try:
-                _cid = int(_v)
+                _cid = parse_sqlite_int(_v)
                 if _cid > 0:
                     character_id_list.append(_cid)
             except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid character_ids value %r in /pictures/stats", _v
+                )
                 continue
         character_id_list = sorted(set(character_id_list))
         character_mode_raw = request.query_params.get("character_mode", "union")
@@ -1239,10 +1299,24 @@ def register_routes(router, server):
         set_ids_raw = request.query_params.getlist("set_ids")
         set_mode_raw = request.query_params.get("set_mode", "union")
         project_id_raw = request.query_params.get("project_id")
-        # Intrinsic-attribute query params via the shared parser.  Membership / scope
-        # params keep their bespoke handling, and min/max score keep their dedicated
-        # HTTPException-on-invalid coercion below.
-        _predicate_filter = PredicateFilter.from_query_params(request)
+        # Intrinsic-attribute query params via the parser the listing and the
+        # search use (``parse_picture_filter``), so every filter the grid sends
+        # narrows the panel the same way, ``workflow`` included. Membership /
+        # scope params keep their bespoke handling, and min/max score keep their
+        # dedicated HTTPException-on-invalid coercion below.
+        #
+        # Two params the grid's list carries are not read here, on purpose:
+        # * ``query``, the text search. Its hits cost two query encodes and a
+        #   fuzzy-tag plus cosine-similarity scan over every candidate
+        #   (``_search.search_results``), nothing caches them, and the Details
+        #   panel sends up to seven stats reads per view, so applying the search
+        #   would repeat that work once per read. Under a search the panel
+        #   describes the view the search runs over, not its hits.
+        # * ``guest_session_id``. A guest's ratings reorder the Score sort and
+        #   replace the score shown on a card; they never decide which pictures
+        #   are listed. The Score histogram counts ``Picture.score``.
+        # docs/backend_architecture.md, ``GET /pictures/stats``, says the same.
+        _predicate_filter = parse_picture_filter(server, request)
         tags_filter = _predicate_filter.tags_filter or []
         rejected_tags = _predicate_filter.tags_rejected_filter or []
         format_filter = _predicate_filter.format or []
@@ -1258,19 +1332,104 @@ def register_routes(router, server):
         confidence_above = _predicate_filter.tags_confidence_above_filter or []
         confidence_below = _predicate_filter.tags_confidence_below_filter or []
         include = set(request.query_params.getlist("include"))
+        tag_state = parse_tag_state(request.query_params.get("tag_state"))
+        unprocessable_ids = frozenset(
+            server.vault.db.unprocessable_images.active_suppressed_ids()
+        )
+        # The registry is in memory and changes without a request; a cached
+        # breakdown must not outlive the set it was split by.
+        cache_key += f"|unprocessable:{stats_cache_digest(unprocessable_ids)}"
 
-        only_deleted = character_id_raw == "SCRAPHEAP"
-        if only_deleted:
+        only_deleted = request_targets_scrapheap(request.query_params)
+        if is_scrapheap_view_id(character_id_raw):
             character_id_raw = None
-        # The Inbox is the unassigned view narrowed to its period, as the
-        # listing reads it (`select_pictures_for_listing`).
-        if request.query_params.get("inbox") is not None:
+        unassigned_by = request.query_params.get("unassigned_by") or None
+        if unassigned_by not in (None, "character", "set"):
+            # The listing declares the same two values and answers 422.
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid unassigned_by: must be character or set",
+            )
+        imported_since = _predicate_filter.imported_since
+        if only_deleted:
+            # The Scrapheap wins over the unassigned view and the Inbox, as the
+            # listing (`select_pictures_for_listing`) and the search read it:
+            # the whole heap, without the Inbox's period.
+            if character_id_raw == "UNASSIGNED":
+                character_id_raw = None
+            imported_since = None
+        elif request.query_params.get("inbox") is not None:
+            # The Inbox is the unassigned view (both halves) narrowed to its
+            # period, as the listing reads it.
             character_id_raw = "UNASSIGNED"
+            unassigned_by = None
+        reference_folder_id_raw = request.query_params.get("reference_folder_id")
+        try:
+            reference_folder_id = (
+                parse_sqlite_int(reference_folder_id_raw)
+                if reference_folder_id_raw not in (None, "")
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid reference_folder_id: must be an integer",
+            ) from exc
+        # The owner's hidden tags (``apply_tag_filter=true``) and the id sets
+        # the grid narrows by: they are read per user, not from the query
+        # string, so the key carries what they resolved to.
+        hidden_tags = _get_hidden_tags_from_request(server, request) or None
+        picture_id_filter: frozenset[int] | None = None
+        for resolved in (
+            _face_cluster_ids(
+                server,
+                request,
+                character_id_raw,
+                request.query_params.get("face_cluster"),
+                request.query_params.get("face_cluster_threshold"),
+            ),
+            shared_picture_ids(server, request),
+        ):
+            if resolved is None:
+                continue
+            picture_id_filter = (
+                frozenset(resolved)
+                if picture_id_filter is None
+                else picture_id_filter & frozenset(resolved)
+            )
+        workflow_structural_hashes = _predicate_filter.workflow_structural_hashes
+        cache_key += f"|hidden:{stats_cache_digest(hidden_tags or ())}"
+        cache_key += (
+            "|ids:none"
+            if picture_id_filter is None
+            else f"|ids:{stats_cache_digest(picture_id_filter)}"
+        )
+        cache_key += (
+            "|workflow:none"
+            if workflow_structural_hashes is None
+            else f"|workflow:{stats_cache_digest(workflow_structural_hashes)}"
+        )
         set_mode = normalize_set_mode(set_mode_raw)
         set_filter_ids = collect_set_filter_ids(
             set_id_value=set_id_raw,
             set_ids_values=set_ids_raw or None,
         )
+        # A difference is the first set minus the rest, so the base the grid
+        # names goes first, as the listing and the search order it.
+        base_set_id_raw = request.query_params.get("base_set_id")
+        if set_mode == "difference" and base_set_id_raw is not None:
+            try:
+                base_set_id = int(base_set_id_raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid base_set_id value %r in /pictures/stats request",
+                    base_set_id_raw,
+                )
+            else:
+                if base_set_id in set_filter_ids:
+                    set_filter_ids = [base_set_id] + [
+                        s for s in set_filter_ids if s != base_set_id
+                    ]
         try:
             min_score = int(min_score_raw) if min_score_raw is not None else None
         except ValueError as exc:
@@ -1292,6 +1451,25 @@ def register_routes(router, server):
         scope_allowed = fetch_scope_allowed_picture_ids(server, request)
         scoped_picture_ids = list(scope_allowed) if scope_allowed is not None else None
 
+        if only_deleted:
+            # The Scrapheap is one library-wide bin ("Empty" acts on all of
+            # it), so the panel counts the whole heap whatever set, project or
+            # person the view still carries, as the grid and the header list it
+            # (``select_pictures_for_listing``). A scoped token's own scope
+            # still holds: ``scoped_picture_ids`` is applied on its own.
+            if character_id_raw is not None and character_id_raw.isdigit():
+                # Refused as the listing refuses it, before it is set aside.
+                try:
+                    parse_sqlite_int(character_id_raw)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid character_id"
+                    ) from exc
+            set_filter_ids = []
+            character_id_list = []
+            character_id_raw = None
+            project_id_raw = None
+
         params = PictureStatsParams(
             only_deleted=only_deleted,
             set_filter_ids=set_filter_ids,
@@ -1309,11 +1487,13 @@ def register_routes(router, server):
             resolution_bucket=resolution_bucket,
             file_path_prefix=file_path_prefix,
             import_source_folder=import_source_folder,
-            imported_since=_predicate_filter.imported_since,
+            imported_since=imported_since,
             tags_filter=tags_filter,
             rejected_tags=rejected_tags,
             face_filter=face_filter,
             stack_state=stack_state,
+            tag_state=tag_state,
+            unprocessable_ids=unprocessable_ids,
             confidence_tag=confidence_tag,
             confidence_above=confidence_above,
             confidence_below=confidence_below,
@@ -1321,5 +1501,13 @@ def register_routes(router, server):
             penalised_tag_set=penalised_tag_set,
             penalised_cooc_both=penalised_cooc_both,
             scoped_picture_ids=scoped_picture_ids,
+            unassigned_by=unassigned_by,
+            comfyui_models=_predicate_filter.comfyui_models_filter,
+            comfyui_loras=_predicate_filter.comfyui_loras_filter,
+            workflow_structural_hashes=workflow_structural_hashes,
+            impossible_sources=_predicate_filter.impossible_sources,
+            hidden_tags=hidden_tags,
+            picture_id_filter=picture_id_filter,
+            reference_folder_id=reference_folder_id,
         )
         return get_cached_picture_stats(server.vault, params, cache_key)

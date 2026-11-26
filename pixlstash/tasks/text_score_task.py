@@ -10,6 +10,7 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.quality import Quality
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
+from pixlstash.tasks.pipeline_scope import pipeline_picture_clauses
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.pixl_logging import get_logger
@@ -99,6 +100,15 @@ class TextScoreTask(BaseTask):
         return changed
 
     @staticmethod
+    def missing_text_score_clauses() -> tuple:
+        """WHERE terms for the pictures still owed a text score: the finder's
+        and the progress count's, so the two count the same pictures."""
+        return (
+            Picture.text_score.is_(None),
+            *pipeline_picture_clauses(deleted_index=True),
+        )
+
+    @staticmethod
     def find_pictures_missing_text_score(
         session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
     ) -> list:
@@ -108,22 +118,23 @@ class TextScoreTask(BaseTask):
         """
         return session.exec(
             select(Picture)
-            .where(Picture.text_score.is_(None))
-            .where(Picture.deleted.is_(False))
-            .where(Picture.file_path.is_not(None))
+            .where(*TextScoreTask.missing_text_score_clauses())
             .where(not_in_json(Picture.id, exclude_ids))
             .limit(limit)
         ).all()
 
     @staticmethod
-    def count_missing_text_score(session: Session) -> int:
-        """Return the number of pictures still missing text_score."""
+    def count_missing_text_score(
+        session: Session, exclude_ids: Collection[int] = frozenset()
+    ) -> int:
+        """How many pictures still lack a text score, not counting
+        *exclude_ids* (the suppressed pictures), which the finder will not hand
+        out: counted, they held "remaining" above 0 for good."""
         result = session.exec(
             select(func.count())
             .select_from(Picture)
-            .where(Picture.text_score.is_(None))
-            .where(Picture.deleted.is_(False))
-            .where(Picture.file_path.is_not(None))
+            .where(*TextScoreTask.missing_text_score_clauses())
+            .where(not_in_json(Picture.id, exclude_ids))
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]

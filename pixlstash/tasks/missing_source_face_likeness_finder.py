@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 from pixlstash.db_models import Face, Picture
 from pixlstash.utils.sql_chunking import not_in_json
 from .base_task_finder import SimpleMissingFinder
+from .pipeline_scope import pipeline_picture_clauses
 from .source_face_likeness_task import SourceFaceLikenessTask
 
 
@@ -30,9 +31,11 @@ class MissingSourceFaceLikenessCharacterFinder(SimpleMissingFinder):
         limit: int,
         suppressed_ids: Collection[int] = frozenset(),
     ) -> list:
+        # The Scrapheap is held out, as from every per-picture stage; a
+        # restored picture keeps its marker and is matched then.
         return session.exec(
             select(Picture)
-            .where(Picture.source_picture_id.is_not(None))
+            .where(Picture.source_picture_id.is_not(None), *pipeline_picture_clauses())
             .where(
                 sa_exists(
                     select(Face.id).where(

@@ -9,6 +9,7 @@ from pixlstash.utils.sql_chunking import not_in_json
 
 from .base_task_finder import SimpleMissingFinder
 from .comfyui_extraction_task import ComfyUIExtractionTask
+from .pipeline_scope import pipeline_picture_clauses
 
 logger = get_logger(__name__)
 
@@ -42,6 +43,30 @@ class MissingComfyUIExtractionFinder(SimpleMissingFinder):
         self._vault = vault
         self._scanning_workflows = hub is not None
 
+    @property
+    def scanning_workflows(self) -> bool:
+        """Whether the workflow scan's predicate is in force (a hub attached,
+        not stood down): what :meth:`unscanned_clauses` is passed."""
+        return self._scanning_workflows
+
+    @staticmethod
+    def unscanned_clauses(scanning_workflows: bool) -> tuple:
+        """WHERE terms for the pictures still owed an extraction: this finder's
+        and the progress count's (``Vault._count_missing_comfyui_extraction``),
+        so the two count the same pictures.
+
+        ``comfyui_models IS NULL`` means never checked; ``"[]"`` is the
+        checked-but-empty sentinel. ``workflow_hash_version`` says the same
+        thing for the workflow scan, and needs its own column because a hash
+        column has no such string.
+        """
+        unscanned = (
+            Picture.workflow_hash_version.is_(None)
+            if scanning_workflows
+            else Picture.comfyui_models.is_(None)
+        )
+        return (unscanned, *pipeline_picture_clauses(deleted_index=True))
+
     def finder_name(self) -> str:
         return "MissingComfyUIExtractionFinder"
 
@@ -54,19 +79,10 @@ class MissingComfyUIExtractionFinder(SimpleMissingFinder):
         limit: int,
         suppressed_ids: Collection[int] = frozenset(),
     ) -> list[Picture]:
-        # comfyui_models IS NULL means never checked; "[]" is the checked-but-empty
-        # sentinel. workflow_hash_version says the same thing for the workflow
-        # scan, and needs its own column because a hash column has no such string.
-        unscanned = (
-            Picture.workflow_hash_version.is_(None)
-            if self._scanning_workflows
-            else Picture.comfyui_models.is_(None)
-        )
         return session.exec(
             select(Picture)
             .options(load_only(Picture.id, Picture.file_path, Picture.comfyui_models))
-            .where(unscanned)
-            .where(Picture.deleted.is_(False))
+            .where(*self.unscanned_clauses(self._scanning_workflows))
             .where(not_in_json(Picture.id, suppressed_ids))
             .order_by(Picture.id)
             .limit(limit)

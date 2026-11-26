@@ -105,6 +105,21 @@ describe("filterChips", () => {
     expect(filterChips(s)).toEqual([]);
   });
 
+  // The stats rail's Untagged rows narrow the grid with no menu row behind
+  // them, so the strip is the only place that says so and the only way off.
+  it.each([
+    ["pending", "Untagged waiting for the tagger"],
+    ["unprocessable", "Untagged couldn't be read"],
+    ["none", "Untagged no tags apply"],
+  ])("shows the %s tag state as a chip whose x clears it", (state, text) => {
+    const s = useFilterStore();
+    s.tagStateFilter = state;
+    expect(chipText(s)).toEqual([text]);
+    filterChips(s)[0].remove();
+    expect(s.tagStateFilter).toBe(null);
+    expect(filterChips(s)).toEqual([]);
+  });
+
   it("removes exactly the filter its chip names", () => {
     const s = useFilterStore();
     s.tagFilter = ["a", "b"];
