@@ -15,6 +15,7 @@ import { setActivePinia, createPinia } from "pinia";
 // before the module body, so a plain `const` here would still be uninitialised.
 const {
   applyPictureEvent,
+  applyReconnectDiff,
   handleMessage,
   isReadOnly,
   isFullRestoreRequestInFlight,
@@ -22,6 +23,7 @@ const {
   reloadAfterFullRestore,
 } = vi.hoisted(() => ({
   applyPictureEvent: vi.fn(() => ({ action: "ignored", reason: "test" })),
+  applyReconnectDiff: vi.fn(() => ({ action: "ignored", reason: "test" })),
   handleMessage: vi.fn(() => ({ action: "ignored", reason: "test" })),
   // Only ever read as `.value`, so a bare box stands in for the real ref
   // without dragging Vue into the hoisted block.
@@ -41,12 +43,18 @@ vi.mock("../stores/useDedupStore", () => ({
 /** The deps the socket handed the realtime sync, for its view classifier. */
 let realtimeDeps = null;
 
-vi.mock("./useGridRealtimeSync", () => ({
-  useGridRealtimeSync: (deps) => {
-    realtimeDeps = deps;
-    return { handleMessage, flushNow: vi.fn() };
-  },
-}));
+// The real `diffViewAgainstIdRead`: the reconnect tests below pin that a read
+// reaches the sync as the diff of what it found, not as raw rows.
+vi.mock("./useGridRealtimeSync", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    useGridRealtimeSync: (deps) => {
+      realtimeDeps = deps;
+      return { handleMessage, flushNow: vi.fn(), applyReconnectDiff };
+    },
+  };
+});
 
 vi.mock("../utils/fullRestoreTransition", () => ({
   isFullRestoreRequestInFlight,
@@ -73,6 +81,8 @@ import { useSelectionStore } from "../stores/useSelectionStore";
 import { useWorkflowsStore } from "../stores/useWorkflowsStore";
 import { useModelShelfStore } from "../stores/useModelShelfStore";
 import { useWorkflowTemplatesStore } from "../stores/useWorkflowTemplatesStore";
+import { useSortStore } from "../stores/useSortStore";
+import { useSnapshotsStore } from "../stores/useSnapshotsStore";
 // The real ones: the apiClient mock below spreads `importOriginal`, so a test
 // can drive an actual session transition rather than a stand-in for one.
 import { API_BASE_URL, notifySessionReset } from "../utils/apiClient";
@@ -136,6 +146,7 @@ beforeEach(() => {
   socketCount = 0;
   isReadOnly.value = false;
   applyPictureEvent.mockClear();
+  applyReconnectDiff.mockClear();
   handleMessage.mockClear();
   reloadAfterFullRestore.mockClear();
   prepareForFullRestoreTransition.mockClear();
@@ -155,11 +166,11 @@ afterEach(() => {
  * The composable registers an `onUnmounted` cleanup, so calling it bare would
  * both warn and leave the socket open between cases.
  */
-function connect({ openModel } = {}) {
+function connect({ openModel, gridContainer = ref(null) } = {}) {
   host = mount({
     setup() {
       useUpdatesSocket({
-        gridContainer: ref(null),
+        gridContainer,
         refreshSidebar: vi.fn(),
         refreshSidebarPicturesDebounced: vi.fn(),
         openModel,
@@ -226,6 +237,75 @@ describe("useUpdatesSocket: routing to the duplicate queue", () => {
       source: "ui",
     });
     expect(applyPictureEvent).not.toHaveBeenCalled();
+  });
+});
+
+// The realtime sync reaches the grid through this bridge. A comeback (a
+// restore run's slices, an undo, Ctrl+Z) is inserted with `highlight: false`,
+// and a bridge that dropped the options flashed every one as a new picture.
+describe("useUpdatesSocket: the grid bridge", () => {
+  it("hands the insert's options through to the grid", () => {
+    const insertGridImagesById = vi.fn();
+    connect({ gridContainer: ref({ insertGridImagesById }) });
+    realtimeDeps.grid.insertGridImagesById([7, 8], { highlight: false });
+    expect(insertGridImagesById).toHaveBeenCalledWith([7, 8], {
+      highlight: false,
+    });
+  });
+});
+
+// A Scrapheap run's events carry its `run_id`. A tab that is not following
+// that run picks it up from the first one, instead of once per session.
+describe("useUpdatesSocket: a Scrapheap run started elsewhere", () => {
+  async function runStore() {
+    const { useScrapheapRunStore } =
+      await import("../stores/useScrapheapRunStore");
+    const store = useScrapheapRunStore();
+    const resume = vi.spyOn(store, "resume").mockResolvedValue(null);
+    return { store, resume };
+  }
+
+  function runEvent(extra = {}) {
+    return {
+      type: "pictures_changed",
+      change_kind: "removed",
+      picture_ids: [7],
+      source: "ui",
+      origin_client_id: "another-tab",
+      run_id: "run-9",
+      run_kind: "purge",
+      ...extra,
+    };
+  }
+
+  it("follows a run it is not following, from that run's first event", async () => {
+    const { resume } = await runStore();
+    connect();
+    receive(runEvent());
+    expect(resume).toHaveBeenCalledWith({ force: true });
+  });
+
+  it("leaves the run it already follows to its poll", async () => {
+    const { store, resume } = await runStore();
+    store.run = { id: "run-9", active: true };
+    connect();
+    receive(runEvent());
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("looks for nothing on an event no run sent", async () => {
+    const { resume } = await runStore();
+    connect();
+    receive(runEvent({ run_id: undefined, run_kind: undefined }));
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("stays out of a read-only session", async () => {
+    const { resume } = await runStore();
+    isReadOnly.value = true;
+    connect();
+    receive(runEvent());
+    expect(resume).not.toHaveBeenCalled();
   });
 });
 
@@ -313,20 +393,35 @@ describe("useUpdatesSocket: connection lifecycle", () => {
     isReadOnly.value = true;
     connect();
 
-    socket.onclose({ code: 1012 });
+    socket.onclose({ code: 1012, reason: "Database restore in progress" });
 
     expect(reloadAfterFullRestore).toHaveBeenCalledTimes(1);
   });
 
-  it("uses close code 1012 when the tab missed restore_started", async () => {
+  it("uses the restore barrier's close when the tab missed restore_started", async () => {
     vi.useFakeTimers();
     connect();
 
-    socket.onclose({ code: 1012 });
+    socket.onclose({ code: 1012, reason: "Database restore in progress" });
     await vi.advanceTimersByTimeAsync(2500);
 
     expect(reloadAfterFullRestore).toHaveBeenCalledTimes(1);
     expect(socketCount).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("reconnects, and does not reload, when the server stops (a 1012 with no reason)", async () => {
+    vi.useFakeTimers();
+    connect();
+
+    // What uvicorn sends every open socket on a graceful shutdown.
+    socket.onclose({ code: 1012, reason: "" });
+    await vi.advanceTimersByTimeAsync(2500);
+
+    expect(reloadAfterFullRestore).not.toHaveBeenCalled();
+    expect(prepareForFullRestoreTransition).not.toHaveBeenCalled();
+    // A second socket: the ordinary reconnect, not a reload of the document.
+    expect(socketCount).toBe(2);
     vi.useRealTimers();
   });
 
@@ -336,12 +431,41 @@ describe("useUpdatesSocket: connection lifecycle", () => {
     connect();
 
     receive({ type: "restore_started", resource_type: "full" });
-    socket.onclose({ code: 1012 });
+    socket.onclose({ code: 1012, reason: "Database restore in progress" });
     await vi.advanceTimersByTimeAsync(2500);
 
     expect(reloadAfterFullRestore).not.toHaveBeenCalled();
     expect(socketCount).toBe(1);
     vi.useRealTimers();
+  });
+
+  it("leaves the initiating tab, and its error, in place when its full restore fails", () => {
+    isFullRestoreRequestInFlight.mockReturnValue(true);
+    connect();
+    const onRestoreFailed = vi
+      .spyOn(useSnapshotsStore(), "onRestoreFailed")
+      .mockImplementation(() => {});
+    const failed = {
+      type: "restore_failed",
+      resource_type: "full",
+      error: "The safety snapshot failed, so the restore did not start.",
+    };
+
+    receive({ type: "restore_started", resource_type: "full" });
+    receive(failed);
+
+    expect(reloadAfterFullRestore).not.toHaveBeenCalled();
+    expect(onRestoreFailed).toHaveBeenCalledWith(failed);
+  });
+
+  it("hard reloads every other tab when a started full restore fails", () => {
+    connect();
+
+    receive({ type: "restore_started", resource_type: "full" });
+    receive({ type: "restore_failed", resource_type: "full", error: "x" });
+
+    expect(prepareForFullRestoreTransition).toHaveBeenCalledTimes(1);
+    expect(reloadAfterFullRestore).toHaveBeenCalledTimes(1);
   });
 
   it("hard reloads a full restore without incremental store reads", () => {
@@ -598,6 +722,139 @@ describe("the view-changed pill while the tagger runs", () => {
   });
 });
 
+// The signal panels with counts of their own (the stats sidebar) watch. It
+// has to fire at every point the sidebar's own picture counts are refreshed,
+// and only there, or the two panels show different totals after a delete.
+describe("useUpdatesSocket: wsPicturesChanged follows the sidebar refresh", () => {
+  function mountWithSidebarSpy() {
+    const refreshSidebarPicturesDebounced = vi.fn();
+    host = mount({
+      setup() {
+        useUpdatesSocket({
+          gridContainer: ref(null),
+          refreshSidebar: vi.fn(),
+          refreshSidebarPicturesDebounced,
+        }).connectUpdatesSocket();
+        return () => null;
+      },
+    });
+    return { refreshSidebarPicturesDebounced, wsStore: useWsStore() };
+  }
+
+  it("bumps the key each time the realtime sync refreshes the sidebar", () => {
+    const { refreshSidebarPicturesDebounced, wsStore } = mountWithSidebarSpy();
+    expect(wsStore.wsPicturesChanged).toEqual({ key: 0 });
+    realtimeDeps.refreshSidebar(true);
+    realtimeDeps.refreshSidebar(false);
+    expect(refreshSidebarPicturesDebounced.mock.calls).toEqual([
+      [true],
+      [false],
+    ]);
+    expect(wsStore.wsPicturesChanged).toEqual({ key: 2 });
+  });
+
+  it("bumps the key on the likeness-groups path, which bypasses the sync", () => {
+    const { refreshSidebarPicturesDebounced, wsStore } = mountWithSidebarSpy();
+    useSortStore().selectedSort = "LIKENESS_GROUPS";
+    receive({
+      type: "pictures_changed",
+      change_kind: "removed",
+      picture_ids: [7],
+      source: "ui",
+    });
+    expect(handleMessage).not.toHaveBeenCalled();
+    expect(refreshSidebarPicturesDebounced).toHaveBeenCalledWith(true);
+    expect(wsStore.wsPicturesChanged.key).toBe(1);
+  });
+
+  // The two branches that answer before the sync hold their refresh back
+  // while this tab uploads. A cancelled or failed upload refreshes nothing on
+  // its own, so the held refresh is owed and runs once the upload ends.
+  it("owes the likeness-groups refresh held back by an upload", async () => {
+    const { refreshSidebarPicturesDebounced, wsStore } = mountWithSidebarSpy();
+    useSortStore().selectedSort = "LIKENESS_GROUPS";
+    wsStore.isUploadInProgress = true;
+    receive({
+      type: "pictures_changed",
+      change_kind: "removed",
+      picture_ids: [7],
+      source: "ui",
+    });
+    await host.vm.$nextTick();
+    expect(refreshSidebarPicturesDebounced).not.toHaveBeenCalled();
+    expect(wsStore.wsPicturesChanged.key).toBe(0);
+
+    wsStore.isUploadInProgress = false;
+    await host.vm.$nextTick();
+    expect(refreshSidebarPicturesDebounced.mock.calls).toEqual([[true]]);
+    expect(wsStore.wsPicturesChanged.key).toBe(1);
+  });
+
+  it("owes one refresh for the arrivals dropped during an upload", async () => {
+    const { refreshSidebarPicturesDebounced, wsStore } = mountWithSidebarSpy();
+    wsStore.isUploadInProgress = true;
+    receive({ type: "picture_imported", picture_ids: [7] });
+    receive({ type: "picture_imported", picture_ids: [8] });
+    await host.vm.$nextTick();
+    expect(handleMessage).not.toHaveBeenCalled();
+    expect(refreshSidebarPicturesDebounced).not.toHaveBeenCalled();
+
+    wsStore.isUploadInProgress = false;
+    await host.vm.$nextTick();
+    expect(refreshSidebarPicturesDebounced.mock.calls).toEqual([[true]]);
+    expect(wsStore.wsPicturesChanged.key).toBe(1);
+    // Paid once: the next upload that drops nothing owes nothing.
+    wsStore.isUploadInProgress = true;
+    await host.vm.$nextTick();
+    wsStore.isUploadInProgress = false;
+    await host.vm.$nextTick();
+    expect(refreshSidebarPicturesDebounced).toHaveBeenCalledOnce();
+  });
+
+  it("drops the owed refresh when the session resets", async () => {
+    const { refreshSidebarPicturesDebounced, wsStore } = mountWithSidebarSpy();
+    wsStore.isUploadInProgress = true;
+    // Let the watch see the upload start, or the end below is no change.
+    await host.vm.$nextTick();
+    receive({ type: "picture_imported", picture_ids: [7] });
+    notifySessionReset("logout"); // the store also clears the upload flag
+    await host.vm.$nextTick();
+    expect(wsStore.isUploadInProgress).toBe(false);
+    expect(refreshSidebarPicturesDebounced).not.toHaveBeenCalled();
+    expect(wsStore.wsPicturesChanged.key).toBe(0);
+  });
+
+  it("stays put for message types that do not refresh the sidebar", () => {
+    const { wsStore } = mountWithSidebarSpy();
+    receive({ type: "tags_changed", picture_ids: [7] });
+    receive({ type: "descriptions_changed", picture_ids: [7] });
+    expect(wsStore.wsPicturesChanged.key).toBe(0);
+  });
+
+  it("re-reads the counts on a reconnect, not on the first open", async () => {
+    vi.useFakeTimers();
+    const { useInboxStore } = await import("../stores/useInboxStore");
+    const { useImportFoldersStore } =
+      await import("../stores/useImportFoldersStore");
+    const inboxRefresh = vi.spyOn(useInboxStore(), "refreshSoon");
+    const foldersRefresh = vi.spyOn(useImportFoldersStore(), "refreshSoon");
+    const { refreshSidebarPicturesDebounced, wsStore } = mountWithSidebarSpy();
+    socket.onopen();
+    expect(refreshSidebarPicturesDebounced).not.toHaveBeenCalled();
+    expect(wsStore.wsPicturesChanged.key).toBe(0);
+    expect(inboxRefresh).not.toHaveBeenCalled();
+
+    socket.onclose({ code: 1006 });
+    await vi.advanceTimersByTimeAsync(2000);
+    socket.onopen();
+    expect(refreshSidebarPicturesDebounced).toHaveBeenCalledOnce();
+    expect(wsStore.wsPicturesChanged.key).toBe(1);
+    expect(inboxRefresh).toHaveBeenCalledOnce();
+    expect(foldersRefresh).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+});
+
 describe("useUpdatesSocket: text read from a picture (#1197)", () => {
   it("never counts as a change to the view", () => {
     connect();
@@ -734,6 +991,22 @@ describe("useUpdatesSocket: a moved file affects only a folder view", () => {
     connect();
     useSelectionStore().selectedFolderFilter = { inbox: true };
     expect(realtimeDeps.pictureChangeAffectsView(["file_path"])).toBe(false);
+  });
+});
+
+// The realtime sync applies this tab's own `removed` echo only in the Scrapheap,
+// where no purge removes a tile optimistically; elsewhere the echo follows a
+// soft delete whose tiles stay ghosted for the undo window.
+describe("useUpdatesSocket: the realtime sync knows when the grid is the Scrapheap", () => {
+  it("is true on the Scrapheap and false on any other view", () => {
+    connect();
+    const selection = useSelectionStore();
+    selection.selectedCharacter = "SCRAPHEAP";
+    expect(realtimeDeps.isScrapheapView()).toBe(true);
+    selection.selectedCharacter = "ALL";
+    expect(realtimeDeps.isScrapheapView()).toBe(false);
+    selection.selectedCharacter = null;
+    expect(realtimeDeps.isScrapheapView()).toBe(false);
   });
 });
 
@@ -922,5 +1195,314 @@ describe("useUpdatesSocket: a face redetect landing", () => {
     expect(update.pictureIds).toEqual([3]);
     expect(update.newFaces).toBe(0);
     expect(update.originClientId).toBe("tab-1");
+  });
+});
+
+// The server does not replay what it sent while the socket was down, so a
+// reconnect has the grid re-read its own ids once the link holds. What is
+// pinned here is the timing and the cancelling: one read per reconnect, none
+// on the first open, none for an open that does not hold, and no answer
+// applied once its socket or session has gone. What the diff then does is
+// `useGridRealtimeSync`'s, tested there.
+describe("useUpdatesSocket: the grid re-reads its ids after a reconnect", () => {
+  /** A whole-view read in which picture 2 left and picture 4 arrived. */
+  const READ = Object.freeze({
+    before: [1, 2, 3].map((id) => ({ id, stackId: null })),
+    after: [1, 2, 3].map((id) => ({ id, stackId: null })),
+    answer: [1, 3, 4].map((id) => ({ id, stack_id: null })),
+    fromStart: true,
+    toEnd: true,
+    stacked: true,
+    skipIds: [],
+  });
+
+  function gridWith(overrides = {}) {
+    const grid = {
+      isImagesLoading: vi.fn(() => false),
+      readViewForReconcile: vi.fn(async () => READ),
+      ...overrides,
+    };
+    return { grid, gridContainer: ref(grid) };
+  }
+
+  /** A read that stays out until the test answers it. */
+  function heldRead() {
+    const held = { resolve: null, signal: null };
+    held.read = vi.fn(
+      ({ signal }) =>
+        new Promise((resolve) => {
+          held.resolve = resolve;
+          held.signal = signal;
+        }),
+    );
+    return held;
+  }
+
+  /** Drop the socket, let the reconnect timer open the next one, open it. */
+  async function reconnect() {
+    socket.onclose({ code: 1006 });
+    await vi.advanceTimersByTimeAsync(2000);
+    socket.onopen();
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("reads nothing on the first open", async () => {
+    const { grid, gridContainer } = gridWith();
+    connect({ gridContainer });
+    socket.onopen();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(grid.readViewForReconcile).not.toHaveBeenCalled();
+    expect(applyReconnectDiff).not.toHaveBeenCalled();
+  });
+
+  it("reads once the link has held, and hands the sync the diff, not a reload", async () => {
+    const { grid, gridContainer } = gridWith();
+    connect({ gridContainer });
+    socket.onopen();
+    const gridStore = useGridStore();
+    const versionBefore = gridStore.gridVersion;
+    const wsKeyBefore = gridStore.wsUpdateKey;
+
+    await reconnect();
+    await vi.advanceTimersByTimeAsync(1499);
+    expect(grid.readViewForReconcile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(grid.readViewForReconcile).toHaveBeenCalledOnce();
+    expect(grid.readViewForReconcile.mock.calls[0][0].signal).toBeInstanceOf(
+      AbortSignal,
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(applyReconnectDiff.mock.calls).toEqual([
+      [{ gone: [2], added: [4], moved: [], goneCards: [[2]] }],
+    ]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(grid.readViewForReconcile).toHaveBeenCalledOnce();
+    expect(gridStore.gridVersion).toBe(versionBefore);
+    expect(gridStore.wsUpdateKey).toBe(wsKeyBefore);
+  });
+
+  it("reads once for a link that flaps, after the open that holds", async () => {
+    const { grid, gridContainer } = gridWith();
+    connect({ gridContainer });
+    socket.onopen();
+    for (let flap = 0; flap < 3; flap += 1) {
+      await reconnect();
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(grid.readViewForReconcile).not.toHaveBeenCalled();
+    await reconnect();
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(grid.readViewForReconcile).toHaveBeenCalledOnce();
+    expect(applyReconnectDiff).toHaveBeenCalledOnce();
+  });
+
+  it("aborts a read still out when the socket drops, and applies nothing", async () => {
+    const held = heldRead();
+    const { gridContainer } = gridWith({ readViewForReconcile: held.read });
+    connect({ gridContainer });
+    socket.onopen();
+    await reconnect();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(held.read).toHaveBeenCalledOnce();
+    expect(held.signal.aborted).toBe(false);
+
+    socket.onclose({ code: 1006 });
+    expect(held.signal.aborted).toBe(true);
+    held.resolve(READ);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(applyReconnectDiff).not.toHaveBeenCalled();
+  });
+
+  // A browser fires `close` after `disconnect` has already let go of the
+  // socket, so the socket's own close handler cannot be what cancels here.
+  it("cancels the wait on an intentional disconnect", async () => {
+    const { grid, gridContainer } = gridWith();
+    connect({ gridContainer });
+    socket.onopen();
+    await reconnect();
+    socket.close = () => {};
+    host.unmount();
+    host = null;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(grid.readViewForReconcile).not.toHaveBeenCalled();
+  });
+
+  it("aborts a read still out when the session resets", async () => {
+    const held = heldRead();
+    const { gridContainer } = gridWith({ readViewForReconcile: held.read });
+    connect({ gridContainer });
+    socket.onopen();
+    await reconnect();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(held.read).toHaveBeenCalledOnce();
+
+    notifySessionReset("logout");
+    expect(held.signal.aborted).toBe(true);
+    held.resolve(READ);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(applyReconnectDiff).not.toHaveBeenCalled();
+  });
+
+  it("waits for a running load to finish before it reads", async () => {
+    let loading = true;
+    const { grid, gridContainer } = gridWith({
+      isImagesLoading: vi.fn(() => loading),
+    });
+    connect({ gridContainer });
+    socket.onopen();
+    await reconnect();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(grid.readViewForReconcile).not.toHaveBeenCalled();
+
+    loading = false;
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(grid.readViewForReconcile).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(applyReconnectDiff).toHaveBeenCalledOnce();
+  });
+
+  it("applies nothing when the grid has nothing to compare", async () => {
+    const { grid, gridContainer } = gridWith({
+      readViewForReconcile: vi.fn(async () => null),
+    });
+    connect({ gridContainer });
+    socket.onopen();
+    await reconnect();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(grid.readViewForReconcile).toHaveBeenCalledOnce();
+    expect(applyReconnectDiff).not.toHaveBeenCalled();
+  });
+
+  it("logs a failed read with what it costs, and applies nothing", async () => {
+    const failure = new Error("network down");
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const { gridContainer } = gridWith({
+      readViewForReconcile: vi.fn(async () => {
+        throw failure;
+      }),
+    });
+    connect({ gridContainer });
+    socket.onopen();
+    await reconnect();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("reconnect reconcile read failed"),
+      failure,
+    );
+    expect(applyReconnectDiff).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A read of part of a long view (2..4 of 1..5) that no longer lists 3, so
+   * it cannot tell whether 3 left the view or moved out of that stretch.
+   */
+  function partialRead(readListed) {
+    return {
+      ...READ,
+      before: [1, 2, 3, 4, 5].map((id) => ({ id, stackId: null })),
+      after: [1, 2, 3, 4, 5].map((id) => ({ id, stackId: null })),
+      answer: [2, 4].map((id) => ({ id, stack_id: null })),
+      fromStart: false,
+      toEnd: false,
+      readListed,
+    };
+  }
+
+  async function reconcileWith(read) {
+    const { gridContainer } = gridWith({
+      readViewForReconcile: vi.fn(async () => read),
+    });
+    connect({ gridContainer });
+    socket.onopen();
+    await reconnect();
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  it("asks the view about a partial read's gone cards: still listed is moved", async () => {
+    const readListed = vi.fn(async () => ({ listedIds: new Set(["3"]) }));
+    await reconcileWith(partialRead(readListed));
+    expect(readListed).toHaveBeenCalledOnce();
+    expect(readListed.mock.calls[0][0]).toEqual([3]);
+    expect(readListed.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    expect(applyReconnectDiff.mock.calls).toEqual([
+      [{ gone: [], added: [], moved: [3] }],
+    ]);
+  });
+
+  it("asks the view about a partial read's gone cards: no longer listed is gone", async () => {
+    const readListed = vi.fn(async () => ({ listedIds: new Set() }));
+    await reconcileWith(partialRead(readListed));
+    expect(applyReconnectDiff.mock.calls).toEqual([
+      [{ gone: [3], added: [], moved: [] }],
+    ]);
+  });
+
+  it("asks nothing more when a partial read found no card gone", async () => {
+    const readListed = vi.fn(async () => ({ listedIds: new Set() }));
+    await reconcileWith({
+      ...partialRead(readListed),
+      answer: [2, 3, 4].map((id) => ({ id, stack_id: null })),
+    });
+    expect(readListed).not.toHaveBeenCalled();
+    expect(applyReconnectDiff).toHaveBeenCalledOnce();
+  });
+
+  it("applies nothing when the view changed during the second read", async () => {
+    const readListed = vi.fn(async () => null);
+    await reconcileWith(partialRead(readListed));
+    expect(readListed).toHaveBeenCalledOnce();
+    expect(applyReconnectDiff).not.toHaveBeenCalled();
+  });
+
+  it("logs a failed second read, and applies nothing", async () => {
+    const failure = new Error("network down");
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    await reconcileWith(
+      partialRead(
+        vi.fn(async () => {
+          throw failure;
+        }),
+      ),
+    );
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("reconnect reconcile read failed"),
+      failure,
+    );
+    expect(applyReconnectDiff).not.toHaveBeenCalled();
+  });
+
+  it("aborts a second read still out when the socket drops, and applies nothing", async () => {
+    const held = { resolve: null, signal: null };
+    const readListed = vi.fn(
+      (ids, { signal }) =>
+        new Promise((resolve) => {
+          held.resolve = resolve;
+          held.signal = signal;
+        }),
+    );
+    await reconcileWith(partialRead(readListed));
+    expect(readListed).toHaveBeenCalledOnce();
+    expect(held.signal.aborted).toBe(false);
+
+    socket.onclose({ code: 1006 });
+    expect(held.signal.aborted).toBe(true);
+    held.resolve({ listedIds: new Set() });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(applyReconnectDiff).not.toHaveBeenCalled();
   });
 });

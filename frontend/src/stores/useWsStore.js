@@ -73,6 +73,12 @@ export const useWsStore = defineStore("ws", () => {
     originClientId: null,
   });
   const wsPluginProgress = ref({ key: 0, payload: null });
+  // Signals a picture change that moves the sidebar's picture counts: bumped
+  // at every point a `pictures_changed` or `picture_imported` message asks for
+  // the debounced sidebar count refresh (useUpdatesSocket). Panels with counts
+  // of their own (the stats sidebar) watch the key and apply their own
+  // debounce, so a run's stream of events costs them one re-read per window.
+  const wsPicturesChanged = ref({ key: 0 });
   const isUploadInProgress = ref(false);
 
   // Stable per-tab client id. Mirrored into apiClient module scope so the
@@ -128,6 +134,10 @@ export const useWsStore = defineStore("ws", () => {
   const unsubscribeSessionReset = onSessionReset(() => {
     clearPendingExternalImportIds();
     clearSortChangedExternalIds();
+    // An upload in flight at sign-out never reports its end to this session:
+    // left set, it would make the socket drop every `picture_imported` the
+    // next session receives as that upload's echo.
+    isUploadInProgress.value = false;
   });
   onScopeDispose(unsubscribeSessionReset);
 
@@ -140,6 +150,7 @@ export const useWsStore = defineStore("ws", () => {
     wsOrientationUpdate,
     wsFacesUpdate,
     wsPluginProgress,
+    wsPicturesChanged,
     isUploadInProgress,
     clientId,
     pendingExternalImportIds,

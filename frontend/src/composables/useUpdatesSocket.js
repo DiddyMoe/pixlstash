@@ -3,18 +3,25 @@ import {
   API_BASE_URL,
   appendShareToken,
   isReadOnly,
+  onSessionReset,
   toBackendWebSocketUrl,
 } from "../utils/apiClient";
-import { useGridRealtimeSync } from "./useGridRealtimeSync";
+import {
+  diffViewAgainstIdRead,
+  settleGoneCards,
+  useGridRealtimeSync,
+} from "./useGridRealtimeSync";
 import { useWsStore } from "../stores/useWsStore";
 import { useGridStore } from "../stores/useGridStore";
 import { useSortStore } from "../stores/useSortStore";
 import { useFilterStore } from "../stores/useFilterStore";
 import { useSelectionStore } from "../stores/useSelectionStore";
+import { SCRAPHEAP_PICTURES_ID } from "../stores/useViewStore";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useOperationStore } from "../stores/useOperationStore";
 import { useSnapshotsStore } from "../stores/useSnapshotsStore";
 import { useDedupStore } from "../stores/useDedupStore";
+import { useScrapheapRunStore } from "../stores/useScrapheapRunStore";
 import { useMovesStore } from "../stores/useMovesStore";
 import { useImportFoldersStore } from "../stores/useImportFoldersStore";
 import { useInboxStore } from "../stores/useInboxStore";
@@ -38,6 +45,20 @@ const BACKEND_URL = API_BASE_URL;
 // one fetch-and-rebuild per event.
 const GRID_WS_COALESCE_MS = 200;
 
+// How long a reconnect waits before it re-reads the grid's ids. A link that
+// flaps opens the socket several times in a few seconds, and every open would
+// otherwise cost a read of up to 5000 rows; a close cancels the wait, so only
+// an open that holds reads.
+const RECONNECT_RECONCILE_DELAY_MS = 1500;
+
+// The close reasons the server gives code 1012 (Service Restart): a library
+// switch (pixlstash/ws/broadcaster.py) and the full-restore barrier draining
+// established sockets (pixlstash/auth.py, `_terminate_authenticated_websocket`).
+// uvicorn sends 1012 with no reason on every graceful shutdown, so a bare 1012
+// is a server going away, not a restore.
+const LIBRARY_SWITCH_CLOSE_REASON = "Library switched";
+const FULL_RESTORE_CLOSE_REASON = "Database restore in progress";
+
 /**
  * Apply the server's WebSocket close contract.
  *
@@ -46,7 +67,7 @@ const GRID_WS_COALESCE_MS = 200;
  * instead of reconnecting the socket underneath stale client state.
  */
 export function handleUpdatesSocketClose(event, { reload, reconnect }) {
-  if (event?.code === 1012 && event?.reason === "Library switched") {
+  if (event?.code === 1012 && event?.reason === LIBRARY_SWITCH_CLOSE_REASON) {
     reload();
     return;
   }
@@ -153,6 +174,7 @@ export function useUpdatesSocket({
   const operationStore = useOperationStore();
   const snapshotsStore = useSnapshotsStore();
   const dedupStore = useDedupStore();
+  const scrapheapRunStore = useScrapheapRunStore();
   const movesStore = useMovesStore();
   const importFoldersStore = useImportFoldersStore();
   const inboxStore = useInboxStore();
@@ -176,6 +198,9 @@ export function useUpdatesSocket({
   let pendingWorkflowsChange = null;
   const WORKFLOWS_CHANGED_DEBOUNCE_MS = 1000;
   let fullRestoreTransitioning = false;
+  // Whether a socket from this composable has opened before. Every later open
+  // is a reconnect, and the server does not replay what it sent in the gap.
+  let hasOpenedOnce = false;
 
   // --- WebSocket ---
   // Event types that can carry a recorded operation (the reversible metadata
@@ -263,8 +288,10 @@ export function useUpdatesSocket({
   // delegates to the ImageGrid template-ref's defineExpose'd methods (Tier-3
   // imperative API), no-oping safely if the grid isn't mounted yet.
   const gridApi = {
-    insertGridImagesById: (ids) =>
-      gridContainer.value?.insertGridImagesById?.(ids),
+    // The options carry `highlight: false` for a comeback (a restore, an
+    // undo), which must not flash as a new picture.
+    insertGridImagesById: (ids, options) =>
+      gridContainer.value?.insertGridImagesById?.(ids, options),
     refreshGridImage: (id) => gridContainer.value?.refreshGridImage?.(id),
     refreshStackFacets: (ids) => gridContainer.value?.refreshStackFacets?.(ids),
     refreshThumbnailUrls: (ids) =>
@@ -283,7 +310,68 @@ export function useUpdatesSocket({
     isLightboxOpen: () => gridContainer.value?.isLightboxOpen?.() ?? false,
     markLightboxDeferredRefresh: () =>
       gridContainer.value?.markLightboxDeferredRefresh?.(),
+    readViewForReconcile: (options) =>
+      gridContainer.value?.readViewForReconcile?.(options) ?? null,
   };
+
+  // The sidebar count refresh for a picture change, plus the signal panels with
+  // counts of their own (the stats sidebar) watch. Every `pictures_changed` and
+  // `picture_imported` path that refreshes the sidebar goes through here, so
+  // the two cannot drift apart.
+  function refreshSidebarForPictureChange(flash) {
+    refreshSidebarPicturesDebounced(flash);
+    wsStore.wsPicturesChanged = {
+      key: (wsStore.wsPicturesChanged?.key || 0) + 1,
+    };
+  }
+
+  // --- Sidebar refresh held back by an upload ------------------------------
+  // While this tab uploads, the import dialog drives the counts, so the
+  // branches here that answer before the realtime sync hold their refresh back
+  // (the sync holds its own, `owedSidebarFlash` in useGridRealtimeSync). The
+  // counts still moved, and a cancelled or failed upload refreshes nothing
+  // when it ends: the refresh is owed, and runs once when the upload ends. The
+  // value is the flash it owes (any held refresh that would have flashed makes
+  // it flash); null when none is owed.
+  let owedSidebarFlash = null;
+  function refreshSidebarUnlessUploading(flash) {
+    if (wsStore.isUploadInProgress) {
+      owedSidebarFlash = owedSidebarFlash === true || flash;
+      return;
+    }
+    refreshSidebarForPictureChange(flash);
+  }
+  watch(
+    () => wsStore.isUploadInProgress,
+    (uploading) => {
+      if (uploading || owedSidebarFlash === null) return;
+      const flash = owedSidebarFlash;
+      owedSidebarFlash = null;
+      refreshSidebarForPictureChange(flash);
+    },
+  );
+  // Sign-out also ends an upload (the store drops the flag), but the counts
+  // owed then belong to the session that is going away.
+  const stopSessionReset = onSessionReset(() => {
+    owedSidebarFlash = null;
+    // A read still out belongs to the session going away, and its ids would
+    // land on the pills after the store has cleared them.
+    cancelReconnectReconcile();
+  });
+
+  // A reconnect: whatever was sent while the socket was down (a Scrapheap run
+  // in another tab, a background import, a filing) never arrived, so re-read
+  // what those events would have moved - the sidebar's counts and lists, the
+  // Insights totals (through `wsPicturesChanged`), and the Inbox and
+  // import-folder counts. The grid is not reloaded: a reload under the user is
+  // what the "view changed" pill exists to avoid. Its changes are recovered
+  // from ids instead (`scheduleReconnectReconcile` below).
+  function resyncCountsAfterReconnect() {
+    refreshSidebarForPictureChange(false);
+    if (isReadOnly.value) return;
+    inboxStore.refreshSoon();
+    importFoldersStore.refreshSoon();
+  }
 
   function fullGridReload() {
     gridStore.wsUpdateKey = Date.now();
@@ -318,9 +406,91 @@ export function useUpdatesSocket({
     pictureChangeAffectsView,
     getSelectedSort: () => sortStore.selectedSort,
     reload: fullGridReload,
-    refreshSidebar: (flash) => refreshSidebarPicturesDebounced(flash),
+    refreshSidebar: refreshSidebarForPictureChange,
+    // The same predicate as ImageGrid's `isScrapheapView`.
+    isScrapheapView: () =>
+      String(selectionStore.selectedCharacter || "").toUpperCase() ===
+      String(SCRAPHEAP_PICTURES_ID).toUpperCase(),
     scheduler: gridWsScheduler,
   });
+
+  // --- The grid after a reconnect ------------------------------------------
+  // The server does not replay the events it sent while the socket was down,
+  // so the grid re-reads its own view's ids once the link holds, and the
+  // difference goes through the external contract (`applyReconnectDiff`): a
+  // gone picture leaves (a held removal), a new one goes on the "New
+  // pictures" pill, a move on the "View changed externally" pill. Never a
+  // reload.
+  let reconnectReconcileTimer = null;
+  let reconnectReconcileAbort = null;
+
+  function cancelReconnectReconcile() {
+    if (reconnectReconcileTimer) {
+      clearTimeout(reconnectReconcileTimer);
+      reconnectReconcileTimer = null;
+    }
+    reconnectReconcileAbort?.abort();
+    reconnectReconcileAbort = null;
+  }
+
+  function scheduleReconnectReconcile() {
+    cancelReconnectReconcile();
+    reconnectReconcileTimer = setTimeout(
+      runReconnectReconcile,
+      RECONNECT_RECONCILE_DELAY_MS,
+    );
+  }
+
+  async function runReconnectReconcile() {
+    reconnectReconcileTimer = null;
+    // A load still running may have read the list before the gap's last
+    // changes: compare with the grid it leaves, not the one it replaces.
+    if (gridApi.isImagesLoading()) {
+      scheduleReconnectReconcile();
+      return;
+    }
+    const controller = new AbortController();
+    reconnectReconcileAbort = controller;
+    const { signal } = controller;
+    let read;
+    try {
+      read = await gridApi.readViewForReconcile({ signal });
+    } catch (error) {
+      logReconnectReadFailure(signal, error);
+      return;
+    }
+    if (signal.aborted || !read) return;
+    let diff = diffViewAgainstIdRead(read);
+    // A read of part of a long view cannot tell a card that left the view
+    // from one that moved out of the stretch it read: ask the view about
+    // those cards alone.
+    if (read.readListed && diff.goneCards.length) {
+      let listed;
+      try {
+        listed = await read.readListed(diff.goneCards.flat(), { signal });
+      } catch (error) {
+        logReconnectReadFailure(signal, error);
+        return;
+      }
+      if (signal.aborted || !listed) return;
+      diff = settleGoneCards(diff, listed.listedIds);
+    }
+    gridRealtimeSync.applyReconnectDiff(diff);
+  }
+
+  function logReconnectReadFailure(signal, error) {
+    if (signal.aborted) {
+      console.debug(
+        "[useUpdatesSocket] reconnect reconcile read cancelled (socket closed or session ended)",
+        error,
+      );
+    } else {
+      console.error(
+        "[useUpdatesSocket] reconnect reconcile read failed: changes made while the socket was down are not shown until the next refresh",
+        error,
+      );
+    }
+  }
 
   function connectUpdatesSocket() {
     reconnectEnabled = true;
@@ -332,7 +502,8 @@ export function useUpdatesSocket({
 
     // A full restore replaces both the database and the authentication context.
     // The STARTED frame reaches established tabs before the server drains their
-    // sockets; close code 1012 is the fallback for a tab that missed that frame.
+    // sockets; their close (1012 with the restore reason) is the fallback for a
+    // tab that missed that frame.
     // Disconnect first so the reload cannot race the ordinary reconnect timer.
     function transitionAfterFullRestore() {
       if (fullRestoreTransitioning) return;
@@ -343,6 +514,11 @@ export function useUpdatesSocket({
 
     ws.onopen = () => {
       sendUpdatesFilters();
+      if (hasOpenedOnce) {
+        resyncCountsAfterReconnect();
+        scheduleReconnectReconcile();
+      }
+      hasOpenedOnce = true;
     };
 
     ws.onmessage = (event) => {
@@ -371,6 +547,19 @@ export function useUpdatesSocket({
       // as new to it as another tab's.
       if (payload?.type === "pictures_changed" && !isReadOnly.value) {
         dedupStore.applyPictureEvent(payload);
+      }
+      // A Scrapheap run's own events name it (`run_id`). One this tab is not
+      // following was started elsewhere, in another tab or before a reload:
+      // follow it now, so its progress and its end show here, rather than at
+      // the next Scrapheap visit or session. The store shares a read already
+      // on the wire, and leaves an active run it follows to its poll.
+      if (
+        payload?.type === "pictures_changed" &&
+        !isReadOnly.value &&
+        payload.run_id &&
+        payload.run_id !== scrapheapRunStore.run?.id
+      ) {
+        void scrapheapRunStore.resume({ force: true });
       }
       const isPictureChange =
         payload?.type === "pictures_changed" ||
@@ -455,19 +644,19 @@ export function useUpdatesSocket({
           payload?.type !== "picture_imported" &&
           pictureChangeAffectsView(payload.fields)
         ) {
-          if (!wsStore.isUploadInProgress) {
-            refreshSidebarPicturesDebounced(true);
-          }
+          refreshSidebarUnlessUploading(true);
           const nextKey = (wsStore.wsTagUpdate?.key || 0) + 1;
           wsStore.wsTagUpdate = { key: nextKey, pictureIds };
           return;
         }
         // Own upload in progress: the import dialog drives the grid; ignore the
-        // echo so it doesn't double-count or reload mid-upload.
+        // echo so it doesn't double-count or reload mid-upload. The sidebar
+        // refresh the sync would have made for the arrival is owed instead.
         if (
           wsStore.isUploadInProgress &&
           payload?.type === "picture_imported"
         ) {
+          refreshSidebarUnlessUploading(true);
           return;
         }
         // Everything else goes through the origin-aware decision table.
@@ -671,6 +860,15 @@ export function useUpdatesSocket({
         refreshSidebar();
       } else if (payload?.type === "restore_failed" && !isReadOnly.value) {
         if (payload?.resource_type === "full") {
+          if (isFullRestoreRequestInFlight()) {
+            // The initiating tab's POST carries the failure, and
+            // RestoreConfirmDialog shows it there. Reloading now would wipe
+            // that message before the person had read it.
+            snapshotsStore.onRestoreFailed(payload);
+            return;
+          }
+          // Every other tab dropped its reads on restore_started, so it must
+          // bootstrap again. A refused restore sends neither event.
           transitionAfterFullRestore();
           return;
         }
@@ -682,16 +880,27 @@ export function useUpdatesSocket({
     };
 
     ws.onclose = (event) => {
-      if (updatesSocket === ws) updatesSocket = null;
-      // Close code 1012 is overloaded. A library switch sends it with an
-      // explicit "Library switched" reason; the restore barrier and the
-      // WebSocket admission refusal send it with no reason at all. Only the
-      // reason separates them, so match the switch before the restore branches
-      // or a switch would be transitioned as though it were a restore.
+      if (updatesSocket === ws) {
+        updatesSocket = null;
+        // Another gap has begun: the read is the next open's to make.
+        cancelReconnectReconcile();
+      }
+      // Close code 1012 is overloaded, and only the reason separates its
+      // senders: a library switch, the restore barrier, and uvicorn shutting
+      // down, which gives none. A server stop must take the ordinary reconnect
+      // path below: reloading the tab into a stopped server left it on the
+      // browser's error page, with the import it was following lost.
+      // The admission refusal during a restore (broadcaster.py) closes before
+      // the handshake is accepted, which the ASGI server answers with HTTP 403
+      // and the browser reports as 1006, so no 1012 of its own reaches here
+      // (https://asgi.readthedocs.io/en/latest/specs/www.html#close-send-event).
       const isLibrarySwitch =
-        event?.code === 1012 && event?.reason === "Library switched";
+        event?.code === 1012 && event?.reason === LIBRARY_SWITCH_CLOSE_REASON;
       if (!isLibrarySwitch) {
-        if (event?.code === 1012) {
+        if (
+          event?.code === 1012 &&
+          event?.reason === FULL_RESTORE_CLOSE_REASON
+        ) {
           // The restore barrier deliberately uses Service Restart (1012). The
           // initiating tab must keep its long-running HTTP request alive; every
           // other tab immediately clears session stores and bootstraps afresh.
@@ -728,6 +937,7 @@ export function useUpdatesSocket({
 
   function disconnectUpdatesSocket() {
     reconnectEnabled = false;
+    cancelReconnectReconcile();
     if (updatesReconnectTimer) {
       clearTimeout(updatesReconnectTimer);
       updatesReconnectTimer = null;
@@ -848,6 +1058,7 @@ export function useUpdatesSocket({
     // same reset and clears both pills, which is what keeps the outgoing
     // session's picture ids from being offered to the next login in this tab.
     releaseHeldSortChangedIds();
+    stopSessionReset();
     disconnectUpdatesSocket();
     gridWsScheduler.cancel();
     if (workflowsChangedTimer) {
