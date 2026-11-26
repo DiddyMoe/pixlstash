@@ -2,7 +2,6 @@ import threading
 from collections import Counter
 from typing import Callable
 
-from .base_task import TaskStatus
 from .base_task_finder import BaseTaskFinder
 from .image_embedding_task import ImageEmbeddingTask
 from .task_outcome import Reason, RetryHold, id_sample, read_outcomes
@@ -207,12 +206,10 @@ class MissingImageEmbeddingFinder(BaseTaskFinder):
     def _settle(self, task, error) -> None:
         """Record what *task*'s outcomes say about its pictures' holds."""
         picture_ids = (getattr(task, "params", None) or {}).get("picture_ids") or []
-        if isinstance(error, TaskCancelledError) or (
-            error is None and getattr(task, "status", None) == TaskStatus.CANCELLED
-        ):
-            # It never ran, or was stopped: nothing was learnt about the
-            # pictures, and they stay eligible. A task cancelled before it
-            # started reports no error at all, only its status.
+        if isinstance(error, TaskCancelledError):
+            # It never ran, or was stopped (the runner settles both as a
+            # cancellation): nothing was learnt about the pictures, and they
+            # stay eligible.
             return
         if error is not None:
             self._hold(picture_ids, f"the task failed: {error}")

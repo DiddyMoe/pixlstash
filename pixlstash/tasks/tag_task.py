@@ -1,14 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from typing import Collection
 from sqlalchemy import func
 from sqlmodel import Session, select, delete
-import os
 import threading
 import time
 from sqlalchemy.exc import IntegrityError
 
 from PIL import Image as PILImage
-from PIL import ImageOps
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
@@ -25,6 +24,7 @@ from pixlstash.db_models.tag_prediction import (
     TagPrediction,
 )
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.image_processing.media_load import LoadFailure
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.utils.image_processing.face_utils import expand_bbox_to_square
 from pixlstash.utils.service.smart_score_invalidation import (
@@ -47,15 +47,14 @@ from pixlstash.tagger_plugins.pixlstash_tagger import (
 )
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.set_lock_service import locked_picture_ids
+from pixlstash.utils.query.predicate_filter import awaiting_tagger_clauses
+from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.unprocessable_image_registry import SignedLoad, load_signed
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
+from pixlstash.tasks.pipeline_scope import pipeline_picture_clauses
 
 
 logger = get_logger(__name__)
-
-# Extensions loaded through the video frame extractor rather than PIL. Only a
-# hint for picking the *first* decoder to try: a file whose extension lies is
-# still resolved by the shared loader in `_load_pic`.
-_VIDEO_EXTS = frozenset({".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv"})
 
 # A face's quality crop is this multiple of its box's long side, so the chin,
 # hairline and both eyes are in the window however large the face is (#1648).
@@ -84,55 +83,20 @@ CROP_TAGS_BY_KIND = {
 }
 
 
-def _is_transient_load_error(exc: BaseException) -> bool:
-    """True when *exc* means the machine failed, not that the file is corrupt.
-
-    This is the gate on `mark_unprocessable`. A mark suppresses the picture in
-    `base_task_finder._filter_and_claim`, i.e. for **every** batch finder -
-    thumbnails, embeddings and quality as well as tagging - until the file's
-    mtime/size changes, and `vault._count_missing_*` subtracts suppressed ids
-    from the "remaining" counters, so the loss does not even show in the UI.
-    Marking a good picture because the machine ran out of file descriptors would
-    therefore disable it silently for the rest of the server session.
-
-    `OSError.errno` is the discriminator, and it is exact: a real filesystem or
-    resource failure carries one (``EMFILE`` 24, ``EIO`` 5, ``ESTALE`` 116),
-    while PIL's decode failures do not - both `UnidentifiedImageError` and the
-    ``"image file is truncated"`` `OSError` leave it `None`.
-    """
-    if isinstance(exc, MemoryError):
-        return True
-    return isinstance(exc, OSError) and exc.errno is not None
-
-
-def _file_is_readable(file_path: str) -> bool:
-    """True when the file's bytes can be read at all.
-
-    The last check before declaring a picture undecodable, for the decoders that
-    swallow their own errors: `extract_representative_video_frames` returns `[]`
-    whenever `cv2.VideoCapture` fails to open, which includes failing under file
-    descriptor exhaustion. Without this, that path marks a good video.
-    """
-    try:
-        with open(file_path, "rb") as handle:
-            handle.read(1)
-        return True
-    except OSError as exc:
-        logger.warning(
-            "TagTask: %s could not be read (%s); not marking it unprocessable",
-            file_path,
-            exc,
-        )
-        return False
-
-
 def _faces_signature(faces) -> tuple:
-    """What a quality crop depends on in *faces*, to tell a stale crop."""
+    """What a quality crop depends on in *faces*, to tell a stale crop.
+
+    The box is compared as the stored ``bbox_`` text, never the parsed
+    ``bbox``: the parse is ``json.loads`` of a column the write-time validator
+    does not cover on load, so a legacy row that is not JSON raised here and
+    took down the whole preload thread. Equal text is an equal box, and
+    :meth:`TagTask._build_quality_crop` decides what a malformed one is worth.
+    """
     return tuple(
         sorted(
             (
                 getattr(face, "id", None) or 0,
-                str(face.bbox),
+                getattr(face, "bbox_", None),
                 getattr(face, "face_index", 0),
                 getattr(face, "frame_index", 0),
             )
@@ -153,8 +117,11 @@ def taggable_picture_clauses() -> tuple:
     in the scrapheap. A picture restored from the scrapheap keeps its pending
     sentinel and is picked up again on the next sweep, so nothing is lost by
     holding it out while it is deleted.
+
+    The pipeline-wide rule (:func:`pipeline_picture_clauses`), in the
+    ``deleted IS 0`` spelling this query has always used.
     """
-    return (Picture.deleted.is_(False), Picture.file_path.is_not(None))
+    return pipeline_picture_clauses(deleted_index=True)
 
 
 class TagTask(BaseTask):
@@ -242,24 +209,31 @@ class TagTask(BaseTask):
 
     _PRELOAD_WORKERS = 4
 
-    def _load_pic(self, pic) -> "tuple[str | None, PILImage.Image | None, bool]":
+    def _load_pic(
+        self, pic
+    ) -> "tuple[str | None, PILImage.Image | None, SignedLoad | None]":
         """Load *pic*'s image for tagging.
 
         Args:
             pic: The picture to load.
 
         Returns:
-            ``(file_path, image, undecodable)``. ``undecodable`` is True **only**
-            when the file's bytes were readable and still could not be decoded by
-            any loader - the sole condition under which the caller may mark it in
-            the unprocessable registry (see `_is_transient_load_error` for why
-            that distinction has to be exact).
+            ``(file_path, image, undecodable)``. ``undecodable`` is the
+            classified load (:func:`load_signed`) when the file's bytes read and
+            no loader could decode them: the sole case in which the caller may
+            mark it in the unprocessable registry, and the registry's evidence,
+            so the gate does not decode the file a second time. ``None``
+            otherwise.
 
-        The extension only picks which decoder is tried first. Whatever it says,
-        a failure falls back to `ImageUtils.load_image_or_video`, the loader the
-        thumbnail, quality and embedding tasks use, so this path can never
-        suppress a picture those pipelines are able to read - a real mp4 named
-        `.png` is common enough with re-encoded downloads to matter.
+        The file is loaded once by :func:`load_signed`, which classifies a
+        failure: an I/O error or running out of memory is the machine's, and
+        is left to retry without another attempt. Any other failure, and a
+        still that cannot be turned upright by its EXIF orientation (EXIF
+        that does not parse), falls back to
+        `ImageUtils.load_image_or_video`, the loader the thumbnail and quality
+        tasks use, so this path can never suppress a picture those pipelines
+        are able to read: a real mp4 named `.png` is common enough with
+        re-encoded downloads to matter.
         """
         file_path = ImageUtils.resolve_picture_path(self._db.image_root, pic.file_path)
         if not file_path:
@@ -267,63 +241,77 @@ class TagTask(BaseTask):
                 "TagTask: picture %s has no resolvable file path",
                 getattr(pic, "id", None),
             )
-            return None, None, False
+            return None, None, None
 
-        try:
-            ext = os.path.splitext(str(file_path))[1].lower()
-            if ext in _VIDEO_EXTS or VideoUtils.is_animated_gif(str(file_path)):
-                frames = VideoUtils.extract_representative_video_frames(
-                    str(file_path), count=1
-                )
-                if frames:
-                    return file_path, frames[0].convert("RGB"), False
-                logger.debug(
-                    "TagTask: no frames extracted from %s; trying the shared loader",
-                    file_path,
-                )
-            else:
-                # exif_transpose, because everything this image is measured
-                # against is already transposed. Face bboxes come from
-                # `load_image_bgr_reduced`, which transposes: a phone photo with
-                # orientation 6 is 4608x2592 on disk and 2592x4608 to anyone
-                # looking at it, so a recorded bbox at y=3699 lands past the
-                # bottom of the frame this loader used to return.
-                # `expand_bbox_to_square` then clamped one edge and not the
-                # other, and PIL refused the crop ("Coordinate 'lower' is less
-                # than 'upper'"). `_build_quality_crop` now refuses such a box
-                # itself, before cropping.
-                #
-                # The refusal was the loud half. The quiet half is worse: with
-                # the face nearer the top the box stayed valid and the crop came
-                # out of the wrong part of a sideways picture - and the
-                # whole-image tagging pass ran on that same sideways image, for
-                # every rotated photo in the library.
-                return (
-                    file_path,
-                    ImageOps.exif_transpose(PILImage.open(file_path)).convert("RGB"),
-                    False,
-                )
-        except Exception as exc:
-            if _is_transient_load_error(exc):
+        path = str(file_path)
+        loaded = load_signed(path, multiframe_count=1)
+        failure = loaded.result.failure
+        if failure is None:
+            frame = loaded.result.frames[0]
+            if VideoUtils.is_multiframe_file(path):
+                return file_path, frame, None
+            # Turned upright as every loader turns it
+            # (`ImageUtils.apply_exif_orientation`, which writes no EXIF back,
+            # so EXIF Pillow reads but cannot write does not stop it), because
+            # everything this image is measured against is already transposed.
+            # Face bboxes come from
+            # `load_image_bgr_reduced`, which transposes: a phone photo with
+            # orientation 6 is 4608x2592 on disk and 2592x4608 to anyone
+            # looking at it, so a recorded bbox at y=3699 lands past the
+            # bottom of the frame this loader used to return.
+            # `expand_bbox_to_square` then clamped one edge and not the other,
+            # and PIL refused the crop ("Coordinate 'lower' is less than
+            # 'upper'"). `_build_quality_crop` now refuses such a box itself,
+            # before cropping.
+            #
+            # The refusal was the loud half. The quiet half is worse: with the
+            # face nearer the top the box stayed valid and the crop came out of
+            # the wrong part of a sideways picture - and the whole-image tagging
+            # pass ran on that same sideways image, for every rotated photo in
+            # the library.
+            try:
+                upright = ImageUtils.apply_exif_orientation(frame)
+                return file_path, upright.convert("RGB"), None
+            except MemoryError as exc:
                 logger.warning(
-                    "TagTask: transient failure loading %s (%s); leaving it to retry",
+                    "TagTask: ran out of memory orienting %s (%s); leaving it to retry",
                     file_path,
                     exc,
                 )
-                return file_path, None, False
-            logger.debug(
-                "TagTask: %s did not decode by extension (%s); trying the shared loader",
+                return file_path, None, None
+            except Exception as exc:
+                logger.warning(
+                    "TagTask: %s decodes but cannot be turned upright by its "
+                    "EXIF orientation (%s: %s); trying the shared loader",
+                    file_path,
+                    type(exc).__name__,
+                    exc,
+                )
+        elif failure in (LoadFailure.IO_ERROR, LoadFailure.RESOURCE):
+            logger.warning(
+                "TagTask: transient failure loading %s (%s: %s); leaving it to retry",
                 file_path,
-                exc,
+                failure.value,
+                loaded.result.error,
+            )
+            return file_path, None, None
+        else:
+            logger.debug(
+                "TagTask: %s did not decode (%s: %s); trying the shared loader",
+                file_path,
+                failure.value,
+                loaded.result.error,
             )
 
-        # The extension lied, or the primary decoder failed on a file that is not
-        # a resource problem. Ask the loader every suppressed pipeline uses before
-        # concluding anything; it logs its own cause at ERROR.
-        array = ImageUtils.load_image_or_video(str(file_path))
+        # The extension lied, or the classified load failed on a file that is
+        # not a resource problem. Ask the loader every suppressed pipeline uses
+        # before concluding anything; it logs its own cause at ERROR.
+        array = ImageUtils.load_image_or_video(path)
         if array is not None:
-            return file_path, PILImage.fromarray(array), False
-        return file_path, None, _file_is_readable(str(file_path))
+            return file_path, PILImage.fromarray(array), None
+        if failure is not None and failure.permanent:
+            return file_path, None, loaded
+        return file_path, None, None
 
     def _build_quality_crop(
         self, pic, faces, target, preloaded_images, face_scale=FACE_CROP_SCALE
@@ -372,8 +360,8 @@ class TagTask(BaseTask):
             if img is None:
                 file_path, img, undecodable = self._load_pic(pic)
                 if img is None:
-                    if undecodable:
-                        self._mark_unprocessable(pic, file_path)
+                    if undecodable is not None:
+                        self._mark_unprocessable(pic, file_path, undecodable)
                     else:
                         # Not undecodable, so either the machine failed
                         # (retry it, mark nothing) or the file's whole
@@ -440,8 +428,9 @@ class TagTask(BaseTask):
         """Hold *pic* out of the finders while its file's location is gone.
 
         The counterpart to :meth:`_mark_unprocessable`, and deliberately NOT a
-        sentinel deletion. Everything `_is_transient_load_error` classes as
-        "the machine failed, not the file" is un-suppressed, so retiring an
+        sentinel deletion. Everything `_load_pic` classes as "the machine
+        failed, not the file" (an I/O error, running out of memory) is
+        un-suppressed, so retiring an
         unresolved picture would also retire the whole batch behind one
         stalled DataLoader (`wd14.tag_images` returns ``{}`` for all of them)
         or one swallowed ONNX error - and a deleted sentinel never comes back,
@@ -469,13 +458,13 @@ class TagTask(BaseTask):
             reason="tag source location is not mounted",
         )
 
-    def _mark_unprocessable(self, pic, file_path) -> None:
+    def _mark_unprocessable(self, pic, file_path, load: SignedLoad) -> None:
         """Record *pic* as undecodable so the finders stop re-selecting it (#585).
 
         Mirrors `thumbnail_generation_task` / `quality_task`: the registry is
         optional on the database object, and its absence degrades to a warning
-        rather than a crash. Only ever called for a genuinely undecodable file -
-        see `_load_pic`'s ``undecodable`` flag.
+        rather than a crash. Only ever called for a genuinely undecodable file,
+        with *load*, `_load_pic`'s classified load, as the registry's evidence.
         """
         registry = getattr(self._db, "unprocessable_images", None)
         if registry is not None:
@@ -483,6 +472,7 @@ class TagTask(BaseTask):
                 getattr(pic, "id", None),
                 str(file_path),
                 reason="tag source could not be decoded",
+                load=load,
             )
         else:
             logger.warning(
@@ -1495,11 +1485,13 @@ class TagTask(BaseTask):
             and is_plugin_model_version(row.model_version) == writing_as_plugin
         ]
         if stale_rows:
-            session.exec(
-                delete(TagPrediction).where(
-                    TagPrediction.id.in_([row.id for row in stale_rows])
+            # One id per stale row is pictures x tags, past the 999 variables
+            # older SQLite builds bind; each DELETE is keyed on the id, so the
+            # chunks delete exactly the same rows.
+            for id_chunk in chunked([row.id for row in stale_rows]):
+                session.exec(
+                    delete(TagPrediction).where(TagPrediction.id.in_(id_chunk))
                 )
-            )
             # Remove from map so they are not treated as existing below.
             for row in stale_rows:
                 existing_map.pop((row.picture_id, row.tag), None)
@@ -1636,16 +1628,31 @@ class TagTask(BaseTask):
         return written
 
     @staticmethod
-    def count_missing_tags(session: Session) -> int:
-        """Count pictures with a pending-retag sentinel (awaiting tagging)."""
-        has_sentinel = Tag.tag.like(
-            TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
-        )
+    def count_missing_tags(
+        session: Session, suppressed_ids: Collection[int] = frozenset()
+    ) -> int:
+        """Count the pictures awaiting tagging: the work the finder will hand out.
+
+        Exactly `awaiting_tagger_clauses`, the definition `MissingTagFinder`
+        selects with: a pending-retag sentinel on a taggable picture (not
+        scrapheaped, has a file), not frozen by a locked set, and not
+        suppressed by the unprocessable registry. Counting a picture the
+        finder leaves out is what kept the progress bar short of done for ever
+        on a library with one unreadable file. Two deliberate differences: a
+        picture still waiting for its faces IS counted (the finder takes it
+        once they land), and so is a picture re-tagged with real tags kept
+        (`retag_face_crops` keeps every tag the crops did not write), which the
+        stats "Waiting for the tagger" row leaves out because that row splits
+        the untagged pictures only.
+
+        Args:
+            session: Active database session.
+            suppressed_ids: ``unprocessable_images.active_suppressed_ids()``.
+        """
         result = session.exec(
             select(func.count())
             .select_from(Picture)
-            .where(Picture.tags.any(has_sentinel))
-            .where(*taggable_picture_clauses())
+            .where(*awaiting_tagger_clauses(suppressed_ids))
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]

@@ -1,3 +1,4 @@
+import http.server
 import os
 import shutil
 import threading
@@ -5,9 +6,11 @@ import time
 from datetime import datetime, timezone
 
 import logging
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import requests
 import torch
 from PIL import Image as PILImage
 from sqlmodel import Session, select, text
@@ -16,8 +19,12 @@ from pixlstash.db_models import Picture
 from pixlstash.tasks import image_embedding_task as embedding_module
 from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
 from pixlstash.tasks.task_outcome import Outcome, Reason
+from pixlstash.utils import bounded_http
+from pixlstash.utils import unprocessable_image_registry as registry_module
+from pixlstash.utils.bounded_http import MAX_REDIRECTS, BoundedResponse, bounded_get
 from pixlstash.utils.image_processing.media_load import LoadFailure
 from pixlstash.vault import Vault
+from tests.test_bounded_http import allow_local_link
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
 
@@ -95,7 +102,7 @@ def test_empty_embedding_blob_is_work_again_after_the_0112_reset(tmp_path):
             batch=[(missing_id, str(tmp_path / "missing.jpg"))],
         )
         result = task._process_preloaded(
-            [(missing_id, "missing.jpg", None, None, None, LoadFailure.RESOURCE)]
+            [(missing_id, "missing.jpg", None, None, None, LoadFailure.RESOURCE, None)]
         )
         assert result["changed"] == []
         assert result["outcomes"] == [
@@ -306,6 +313,142 @@ def test_the_embedding_preload_keeps_only_what_clip_reads(tmp_path, clip_loaded)
             assert tensor is None
 
 
+def test_a_cached_clip_checkpoint_gets_the_transform_the_tag_gives(tmp_path):
+    """Loaded from the Hugging Face cache by path, CLIP preprocesses images
+    exactly as it does when open_clip resolves the tag itself."""
+    import open_clip
+
+    from pixlstash.tagger_plugins.clip_service import (
+        CLIP_MODEL_NAME,
+        CLIP_MODEL_WEIGHTS,
+        _cached_load_kwargs,
+    )
+
+    # Never read: with load_weights=False open_clip only checks it exists.
+    weights = tmp_path / "open_clip_model.safetensors"
+    weights.write_bytes(b"")
+    tag_cfg = open_clip.get_pretrained_cfg(CLIP_MODEL_NAME, CLIP_MODEL_WEIGHTS)
+
+    _model, _, by_tag = open_clip.create_model_and_transforms(
+        CLIP_MODEL_NAME, pretrained=CLIP_MODEL_WEIGHTS, load_weights=False
+    )
+    _model, _, by_path = open_clip.create_model_and_transforms(
+        CLIP_MODEL_NAME,
+        load_weights=False,
+        **_cached_load_kwargs(str(weights), tag_cfg),
+    )
+
+    assert repr(by_path) == repr(by_tag)
+
+
+# The tag's config as open_clip 4.2 gives it, so the load tests below need
+# neither open_clip nor the network.
+_CLIP_TAG_CFG = {
+    "url": "",
+    "hf_hub": "example-org/example-clip/",
+    "mean": (0.48145466, 0.4578275, 0.40821073),
+    "std": (0.26862954, 0.26130258, 0.27577711),
+    "interpolation": "bicubic",
+    "resize_mode": "shortest",
+}
+
+
+def _clip_load_with(monkeypatch, hf_hub_download):
+    """Run ``ClipService._load`` against a fake open_clip and the given
+    ``hf_hub_download``; return the keyword arguments each model build got."""
+    import sys
+
+    import huggingface_hub
+
+    from pixlstash.tagger_plugins.clip_service import ClipService
+
+    built = []
+
+    class _Model:
+        def to(self, device):
+            return self
+
+        def half(self):
+            return self
+
+    def _create(name, **kwargs):
+        built.append(kwargs)
+        return _Model(), None, object()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "open_clip",
+        SimpleNamespace(
+            create_model_and_transforms=_create,
+            get_pretrained_cfg=lambda name, tag: dict(_CLIP_TAG_CFG),
+            get_tokenizer=lambda name: object(),
+        ),
+    )
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
+    ClipService(device="cpu")._load()
+    return built
+
+
+def test_clip_weights_already_downloaded_load_without_asking_the_hub(monkeypatch):
+    """With the checkpoint in the cache, the load is by path: open_clip,
+    given the tag, asked the hub for its metadata on every load."""
+    asked = []
+
+    def _download(*, repo_id, filename, local_files_only=False):
+        asked.append((repo_id, filename, local_files_only))
+        assert local_files_only, "the load asked the hub"
+        return f"/example/cache/{filename}"
+
+    built = _clip_load_with(monkeypatch, _download)
+
+    assert asked == [("example-org/example-clip", "open_clip_model.safetensors", True)]
+    assert built == [
+        {
+            "pretrained": "/example/cache/open_clip_model.safetensors",
+            "image_mean": _CLIP_TAG_CFG["mean"],
+            "image_std": _CLIP_TAG_CFG["std"],
+            "image_interpolation": "bicubic",
+            "image_resize_mode": "shortest",
+            "force_quick_gelu": False,
+        }
+    ]
+
+
+def test_clip_weights_not_yet_downloaded_are_fetched_by_the_tag_and_logged(
+    monkeypatch, caplog
+):
+    """Only a cache miss sends the load to the network, under both names
+    open_clip downloads."""
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    from pixlstash.tagger_plugins.clip_service import CLIP_MODEL_WEIGHTS
+
+    asked = []
+
+    def _download(*, repo_id, filename, local_files_only=False):
+        asked.append(filename)
+        raise LocalEntryNotFoundError(f"example: {filename} is not cached")
+
+    with caplog.at_level(logging.INFO, logger="pixlstash.tagger_plugins.clip_service"):
+        built = _clip_load_with(monkeypatch, _download)
+
+    assert asked == ["open_clip_model.safetensors", "open_clip_pytorch_model.bin"]
+    assert built == [{"pretrained": CLIP_MODEL_WEIGHTS}]
+    assert "Downloading the CLIP weights" in caplog.text
+
+
+def test_a_cache_that_cannot_be_read_fails_the_clip_load_rather_than_downloading(
+    monkeypatch,
+):
+    """Any error other than a miss is not a reason to go to the network."""
+
+    def _download(*, repo_id, filename, local_files_only=False):
+        raise PermissionError("example: the cache is not readable")
+
+    with pytest.raises(PermissionError):
+        _clip_load_with(monkeypatch, _download)
+
+
 def test_an_animated_gif_preloads_three_frames_and_a_still_gif_one(tmp_path):
     """An animated GIF is averaged over the frames a video is (#1487)."""
     from PIL import Image as PILImage
@@ -450,7 +593,7 @@ def test_a_failure_never_erases_an_embedding_already_stored(
     img = PILImage.new("RGB", (32, 24), "teal")
     if failure == "load":
         workflow = _RecordingWorkflow()
-        preloaded = [(pid, "p.png", None, None, None, LoadFailure.RESOURCE)]
+        preloaded = [(pid, "p.png", None, None, None, LoadFailure.RESOURCE, None)]
         expected = (pid, Outcome.FAILED_RETRYABLE, Reason.RESOURCE)
     else:
         workflow = _FailingWorkflow(_raise(RuntimeError("test-boom")))
@@ -513,6 +656,44 @@ def test_one_batch_reports_each_picture_in_batch_order(shared_vault, no_scorer):
     assert not shared_vault.db.unprocessable_images.is_suppressed(good)
     assert _stored(shared_vault, broken) == (None, None)
     assert _stored(shared_vault, good)[0] is not None
+
+
+def test_marking_an_undecodable_file_does_not_decode_it_again(
+    shared_vault, no_scorer, monkeypatch
+):
+    """The preload's classified load is the registry's evidence: the file is
+    decoded once, still marked, and pinned to the signature taken before that
+    one decode."""
+    path = os.path.join(shared_vault.db.image_root, "test-broken-once.jpg")
+    with open(path, "wb") as handle:
+        handle.write(b"test- these bytes are not a JPEG either \xff\xd8\x00")
+    broken = _add_picture(shared_vault, "test-broken-once.jpg")
+    decodes = []
+    real = registry_module.load_pil_classified
+
+    def counting(file_path, *, multiframe_count):
+        decodes.append(file_path)
+        return real(file_path, multiframe_count=multiframe_count)
+
+    monkeypatch.setattr(registry_module, "load_pil_classified", counting)
+    task = ImageEmbeddingTask(
+        database=shared_vault.db,
+        clip_workflow=_RecordingWorkflow(),
+        batch=[(broken, path)],
+    )
+
+    task._preload_images_task()
+    result = task._process_preloaded(task._wait_for_preload())
+
+    assert result["outcomes"] == [
+        (broken, Outcome.FAILED_PERMANENT, Reason.UNDECODABLE)
+    ]
+    assert decodes == [path], "one classified decode, shared with the gate"
+    registry = shared_vault.db.unprocessable_images
+    assert registry.is_suppressed(broken)
+    stat = os.stat(path)
+    _, mtime_ns, size = registry.snapshot()[broken]
+    assert (mtime_ns, size) == (stat.st_mtime_ns, stat.st_size)
 
 
 @pytest.mark.parametrize(
@@ -722,7 +903,7 @@ def stuck_decode(monkeypatch):
     started = threading.Event()
     release = threading.Event()
     seen = []
-    load = embedding_module.load_pil_classified
+    load = embedding_module.load_signed
 
     def blocking_load(path, **kwargs):
         name = os.path.basename(path)
@@ -732,7 +913,7 @@ def stuck_decode(monkeypatch):
             release.wait(10)
         return load(path, **kwargs)
 
-    monkeypatch.setattr(embedding_module, "load_pil_classified", blocking_load)
+    monkeypatch.setattr(embedding_module, "load_signed", blocking_load)
     yield started, release, seen
     release.set()
 
@@ -892,14 +1073,14 @@ def test_a_decode_that_raises_fails_only_its_own_picture(
     """An exception the loader did not classify is retried, never marked."""
     bad, bad_path = _png(shared_vault, f"test-decode-raises-{reason.value}.png")
     good, good_path = _png(shared_vault, f"test-decodes-fine-{reason.value}.png")
-    load = embedding_module.load_pil_classified
+    load = embedding_module.load_signed
 
     def raising_load(path, **kwargs):
         if os.path.basename(path).startswith("test-decode-raises"):
             raise exc
         return load(path, **kwargs)
 
-    monkeypatch.setattr(embedding_module, "load_pil_classified", raising_load)
+    monkeypatch.setattr(embedding_module, "load_signed", raising_load)
     task = ImageEmbeddingTask(
         database=shared_vault.db,
         clip_workflow=_RecordingWorkflow(),
@@ -943,3 +1124,229 @@ def test_the_scrapheap_and_rows_without_a_file_are_not_embedding_work(shared_vau
     assert deleted not in ids
     assert no_file not in ids
     assert shared_vault.db.run_task(counted) == before + 1
+
+
+# A scorer that cannot be loaded (offline, a half-written download) used
+# to switch aesthetic scoring off until the server was restarted.
+
+
+@pytest.fixture
+def offline_scorer(tmp_path, monkeypatch):
+    """No scorer on disk, a download that fails, and a clock the test moves."""
+    now = {"t": 5000.0}
+    monkeypatch.setattr(
+        embedding_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now["t"],
+            perf_counter=time.perf_counter,
+            sleep=time.sleep,
+        ),
+    )
+    monkeypatch.setattr(embedding_module, "CLIP_MODEL_NAME", "ViT-B-32")
+    monkeypatch.setattr(embedding_module, "builtin_model_dir", lambda: str(tmp_path))
+    downloads = []
+
+    def offline(url, **kwargs):
+        downloads.append(url)
+        raise requests.ConnectionError("offline")
+
+    monkeypatch.setattr(embedding_module, "bounded_get", offline)
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_model", None)
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_disabled", None)
+    monkeypatch.setattr(
+        ImageEmbeddingTask, "_aesthetic_load_failures", 0, raising=False
+    )
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_retry_at", None, raising=False)
+    path = os.path.join(
+        str(tmp_path), ImageEmbeddingTask.AESTHETIC_MODELS["ViT-B-32"]["filename"]
+    )
+    return now, downloads, path
+
+
+def test_a_scorer_that_cannot_load_is_tried_again_later(offline_scorer, caplog):
+    now, downloads, path = offline_scorer
+    task = ImageEmbeddingTask(None, None, [])
+    base = getattr(ImageEmbeddingTask, "AESTHETIC_RETRY_BASE_S", 60.0)
+
+    with caplog.at_level(logging.ERROR, logger=embedding_module.__name__):
+        task._ensure_model()
+    assert len(downloads) == 1
+    assert ImageEmbeddingTask._aesthetic_model is None
+    failed = [r for r in caplog.records if "aesthetic" in r.getMessage().lower()]
+    assert len(failed) == 1, [r.getMessage() for r in caplog.records]
+    message = failed[0].getMessage()
+    assert "ConnectionError" in message and path in message, message
+    assert f"{base:.0f} s" in message, message
+
+    # While it waits, the score is not work: the finder does not hand the same
+    # pictures back batch after batch, and no batch downloads it again.
+    assert ImageEmbeddingTask._is_aesthetic_disabled() is True
+    for _ in range(3):
+        task._ensure_model()
+    assert len(downloads) == 1
+
+    now["t"] += base
+    assert ImageEmbeddingTask._is_aesthetic_disabled() is False
+    task._ensure_model()
+    assert len(downloads) == 2, "tried again once the wait is over"
+
+    # The next wait is longer.
+    now["t"] += base
+    assert ImageEmbeddingTask._is_aesthetic_disabled() is True
+    now["t"] += base
+
+    torch.save(torch.nn.Linear(512, 1).state_dict(), path)
+    assert ImageEmbeddingTask._is_aesthetic_disabled() is False
+    task._ensure_model()
+    assert ImageEmbeddingTask._aesthetic_model is not None
+    assert ImageEmbeddingTask._is_aesthetic_disabled() is False
+    assert ImageEmbeddingTask._aesthetic_load_failures == 0
+
+
+def test_the_wait_before_the_scorer_is_loaded_again_is_capped(offline_scorer):
+    now, downloads, _ = offline_scorer
+    task = ImageEmbeddingTask(None, None, [])
+    waits = []
+    for _ in range(12):
+        task._ensure_model()
+        waits.append(ImageEmbeddingTask._aesthetic_retry_at - now["t"])
+        now["t"] = ImageEmbeddingTask._aesthetic_retry_at
+    assert len(downloads) == 12
+    assert waits == sorted(waits)
+    assert max(waits) == ImageEmbeddingTask.AESTHETIC_RETRY_MAX_S
+
+
+def test_a_clip_model_with_no_scorer_stays_without_one(offline_scorer, monkeypatch):
+    # A configuration state, not a failure: nothing to wait for or retry.
+    now, downloads, _ = offline_scorer
+    monkeypatch.setattr(embedding_module, "CLIP_MODEL_NAME", "ViT-H-14")
+    task = ImageEmbeddingTask(None, None, [])
+    task._ensure_model()
+    now["t"] += 10**6
+    assert ImageEmbeddingTask._is_aesthetic_disabled() is True
+    assert downloads == []
+
+
+# The scorer download is bounded: a deadline, a byte cap, and
+# only checked redirects (https, public hosts) followed.
+
+
+def test_the_scorer_download_is_bounded_and_written_whole(offline_scorer, monkeypatch):
+    _, _, path = offline_scorer
+    asked = []
+
+    def download(url, **kwargs):
+        asked.append(kwargs)
+        kwargs["sink"](b"scorer-")
+        kwargs["sink"](b"bytes")
+        return BoundedResponse(url, 200, b"")
+
+    monkeypatch.setattr(embedding_module, "bounded_get", download)
+    ImageEmbeddingTask._download_aesthetic_model("https://example.com/s.pth", path)
+    (kwargs,) = asked
+    assert kwargs["deadline_s"] == ImageEmbeddingTask.AESTHETIC_DOWNLOAD_DEADLINE_S
+    assert kwargs["max_bytes"] == ImageEmbeddingTask.AESTHETIC_DOWNLOAD_MAX_BYTES
+    assert kwargs["timeout"] == ImageEmbeddingTask.AESTHETIC_DOWNLOAD_TIMEOUT_S
+    assert kwargs["redirects"] == MAX_REDIRECTS
+    with open(path, "rb") as handle:
+        assert handle.read() == b"scorer-bytes"
+    assert not os.path.exists(f"{path}.part")
+
+
+class _ScorerHost(http.server.BaseHTTPRequestHandler):
+    """Answers ``/big`` with more bytes than the test's cap, ``/moved`` with a
+    redirect to plain http, and anything else with 404."""
+
+    def do_GET(self):
+        if self.path == "/big":
+            body = b"x" * 8192
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/moved":
+            self.send_response(302)
+            self.send_header(
+                "Location", f"http://127.0.0.1:{self.server.server_port}/big"
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def log_message(self, *args):
+        """Quiet: the test asserts on the task's own log."""
+
+
+@pytest.fixture
+def scorer_host(monkeypatch):
+    """A local stand-in for the scorer's host, never through a proxy."""
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    host = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ScorerHost)
+    thread = threading.Thread(target=host.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{host.server_port}"
+    finally:
+        host.shutdown()
+        host.server_close()
+        thread.join(10)
+
+
+def _scorer_at(monkeypatch, url):
+    models = dict(ImageEmbeddingTask.AESTHETIC_MODELS)
+    models["ViT-B-32"] = {**models["ViT-B-32"], "url": url}
+    monkeypatch.setattr(ImageEmbeddingTask, "AESTHETIC_MODELS", models)
+
+
+@pytest.mark.parametrize(
+    "where, why",
+    [
+        ("/big", "ResponseTooLarge"),
+        ("/moved", "RedirectRefused"),
+        ("/missing", "HTTP 404"),
+    ],
+)
+def test_a_scorer_download_past_its_bounds_leaves_no_file(
+    offline_scorer, scorer_host, monkeypatch, caplog, where, why
+):
+    """Over the cap, redirected to plain http, or not found: the load fails
+    and is tried again later, and nothing half-written is left to load."""
+    _, _, path = offline_scorer
+    monkeypatch.setattr(embedding_module, "bounded_get", bounded_get)
+    # The stand-in host is plain http on this computer, which the link's own
+    # check refuses (the next test); its redirects are still checked for real.
+    allow_local_link(monkeypatch, bounded_http, scorer_host)
+    monkeypatch.setattr(ImageEmbeddingTask, "AESTHETIC_DOWNLOAD_MAX_BYTES", 1024)
+    _scorer_at(monkeypatch, f"{scorer_host}{where}")
+    task = ImageEmbeddingTask(None, None, [])
+    with caplog.at_level(logging.ERROR, logger=embedding_module.__name__):
+        task._ensure_model()
+    assert ImageEmbeddingTask._aesthetic_model is None
+    assert ImageEmbeddingTask._aesthetic_load_failures == 1
+    assert why in caplog.text, caplog.text
+    assert not os.path.exists(path)
+    assert not os.path.exists(f"{path}.part")
+
+
+def test_a_scorer_link_that_is_not_public_https_is_refused(
+    offline_scorer, scorer_host, monkeypatch, caplog
+):
+    """The scorer's link is checked like each redirect it follows: one to
+    plain http on this computer is refused, and nothing is written."""
+    _, _, path = offline_scorer
+    monkeypatch.setattr(embedding_module, "bounded_get", bounded_get)
+    _scorer_at(monkeypatch, f"{scorer_host}/big")
+    task = ImageEmbeddingTask(None, None, [])
+    with caplog.at_level(logging.ERROR, logger=embedding_module.__name__):
+        task._ensure_model()
+    assert ImageEmbeddingTask._aesthetic_model is None
+    assert ImageEmbeddingTask._aesthetic_load_failures == 1
+    assert "TargetRefused: The link to 127.0.0.1 is not https" in caplog.text
+    assert "could not be loaded, 1 failed attempt:" in caplog.text, caplog.text
+    assert not os.path.exists(path)
+    assert not os.path.exists(f"{path}.part")

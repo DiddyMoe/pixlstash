@@ -19,13 +19,14 @@ from pixlstash.services.scrapheap_service import file_location_is_unreachable
 from pixlstash.tagger_plugins.clip_service import CLIP_MODEL_NAME
 
 from pixlstash.utils.image_processing.image_utils import ImageUtils
-from pixlstash.utils.image_processing.media_load import (
-    LoadFailure,
-    load_pil_classified,
-)
+from pixlstash.utils.image_processing.media_load import LoadFailure
+from pixlstash.utils.unprocessable_image_registry import SignedLoad, load_signed
+from pixlstash.utils.bounded_http import MAX_REDIRECTS, bounded_get
+from pixlstash.utils.model_utils import ml_imports
 from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
+from pixlstash.tasks.pipeline_scope import pipeline_picture_clauses
 from pixlstash.tasks.task_outcome import Outcome, Reason, id_sample, outcomes_payload
 from pixlstash.utils.vram_utils import is_vram_oom
 
@@ -82,9 +83,27 @@ class ImageEmbeddingTask(BaseTask):
         },
     }
     AESTHETIC_SUPPORTED_CLIP = set(AESTHETIC_MODELS.keys())
+    #: Wait after a scorer that failed to load, seconds; it doubles with each
+    #: failure in a row up to AESTHETIC_RETRY_MAX_S. While it lasts the score is
+    #: not work, so the finder does not hand the same pictures back per batch.
+    AESTHETIC_RETRY_BASE_S = 60.0
+    AESTHETIC_RETRY_MAX_S = 1800.0
+    #: The scorer download's bounds. A scorer is a few megabytes at most; the
+    #: hosts send it on to a CDN, so a few https redirects to public hosts are
+    #: followed (``bounded_http.vet_redirect_target``).
+    AESTHETIC_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024
+    AESTHETIC_DOWNLOAD_DEADLINE_S = 300.0
+    AESTHETIC_DOWNLOAD_TIMEOUT_S = 30.0
 
     _aesthetic_model = None
+    #: True when the CLIP model has no scorer at all: a configuration state,
+    #: never set by a failed load.
     _aesthetic_disabled: Optional[bool] = None
+    # A failed load: how many in a row, and the time.monotonic() before which
+    # it is not tried again. Written under _aesthetic_load_lock.
+    _aesthetic_load_failures = 0
+    _aesthetic_retry_at: Optional[float] = None
+    _aesthetic_load_lock = threading.Lock()
 
     def __init__(self, database, clip_workflow, batch: list):
         """
@@ -222,21 +241,26 @@ class ImageEmbeddingTask(BaseTask):
             full_path = ImageUtils.resolve_picture_path(self._db.image_root, file_path)
             if not full_path:
                 logger.error("EmbedPreload: picture %s has no file path", pid)
-                return [(pid, file_path, None, None, None, LoadFailure.UNCLASSIFIED)]
-            loaded = load_pil_classified(full_path, multiframe_count=3)
-            if loaded.failure is not None:
+                return [
+                    (pid, file_path, None, None, None, LoadFailure.UNCLASSIFIED, None)
+                ]
+            # The registry's evidence too, so the gate does not decode the
+            # file a second time.
+            loaded = load_signed(full_path, multiframe_count=3)
+            failure = loaded.result.failure
+            if failure is not None:
                 logger.log(
                     logging.ERROR
-                    if loaded.failure is LoadFailure.UNCLASSIFIED
+                    if failure is LoadFailure.UNCLASSIFIED
                     else logging.WARNING,
                     "EmbedPreload: could not load picture %s (%s): %s, %s",
                     pid,
                     file_path,
-                    loaded.failure.value,
-                    loaded.error,
+                    failure.value,
+                    loaded.result.error,
                 )
-                return [(pid, file_path, None, None, None, loaded.failure)]
-            images = loaded.frames
+                return [(pid, file_path, None, None, None, failure, loaded)]
+            images = loaded.result.frames
             # Hashed from the full frame, then dropped (#2748): the original
             # held to the end of the batch, beside its tensor, is what kept
             # 6.6 GB per batch of 64 24 MP photos.
@@ -491,9 +515,17 @@ class ImageEmbeddingTask(BaseTask):
 
     @classmethod
     def _is_aesthetic_disabled(cls):
+        """Whether aesthetic scores are left out of the work for now.
+
+        For good when the CLIP model has no scorer; for the wait after a load
+        that failed, after which the next batch loads it again.
+        """
         if cls._aesthetic_disabled is None:
             cls._aesthetic_disabled = cls._aesthetic_config() is None
-        return bool(cls._aesthetic_disabled)
+        if cls._aesthetic_disabled:
+            return True
+        retry_at = cls._aesthetic_retry_at
+        return retry_at is not None and time.monotonic() < retry_at
 
     @classmethod
     def count_remaining(
@@ -575,16 +607,20 @@ class ImageEmbeddingTask(BaseTask):
         and walk every live row, instead of the two partial missing-column
         indexes, which have no ``deleted`` column to outbid it with (see
         ``Picture.__table_args__``). ``IS NOT`` is not an indexable term, and
-        ``deleted`` is never NULL, so the rows are the same.
+        ``deleted`` is never NULL, so the rows are the same. This is the
+        pipeline-wide rule, :func:`pipeline_picture_clauses`.
         """
-        return (Picture.deleted.is_not(True), Picture.file_path.is_not(None))
+        return pipeline_picture_clauses()
 
     @classmethod
     def release_models(cls):
         cls._aesthetic_model = None
 
     def _settle_load_failures(
-        self, failures: dict[int, LoadFailure], batch_files: dict
+        self,
+        failures: dict[int, LoadFailure],
+        loads: "dict[int, SignedLoad | None]",
+        batch_files: dict,
     ) -> dict:
         """The outcome of each picture that could not be loaded.
 
@@ -599,6 +635,11 @@ class ImageEmbeddingTask(BaseTask):
         Everything else (no file descriptor left, an I/O error on a mounted
         disk, an exception nobody classified) is retryable, and the finder
         holds it back for a while instead.
+
+        *loads* holds the preload's classified load of each picture in
+        *failures* (``None`` for one with no file path). It is the registry's
+        evidence for a permanent failure, so the gate does not decode the file
+        a second time.
 
         Returns:
             ``{pid: (Outcome, Reason)}`` for every picture in *failures*.
@@ -629,6 +670,7 @@ class ImageEmbeddingTask(BaseTask):
                     pid,
                     full_path,
                     reason=f"image could not be decoded ({failure.value})",
+                    load=loads[pid],
                 )
         return settled
 
@@ -697,24 +739,67 @@ class ImageEmbeddingTask(BaseTask):
             ImageEmbeddingTask._aesthetic_disabled = True
             return
 
+        with ImageEmbeddingTask._aesthetic_load_lock:
+            # Another batch may have loaded it, or failed to, while this one
+            # waited for the lock.
+            if (
+                ImageEmbeddingTask._aesthetic_model is not None
+                or self._is_aesthetic_disabled()
+            ):
+                return
+            self._load_aesthetic_model(config)
+
+    @classmethod
+    def _download_aesthetic_model(cls, model_url: str, model_path: str) -> None:
+        """Download the scorer to *model_path*, whole or not at all.
+
+        The bytes go to a ``.part`` file beside it, renamed into place only
+        once the whole answer is in, so a download cut off by its deadline or
+        cap never leaves a file the next load would take for the scorer.
+
+        Raises:
+            requests.RequestException: The download failed, was refused a
+                redirect, ran past its deadline or cap, or was not answered
+                with 200.
+        """
+        partial = f"{model_path}.part"
+        try:
+            with open(partial, "wb") as handle:
+                response = bounded_get(
+                    model_url,
+                    deadline_s=cls.AESTHETIC_DOWNLOAD_DEADLINE_S,
+                    max_bytes=cls.AESTHETIC_DOWNLOAD_MAX_BYTES,
+                    timeout=cls.AESTHETIC_DOWNLOAD_TIMEOUT_S,
+                    sink=handle.write,
+                    redirects=MAX_REDIRECTS,
+                )
+            if response.status_code != 200:
+                raise requests.HTTPError(
+                    f"{response.url} answered HTTP {response.status_code}: "
+                    f"{response.excerpt()}"
+                )
+            os.replace(partial, model_path)
+        finally:
+            if os.path.exists(partial):
+                os.remove(partial)
+
+    def _load_aesthetic_model(self, config: dict) -> None:
+        """Load the scorer, or wait before the next try. Under the load lock."""
         # Local import: torch costs seconds to import and this module is on the
         # server's import path. By the time an aesthetic model is being built,
         # the CLIP workflow has already loaded torch anyway.
-        import torch
-        import torch.nn as nn
+        with ml_imports():
+            import torch
+            import torch.nn as nn
 
+        model_path = config["path"]
+        model_url = config["url"]
+        model_dim = config["dim"]
         try:
-            model_path = config["path"]
-            model_url = config["url"]
-            model_dim = config["dim"]
-
             if not os.path.exists(model_path):
                 logger.info("Downloading aesthetic model from %s...", model_url)
                 os.makedirs(os.path.dirname(model_path), exist_ok=True)
-                response = requests.get(model_url, timeout=30)
-                response.raise_for_status()
-                with open(model_path, "wb") as file_handle:
-                    file_handle.write(response.content)
+                self._download_aesthetic_model(model_url, model_path)
 
             state_dict = torch.load(model_path, map_location="cpu")
             model = nn.Linear(model_dim, 1)
@@ -724,13 +809,36 @@ class ImageEmbeddingTask(BaseTask):
             if self._clip_workflow is not None:
                 model = model.to(self._clip_workflow.device)
 
-            ImageEmbeddingTask._aesthetic_model = model
-            logger.info("ImageEmbeddingTask: Aesthetic model loaded.")
-
         except Exception as exc:
-            logger.error("ImageEmbeddingTask: Failed to load aesthetic model: %s", exc)
-            ImageEmbeddingTask._aesthetic_model = None
-            ImageEmbeddingTask._aesthetic_disabled = True
+            failures = ImageEmbeddingTask._aesthetic_load_failures + 1
+            wait = min(
+                self.AESTHETIC_RETRY_MAX_S,
+                self.AESTHETIC_RETRY_BASE_S * 2 ** min(failures - 1, 32),
+            )
+            ImageEmbeddingTask._aesthetic_load_failures = failures
+            ImageEmbeddingTask._aesthetic_retry_at = time.monotonic() + wait
+            # Worded as the tagger words its own load failure (pixlstash_tagger.py).
+            attempts = (
+                "1 failed attempt" if failures == 1 else f"{failures} attempts in a row"
+            )
+            logger.error(
+                "ImageEmbeddingTask: the aesthetic model %s (from %s) could not "
+                "be loaded, %s: %s: %s. Pictures are embedded "
+                "without a score, and it is loaded again in %.0f s.",
+                model_path,
+                model_url,
+                attempts,
+                type(exc).__name__,
+                exc,
+                wait,
+                exc_info=True,
+            )
+            return
+
+        ImageEmbeddingTask._aesthetic_model = model
+        ImageEmbeddingTask._aesthetic_load_failures = 0
+        ImageEmbeddingTask._aesthetic_retry_at = None
+        logger.info("ImageEmbeddingTask: Aesthetic model loaded.")
 
     def _ensure_embedding_backend(self) -> bool:
         """Whether CLIP can embed now; says why not every time it cannot.
@@ -811,7 +919,8 @@ class ImageEmbeddingTask(BaseTask):
                 the perceptual hash and the CLIP-preprocessed tensor the
                 preload pool computed. Anything missing is computed here. A
                 picture that could not be loaded is one entry,
-                ``(pid, file_path, None, None, None, LoadFailure)``.
+                ``(pid, file_path, None, None, None, LoadFailure, SignedLoad)``,
+                the load ``None`` when the picture has no file path.
             batch: The ``(pid, file_path)`` pairs the task was given; defaults
                 to the task's own. The batch, not ``preloaded``, says which
                 pictures need an outcome: a picture the preload produced no
@@ -839,11 +948,13 @@ class ImageEmbeddingTask(BaseTask):
         flat_hashes = []
         flat_tensors = []
         load_failures: dict[int, LoadFailure] = {}
+        failed_loads: dict[int, SignedLoad | None] = {}
 
         for entry in preloaded:
             pid, file_path, img = entry[:3]
             if img is None:
                 load_failures[pid] = entry[5]
+                failed_loads[pid] = entry[6]
                 continue
             # A preloaded image is reduced, so its hash comes from the preload
             # (None when that failed); hashing it here would differ.
@@ -860,7 +971,9 @@ class ImageEmbeddingTask(BaseTask):
 
         # A None image means the file could not be loaded; the preload says why.
         frame_pids = set(flat_pids)
-        settled.update(self._settle_load_failures(load_failures, batch_files))
+        settled.update(
+            self._settle_load_failures(load_failures, failed_loads, batch_files)
+        )
         for pid, outcome in unattempted.items():
             if pid not in settled and pid not in frame_pids:
                 settled[pid] = outcome
@@ -1016,7 +1129,8 @@ class ImageEmbeddingTask(BaseTask):
             return None, False
         # Local import (see _ensure_model): a loaded scorer means torch is
         # already resident.
-        import torch
+        with ml_imports():
+            import torch
 
         try:
             with torch.no_grad():

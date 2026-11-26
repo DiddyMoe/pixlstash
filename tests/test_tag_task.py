@@ -1,12 +1,18 @@
+import json
+import sqlite3
 import threading
 from types import SimpleNamespace
 
 import pytest
 
+from PIL import Image as PILImage
 from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel, Session, create_engine, select
 
+from pixlstash.db_models.face import Face
 from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.tag import TAG_PENDING_SENTINEL, Tag
 from pixlstash.db_models.tag_prediction import TagPrediction
@@ -17,10 +23,17 @@ from pixlstash.tagger_plugins.pixlstash_tagger import (
     FACE_QUALITY_CROP_TAGS,
     PixlStashTaggerPlugin,
     QUALITY_CROP_TAG_WHITELIST,
+    TaggerLoadFailure,
+    TaggerUnavailableError,
 )
 from pixlstash.task_runner import TaskRunner
-from pixlstash.tasks.base_task import TaskStatus
-from pixlstash.tasks.tag_task import TagTask
+from pixlstash.tasks.base_task import TASK_FAILURE_MESSAGE, TaskStatus
+from pixlstash.tasks.tag_task import TagTask, _faces_signature
+from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.image_processing.media_load import LoadFailure
+from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK
+from pixlstash.utils.unprocessable_image_registry import UnprocessableImageRegistry
+from tests.test_exif_orientation_loads import _unwritable_exif
 
 
 def test_centre_crop_whitelist_excludes_face_tags():
@@ -204,6 +217,58 @@ def test_predictions_never_record_a_tag_removed_from_tagging(tmp_path):
         assert picture.tag_uncertainty == pytest.approx(0.1)
 
 
+def test_a_new_model_version_clears_stale_rows_past_the_sqlite_variable_limit(
+    tmp_path,
+):
+    """Every stale prediction row goes, however many there are: one id per
+    row is pictures x tags, and SQLite builds before 3.32 bind at most 999
+    variables per statement, so a single unchunked ``IN`` fails on them."""
+    engine = _make_engine(tmp_path)
+    stale_count = SQLITE_ID_CHUNK + 150
+    with Session(engine) as session:
+        picture = Picture(file_path="p.jpg")
+        session.add(picture)
+        session.commit()
+        picture_id = picture.id
+        session.add_all(
+            [
+                TagPrediction(
+                    picture_id=picture_id,
+                    tag=f"stale-{index}",
+                    confidence=0.5,
+                    model_version="test-v0",
+                )
+                for index in range(stale_count)
+            ]
+        )
+        session.commit()
+
+    # Pinned after seeding, on every new connection (the engine has no pool).
+    @event.listens_for(engine, "connect")
+    def _pin_variable_limit(dbapi_connection, _record):
+        dbapi_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+
+    with Session(engine) as session:
+        stale_ids = session.exec(select(TagPrediction.id)).all()
+        assert len(stale_ids) == stale_count > 999
+        with pytest.raises(OperationalError, match="too many SQL variables"):
+            session.exec(
+                select(TagPrediction.id).where(TagPrediction.id.in_(stale_ids))
+            ).all()
+
+    with Session(engine) as session:
+        TagTask._write_predictions_from_tags(
+            session,
+            {picture_id: {"portrait": 0.9}},
+            {picture_id: {"portrait"}},
+            "test-v1",
+        )
+        rows = session.exec(
+            select(TagPrediction.tag, TagPrediction.model_version)
+        ).all()
+        assert set(rows) == {("portrait", "test-v1")}
+
+
 # --- Unprocessable-registry gating (PR #750 review blockers) -----------------
 
 
@@ -222,9 +287,11 @@ class _FakeDb:
 class _RecordingRegistry:
     def __init__(self):
         self.marked = []
+        self.loads = []
 
-    def mark_unprocessable(self, picture_id, file_path, *, reason=""):
+    def mark_unprocessable(self, picture_id, file_path, *, reason="", load=None):
         self.marked.append((picture_id, file_path, reason))
+        self.loads.append(load)
         return True
 
 
@@ -245,11 +312,13 @@ def test_a_corrupt_file_is_marked_unprocessable(tmp_path):
     file_path, img, undecodable = task._load_pic(pic)
 
     assert img is None
-    assert undecodable is True, "a readable but undecodable file must be markable"
-    task._mark_unprocessable(pic, file_path)
+    assert undecodable is not None, "a readable but undecodable file must be markable"
+    assert undecodable.result.failure is LoadFailure.UNDECODABLE
+    task._mark_unprocessable(pic, file_path, undecodable)
     assert registry.marked == [
         (1, str(bad), "tag source could not be decoded"),
     ]
+    assert registry.loads == [undecodable], "the load is the registry's evidence"
 
 
 def test_a_transient_load_error_is_never_marked(tmp_path, monkeypatch):
@@ -280,7 +349,7 @@ def test_a_transient_load_error_is_never_marked(tmp_path, monkeypatch):
     _file_path, img, undecodable = task._load_pic(Picture(id=2, file_path=str(good)))
 
     assert img is None
-    assert undecodable is False, "EMFILE is the machine failing, not the file"
+    assert undecodable is None, "EMFILE is the machine failing, not the file"
 
 
 def test_a_mislabelled_video_is_loaded_not_suppressed(tmp_path, monkeypatch):
@@ -305,7 +374,7 @@ def test_a_mislabelled_video_is_loaded_not_suppressed(tmp_path, monkeypatch):
 
     assert img is not None, "the shared loader decoded it, so tagging must use it"
     assert img.size == (4, 4)
-    assert undecodable is False
+    assert undecodable is None
     assert registry.marked == []
 
 
@@ -315,15 +384,15 @@ def test_transient_error_classifier():
 
     from PIL import Image as PILImage
 
-    from pixlstash.tasks.tag_task import _is_transient_load_error
+    from pixlstash.utils.image_processing.media_load import is_transient_load_error
 
-    assert _is_transient_load_error(OSError(errno.EMFILE, "Too many open files"))
-    assert _is_transient_load_error(OSError(errno.EIO, "I/O error"))
-    assert _is_transient_load_error(MemoryError())
+    assert is_transient_load_error(OSError(errno.EMFILE, "Too many open files"))
+    assert is_transient_load_error(OSError(errno.EIO, "I/O error"))
+    assert is_transient_load_error(MemoryError())
     # PIL raises both of these with errno unset: the file, not the machine.
-    assert not _is_transient_load_error(PILImage.UnidentifiedImageError("nope"))
-    assert not _is_transient_load_error(OSError("image file is truncated"))
-    assert not _is_transient_load_error(PILImage.DecompressionBombError("huge"))
+    assert not is_transient_load_error(PILImage.UnidentifiedImageError("nope"))
+    assert not is_transient_load_error(OSError("image file is truncated"))
+    assert not is_transient_load_error(PILImage.DecompressionBombError("huge"))
 
 
 # --- The per-picture crop guard (PR #750 review blocker B2) ------------------
@@ -534,6 +603,9 @@ class _FakeFace:
     def __init__(self, face_id, bbox, face_index=0):
         self.id = face_id
         self.bbox = bbox
+        # The stored text, as `Face.bbox_` holds it: the preload's staleness
+        # check compares this, not the parsed box.
+        self.bbox_ = json.dumps(bbox)
         self.face_index = face_index
 
 
@@ -635,6 +707,75 @@ def test_an_undecodable_picture_is_marked_once_from_the_crop_pass(tmp_path):
 
     assert task._build_quality_crop(pic, [], 32, {}) is None
     assert registry.marked == [(7, str(bad), "tag source could not be decoded")]
+    [load] = registry.loads
+    assert load.file_path == str(bad)
+    assert load.result.failure is LoadFailure.UNDECODABLE
+
+
+def test_the_crop_pass_mark_does_not_decode_the_file_a_second_time(
+    tmp_path, monkeypatch
+):
+    """The registry's gate takes the tag load as its evidence.
+
+    `mark_unprocessable` decodes a file itself only when its caller brings no
+    load; the tag stage's classified load is that evidence, so the undecodable
+    file is decoded once, the mark is still recorded, and the pin is the
+    signature taken before that one decode.
+    """
+    import os
+
+    from pixlstash.utils import unprocessable_image_registry as registry_module
+
+    bad = tmp_path / "broken-once.png"
+    bad.write_bytes(b"test-not-a-png")
+    decodes = []
+    real = registry_module.load_pil_classified
+
+    def counting(path, *, multiframe_count):
+        decodes.append(path)
+        return real(path, multiframe_count=multiframe_count)
+
+    monkeypatch.setattr(registry_module, "load_pil_classified", counting)
+    registry = UnprocessableImageRegistry()
+    task = _task_for(_FakeDb(str(tmp_path), registry))
+
+    assert (
+        task._build_quality_crop(Picture(id=8, file_path=str(bad)), [], 32, {}) is None
+    )
+
+    assert decodes == [str(bad)], "one classified decode, shared with the gate"
+    assert registry.is_suppressed(8)
+    stat = os.stat(bad)
+    [(_, mtime_ns, size)] = registry.snapshot().values()
+    assert (mtime_ns, size) == (stat.st_mtime_ns, stat.st_size)
+
+
+def test_a_photo_whose_exif_cannot_be_written_back_is_turned_by_its_own_load(
+    tmp_path, monkeypatch
+):
+    """It decodes and is turned upright by the tag load itself; never marked.
+
+    EXIF Pillow reads but cannot write back (a LONG8 tag beside orientation
+    6): `ImageOps.exif_transpose` raised on it, so the tag load warned and
+    decoded the file a second time through the shared loader. The turn writes
+    no EXIF back now, so that loader is not asked.
+    """
+    path = tmp_path / "unwritable-exif.png"
+    PILImage.new("RGB", (40, 30), "blue").save(
+        path, "PNG", exif=b"Exif\x00\x00" + _unwritable_exif(6)
+    )
+    second_loads = []
+    monkeypatch.setattr(
+        ImageUtils, "load_image_or_video", staticmethod(second_loads.append)
+    )
+    task = _task_for(_FakeDb(str(tmp_path)))
+
+    _file_path, img, undecodable = task._load_pic(Picture(id=9, file_path=str(path)))
+
+    assert img is not None and img.size == (30, 40), "orientation 6, upright"
+    assert second_loads == [], "the file was decoded a second time"
+    # No load returned as evidence, so the crop pass never marks it.
+    assert undecodable is None, "the bytes decode: never the registry's case"
 
 
 def _rotated_jpeg(tmp_path, name, size=(4608, 2592), orientation=6):
@@ -1128,6 +1269,63 @@ def test_a_face_found_after_the_preload_gets_a_crop_of_its_own(tmp_path):
     assert workflow.crop_keys == [f"{picture.file_path}#face9"]
 
 
+def _face_loaded_with_bbox_text(face_id, text):
+    """A `Face` as a load from the database gives it: ``bbox_`` set without
+    the write-time validator, which is how a legacy non-JSON row arrives."""
+    face = Face(id=face_id, picture_id=1, face_index=0, frame_index=0)
+    set_committed_value(face, "bbox_", text)
+    return face
+
+
+def test_a_face_row_whose_bbox_is_not_json_does_not_stop_the_preload(tmp_path):
+    """The preload records each crop with the faces it was cut for. Parsing a
+    legacy ``"0,0,10,10"`` row there raised `JSONDecodeError` and killed the
+    preload thread, so no picture in the task got a preloaded image. The
+    preload must finish, and the batch's stale check must still treat the
+    unchanged row as unchanged."""
+    from PIL import Image as PILImage
+
+    PILImage.new("RGB", (800, 600), "blue").save(tmp_path / "legacy.png")
+    picture = Picture(id=1, file_path=str(tmp_path / "legacy.png"))
+    faces_now = [_face_loaded_with_bbox_text(9, "0,0,10,10")]
+
+    class _FacesDb(_PredictionDb):
+        def run_immediate_read_task(self, fn, *args, **kwargs):
+            return {1: list(faces_now)}
+
+    task = _prediction_task(_FacesDb(str(tmp_path), [1]), _PluginWorkflow(), [picture])
+    builds = []
+    build_quality_crop = task._build_quality_crop
+
+    def counting_build(*args, **kwargs):
+        builds.append(args[0].id)
+        return build_quality_crop(*args, **kwargs)
+
+    task._build_quality_crop = counting_build
+
+    task._preload_images()
+    built, signature = task._preloaded_crops[1]
+    task._tag_pictures_batch()
+
+    # The unreadable box yields no crop (`_build_quality_crop`'s own rule),
+    # and the batch reuses that verdict instead of building it a second time.
+    assert built is None
+    assert signature == ((9, "0,0,10,10", 0, 0),)
+    assert builds == [1]
+
+
+def test_a_moved_face_changes_the_preload_signature():
+    """Same face, new box: the stale check must see it, or the crop pass
+    judges a crop cut around where the face used to be."""
+    before = _face_loaded_with_bbox_text(9, json.dumps([0, 0, 10, 10]))
+    after = _face_loaded_with_bbox_text(9, json.dumps([20, 20, 40, 40]))
+
+    assert _faces_signature([before]) == _faces_signature(
+        [_face_loaded_with_bbox_text(9, json.dumps([0, 0, 10, 10]))]
+    )
+    assert _faces_signature([before]) != _faces_signature([after])
+
+
 def test_a_picture_that_will_not_reduce_costs_only_its_own_preload(tmp_path, caplog):
     """A reduction that raises is logged, and that picture's full pass loads
     it from disk; its crop and its neighbour's image are still preloaded."""
@@ -1355,7 +1553,8 @@ def test_a_model_that_will_not_load_fails_the_task_with_its_error(tmp_path):
     errors = _settle_through_runner(task, _RecordingArbiter(events))
 
     assert task.status == TaskStatus.FAILED
-    assert task.error == "test-tagger-load-failure"
+    # The served field carries no exception text; the finder gets the error.
+    assert task.error == TASK_FAILURE_MESSAGE
     assert errors == [load_error]
     assert [step for step, _thread in events] == ["admit", "load"]
 
@@ -1391,6 +1590,7 @@ class _FailingPlugin:
     """A third-party tagger whose `init` raises *error*."""
 
     name = "test-failing-tagger"
+    supports_tags = True
 
     def __init__(self, error):
         self.error = error
@@ -1405,8 +1605,19 @@ class _FailingPlugin:
         return False
 
 
-def _plugin_workflow(monkeypatch, plugins, active, pixlstash_loaded=False):
-    """A TaggingWorkflow whose registry knows *plugins* by name."""
+_LOAD_FAILURE = TaggerLoadFailure(
+    failures=3, retry_in_s=120.0, error="test-tagger weights unreadable"
+)
+
+
+def _plugin_workflow(
+    monkeypatch, plugins, active, pixlstash_loaded=False, load_failure=_LOAD_FAILURE
+):
+    """A TaggingWorkflow whose registry knows *plugins* by name.
+
+    The PixlStash tagger never loads here; *load_failure* is what its service
+    reports about the last attempt.
+    """
     by_name = {plugin.name: plugin for plugin in plugins}
     manager = SimpleNamespace(get_plugin=by_name.get)
     monkeypatch.setattr(
@@ -1417,7 +1628,9 @@ def _plugin_workflow(monkeypatch, plugins, active, pixlstash_loaded=False):
         device="cpu",
         lifecycle=SimpleNamespace(ensure_tagging_ready=lambda *args: False),
         wd14_service=SimpleNamespace(is_loaded=lambda: False),
-        pixlstash_tagger_service=SimpleNamespace(is_loaded=lambda: pixlstash_loaded),
+        pixlstash_tagger_service=SimpleNamespace(
+            is_loaded=lambda: pixlstash_loaded, load_failure=lambda: load_failure
+        ),
     )
     return TaggingWorkflow(
         engine=engine,
@@ -1427,18 +1640,53 @@ def _plugin_workflow(monkeypatch, plugins, active, pixlstash_loaded=False):
     )
 
 
-def test_a_pixlstash_tagger_that_will_not_load_raises(monkeypatch):
+@pytest.mark.parametrize("failure", [_LOAD_FAILURE, None])
+def test_a_pixlstash_tagger_that_will_not_load_raises(monkeypatch, failure):
     """The tagger reports a failed load by returning False; carried on, the
-    task would finish with nothing tagged and its pictures written off."""
-    workflow = _plugin_workflow(monkeypatch, [], "pixlstash_tagger")
+    task would finish with nothing tagged and its pictures written off. The
+    error carries the service's failure, so the finder waits as long as the
+    tagger will."""
+    workflow = _plugin_workflow(
+        monkeypatch, [], "pixlstash_tagger", load_failure=failure
+    )
 
-    with pytest.raises(RuntimeError, match="PixlStash tagger could not be loaded"):
+    with pytest.raises(TaggerUnavailableError) as raised:
         workflow.ensure_active_plugin_ready()
 
+    assert raised.value.failure is failure
 
-def test_a_plugin_missing_a_module_is_left_to_the_tagging_pass(monkeypatch, caplog):
-    """A missing package never appears on a retry: `tag_images` clears those
-    pictures, so failing the task here would only queue them forever."""
+
+@pytest.mark.parametrize("failure", [_LOAD_FAILURE, None])
+def test_m038_tagging_with_a_pixlstash_tagger_that_will_not_load_raises(
+    monkeypatch, failure
+):
+    """CPU spillover skips `ensure_active_plugin_ready` and goes
+    straight to `tag_images`. Its empty result finished the task as a success,
+    which lifted the finder's hold, and the next sweep loaded again."""
+    workflow = _plugin_workflow(
+        monkeypatch, [], "pixlstash_tagger", load_failure=failure
+    )
+
+    with pytest.raises(TaggerUnavailableError) as raised:
+        workflow.tag_images(["test-picture.png"])
+
+    assert raised.value.failure is failure
+
+
+def test_m038_a_pixlstash_tagger_unloaded_before_inference_raises(monkeypatch):
+    """Unloaded between the load and the pass (evicted under memory
+    pressure): an empty result reads as a batch that tagged."""
+    workflow = _plugin_workflow(monkeypatch, [], "pixlstash_tagger")
+
+    with pytest.raises(TaggerUnavailableError) as raised:
+        workflow._tag_images_custom(["test-picture.png"])
+
+    assert raised.value.failure is _LOAD_FAILURE
+
+
+def test_m038_a_plugin_missing_a_module_fails_the_task(monkeypatch):
+    """Clearing the pictures without tags marked them tagged with nothing,
+    for good; failed, they stay pending and tag once the package is there."""
     error = ModuleNotFoundError(
         "No module named 'test_missing_package'", name="test_missing_package"
     )
@@ -1446,10 +1694,73 @@ def test_a_plugin_missing_a_module_is_left_to_the_tagging_pass(monkeypatch, capl
         monkeypatch, [_FailingPlugin(error)], _FailingPlugin.name
     )
 
-    with caplog.at_level("WARNING"):
+    with pytest.raises(ModuleNotFoundError) as raised:
         workflow.ensure_active_plugin_ready()
 
-    assert "test_missing_package" in caplog.text
+    assert raised.value is error
+
+
+class _TaggingPlugin:
+    """A third-party tagger whose `tag_images` raises *error*."""
+
+    name = "test-tagging-tagger"
+    supports_tags = True
+
+    def __init__(self, error):
+        self.error = error
+
+    def default_params(self):
+        return {}
+
+    def init(self, params):
+        return None
+
+    def tag_images(self, image_paths, parameters=None, stop_event=None):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ModuleNotFoundError(
+            "No module named 'test_missing_package'", name="test_missing_package"
+        ),
+        RuntimeError("test-plugin-inference-failure"),
+    ],
+    ids=["missing-module", "inference-error"],
+)
+def test_m038_a_plugin_that_fails_to_tag_fails_the_task(monkeypatch, error):
+    """An empty result per path removes each sentinel (tagged with nothing),
+    and an empty dict finishes the task as a success: neither is a failure."""
+    workflow = _plugin_workflow(
+        monkeypatch, [_TaggingPlugin(error)], _TaggingPlugin.name
+    )
+
+    with pytest.raises(type(error)) as raised:
+        workflow.tag_images(["test-picture.png"])
+
+    assert raised.value is error
+
+
+class _CaptionOnlyPlugin(_TaggingPlugin):
+    name = "test-caption-only-plugin"
+    supports_tags = False
+
+    def tag_images(self, image_paths, parameters=None, stop_event=None):
+        return {}
+
+
+@pytest.mark.parametrize("active", [_CaptionOnlyPlugin.name, "test-uninstalled-plugin"])
+@pytest.mark.parametrize("call", ["ensure", "tag"])
+def test_m038_a_plugin_that_cannot_tag_fails_the_task(monkeypatch, active, call):
+    """Uninstalled, or installed but not a tagger: the batch tags nothing."""
+    workflow = _plugin_workflow(monkeypatch, [_CaptionOnlyPlugin(None)], active)
+
+    with pytest.raises(LookupError, match=active):
+        if call == "ensure":
+            workflow.ensure_active_plugin_ready()
+        else:
+            workflow.tag_images(["test-picture.png"])
 
 
 def test_any_other_plugin_load_error_reaches_the_task(monkeypatch):

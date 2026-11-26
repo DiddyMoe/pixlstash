@@ -12,6 +12,8 @@ import logging
 import os
 import shutil
 import threading
+import time
+from dataclasses import dataclass
 from io import BytesIO
 from typing import TYPE_CHECKING, Callable
 
@@ -24,7 +26,7 @@ if TYPE_CHECKING:  # annotations only - see the function-local import note below
 
 from pixlstash.tagger_plugins.base import TagResult, TaggerPlugin
 from pixlstash.utils.accelerator import is_accelerated, supports_fp16
-from pixlstash.utils.model_utils import MODEL_CONSTRUCTION_LOCK
+from pixlstash.utils.model_utils import MODEL_CONSTRUCTION_LOCK, ml_imports
 from pixlstash.utils.service.caption_utils import naturalize_tags, sanitise_tag
 from pixlstash.utils.vram_utils import empty_device_cache, is_vram_oom
 
@@ -54,6 +56,49 @@ PIXLSTASH_TAGGER_DINOV3_ARCH = "dinov3_vitb16"
 PIXLSTASH_TAGGER_REVISION = "cba5e8ab3674714018b204f09700d4b25441d128"
 PIXLSTASH_TAGGER_DEFAULT_THRESHOLD = 0.50
 PIXLSTASH_TAGGER_LABEL_THRESHOLD_BIAS = 0.0
+
+#: The wait after the tagger's first failed load before it is loaded again; it
+#: doubles with each failure that follows, up to LOAD_RETRY_MAX_S. Until then
+#: every caller is turned away without touching the disk.
+LOAD_RETRY_BASE_S = 30.0
+LOAD_RETRY_MAX_S = 600.0
+
+
+@dataclass(frozen=True)
+class TaggerLoadFailure:
+    """Why the PixlStash tagger is not loaded, and when it is tried again."""
+
+    #: Failed loads in a row.
+    failures: int
+    #: Seconds until the next load is tried; 0 when the next call tries it.
+    retry_in_s: float
+    #: The type of what the last load raised; the server log has the rest.
+    error: str
+
+
+class TaggerUnavailableError(RuntimeError):
+    """The PixlStash tagger cannot tag now: its load failed.
+
+    For a caller to fail its task with, rather than finish it with no tags:
+    a task that ends without error tells its finder the tagger works.
+    """
+
+    def __init__(self, failure: TaggerLoadFailure | None) -> None:
+        self.failure = failure
+        if failure is None:
+            message = "The PixlStash tagger is not loaded."
+        else:
+            attempts = (
+                "1 failed attempt"
+                if failure.failures == 1
+                else f"{failure.failures} attempts in a row"
+            )
+            message = (
+                f"The PixlStash tagger could not be loaded ({failure.error}, "
+                f"{attempts}); it is tried again in {failure.retry_in_s:.0f} s."
+            )
+        super().__init__(message)
+
 
 # Tags that require close-up face crops to detect reliably at full-image resolution.
 # These are collected from face-crop passes and merged into the picture's flat tag list.
@@ -135,8 +180,9 @@ def _build_dinov3_tagger(config_path: str, num_labels: int):
     Returns:
         An untrained ``torch.nn.Module``; the caller loads the weights.
     """
-    import torch
-    from transformers import DINOv3ViTConfig, DINOv3ViTModel
+    with ml_imports():
+        import torch
+        from transformers import DINOv3ViTConfig, DINOv3ViTModel
 
     class DINOv3Tagger(torch.nn.Module):
         def __init__(self) -> None:
@@ -203,7 +249,8 @@ class PixlStashTaggerService:
         model_dir: str,
         batch_size_fn: Callable[[], int],
     ) -> None:
-        import torch
+        with ml_imports():
+            import torch
 
         self._device = device
         self._model_path = os.path.join(model_dir, PIXLSTASH_TAGGER_FILENAME)
@@ -232,6 +279,13 @@ class PixlStashTaggerService:
         # is still writing into. Reentrant because ``reload_on_cpu`` calls
         # ``unload`` from its own failure path. See test_model_unload_race.py.
         self._load_lock = threading.RLock()
+        # The failed loads in a row, when the next is tried (time.monotonic)
+        # and what the last raised. Under _load_state_lock, so load_failure()
+        # answers while a load holds _load_lock.
+        self._load_state_lock = threading.Lock()
+        self._load_failures = 0
+        self._load_retry_at: float | None = None
+        self._load_error: str | None = None
 
     # ------------------------------------------------------------------ #
     # State queries
@@ -309,7 +363,8 @@ class PixlStashTaggerService:
         revision is written to a sidecar file for future staleness checks.
         """
         try:
-            from huggingface_hub import hf_hub_download
+            with ml_imports():
+                from huggingface_hub import hf_hub_download
 
             dest_dir = os.path.dirname(os.path.abspath(self._model_path))
             os.makedirs(dest_dir, exist_ok=True)
@@ -357,13 +412,24 @@ class PixlStashTaggerService:
             logger.warning("Failed to download PixlStash tagger: %s", e)
 
     def init(self) -> None:
-        """Load the model checkpoint and metadata from disk into memory."""
+        """Load the model checkpoint and metadata from disk into memory.
+
+        Not held back by the wait after a failed load (that is
+        :meth:`init_or_cpu_fallback`'s), but a load that succeeds here clears
+        the failure, so :meth:`load_failure` never reports one while the
+        model is loaded.
+        """
         with self._load_lock:
             self._init_locked()
+            with self._load_state_lock:
+                self._load_failures = 0
+                self._load_retry_at = None
+                self._load_error = None
 
     def _init_locked(self) -> None:
         """Do the load. The caller must hold ``_load_lock``."""
-        import torch
+        with ml_imports():
+            import torch
 
         if not os.path.exists(self._model_path):
             raise FileNotFoundError(
@@ -379,7 +445,8 @@ class PixlStashTaggerService:
         arch = meta.get("arch", "convnext_base")
         if not labels:
             raise ValueError("PixlStash tagger metadata missing labels list.")
-        from safetensors.torch import load_file
+        with ml_imports():
+            from safetensors.torch import load_file
 
         state_dict = load_file(self._model_path, device=str(self._device))
         self._labels = labels
@@ -425,38 +492,85 @@ class PixlStashTaggerService:
         self._transform_cache = {}
         self._transform = self._build_transform(self._image_size_full)
 
+    def load_failure(self) -> TaggerLoadFailure | None:
+        """Why the last load failed and when the next is tried, or None when
+        the last load did not fail."""
+        with self._load_state_lock:
+            if self._load_retry_at is None:
+                return None
+            return TaggerLoadFailure(
+                failures=self._load_failures,
+                retry_in_s=max(0.0, self._load_retry_at - time.monotonic()),
+                error=self._load_error or "",
+            )
+
     def init_or_cpu_fallback(self) -> bool:
         """Load the model, falling back to CPU on OOM.
 
+        After a failed load the next is not tried until its wait is over
+        (``LOAD_RETRY_BASE_S``, doubling to ``LOAD_RETRY_MAX_S``); until then
+        this returns False at once. :meth:`load_failure` says why and how long.
+
         Returns:
-            True if the model is successfully loaded, False if loading
-            failed on both GPU and CPU.
+            True if the model is loaded, False if it is not: the load failed
+            on both GPU and CPU, now or within the wait.
         """
         if self.is_loaded():
             return True
+        with self._load_lock:
+            if self.is_loaded():
+                return True
+            with self._load_state_lock:
+                retry_at = self._load_retry_at
+            if retry_at is not None and time.monotonic() < retry_at:
+                logger.debug(
+                    "PixlStash tagger: not loaded again for %.0f s after a failed load",
+                    retry_at - time.monotonic(),
+                )
+                return False
+            try:
+                # A load that succeeds clears the failure (see init).
+                self._init_with_cpu_fallback()
+            except Exception as exc:
+                self._record_load_failure(exc)
+                return False
+            return True
+
+    def _init_with_cpu_fallback(self) -> None:
+        """Load the model; on an accelerator out of memory, load it on CPU."""
         try:
             self.init()
-            return True
         except Exception as exc:
-            if is_vram_oom(exc) and is_accelerated(self._device):
-                logger.warning(
-                    "PixlStash tagger GPU load failed (OOM); retrying on CPU: %s", exc
-                )
-                self._device = "cpu"
-                try:
-                    self.init()
-                    logger.info("PixlStash tagger loaded on CPU successfully.")
-                    return True
-                except Exception as cpu_exc:
-                    logger.warning(
-                        "PixlStash tagger CPU fallback also failed; disabling: %s",
-                        cpu_exc,
-                    )
-                    return False
+            if not (is_vram_oom(exc) and is_accelerated(self._device)):
+                raise
             logger.warning(
-                "PixlStash tagger reinit failed; disabling PixlStash tagger: %s", exc
+                "PixlStash tagger GPU load failed (OOM); retrying on CPU: %s", exc
             )
-            return False
+            self._device = "cpu"
+            self.init()
+            logger.info("PixlStash tagger loaded on CPU successfully.")
+
+    def _record_load_failure(self, exc: Exception) -> None:
+        """Count a failed load and set when the next is tried."""
+        with self._load_state_lock:
+            self._load_failures += 1
+            failures = self._load_failures
+            wait = min(
+                LOAD_RETRY_MAX_S, LOAD_RETRY_BASE_S * 2.0 ** min(failures - 1, 32)
+            )
+            self._load_retry_at = time.monotonic() + wait
+            self._load_error = type(exc).__name__
+        logger.warning(
+            "The PixlStash tagger could not be loaded on %s (%d failed loads in "
+            "a row): %s: %s. Tagging with it fails until it is loaded again in "
+            "%.0f s.",
+            self._device,
+            failures,
+            type(exc).__name__,
+            exc,
+            wait,
+            exc_info=True,
+        )
 
     def reload_on_cpu(self) -> bool:
         """Move the already-loaded model to CPU, freeing GPU memory.
@@ -468,7 +582,8 @@ class PixlStashTaggerService:
         Returns:
             True on success, False if the move failed.
         """
-        import torch
+        with ml_imports():
+            import torch
 
         logger.warning("PixlStash tagger GPU inference failed; reloading on CPU...")
         with self._load_lock:
@@ -544,7 +659,8 @@ class PixlStashTaggerService:
         Returns:
             Dict mapping key to list of tags above threshold, naturalized.
         """
-        import torch
+        with ml_imports():
+            import torch
 
         if not items:
             return {}
@@ -650,7 +766,8 @@ class PixlStashTaggerService:
             - ``tags_by_key``: ``{key: [tag, ...]}`` thresholded and naturalized.
             - ``scores_by_key``: ``{key: {natural_label: float}}`` raw scores.
         """
-        import torch
+        with ml_imports():
+            import torch
 
         if not items:
             return {}, {}
@@ -818,7 +935,8 @@ class PixlStashTaggerService:
         Returns:
             Dict mapping path to ``{label: confidence}`` for each kept label.
         """
-        import torch
+        with ml_imports():
+            import torch
 
         if not items:
             return {}
@@ -958,9 +1076,10 @@ class PixlStashTaggerService:
     # ------------------------------------------------------------------ #
 
     def _build_model(self, arch: str, num_labels: int):
-        import torch
+        with ml_imports():
+            import torch
 
-        from torchvision.models import convnext_tiny, convnext_base
+            from torchvision.models import convnext_tiny, convnext_base
 
         if arch == "convnext_tiny":
             model = convnext_tiny(weights=None)
@@ -977,7 +1096,8 @@ class PixlStashTaggerService:
         raise ValueError(f"Unsupported PixlStash tagger arch: {arch}")
 
     def _build_transform(self, image_size: int) -> transforms.Compose:
-        from torchvision import transforms
+        with ml_imports():
+            from torchvision import transforms
 
         return transforms.Compose(
             [
@@ -1008,8 +1128,9 @@ class PixlStashTaggerService:
         which produces NaN gradients) and restored to its original dtype in ``finally`` so the hot tagging path is
         unaffected.
         """
-        import torch.nn.functional as F
-        import torch
+        with ml_imports():
+            import torch.nn.functional as F
+            import torch
 
         model = self._model
         transform = self._get_transform(self._image_size_full)
@@ -1274,8 +1395,18 @@ class PixlStashTaggerPlugin(TaggerPlugin):
         self.service.download()
 
     def init(self, parameters: dict) -> None:
-        """Load the model checkpoint (idempotent)."""
-        self.service.init()
+        """Load the model checkpoint (idempotent), as the tagging workflow does.
+
+        Through :meth:`PixlStashTaggerService.init_or_cpu_fallback`, so a
+        plugin check honours the wait after a failed load, counts its own
+        failure, and clears the failure when it loads.
+
+        Raises:
+            TaggerUnavailableError: The load failed, now or within the wait;
+                the server log has what it raised.
+        """
+        if not self.service.init_or_cpu_fallback():
+            raise TaggerUnavailableError(self.service.load_failure())
 
     def unload(self) -> None:
         """Release the model from memory."""

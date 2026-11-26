@@ -1,3 +1,4 @@
+import threading
 from collections import Counter
 from typing import Callable, Collection
 
@@ -8,6 +9,7 @@ from pixlstash.db_models import (
     Picture,
     DESCRIPTION_SENTINEL_LIKE_PATTERN,
     DESCRIPTION_SENTINEL_ESCAPE_CHAR,
+    make_description_sentinel,
     parse_engine_from_description_sentinel,
     is_description_sentinel,
 )
@@ -16,7 +18,6 @@ from pixlstash.services.set_lock_service import locked_picture_id_subquery
 from pixlstash.task_runner import TaskCancelledError
 from pixlstash.utils.sql_chunking import not_in_json
 
-from .base_task import TaskStatus
 from .description_task import DescriptionTask, describable_picture_clauses
 from .task_outcome import Reason, RetryHold, id_sample, read_outcomes
 from .task_type import TaskType
@@ -35,24 +36,29 @@ class MissingDescriptionFinder(BaseTaskFinder):
       exponential backoff (:class:`RetryHold`), so one that keeps failing is
       retried more and more rarely, and its description is never cleared.
     - ``FAILED_RETRYABLE`` because the batch captioned nobody
-      (``BACKEND_UNAVAILABLE``) also holds the whole finder: no batch is built
-      until that hold expires, and the next batch is the probe. The pictures
-      are held one by one as well, because the same answer comes from a batch
-      that one picture in it makes the model fail every time: their holds
-      outgrow the backend hold (capped at 300 s against 60 s), so such a
-      batch is passed over and the backlog behind it moves on.
+      (``BACKEND_UNAVAILABLE``) also holds the engine that captioned it: no
+      batch for that engine is built until the hold expires, and the next one
+      is the probe. Other engines' work goes on, and the held engine's
+      pictures are left out of the read so they cannot fill the window. The
+      engine of a batch is the one its sentinel names, else the active
+      description plugin. The pictures are held one by one as well, because
+      the same answer comes from a batch that one picture in it makes the
+      model fail every time: their holds outgrow the backend hold (capped at
+      300 s against 60 s), so such a batch is passed over and the backlog
+      behind it moves on.
     - ``FAILED_PERMANENT`` was written as ``""``, which the query never
       selects, or is held out by the unprocessable-image registry, whose
       pictures the query leaves out; ``DEFERRED`` was not attempted and stays
       eligible.
-    - ``SUCCEEDED`` clears the picture's hold and the backend hold.
+    - ``SUCCEEDED`` clears the picture's hold and its engine's hold.
 
     A task that failed outright holds all of its pictures; a cancelled one
     holds none. The holds live in memory: a restart retries everything.
     """
 
-    #: The backend hold's only key.
-    _BACKEND = "backend"
+    #: The engine a batch captions with when nothing names one (the
+    #: ``DescriptionWorkflow`` default, for an engine with no tagger settings).
+    DEFAULT_ENGINE = "florence2"
     #: Longest wait between two probes of a backend that captions nothing, seconds.
     BACKEND_HOLD_CAP_S = 60.0
 
@@ -70,8 +76,9 @@ class MissingDescriptionFinder(BaseTaskFinder):
             engine_getter: Returns the inference engine, or ``None`` while
                 there is none.
             retry_hold: Per-picture backoff; a default one when omitted.
-            backend_hold: Backoff for a backend that captions nothing; a
-                default one capped at :attr:`BACKEND_HOLD_CAP_S` when omitted.
+            backend_hold: Per-engine backoff for an engine that captions
+                nothing; a default one capped at :attr:`BACKEND_HOLD_CAP_S`
+                when omitted.
         """
         super().__init__()
         self._db = database
@@ -82,6 +89,9 @@ class MissingDescriptionFinder(BaseTaskFinder):
             if backend_hold is not None
             else RetryHold(cap_s=self.BACKEND_HOLD_CAP_S)
         )
+        # Task id -> the engine it captions with, until it completes.
+        self._task_engines: dict[str, str] = {}
+        self._task_engines_lock = threading.Lock()
 
     def finder_name(self) -> str:
         return "MissingDescriptionFinder"
@@ -100,10 +110,13 @@ class MissingDescriptionFinder(BaseTaskFinder):
             active_plugin = tagger_settings.get("active_description_plugin")
             if not active_plugin:
                 return None
-        # If no tagger_settings at all, fall through to the old behaviour
-        # (Florence-2 always active).
-        if self._BACKEND in self._backend_hold.active():
-            return None
+        else:
+            # No tagger_settings at all: the old behaviour (Florence-2 always
+            # active).
+            active_plugin = self.DEFAULT_ENGINE
+        # Per engine: one engine that captions nothing must not hold
+        # back a request for another.
+        held_engines = self._backend_hold.active()
 
         batch_limit = max(
             1,
@@ -114,7 +127,11 @@ class MissingDescriptionFinder(BaseTaskFinder):
         # itself, so they cannot fill the candidate window and stall the rest.
         excluded_ids = self._retry_hold.active() | self._suppressed_picture_ids()
         pictures = self._db.run_immediate_read_task(
-            self._fetch_missing_descriptions, batch_limit * 3, excluded_ids
+            self._fetch_missing_descriptions,
+            batch_limit * 3,
+            excluded_ids,
+            held_engines=held_engines,
+            active_engine=active_plugin,
         )
         if not pictures:
             return None
@@ -140,13 +157,18 @@ class MissingDescriptionFinder(BaseTaskFinder):
         if not selected:
             return None
 
-        return DescriptionTask(
+        task = DescriptionTask(
             database=self._db,
             workflow=engine.description_workflow,
             pictures=selected,
             engine_override=first_engine,
             interactive=bool(requested),
         )
+        with self._task_engines_lock:
+            self._task_engines[task.id] = (
+                first_engine if first_engine is not None else active_plugin
+            )
+        return task
 
     def on_task_complete(self, task, error) -> None:
         """Hold back what failed and may be retried, then release the batch.
@@ -179,12 +201,12 @@ class MissingDescriptionFinder(BaseTaskFinder):
     def _settle(self, task, error) -> None:
         """Record what *task*'s outcomes say about its pictures' holds."""
         picture_ids = (getattr(task, "params", None) or {}).get("picture_ids") or []
-        if isinstance(error, TaskCancelledError) or (
-            error is None and getattr(task, "status", None) == TaskStatus.CANCELLED
-        ):
-            # It never ran, or was stopped: nothing was learnt about the
-            # pictures, and they stay eligible. A task cancelled before it
-            # started reports no error at all, only its status.
+        with self._task_engines_lock:
+            engine = self._task_engines.pop(getattr(task, "id", None), None)
+        if isinstance(error, TaskCancelledError):
+            # It never ran, or was stopped (the runner settles both as a
+            # cancellation): nothing was learnt about the pictures, and they
+            # stay eligible.
             return
         if error is not None:
             self._hold(picture_ids, f"the task failed: {error}")
@@ -215,8 +237,8 @@ class MissingDescriptionFinder(BaseTaskFinder):
 
         for pid in summary.succeeded | summary.failed_permanent:
             self._retry_hold.clear(pid)
-        if summary.succeeded:
-            self._backend_hold.clear(self._BACKEND)
+        if summary.succeeded and engine is not None:
+            self._backend_hold.clear(engine)
 
         backend_down = {
             pid
@@ -224,13 +246,22 @@ class MissingDescriptionFinder(BaseTaskFinder):
             if summary.reasons.get(pid) is Reason.BACKEND_UNAVAILABLE
         }
         # One task in flight at a time (``max_inflight_tasks``), and none is
-        # created while the backend is held, so each failure lengthens it once.
-        if backend_down:
-            wait = self._backend_hold.hold(self._BACKEND)
+        # created for a held engine, so each failure lengthens its hold once.
+        if backend_down and engine is not None:
+            wait = self._backend_hold.hold(engine)
             logger.warning(
-                "MissingDescriptionFinder: the last batch captioned nobody; no "
-                "new batch for %.0f s",
+                "MissingDescriptionFinder: the last %r batch captioned nobody; "
+                "no new %r batch for %.0f s",
+                engine,
+                engine,
                 wait,
+            )
+        elif backend_down:
+            # Not a task this finder built: no engine is known to hold.
+            logger.warning(
+                "MissingDescriptionFinder: task %s captioned nobody and names "
+                "no engine this finder recorded; no engine is held",
+                getattr(task, "id", None),
             )
 
         # The backend-down pictures are held one by one too (see the class
@@ -263,10 +294,19 @@ class MissingDescriptionFinder(BaseTaskFinder):
 
     @staticmethod
     def _fetch_missing_descriptions(
-        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+        session: Session,
+        limit: int,
+        exclude_ids: Collection[int] = frozenset(),
+        *,
+        held_engines: Collection[str] = frozenset(),
+        active_engine: str | None = None,
     ):
         # *exclude_ids* (the held and the suppressed pictures) are left out
         # here, ahead of the LIMIT, so they cannot fill the window.
+        #
+        # So are the pictures a held engine would caption (*held_engines*): a
+        # sentinel naming one, and, when *active_engine* is held, the NULL
+        # backlog and the sentinel naming no engine, which caption with it.
         #
         # A picture frozen by a locked set has a read-only description (rule 3):
         # never re-queue it for machine (re)description. Parity with the tagger's
@@ -285,6 +325,23 @@ class MissingDescriptionFinder(BaseTaskFinder):
         # the write skips a Scrapheap picture, so selecting one would caption
         # it again on every sweep.
         not_locked = ~Picture.id.in_(locked_picture_id_subquery())
+        held_clauses = []
+        if held_engines:
+            held_values = [make_description_sentinel(e) for e in sorted(held_engines)]
+            if active_engine in held_engines:
+                held_clauses = [
+                    Picture.description.is_not(None),
+                    Picture.description.not_in(
+                        [*held_values, make_description_sentinel(None)]
+                    ),
+                ]
+            else:
+                held_clauses = [
+                    or_(
+                        Picture.description.is_(None),
+                        Picture.description.not_in(held_values),
+                    )
+                ]
         stmt = select(Picture).where(
             or_(
                 Picture.description.is_(None),
@@ -301,6 +358,7 @@ class MissingDescriptionFinder(BaseTaskFinder):
             not_locked,
             *describable_picture_clauses(),
             not_in_json(Picture.id, exclude_ids),
+            *held_clauses,
         )
         return session.exec(
             # Sentinels (a reset) ahead of NULLs (never captioned), then by id,
