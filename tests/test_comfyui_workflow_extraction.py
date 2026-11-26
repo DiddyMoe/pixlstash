@@ -19,7 +19,6 @@ from pixlstash.utils.comfyui_utilities import _NOT_A_MODEL_WIDGET
 from pixlstash.services.workflow_identity import CHECKPOINT_WIDGETS
 from pixlstash.services.workflow_io import detect_workflow_io
 from pixlstash.utils.comfyui_utilities import (
-    _parse_metadata_value,
     extract_comfy_workflow_info,
     extract_generation_info,
     extract_recipe_extras,
@@ -1049,8 +1048,10 @@ def test_a_sampler_node_names_the_sampler_in_the_recipe_settings():
     assert extract_recipe_extras(graph)["settings"]["sampler_name"] == "euler"
 
 
-def test_metadata_text_nested_past_the_parser_is_kept_as_text():
+@pytest.mark.parametrize("key", ["png", "comfyui", "workflow"])
+def test_metadata_text_nested_past_the_parser_is_no_workflow(key):
     """JSON nested deeper than the parser recurses raises RecursionError, not
-    ValueError; the value is still only text that does not parse."""
+    ValueError. A picture's metadata is text from outside the app, so a value
+    like that is a workflow that does not parse, not a failed import."""
     deep = "[" * 100_000 + "]" * 100_000
-    assert _parse_metadata_value({"workflow": deep}) == {"workflow": deep}
+    assert find_comfy_workflow({key: deep}) is None
