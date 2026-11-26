@@ -10,7 +10,7 @@ import json
 import pytest
 
 from pixlstash.services import comfyui_recipe_service
-from pixlstash.services.comfyui_service import NO_PROXY
+from pixlstash.services.comfyui_service import COMFYUI_ANSWER_MAX_BYTES, NO_PROXY
 from pixlstash.services.comfyui_recipe_service import (
     MAX_SEED_64,
     MODEL_FILENAME_FIELDS,
@@ -689,6 +689,20 @@ class TestDetectLoraTargets:
             }
         }
         assert [t["strengths"] for t in detect_lora_targets(graph)] == [{}]
+
+    def test_an_integer_past_the_float_range_is_refused_not_overflowed(self):
+        """`json.loads` reads 10**400 exactly; testing it as a float overflows."""
+        graph = {
+            "1": {
+                "class_type": "LoraLoader",
+                "inputs": {
+                    "lora_name": "a.safetensors",
+                    "strength_model": 10**400,
+                    "strength_clip": -(10**400),
+                },
+            }
+        }
+        assert detect_lora_targets(graph)[0]["strengths"] == {}
 
     def test_a_non_finite_strength_is_refused_rather_than_rendered(self):
         """`json.loads` takes `NaN`; the response renders with allow_nan=False.
@@ -1594,8 +1608,34 @@ class TestBypassNode:
         assert "5" in graph
 
     def test_a_node_that_is_not_there_refuses(self):
-        with pytest.raises(LookupError, match="not in this graph"):
+        with pytest.raises(LookupError, match="node 99: it is not in this graph"):
             bypass_node(self._graph(), "99", self.INFO)
+
+    def test_a_refusal_names_a_node_by_number_never_in_the_graph_s_words(self):
+        """The ids and class are the caller's text: named only once they read
+        as a node number, or as a class this ComfyUI lists."""
+        graph = self._graph(clip_wired=False)
+        graph["evil<b>"] = graph.pop("6")
+        graph["evil<b>"]["class_type"] = "Evil<i>Encode"
+        with pytest.raises(LookupError) as refused:
+            bypass_node(graph, "5", self.INFO)
+        text = str(refused.value)
+        assert text.startswith("A node reads output 1 of node 5 (LoraLoader),")
+        assert "evil" not in text.lower()
+
+        graph = self._graph()
+        graph["7:0012"] = graph.pop("5")
+        graph["7:0012"]["class_type"] = "Unlisted<script>"
+        with pytest.raises(LookupError) as refused:
+            bypass_node(graph, "7:0012", self.INFO)
+        text = str(refused.value)
+        assert "what node 7:12 hands on" in text
+        assert "Unlisted" not in text and "script" not in text
+
+        with pytest.raises(LookupError) as refused:
+            bypass_node(self._graph(), "../evil", self.INFO)
+        assert "evil" not in str(refused.value)
+        assert "a node: it is not in this graph" in str(refused.value)
 
 
 class TestLoraChain:
@@ -1672,6 +1712,26 @@ class TestLoraChain:
         plan = plan_lora_chain(graph, chain, entries, info)
         apply_lora_chain(graph, plan, info)
         return plan
+
+    @pytest.mark.parametrize(
+        "missing, named", [("4", "node 4"), ("test-secret-node", "a node")]
+    )
+    def test_a_loader_wired_to_a_missing_node_is_refused_in_its_own_words(
+        self, missing, named
+    ):
+        # The lookup's own text would be the graph's key, which is no reason.
+        graph = self._graph()
+        del graph["4"]
+        graph["10"]["inputs"]["model"] = [missing, 0]
+        graph["10"]["inputs"]["clip"] = [missing, 1]
+        with pytest.raises(LookupError) as refused:
+            read_lora_chain(graph, self.INFO)
+        assert type(refused.value) is LookupError
+        assert str(refused.value) == (
+            f"A LoRA loader in this workflow reads {named}, which the workflow "
+            "does not have, so there is no chain of LoRAs to edit. Change it "
+            "in ComfyUI."
+        )
 
     def test_the_chain_is_read_in_the_order_it_applies(self):
         chain = read_lora_chain(self._graph(), self.INFO)
@@ -1815,15 +1875,22 @@ class TestLoraChain:
     @pytest.mark.parametrize(
         "entries, message",
         [
-            ([{"node_id": "99"}], "no LoRA loader #99"),
+            ([{"node_id": "99"}], "Entry 1 names a LoRA loader"),
+            (
+                [{"node_id": "10"}, {"node_id": "evil<b>"}],
+                "Entry 2 names a LoRA loader this workflow does not have",
+            ),
             ([{"node_id": "10"}, {"node_id": "10"}], "listed twice"),
         ],
     )
     def test_an_unknown_or_repeated_loader_is_refused(self, entries, message):
         graph = self._graph()
         chain = read_lora_chain(graph, self.INFO)
-        with pytest.raises(LookupError, match=message):
+        with pytest.raises(LookupError, match=message) as refused:
             plan_lora_chain(graph, chain, entries, self.INFO)
+        # The caller's own node_id is never handed back.
+        assert "evil" not in str(refused.value)
+        assert "99" not in str(refused.value)
 
     def test_a_refused_apply_leaves_the_graph_as_it_was(self):
         graph = self._graph()
@@ -1953,6 +2020,29 @@ class TestLoraChain:
         unread = _describe_lora_chain(self._two_pass(), None, "ComfyUI is down")
         assert unread["branches"] is None
         assert "ComfyUI is down" in unread["refusal"]
+
+    @pytest.mark.parametrize(
+        "tripped", [KeyError("test-secret-key"), IndexError("test-secret-index")]
+    )
+    def test_a_recipe_chain_the_reader_trips_over_says_so_in_a_fixed_sentence(
+        self, monkeypatch, caplog, tripped
+    ):
+        import logging
+
+        import pixlstash.routes.comfyui as comfyui_routes
+
+        def trip(*_args, **_kwargs):
+            raise tripped
+
+        monkeypatch.setattr(comfyui_routes, "read_lora_chain", trip)
+        with caplog.at_level(logging.WARNING, logger=comfyui_routes.logger.name):
+            chain = _describe_lora_chain(self._two_pass(), self.INFO, None)
+        assert chain["branches"] is None
+        assert chain["refusal"] == (
+            "PixlStash could not read this workflow's graph well enough to tell "
+            "how its LoRAs are wired."
+        )
+        assert [r for r in caplog.records if r.exc_info and r.exc_info[1] is tripped]
 
     def test_one_edit_per_pass_rewires_each_lane_off_the_trunk(self):
         graph = self._two_pass()
@@ -2916,6 +3006,34 @@ class TestFilenameSwap:
             },
         }
 
+    def test_every_row_names_its_swap_by_position(self):
+        """So a refusal can say `swaps[i]` without repeating a filename."""
+        info = {
+            "VAELoader": {
+                "input": {"required": {"vae_name": [["flux2-vae.safetensors"], {}]}}
+            },
+            "CheckpointLoaderSimple": {
+                "input": {"required": {"ckpt_name": [["other.safetensors"], {}]}}
+            },
+        }
+        swapped, unswapped = apply_filename_swap(
+            self._graph(),
+            {
+                "absent.safetensors": "x.safetensors",
+                "zimage/zimage-turbo.safetensors": "krea2.safetensors",
+                "ae.safetensors": "flux2-vae.safetensors",
+            },
+            info,
+        )
+        assert {(row["node_id"], row["swap"]) for row in swapped} == {
+            ("5", 2),
+            ("6", 2),
+        }
+        assert sorted((row["reason"], row["swap"]) for row in unswapped) == [
+            ("not_in_graph", 0),
+            ("not_on_comfyui", 1),
+        ]
+
     def test_every_field_naming_the_file_is_rewritten(self):
         graph = self._graph()
         swapped, unswapped = apply_filename_swap(
@@ -3022,6 +3140,7 @@ class TestFilenameSwap:
                 "was": "zimage/zimage-turbo.safetensors",
                 "now": "krea2.safetensors",
                 "verified": False,
+                "swap": 0,
             }
         ]
 
@@ -3076,6 +3195,7 @@ class TestFilenameSwap:
                 "was": "zimage/zimage-turbo.safetensors",
                 "now": "krea2.safetensors",
                 "reason": "not_on_comfyui",
+                "swap": 0,
             }
         ]
 
@@ -3278,6 +3398,20 @@ def test_a_stacker_is_never_half_swapped():
     assert graph["2"]["class_type"] == "LoraStacker"
 
 
+def test_only_ascii_digit_node_ids_sort_as_numbers():
+    # `str.isdigit` takes a superscript two and an id thousands of digits
+    # long; `int` refuses both, and a sort key that raises takes a read down.
+    long_id = "9" * 5000
+    ids = ["10", "9", "75:83", "\u00b2", long_id]
+    assert sorted(ids, key=comfyui_recipe_service._node_order_key) == [
+        "9",
+        "10",
+        "75:83",
+        long_id,
+        "\u00b2",
+    ]
+
+
 def test_object_info_requests_arriving_together_share_one_get(monkeypatch):
     """The Edit tab pre-flights every card at once; ComfyUI builds the map
     once per GET, serially, so concurrent callers must not each ask."""
@@ -3293,12 +3427,12 @@ def test_object_info_requests_arriving_together_share_one_get(monkeypatch):
         status_code = 200
         text = json.dumps({"KSampler": {"input": {}}})
 
-    def slow_get(url, timeout=None, allow_redirects=True, proxies=None):
+    def slow_get(url, **kwargs):
         asked.append(url)
         release.wait(5)
         return Answer()
 
-    monkeypatch.setattr(service.requests, "get", slow_get)
+    monkeypatch.setattr(service, "bounded_get", slow_get)
     results = []
     callers = [
         threading.Thread(
@@ -3336,18 +3470,18 @@ def test_a_shutdown_signal_in_the_shared_get_reaches_waiters_as_a_failure(
 
     release = threading.Event()
 
-    def interrupted_get(url, timeout=None, allow_redirects=True, proxies=None):
+    def interrupted_get(url, **kwargs):
         release.wait(5)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(service.requests, "get", interrupted_get)
+    monkeypatch.setattr(service, "bounded_get", interrupted_get)
     seen = {}
 
     def call(name):
         try:
             service.fetch_object_info("http://c")
         except BaseException as exc:  # noqa: BLE001 - the type is the assertion
-            seen[name] = type(exc)
+            seen[name] = (type(exc), str(exc))
 
     owner = threading.Thread(target=call, args=("owner",))
     owner.start()
@@ -3361,25 +3495,73 @@ def test_a_shutdown_signal_in_the_shared_get_reaches_waiters_as_a_failure(
     release.set()
     owner.join(5)
     waiter.join(5)
-    assert seen == {"owner": KeyboardInterrupt, "waiter": RuntimeError}
+    # The waiter's failure is a fixed sentence: whatever interrupted the
+    # owner is the owner's to log, not text a route hands a caller.
+    assert seen == {
+        "owner": (KeyboardInterrupt, ""),
+        "waiter": (
+            RuntimeError,
+            "The request to ComfyUI for /object_info was interrupted",
+        ),
+    }
+
+
+def test_object_info_nested_past_the_parsers_depth_is_invalid_json(monkeypatch, caplog):
+    """The C decoder raises RecursionError, not ValueError, on deep nesting.
+
+    It is a RuntimeError, so it reached the routes as if it were one of this
+    module's own sentences and its text went out as the reason.
+    """
+    import logging
+
+    import pixlstash.services.comfyui_recipe_service as service
+
+    class Answer:
+        status_code = 200
+        text = "[" * 200_000 + "]" * 200_000
+
+    monkeypatch.setattr(service, "bounded_get", lambda url, **kwargs: Answer())
+    with caplog.at_level(logging.WARNING, logger=service.logger.name):
+        with pytest.raises(RuntimeError) as refused:
+            service.fetch_object_info("http://c")
+    assert str(refused.value) == "ComfyUI returned invalid JSON for /object_info"
+    assert isinstance(refused.value.__cause__, RecursionError)
+    logged = [r for r in caplog.records if r.exc_info]
+    assert logged and isinstance(logged[0].exc_info[1], RecursionError)
 
 
 def test_the_object_info_read_goes_straight_to_comfyui(monkeypatch):
-    """Never through a proxy set in the environment, and never on to wherever
-    a redirect points: the map it reads decides what a run is sent with."""
+    """Never through a proxy set in the environment, never on to wherever a
+    redirect points, and never read past a deadline or ComfyUI's answer cap:
+    the map it reads decides what a run is sent with."""
     asked = []
 
     class Answer:
         status_code = 200
         text = json.dumps({"KSampler": {"input": {}}})
 
-    # ``requests`` follows a redirect unless told not to.
-    def get(url, timeout=None, allow_redirects=True, proxies=None):
-        asked.append((url, allow_redirects, proxies))
+    def get(url, **kwargs):
+        asked.append(
+            (
+                url,
+                kwargs.get("redirects", 0),
+                kwargs.get("proxies"),
+                kwargs.get("deadline_s"),
+                kwargs.get("max_bytes"),
+            )
+        )
         return Answer()
 
-    monkeypatch.setattr(comfyui_recipe_service.requests, "get", get)
+    monkeypatch.setattr(comfyui_recipe_service, "bounded_get", get)
     assert comfyui_recipe_service.fetch_object_info("http://c") == {
         "KSampler": {"input": {}}
     }
-    assert asked == [("http://c/object_info", False, NO_PROXY)]
+    assert asked == [
+        (
+            "http://c/object_info",
+            0,
+            NO_PROXY,
+            comfyui_recipe_service.OBJECT_INFO_DEADLINE_S,
+            COMFYUI_ANSWER_MAX_BYTES,
+        )
+    ]

@@ -2208,7 +2208,7 @@ def _stored_value(text: str) -> bool | int | float | str:
     """
     try:
         value = json.loads(text)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return text
     return value if isinstance(value, (bool, int, float, str)) else text
 

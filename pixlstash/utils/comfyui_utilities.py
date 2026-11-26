@@ -1283,7 +1283,7 @@ def _parse_metadata_value(value: Any) -> Any:
         ):
             try:
                 return json.loads(trimmed)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return value
         return value
     if isinstance(value, list):
@@ -1307,7 +1307,7 @@ def _workflow_candidate(value: Any) -> dict | None:
         ):
             try:
                 return json.loads(trimmed)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return None
         return None
     if isinstance(value, dict):
@@ -1391,19 +1391,23 @@ def check_comfy_workflow(value: Any) -> None:
                     f"not a ComfyUI workflow: entry {index} of its nodes has no id"
                 )
             if not _is_name(node.get("type")):
+                # Named by position: the id is the document's own text.
                 raise NotAWorkflowError(
-                    f"not a ComfyUI workflow: node {_shown(node['id'])} has no type"
+                    f"not a ComfyUI workflow: entry {index} of its nodes has no type"
                 )
         return
     graph = value["prompt"] if isinstance(value.get("prompt"), dict) else value
+    # Each entry with its 1-based place in the graph, counting PixlStash's own
+    # keys too so the number matches the file: a refusal names the place, never
+    # the key, which is the document's own text.
     entries = {
-        key: node
-        for key, node in graph.items()
+        place: node
+        for place, (key, node) in enumerate(graph.items(), start=1)
         if not str(key).startswith("pixlstash_")
     }
     strays = [
-        key
-        for key, node in entries.items()
+        place
+        for place, node in entries.items()
         if not (
             isinstance(node, dict)
             and _is_name(node.get("class_type"))
@@ -1414,18 +1418,13 @@ def check_comfy_workflow(value: Any) -> None:
         raise NotAWorkflowError("not a ComfyUI workflow")
     if strays:
         raise NotAWorkflowError(
-            f"not a ComfyUI workflow: {_shown(strays[0])} is not a node with a "
-            "class_type and inputs"
+            f"not a ComfyUI workflow: entry {strays[0]} of the graph is not a node "
+            "with a class_type and inputs"
         )
 
 
 def _is_name(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
-
-
-def _shown(value: Any) -> str:
-    """*value* quoted for a message, cut short so a huge key cannot flood it."""
-    return repr(str(value)[:60])
 
 
 def find_comfy_workflow(metadata: dict) -> dict | None:

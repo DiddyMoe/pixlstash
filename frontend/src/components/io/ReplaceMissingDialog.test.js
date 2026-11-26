@@ -10,7 +10,12 @@ const setWorkflowModelFix = vi.fn();
 vi.mock("../../api/workflows", () => ({
   readModelSwap: (...args) => readModelSwap(...args),
   setWorkflowModelFix: (...args) => setWorkflowModelFix(...args),
-  getWorkflowCard: vi.fn(async (id) => ({ card: { id, name: `Name of ${id}` } })),
+  // The names come from the grid's listing, one read for every id.
+  listWorkflowCards: vi.fn(async () => ({
+    cards: ["auto:a", "auto:b", "auto:d"].map((id) => ({ id, name: `Name of ${id}` })),
+    one_offs: 0,
+    hidden: 0,
+  })),
 }));
 const fetchWorkflowSets = vi.fn(async () => ({ combinations: [], no_set: [] }));
 vi.mock("../../api/modelShelf", async (importOriginal) => ({

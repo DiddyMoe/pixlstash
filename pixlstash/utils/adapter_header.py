@@ -353,7 +353,7 @@ def read_safetensors_header(path: str) -> Optional[dict]:
     except (OSError, struct.error) as exc:
         logger.warning("Could not read safetensors header from %s: %s", path, exc)
         return None
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         logger.warning(
             "safetensors header in %s is not valid JSON: %s. Treating the file "
             "as undescribed rather than rejecting it.",
@@ -731,7 +731,7 @@ def _trigger_words_from_tag_frequency(raw) -> list[str]:
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             logger.warning("ss_tag_frequency is not valid JSON (%s); ignoring.", exc)
             return []
     if not isinstance(raw, dict):
@@ -765,7 +765,7 @@ def _decode_json_object(raw, label: str) -> dict:
     if isinstance(raw, str):
         try:
             decoded = json.loads(raw)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             logger.warning(
                 "Metadata key %r is not valid JSON (%s); ignoring.", label, exc
             )

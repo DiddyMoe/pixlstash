@@ -40,6 +40,8 @@ import requests
 from pixlstash.pixl_logging import get_logger
 from pixlstash.resources.arbiter import Tenant, arbiter
 from pixlstash.resources.ledger import UNMEASURED_DEVICE, ledger
+from pixlstash.utils.bounded_http import bounded_get, bounded_request
+from pixlstash.utils.comfyui_url import is_loopback_host, normalize_comfyui_url
 
 logger = get_logger(__name__)
 
@@ -61,16 +63,26 @@ SAME_CARD_TOTAL_TOLERANCE_MB = 1024
 FREE_SETTLE_TIMEOUT_S = 30.0
 #: Two reads this close together count as settled.
 FREE_SETTLE_MB = 256
+#: How long the ``POST /free`` itself may take in all, its answer included.
+FREE_REQUEST_TIMEOUT_S = 10.0
 #: How often a run's peak is sampled.
 PEAK_SAMPLE_S = 0.5
 #: How long ``quit`` waits for ComfyUI to exit after asking it to.
 QUIT_WAIT_S = 30.0
+#: How long one receive (and the connect) of a ComfyUI read may take.
+READ_TIMEOUT_S = 5.0
+#: How long one ``/system_stats`` or ``/queue`` read may take in all, body
+#: included: a ComfyUI that trickles its answer is unread past this, rather
+#: than holding every caller that joined the read.
+READ_DEADLINE_S = 10.0
+#: The most a ``/system_stats`` or ``/queue`` answer may be. A queue carries
+#: every pending prompt's whole graph; this is the service's own queue cap.
+READ_MAX_BYTES = 32 * 1024 * 1024
 
 _MB = 1024 * 1024
 # What ``_map_device`` answers when a read failed partway: unknown, not remote.
 _UNREAD = object()
 _NO_PROXY = {"http": None, "https": None, "all": None}
-_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 _T = TypeVar("_T")
 
 
@@ -100,6 +112,10 @@ class ComfyUIProbe:
     def __init__(self, client_id: str) -> None:
         self._client_id = client_id
         self._lock = threading.Lock()
+        # One search for ComfyUI's process at a time, off ``_lock``: the
+        # search reads every process's sockets on its card. Taken before
+        # ``_lock``, never while holding it.
+        self._search_lock = threading.Lock()
         self._base_url: str | None = None
         self._stats: tuple[float, dict | None] = (0.0, None)
         self._queue: tuple[float, dict | None] = (0.0, None)
@@ -121,19 +137,36 @@ class ComfyUIProbe:
         return self._base_url
 
     def watch(self, base_url: str) -> None:
-        """Point the probe at the ComfyUI PixlStash is about to submit to."""
+        """Point the probe at the ComfyUI PixlStash is about to submit to.
+
+        The address is normalised first (``normalize_comfyui_url``), so
+        ``http://host:8188`` and ``http://host:8188/`` are one ComfyUI, not a
+        change of address that drops what was read of it. One that is not an
+        unambiguous http(s) address (a user part, a query, a host the URL
+        parsers read differently) leaves the probe pointed at nothing, so no
+        read is sent and no process is matched to it.
+        """
+        try:
+            # Without the slash: paths are joined on as ``/system_stats``.
+            normalized = normalize_comfyui_url(base_url).rstrip("/")
+        except ValueError as exc:
+            # The message is fixed text; the address itself is not logged, as
+            # it is not one the parsers agree on.
+            logger.warning(
+                "Not reading ComfyUI's memory or queue: the address is not valid (%s)",
+                exc,
+            )
+            normalized = None
         with self._lock:
-            if base_url != self._base_url:
-                self._base_url = base_url
+            if normalized != self._base_url:
+                self._base_url = normalized
                 self._mapping = (0.0, None)
                 self._forget_process_locked()
 
     # ── reads ────────────────────────────────────────────────────────────
 
     def _get(self, path: str):
-        response = requests.get(f"{self._base_url}{path}", timeout=5, proxies=_NO_PROXY)
-        response.raise_for_status()
-        return response.json()
+        return _read_json(f"{self._base_url}{path}")
 
     def _read(self, path: str, what: str) -> dict | None:
         """*path*'s answer, or None when ComfyUI cannot be read."""
@@ -262,7 +295,8 @@ class ComfyUIProbe:
         if first is None:
             return _UNREAD
         cards = ledger().devices(max_age_s=0.0)
-        loopback = (urlparse(self._base_url or "").hostname or "") in _LOOPBACK_HOSTS
+        host = urlparse(self._base_url or "").hostname or ""
+        loopback = bool(host) and is_loopback_host(host)
         if cards and not cards[0].measurable:
             # No NVML to compare with (Metal, ROCm). A ComfyUI on a loopback
             # address shares this machine's one unmeasurable device.
@@ -393,32 +427,51 @@ class ComfyUIProbe:
                     self._base_url,
                 )
                 return False
-        try:
-            process = psutil.Process(pid)
-            process.terminate()
-            process.wait(timeout=wait_s)
-        except psutil.NoSuchProcess:
-            logger.info("ComfyUI's process %s had already exited", pid)
-        except (psutil.Error, OSError) as exc:
-            # TimeoutExpired is a psutil.Error too: not escalated to a kill.
-            # (On Windows psutil's terminate is already TerminateProcess.)
-            logger.warning(
-                "Could not quit ComfyUI at %s (process %s): %s",
-                self._base_url,
-                pid,
-                exc,
-            )
-            return False
+            # The check and the signal as one step: a switch asked now lands
+            # after the terminate, so the process ended is the one whose port
+            # and queue were checked. Only the wait is off the lock.
+            base_url = self._base_url
+            try:
+                process = psutil.Process(pid)
+                process.terminate()
+            except psutil.NoSuchProcess:
+                logger.info("ComfyUI's process %s had already exited", pid)
+                process = None
+            except (psutil.Error, OSError) as exc:
+                # (On Windows psutil's terminate is already TerminateProcess.)
+                logger.warning(
+                    "Could not quit ComfyUI at %s (process %s): %s",
+                    base_url,
+                    pid,
+                    exc,
+                )
+                return False
+        if process is not None:
+            try:
+                # An exited process returns at once rather than raising.
+                process.wait(timeout=wait_s)
+            except (psutil.Error, OSError) as exc:
+                # TimeoutExpired is a psutil.Error too: not escalated to a kill.
+                logger.warning(
+                    "Could not quit ComfyUI at %s (process %s): %s",
+                    base_url,
+                    pid,
+                    exc,
+                )
+                return False
         logger.warning(
             "Quit ComfyUI at %s (process %s) to make room for training, as "
             "the owner asked; it has to be started again by hand",
-            self._base_url,
+            base_url,
             pid,
         )
         with self._lock:
             # The next ComfyUI started here is a new process with its own
-            # floor, and a read begun before the quit was the old one's.
-            self._forget_process_locked()
+            # floor, and a read begun before the quit was the old one's. A
+            # switch during the wait already dropped them, and what was read
+            # since is the new address's.
+            if generation == self._generation:
+                self._forget_process_locked()
         return True
 
     def _forget_process_locked(self) -> None:
@@ -448,28 +501,42 @@ class ComfyUIProbe:
         if not card or card == UNMEASURED_DEVICE:
             return None
         processes = ledger().processes(card)
-        # The search under the lock, so concurrent callers do not each scan
-        # every process's sockets; it is local, no HTTP.
-        with self._lock:
-            if generation != self._generation:
-                # ComfyUI changed since its card was read: not this one's.
-                return None
-            if self._pid not in processes and frozenset(processes) != self._searched:
+        # One search at a time, so concurrent callers do not each scan every
+        # process's sockets: a caller that waited reuses the answer. The scan
+        # runs off ``_lock``, so reads of ComfyUI and a switch of address do
+        # not wait behind it.
+        with self._search_lock:
+            with self._lock:
+                if generation != self._generation:
+                    # ComfyUI changed since its card was read: not this one's.
+                    return None
+                if self._pid in processes or frozenset(processes) == self._searched:
+                    return processes.get(self._pid)
+                previous = self._pid
+            found = self._listening_pid(processes)
+            with self._lock:
+                if generation != self._generation:
+                    # ComfyUI changed during the search: the pid found is the
+                    # old address's process, which ``quit`` would end.
+                    logger.info(
+                        "Dropped a search for ComfyUI's process: ComfyUI "
+                        "changed while it ran (now %s)",
+                        self._base_url,
+                    )
+                    return None
                 self._searched = frozenset(processes)
-                found = self._listening_pid(processes)
-                if found is not None and self._pid is not None and found != self._pid:
+                if found is not None and previous is not None and found != previous:
                     # ComfyUI was restarted: its floor was another process's.
                     self._floor_mb = None
                 self._pid = found
-                if self._pid is None and processes:
+                if found is None and processes:
                     logger.warning(
                         "No process on ComfyUI's card listens on %s, so its "
                         "memory is read from its allocator alone and may show "
                         "as other apps'",
                         self._base_url,
                     )
-            pid = self._pid
-        return processes.get(pid)
+        return processes.get(found)
 
     def _listening_pid(self, pids) -> int | None:
         """Which of *pids* listens on ComfyUI's port, or None."""
@@ -540,13 +607,21 @@ class ComfyUIProbe:
             return None
         before = self.usage_mb() or 0
         try:
-            response = requests.post(
+            # Not followed: a redirect names an address nobody checked. The
+            # answer carries nothing, and is read within the probe's bounds.
+            response = bounded_request(
+                "POST",
                 f"{self._base_url}/free",
                 json={"unload_models": True, "free_memory": True},
-                timeout=10,
+                timeout=FREE_REQUEST_TIMEOUT_S,
+                deadline_s=FREE_REQUEST_TIMEOUT_S,
+                max_bytes=READ_MAX_BYTES,
                 proxies=_NO_PROXY,
             )
-            response.raise_for_status()
+            if response.status_code != 200:
+                raise requests.HTTPError(
+                    f"{self._base_url}/free answered {response.status_code}"
+                )
         except requests.RequestException as exc:
             logger.warning(
                 "ComfyUI at %s could not be asked to free memory: %s",
@@ -573,6 +648,25 @@ class ComfyUIProbe:
             last,
         )
         return max(0, before - last)
+
+
+def _read_json(url: str):
+    """*url*'s JSON answer, read within ``READ_DEADLINE_S`` and
+    ``READ_MAX_BYTES``; any answer but a 200 is ``requests.HTTPError``.
+
+    A redirect is not followed and counts as no answer: it names an address
+    nobody checked. Every probe read goes through here.
+    """
+    response = bounded_get(
+        url,
+        deadline_s=READ_DEADLINE_S,
+        max_bytes=READ_MAX_BYTES,
+        timeout=READ_TIMEOUT_S,
+        proxies=_NO_PROXY,
+    )
+    if response.status_code != 200:
+        raise requests.HTTPError(f"{url} answered {response.status_code}")
+    return response.json()
 
 
 def _ttl(value, max_age_s: float) -> float:

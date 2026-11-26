@@ -34,10 +34,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import http.client
+import io
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import time
@@ -82,6 +85,10 @@ RUN_POLL_SECONDS = 1.0
 RUN_FIRST_LOOK_SECONDS = 5.0
 # ponytail: a real graph is 50-500 KB; this only stops a stray path at a huge file.
 MAX_GRAPH_BYTES = 16 * 1024 * 1024
+# The most of one answer kept in memory. The largest answers are a page of
+# MAX_LIMIT pictures and a workflow graph (MAX_GRAPH_BYTES); a server sending
+# more is not PixlStash answering a request, and reading on would fill memory.
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 # Returned from `initialize`. Without it a client knows only six tool names and
 # reaches for `ls` and `find` instead, which cannot see any of this: tags,
@@ -563,8 +570,10 @@ WORKFLOW_TOOLS = [
         "failed and why (stopped true for a run that was interrupted), or "
         "running or waiting (held by PixlStash until the GPU has room, with a "
         "run_id and no prompt_id yet), which get_workflow_run reads later. A "
-        "call whose every run "
-        "failed is an error carrying that message.",
+        "run not read before the wait ended (always, with wait_seconds 0) "
+        "keeps the status it was submitted with, queued or waiting; one whose "
+        "read failed is unknown, with the reason in message. A call whose "
+        "every run failed is an error carrying that message.",
         "inputSchema": {
             **_RUN_SCHEMA,
             "properties": {
@@ -606,10 +615,97 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _DeadlineReader(io.RawIOBase):
+    """A response's socket, read with each receive held to what is left of *end*.
+
+    A socket timeout bounds one receive; setting it to the time remaining
+    before every receive makes it bound the whole response instead: the status
+    line, the headers, each chunk-size line and the content alike, since
+    ``http.client`` reads all of them through this one stream. *end* is a
+    ``time.monotonic()`` value.
+    """
+
+    def __init__(self, sock: socket.socket, end: float) -> None:
+        super().__init__()
+        self._sock = sock
+        # makefile, not a bare SocketIO: it counts a reference on the socket,
+        # which keeps it open after urllib closes the connection's own handle.
+        self._raw = sock.makefile("rb", buffering=0)
+        self._end = end
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        left = self._end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("PixlStash was still answering when its time ran out")
+        self._sock.settimeout(left)
+        return self._raw.readinto(buffer)
+
+    def close(self) -> None:
+        if not self.closed:
+            self._raw.close()
+        super().close()
+
+
+class _DeadlineSocket:
+    """The socket as ``HTTPResponse`` sees it: one stream, read by a deadline."""
+
+    def __init__(self, sock: socket.socket, end: float) -> None:
+        self._sock = sock
+        self._end = end
+
+    def makefile(self, mode: str) -> io.BufferedReader:
+        return io.BufferedReader(_DeadlineReader(self._sock, self._end))
+
+
+def _deadline_response(sock, *args, end: float, **kwargs) -> http.client.HTTPResponse:
+    """An ``HTTPResponse`` that reads *sock* through a :class:`_DeadlineReader`."""
+    return http.client.HTTPResponse(_DeadlineSocket(sock, end), *args, **kwargs)
+
+
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    """An ``HTTPConnection`` whose response must be in by *end*."""
+
+    def __init__(self, *args, end: float, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.response_class = functools.partial(_deadline_response, end=end)
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """An ``HTTPSConnection`` whose response must be in by *end*."""
+
+    def __init__(self, *args, end: float, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.response_class = functools.partial(_deadline_response, end=end)
+
+
+def _deadline_of(request: urllib.request.Request) -> float:
+    """When *request*'s answer must be in: its timeout, from now, in all."""
+    return time.monotonic() + request.timeout
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    """``http://`` with the request's timeout as a deadline on the response."""
+
+    def http_open(self, req):
+        connection = functools.partial(_DeadlineHTTPConnection, end=_deadline_of(req))
+        return self.do_open(connection, req)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    """``https://`` with the request's timeout as a deadline on the response."""
+
+    def https_open(self, req):
+        connection = functools.partial(_DeadlineHTTPSConnection, end=_deadline_of(req))
+        return self.do_open(connection, req, context=self._context)
+
+
 def _build_opener(
     context: ssl.SSLContext | None = None,
 ) -> urllib.request.OpenerDirector:
-    """An opener that reaches the named URL and nothing else.
+    """An opener that reaches the named URL and nothing else, by a deadline.
 
     The token goes to the URL the owner named and nowhere else, which takes two
     handlers rather than one. Refusing redirects is the obvious half; the empty
@@ -617,11 +713,19 @@ def _build_opener(
     ``http_proxy`` from the environment and does not bypass loopback (it
     consults ``no_proxy`` only), so a proxy set for the shell would receive the
     Authorization header.
+
+    The ``http``/``https`` handlers make the timeout given to ``open`` a
+    deadline on the whole response, framing included, rather than on each
+    receive: a server dribbling its status line, headers or chunk-size lines
+    a byte at a time is cut off when that time is up. ``open`` must be given
+    a timeout.
     """
-    handlers: list = [_NoRedirect, urllib.request.ProxyHandler({})]
-    if context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=context))
-    return urllib.request.build_opener(*handlers)
+    return urllib.request.build_opener(
+        _NoRedirect,
+        urllib.request.ProxyHandler({}),
+        _DeadlineHTTPHandler,
+        _DeadlineHTTPSHandler(context=context),
+    )
 
 
 class ToolError(Exception):
@@ -634,6 +738,14 @@ class NotFoundError(ToolError):
 
 class WaitOver(ToolError):
     """The caller's own deadline, not PixlStash, ended the request."""
+
+
+class ResponseTooLarge(Exception):
+    """An answer ran past :data:`MAX_RESPONSE_BYTES`; the read stopped there."""
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"the answer was larger than {max_bytes} bytes")
+        self.max_bytes = max_bytes
 
 
 def unreachable_message(base: str, reason) -> str:
@@ -666,28 +778,34 @@ def unreachable_message(base: str, reason) -> str:
     )
 
 
-def _read_by(response, end: float) -> bytes:
+def _read_by(response, end: float, max_bytes: int) -> bytes:
     """The rest of *response*'s body, or ``TimeoutError`` once *end* passes.
 
     urllib's timeout bounds each socket operation, not the body: a server that
     sends a byte at a time keeps a plain ``read()`` going for as long as it
-    likes. *end* is a ``time.monotonic()`` value. The bound covers the body's
-    content, not the framing of a chunked answer.
+    likes. *end* is a ``time.monotonic()`` value. Under :func:`_build_opener`
+    every receive, framing included, is also held to the same deadline by
+    :class:`_DeadlineReader`; this check is what ends a body whose receives
+    each answer in time. urllib sends no ``Accept-Encoding`` and decodes
+    nothing, so the bytes counted against *max_bytes* are the bytes kept.
+
+    Raises:
+        TimeoutError: *end* passed with the body still arriving.
+        ResponseTooLarge: The body ran past *max_bytes*.
     """
     chunks = []
+    size = 0
     while True:
         if time.monotonic() >= end:
             raise TimeoutError("the body was still arriving")
-        # read1 makes at most one recv for the payload, so trickled content
-        # holds past *end* by that one recv at most, which can last the
-        # request's whole budget. For a chunked answer http.client reads each
-        # chunk-size line and the trailers in its own readline loops, bounded
-        # per recv only: a server that dribbles that framing, like one that
-        # dribbles the status line or headers, can still hold a request past
-        # *end*.
+        # read1 makes at most one recv for the payload, and that recv's own
+        # timeout is what remains before *end*.
         chunk = response.read1(64 * 1024)
         if not chunk:
             return b"".join(chunks)
+        size += len(chunk)
+        if size > max_bytes:
+            raise ResponseTooLarge(max_bytes)
         chunks.append(chunk)
 
 
@@ -696,11 +814,10 @@ def http_fetch(
 ) -> Fetch:
     """Return a :data:`Fetch` that calls *base_url* with *token* as Bearer.
 
-    Each request's body content is held to ``TIMEOUT_SECONDS`` in all, and to
-    *deadline* when that comes sooner, give or take the one socket read under
-    way then, which can last as long as the request's whole budget. The status
-    line, the headers and the framing of a chunked answer are bounded per
-    socket read only.
+    Each request's answer (status line, headers, chunk framing and content)
+    is held to ``TIMEOUT_SECONDS`` in all, and to *deadline* when that comes
+    sooner. The connect and the send are bounded by that budget per socket
+    operation.
     """
     base = base_url.rstrip("/")
     opener = _build_opener(context)
@@ -741,7 +858,7 @@ def http_fetch(
                 return (
                     response.status,
                     response.headers.get("Content-Type", ""),
-                    _read_by(response, end),
+                    _read_by(response, end, MAX_RESPONSE_BYTES),
                 )
         except urllib.error.URLError as exc:
             if cut_by_wait and isinstance(exc.reason, TimeoutError):
@@ -762,6 +879,12 @@ def http_fetch(
                 "plain HTTP, so PixlStash is probably serving https on this "
                 "port. Check `require_ssl` in its server-config.json, and "
                 "point this server at that file with --server-config."
+            ) from exc
+        except ResponseTooLarge as exc:
+            logger.warning("[mcp] %s%s: %s; not read further", base, path, exc)
+            raise ToolError(
+                f"PixlStash's answer to {path} was larger than "
+                f"{exc.max_bytes // (1024 * 1024)} MiB, so it was not read."
             ) from exc
         except TimeoutError as exc:
             # Only the *send* is wrapped in URLError; a read timeout arrives
@@ -1229,7 +1352,7 @@ def serve(fetch: Fetch, stdin=None, stdout=None, allow_write: bool = False) -> N
             continue
         try:
             message = json.loads(line)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             logger.warning("[mcp] Unparseable message %r: %s", line[:200], exc)
             reply = {
                 "jsonrpc": "2.0",

@@ -34,14 +34,17 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.model_icons import (
+    MAX_ICON_BYTES,
     IconRefused,
     icon_path,
     media_type_of,
     store_icon,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -71,7 +74,7 @@ class ClearIconsRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(description="Hub `model.id` values to clear.")
+    ids: list[SqliteInt] = Field(description="Hub `model.id` values to clear.")
 
 
 class ClearIconsResponse(BaseModel):
@@ -117,14 +120,21 @@ def create_router(server) -> APIRouter:
         response_model=IconSetResponse,
     )
     async def set_model_icon(
-        model_id: int, request: Request, file: UploadFile = File(...)
+        model_id: SqliteInt, request: Request, file: UploadFile = File(...)
     ):
         server.auth.ensure_secure_when_required(request)
+        # One byte past the cap is enough for store_icon to refuse it; the
+        # rest of an oversized upload is never read into memory.
+        data = await file.read(MAX_ICON_BYTES + 1)
+        # The hub reads and writes and the image decode wait on a worker, not
+        # on the event loop every other request shares.
+        return await run_in_threadpool(_set_icon, model_id, data)
+
+    def _set_icon(model_id: int, data: bytes) -> IconSetResponse:
+        """The rest of ``set_model_icon``: check, store, point the row at it."""
         row = server.hub.fetchone("SELECT id FROM model WHERE id = ?", (model_id,))
         if row is None:
             raise HTTPException(status_code=404, detail="No such model.")
-
-        data = await file.read()
         try:
             digest = store_icon(server.hub.path, data)
         except IconRefused as exc:

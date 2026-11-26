@@ -26,10 +26,14 @@ import time
 from importlib.metadata import PackageNotFoundError, version as package_version
 
 import requests
-import urllib3
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.training import presets
+from pixlstash.utils.bounded_http import (
+    ReadDeadlineExceeded,
+    ResponseTooLarge,
+    bounded_get,
+)
 
 logger = get_logger(__name__)
 
@@ -209,35 +213,33 @@ def _take(entry: dict, cache: str) -> dict | None:
 
 
 def _fetch(name: str) -> bytes:
-    """GET ``SITE_URL/name``: no redirects, :data:`MAX_BYTES` at most, and
-    :data:`TIMEOUT_SECONDS` in all, however slowly the bytes arrive.
+    """GET ``SITE_URL/name``: no redirect followed, :data:`MAX_BYTES` at most,
+    and the whole answer in within :data:`TIMEOUT_SECONDS`.
+
+    The deadline holds however slowly the bytes arrive: ``bounded_get`` cuts
+    every receive off at it, not only the gaps between receives. The cap is on
+    the bytes sent and on what they decode to.
+
+    Raises:
+        FetchError: Anything but a 200 read whole within those limits.
     """
     url = f"{SITE_URL}/{name}"
-    deadline = time.monotonic() + TIMEOUT_SECONDS
     try:
-        with requests.get(
+        response = bounded_get(
             url,
             timeout=TIMEOUT_SECONDS,
-            allow_redirects=False,
-            stream=True,
-            # Undecoded bytes, so the size cap and the sha256 are on what was sent.
-            headers={"Accept-Encoding": "identity"},
-        ) as response:
-            if response.status_code != 200:
-                raise FetchError(f"{url} answered {response.status_code}")
-            body = b""
-            while True:
-                if time.monotonic() > deadline:
-                    raise FetchError(f"{url} took longer than {TIMEOUT_SECONDS} s")
-                # One recv at most, so a trickle cannot hold past the deadline.
-                chunk = response.raw.read1(64 * 1024)
-                if not chunk:
-                    return body
-                body += chunk
-                if len(body) > MAX_BYTES:
-                    raise FetchError(f"{url} is larger than {MAX_BYTES} bytes")
-    except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as exc:
+            deadline_s=TIMEOUT_SECONDS,
+            max_bytes=MAX_BYTES,
+        )
+    except ReadDeadlineExceeded as exc:
+        raise FetchError(f"{url} took longer than {TIMEOUT_SECONDS} s") from exc
+    except ResponseTooLarge as exc:
+        raise FetchError(f"{url} is larger than {MAX_BYTES} bytes") from exc
+    except requests.RequestException as exc:
         raise FetchError(f"{url}: {exc}") from exc
+    if response.status_code != 200:
+        raise FetchError(f"{url} answered {response.status_code}")
+    return response.content
 
 
 def _loads(raw: bytes):

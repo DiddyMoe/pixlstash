@@ -205,7 +205,7 @@ def _feature_from_files(snapshot: str) -> Optional[str]:
     try:
         with open(config, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, ValueError, UnicodeDecodeError) as exc:
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
         logger.info(
             "Could not read %s (%s); this snapshot answers nothing, so the repo "
             "falls through to its other revisions and then to its name, and is "

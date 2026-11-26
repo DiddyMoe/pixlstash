@@ -18,6 +18,7 @@ import socket
 import ssl
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 from contextlib import contextmanager
@@ -192,6 +193,31 @@ def test_protocol_handshake_and_tool_list():
     assert replies[6]["error"]["code"] == -32600
     assert replies[7]["result"] == {}
     assert replies[8]["error"]["code"] == -32700
+
+
+def test_a_message_nested_past_the_parser_is_a_parse_error():
+    """JSON nested deeper than the parser recurses raises RecursionError, not
+    ValueError. It is answered as unparseable and the session goes on."""
+    stdin = io.StringIO(
+        "[" * 100_000
+        + "]" * 100_000
+        + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        + "\n"
+    )
+    stdout = io.StringIO()
+    mcp_server.serve(
+        lambda path, params: pytest.fail("no tool was called"), stdin, stdout
+    )
+    replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert replies == [
+        {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        },
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+    ]
 
 
 def test_an_unknown_protocol_version_gets_ours():
@@ -1101,6 +1127,15 @@ def test_a_bad_answer_that_lasts_the_whole_wait_is_reported_unknown(monkeypatch)
     assert seen == ["/workflows/run", "/workflows/runs/p1"]
 
 
+def test_run_workflow_names_every_status_a_run_can_be_answered_with():
+    """An agent reads the description to know what to expect, so each
+    status a prompts entry can carry is named there: "queued" from the run's
+    own answer when it is not read in time, "unknown" when the read failed."""
+    (tool,) = [t for t in mcp_server.WORKFLOW_TOOLS if t["name"] == "run_workflow"]
+    for status in ("completed", "failed", "running", "waiting", "queued", "unknown"):
+        assert status in tool["description"], status
+
+
 def test_a_run_whose_ending_cannot_be_read_is_still_reported_queued(monkeypatch):
     """An older PixlStash without the route: the run is queued all the same."""
     monkeypatch.setattr(mcp_server, "RUN_POLL_SECONDS", 0)
@@ -1368,6 +1403,142 @@ def test_a_timeout_at_the_deadline_is_the_wait_ending(
     with pytest.raises(mcp_server.ToolError, match=without_a_wait) as raised:
         fetch("/tags", {})
     assert not isinstance(raised.value, mcp_server.WaitOver)
+
+
+@contextmanager
+def _dribbling(prefix: bytes, dribble: bytes, then_stall: float = 0):
+    """A real listener that answers *prefix* at once, then *dribble* a byte
+    every tenth of a second, then nothing for *then_stall* seconds: each
+    receive answers well inside any per-recv timeout, so only a deadline on
+    the whole response ends the read."""
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def serve():
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                try:
+                    conn.sendall(prefix)
+                    for byte in dribble:
+                        conn.sendall(bytes([byte]))
+                        time.sleep(0.1)
+                    time.sleep(then_stall)
+                except OSError as exc:
+                    # The client hung up: what a deadline is meant to do.
+                    print(f"dribbling listener stopped: {exc!r}")
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{port}"
+        finally:
+            thread.join(timeout=15)
+
+
+def test_a_dribbled_status_line_is_cut_at_the_deadline():
+    """The framing is bounded too: a status line sent a byte at a time ends
+    with the caller's wait, not when the sender stops."""
+    with _dribbling(b"", b"HTTP/1.1 200 OK" + b" " * 80) as url:
+        fetch = mcp_server.http_fetch(url, "example-token")
+        start = time.monotonic()
+        with pytest.raises(mcp_server.WaitOver):
+            fetch("/workflows/runs/p1", {}, deadline=start + 0.5)
+        assert time.monotonic() - start < 2
+
+
+def test_dribbled_chunk_framing_is_held_to_timeout_seconds(monkeypatch):
+    """A chunk-size line sent a byte at a time is held to the request's
+    budget in all, not per receive."""
+    monkeypatch.setattr(mcp_server, "TIMEOUT_SECONDS", 0.5)
+    head = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+    )
+    with _dribbling(head, b"1;" + b"x" * 80) as url:
+        fetch = mcp_server.http_fetch(url, "example-token")
+        start = time.monotonic()
+        with pytest.raises(mcp_server.ToolError, match="did not answer") as raised:
+            fetch("/tags", {})
+        assert not isinstance(raised.value, mcp_server.WaitOver)
+        assert time.monotonic() - start < 2
+
+
+def test_a_stall_after_a_dribble_waits_only_for_what_is_left(monkeypatch):
+    """A receive is given what remains of the budget, not the whole budget
+    again: a sender that dribbles for most of it and then stops is cut off
+    when the budget runs out, not one budget later."""
+    monkeypatch.setattr(mcp_server, "TIMEOUT_SECONDS", 2)
+    with _dribbling(b"", b"HTTP/1.1 2" + b"0" * 5, then_stall=2.5) as url:
+        fetch = mcp_server.http_fetch(url, "example-token")
+        start = time.monotonic()
+        with pytest.raises(mcp_server.ToolError, match="did not answer"):
+            fetch("/tags", {})
+        assert time.monotonic() - start < 2.8
+
+
+def test_a_whole_answer_is_read_through_the_deadline_reader():
+    """Positive control for the two above: a whole answer sent at once is
+    read, chunked framing and all, through the same opener."""
+    body = b'[{"name": "cat"}]'
+    answer = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n"
+        + f"{len(body):x}\r\n".encode()
+        + body
+        + b"\r\n0\r\n\r\n"
+    )
+    with _dribbling(answer, b"") as url:
+        fetch = mcp_server.http_fetch(url, "example-token")
+        status, content_type, content = fetch("/tags", {})
+    assert (status, content_type, content) == (200, "application/json", body)
+
+
+@contextmanager
+def _endless_server():
+    """A listener that answers 200 and then sends zeros as fast as it can,
+    with no length, until the client hangs up."""
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        sent = []
+
+        def serve():
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(65536)
+                block = b"\0" * (64 * 1024)
+                try:
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                    while True:
+                        conn.sendall(block)
+                        sent.append(len(block))
+                except OSError as exc:
+                    print(f"endless listener stopped: {exc!r}")
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{port}", sent
+        finally:
+            thread.join(timeout=15)
+
+
+def test_an_endless_answer_is_cut_at_the_size_cap(monkeypatch):
+    """A fast sender is held to MAX_RESPONSE_BYTES, not to the deadline,
+    which it would meet with gigabytes in memory."""
+    monkeypatch.setattr(mcp_server, "MAX_RESPONSE_BYTES", 1024 * 1024)
+    with _endless_server() as (url, sent):
+        fetch = mcp_server.http_fetch(url, "example-token")
+        start = time.monotonic()
+        with pytest.raises(mcp_server.ToolError, match="larger than 1 MiB"):
+            fetch("/tags", {})
+        assert time.monotonic() - start < 5
+    # The read stopped near the cap, not after the sender gave up.
+    assert sum(sent) < 64 * 1024 * 1024
 
 
 def test_import_posts_json_through_http_fetch(monkeypatch):
