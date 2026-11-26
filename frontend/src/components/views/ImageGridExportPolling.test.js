@@ -116,7 +116,8 @@ const kinds = [
         {
           level: "success",
           key: "export-folder",
-          text: `Exported ${processed} pictures to ${DESTINATION}.`,
+          // Grouped as a person reads it: TOTAL is 5000, so "5,000".
+          text: `Exported ${processed.toLocaleString()} pictures to ${DESTINATION}.`,
         },
       ]);
     },

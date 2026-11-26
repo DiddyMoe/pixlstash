@@ -11,9 +11,9 @@ import tempfile
 import unicodedata
 import zipfile
 
-from PIL import Image, ImageOps, PngImagePlugin
+from PIL import Image, PngImagePlugin
 
-from pixlstash.db_models.face import Face
+from pixlstash.db_models.face import Face, read_stored_bbox
 from pixlstash.db_models.picture import Picture, PictureSet
 from pixlstash.db_models.picture_set import PictureSetMember
 from pixlstash.utils.host_open import open_in_file_manager
@@ -21,8 +21,13 @@ from pixlstash.utils.image_processing.generation_data import strip_generation_da
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.utils.service.caption_utils import CaptionUtils
-from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
+from pixlstash.utils.service.filter_helpers import (
+    fetch_scope_allowed_picture_ids,
+    request_targets_scrapheap,
+)
+from pixlstash.utils.sql_chunking import chunked
 from sqlmodel import select
+from starlette.datastructures import QueryParams
 
 
 logger = logging.getLogger(__name__)
@@ -250,22 +255,100 @@ class _StripGenerationDataSink:
         self._sink.writestr(arcname, data)
 
 
+# The export's own options. Everything else in an export's query string is the
+# view's (its filters, sort, Scrapheap flag), so these are cut out before the
+# listing or the search reads it: an option must never be read as a filter.
+# ``exportType`` and ``bboxMode`` are the spellings ``_parse_export_params``
+# also reads.
+EXPORT_OPTION_PARAMS = frozenset(
+    {
+        "query",
+        "threshold",
+        "caption_mode",
+        "include_character_name",
+        "export_type",
+        "exportType",
+        "resolution",
+        "use_original_file_names",
+        "destination",
+        "tag_format",
+        "bbox_mode",
+        "bboxMode",
+        "keep_generation_data",
+    }
+)
+
+
+class _ViewRequest:
+    """An export's request, its query string cut to the view's params.
+
+    The token, state and everything else are the real request's, so the
+    search reads the caller's scope as for ``GET /pictures/search``.
+    """
+
+    def __init__(self, request):
+        self._request = request
+        self.query_params = QueryParams(
+            [
+                (key, value)
+                for key, value in request.query_params.multi_items()
+                if key not in EXPORT_OPTION_PARAMS
+            ]
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._request, name)
+
+
 class ExportUtils:
     """Utility methods for ZIP-based picture export."""
+
+    @staticmethod
+    def _face_crop_box(face):
+        """The stored box a face crop is cut from, or ``None`` to skip the face.
+
+        A face is skipped when it has no index (``face_index`` below 0), when
+        it was measured on a later frame of an animated GIF (the crop is cut
+        from frame 0), or when its stored box is not four finite numbers
+        (logged once, with the picture and face ids, by
+        :func:`read_stored_bbox`). The progress total and the writer both ask
+        this, so they count the same faces.
+        """
+        if getattr(face, "face_index", 0) < 0:
+            return None
+        if getattr(face, "frame_index", 0) != 0:
+            return None
+        return read_stored_bbox(
+            face.bbox_, owner="Face", row_id=face.id, picture_id=face.picture_id
+        )
+
+    @staticmethod
+    def _countable_faces(faces):
+        """How many of *faces* a face export counts: those it cuts a crop for.
+
+        The progress total and the writer's progress both count this, so a
+        finished export's ``processed`` reaches its ``total`` even when a
+        picture's faces could not be written.
+        """
+        return sum(1 for face in faces if ExportUtils._face_crop_box(face) is not None)
 
     @staticmethod
     def _export_features_to_zip(
         img, base_name, features, tags_by_feature, feature_type, zip_file, scale=1.0
     ):
-        """Export face/hand crops and tags to a zip file."""
+        """Write each face's crop (and its tags) into *zip_file*.
+
+        A face :meth:`_face_crop_box` skips, or whose box clamps to nothing,
+        writes none. The caller counts progress with :meth:`_countable_faces`.
+        """
         for feature in features:
             index = getattr(feature, f"{feature_type}_index", 0)
-            if index < 0 or not feature.bbox:
+            stored = ExportUtils._face_crop_box(feature)
+            if stored is None:
                 continue
-            if getattr(feature, "frame_index", 0) != 0:
-                # Measured on a later frame of an animated GIF; img is frame 0.
+            bbox = ImageUtils.clamp_bbox(stored, img.width, img.height)
+            if bbox is None:
                 continue
-            bbox = feature.bbox
             crop = img.crop(bbox)
             if scale < 1.0:
                 crop = crop.resize(
@@ -359,7 +442,9 @@ class ExportUtils:
         try:
             with Image.open(full_path) as img:
                 icc_profile = img.info.get("icc_profile")
-                img = ImageOps.exif_transpose(img)
+                # Turned as every loader turns it, writing no EXIF back: EXIF
+                # Pillow reads but cannot write does not leave it out.
+                img = ImageUtils.apply_exif_orientation(img)
                 if img.mode.startswith("I;16"):
                     # 16-bit grey: convert("RGB") clips every value above 255
                     # to white, so scale it down first. Plain "I" is left
@@ -399,14 +484,19 @@ class ExportUtils:
         Boxes are pixel ``xyxy``; when the export is downscaled the box
         coordinates and reported dimensions are scaled to match the exported
         image. Florence detections carry no confidence, so ``score`` defaults
-        to ``0.0``.
+        to ``0.0``. A detection whose stored box is not four finite numbers is
+        left out of the sidecar (logged once by :func:`read_stored_bbox`):
+        written as is it put ``NaN`` into the JSON, and scaled it failed the
+        export.
         """
         width = getattr(pic, "width", None)
         height = getattr(pic, "height", None)
         objects = []
         for det in detections:
-            bbox = det.bbox
-            if not bbox or len(bbox) != 4:
+            bbox = read_stored_bbox(
+                det.bbox_, owner="Detection", row_id=det.id, picture_id=det.picture_id
+            )
+            if bbox is None:
                 continue
             if scale_factor < 1.0:
                 bbox = [int(round(v * scale_factor)) for v in bbox]
@@ -444,7 +534,10 @@ class ExportUtils:
           key order);
         - the picture's caption (when any) becomes ``high_level_description``;
         - ``style_description`` is omitted (it is optional, and we do not derive
-          aesthetics/lighting/medium/palette) rather than emit a partial block.
+          aesthetics/lighting/medium/palette) rather than emit a partial block;
+        - a detection whose stored box is not four finite numbers is left out
+          (logged once by :func:`read_stored_bbox`); normalising it failed the
+          export.
 
         See docs/integration_architecture.md §11.1 for the contract.
         """
@@ -457,8 +550,13 @@ class ExportUtils:
         elements = []
         if width > 0 and height > 0:
             for det in detections:
-                bbox = det.bbox
-                if not bbox or len(bbox) != 4:
+                bbox = read_stored_bbox(
+                    det.bbox_,
+                    owner="Detection",
+                    row_id=det.id,
+                    picture_id=det.picture_id,
+                )
+                if bbox is None:
                     continue
                 x1, y1, x2, y2 = bbox
                 ymin = _norm(y1, height)
@@ -553,7 +651,7 @@ class ExportUtils:
         if export_type_d != Picture.ExportType.FULL:
             bbox_mode_d = "none"
 
-        only_deleted = request.query_params.get("character_id") == "SCRAPHEAP"
+        only_deleted = request_targets_scrapheap(request.query_params)
         picture_ids = request.query_params.getlist("id")
 
         select_fields = Picture.metadata_fields()
@@ -584,20 +682,28 @@ class ExportUtils:
         The leader is the cover the grid shows, the lowest ``stack_position``;
         a stack without positions falls back to the newest picture by
         ``created_at`` (ties broken by highest ``id``). Pictures not in any
-        stack are passed through unchanged.
+        stack are passed through unchanged. The order is kept: a leader takes
+        the place of its stack's first picture in *pics*.
         """
         by_stack: dict = {}
-        result = []
+        slots = []
         for pic in pics:
             stack_id = getattr(pic, "stack_id", None)
             if stack_id is None:
-                result.append(pic)
+                slots.append(pic)
+            elif stack_id in by_stack:
+                by_stack[stack_id].append(pic)
             else:
-                by_stack.setdefault(stack_id, []).append(pic)
+                by_stack[stack_id] = [pic]
+                slots.append(by_stack[stack_id])
 
-        for stack_id, members in by_stack.items():
+        result = []
+        for slot in slots:
+            if not isinstance(slot, list):
+                result.append(slot)
+                continue
             newest = sorted(
-                members,
+                slot,
                 key=lambda p: (
                     getattr(p, "created_at", None) or "",
                     getattr(p, "id", 0) or 0,
@@ -616,122 +722,133 @@ class ExportUtils:
         return result
 
     @staticmethod
-    def _fetch_character_picture_ids(server, character_id: int, only_deleted: bool):
-        """Resolve a character id to its picture ids via the Face table.
+    def _find_pictures_in_order(server, picture_ids, *, select_fields, only_deleted):
+        """Read the named pictures, in the order named.
 
-        Every Face row whose ``character_id`` matches contributes its
-        ``picture_id``; the distinct set is then filtered to the requested
-        lifecycle (deleted vs. live).  Used by the training dataset builder,
-        which selects by character; the ZIP/folder routes never pass a
-        ``character_id`` here (they filter by it through the list path).
+        ``Picture.find`` takes an id list of any length (a long one is read
+        from a temp table) and returns rows in database order; the result is
+        put back in the caller's order, with a repeated id kept once at its
+        first place.
+
+        Args:
+            server: The server whose vault holds the pictures.
+            picture_ids: The ids, as ints or digit strings.
+            select_fields: The columns to read.
+            only_deleted: Read soft-deleted pictures only (the Scrapheap);
+                otherwise live pictures only.
+
+        Returns:
+            The pictures found, in the order *picture_ids* names them.
         """
+        ordered = list(dict.fromkeys(int(pid) for pid in picture_ids))
 
-        def _query(session, char_id):
-            face_pic_ids = {
-                int(r) if not isinstance(r, tuple) else int(r[0])
-                for r in session.exec(
-                    select(Face.picture_id).where(Face.character_id == char_id)
-                ).all()
-            }
-            if not face_pic_ids:
-                return []
-            rows = session.exec(
-                select(Picture.id).where(
-                    Picture.id.in_(face_pic_ids),
-                    Picture.deleted.is_(bool(only_deleted)),
+        def fetch(session):
+            found = {
+                pic.id: pic
+                for pic in Picture.find(
+                    session,
+                    id=ordered,
+                    select_fields=select_fields,
+                    only_deleted=only_deleted,
                 )
-            ).all()
-            return [int(r) if not isinstance(r, tuple) else int(r[0]) for r in rows]
+            }
+            return [found[pid] for pid in ordered if pid in found]
 
-        return server.vault.db.run_task(_query, int(character_id))
+        return server.vault.db.run_task(fetch)
 
     @staticmethod
     def _gather_export_pictures(server, request, task_id, background_data, params):
         """Resolve the pictures an export task should package.
 
         Shared by :meth:`generate_zip` and :meth:`generate_folder_export`: the
-        same id/set/query/list-filter resolution, token-scope enforcement and
+        same id/query/list-filter resolution, token-scope enforcement and
         stack deduplication apply whether the pictures end up in a ZIP or
-        written straight into a folder.
+        written straight into a folder. A set view's export is the listing's,
+        so it keeps the view's filters, order and Scrapheap flag; the set and
+        character branches serve the training dataset builder, which passes
+        no request.
 
         Returns:
-            The pictures to export, scope-filtered and stack-deduplicated.
-            Empty when nothing matched or the caller's token cannot see any of
-            it.
+            The pictures to export, scope-filtered and stack-deduplicated, in
+            the order of the selection or of the view. Empty when nothing
+            matched or the caller's token cannot see any of it.
         """
         only_deleted = params["only_deleted"]
         picture_ids = params["picture_ids"]
         select_fields = params["select_fields"]
 
         pics = []
+        scoped_by_search = False
         set_id = background_data.get("set_id")
         query = background_data.get("query")
         threshold = background_data.get("threshold", 0.0)
 
         if picture_ids:
-            pics = server.vault.db.run_task(
-                Picture.find,
-                id=picture_ids,
+            pics = ExportUtils._find_pictures_in_order(
+                server,
+                picture_ids,
                 select_fields=select_fields,
-                include_deleted=only_deleted,
+                only_deleted=only_deleted,
             )
-        elif set_id is not None:
-            logger.debug("Exporting pictures set {} ".format(set_id))
+        elif request is None and set_id is not None:
+            logger.debug("Exporting pictures set %s", set_id)
 
-            def fetch_members(session, set_id):
-                members = session.exec(
-                    select(PictureSetMember).where(PictureSetMember.set_id == set_id)
-                ).all()
-                picture_ids = [m.picture_id for m in members]
-                if not picture_ids:
-                    return []
+            def fetch_members(session):
+                # A subquery, not a fetched id list: a set can hold more
+                # pictures than SQLite binds in one statement.
                 return Picture.find(
                     session,
-                    id=picture_ids,
+                    id=select(PictureSetMember.picture_id).where(
+                        PictureSetMember.set_id == int(set_id)
+                    ),
                     select_fields=select_fields,
+                    only_deleted=only_deleted,
                 )
 
-            pics = server.vault.db.run_task(fetch_members, set_id)
-        elif background_data.get("character_id") is not None:
-            character_id = background_data["character_id"]
+            pics = server.vault.db.run_task(fetch_members)
+        elif request is None and background_data.get("character_id") is not None:
+            character_id = int(background_data["character_id"])
             logger.debug("Exporting pictures for character %s", character_id)
-            char_pic_ids = ExportUtils._fetch_character_picture_ids(
-                server, character_id, only_deleted
-            )
-            if char_pic_ids:
-                pics = server.vault.db.run_task(
-                    Picture.find,
-                    id=char_pic_ids,
+
+            def fetch_character_pictures(session):
+                # A subquery, as for a set: a person can be in more pictures
+                # than SQLite binds in one statement.
+                return Picture.find(
+                    session,
+                    id=select(Face.picture_id).where(Face.character_id == character_id),
                     select_fields=select_fields,
-                    include_deleted=only_deleted,
+                    only_deleted=only_deleted,
                 )
+
+            pics = server.vault.db.run_task(fetch_character_pictures)
         elif query:
-            logger.debug("Exporting pictures using search query: {}".format(query))
+            logger.debug("Exporting pictures using search query")
+            # Local import: pixlstash.routes.pictures imports _export, whose
+            # share_copies import reads this module, so a top-level import
+            # here is a cycle (checked: ImportError on _safe_archive_stem).
+            from pixlstash.routes.pictures._search import search_results
 
-            words = re.findall(r"\b\w+\b", query.lower())
-            query_full = "A photo of " + query
-            # Encoded on this thread, never inside the database task - see
-            # ``Picture.semantic_search`` for why an encode must not hold the
-            # DB writer.
-            query_embedding = server.vault.generate_text_embedding(query_full)
-
-            def find_by_text(session):
-                return [
-                    r[0]
-                    for r in Picture.semantic_search(
-                        session,
-                        query_full,
-                        words,
-                        query_embedding=query_embedding,
-                        offset=0,
-                        limit=sys.maxsize,
-                        threshold=threshold,
-                        select_fields=select_fields,
-                        only_deleted=only_deleted,
-                    )
-                ]
-
-            pics = server.vault.db.run_task(find_by_text)
+            # The search view's own pictures, in its order: the search route's
+            # filters, Scrapheap flag, token scope, hidden tags and "In text"
+            # switch, from the view's query string with the export's options
+            # cut out. Bounded as the view is, by what the search matches.
+            ranked = search_results(
+                server,
+                _ViewRequest(request),
+                query,
+                offset=0,
+                limit=sys.maxsize,
+                threshold=threshold,
+            )
+            pics = ExportUtils._find_pictures_in_order(
+                server,
+                [pic.id for pic, _relevance in ranked if pic is not None],
+                select_fields=select_fields,
+                only_deleted=only_deleted,
+            )
+            # ``search_results`` intersected the token's scope already, with
+            # the same ``fetch_scope_allowed_picture_ids`` set.
+            scoped_by_search = True
         else:
             logger.debug("Exporting pictures using list filters")
             from pixlstash.routes.pictures import select_pictures_for_listing
@@ -745,35 +862,21 @@ class ExportUtils:
                 limit=sys.maxsize,
                 metadata_fields=select_fields,
                 return_ids_only=True,
-                exclude_query_params={
-                    "query",
-                    "set_id",
-                    "threshold",
-                    "caption_mode",
-                    "include_character_name",
-                    "export_type",
-                    "resolution",
-                    "use_original_file_names",
-                    "destination",
-                    "tag_format",
-                    "bbox_mode",
-                },
+                exclude_query_params=set(EXPORT_OPTION_PARAMS),
             )
             if ordered_ids:
-                pics = server.vault.db.run_task(
-                    Picture.find,
-                    id=ordered_ids,
+                pics = ExportUtils._find_pictures_in_order(
+                    server,
+                    ordered_ids,
                     select_fields=select_fields,
-                    include_deleted=only_deleted,
+                    only_deleted=only_deleted,
                 )
-                pic_map = {pic.id: pic for pic in pics}
-                pics = [pic_map.get(pid) for pid in ordered_ids if pid in pic_map]
 
         # Enforce token scope: remove any pictures the token is not
         # authorised to access before packaging the export.
         # Trusted server-side callers (the training dataset builder) pass
         # request=None and carry no token, so there is no scope to apply.
-        if request is not None:
+        if request is not None and not scoped_by_search:
             scope_allowed = fetch_scope_allowed_picture_ids(server, request)
             if scope_allowed is not None and pics:
                 pics = [p for p in pics if getattr(p, "id", None) in scope_allowed]
@@ -811,12 +914,15 @@ class ExportUtils:
             from pixlstash.db_models.detection import Detection
 
             def fetch_detections(session, ids):
-                rows = session.exec(
-                    select(Detection).where(Detection.picture_id.in_(ids))
-                ).all()
                 grouped: dict = {}
-                for det in rows:
-                    grouped.setdefault(det.picture_id, []).append(det)
+                # One IN per chunk: an export has no id cap, and SQLite's
+                # bound-variable limit can be as low as 999.
+                for chunk in chunked(ids):
+                    rows = session.exec(
+                        select(Detection).where(Detection.picture_id.in_(list(chunk)))
+                    ).all()
+                    for det in rows:
+                        grouped.setdefault(det.picture_id, []).append(det)
                 return grouped
 
             detections_by_pic = server.vault.db.run_task(
@@ -824,14 +930,13 @@ class ExportUtils:
             )
 
         if export_type_d != Picture.ExportType.FULL:
-            (
-                feature_faces_by_pic,
-                _,
-                face_tags_by_face,
-                _,
-            ) = server.vault.db.run_task(
-                Picture.fetch_features,
-                [pic.id for pic in pics],
+
+            def fetch_features(session, ids):
+                faces_by_pic, _, tags_by_face, _ = Picture.fetch_features(session, ids)
+                return faces_by_pic, tags_by_face
+
+            feature_faces_by_pic, face_tags_by_face = server.vault.db.run_task(
+                fetch_features, [pic.id for pic in pics]
             )
 
         if export_type_d == Picture.ExportType.FULL:
@@ -850,15 +955,9 @@ class ExportUtils:
                 )
                 if VideoUtils.is_video_file(full_path):
                     continue
-                faces = feature_faces_by_pic.get(pic.id, [])
-                for face in faces:
-                    if getattr(face, "face_index", 0) < 0:
-                        continue
-                    if not face.bbox:
-                        continue
-                    if getattr(face, "frame_index", 0) != 0:
-                        continue
-                    total_items += 1
+                total_items += ExportUtils._countable_faces(
+                    feature_faces_by_pic.get(pic.id, [])
+                )
 
         return feature_faces_by_pic, face_tags_by_face, detections_by_pic, total_items
 
@@ -942,6 +1041,9 @@ class ExportUtils:
                         if not ExportUtils._write_trainer_png(
                             full_path, arcname, sink, scale_factor
                         ):
+                            # Logged there; left out, but counted as done
+                            # because the total counts it.
+                            export_tasks[task_id]["processed"] += 1
                             continue
                     elif scale_factor < 1.0 and not VideoUtils.is_video_file(full_path):
                         try:
@@ -1059,18 +1161,17 @@ class ExportUtils:
                 else:
                     if VideoUtils.is_video_file(full_path):
                         continue
+                    faces = feature_faces_by_pic.get(pic.id, [])
+                    # Counted as the total counts them, written or not.
+                    countable = ExportUtils._countable_faces(faces)
                     try:
                         with Image.open(full_path) as img:
                             base_name = f"image_{idx:05d}"
                             export_faces = export_type_d == Picture.ExportType.FACE
 
                             if export_faces:
-                                faces = feature_faces_by_pic.get(pic.id, [])
-                                for face in faces:
-                                    if face.bbox:
-                                        face.bbox = ImageUtils.clamp_bbox(
-                                            face.bbox, img.width, img.height
-                                        )
+                                # Each box is read and clamped in the writer;
+                                # the stored rows are never written back.
                                 ExportUtils._export_features_to_zip(
                                     img,
                                     base_name,
@@ -1080,13 +1181,32 @@ class ExportUtils:
                                     sink,
                                     scale=scale_factor,
                                 )
-                                export_tasks[task_id]["processed"] += len(faces)
                     except Exception as exc:
                         logger.warning(
-                            "Failed to export features for %s (%s).",
+                            "Export task %s: could not export the faces of %s "
+                            "(%s: %s); its %d face(s) are counted as done, and "
+                            "any not yet written are left out.",
+                            task_id,
                             full_path,
+                            type(exc).__name__,
                             exc,
+                            countable,
                         )
+                    export_tasks[task_id]["processed"] += countable
+            else:
+                logger.warning(
+                    "Export task %s: picture %s has no file at %s; it is left out.",
+                    task_id,
+                    pic.id,
+                    ImageUtils.resolve_picture_path(
+                        server.vault.image_root, pic.file_path
+                    )
+                    if getattr(pic, "file_path", None)
+                    else "(no path stored)",
+                )
+                if export_type_d == Picture.ExportType.FULL:
+                    # A whole-picture total counts every picture.
+                    export_tasks[task_id]["processed"] += 1
 
     @staticmethod
     def _training_pictures(server, set_id, character_id, params, clips=False):
@@ -1230,17 +1350,18 @@ class ExportUtils:
             near = {pid for pair in pairs for pid in pair[:2]}
             others = 0
             if character_id is not None and ids:
-                others = len(
-                    set(
+                named_others: set = set()
+                for chunk in chunked(ids):
+                    named_others.update(
                         session.exec(
                             select(Face.picture_id).where(
-                                Face.picture_id.in_(ids),
+                                Face.picture_id.in_(list(chunk)),
                                 Face.character_id.is_not(None),
                                 Face.character_id != int(character_id),
                             )
                         ).all()
                     )
-                )
+                others = len(named_others)
             return len(near), others
 
         near, others = server.vault.db.run_task(near_and_others)

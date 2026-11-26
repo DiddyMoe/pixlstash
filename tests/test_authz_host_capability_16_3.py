@@ -90,6 +90,7 @@ _LOOPBACK_ROUTE_KEYS = {
     ("POST", "/api/v1/model-folders/{folder_id}/open"),
     ("POST", "/api/v1/server-config/open"),
     ("POST", "/api/v1/pictures/export/folder"),
+    ("POST", "/api/v1/pictures/export/folder/selection"),
     ("POST", "/api/v1/pictures/share-copies"),
     ("GET", "/api/v1/open-with"),
     ("POST", "/api/v1/open-with"),
@@ -184,10 +185,10 @@ def test_loopback_owner_only_is_justification_required():
     assert ok == []
 
 
-def test_host_capability_tier_split_is_49_local_7_loopback():
-    """The loopback tier is the 5 file-manager spawns, the process restart and
-    the e2e test hook; the filesystem/folder routes stay LOCAL_OWNER_ONLY. 56
-    routes carry a locality tier = 49 local + 7 loopback.
+def test_host_capability_tier_split_matches_the_declared_route_sets():
+    """The loopback tier is the routes in ``_LOOPBACK_ROUTE_KEYS``; the
+    filesystem/folder routes stay LOCAL_OWNER_ONLY. 94 routes carry a locality
+    tier = 75 local + 19 loopback, as the last history entry below records.
 
     History, so a future change to this number arrives with its reason: 16 = 13 +
     3 originally; 17 = 13 + 4 after CSO Condition 1 folded in
@@ -582,6 +583,10 @@ def test_host_capability_tier_split_is_49_local_7_loopback():
     run on it again, ``POST /training/jobs``' class. It takes no path. Its
     ``GET`` reads the run's checkpoint headers and returns no path, so it is
     ``owner_only``.
+    94 = 75 + 19 with ``POST /pictures/export/folder/selection``: the folder
+    export with its selection and destination in a JSON body, so it writes onto
+    the host disk and opens the file manager exactly as ``pictures/export/folder``
+    does, and takes its tier.
 
     Arithmetic, not judgement."""
     loopback = {
@@ -595,7 +600,7 @@ def test_host_capability_tier_split_is_49_local_7_loopback():
         if rp.policy is AccessPolicy.LOCAL_OWNER_ONLY
     }
     assert loopback == _LOOPBACK_ROUTE_KEYS, loopback
-    assert len(loopback) == 18, sorted(loopback)
+    assert len(loopback) == 19, sorted(loopback)
     assert len(local) == 75, sorted(local)
 
 

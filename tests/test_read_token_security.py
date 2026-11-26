@@ -60,6 +60,7 @@ import io
 import json
 import tempfile
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -75,7 +76,9 @@ import pixlstash.utils.rate_limiter as rl_module
 from pixlstash.db_models import (
     Character,
     CharacterProjectMember,
+    Face,
     Picture,
+    PictureLikeness,
     PictureSetMember,
     PictureStack,
     Tag,
@@ -86,6 +89,7 @@ from pixlstash.hub.workflows import record_api_graph
 from pixlstash.server import Server
 from pixlstash.services.workflow_hash import asset_reference, normalized_filename
 from pixlstash.utils.rate_limiter import RateLimitMiddleware
+from tests.authz_guard import assert_real_route
 from tests.test_workflow_identity import _graph as _workflow_graph
 from tests.utils import (
     mint_read_token,
@@ -493,15 +497,57 @@ def _picture_set_members(server, set_id: int) -> set:
     return server.vault.db.run_task(_read)
 
 
+def _original_file_names(server) -> dict[int, str]:
+    """Read every picture's original file name, the name an export can use."""
+
+    def _read(session: Session):
+        rows = session.exec(select(Picture.id, Picture.original_file_name)).all()
+        return {pid: name for pid, name in rows}
+
+    return server.vault.db.run_task(_read)
+
+
+def _exported_file_names(client, started, headers: dict) -> set:
+    """Wait out the export *started* queued and name the pictures in its ZIP.
+
+    Pass ``use_original_file_names`` to the export, so each name says which
+    picture it is.
+    """
+    assert started.status_code == 200, started.text
+    task_id = started.json()["task_id"]
+    deadline = time.monotonic() + 30
+    status = None
+    while time.monotonic() < deadline:
+        r = client.get(
+            f"{API}/pictures/export/status",
+            params={"task_id": task_id},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        status = r.json()
+        if status["status"] in ("completed", "failed"):
+            break
+        time.sleep(0.1)
+    assert status and status["status"] == "completed", status
+    r = client.get(f"{API}/pictures/export/download/{task_id}", headers=headers)
+    assert r.status_code == 200, r.text
+    with zipfile.ZipFile(io.BytesIO(r.content)) as archive:
+        return {name for name in archive.namelist() if name.endswith(".png")}
+
+
 def _reset_two_set_library(env) -> None:
     """Put the shared two-set library back on the shape its tests assume.
 
-    Five kinds of row are written by tests in that class and would otherwise be
+    Seven kinds of row are written by tests in that class and would otherwise be
     inherited by the ones that follow:
 
     * tags - one test asserts a per-tag count *exactly*, so a leftover tag row
       turns that count into someone else's;
-    * a character named ``Ref``, created by two different tests;
+    * a character named ``Ref``, created by two different tests, and the
+      detected faces one of them hangs on it (the import's own "no face found"
+      rows, ``face_index = -1``, stay);
+    * the likeness between the two pictures that the likeness-groups test
+      seeds;
     * the ComfyUI model/LoRA vocab columns, seeded straight onto the pictures;
     * a stack spanning both sets;
     * **set membership**. This one is the trap: forming a stack is
@@ -522,6 +568,8 @@ def _reset_two_set_library(env) -> None:
 
     def _wipe(session: Session):
         session.exec(delete(Tag))
+        session.exec(delete(PictureLikeness))
+        session.exec(delete(Face).where(Face.face_index != -1))
         session.exec(delete(CharacterProjectMember))
         session.exec(delete(Character))
         # Detach the pictures first so the stack rows are unreferenced.
@@ -1226,28 +1274,81 @@ class TestResourceScopedReadTokenIsolation:
         )
 
     def test_search_cannot_leak_out_of_scope_pictures(self, env):
-        """GET /pictures/search must not return pictures outside the token's set."""
-        r = TestClient(env.server.api).get(
-            f"{API}/pictures/search",
-            params={"query": "picture"},
-            headers={"Authorization": f"Bearer {env.token_a}"},
-        )
+        """GET /pictures/search returns exactly the token's matching pictures.
+
+        Both pictures carry the searched tag, and the owner's search finds both,
+        so the scoped search's single picture is the scope at work and not a
+        search that matched nothing else.
+        """
+        path = f"{API}/pictures/search"
+        assert_real_route(env.server.api, "GET", path, template=path)
+        for pid in (env.pic_a, env.pic_b):
+            r = env.owner_client.post(
+                f"{API}/pictures/{pid}/tags", json={"tag": "zebra"}
+            )
+            assert r.status_code == 200, r.text
+        params = {"query": "zebra", "threshold": "0.01"}
+
+        r = env.owner_client.get(path, params=params)
         assert r.status_code == 200, r.text
-        result_ids = {p["id"] for p in r.json()}
-        assert env.pic_b not in result_ids, (
-            "Token for set A returned picture from set B in /pictures/search"
+        owner_ids = {p["id"] for p in r.json()}
+        assert {env.pic_a, env.pic_b} <= owner_ids, (
+            "the owner's search must find both tagged pictures, or the scoped "
+            f"result below proves nothing: {owner_ids}"
+        )
+
+        result_ids = _prove_token_reads(
+            env.server, env.token_a, "/pictures/search", **params
+        )
+        assert result_ids == {env.pic_a}, (
+            "a set-A token's search must return exactly pic_a (pic_b leaks "
+            f"set B, nothing over-blocks set A): {result_ids}"
         )
 
     def test_likeness_groups_cannot_leak_out_of_scope_pictures(self, env):
-        """GET /pictures/likeness-groups must not include pictures outside the token's set."""
-        r = TestClient(env.server.api).get(
-            f"{API}/pictures/likeness-groups",
-            headers={"Authorization": f"Bearer {env.token_a}"},
-        )
+        """GET /pictures/likeness-groups must not group a picture outside the set.
+
+        The two pictures are made alike, so the owner's groups hold both. The
+        set-A token gets no group while pic_b is outside its set, and the pair
+        once pic_b is added to set A: the empty answer is the scope at work,
+        not a library with nothing to group.
+        """
+        path = f"{API}/pictures/likeness-groups"
+        assert_real_route(env.server.api, "GET", path, template=path)
+        low, high = sorted((env.pic_a, env.pic_b))
+
+        def _alike(session: Session):
+            session.add(
+                PictureLikeness(
+                    picture_id_a=low, picture_id_b=high, likeness=0.9, metric="test"
+                )
+            )
+            session.commit()
+
+        env.server.vault.db.run_task(_alike)
+        r = env.owner_client.get(path)
         assert r.status_code == 200, r.text
-        all_ids = {pid for group in r.json() for pid in group}
-        assert env.pic_b not in all_ids, (
-            "Token for set A returned picture from set B in /pictures/likeness-groups"
+        assert {row["id"] for row in r.json()} == {env.pic_a, env.pic_b}, (
+            f"the owner's groups must hold the alike pair: {r.json()}"
+        )
+
+        auth = {"Authorization": f"Bearer {env.token_a}"}
+        r = TestClient(env.server.api).get(path, headers=auth)
+        assert r.status_code == 200, r.text
+        assert {row["id"] for row in r.json()} == set(), (
+            "a set-A token was grouped with set B's pic_b in "
+            f"/pictures/likeness-groups: {r.json()}"
+        )
+
+        def _join_set_a(session: Session):
+            session.add(PictureSetMember(set_id=env.set_a, picture_id=env.pic_b))
+            session.commit()
+
+        env.server.vault.db.run_task(_join_set_a)
+        r = TestClient(env.server.api).get(path, headers=auth)
+        assert r.status_code == 200, r.text
+        assert {row["id"] for row in r.json()} == {env.pic_a, env.pic_b}, (
+            f"with both pictures in set A, its token must see the pair: {r.json()}"
         )
 
     def test_picture_scoped_token_cannot_list_whole_library(self, env):
@@ -1501,6 +1602,91 @@ class TestResourceScopedReadTokenIsolation:
             "out-of-scope pictures from set B may have been included"
         )
 
+    def test_a_search_views_export_keeps_to_the_tokens_scope(self, env):
+        """GET /pictures/export?query= packages only the token's pictures.
+
+        A search view's export runs the search itself and skips the export's
+        own scope filter, trusting the search's scope intersection instead, so
+        a share token exporting a search view takes a path of its own. Both
+        pictures match the query: the owner's export of the same view holds
+        both, so the scoped export's single picture is the scope at work and not
+        a search that matched nothing else.
+        """
+        path = f"{API}/pictures/export"
+        assert_real_route(env.server.api, "GET", path, template=path)
+        for pid in (env.pic_a, env.pic_b):
+            r = env.owner_client.post(
+                f"{API}/pictures/{pid}/tags", json={"tag": "zebra"}
+            )
+            assert r.status_code == 200, r.text
+        names = _original_file_names(env.server)
+        view = {
+            "query": "zebra",
+            "threshold": "0.01",
+            "caption_mode": "none",
+            "use_original_file_names": "true",
+        }
+
+        owner = _exported_file_names(
+            env.owner_client, env.owner_client.get(path, params=view), {}
+        )
+        assert owner == {names[env.pic_a], names[env.pic_b]}, (
+            "the owner's export of the search view must hold both matching "
+            f"pictures, or the scoped result below proves nothing: {owner}"
+        )
+
+        scoped = TestClient(env.server.api)
+        auth = {"Authorization": f"Bearer {env.token_a}"}
+        exported = _exported_file_names(
+            scoped, scoped.get(path, params=view, headers=auth), auth
+        )
+        assert exported == {names[env.pic_a]}, (
+            "a set-A token's export of a search view must hold exactly pic_a "
+            f"(pic_b leaks set B, nothing over-blocks set A): {exported}"
+        )
+
+    def test_an_id_export_with_a_query_string_keeps_to_the_tokens_scope(self, env):
+        """POST /pictures/export packages only the token's pictures, query or not.
+
+        The POST route reads its selection from the body; a ``?query=`` beside
+        it must not turn the export into a search that skips the export's own
+        scope filter. The body names both matching pictures and the owner's
+        export holds both, so the scoped export's single picture is the scope.
+        """
+        path = f"{API}/pictures/export"
+        assert_real_route(env.server.api, "POST", path, template=path)
+        for pid in (env.pic_a, env.pic_b):
+            r = env.owner_client.post(
+                f"{API}/pictures/{pid}/tags", json={"tag": "zebra"}
+            )
+            assert r.status_code == 200, r.text
+        names = _original_file_names(env.server)
+        search = {"query": "zebra", "threshold": "0.01"}
+        body = {
+            "picture_ids": [env.pic_a, env.pic_b],
+            "caption_mode": "none",
+            "use_original_file_names": True,
+        }
+
+        owner = _exported_file_names(
+            env.owner_client,
+            env.owner_client.post(path, params=search, json=body),
+            {},
+        )
+        assert owner == {names[env.pic_a], names[env.pic_b]}, (
+            f"the owner's export must hold both named pictures: {owner}"
+        )
+
+        scoped = TestClient(env.server.api)
+        auth = {"Authorization": f"Bearer {env.token_a}"}
+        exported = _exported_file_names(
+            scoped, scoped.post(path, params=search, json=body, headers=auth), auth
+        )
+        assert exported == {names[env.pic_a]}, (
+            "a set-A token's export of pic_a and pic_b under ?query= must hold "
+            f"exactly pic_a: {exported}"
+        )
+
     # -- Batch POST endpoints (READ_SAFE_POST_PATHS) must scope-filter -------
     #
     # These endpoints take a client-supplied picture-id list and are exempt
@@ -1509,36 +1695,61 @@ class TestResourceScopedReadTokenIsolation:
     # (pic_b) must never leak it back.  Regression guard for the BOLA fix.
 
     def test_bulk_fetch_tags_cannot_leak_out_of_scope_pictures(self, env):
+        path = f"{API}/pictures/tags/bulk_fetch"
+        for pid in (env.pic_a, env.pic_b):
+            r = env.owner_client.post(
+                f"{API}/pictures/{pid}/tags", json={"tag": "zebra"}
+            )
+            assert r.status_code == 200, r.text
+        body = {"picture_ids": [env.pic_a, env.pic_b]}
+
+        def _tagged(entries):
+            return {
+                entry["id"]
+                for entry in entries
+                if "zebra" in {tag["tag"] for tag in entry["tags"]}
+            }
+
+        r = env.owner_client.post(path, json=body)
+        assert r.status_code == 200, r.text
+        assert _tagged(r.json()) == {env.pic_a, env.pic_b}, r.json()
         r = TestClient(env.server.api).post(
-            f"{API}/pictures/tags/bulk_fetch",
-            json={"picture_ids": [env.pic_a, env.pic_b]},
-            headers={"Authorization": f"Bearer {env.token_a}"},
+            path, json=body, headers={"Authorization": f"Bearer {env.token_a}"}
         )
         assert r.status_code == 200, r.text
-        returned_ids = {entry["id"] for entry in r.json()}
-        assert env.pic_b not in returned_ids, (
-            "bulk_fetch tags leaked out-of-scope picture B to a set-A token"
-        )
-        assert returned_ids <= {env.pic_a}, (
-            f"bulk_fetch tags returned unexpected ids {returned_ids}"
+        # Exactly pic_a, with its tag: pic_b is the leak, nothing over-blocks.
+        assert _tagged(r.json()) == {env.pic_a}, r.json()
+        assert {entry["id"] for entry in r.json()} == {env.pic_a}, (
+            f"bulk_fetch tags returned unexpected ids {r.json()}"
         )
 
     def test_thumbnails_batch_cannot_leak_out_of_scope_pictures(self, env):
+        path = f"{API}/pictures/thumbnails"
+        body = {"ids": [env.pic_a, env.pic_b]}
+        r = env.owner_client.post(path, json=body)
+        assert r.status_code == 200, r.text
+        assert {str(env.pic_a), str(env.pic_b)} <= set(r.json()), (
+            f"the owner's batch must answer both pictures: {sorted(r.json())}"
+        )
         r = TestClient(env.server.api).post(
-            f"{API}/pictures/thumbnails",
-            json={"ids": [env.pic_a, env.pic_b]},
-            headers={"Authorization": f"Bearer {env.token_a}"},
+            path, json=body, headers={"Authorization": f"Bearer {env.token_a}"}
         )
         assert r.status_code == 200, r.text
         assert str(env.pic_b) not in r.json(), (
             "thumbnail batch leaked out-of-scope picture B to a set-A token"
         )
+        assert str(env.pic_a) in r.json(), (
+            "thumbnail batch wrongly withheld the token's own picture A"
+        )
 
     def test_set_membership_cannot_leak_out_of_scope_pictures(self, env):
+        path = f"{API}/picture_sets/membership"
+        body = {"picture_ids": [env.pic_a, env.pic_b]}
+        r = env.owner_client.post(path, json=body)
+        assert r.status_code == 200, r.text
+        assert r.json() == {str(env.set_a): [env.pic_a], str(env.set_b): [env.pic_b]}
         r = TestClient(env.server.api).post(
-            f"{API}/picture_sets/membership",
-            json={"picture_ids": [env.pic_a, env.pic_b]},
-            headers={"Authorization": f"Bearer {env.token_a}"},
+            path, json=body, headers={"Authorization": f"Bearer {env.token_a}"}
         )
         assert r.status_code == 200, r.text
         result = r.json()
@@ -1549,12 +1760,20 @@ class TestResourceScopedReadTokenIsolation:
         assert env.pic_b not in leaked, (
             "set membership leaked out-of-scope picture B to a set-A token"
         )
+        assert result == {str(env.set_a): [env.pic_a]}, (
+            f"set membership wrongly withheld set A's own picture: {result}"
+        )
 
     def test_project_membership_cannot_leak_out_of_scope_pictures(self, env):
+        path = f"{API}/projects/membership"
+        body = {"picture_ids": [env.pic_a, env.pic_b]}
+        r = env.owner_client.post(path, json=body)
+        assert r.status_code == 200, r.text
+        assert sorted(r.json()["unassigned_picture_ids"]) == sorted(
+            [env.pic_a, env.pic_b]
+        ), r.json()
         r = TestClient(env.server.api).post(
-            f"{API}/projects/membership",
-            json={"picture_ids": [env.pic_a, env.pic_b]},
-            headers={"Authorization": f"Bearer {env.token_a}"},
+            path, json=body, headers={"Authorization": f"Bearer {env.token_a}"}
         )
         assert r.status_code == 200, r.text
         result = r.json()
@@ -1567,12 +1786,38 @@ class TestResourceScopedReadTokenIsolation:
         assert env.pic_b not in leaked, (
             "project membership leaked out-of-scope picture B (assigned)"
         )
+        # pic_a is in no project, so it is the token's one unassigned picture.
+        assert result["unassigned_picture_ids"] == [env.pic_a], (
+            f"project membership wrongly withheld the token's picture A: {result}"
+        )
 
     def test_character_membership_cannot_leak_out_of_scope_pictures(self, env):
+        """Both pictures carry a face of one character; the token sees pic_a's."""
+        path = f"{API}/characters/membership"
+
+        def _faces(session: Session):
+            character = Character(name="Ref")
+            session.add(character)
+            session.flush()
+            for pid in (env.pic_a, env.pic_b):
+                session.add(
+                    Face(picture_id=pid, face_index=0, character_id=character.id)
+                )
+            session.commit()
+            return character.id
+
+        character_id = env.server.vault.db.run_task(_faces)
+        body = {"picture_ids": [env.pic_a, env.pic_b]}
+        r = env.owner_client.post(path, json=body)
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "character_assignments": {
+                str(character_id): sorted([env.pic_a, env.pic_b])
+            },
+            "pictures_with_faces": sorted([env.pic_a, env.pic_b]),
+        }, r.json()
         r = TestClient(env.server.api).post(
-            f"{API}/characters/membership",
-            json={"picture_ids": [env.pic_a, env.pic_b]},
-            headers={"Authorization": f"Bearer {env.token_a}"},
+            path, json=body, headers={"Authorization": f"Bearer {env.token_a}"}
         )
         assert r.status_code == 200, r.text
         result = r.json()
@@ -1585,17 +1830,33 @@ class TestResourceScopedReadTokenIsolation:
         assert env.pic_b not in leaked, (
             "character membership leaked out-of-scope picture B (assigned)"
         )
+        assert result == {
+            "character_assignments": {str(character_id): [env.pic_a]},
+            "pictures_with_faces": [env.pic_a],
+        }, f"character membership wrongly withheld picture A's face: {result}"
 
     def test_unassigned_listing_cannot_leak_out_of_scope_pictures(self, env):
         """character_id=UNASSIGNED must honour token scope. Regression for the
         bypass where an empty intersected id list fell through to no filter and
-        the set/character scope was never applied to the UNASSIGNED branch."""
+        the set/character scope was never applied to the UNASSIGNED branch.
+
+        Unassigned means no named face and no set, so a set-scoped token's
+        pictures are never unassigned in full; ``unassigned_by=character`` asks
+        only about faces. Neither picture has a named face, so the owner's
+        listing holds both and the token's must hold exactly pic_a.
+        """
+        by_character = "/pictures?character_id=UNASSIGNED&unassigned_by=character"
+        r = env.owner_client.get(f"{API}{by_character}")
+        assert r.status_code == 200, r.text
+        assert {p["id"] for p in r.json()} == {env.pic_a, env.pic_b}, r.json()
         client = TestClient(env.server.api)
         hdr = {"Authorization": f"Bearer {env.token_a}"}
-        listed = None
+        listed = {}
         for path in (
             "/pictures?character_id=UNASSIGNED",
             f"/pictures?character_id=UNASSIGNED&id={env.pic_b}",
+            by_character,
+            f"{by_character}&id={env.pic_b}",
         ):
             r = client.get(f"{API}{path}", headers=hdr)
             assert r.status_code == 200, r.text
@@ -1606,17 +1867,18 @@ class TestResourceScopedReadTokenIsolation:
             assert ids <= {env.pic_a}, (
                 f"UNASSIGNED listing returned ids outside the grant via {path}: {ids}"
             )
-            if listed is None:
-                listed = ids
-        r = client.get(f"{API}/pictures/count?character_id=UNASSIGNED", headers=hdr)
+            listed[path] = ids
+        assert listed[by_character] == {env.pic_a}, (
+            "the UNASSIGNED listing wrongly withheld the token's picture A: "
+            f"{listed[by_character]}"
+        )
+        count_path = by_character.replace("/pictures?", "/pictures/count?")
+        r = client.get(f"{API}{count_path}", headers=hdr)
         assert r.status_code == 200, r.text
-        # Pinned against the row set rather than a literal: the fixture pictures
-        # carry a "no face found" sentinel, so whether pic_a lands in the
-        # UNASSIGNED bucket at all is the endpoint's business - but the count
-        # and the listing must agree, and neither may exceed the grant.
-        assert r.json().get("count") == len(listed), (
+        # The count and the listing must agree, and neither may exceed the grant.
+        assert r.json().get("count") == 1, (
             f"UNASSIGNED count {r.json()} disagrees with the rows it returned: "
-            f"{sorted(listed)}"
+            f"{sorted(listed[by_character])}"
         )
 
     def test_scoped_token_cannot_read_other_picture_fields(self, env):

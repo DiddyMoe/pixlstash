@@ -10,13 +10,17 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
+from starlette.datastructures import QueryParams
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import select
 from typing import Literal, Optional
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.db_models.picture import Picture
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.library_roots import refuse_path_inside_a_library
+from pixlstash.utils.links import is_link_or_missing
+from pixlstash.utils.service.library_lease import PinnedVaultServer
 from pixlstash.utils.service.share_copies import (
     make_share_copies,
     share_copies_root,
@@ -27,19 +31,63 @@ from pixlstash.utils.watermark import get_watermark_bytes
 from pixlstash.utils.reference_folder_validator import validate_reference_folder_path
 from pixlstash.utils.sql_chunking import chunked
 
+from ._search import SEARCH_DEFAULT_THRESHOLD
+
 
 logger = get_logger(__name__)
 
 
-class _PinnedVaultServer:
-    """Delegate machine-global state while fixing export work to one vault."""
+# Upper bound on the ids one POST /pictures/export body may name. An export is
+# a background task like a Scrapheap run, so this matches SCRAPHEAP_MAX_IDS
+# (routes/pictures/_crud.py): it bounds what one body makes the server hold
+# (200,000 ids is about 1.4 MB of JSON), not the work, which the export of a
+# whole view already does for any size with no id list at all.
+EXPORT_MAX_IDS = 200_000
 
-    def __init__(self, server, vault):
-        self._server = server
-        self.vault = vault
+
+class _BodySelectionRequest:
+    """The request, with a POST body's selection standing in for its query.
+
+    ``ExportUtils`` reads an export's selection from ``query_params`` (``id``
+    and the Scrapheap flag) and the token scope from ``state``. Everything
+    but the query string is the real request's, so the scope filter still
+    sees the caller's token.
+    """
+
+    def __init__(self, request: Request, query_params: QueryParams):
+        self._request = request
+        self.query_params = query_params
 
     def __getattr__(self, name):
-        return getattr(self._server, name)
+        return getattr(self._request, name)
+
+
+class ExportByIdsRequest(BaseModel):
+    """An export of named pictures; the options are the GET route's."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    picture_ids: list[SqliteInt] = Field(min_length=1, max_length=EXPORT_MAX_IDS)
+    # The selection is in the Scrapheap: ids of soft-deleted pictures.
+    only_deleted: bool = False
+    caption_mode: Literal["none", "description", "tags"] = "description"
+    include_character_name: bool = False
+    use_original_file_names: bool = False
+    resolution: Literal["original", "half", "quarter"] = "original"
+    export_type: Literal["full", "face"] = "full"
+    tag_format: Literal["spaces", "underscores"] = "spaces"
+    bbox_mode: Literal["none", "coco-json", "ideogram-json"] = "none"
+    keep_generation_data: bool = False
+
+
+class ExportFolderByIdsRequest(ExportByIdsRequest):
+    """A folder export of named pictures: the ZIP body's fields and the folder.
+
+    The selection travels in the body for the reason the ZIP's does: as
+    ``?id=`` parameters a large one is a request line the server refuses.
+    """
+
+    destination: str = Field(min_length=1)
 
 
 class ExportStartResponse(BaseModel):
@@ -66,7 +114,7 @@ class ExportStatusResponse(BaseModel):
 
 class ShareCopiesRequest(BaseModel):
     # No cap: a drag or a copy of a whole view links the originals (#2420).
-    picture_ids: list[int] = Field(min_length=1)
+    picture_ids: list[SqliteInt] = Field(min_length=1)
     keep_generation_data: bool = False
     # The longer side of each image, at most; None keeps the original size.
     max_long_edge: Optional[int] = Field(default=None, ge=64, le=16384)
@@ -100,6 +148,34 @@ class ShareCopiesResponse(BaseModel):
     skipped: list[ShareCopySkipped]
 
 
+def _body_selection_and_options(
+    request: Request, payload: ExportByIdsRequest
+) -> tuple[_BodySelectionRequest, dict]:
+    """The export request and options for a body that names its pictures.
+
+    The ids (and the Scrapheap flag) stand in for the query string the export
+    reads its selection from; the options are the query routes' own. An id
+    selection has no search, so no threshold applies to it.
+    """
+    selection = [("id", str(picture_id)) for picture_id in payload.picture_ids]
+    if payload.only_deleted:
+        selection.append(("only_deleted", "true"))
+    background_data = {
+        "query": None,
+        "set_id": None,
+        "threshold": 0.0,
+        "caption_mode": payload.caption_mode,
+        "include_character_name": payload.include_character_name,
+        "use_original_file_names": payload.use_original_file_names,
+        "resolution": payload.resolution,
+        "export_type": payload.export_type,
+        "tag_format": payload.tag_format,
+        "bbox_mode": payload.bbox_mode,
+        "keep_generation_data": payload.keep_generation_data,
+    }
+    return _BodySelectionRequest(request, QueryParams(selection)), background_data
+
+
 def register_routes(router, server):
     def discard_export(task_id: str, task: dict) -> None:
         current = server.export_tasks.get(task_id)
@@ -112,40 +188,20 @@ def register_routes(router, server):
             logger.warning("Refusing to remove unexpected export path %s", private_dir)
             return
         try:
-            if os.path.islink(private_dir):
+            if is_link_or_missing(private_dir):
                 os.unlink(private_dir)
             elif os.path.isdir(private_dir):
                 shutil.rmtree(private_dir)
         except OSError as exc:
             logger.warning("Could not remove completed export %s: %s", private_dir, exc)
 
-    @router.get(
-        "/pictures/export",
-        summary="Start picture export job",
-        description="Queues an asynchronous export task and returns a task id for polling status and downloading the generated archive.",
-        response_model=ExportStartResponse,
-    )
-    def export_pictures_zip(
+    def start_zip_export(
         request: Request,
         background_tasks: BackgroundTasks,
-        query: str = Query(None),
-        set_id: int = Query(None),
-        threshold: float = Query(0.0),
-        caption_mode: str = Query("description"),
-        include_character_name: bool = Query(False),
-        use_original_file_names: bool = Query(False),
-        resolution: str = Query("original"),
-        export_type: str = Query("full"),
-        tag_format: str = Query("spaces"),
-        bbox_mode: str = Query("none"),
-        keep_generation_data: bool = Query(
-            False,
-            description=(
-                "Leave the ComfyUI workflow, prompt and A1111 parameters in "
-                "the exported images. Stripped by default."
-            ),
-        ),
-    ):
+        task_request,
+        background_data: dict,
+    ) -> JSONResponse:
+        """Register a ZIP export task, queue it, and answer with its id."""
         task_id = str(uuid.uuid4())
         lease = request.state.library_lease
         server.export_tasks[task_id] = {
@@ -162,51 +218,40 @@ def register_routes(router, server):
             ExportUtils as PictureServiceUtils,
         )
 
-        # Gather extra params for the export service
-        background_data = {
-            "query": query,
-            "set_id": set_id,
-            "threshold": threshold,
-            "caption_mode": caption_mode,
-            "include_character_name": include_character_name,
-            "use_original_file_names": use_original_file_names,
-            "resolution": resolution,
-            "export_type": export_type,
-            "tag_format": tag_format,
-            "bbox_mode": bbox_mode,
-            "keep_generation_data": keep_generation_data,
-        }
         background_tasks.add_task(
             PictureServiceUtils.generate_zip,
-            _PinnedVaultServer(server, lease.vault),
-            request,
+            PinnedVaultServer(server, lease.vault),
+            task_request,
             task_id,
             server.export_tasks,
             background_data,
         )
         return JSONResponse({"task_id": task_id})
 
-    @router.post(
-        "/pictures/export/folder",
-        summary="Start picture export-to-folder job",
-        description=(
-            "Queues an asynchronous export task that writes pictures straight "
-            "into a folder on the machine running PixlStash, then opens that "
-            "folder in the host file manager. The destination must be an "
-            "empty, writable, existing directory outside every registered "
-            "library, this library's reference folders and its import folders. "
-            "Local owner, on that machine, only - see POST /pictures/export "
-            "for a ZIP you can download from anywhere instead."
-        ),
+    @router.get(
+        "/pictures/export",
+        summary="Start picture export job",
+        description="Queues an asynchronous export task and returns a task id for polling status and downloading the generated archive.",
         response_model=ExportStartResponse,
     )
-    def export_pictures_folder(
+    def export_pictures_zip(
         request: Request,
         background_tasks: BackgroundTasks,
-        destination: str = Query(...),
         query: str = Query(None),
-        set_id: int = Query(None),
-        threshold: float = Query(0.0),
+        set_id: Optional[SqliteInt] = Query(None),
+        # Read from the query string by the export itself; declared so an id
+        # SQLite cannot store is a 422 here, not a failed task later.
+        picture_ids: Optional[list[SqliteInt]] = Query(
+            None,
+            alias="id",
+            description=(
+                "Pictures to export, in order. A large selection belongs in "
+                "the body of POST /pictures/export."
+            ),
+        ),
+        # The search's own default, so a query export without one exports
+        # what GET /pictures/search answers for the same query string.
+        threshold: float = Query(SEARCH_DEFAULT_THRESHOLD),
         caption_mode: str = Query("description"),
         include_character_name: bool = Query(False),
         use_original_file_names: bool = Query(False),
@@ -222,6 +267,59 @@ def register_routes(router, server):
             ),
         ),
     ):
+        # Gather extra params for the export service
+        background_data = {
+            "query": query,
+            "set_id": set_id,
+            "threshold": threshold,
+            "caption_mode": caption_mode,
+            "include_character_name": include_character_name,
+            "use_original_file_names": use_original_file_names,
+            "resolution": resolution,
+            "export_type": export_type,
+            "tag_format": tag_format,
+            "bbox_mode": bbox_mode,
+            "keep_generation_data": keep_generation_data,
+        }
+        return start_zip_export(request, background_tasks, request, background_data)
+
+    @router.post(
+        "/pictures/export",
+        summary="Start picture export job for named pictures",
+        description=(
+            "The GET route's ZIP export, with the selection in a JSON body: a "
+            "large selection named as `?id=` parameters makes a URL a reverse "
+            "proxy may refuse (414). Takes 1 to 200,000 picture ids and the "
+            "GET route's options; exports those pictures and nothing else. "
+            "A share token's export keeps only the ids in its scope. Poll "
+            "GET /pictures/export/status and download as for the GET route."
+        ),
+        response_model=ExportStartResponse,
+    )
+    def export_picture_ids_zip(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        payload: ExportByIdsRequest,
+    ):
+        task_request, background_data = _body_selection_and_options(request, payload)
+        return start_zip_export(
+            request, background_tasks, task_request, background_data
+        )
+
+    def start_folder_export(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        task_request,
+        destination: str,
+        background_data: dict,
+    ) -> JSONResponse:
+        """Check the destination, register a folder export task and queue it.
+
+        Shared by the view's route and the named pictures' route, so both
+        refuse the same destinations and write the same way. *task_request* is
+        where the export reads its selection: the request itself, or the body's
+        ids standing in for its query.
+        """
         if server.running_in_docker():
             raise HTTPException(
                 status_code=403,
@@ -294,13 +392,71 @@ def register_routes(router, server):
             "library_uuid": lease.library_uuid,
             "generation": lease.generation,
         }
+        background_data = {"destination": resolved_destination, **background_data}
 
         from pixlstash.utils.service.export_utils import (
             ExportUtils as PictureServiceUtils,
         )
 
+        background_tasks.add_task(
+            PictureServiceUtils.generate_folder_export,
+            PinnedVaultServer(server, lease.vault),
+            task_request,
+            task_id,
+            server.export_tasks,
+            background_data,
+        )
+        return JSONResponse({"task_id": task_id})
+
+    @router.post(
+        "/pictures/export/folder",
+        summary="Start picture export-to-folder job",
+        description=(
+            "Queues an asynchronous export task that writes pictures straight "
+            "into a folder on the machine running PixlStash, then opens that "
+            "folder in the host file manager. The destination must be an "
+            "empty, writable, existing directory outside every registered "
+            "library, this library's reference folders and its import folders. "
+            "Local owner, on that machine, only - see POST /pictures/export "
+            "for a ZIP you can download from anywhere instead."
+        ),
+        response_model=ExportStartResponse,
+    )
+    def export_pictures_folder(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        destination: str = Query(...),
+        query: str = Query(None),
+        set_id: Optional[SqliteInt] = Query(None),
+        # Read from the query string by the export itself; declared so an id
+        # SQLite cannot store is a 422 here, not a failed task later.
+        picture_ids: Optional[list[SqliteInt]] = Query(
+            None,
+            alias="id",
+            description=(
+                "Pictures to export, in order. A large selection belongs in "
+                "the body of POST /pictures/export/folder/selection."
+            ),
+        ),
+        # The search's own default, so a query export without one exports
+        # what GET /pictures/search answers for the same query string.
+        threshold: float = Query(SEARCH_DEFAULT_THRESHOLD),
+        caption_mode: str = Query("description"),
+        include_character_name: bool = Query(False),
+        use_original_file_names: bool = Query(False),
+        resolution: str = Query("original"),
+        export_type: str = Query("full"),
+        tag_format: str = Query("spaces"),
+        bbox_mode: str = Query("none"),
+        keep_generation_data: bool = Query(
+            False,
+            description=(
+                "Leave the ComfyUI workflow, prompt and A1111 parameters in "
+                "the exported images. Stripped by default."
+            ),
+        ),
+    ):
         background_data = {
-            "destination": resolved_destination,
             "query": query,
             "set_id": set_id,
             "threshold": threshold,
@@ -313,15 +469,37 @@ def register_routes(router, server):
             "bbox_mode": bbox_mode,
             "keep_generation_data": keep_generation_data,
         }
-        background_tasks.add_task(
-            PictureServiceUtils.generate_folder_export,
-            _PinnedVaultServer(server, lease.vault),
+        return start_folder_export(
+            request, background_tasks, request, destination, background_data
+        )
+
+    @router.post(
+        "/pictures/export/folder/selection",
+        summary="Start picture export-to-folder job for named pictures",
+        description=(
+            "The folder export of POST /pictures/export/folder, with the "
+            "selection and the destination in a JSON body: a large selection "
+            "named as `?id=` parameters makes a request line the server "
+            "refuses. Takes 1 to 200,000 picture ids, `only_deleted` for a "
+            "Scrapheap selection, and the view route's options; writes those "
+            "pictures and nothing else. The destination rules and the "
+            "local-owner-on-this-machine rule are the view route's."
+        ),
+        response_model=ExportStartResponse,
+    )
+    def export_picture_ids_folder(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        payload: ExportFolderByIdsRequest,
+    ):
+        task_request, background_data = _body_selection_and_options(request, payload)
+        return start_folder_export(
             request,
-            task_id,
-            server.export_tasks,
+            background_tasks,
+            task_request,
+            payload.destination,
             background_data,
         )
-        return JSONResponse({"task_id": task_id})
 
     @router.post(
         "/pictures/share-copies",
