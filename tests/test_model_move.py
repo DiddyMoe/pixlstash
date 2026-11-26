@@ -25,6 +25,7 @@ standing up a server would cost 1.35 s and prove nothing extra. The route half
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 
 import pytest
@@ -33,6 +34,7 @@ from pixlstash.hub.db import HubDatabase
 from pixlstash.services import model_dir_mover as dir_mover_module
 from pixlstash.services import model_mover as mover_module
 from pixlstash.services.model_dir_mover import (
+    FOLDER_MOVE_FAILED_DETAIL,
     execute_directory_move,
     plan_directory_move,
 )
@@ -42,9 +44,11 @@ from pixlstash.services.model_mover import (
     STATUS_FAILED,
     STATUS_MOVED,
     STATUS_SKIPPED,
+    CopyNotVerified,
     ModelMover,
     MoveRefused,
 )
+from pixlstash.utils.query.folder_prefix import PATHS_FOLD_CASE
 
 
 class Crash(BaseException):
@@ -377,6 +381,11 @@ def test_a_copy_that_does_not_verify_leaves_the_original_alone(
     )
 
     assert [outcome.status for outcome in report.outcomes] == [STATUS_FAILED]
+    # The server's own sentence reaches the outcome, naming the registered
+    # relpath; the status payload never carries a path on this machine.
+    detail = report.outcomes[0].detail
+    assert detail.startswith(f"The copy of alice.safetensors verified as {'0' * 64}")
+    assert str(two_folders["source_dir"]) not in detail, detail
     assert os.path.exists(two_folders["source_path"])
     assert not os.path.exists(two_folders["destination_path"])
     assert not os.path.exists(two_folders["destination_path"] + PARTIAL_SUFFIX)
@@ -518,6 +527,35 @@ def test_a_failed_samples_move_still_leaves_the_model_moved(
     assert not os.path.exists(two_folders["source_path"])
     assert os.listdir(squatter) == ["mine.jpg"]
     assert_no_dangling_rows(two_folders["hub"])
+
+
+def test_a_samples_carry_the_os_refuses_names_the_directory_not_the_error(
+    two_folders, monkeypatch, caplog
+):
+    """The carry's own failure, past the name check: the OS's text names paths
+    on this machine, so the outcome a client polls says only which previews
+    stayed, and the log keeps the cause."""
+    _with_samples(two_folders, "1712345678901__000000500_0.jpg")
+    secret = "/home/me/test-samples-cause"
+
+    def refuse(source, destination):
+        raise PermissionError(13, "Permission denied", secret)
+
+    monkeypatch.setattr(mover_module, "move_directory", refuse)
+    mover = ModelMover(two_folders["hub"])
+    report = mover.execute(
+        mover.plan(
+            [(two_folders["source_id"], "alice.safetensors")],
+            two_folders["destination_id"],
+        )
+    )
+
+    assert [outcome.status for outcome in report.outcomes] == [STATUS_MOVED]
+    assert report.outcomes[0].detail == (
+        "Samples were not carried from alice_samples; the server log says why."
+    )
+    assert secret in caplog.text, "the cause did not reach the log"
+    assert os.path.exists(two_folders["destination_path"])
 
 
 @pytest.mark.parametrize("force_copy", [False, True], ids=["rename", "copy"])
@@ -773,7 +811,7 @@ def test_a_destination_created_at_publication_time_is_refused_not_clobbered(
 
 @pytest.mark.parametrize("force_copy", [False, True], ids=["rename", "copy"])
 def test_a_publication_that_cannot_drop_its_source_leaves_the_name_free(
-    two_folders, monkeypatch, force_copy
+    two_folders, monkeypatch, force_copy, caplog
 ):
     """The half-state the old single ``os.rename`` could not produce.
 
@@ -812,6 +850,15 @@ def test_a_publication_that_cannot_drop_its_source_leaves_the_name_free(
     )
 
     assert [outcome.status for outcome in report.outcomes] == [STATUS_FAILED]
+    # The OS's text names a path, so it goes to the log and the outcome a
+    # client polls carries the fixed sentence.
+    assert report.outcomes[0].detail == mover_module.MOVE_FAILED_DETAIL
+    # The move's own record carries it: the publication logs the drop as well,
+    # so the whole caplog text would pass without the move's line.
+    failed = [r for r in caplog.records if r.getMessage().startswith("Moving ")]
+    assert failed and "is held open by another process" in failed[0].getMessage(), (
+        "the cause did not reach the move's log line"
+    )
     with open(two_folders["source_path"], "rb") as handle:
         assert handle.read() == source_bytes
     assert not os.path.exists(two_folders["destination_path"]), (
@@ -1427,8 +1474,38 @@ def test_a_subpath_that_leaves_the_folder_is_refused(two_folders, subpath):
             destination_subpath=subpath,
         )
     assert refused.value.status_code == 400
+    # The subpath is the caller's text: the refusal is the server's sentence.
+    assert str(refused.value) == (
+        "That path goes through a link or a hidden folder, which the shelf "
+        "does not move into."
+        if subpath in ("out", "inner", ".hidden")
+        else "That path is not a folder inside the destination: name it "
+        "relative to the folder, with '/' between the parts."
+    )
     assert os.path.exists(two_folders["source_path"])
     assert sorted(os.listdir(destination_dir / "Lora")) == []
+
+
+def test_a_subpath_the_containment_check_refuses_names_the_folder_not_the_path(
+    tmp_path, monkeypatch, caplog
+):
+    """The last word on the disk is ``resolve_path_within``. Its refusal names
+    which folder, in the server's words; the caller's subpath goes to the log."""
+
+    def outside(base, *parts):
+        # The cause leaves the subpath out, so the log line must name it itself.
+        raise ValueError("test-leaves-cause")
+
+    monkeypatch.setattr(mover_module, "resolve_path_within", outside)
+    with caplog.at_level("ERROR", logger=mover_module.logger.name):
+        with pytest.raises(MoveRefused) as refused:
+            mover_module.resolve_subfolder(
+                str(tmp_path), "test-subpath", "the destination folder"
+            )
+    assert refused.value.status_code == 400
+    assert str(refused.value) == "That path is outside the destination folder."
+    assert "test-subpath" in caplog.text, "the refused subpath did not reach the log"
+    assert "test-leaves-cause" in caplog.text, "the cause did not reach the log"
 
 
 def test_a_subfolder_removed_after_the_plan_is_not_recreated(two_folders):
@@ -1453,14 +1530,36 @@ def test_a_subfolder_removed_after_the_plan_is_not_recreated(two_folders):
 
 
 def test_a_missing_subfolder_is_refused_not_created(two_folders):
-    with pytest.raises(MoveRefused, match="Create it first") as refused:
+    with pytest.raises(MoveRefused) as refused:
         ModelMover(two_folders["hub"]).plan(
             [(two_folders["source_id"], "alice.safetensors")],
             two_folders["destination_id"],
-            destination_subpath="Lora",
+            destination_subpath="example-Lora",
         )
     assert refused.value.status_code == 409
-    assert not (two_folders["destination_dir"] / "Lora").exists()
+    # A folder that is not there is still the caller's text: not repeated.
+    assert str(refused.value) == (
+        "There is no such folder in the destination. Create it first; a move "
+        "does not make folders."
+    )
+    assert not (two_folders["destination_dir"] / "example-Lora").exists()
+
+
+def test_an_item_naming_no_registered_copy_is_a_404_that_does_not_repeat_it(
+    two_folders,
+):
+    """The relpath matched no row, so the refusal names the folder id only."""
+    folder_id = two_folders["source_id"]
+    with pytest.raises(MoveRefused) as refused:
+        ModelMover(two_folders["hub"]).plan(
+            [(folder_id, "example-missing.safetensors")],
+            two_folders["destination_id"],
+        )
+    assert refused.value.status_code == 404
+    assert str(refused.value) == (
+        f"No registered copy at that path in folder {folder_id}."
+    )
+    assert os.path.exists(two_folders["source_path"])
 
 
 @pytest.mark.parametrize("movable", ["root_only", "fixed"])
@@ -1826,17 +1925,43 @@ def test_renaming_a_directory_is_a_move_into_its_own_parent(dir_tree):
 
 
 def test_a_taken_name_is_refused_and_nothing_is_merged(dir_tree):
-    (dir_tree["destination_dir"] / "sdxl").mkdir()
-    (dir_tree["destination_dir"] / "sdxl" / "theirs.txt").write_text("keep")
+    (dir_tree["destination_dir"] / "example-taken").mkdir()
+    (dir_tree["destination_dir"] / "example-taken" / "theirs.txt").write_text("keep")
     before = locations(dir_tree["hub"])
     with pytest.raises(MoveRefused) as refused:
-        _move_sdxl(dir_tree)
+        _move_sdxl(dir_tree, new_name="example-taken")
     assert refused.value.status_code == 409
+    # The name is the caller's, so the refusal says what is wrong without it.
+    assert str(refused.value) == (
+        "A folder with that name already exists there. Folders are never merged; "
+        "rename one of them first."
+    )
     assert (dir_tree["source_dir"] / "sdxl" / "alice.safetensors").is_file()
-    assert sorted(p.name for p in (dir_tree["destination_dir"] / "sdxl").iterdir()) == [
-        "theirs.txt"
-    ]
+    assert sorted(
+        p.name for p in (dir_tree["destination_dir"] / "example-taken").iterdir()
+    ) == ["theirs.txt"]
     assert locations(dir_tree["hub"]).keys() == before.keys()
+
+
+def test_a_path_that_is_not_there_is_refused_without_repeating_it(dir_tree):
+    """The source and the destination path are the caller's guesses, so neither
+    refusal repeats one."""
+    hub = dir_tree["hub"]
+    with pytest.raises(MoveRefused) as no_source:
+        plan_directory_move(
+            hub, dir_tree["source_id"], "example-absent", dir_tree["destination_id"], ""
+        )
+    assert no_source.value.status_code == 404
+    assert str(no_source.value) == (
+        "There is no folder at that path in the model folder."
+    )
+    with pytest.raises(MoveRefused) as no_destination:
+        _move_sdxl(dir_tree, destination_subpath="example-nowhere")
+    assert no_destination.value.status_code == 409
+    assert str(no_destination.value) == (
+        "There is no folder at that path in the destination to move into."
+    )
+    assert (dir_tree["source_dir"] / "sdxl" / "alice.safetensors").is_file()
 
 
 def test_a_directory_cannot_move_into_itself_or_below(dir_tree):
@@ -1879,7 +2004,34 @@ def test_a_directory_holding_a_registered_folder_is_refused(dir_tree):
     with pytest.raises(MoveRefused) as refused:
         _move_sdxl(dir_tree)
     assert refused.value.status_code == 409
+    # The path it names is the hub's registered one, not the caller's subpath.
+    assert str(refused.value) == (
+        f"{nested} is a registered model folder inside that folder. Moving it "
+        "would move that folder's files out from under it; stop watching it first."
+    )
+    assert "'sdxl'" not in str(refused.value)
     assert nested.is_dir()
+
+
+def test_a_left_over_partial_is_refused_by_kind_and_named_in_the_log(
+    dir_tree, dir_cross_device, caplog
+):
+    """Its name is the caller's new name with the suffix on, so the refusal
+    says what is in the way and the log says where."""
+    left_over = dir_tree["destination_dir"] / ("example-renamed" + PARTIAL_SUFFIX)
+    left_over.mkdir()
+    with caplog.at_level(logging.WARNING, logger=dir_mover_module.logger.name):
+        with pytest.raises(MoveRefused) as refused:
+            _move_sdxl(dir_tree, new_name="example-renamed")
+    assert refused.value.status_code == 409
+    assert str(refused.value) == (
+        f"A {PARTIAL_SUFFIX} folder left over from an interrupted move is in the "
+        "way in the destination; the server log names it. Remove it first."
+    )
+    assert "example-renamed" not in str(refused.value)
+    [logged] = [r for r in caplog.records if r.name == dir_mover_module.logger.name]
+    assert str(left_over) in logged.getMessage(), "the log does not name the partial"
+    assert left_over.is_dir()
 
 
 def test_a_cancelled_cross_drive_move_leaves_no_partial_and_repoints_nothing(
@@ -1895,25 +2047,60 @@ def test_a_cancelled_cross_drive_move_leaves_no_partial_and_repoints_nothing(
 
 
 def test_a_copy_that_does_not_verify_is_discarded_and_the_source_kept(
-    dir_tree, dir_cross_device, monkeypatch
+    dir_tree, dir_cross_device, monkeypatch, caplog
 ):
     monkeypatch.setattr(dir_mover_module, "file_digest", lambda path, **_: "0" * 64)
     before = locations(dir_tree["hub"])
-    _, outcome = _move_sdxl(dir_tree)
+    registered = locations(dir_tree["hub"])[
+        (dir_tree["source_id"], dir_tree["relpath"])
+    ]
+    sha256 = dir_tree["hub"].fetchone(
+        "SELECT sha256 FROM model WHERE id = ?", (registered["model_id"],)
+    )["sha256"]
+    with caplog.at_level(logging.ERROR, logger=dir_mover_module.logger.name):
+        _, outcome = _move_sdxl(dir_tree)
     assert outcome.status == STATUS_FAILED
-    assert "registered as" in outcome.detail
+    # The one failure text a folder move answers: the hub's relpath and the two
+    # digests, all the server's.
+    assert outcome.detail == (
+        f"{dir_tree['relpath']} arrived as {'0' * 64} but is registered as "
+        f"{sha256}; nothing was moved. Try again once its folder's next scan has "
+        "re-read it."
+    )
+    assert str(dir_tree["destination_dir"]) not in outcome.detail
+    [logged] = [
+        r
+        for r in caplog.records
+        if r.name == dir_mover_module.logger.name and r.exc_info
+    ]
+    assert isinstance(logged.exc_info[1], CopyNotVerified)
     assert not list(dir_tree["destination_dir"].iterdir())
     assert (dir_tree["source_dir"] / "sdxl" / "alice.safetensors").is_file()
     assert locations(dir_tree["hub"]).keys() == before.keys()
 
 
-def test_a_failed_repoint_renames_the_directory_back(dir_tree, monkeypatch):
+def test_a_failed_repoint_renames_the_directory_back(dir_tree, monkeypatch, caplog):
+    cause = mover_module.RepointLost("example-leak: the rows went away")
+
     def lost(hub, plan):
-        raise mover_module.RepointLost("simulated: the rows went away")
+        raise cause
 
     monkeypatch.setattr(dir_mover_module, "_repoint", lost)
-    _, outcome = _move_sdxl(dir_tree)
+    with caplog.at_level(logging.ERROR, logger=dir_mover_module.logger.name):
+        _, outcome = _move_sdxl(dir_tree)
     assert outcome.status == STATUS_FAILED
+    # The cause names database internals, so the outcome a client polls says
+    # the fixed sentence and the log says why.
+    assert outcome.detail == FOLDER_MOVE_FAILED_DETAIL
+    assert "example-leak" not in outcome.detail
+    # The outcome's own line: the rename-back logs the same cause first.
+    failed = [
+        r
+        for r in caplog.records
+        if r.name == dir_mover_module.logger.name
+        and r.getMessage().startswith("Moving folder")
+    ]
+    assert [r.exc_info[1] for r in failed] == [cause]
     assert (dir_tree["source_dir"] / "sdxl" / "alice.safetensors").is_file()
     assert not (dir_tree["destination_dir"] / "sdxl").exists()
     assert_no_dangling_rows(dir_tree["hub"])
@@ -2008,6 +2195,8 @@ def test_a_partial_that_appeared_after_the_plan_is_not_discarded(
     (foreign / "theirs.txt").write_text("keep")
     outcome = execute_directory_move(dir_tree["hub"], plan)
     assert outcome.status == STATUS_FAILED
+    # The OS's refusal names the path; the outcome does not repeat it.
+    assert outcome.detail == FOLDER_MOVE_FAILED_DETAIL
     assert (foreign / "theirs.txt").read_text() == "keep"
     assert (dir_tree["source_dir"] / "sdxl" / "alice.safetensors").is_file()
     assert_no_dangling_rows(dir_tree["hub"])
@@ -2060,3 +2249,86 @@ def test_an_empty_folder_made_after_the_final_check_is_left_not_swept(
     assert made.is_dir()
     assert (dir_tree["destination_dir"] / "sdxl" / "alice.safetensors").is_file()
     assert_no_dangling_rows(dir_tree["hub"])
+
+
+def test_an_original_that_cannot_be_removed_is_reported_without_the_os_text(
+    dir_tree, dir_cross_device, monkeypatch, caplog
+):
+    """The copy is published and repointed; the OS's refusal to remove the
+    original names a server path, so it goes to the log."""
+    real_unlink = os.unlink
+    original = str(dir_tree["source_dir"] / "sdxl")
+    cause = PermissionError(13, "example-leak: held open", original)
+
+    def refuse_the_original(path, *args, **kwargs):
+        # Only the original's files: the copy's publication must still work.
+        if str(path).startswith(original + os.sep):
+            raise cause
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(dir_mover_module.os, "unlink", refuse_the_original)
+    with caplog.at_level(logging.ERROR, logger=dir_mover_module.logger.name):
+        _, outcome = _move_sdxl(dir_tree)
+    assert outcome.status == STATUS_MOVED
+    assert outcome.detail == (
+        "Moved, but the original could not be removed; what is left there is a "
+        "duplicate. The server log says why."
+    )
+    assert "example-leak" not in outcome.detail
+    assert str(dir_tree["source_dir"]) not in outcome.detail
+    [logged] = [
+        r
+        for r in caplog.records
+        if r.name == dir_mover_module.logger.name and r.exc_info
+    ]
+    assert logged.exc_info[1] is cause
+    assert (dir_tree["destination_dir"] / "sdxl" / "alice.safetensors").is_file()
+    assert_no_dangling_rows(dir_tree["hub"])
+
+
+def test_a_directory_move_takes_the_rows_below_it_and_no_sibling(hub, tmp_path):
+    """Moving ``sd_xl`` repoints the rows below it and no other folder's.
+
+    ``sd_xl-old`` only starts with its name, and ``sdaxl`` matches it once
+    ``_`` is read as a LIKE wildcard: their files and rows stay. ``SD_XL``
+    (a row whose file is gone) is the same folder only where the platform's
+    paths fold case (:class:`FolderPrefix`), so it moves there and stays
+    everywhere else. Wrong if the plan counts a sibling or the repoint moves
+    one.
+    """
+    source_dir = tmp_path / "loras"
+    destination_dir = tmp_path / "archive"
+    source_dir.mkdir()
+    destination_dir.mkdir()
+    source_id = register_folder(hub, source_dir)
+    destination_id = register_folder(hub, destination_dir)
+    below = os.path.join("sd_xl", "alice.safetensors")
+    siblings = [
+        os.path.join("sd_xl-old", "bob.safetensors"),
+        os.path.join("sdaxl", "carol.safetensors"),
+    ]
+    for relpath in (below, *siblings):
+        register_file(hub, source_id, source_dir, relpath)
+    other_case = os.path.join("SD_XL", "dana.safetensors")
+    _, other_case_file = register_file(hub, source_id, source_dir, other_case)
+    os.remove(other_case_file)
+
+    plan = plan_directory_move(hub, source_id, "sd_xl", destination_id, "", None)
+    outcome = execute_directory_move(hub, plan)
+
+    assert outcome.status == STATUS_MOVED, outcome.detail
+    other_case_moved = (destination_id, os.path.join("sd_xl", "dana.safetensors"))
+    if PATHS_FOLD_CASE:
+        assert {entry.relpath for entry in plan.catalogued} == {below, other_case}
+        other_case_now = other_case_moved
+    else:
+        assert {entry.relpath for entry in plan.catalogued} == {below}
+        other_case_now = (source_id, other_case)
+    assert set(locations(hub)) == {
+        (destination_id, below),
+        *((source_id, relpath) for relpath in siblings),
+        other_case_now,
+    }
+    assert (destination_dir / below).is_file()
+    for relpath in siblings:
+        assert (source_dir / relpath).is_file()

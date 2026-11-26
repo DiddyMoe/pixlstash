@@ -18,7 +18,9 @@ import time
 
 import pytest
 
+from pixlstash.routes import folder_structure
 from pixlstash.server import Server
+from pixlstash.services import folder_structure_commit_service as commit_service
 from tests.authz_guard import assert_real_route, no_spa_fallback  # noqa: F401
 
 API = "/api/v1"
@@ -69,8 +71,21 @@ def _snapshot(root: str) -> dict:
 def owner_env():
     tmp = tempfile.TemporaryDirectory()
     cfg = os.path.join(tmp.name, "server-config.json")
+    # `daily_snapshots` off: every library this module serves (the first
+    # import's included, whose vault is built from this config) would take a
+    # DAILY snapshot at once, writing and deleting
+    # `snapshots/.tmp/.../snapshot.sqlite-journal` inside the folder `_snapshot`
+    # hashes, so the walk listed a file that open() then found gone (CI run
+    # 45388205378). No test here is about snapshots.
     with open(cfg, "w") as fh:
-        json.dump({"port": 8000, "trusted_proxies": ["testclient"]}, fh)
+        json.dump(
+            {
+                "port": 8000,
+                "trusted_proxies": ["testclient"],
+                "daily_snapshots": False,
+            },
+            fh,
+        )
     server = Server(cfg)
     server.__enter__()
     try:
@@ -252,17 +267,23 @@ def test_a_malformed_commit_does_not_burn_the_read_s_one_commit(owner_env):
         _COMMIT,
         json={
             "task_id": task_id,
-            "assignments": [{"relative_path": "", "kind": "nope"}],
+            "assignments": [{"relative_path": "", "kind": "example-nope"}],
         },
     )
     assert bad.status_code == 400, bad.text
+    # The refusal names the row and the server's vocabulary; the caller's
+    # value is not echoed.
+    assert bad.json()["detail"] == (
+        "assignments[0].kind must be one of ['person', 'project', 'set', 'tag']"
+    )
+    assert "example-nope" not in bad.text
 
     good = owner.post(_COMMIT, json={"task_id": task_id, "assignments": []})
     assert good.status_code == 200, good.text
     _drain_commit(owner, good.json()["task_id"], timeout_s=60.0)
 
 
-def test_committing_a_path_already_registered_and_scanned_is_refused(owner_env):
+def test_committing_a_path_already_registered_and_scanned_is_refused(owner_env, caplog):
     """Backend §24.2's reuse-vs-refuse rule: a folder that already completed a scan
     (an unrelated reference folder, or an earlier commit of the same path
     from a since-cancelled read run again) must not be silently reused -
@@ -294,7 +315,12 @@ def test_committing_a_path_already_registered_and_scanned_is_refused(owner_env):
     assert commit_started.status_code == 200, commit_started.text
     body = _drain_commit(owner, commit_started.json()["task_id"], timeout_s=60.0)
     assert body["status"] == "failed", body
-    assert "already a reference folder" in body["error"]
+    # The refusal names the folder, so the client gets the fixed sentence and
+    # the log gets the reason.
+    assert body["error"] == folder_structure.COMMIT_REFUSED_MESSAGE, body
+    assert any(
+        "already a reference folder" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_a_second_commit_while_one_runs_is_a_409(owner_env, monkeypatch):
@@ -590,6 +616,41 @@ def test_captions_are_refused_in_reference_mode_and_validated(owner_env):
     ):
         with pytest.raises(commit_service.CommitError):
             commit_service.parse_captions(bad)
+
+    # A 400 names the row and the server's vocabulary, never the caller's
+    # suffix, kind or folder.
+    for field, rows, detail in (
+        (
+            "captions",
+            [
+                {"suffix": ".example-cap", "kind": "tags"},
+                {"suffix": ".EXAMPLE-CAP", "kind": "tags"},
+            ],
+            "captions[1] repeats an earlier row's suffix",
+        ),
+        (
+            "captions",
+            [{"suffix": ".txt", "kind": "example-kind"}],
+            "captions[0].kind must be one of ['description', 'ignore', 'tags']",
+        ),
+        (
+            "assignments",
+            [
+                {"relative_path": "example-folder", "kind": "tag"},
+                {"relative_path": "/example-folder/", "kind": "tag"},
+            ],
+            "assignments[1] repeats an earlier row's folder",
+        ),
+    ):
+        body = {"task_id": read_task_id, "mode": "local_import", field: rows}
+        if field == "captions":
+            body["assignments"] = []
+        refused = owner.post(_COMMIT, json=body)
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["detail"] == detail, refused.text
+        for row in rows:
+            for value in row.values():
+                assert value.strip("/") not in refused.text, (value, refused.text)
     assert commit_service.parse_captions(None) is None
     assert commit_service.parse_captions([]) == []
 
@@ -710,7 +771,7 @@ def test_local_import_skips_the_librarys_own_folders(owner_env):
     ]
 
 
-def test_local_import_mode_refuses_a_root_outside_image_root(owner_env):
+def test_local_import_mode_refuses_a_root_outside_image_root(owner_env, caplog):
     """local_import must never be reachable against an external folder - that
     is exactly what mode="reference" (register_reference_folder) is for, and
     routes.reference_folders already refuses the opposite direction (a
@@ -731,7 +792,54 @@ def test_local_import_mode_refuses_a_root_outside_image_root(owner_env):
     assert commit_started.status_code == 200, commit_started.text
     body = _drain_commit(owner, commit_started.json()["task_id"], timeout_s=30.0)
     assert body["status"] == "failed", body
-    assert "library's own folder" in body["error"], body
+    # The refusal names the root and the library's image_root: logged, and
+    # the client gets the fixed sentence.
+    assert body["error"] == folder_structure.COMMIT_REFUSED_MESSAGE, body
+    assert any(
+        "library's own folder" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_a_read_or_commit_that_raises_reports_a_fixed_sentence(
+    owner_env, monkeypatch, caplog
+):
+    """The task status a client polls is served to it, so an unexpected
+    exception's text (which can name a server path) stays in the log."""
+    cause = "example-cause /example/server/path"
+    owner = owner_env["owner"]
+    root = os.path.join(owner_env["tmp"], "a-read-that-raises")
+    _make_tree(root, {"": ["a.jpg"]})
+
+    def raising_run(self):
+        raise RuntimeError(cause)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(folder_structure.FolderStructureRead, "run", raising_run)
+        started = owner.post(_READ, json={"path": root})
+        assert started.status_code == 200, started.text
+        body = _drain_read(owner, started.json()["task_id"])
+    assert body["status"] == "failed", body
+    assert body["error"] == folder_structure.READ_FAILED_MESSAGE, body
+    assert any(cause in record.getMessage() for record in caplog.records)
+
+    caplog.clear()
+    started = owner.post(_READ, json={"path": root})
+    task_id = started.json()["task_id"]
+    _drain_read(owner, task_id)
+
+    def raising_validate(server, root_path):
+        raise RuntimeError(cause)
+
+    monkeypatch.setattr(commit_service, "validate_local_import_root", raising_validate)
+    commit_started = owner.post(
+        _COMMIT,
+        json={"task_id": task_id, "mode": "local_import", "assignments": []},
+    )
+    assert commit_started.status_code == 200, commit_started.text
+    body = _drain_commit(owner, commit_started.json()["task_id"], timeout_s=30.0)
+    assert body["status"] == "failed", body
+    assert body["error"] == folder_structure.COMMIT_FAILED_MESSAGE, body
+    assert any(cause in record.getMessage() for record in caplog.records)
 
 
 def test_reference_mode_refuses_the_librarys_own_folder(owner_env):
@@ -1536,16 +1644,17 @@ def test_a_switch_refused_by_a_running_commit_says_why(owner_env):
         }
     try:
         assert (
-            server.library_switch._what_is_holding_the_library()
+            server.library_switch.describe_library_holders()
             == "a folder mapping is still being organised"
         )
     finally:
         with server.folder_structure_commit_lock:
             server.folder_structure_commit = None
 
-    # With nothing running there is nothing to name, and the caller falls back
-    # to the coordinator's own words rather than inventing a reason.
-    assert server.library_switch._what_is_holding_the_library() is None
+    # With nothing running there is nothing to name, so the caller answers a
+    # fixed sentence and logs the coordinator's own words rather than inventing
+    # a reason.
+    assert server.library_switch.describe_library_holders() is None
 
 
 def _insert_reference_folder(server, folder: str, *, last_scanned):
@@ -1938,6 +2047,29 @@ def test_a_finished_first_import_makes_the_folder_a_library(owner_env, first_imp
     assert server.vault.image_root == folder, "the session serves the new library"
     after = _snapshot(folder)
     assert {rel: after.get(rel) for rel in before} == before, "a picture changed"
+
+
+def test_a_first_import_that_cannot_be_promoted_reports_a_fixed_sentence(
+    owner_env, first_import, monkeypatch, caplog
+):
+    """The promotion's exception can name the library's folders, so the status a
+    client polls carries the server's sentence and the log carries the cause."""
+    cause = "example-cause /example/library/path"
+    owner, server = owner_env["owner"], owner_env["server"]
+    library, _ = first_import
+
+    def failing_promotion(pending):
+        raise RuntimeError(cause)
+
+    monkeypatch.setattr(
+        server.library_switch, "promote_pending_vault", failing_promotion
+    )
+
+    body = _settled_status(owner, _commit_first_import(owner, library.path))
+
+    assert body["status"] == "failed", body
+    assert body["error"] == folder_structure.FIRST_IMPORT_UNFINISHED_MESSAGE, body
+    assert any(cause in record.getMessage() for record in caplog.records)
 
 
 def test_an_abandoned_first_import_gives_the_folder_back(

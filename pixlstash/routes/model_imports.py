@@ -51,9 +51,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from send2trash import TrashPermissionError, send2trash
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.hub.training_runs import busy_runs
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.model_folder_scanner import STATE_PRESENT
+from pixlstash.routes.model_folders import move_refusal_error
 from pixlstash.services.model_mover import SHELF_IO_LOCK, MoveRefused, samples_relpath
 from pixlstash.services.run_importer import RunImporter
 from pixlstash.training.local_ai_toolkit import LocalAiToolkit
@@ -64,12 +66,18 @@ from pixlstash.utils.aitoolkit_run import (
     read_run,
 )
 from pixlstash.utils.known_base_models import training_base_tile
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.system_utils import TRASH_NAME
 
 logger = get_logger(__name__)
 
 SOURCE_FOLDER_KIND = "source"
+
+# The refusals that name a run. The caller already holds the name it sent, so a
+# detail never repeats it: a 4xx says what was wrong, not what was typed.
+NOT_A_RUN_MESSAGE = "That name is not a run inside that folder."
+NO_SUCH_RUN_MESSAGE = "There is no run of that name in that folder."
 
 # What a run's ``samples/`` directory may be served as. An allowlist rather than
 # ``mimetypes.guess_type``: the directory is on the owner's disk and anything
@@ -190,7 +198,7 @@ class ImportRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    source_folder_id: int = Field(
+    source_folder_id: SqliteInt = Field(
         description="A registered `source` folder - an ai-toolkit output root."
     )
     run_name: str = Field(
@@ -200,10 +208,10 @@ class ImportRequest(BaseModel):
             "anything that resolves outside."
         )
     )
-    destination_folder_id: int = Field(
+    destination_folder_id: SqliteInt = Field(
         description="A registered folder the shelf catalogues. Never a `source` one."
     )
-    steps: Optional[list[Optional[int]]] = Field(
+    steps: Optional[list[Optional[SqliteInt]]] = Field(
         default=None,
         description=(
             "Which checkpoints to take, by step, with `null` for the bare final. "
@@ -434,7 +442,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=RunListResponse,
     )
-    def list_runs(folder_id: int, request: Request):
+    def list_runs(folder_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         folder = _source_folder(folder_id)
         try:
@@ -445,10 +453,16 @@ def create_router(server) -> APIRouter:
                 folder["path"],
                 folder_id,
                 exc,
+                exc_info=True,
             )
+            # The registered path is the owner's; the OS text is not composed
+            # here, so it stays in the log.
             raise HTTPException(
                 status_code=409,
-                detail=f"Could not read {folder['path']}: {exc}",
+                detail=(
+                    f"Could not read {folder['path']}. Check that the folder is "
+                    "still there and PixlStash can open it."
+                ),
             ) from exc
         return RunListResponse(runs=[_to_run_response(run) for run in runs])
 
@@ -466,14 +480,14 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=TrashRunResponse,
     )
-    def trash_run(folder_id: int, run_name: str, request: Request):
+    def trash_run(folder_id: SqliteInt, run_name: str, request: Request):
         server.auth.ensure_secure_when_required(request)
         folder = _source_folder(folder_id)
         # One name, joined and contained, as the import takes it.
         if run_name in ("", ".", "..") or "/" in run_name or "\\" in run_name:
             raise HTTPException(
                 status_code=400,
-                detail=f"{run_name!r} is not a run inside that folder.",
+                detail=NOT_A_RUN_MESSAGE,
             )
         joined = os.path.join(folder["path"], run_name)
         try:
@@ -488,19 +502,19 @@ def create_router(server) -> APIRouter:
             )
             raise HTTPException(
                 status_code=400,
-                detail=f"{run_name!r} is not a run inside that folder.",
+                detail=NOT_A_RUN_MESSAGE,
             ) from exc
-        if os.path.islink(joined):
-            # The trash would take the link and the listing reads its target:
-            # what the card showed is not what would go.
+        if is_link_or_missing(joined):
+            # ``run_dir`` is the resolved path, so the trash would take the
+            # target the link resolves to, which the card does not name.
             raise HTTPException(
                 status_code=409,
-                detail=f"{run_name!r} is a link, so PixlStash leaves it alone.",
+                detail="That run is a link, so PixlStash leaves it alone.",
             )
         # Only what the listing would show as a run: the output root may hold
         # other folders, and those are not this route's to remove.
         if not os.path.isdir(run_dir) or not read_run(run_dir).checkpoints:
-            raise HTTPException(status_code=404, detail=f"No run named {run_name!r}.")
+            raise HTTPException(status_code=404, detail=NO_SUCH_RUN_MESSAGE)
         for job in busy_runs(server.hub):
             if not job.get("training_folder"):
                 continue
@@ -539,7 +553,7 @@ def create_router(server) -> APIRouter:
                 status_code=409,
                 detail=(
                     f"This drive has no {TRASH_NAME} PixlStash can use, so "
-                    f"{run_name!r} was left where it is."
+                    "the run was left where it is."
                 ),
             ) from exc
         except OSError as exc:
@@ -552,8 +566,7 @@ def create_router(server) -> APIRouter:
                 exc_info=True,
             )
             raise HTTPException(
-                status_code=500,
-                detail=f"Could not remove {run_name!r}: {exc.strerror or exc}",
+                status_code=500, detail="Could not move the run to the trash."
             ) from exc
         finally:
             SHELF_IO_LOCK.release()
@@ -584,7 +597,9 @@ def create_router(server) -> APIRouter:
         response_class=FileResponse,
         responses={200: {"content": {"image/*": {}, "video/mp4": {}}}},
     )
-    def get_run_sample(folder_id: int, run_name: str, filename: str, request: Request):
+    def get_run_sample(
+        folder_id: SqliteInt, run_name: str, filename: str, request: Request
+    ):
         server.auth.ensure_secure_when_required(request)
         folder = _source_folder(folder_id)
         try:
@@ -677,7 +692,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=ModelSamplesResponse,
     )
-    def list_model_samples(model_id: int, request: Request):
+    def list_model_samples(model_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         location = _samples_location(model_id)
         if location is None:
@@ -719,7 +734,7 @@ def create_router(server) -> APIRouter:
         response_class=FileResponse,
         responses={200: {"content": {"image/*": {}, "video/mp4": {}}}},
     )
-    def get_model_sample(model_id: int, filename: str, request: Request):
+    def get_model_sample(model_id: SqliteInt, filename: str, request: Request):
         server.auth.ensure_secure_when_required(request)
         location = _samples_location(model_id)
         if location is None:
@@ -785,7 +800,7 @@ def create_router(server) -> APIRouter:
             )
             raise HTTPException(
                 status_code=400,
-                detail=f"{payload.run_name!r} is not a run inside that folder.",
+                detail=NOT_A_RUN_MESSAGE,
             ) from exc
 
         delete_source = bool(folder["delete_after_import"])
@@ -810,11 +825,9 @@ def create_router(server) -> APIRouter:
                 delete_source=delete_source,
             )
         except NotADirectoryError as exc:
-            raise HTTPException(
-                status_code=404, detail=f"No run named {payload.run_name!r}."
-            ) from exc
+            raise HTTPException(status_code=404, detail=NO_SUCH_RUN_MESSAGE) from exc
         except MoveRefused as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            raise move_refusal_error(exc, "Nothing was imported.") from exc
         finally:
             SHELF_IO_LOCK.release()
 

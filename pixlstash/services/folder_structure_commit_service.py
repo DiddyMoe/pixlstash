@@ -69,6 +69,7 @@ from pixlstash.db_models.folder_mapping_commit import (
     STATE_SUPERSEDED,
 )
 from pixlstash.db_models.picture import Picture
+from pixlstash.db_models.picture_pending_person import PicturePendingPerson
 from pixlstash.db_models.picture_project import PictureProjectMember
 from pixlstash.db_models.picture_set import PictureSet, PictureSetMember
 from pixlstash.db_models.project import Project
@@ -101,6 +102,7 @@ from pixlstash.utils.library_roots import (
     holding_folder_overlap_lock,
     refuse_overlapping_folder,
 )
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import path_is_within
 from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
@@ -141,7 +143,14 @@ CAPTION_KINDS = frozenset({SIDECAR_TYPE_TAGS, SIDECAR_TYPE_DESCRIPTION, CAPTION_
 
 
 class CommitError(Exception):
-    """A refusal the route turns into an HTTP error."""
+    """A refusal the route turns into an HTTP error.
+
+    The parse refusals (`parse_assignments`, `parse_captions`) are a 400's
+    detail, so they name a row by its index and the vocabulary the server
+    owns, never the caller's own value. The run-time ones name server paths
+    and go only to the log: the status a client polls carries a fixed
+    sentence instead.
+    """
 
 
 class CommitStopped(Exception):
@@ -232,10 +241,10 @@ def parse_captions(raw) -> Optional[list[CaptionPattern]]:
                 f"captions[{index}].suffix must be a bare filename fragment"
             )
         if suffix.lower() in seen:
-            raise CommitError(f"captions[{index}] repeats suffix {suffix!r}")
+            raise CommitError(f"captions[{index}] repeats an earlier row's suffix")
         if kind not in CAPTION_KINDS:
             raise CommitError(
-                f"captions[{index}].kind must be one of {sorted(CAPTION_KINDS)}, got {kind!r}"
+                f"captions[{index}].kind must be one of {sorted(CAPTION_KINDS)}"
             )
         seen.add(suffix.lower())
         parsed.append(CaptionPattern(suffix, kind))
@@ -297,11 +306,10 @@ def parse_assignments(raw: list) -> list[Assignment]:
         # separators, no leading/trailing slash, "" for the root.
         relative_path = relative_path.strip("/")
         if relative_path in seen:
-            raise CommitError(f"assignments[{index}] repeats folder {relative_path!r}")
+            raise CommitError(f"assignments[{index}] repeats an earlier row's folder")
         if kind not in _ACCEPTED_KINDS:
             raise CommitError(
-                f"assignments[{index}].kind must be one of "
-                f"{sorted(_ACCEPTED_KINDS)}, got {kind!r}"
+                f"assignments[{index}].kind must be one of {sorted(_ACCEPTED_KINDS)}"
             )
         match_id = row.get("match_id")
         if match_id is not None:
@@ -756,7 +764,9 @@ def _build_managed_picture(
         try:
             with Image.open(abs_path) as img:
                 img_format = img.format or "PNG"
-                width, height = img.size
+                # As stored, not turned: what a JPEG records, and what the
+                # frontend swaps for orientations 5-8.
+                width, height = ImageUtils.stored_size(img)
                 rendered = ImageUtils.render_thumbnail(img)
                 if rendered is not None:
                     thumbnail_bytes, bmp_w, bmp_h, crop = rendered
@@ -862,6 +872,7 @@ def local_import_pictures(
             for name in dirnames
             if not is_hidden_entry(name)
             and os.path.realpath(os.path.join(dirpath, name)) not in own
+            and not is_link_or_missing(os.path.join(dirpath, name))
         ]
         for name in filenames:
             if not is_hidden_entry(name) and is_supported_media_file(name):
@@ -1399,7 +1410,7 @@ def apply_mapping(
         return result
 
     result = server.vault.db.run_task(commit, priority=DBPriority.IMMEDIATE)
-    resolve_pending_people_with_faces(server, linked_ids)
+    resolve_pending_people_with_faces(server.vault, linked_ids, origin="Folder mapping")
     return result
 
 
@@ -1438,51 +1449,134 @@ def apply_local_mapping(
         return result
 
     result = server.vault.db.run_task(commit, priority=DBPriority.IMMEDIATE)
-    resolve_pending_people_with_faces(server, picture_ids)
+    resolve_pending_people_with_faces(
+        server.vault, picture_ids, origin="Folder mapping"
+    )
     return result
 
 
-def resolve_pending_people_with_faces(server, picture_ids: list[int]) -> int:
-    """Attach the folder-derived person to pictures whose faces already exist.
+def resolve_pending_people_with_faces(
+    vault, picture_ids: list[int], *, origin: str
+) -> int:
+    """Attach a pending person to those of *picture_ids* whose faces already exist.
 
-    `_link_pictures` defers a person assignment into
-    `Picture.pending_character_id`, which `FaceExtractionTask`'s completion
-    hook resolves - but only for the pictures it just extracted. Since the
-    workers start while the import is still indexing, extraction routinely
-    finishes BEFORE the mapping runs, and a picture in that order was never
-    revisited: pending set, faces present, nobody to join them. This runs the
-    same resolver now for exactly those pictures. Pictures whose extraction
-    has not run are left alone on purpose: the resolver treats "no face rows"
-    as "extraction found nothing" and would discard the pending id.
+    A pending person (`Picture.pending_character_id` or a
+    `PicturePendingPerson` row) waits for face extraction, whose completion
+    hook resolves it - but only for the pictures it just extracted. A write
+    that sets one on a picture whose faces are ALREADY there is never
+    revisited by extraction, so its committing wrapper calls this after the
+    write has committed and off the DB writer (inside the write's own session
+    it would wait on the writer it holds). The writers that need it: the
+    folder mapping's `_link_pictures` (extraction routinely finishes before
+    the mapping runs), a duplicate merge's metadata union, and an undo or redo
+    that replays a picture's pending person.
+
+    Only pictures that have face rows are handed on. A picture whose
+    extraction has not run is left alone on purpose: the resolver treats "no
+    face rows" as "extraction found nothing" and would discard the pending id.
+
+    The caller's write has already committed, so a failure here is logged with
+    *origin* and the pictures and never raised: the write must not read as
+    failed, and the start-up pass (`reconcile_pending_people_with_faces`)
+    resolves whatever this left.
+
+    Args:
+        vault: The vault whose write committed.
+        picture_ids: The pictures that write touched.
+        origin: What committed, for the log ("folder mapping", "duplicate
+            merge", "undo/redo", ...).
 
     Returns:
-        How many pictures were handed to the resolver.
+        How many pictures were handed to the resolver (0 after a failure).
     """
     if not picture_ids:
         return 0
 
     def fetch(session: Session) -> list[int]:
-        found: list[int] = []
+        found: set[int] = set()
         # Chunked: SQLite bounds the number of bound parameters per statement.
-        extracted = select(Face.id).where(Face.picture_id == Picture.id).exists()
         for chunk in chunked(picture_ids):
-            found.extend(
-                session.exec(
-                    select(Picture.id).where(
-                        Picture.id.in_(list(chunk)),
-                        Picture.pending_character_id.is_not(None),
-                        extracted,
-                    )
-                ).all()
-            )
-        return found
+            found.update(_pending_with_faces(session, list(chunk)))
+        return sorted(found)
 
-    ready = server.vault.db.run_task(fetch)
+    try:
+        ready = vault.db.run_task(fetch)
+        if ready:
+            logger.info(
+                "%s: %d picture(s) had faces before their person was "
+                "assigned (pictures %s); assigning now",
+                origin,
+                len(ready),
+                ready[:20],
+            )
+            _resolve_pending(vault, ready)
+    except Exception:
+        logger.exception(
+            "%s committed, but resolving the pending people of %d picture(s) "
+            "(first %s) failed; the next start-up resolves them",
+            origin,
+            len(picture_ids),
+            sorted(picture_ids)[:20],
+        )
+        return 0
+    return len(ready)
+
+
+def reconcile_pending_people_with_faces(vault) -> int:
+    """Resolve every pending person whose picture already has face rows.
+
+    Call once at start-up, before the workers start. Face extraction writes a
+    picture's face rows and matches its pending people in two separate
+    transactions (`Vault._after_face_writes_land`), so a crash or kill between
+    them, a stop that gave up waiting for the match, or a failed face write
+    on a picture that already had faces leaves the person pending on a
+    picture the face finder never offers again, because it has faces. The
+    resolver is the one face extraction runs; a picture with only the
+    no-face marker row gets its pending person discarded, which is what
+    extraction would have done.
+
+    Returns:
+        How many pictures were handed to the resolver.
+    """
+    ready = vault.db.run_task(lambda session: _pending_with_faces(session, None))
     if ready:
         logger.info(
-            "Folder mapping: %d picture(s) had faces before their person was "
-            "assigned; assigning now",
+            "Start-up: %d picture(s) had faces but a person still pending "
+            "(pictures %s); assigning now",
             len(ready),
+            ready[:20],
         )
-        server.vault._process_pending_character_assignments(ready)
+        _resolve_pending(vault, ready)
     return len(ready)
+
+
+def _pending_with_faces(
+    session: Session, picture_ids: Optional[list[int]]
+) -> list[int]:
+    """Pictures with a pending person (scalar or `PicturePendingPerson`) and a face row.
+
+    With *picture_ids* None, the whole library; otherwise only those ids,
+    which the caller keeps within SQLite's bound-parameter limit.
+    """
+    has_face_pic = select(Face.id).where(Face.picture_id == Picture.id).exists()
+    has_face_row = (
+        select(Face.id)
+        .where(Face.picture_id == PicturePendingPerson.picture_id)
+        .exists()
+    )
+    scalar = select(Picture.id).where(
+        Picture.pending_character_id.is_not(None), has_face_pic
+    )
+    people = select(PicturePendingPerson.picture_id).where(has_face_row)
+    if picture_ids is not None:
+        scalar = scalar.where(Picture.id.in_(picture_ids))
+        people = people.where(PicturePendingPerson.picture_id.in_(picture_ids))
+    found = set(session.exec(scalar).all())
+    found.update(session.exec(people).all())
+    return sorted(found)
+
+
+def _resolve_pending(vault, picture_ids: list[int]) -> None:
+    """Run the face-extraction resolver over *picture_ids*, one bounded chunk at a time."""
+    for chunk in chunked(picture_ids):
+        vault._process_pending_character_assignments(list(chunk), wait=True)

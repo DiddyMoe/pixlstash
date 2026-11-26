@@ -50,9 +50,18 @@ from pixlstash.image_plugins.service import (
     import_derived_outputs,
 )
 from pixlstash.pixl_logging import get_logger
+from pixlstash.services.library_generation_coordinator import (
+    LibraryNotReadyError,
+    SwitchState,
+)
 from pixlstash.utils.atomic_write import write_json_atomic
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.links import is_link_entry
 from pixlstash.utils.media_files import SUPPORTED_IMAGE_EXTS, is_hidden_entry
+from pixlstash.utils.service.library_lease import (
+    UNAVAILABLE_RETRIES,
+    PinnedVaultServer,
+)
 from pixlstash.utils.service.share_copies import _is_batch_name, make_share_copies
 
 logger = get_logger(__name__)
@@ -187,17 +196,61 @@ def changed_file(path: str, seen_sha: str | None) -> tuple[bytes, str, str] | No
     return data, _FORMAT_EXT.get(fmt, f".{fmt.lower()}" if fmt else ".png"), sha
 
 
+class EditSessionDeferred(Exception):
+    """Library admission refused the pass a lease, so the session waits.
+
+    Raised by :func:`process_session`; nothing was read or written.
+    :class:`EditCopyWatcher` reads the session again one debounce later: for
+    as long as a switch or a restore lasts (SWITCHING), and at most
+    ``UNAVAILABLE_RETRIES`` times in a row while no coherent library is open
+    (UNAVAILABLE). After that the next save or start reads it.
+
+    Attributes:
+        state: The ``SwitchState`` admission refused the lease in.
+    """
+
+    def __init__(self, message: str, state: SwitchState):
+        super().__init__(message)
+        self.state = state
+
+
 def process_session(server, session_dir: str) -> list[int]:
-    """Import every changed image in *session_dir*; the new picture ids."""
+    """Import every changed image in *session_dir*; the new picture ids.
+
+    The pass holds a library read lease from ``server.library_coordinator``,
+    as a request does, so a library switch or a full restore waits for it to
+    finish and it never writes into a library file that replaced the one it
+    started on.
+
+    Raises:
+        EditSessionDeferred: Admission refused the lease; try again later.
+    """
+    coordinator = server.library_coordinator
+    try:
+        lease = coordinator.acquire_read_or_raise()
+    except LibraryNotReadyError as exc:
+        if exc.state is SwitchState.SWITCHING:
+            why = "the library is being switched or restored."
+        else:
+            why = "no library is open."
+        raise EditSessionDeferred(
+            f"Edit copy session {session_dir} waits: {why}", exc.state
+        ) from exc
+    try:
+        return _process_session_leased(server, lease.vault, session_dir)
+    finally:
+        coordinator.release_read(lease)
+
+
+def _process_session_leased(server, vault, session_dir: str) -> list[int]:
+    """:func:`process_session`'s pass, with *vault* the leased vault."""
     with _IMPORT_LOCK:
         session = read_session(session_dir)
         if session is None:
             return []
-        # One vault for the whole pass, checked to be the session's library:
-        # a library switch mid-pass then fails the write on the closed vault
-        # (logged, retried on the next save) instead of importing into the
-        # library that replaced it.
-        vault = server.vault
+        # One vault for the whole pass, the leased one, checked to be the
+        # session's library: a switch or restore waits for the lease, so the
+        # pass never writes into the library that replaced it.
         library_uuid = session.get("library_uuid")
         active = vault.library_uuid
         if library_uuid and active and library_uuid != active:
@@ -223,7 +276,7 @@ def process_session(server, session_dir: str) -> list[int]:
                 continue
             data, ext, sha = found
             created += _import_edit(
-                _PinnedVaultServer(server, vault), session, data, ext, name
+                PinnedVaultServer(server, vault), session, data, ext, name
             )
             session["seen"][name] = sha
             write_session(session_dir, session)
@@ -253,7 +306,7 @@ def sweep_edit_sessions(
     removed = 0
     for entry in entries:
         try:
-            if entry.is_symlink() or not entry.is_dir():
+            if is_link_entry(entry) or not entry.is_dir():
                 continue
             newest = max(
                 [entry.stat().st_mtime]
@@ -269,17 +322,6 @@ def sweep_edit_sessions(
         except OSError as exc:
             logger.warning("Could not sweep edit copy session %s: %s", entry.path, exc)
     return removed
-
-
-class _PinnedVaultServer:
-    """The server, with ``vault`` fixed to one vault across a library switch."""
-
-    def __init__(self, server, vault):
-        self._server = server
-        self.vault = vault
-
-    def __getattr__(self, name):
-        return getattr(self._server, name)
 
 
 def reconcile_all(server, root: str) -> int:
@@ -298,8 +340,11 @@ def reconcile_all(server, root: str) -> int:
     imported = 0
     for entry in entries:
         try:
-            if entry.is_dir() and not entry.is_symlink():
+            if entry.is_dir() and not is_link_entry(entry):
                 imported += len(process_session(server, entry.path))
+        except EditSessionDeferred as exc:
+            # Left in place: the next save into it, or the next start, retries.
+            logger.info("%s It is imported at the next save or start.", exc)
         except Exception as exc:
             # Left in place: the next save into it, or the next start, retries.
             logger.error(
@@ -426,6 +471,8 @@ class EditCopyWatcher:
         # callback starts after it (the vault closes next).
         self._run_lock = threading.Lock()
         self._stopped = False
+        # Per session: reads deferred in a row while no library was open.
+        self._unavailable_tries: dict[str, int] = {}
 
     def start(self) -> None:
         """Watch the root, creating it when missing."""
@@ -467,6 +514,21 @@ class EditCopyWatcher:
             with self._run_lock:
                 if not self._stopped and os.path.isdir(path):
                     self._on_settled(path)
+        except EditSessionDeferred as exc:
+            # A save during a switch or restore is read once it is over. After
+            # stop() the new timer finds the watcher stopped and does nothing.
+            if not self._may_read_again(session, exc.state):
+                logger.warning(
+                    "%s Gave up after %d reads; the next save into it, or the "
+                    "next start, reads it.",
+                    exc,
+                    UNAVAILABLE_RETRIES + 1,
+                )
+                return
+            logger.info("%s Reading it again in %.0f s.", exc, self._debounce_s)
+            if not self._stopped:
+                self._schedule(session)
+            return
         except Exception as exc:
             # A raising callback can deafen every watchdog watcher (the pin
             # note in pyproject.toml); the next save tries again.
@@ -477,3 +539,17 @@ class EditCopyWatcher:
                 exc,
                 exc_info=True,
             )
+        with self._lock:
+            self._unavailable_tries.pop(session, None)
+
+    def _may_read_again(self, session: str, state: SwitchState) -> bool:
+        """Count one deferred read of *session*; False once it is out of tries."""
+        if state is SwitchState.SWITCHING:
+            return True
+        with self._lock:
+            tries = self._unavailable_tries.get(session, 0) + 1
+            if tries > UNAVAILABLE_RETRIES:
+                self._unavailable_tries.pop(session, None)
+                return False
+            self._unavailable_tries[session] = tries
+            return True

@@ -69,6 +69,7 @@ from pixlstash.utils.caption_file_utils import (
     sniff_caption,
 )
 from pixlstash.utils.library_layout import Facet
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.media_files import (
     SUPPORTED_IMAGE_EXTS,
     is_hidden_entry,
@@ -498,6 +499,7 @@ class FolderStructureRead:
         ):
             self._checkpoint()
             kept = []
+            links = 0
             for name in sorted(dirnames):
                 if is_hidden_entry(name):
                     # `.pixlstash` sidecars and a vault's own thumbnail cache.
@@ -526,6 +528,14 @@ class FolderStructureRead:
                     )
                     self._skipped_restricted += 1
                     continue
+                if is_link_or_missing(child):
+                    # Listed but never descended, which is what
+                    # followlinks=False does for a directory symlink. Spelled
+                    # out because os.walk descends a Windows junction, a loop
+                    # included. Still counted as a child below, as a symlink
+                    # always was.
+                    links += 1
+                    continue
                 kept.append(name)
             dirnames[:] = kept
             if len(self._folders) >= MAX_FOLDERS:
@@ -545,7 +555,7 @@ class FolderStructureRead:
                 abs_path=dirpath,
                 rel_path=rel,
                 parent_index=by_path.get(parent_path) if rel else None,
-                child_count=len(dirnames),
+                child_count=len(dirnames) + links,
             )
             # `is_supported_media_file` drops our own `_thumb.webp` files, which
             # a library indexed before #1164 is full of, sitting beside every

@@ -73,7 +73,6 @@ import hashlib
 import os
 import shutil
 import sqlite3
-import stat
 from typing import Optional, Union
 
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -81,6 +80,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from send2trash import TrashPermissionError, send2trash
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.comfyui_recipe_service import (
     advertised_model_names,
@@ -104,6 +104,9 @@ from pixlstash.services.model_folder_scanner import (
     TAKEN_FROM_KINDS,
     ModelFolderScanner,
 )
+from pixlstash.routes.comfyui import _comfyui_url
+from pixlstash.routes.model_folders import move_refusal_error, reserve_while_moving
+from pixlstash.services.model_downloads import release_folder
 from pixlstash.services.model_mover import (
     PARTIAL_SUFFIX,
     SHELF_IO_LOCK,
@@ -131,6 +134,7 @@ from pixlstash.services.trash_undo import (
 )
 from pixlstash.utils.adapter_header import FILE_ENGINE
 from pixlstash.utils.aitoolkit_run import is_sample_filename
+from pixlstash.utils.links import is_link, is_link_or_missing
 from pixlstash.utils.path_utils import path_is_within, resolve_path_within
 from pixlstash.utils.system_utils import TRASH_NAME
 from pixlstash.utils.trash_restore import NotInTrash, fingerprint, restore_from_trash
@@ -165,7 +169,7 @@ class AddModelFileRequest(BaseModel):
             "moved: the original stays where it is."
         )
     )
-    destination_folder_id: Optional[int] = Field(
+    destination_folder_id: Optional[SqliteInt] = Field(
         default=None,
         description=(
             "A registered folder the shelf catalogues. Omit for the default "
@@ -191,7 +195,7 @@ class DeleteModelsRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The models to delete, by hub `model.id`. Every copy goes.",
@@ -249,8 +253,8 @@ class KeepModelCopy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model_id: int = Field(description="Hub `model.id` the copies belong to.")
-    folder_id: int = Field(description="`model_folder.id` of the copy to KEEP.")
+    model_id: SqliteInt = Field(description="Hub `model.id` the copies belong to.")
+    folder_id: SqliteInt = Field(description="`model_folder.id` of the copy to KEEP.")
     relpath: str = Field(
         description="That copy's path relative to its folder, as the shelf reports it."
     )
@@ -532,25 +536,16 @@ class RemoveFolderResponse(BaseModel):
     trash_name: str = Field(default=TRASH_NAME)
 
 
-# The reparse tag of a Windows junction. ``stat`` names it only on Windows.
-_JUNCTION_TAG = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
-
-
 def _is_link(path: str) -> bool:
     """A symbolic link, or a Windows junction, which ``islink`` does not see.
 
-    The junction test is what ``os.path.isjunction`` does on 3.12, spelled out
-    so 3.11 gets it too: without it a junction is walked into, and one pointing
-    at its own ancestor never ends. Only the junction tag counts, not every
-    reparse point: a cloud placeholder directory is one too, and pruning it
-    would hide files the removal still takes.
+    Without the junction test a junction is walked into, and one pointing at
+    its own ancestor never ends (:mod:`pixlstash.utils.links`).
 
     Raises:
         OSError: *path* cannot be read, which the caller answers as a refusal.
     """
-    if os.path.islink(path):
-        return True
-    return getattr(os.lstat(path), "st_reparse_tag", 0) == _JUNCTION_TAG
+    return is_link(path)
 
 
 def _raise_walk_error(error: OSError) -> None:
@@ -903,7 +898,7 @@ def _warn_about_samples(model_path: str) -> None:
     ago without this line.
     """
     directory = samples_relpath(model_path)
-    if os.path.isdir(directory) and not os.path.islink(directory):
+    if os.path.isdir(directory) and not is_link_or_missing(directory):
         logger.info(
             "Left %s in place: %s was removed as a duplicate but the model is "
             "still on the shelf, so its training previews are still its own. "
@@ -1118,7 +1113,7 @@ def _remove_samples(model_path: str, *, permanent: bool) -> bool:
     directory = samples_relpath(model_path)
     if not os.path.isdir(directory):
         return False
-    if os.path.islink(directory):
+    if is_link_or_missing(directory):
         # ``isdir`` follows the link, so without this the removal is decided by
         # which branch runs: ``rmtree`` happens to refuse a symlinked root and
         # ``send2trash`` happens to move the link and spare its target. Neither
@@ -1222,16 +1217,15 @@ def create_router(server) -> APIRouter:
         """
         resolved = os.path.realpath(os.path.normpath(raw_path))
         if not os.path.isabs(resolved) or not os.path.isfile(resolved):
-            raise HTTPException(
-                status_code=404, detail=f"No file at {raw_path!r} on this machine."
-            )
+            # The caller holds the path it sent; a detail never repeats it.
+            raise HTTPException(status_code=404, detail="No such file on this machine.")
         if not resolved.lower().endswith(SHELF_MODEL_SUFFIXES):
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "The shelf catalogues "
-                    f"{' and '.join(SHELF_MODEL_SUFFIXES)} files. "
-                    f"{os.path.basename(resolved)} is not one."
+                    f"{' and '.join(SHELF_MODEL_SUFFIXES)} files, and that "
+                    "file is not one."
                 ),
             )
         # The Downloads folder is the one registered folder a file may be added
@@ -1331,13 +1325,14 @@ def create_router(server) -> APIRouter:
             )
             raise HTTPException(
                 status_code=400,
-                detail=f"{relpath!r} would be written outside the destination folder.",
+                detail="That file would be written outside the destination folder.",
             ) from exc
         if os.path.lexists(target):
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"{relpath} already exists in {folder['path']}. Nothing was added."
+                    f"A file of that name already exists in {folder['path']}. "
+                    "Nothing was added."
                 ),
             )
         if server.hub.fetchone(
@@ -1367,9 +1362,7 @@ def create_router(server) -> APIRouter:
             try:
                 require_space(folder["path"], os.path.getsize(source))
             except MoveRefused as exc:
-                raise HTTPException(
-                    status_code=exc.status_code, detail=str(exc)
-                ) from exc
+                raise move_refusal_error(exc, "Nothing was added.") from exc
 
             partial = target + PARTIAL_SUFFIX
             try:
@@ -1393,7 +1386,13 @@ def create_router(server) -> APIRouter:
                     exc,
                     exc_info=True,
                 )
-                raise HTTPException(status_code=500, detail=str(exc)) from exc
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Could not copy the file onto the shelf; the original is "
+                        "untouched."
+                    ),
+                ) from exc
 
             # The digest goes with it: `copy_and_digest` hashed these bytes on
             # the way in and `file_digest` proved the copy matches, so the
@@ -1727,7 +1726,9 @@ def create_router(server) -> APIRouter:
                 )
             keep[item.model_id] = item
         user = server.auth.get_user_for_request(request)
-        comfyui_url = (getattr(user, "comfyui_url", None) or "").rstrip("/")
+        # Through the normaliser: an invalid saved address is the 409, before
+        # anything is moved; None with none saved.
+        comfyui_url = _comfyui_url(user, None)
         # **Asked BEFORE the lock.** `fetch_object_info` is a blocking HTTP call
         # with a 15 s per-phase timeout, and inside the slot an unreachable
         # ComfyUI would 409 every move, import, add and delete for the length of
@@ -1859,7 +1860,7 @@ def create_router(server) -> APIRouter:
         if not os.path.isdir(target):
             raise HTTPException(
                 status_code=404,
-                detail=f"There is no folder {subpath!r} in that model folder.",
+                detail="There is no folder at that path in the model folder.",
             )
         for row in server.hub.fetchall("SELECT id, path FROM model_folder"):
             if path_is_within(row["path"], target):
@@ -1867,23 +1868,28 @@ def create_router(server) -> APIRouter:
                     status_code=409,
                     detail=(
                         f"{row['path']} is a registered model folder inside "
-                        f"{subpath!r}. Stop watching it first."
+                        "that folder. Stop watching it first."
                     ),
                 )
         return folder, subpath, target
 
-    def _read_folder(target: str, subpath: str) -> list[tuple[str, int, int, bool]]:
+    def _read_folder(target: str) -> list[tuple[str, int, int, bool]]:
         try:
             return _folder_listing(target)
         except OSError as exc:
             logger.error(
-                "Could not read every file in %s before removing it: %s", target, exc
+                "Could not read every file in %s before removing it: %s",
+                target,
+                exc,
+                exc_info=True,
             )
+            # The OS's own words for the errno, never ``str(exc)``, which
+            # carries the path.
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Could not read everything in {subpath!r} "
-                    f"({exc.strerror or exc}), so nothing was removed."
+                    f"Could not read everything in that folder ({exc.strerror}), "
+                    "so nothing was removed."
                 ),
             ) from exc
 
@@ -1903,7 +1909,8 @@ def create_router(server) -> APIRouter:
             "directory changed since. Links inside are removed as links; what "
             "they point at is never touched. Refused for the registered folder "
             "itself (400), a locked folder or one PixlStash does not delete from, "
-            "or a registered folder inside it (409)."
+            "a registered folder inside it, or a model downloading into the "
+            "folder (409)."
         ),
         tags=["model_shelf"],
         # Both answers are a 200, so the schema names both: the plan for
@@ -1911,12 +1918,12 @@ def create_router(server) -> APIRouter:
         response_model=Union[RemoveFolderResponse, RemoveFolderPlanResponse],
     )
     def remove_model_folder_dir(
-        folder_id: int, request: Request, payload: RemoveFolderRequest = Body(...)
+        folder_id: SqliteInt, request: Request, payload: RemoveFolderRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         if payload.dry_run:
             folder, subpath, target = _removal_target(folder_id, payload.path)
-            listing = _read_folder(target, subpath)
+            listing = _read_folder(target)
             rows = rows_under(server.hub.fetchall, folder_id, subpath)
             prefix = len(subpath_prefix(subpath))
             copies: dict[str, int] = {}
@@ -1988,15 +1995,17 @@ def create_router(server) -> APIRouter:
                     "us put there."
                 ),
             )
+        reservation = None
         try:
-            _folder, subpath, target = _removal_target(folder_id, payload.path)
-            listing = _read_folder(target, subpath)
+            folder, subpath, target = _removal_target(folder_id, payload.path)
+            reservation = reserve_while_moving(target)
+            listing = _read_folder(target)
             rows = rows_under(server.hub.fetchall, folder_id, subpath)
             if _fingerprint(listing, rows) != payload.expect:
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        f"{subpath!r} changed since it was read, so nothing was "
+                        "The folder changed since it was read, so nothing was "
                         "removed. Look at it again."
                     ),
                 )
@@ -2029,7 +2038,10 @@ def create_router(server) -> APIRouter:
                 )
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Could not remove {subpath!r}: {exc.strerror or exc}",
+                    detail=(
+                        "Could not remove that folder. Whatever went is marked "
+                        "missing by the folder's next scan."
+                    ),
                 ) from exc
             # Re-read after the bytes went, so a row a scan added meanwhile goes
             # too rather than naming a file that is not there.
@@ -2040,6 +2052,8 @@ def create_router(server) -> APIRouter:
                 )
             purged = purge_deleted_models(server.hub, emptied)
         finally:
+            if reservation is not None:
+                release_folder(reservation)
             SHELF_IO_LOCK.release()
 
         logger.info(

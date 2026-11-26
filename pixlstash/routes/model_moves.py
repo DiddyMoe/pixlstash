@@ -80,8 +80,13 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.pixl_logging import get_logger
-from pixlstash.routes.model_folders import _validate_folder_conflicts
+from pixlstash.routes.model_folders import (
+    _validate_folder_conflicts,
+    move_refusal_error,
+    reserve_while_moving,
+)
 from pixlstash.services.builtin_caches import (
     insightface_models_dir_under,
     is_insightface_models_dir,
@@ -91,6 +96,7 @@ from pixlstash.services.builtin_models import (
     set_builtin_model_dir,
 )
 from pixlstash.services.managed_model_store import relocatable_identity
+from pixlstash.services.model_downloads import release_folder
 from pixlstash.services.model_dir_mover import (
     execute_directory_move,
     plan_directory_move,
@@ -110,6 +116,7 @@ from pixlstash.services.model_mover import (
     same_device,
 )
 from pixlstash.utils.insightface_model_utils import set_insightface_root
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.reference_folder_validator import validate_reference_folder_path
 
@@ -126,13 +133,19 @@ _job_lock = threading.Lock()
 STATUS_RUNNING = "running"
 STATUS_FINISHED = "finished"
 
+# A pack that failed to move, as the polled job reports it. The OS error names
+# server paths, so it goes to the log with the pack and both ends of the move.
+PACK_MOVE_FAILED_DETAIL = (
+    "The pack could not be moved and was left where it was. The server log says why."
+)
+
 
 class MoveItem(BaseModel):
     """One registered copy to move, named by its ``model_file`` primary key."""
 
     model_config = ConfigDict(extra="forbid")
 
-    folder_id: int = Field(
+    folder_id: SqliteInt = Field(
         description=(
             "`model_folder.id` the copy currently lives under. Comes straight "
             "from a shelf row's `locations[].folder_id`."
@@ -153,7 +166,7 @@ class MoveRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    destination_folder_id: int = Field(
+    destination_folder_id: SqliteInt = Field(
         description=(
             "A registered folder the shelf catalogues. A `source` folder is "
             "refused: it is an ai-toolkit output root, taken from, never "
@@ -219,7 +232,7 @@ class FolderMoveRequest(BaseModel):
             "(`loras/sdxl`). Empty, the registered folder itself, is a 400."
         )
     )
-    destination_folder_id: int = Field(
+    destination_folder_id: SqliteInt = Field(
         description="The registered folder it moves into; the same one for a rename."
     )
     destination_path: str = Field(
@@ -429,6 +442,7 @@ def _start_job(
     on_finished=None,
     kind: str = "files",
     details: Optional[dict] = None,
+    reserve: Optional[str] = None,
 ) -> dict:
     """Take the one job slot, run *run* on a thread, and return the job.
 
@@ -457,6 +471,10 @@ def _start_job(
             folder rows.
         kind: ``files`` or ``folder``, echoed to the clients watching.
         details: Extra fields for the status response, fixed for the job.
+        reserve: The directory the job moves away, reserved against downloads
+            (``model_folders.reserve_while_moving``) once the slot is held and
+            released with it, so no download starts inside it while the job
+            runs and the job does not start while one writes there (409).
 
     Returns:
         The job dict, already running.
@@ -471,6 +489,19 @@ def _start_job(
                 "checked before starting."
             ),
         )
+    reservation = None
+    if reserve is not None:
+        try:
+            reservation = reserve_while_moving(reserve)
+        except BaseException:
+            SHELF_IO_LOCK.release()
+            raise
+
+    def _release() -> None:
+        if reservation is not None:
+            release_folder(reservation)
+        SHELF_IO_LOCK.release()
+
     with _job_lock:
         job = {
             "status": STATUS_RUNNING,
@@ -506,7 +537,7 @@ def _start_job(
             _finish_job(job)
             # Released last, so a POST that wins the lock never observes a
             # job still marked running.
-            SHELF_IO_LOCK.release()
+            _release()
 
     try:
         threading.Thread(target=_run, daemon=True, name="model-move").start()
@@ -514,7 +545,7 @@ def _start_job(
         # The worker's ``finally`` is the only other release, so a thread
         # that never started would strand the lock and refuse every later
         # move and import for the life of the process.
-        SHELF_IO_LOCK.release()
+        _release()
         _finish_job(job)
         logger.error(
             "Could not start the move worker for folder %s; the job slot has "
@@ -601,7 +632,10 @@ def _move_leftovers(source: str, destination: str) -> None:
     could not follow is worth a loud line and a re-download, not an exception
     thrown from a finished job.
     """
-    for root, _dirs, files in os.walk(source):
+    for root, dirs, files in os.walk(source):
+        dirs[:] = [
+            name for name in dirs if not is_link_or_missing(os.path.join(root, name))
+        ]
         for name in files:
             origin = os.path.join(root, name)
             target = os.path.join(destination, os.path.relpath(origin, source))
@@ -622,21 +656,26 @@ def _move_leftovers(source: str, destination: str) -> None:
 def _remove_if_empty(path: str) -> None:
     """Tidy the vacated directory, and never let tidying fail a relocation.
 
-    Bottom-up, because a relocation preserves subdirectories: the files have
+    Deepest first, because a relocation preserves subdirectories: the files have
     moved out of ``runA/`` and ``runB/`` but the empty directories remain, and
     ``os.rmdir`` on the root would refuse while they do. Only *empty*
     directories are removed, so anything the owner left behind keeps the store
-    directory alive and is never deleted.
+    directory alive and is never deleted. A link (a symlink or a Windows
+    junction) is the owner's too: it is neither walked nor removed. The walk is
+    top-down so it can prune links (a bottom-up walk ignores changes to its
+    ``dirs``), and the folders it found are removed in reverse.
     """
-    for root, dirs, _files in os.walk(path, topdown=False):
-        for name in dirs:
-            child = os.path.join(root, name)
-            try:
-                os.rmdir(child)
-            except OSError as exc:
-                logger.debug(
-                    "Left the vacated subdirectory %s in place: %s", child, exc
-                )
+    folders: list[str] = []
+    for root, dirs, _files in os.walk(path):
+        dirs[:] = [
+            name for name in dirs if not is_link_or_missing(os.path.join(root, name))
+        ]
+        folders.extend(os.path.join(root, name) for name in dirs)
+    for child in reversed(folders):
+        try:
+            os.rmdir(child)
+        except OSError as exc:
+            logger.debug("Left the vacated subdirectory %s in place: %s", child, exc)
     try:
         os.rmdir(path)
     except OSError as exc:
@@ -659,7 +698,9 @@ def create_router(server) -> APIRouter:
     """
     router = APIRouter()
 
-    def _launch(mover: ModelMover, plan, on_finished=None) -> dict:
+    def _launch(
+        mover: ModelMover, plan, on_finished=None, reserve: Optional[str] = None
+    ) -> dict:
         """Put one planned batch of *files* on the single move thread.
 
         Shared by the plain move and by the managed store's relocation, because
@@ -673,6 +714,7 @@ def create_router(server) -> APIRouter:
             on_finished: Called with the :class:`MoveReport` when every file has
                 been decided, on the worker thread, only when the batch ran to
                 completion. A relocation uses it to flip the folder rows.
+            reserve: The folder a relocation takes away, for :func:`_start_job`.
         """
 
         def _run(job: dict) -> MoveReport:
@@ -695,6 +737,7 @@ def create_router(server) -> APIRouter:
             bytes_to_copy=plan.bytes_to_copy,
             run=_run,
             on_finished=on_finished,
+            reserve=reserve,
         )
 
     @router.post(
@@ -724,7 +767,7 @@ def create_router(server) -> APIRouter:
                 destination_subpath=payload.destination_subpath,
             )
         except MoveRefused as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            raise move_refusal_error(exc, "Nothing was moved.") from exc
 
         return _snapshot(_launch(mover, plan))
 
@@ -878,9 +921,13 @@ def create_router(server) -> APIRouter:
                 "Could not create %s for the InsightFace relocation: %s",
                 destination_dir,
                 exc,
+                exc_info=True,
             )
+            # The path is the one the caller sent, so the detail does not
+            # repeat it; the OS's own reason is a fixed text.
             raise HTTPException(
-                status_code=409, detail=f"Could not create {destination_dir}: {exc}"
+                status_code=409,
+                detail=f"Could not create the destination folder: {exc.strerror}",
             ) from exc
 
         # The same two-step ending the other two relocations use: the
@@ -943,7 +990,7 @@ def create_router(server) -> APIRouter:
         try:
             require_space(destination_dir, bytes_to_copy)
         except MoveRefused as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            raise move_refusal_error(exc, "Nothing was moved.") from exc
 
         def _run(job: dict) -> MoveReport:
             outcomes: list[MoveOutcome] = []
@@ -970,7 +1017,10 @@ def create_router(server) -> APIRouter:
                             exc_info=True,
                         )
                         outcome = MoveOutcome(
-                            int(folder["id"]), relpath, STATUS_FAILED, str(exc)
+                            int(folder["id"]),
+                            relpath,
+                            STATUS_FAILED,
+                            PACK_MOVE_FAILED_DETAIL,
                         )
                 outcomes.append(outcome)
                 _record_result(job, outcome)
@@ -1026,6 +1076,7 @@ def create_router(server) -> APIRouter:
             bytes_to_copy=bytes_to_copy,
             run=_run,
             on_finished=_promote,
+            reserve=source_dir,
         )
 
     @router.post(
@@ -1050,14 +1101,15 @@ def create_router(server) -> APIRouter:
             "A folder you registered is one you moved yourself; register it "
             "again at its new path. The HuggingFace cache cannot be relocated at "
             "all - its location is `HF_HOME`, read at import by a library shared "
-            "with your other tools."
+            "with your other tools. Refused (409) while a model is downloading, "
+            "or waiting to download, into the folder."
         ),
         status_code=202,
         tags=["model_shelf"],
         response_model=MoveStatusResponse,
     )
     def relocate_model_folder(
-        folder_id: int, request: Request, payload: RelocateRequest = Body(...)
+        folder_id: SqliteInt, request: Request, payload: RelocateRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         folder = server.hub.fetchone(
@@ -1079,6 +1131,11 @@ def create_router(server) -> APIRouter:
                     "so register it again at its new path."
                 ),
             )
+        # Every branch below takes the whole folder along: the store and the
+        # engines' folder file by file, the InsightFace packs pack by pack, so
+        # each reserves it for its whole job (`_start_job`'s `reserve`). On a
+        # hub where no folder is marked for downloads the store is where a
+        # model download goes.
         # Read before anything moves: `relocatable_identity` recognises these two
         # by comparing them with `builtin_model_dir()` / `insightface_models_dir()`,
         # and this route is about to change what those return.
@@ -1102,9 +1159,11 @@ def create_router(server) -> APIRouter:
                 "Could not create %s for the managed store relocation: %s",
                 destination_path,
                 exc,
+                exc_info=True,
             )
             raise HTTPException(
-                status_code=409, detail=f"Could not create {destination_path}: {exc}"
+                status_code=409,
+                detail=f"Could not create the destination folder: {exc.strerror}",
             ) from exc
 
         destination_id = _register_or_reuse(server.hub, destination_path)
@@ -1138,7 +1197,7 @@ def create_router(server) -> APIRouter:
                 relocating=True,
             )
         except MoveRefused as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            raise move_refusal_error(exc, "Nothing was moved.") from exc
 
         def _promote(report) -> None:
             failed = [o for o in report.outcomes if o.status != "moved"]
@@ -1188,7 +1247,9 @@ def create_router(server) -> APIRouter:
                 len(plan.moves),
             )
 
-        return _snapshot(_launch(mover, plan, on_finished=_promote))
+        return _snapshot(
+            _launch(mover, plan, on_finished=_promote, reserve=folder["path"])
+        )
 
     @router.post(
         "/model-folders/{folder_id}/dirs/move",
@@ -1198,8 +1259,9 @@ def create_router(server) -> APIRouter:
             "the same or another registered folder; a rename is a move into the "
             "same parent with `new_name`. Refused before anything is touched for "
             "the registered folder itself or a target inside the source (400), a "
-            "locked folder, a taken name or a registered folder inside the source "
-            "(409), and a copy that would not fit (507). Folders are never merged. "
+            "locked folder, a taken name, a registered folder inside the source "
+            "or a model downloading into the folder (409), and a copy that would "
+            "not fit (507). Folders are never merged. "
             "On one drive it is a rename and one transaction repointing every row "
             "under it, undone if the repoint fails. Across drives the tree is "
             "copied under a partial name, every catalogued file is checked, and "
@@ -1214,7 +1276,7 @@ def create_router(server) -> APIRouter:
         responses={200: {"model": FolderMovePlanResponse}},
     )
     def move_model_folder_dir(
-        folder_id: int, request: Request, payload: FolderMoveRequest = Body(...)
+        folder_id: SqliteInt, request: Request, payload: FolderMoveRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         try:
@@ -1227,7 +1289,7 @@ def create_router(server) -> APIRouter:
                 payload.new_name,
             )
         except MoveRefused as exc:
-            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            raise move_refusal_error(exc, "Nothing was moved.") from exc
 
         if payload.dry_run:
             return JSONResponse(
@@ -1267,6 +1329,7 @@ def create_router(server) -> APIRouter:
                 run=_run,
                 kind="folder",
                 details={"name": plan.name, "files": len(plan.catalogued)},
+                reserve=plan.source_path,
             )
         )
 

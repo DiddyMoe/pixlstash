@@ -31,6 +31,7 @@ from typing import Optional
 from pixlstash.hub.db import HubDatabase
 from pixlstash.startup_permissions import mkdir_private
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.sqlite_uri import sqlite_file_uri
 
 logger = get_logger(__name__)
@@ -105,7 +106,7 @@ def remove_library_made_entries(library: Library) -> None:
         if name in library.pending_import_kept:
             continue
         path = os.path.join(library.path, name)
-        if not os.path.isdir(path) or os.path.islink(path):
+        if not os.path.isdir(path) or is_link_or_missing(path):
             continue
         try:
             shutil.rmtree(path)
@@ -269,13 +270,17 @@ def validate_vault_folder(folder: str, *, filename: str = VAULT_FILENAME) -> str
         NotAVaultError: No folder, no database file, unreadable, or missing the
             marker tables.
     """
+    # The messages name no path and repeat no SQLite text: they reach HTTP
+    # answers and the recovery screen as they are. Where there is a cause, it
+    # is logged here with the path, and chained, so a caller that has to tell
+    # "not a vault" from "could not read it" asks ``__cause__``, not the words.
     if not os.path.isdir(folder):
-        raise NotAVaultError(f"{folder} is not a folder.")
+        raise NotAVaultError("That path is not a folder.")
 
     vault_path = os.path.join(folder, filename)
     if not os.path.isfile(vault_path):
         raise NotAVaultError(
-            f"No {filename} in {folder}. Pick the folder that contains "
+            f"No {filename} in that folder. Pick the folder that contains "
             f"it, or use `create` to start an empty library."
         )
 
@@ -284,17 +289,19 @@ def validate_vault_folder(folder: str, *, filename: str = VAULT_FILENAME) -> str
             sqlite_file_uri(vault_path, read_only=True), uri=True, timeout=5
         )
     except sqlite3.Error as exc:
-        logger.error("Could not open vault %s read-only: %s", vault_path, exc)
-        raise NotAVaultError(f"{vault_path} could not be opened: {exc}") from exc
+        logger.error("Could not open vault %s read-only", vault_path, exc_info=True)
+        raise NotAVaultError(
+            f"The {filename} in that folder could not be opened."
+        ) from exc
 
     try:
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     except sqlite3.Error as exc:
-        logger.error("Could not read the schema of vault %s: %s", vault_path, exc)
+        logger.error("Could not read the schema of vault %s", vault_path, exc_info=True)
         raise NotAVaultError(
-            f"{vault_path} is not a readable SQLite database: {exc}"
+            f"The {filename} in that folder is not a readable SQLite database."
         ) from exc
     finally:
         conn.close()
@@ -313,9 +320,9 @@ def validate_vault_folder(folder: str, *, filename: str = VAULT_FILENAME) -> str
             # surfaced verbatim by the recovery dialog, so it has to carry
             # which of the two it failed to be.
             raise NotAVaultError(
-                f"{vault_path} does not look like a PixlStash vault (missing "
-                f"{', '.join(missing)}), and not a pre-Alembic one either "
-                f"(missing {', '.join(legacy_missing)})."
+                f"The {filename} in that folder does not look like a PixlStash "
+                f"vault (missing {', '.join(missing)}), and not a pre-Alembic "
+                f"one either (missing {', '.join(legacy_missing)})."
             )
         logger.info(
             "%s is a PixlStash vault from before Alembic (no alembic_version); "
@@ -419,14 +426,14 @@ def read_vault_folder_roots(folder: str) -> list[str]:
         # Locked, busy, unreadable right now: the vault may be perfectly good
         # and in use, so its folders are unknown rather than absent.
         logger.warning(
-            "Could not read the watch and reference folders of %s: %s",
+            "Could not read the watch and reference folders of %s",
             vault_path,
-            exc,
+            exc_info=True,
         )
         raise LibraryError(
-            f"Could not read the watch and reference folders of the library at "
-            f"{folder}, so this folder cannot be shown to be outside them. Try "
-            "again in a moment."
+            "Could not read the watch and reference folders of one of the "
+            "registered libraries, so this folder cannot be shown to be outside "
+            "them. Try again in a moment."
         ) from exc
     except sqlite3.DatabaseError as exc:
         # Not a database at all: PixlStash cannot open this library either, so
@@ -545,14 +552,19 @@ class LibraryRegistry:
                 (str(name_or_id),),
             )
             if len(rows) > 1:
+                # The stored name, not the one typed: what came in can be
+                # anything, a path included, and is not repeated back.
                 raise LibraryNotFoundError(
-                    f'"{name_or_id}" matches {len(rows)} libraries; use the id '
-                    "from `list` instead."
+                    f"{len(rows)} libraries are named "
+                    f'"{self._row_to_library(rows[0]).name}"; use the id from '
+                    "`list` instead."
                 )
             row = rows[0] if rows else None
 
         if row is None:
-            raise LibraryNotFoundError(f'No library named or numbered "{name_or_id}".')
+            raise LibraryNotFoundError(
+                "No library has that name, number or uuid. `list` shows them."
+            )
         return self._row_to_library(row)
 
     def _refuse_duplicate_name(
@@ -595,14 +607,20 @@ class LibraryRegistry:
         Raises:
             LibraryExistsError: Another attached library has that name.
         """
-        sql = "SELECT id FROM library WHERE name = ? COLLATE NOCASE AND attached = 1"
+        sql = (
+            "SELECT id, name FROM library WHERE name = ? COLLATE NOCASE "
+            "AND attached = 1"
+        )
         rows = (
             conn.execute(sql, (cleaned,)).fetchall()
             if conn is not None
             else self._hub.fetchall(sql, (cleaned,))
         )
-        if any(int(row[0]) != except_id for row in rows):
-            raise LibraryExistsError(f'Another library is already named "{cleaned}".')
+        clash = next((row for row in rows if int(row[0]) != except_id), None)
+        if clash is not None:
+            # Names the library that holds it, as stored, rather than echoing
+            # the requested text back.
+            raise LibraryExistsError(f'Another library is already named "{clash[1]}".')
 
     def overlapping(self, path: str) -> list[Library]:
         """Return registered libraries that contain, or sit inside, *path*.
@@ -768,8 +786,8 @@ class LibraryRegistry:
             vault_path = os.path.join(resolved, filename)
             if os.path.exists(os.path.join(resolved, VAULT_FILENAME)):
                 raise LibraryExistsError(
-                    f"{resolved} already contains a {VAULT_FILENAME}. Use `attach` "
-                    "to register it."
+                    f"That folder already contains a {VAULT_FILENAME}. Use "
+                    "`attach` to register it."
                 )
             # Either an import running right now - a second process, the CLI - or
             # one that died without its row, which the startup sweep clears. Refuse
@@ -777,7 +795,7 @@ class LibraryRegistry:
             # live one is holding that file.
             if os.path.exists(vault_path):
                 raise LibraryExistsError(
-                    f"{resolved} is already being imported, or holds a {filename} "
+                    f"That folder is already being imported, or holds a {filename} "
                     "left by an import that did not finish."
                 )
 
@@ -929,9 +947,16 @@ class LibraryRegistry:
                     (library_uuid, resolved_path, payload_digest),
                 )
         except sqlite3.IntegrityError as exc:
+            logger.warning(
+                "Recording the legacy import of %s as %s violated a hub "
+                "uniqueness constraint",
+                resolved_path,
+                cleaned,
+                exc_info=True,
+            )
             raise LibraryExistsError(
-                f'Could not register {resolved_path} as "{cleaned}": the path '
-                "or name is already in the registry."
+                "Could not register that folder: its path or name is already in "
+                "the registry."
             ) from exc
         return self.get(library_id)
 
@@ -1104,7 +1129,7 @@ class LibraryRegistry:
             clash = self._find_by_path(resolved)
             if clash is not None and clash.id != library.id:
                 raise LibraryExistsError(
-                    f'{resolved} is already registered as "{clash.name}".'
+                    f'That folder is already registered as "{clash.name}".'
                 )
 
             fingerprint = read_vault_uuid(resolved)
@@ -1119,7 +1144,7 @@ class LibraryRegistry:
                     library.vault_uuid,
                 )
                 raise ForeignLibraryError(
-                    f'{resolved} holds a different library, not "{library.name}". '
+                    f'That folder holds a different library, not "{library.name}". '
                     "Nothing was changed."
                 )
             if not matches:
@@ -1166,8 +1191,15 @@ class LibraryRegistry:
                     "UPDATE library SET name = ? WHERE id = ?", (cleaned, library.id)
                 )
         except sqlite3.IntegrityError as exc:
+            logger.warning(
+                "Renaming %s to %s violated a hub uniqueness constraint",
+                library.name,
+                cleaned,
+                exc_info=True,
+            )
             raise LibraryExistsError(
-                f'Another library is already named "{cleaned}".'
+                f'Could not rename "{library.name}": another library already '
+                "holds that name."
             ) from exc
         return self.get(library.id)
 
@@ -1206,7 +1238,7 @@ class LibraryRegistry:
 
         if existing is not None and existing.attached:
             raise LibraryExistsError(
-                f'{resolved_path} is already registered as "{existing.name}".'
+                f'That folder is already registered as "{existing.name}".'
             )
 
         if existing is not None:
@@ -1295,14 +1327,14 @@ class LibraryRegistry:
             # may have registered this path or name between the check above and
             # here.
             logger.warning(
-                "Registering %s as %s violated a hub uniqueness constraint: %s",
+                "Registering %s as %s violated a hub uniqueness constraint",
                 resolved_path,
                 cleaned,
-                exc,
+                exc_info=True,
             )
             raise LibraryExistsError(
-                f'Could not register {resolved_path} as "{cleaned}": the path '
-                "or name is already in the registry."
+                "Could not register that folder: its path or name is already in "
+                "the registry."
             ) from exc
 
         logger.info(

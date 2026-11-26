@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.links import is_link_stat
 from pixlstash.utils.sqlite_uri import sqlite_file_uri
 from pixlstash.utils.snapshot_compression import (
     compress_snapshot,
@@ -401,7 +402,7 @@ def _snapshots_root(vault_root: str) -> str | None:
     if not os.path.lexists(snapshots):
         return None
     info = os.lstat(snapshots)
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+    if is_link_stat(info) or not stat.S_ISDIR(info.st_mode):
         raise PortableIdentityScrubError(
             f"Vault snapshots path is not a trusted directory: {snapshots}"
         )
@@ -450,9 +451,10 @@ def _registered_snapshot_path(
             raise PortableIdentityScrubError(
                 f"Registered snapshot is missing at {current}: {exc}"
             ) from exc
-        if stat.S_ISLNK(info.st_mode):
+        if is_link_stat(info):
             raise PortableIdentityScrubError(
-                f"Registered snapshot path contains a symlink: {current}"
+                "Registered snapshot path contains a link (a symlink or "
+                f"junction): {current}"
             )
         if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
             raise PortableIdentityScrubError(
@@ -475,11 +477,12 @@ def _cleanup_stale_snapshot_scrubs(vault_root: str) -> None:
         for name in list(subdirs):
             candidate = os.path.join(directory, name)
             info = os.lstat(candidate)
-            if stat.S_ISLNK(info.st_mode):
+            if is_link_stat(info):
                 subdirs.remove(name)
                 if name.startswith(_SCRUB_PREFIX):
                     raise PortableIdentityScrubError(
-                        f"Refusing symlinked stale scrub directory {candidate}."
+                        f"Refusing stale scrub directory {candidate}: it is a "
+                        "link (a symlink or junction)."
                     )
                 continue
             if name.startswith(_SCRUB_PREFIX):

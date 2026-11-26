@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 import pytest
 
@@ -114,6 +115,51 @@ def test_only_weights_are_reported_as_unclaimed(tmp_path):
     (tmp_path / "hub.db").write_bytes(b"SQLite")
 
     assert [item["relpath"] for item in unclaimed_files(str(tmp_path))] == ["best.pt"]
+
+
+class _JunctionStat:
+    """An ``lstat`` result carrying the Windows junction reparse tag."""
+
+    st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+    def __init__(self, info):
+        self._info = info
+
+    def __getattr__(self, name):
+        return getattr(self._info, name)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="creating a symlink needs privileges on Windows"
+)
+def test_a_file_behind_a_directory_link_is_not_unclaimed(tmp_path, monkeypatch):
+    """The list is offered for cleanup and the delete refuses a file whose
+    directory resolves outside the folder, so listing one behind a link would
+    offer a removal the app refuses. ``junction`` is a real directory whose
+    ``lstat`` carries the junction tag, as Windows reports one, and ``os.walk``
+    descends it as it descends a real junction; ``symlinked`` holds the walk
+    to not following a symlink either."""
+    folder = tmp_path / "builtin"
+    folder.mkdir()
+    (folder / "best.pt").write_bytes(b"y" * 20)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "theirs.pt").write_bytes(b"z" * 20)
+    os.symlink(elsewhere, folder / "symlinked", target_is_directory=True)
+    junction = folder / "junction"
+    junction.mkdir()
+    (junction / "theirs.pt").write_bytes(b"z" * 20)
+    real_lstat = os.lstat
+
+    def lstat(candidate, *args, **kwargs):
+        info = real_lstat(candidate, *args, **kwargs)
+        return _JunctionStat(info) if os.fspath(candidate) == str(junction) else info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+    found = unclaimed_files(str(folder))
+
+    assert [item["relpath"] for item in found] == ["best.pt"]
 
 
 def test_a_folder_that_has_never_been_downloaded_into_reports_nothing(tmp_path):
@@ -970,7 +1016,7 @@ def _capabilities_by_name(hub, folder_id):
 
 
 def _hf_cache(monkeypatch, repos):
-    """Point `scan_cache_dir` at a fake cache holding *repos*."""
+    """Point `scan_cache_dir` at a fake cache holding *repos*, and return it."""
 
     class _Repo:
         def __init__(self, repo_id):
@@ -989,6 +1035,7 @@ def _hf_cache(monkeypatch, repos):
     import huggingface_hub
 
     monkeypatch.setattr(huggingface_hub, "scan_cache_dir", lambda _path: info)
+    return info
 
 
 def test_declaring_a_cache_writes_the_whole_capability_set(
@@ -1018,6 +1065,35 @@ def test_declaring_a_cache_writes_the_whole_capability_set(
         )
     }
     assert kinds["florence-community/Florence-2-base"] == "captioner"
+
+
+def test_a_config_nested_past_the_parser_is_labelled_other(
+    server_hub, tmp_path, monkeypatch, caplog
+):
+    """JSON nested deeper than the parser recurses raises RecursionError, not
+    ValueError. The snapshot answers nothing, so the repo is labelled `other`
+    and the rest of the cache is still declared."""
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("[" * 100_000 + "]" * 100_000)
+    info = _hf_cache(monkeypatch, ("acme/deep", "SmilingWolf/wd-convnext-tagger-v3"))
+
+    class _Rev:
+        snapshot_path = str(snapshot)
+
+    info.repos[0].revisions = frozenset({_Rev()})
+
+    with caplog.at_level(logging.INFO):
+        folder_id = declare_huggingface_cache(server_hub, str(tmp_path))
+
+    assert _capabilities_by_name(server_hub, folder_id) == {
+        "acme/deep": ["other"],
+        "SmilingWolf/wd-convnext-tagger-v3": ["tagger"],
+    }
+    assert any(
+        r.getMessage().startswith(f"Could not read {snapshot / 'config.json'}")
+        for r in caplog.records
+    )
 
 
 def test_a_capability_the_declaration_drops_stops_being_listed(

@@ -22,6 +22,7 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.db_models.folder_mapping_commit import (
     STATE_ABANDONED,
     STATE_DEFERRED,
@@ -53,6 +54,23 @@ _FACE_BATCH_TIMEOUT_S = 180.0
 _WORKER_HOLD_S = 60.0
 # Whose hold it is: the planner has other holders (a VRAM lease making room).
 _WORKER_HOLD_OWNER = "folder-structure-read"
+
+#: What a polling client is told when the read or the commit raised. Fixed:
+#: the exception's text can name a server path, so it goes to the log only.
+READ_FAILED_MESSAGE = "The folder-structure read failed. The server log says why."
+COMMIT_FAILED_MESSAGE = "The folder-structure commit failed. The server log says why."
+#: A commit refused at run time (`CommitError`). Its record stays pending, and
+#: the next start-up tries it again, which is what this sentence tells the owner.
+COMMIT_REFUSED_MESSAGE = (
+    "The folder-structure commit could not finish. PixlStash tries it again the "
+    "next time it starts, and the server log says why."
+)
+#: A first import whose pictures were indexed but whose library was not
+#: promoted. The cause can name the library's folders, so it is logged.
+FIRST_IMPORT_UNFINISHED_MESSAGE = (
+    "Your pictures were indexed, but the library could not be finished. "
+    "The server log says why."
+)
 
 # Matches any non-empty string with no null bytes or newlines. Applied with
 # fullmatch() after realpath so CodeQL recognises the result as a path-injection
@@ -104,7 +122,7 @@ class FolderStructureAssignmentPayload(BaseModel):
 
     relative_path: str
     kind: str
-    match_id: Optional[int] = None
+    match_id: Optional[SqliteInt] = None
 
 
 class FolderStructureCaptionPayload(BaseModel):
@@ -410,7 +428,9 @@ def create_router(server) -> APIRouter:
             state = server.folder_structure_read
             if state and state["task_id"] == task_id:
                 state["status"] = "failed"
-                state["error"] = f"{type(exc).__name__}: {exc}"
+                # Served to the polling client: a fixed sentence, the cause is
+                # in the log line above (it can name a server path).
+                state["error"] = READ_FAILED_MESSAGE
             # Anything that is not an ordinary Exception is still not this
             # thread's to swallow - but the slot is marked failed FIRST, or a
             # KeyboardInterrupt or a MemoryError leaves it "running" forever and
@@ -647,13 +667,13 @@ def create_router(server) -> APIRouter:
                 # rename did not happen, so the folder still holds no vault.db.
                 # Saying `completed` would claim a library that is not there.
                 logger.exception(
-                    "The import finished but the library could not be: %s", exc
+                    "Folder-structure commit %s: the import finished but the "
+                    "library could not be: %s",
+                    task_id,
+                    exc,
                 )
                 outcome["status"] = "failed"
-                outcome["error"] = (
-                    "Your pictures were indexed, but the library could not "
-                    f"be finished: {exc}"
-                )
+                outcome["error"] = FIRST_IMPORT_UNFINISHED_MESSAGE
         with server.folder_structure_commit_lock:
             state = server.folder_structure_commit
             if state and state["task_id"] == task_id:
@@ -761,11 +781,21 @@ def create_router(server) -> APIRouter:
             # record exists to prevent, so the next start-up tries once more.
             # A commit that keeps failing is stopped by the owner, not by us
             # guessing which failures are permanent.
-            logger.error("Folder-structure commit %s failed: %s", task_id, exc)
+            logger.error(
+                "Folder-structure commit %s (%s, root %s) refused; left pending "
+                "for the next start-up: %s",
+                task_id,
+                mode,
+                root_path,
+                exc,
+                exc_info=True,
+            )
             with server.folder_structure_commit_lock:
                 state = server.folder_structure_commit
                 if state and state["task_id"] == task_id:
-                    state["error"] = str(exc)
+                    # Fixed: the refusal can name a server path or another
+                    # library's folder. The log above has it.
+                    state["error"] = COMMIT_REFUSED_MESSAGE
                     state["status"] = "failed"
             return
         except BaseException as exc:  # noqa: BLE001 - the slot must never wedge
@@ -779,7 +809,8 @@ def create_router(server) -> APIRouter:
             with server.folder_structure_commit_lock:
                 state = server.folder_structure_commit
                 if state and state["task_id"] == task_id:
-                    state["error"] = f"{type(exc).__name__}: {exc}"
+                    # Fixed, like the read's: the cause is in the log above.
+                    state["error"] = COMMIT_FAILED_MESSAGE
                     state["status"] = "failed"
             if not isinstance(exc, Exception):
                 raise
@@ -974,6 +1005,9 @@ def create_router(server) -> APIRouter:
                 else [c.model_dump() for c in payload.captions]
             )
         except commit_service.CommitError as exc:
+            # The parse's sentence names the row by index and the vocabulary
+            # the server owns, never the caller's own value, so it is the body.
+            logger.info("Folder-structure commit refused (400): %s", exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if "captions" in payload.model_fields_set and payload.mode == "reference":
             # The field being present at all is what integration §20.2 refuses, `null`
