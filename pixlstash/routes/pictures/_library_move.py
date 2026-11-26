@@ -37,21 +37,28 @@ from pixlstash.db_models import TAG_PENDING_SENTINEL, Picture, Tag
 from pixlstash.db_models.tag import is_tag_sentinel
 from pixlstash.hub.registry import LibraryError, LibraryNotFoundError
 from pixlstash.pixl_logging import get_logger
+from pixlstash.services import import_dedup_service, import_publish_service
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
     session_tag_exclusions,
 )
+from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 from ._crud import BULK_DELETE_MAX_IDS, scrapheap_pictures
 from ._helpers import _create_picture_imports
 
 logger = get_logger(__name__)
 
+#: The 409 detail when the other library fails to open in the layers below the
+#: library service, whose own text is logged rather than returned.
+_OPEN_FAILED_DETAIL = "The other library could not be opened. Nothing was moved."
+
 
 class MoveToLibraryRequest(BaseModel):
-    picture_ids: list[int] = Field(min_length=1, max_length=BULK_DELETE_MAX_IDS)
+    picture_ids: list[SqliteInt] = Field(min_length=1, max_length=BULK_DELETE_MAX_IDS)
     # The library's stable identity, as `GET /libraries` lists it.
     library_uuid: str
 
@@ -114,19 +121,27 @@ def _refuse_token_pinned_elsewhere(request: Request, library_uuid: str) -> None:
 
 
 def _read_source(session: Session, ids: list[int]):
-    """The live pictures among *ids*, their tags, and which a locked set freezes."""
-    pictures = {
-        pic.id: pic
+    """The live pictures among *ids*, their tags, and which a locked set freezes.
+
+    Both reads go a :func:`chunked` slice at a time and union what each slice
+    finds. A request carries up to ``BULK_DELETE_MAX_IDS`` ids, and SQLite
+    refuses a statement with more host parameters than
+    ``SQLITE_MAX_VARIABLE_NUMBER``: 999 before 3.32.0, 32766 since
+    (https://www.sqlite.org/limits.html).
+    """
+    pictures: dict[int, Picture] = {}
+    for chunk in chunked(list(dict.fromkeys(ids))):
         for pic in session.exec(
-            select(Picture).where(Picture.id.in_(ids), Picture.deleted.is_(False))
-        ).all()
-    }
+            select(Picture).where(Picture.id.in_(chunk), Picture.deleted.is_(False))
+        ).all():
+            pictures[pic.id] = pic
     tags: dict[int, list[str]] = {}
-    for picture_id, tag in session.exec(
-        select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(list(pictures)))
-    ).all():
-        if tag and not is_tag_sentinel(tag):
-            tags.setdefault(picture_id, []).append(tag)
+    for chunk in chunked(list(pictures)):
+        for picture_id, tag in session.exec(
+            select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(chunk))
+        ).all():
+            if tag and not is_tag_sentinel(tag):
+                tags.setdefault(picture_id, []).append(tag)
     rows = [
         SimpleNamespace(
             id=pic.id,
@@ -143,66 +158,74 @@ def _read_source(session: Session, ids: list[int]):
 
 
 def _copy_into(target, source_root: str, row) -> str:
-    """Put one picture into *target*. Returns ``new``, ``duplicate`` or ``scrapheaped``."""
+    """Put one picture into *target*. Returns ``new``, ``duplicate`` or ``scrapheaped``.
+
+    Reading the source, hashing it, the lookup and writing the copy into the
+    target's image root all run outside
+    :func:`import_dedup_service.serialised_import`. That lock is one per
+    process, so a long video copied under it would stall every import, in
+    every library, for as long as the copy took. Under the lock run only what
+    every import runs there: the look again, since an import can have added
+    the same content after the lookup
+    (:func:`import_publish_service.withdraw_imported_meanwhile`), and the
+    insert.
+
+    The copy is recorded in an :class:`import_publish_service.PublishedPictures`,
+    so a failure before its row commits removes the file and its thumbnail,
+    and a copy the look again matches is withdrawn.
+    """
     source_path = ImageUtils.resolve_picture_path(source_root, row.file_path)
     with open(source_path, "rb") as handle:
         data = handle.read()
     ext = os.path.splitext(row.file_path)[1].lower()
-    # The helper checks known matches before creating any file or thumbnail;
-    # only fingerprints in `created` have written artifacts to clean up.
-    fingerprints, existing, scrapheaped, created = _create_picture_imports(
-        SimpleNamespace(vault=target),
-        [(data, ext, row.original_file_name)],
-        target.image_root,
-    )
-    fingerprint = fingerprints[0]
-    if fingerprint in existing:
-        return "duplicate"
-    if fingerprint in scrapheaped:
-        return "scrapheaped"
+    with import_publish_service.PublishedPictures(
+        target.image_root, f"Move of picture {row.id} into another library"
+    ) as published:
+        # The helper checks known matches before creating any file or thumbnail;
+        # only a fingerprint in `created` has a copy to record. The candidates
+        # it compared: the look again under the lock reads no file for them.
+        compared: set[int] = set()
+        fingerprints, existing, scrapheaped, created = _create_picture_imports(
+            SimpleNamespace(vault=target),
+            [(data, ext, row.original_file_name)],
+            target.image_root,
+            compared=compared,
+        )
+        fingerprint = fingerprints[0]
+        if fingerprint in existing:
+            return "duplicate"
+        if fingerprint in scrapheaped:
+            return "scrapheaped"
 
-    picture = created[fingerprint]
-    # The file was just written, so anything derived from it would say "now".
-    picture.created_at = row.created_at or picture.created_at
-    picture.imported_at = datetime.now(timezone.utc)
-    picture.score = row.score
-    picture.description = row.description
+        picture = published.add(created[fingerprint])
+        # The file was just written, so anything derived from it would say "now".
+        picture.created_at = row.created_at or picture.created_at
+        picture.imported_at = datetime.now(timezone.utc)
+        picture.score = row.score
+        picture.description = row.description
 
-    def persist(session: Session):
-        session.add(picture)
-        session.flush()
-        # A tag removed from tagging stays behind. No tags of its own: leave
-        # the marker the tagger looks for, as every other import does. One whose
-        # only tags were removed was tagged here, so it gets no marker either.
-        permitted = filter_tag_names(row.tags, session_tag_exclusions(session))
-        for tag in permitted or ([] if row.tags else [TAG_PENDING_SENTINEL]):
-            session.add(Tag(tag=tag, picture_id=picture.id))
-        session.commit()
+        def persist(session: Session):
+            session.add(picture)
+            session.flush()
+            # A tag removed from tagging stays behind. No tags of its own: leave
+            # the marker the tagger looks for, as every other import does. One whose
+            # only tags were removed was tagged here, so it gets no marker either.
+            permitted = filter_tag_names(row.tags, session_tag_exclusions(session))
+            for tag in permitted or ([] if row.tags else [TAG_PENDING_SENTINEL]):
+                session.add(Tag(tag=tag, picture_id=picture.id))
+            session.commit()
+            published.mark_committed()
 
-    try:
-        target.db.run_task(persist)
-    except Exception:
-        # Import construction writes the file (and may write a thumbnail)
-        # before the database row is committed. Do not leave either behind
-        # when persisting the row fails.
-        written = os.path.join(target.image_root, picture.file_path)
-        try:
-            os.remove(written)
-        except OSError:
-            logger.exception(
-                "Could not remove orphan file %s after failed move of picture %s",
-                written,
-                row.id,
+        with import_dedup_service.serialised_import():
+            # The full SHA-256 is the one computed above, so nothing is hashed
+            # here unless the target holds a candidate the lookup did not
+            # compare: one an import added since.
+            (match,) = import_publish_service.withdraw_imported_meanwhile(
+                target.db, published, [(picture, fingerprint[2])], compared
             )
-        try:
-            ImageUtils.remove_thumbnail(target.image_root, picture.file_path)
-        except Exception:
-            logger.exception(
-                "Could not remove orphan thumbnail for %s after failed move of picture %s",
-                picture.file_path,
-                row.id,
-            )
-        raise
+            if match is not None:
+                return "scrapheaped" if match.deleted else "duplicate"
+            target.db.run_task(persist)
     return "new"
 
 
@@ -277,14 +300,18 @@ def register_routes(router, server):
                         # notification can fail AFTER commit. Re-read instead
                         # of claiming every source stayed live in either case.
                         def source_outcomes(session: Session):
-                            deleted = set(
-                                session.exec(
-                                    select(Picture.id).where(
-                                        Picture.id.in_(arrived),
-                                        Picture.deleted.is_(True),
-                                    )
-                                ).all()
-                            )
+                            # A slice at a time, as `_read_source` reads: a
+                            # move can copy more ids than SQLite binds at once.
+                            deleted: set[int] = set()
+                            for chunk in chunked(arrived):
+                                deleted.update(
+                                    session.exec(
+                                        select(Picture.id).where(
+                                            Picture.id.in_(chunk),
+                                            Picture.deleted.is_(True),
+                                        )
+                                    ).all()
+                                )
                             # Classify locks and deletions in the same read
                             # task. A lock never overrides a confirmed move.
                             return deleted, locked_picture_ids(session, arrived)
@@ -317,10 +344,35 @@ def register_routes(router, server):
                                 if pid not in deleted and pid not in locked_now
                             ]
         except LibraryNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            # The service's message repeats the uuid as sent, unvalidated.
+            raise HTTPException(
+                status_code=404, detail="No attached library has that uuid."
+            ) from exc
         except LibraryError as exc:
             # The library could not be opened, or a switch or another move is
             # running. Nothing was copied and nothing here was touched.
+            cause = exc.__cause__
+            if cause is not None and not isinstance(cause, LibraryError):
+                # Opening failed below the library service, whose message
+                # names no path and quotes no exception. The cause's own text
+                # goes to the log, and its traceback with the chain exc_info
+                # renders; the owner gets the fixed sentence.
+                record = server.library_registry.by_uuid(payload.library_uuid)
+                logger.error(
+                    "Could not open library %s (folder %s) to move picture(s) "
+                    "%s into: %s: %s",
+                    payload.library_uuid,
+                    record.path if record is not None else None,
+                    payload.picture_ids,
+                    type(cause).__name__,
+                    cause,
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=409, detail=_OPEN_FAILED_DETAIL
+                ) from exc
+            # The service composed this message itself: busy, already open,
+            # still on its first import, or not a usable library folder.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         logger.info(

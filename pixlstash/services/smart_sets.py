@@ -37,6 +37,7 @@ from pixlstash.services.project_membership_service import (
     reconcile_entity_projects_change,
 )
 from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
+from pixlstash.utils.sql_chunking import in_json
 
 logger = get_logger(__name__)
 
@@ -163,7 +164,7 @@ def custom_smart_set_ids_in_session(
         int(s.id): s.smart
         for s in session.exec(
             select(PictureSet).where(
-                PictureSet.id.in_(list(set_ids)), PictureSet.smart.is_not(None)
+                in_json(PictureSet.id, list(set_ids)), PictureSet.smart.is_not(None)
             )
         ).all()
     }
@@ -176,7 +177,7 @@ def custom_smart_set_ids_in_session(
         for sid in session.exec(
             select(PictureSetMember.set_id)
             .where(
-                PictureSetMember.set_id.in_(ids),
+                in_json(PictureSetMember.set_id, ids),
                 PictureSetMember.smart_auto.is_(False),
             )
             .distinct()

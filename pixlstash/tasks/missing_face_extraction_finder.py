@@ -10,6 +10,7 @@ from pixlstash.utils.sql_chunking import not_in_json
 from .base_task_finder import BaseTaskFinder
 from .device_release_task import DeviceReleaseTask
 from .face_extraction_task import FaceExtractionTask
+from .pipeline_scope import pipeline_picture_clauses
 
 FACE_EXTRACTION_BATCH_LIMIT = 100
 
@@ -136,15 +137,25 @@ class MissingFaceExtractionFinder(BaseTaskFinder):
         return engine is not None and getattr(engine, "keep_models_in_memory", False)
 
     @staticmethod
+    def missing_face_clauses() -> tuple:
+        """WHERE terms for the pictures face detection has not run on (no
+        ``Face`` row, not even the no-face sentinel): this finder's and the
+        progress count's (``Vault._count_missing_feature_extractions``), so the
+        two count the same pictures. The Scrapheap is held out: detection used
+        to run on it, spending the GPU on pictures the owner had deleted."""
+        return (~Picture.faces.any(), *pipeline_picture_clauses())
+
+    @staticmethod
     def _fetch_missing_features(
         session: Session, limit: int, suppressed_ids: Collection[int] = frozenset()
     ):
-        # At the query, not in `_filter_and_claim`: a run of undecodable
-        # pictures long enough to fill the window would otherwise hand back a
-        # candidate list that claims nothing, forever, and the work behind them
-        # would never be reached at all.
+        # The suppressed ids are left out at the query, not in
+        # `_filter_and_claim`: a run of undecodable pictures long enough to fill
+        # the window would otherwise hand back a candidate list that claims
+        # nothing, forever, and the work behind them would never be reached.
         stmt = select(Picture).where(
-            ~Picture.faces.any(), not_in_json(Picture.id, suppressed_ids)
+            *MissingFaceExtractionFinder.missing_face_clauses(),
+            not_in_json(Picture.id, suppressed_ids),
         )
         return session.exec(
             stmt.options(selectinload(Picture.faces)).order_by(Picture.id).limit(limit)

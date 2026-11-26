@@ -1,6 +1,6 @@
 """Shared filter helpers for picture query construction."""
 
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from fastapi import HTTPException
 from sqlalchemy import exists, select
@@ -18,8 +18,31 @@ from pixlstash.db_models import (
 )
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 logger = get_logger(__name__)
+
+
+# Here rather than in ``predicate_filter`` (which re-exports it): that module
+# imports ``utils.service``, whose package init imports this one, so importing
+# it from here closed an import cycle.
+def is_truthy_flag(raw) -> bool:
+    """Return ``True`` for the boolean query-param spellings the frontend sends.
+
+    ``unscored=1`` is the contract, but ``true``/``yes``/``on`` are accepted too so
+    a hand-written URL behaves the same. Anything else (including an absent param
+    and the explicit ``unscored=0``) is False.
+    """
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+# The Scrapheap's pseudo character id. Compare through ``is_scrapheap_view_id``
+# and read a query's scope through ``request_targets_scrapheap``; an inline
+# comparison is what let four endpoints miss ``only_deleted``.
+SCRAPHEAP_VIEW_ID = "SCRAPHEAP"
 
 VALID_COMBINE_MODES: frozenset[str] = frozenset(
     {"mean", "max", "min", "harmonic_mean", "geometric_mean"}
@@ -79,6 +102,43 @@ def normalize_set_mode(value: str | None) -> str:
     return mode
 
 
+def is_scrapheap_view_id(value: object) -> bool:
+    """Return True when ``value`` is the Scrapheap's pseudo character id.
+
+    ``SCRAPHEAP`` is the sidebar's id for the Scrapheap view: a path id on
+    ``/characters/{id}/summary`` and the legacy ``character_id`` value of the
+    picture queries. It names no real character.
+    """
+    return value == SCRAPHEAP_VIEW_ID
+
+
+def request_targets_scrapheap(query_params: Mapping[str, object]) -> bool:
+    """Return True when a picture query is scoped to the Scrapheap.
+
+    The one parser for the Scrapheap scope of every picture query (listing,
+    stream, count, stats, search, likeness groups, export). ``only_deleted=true``
+    is the contract the frontend sends; the legacy ``character_id=SCRAPHEAP`` is
+    still honoured and logs a deprecation warning. An endpoint that reads the
+    scope any other way can answer for the live library while the grid shows the
+    Scrapheap, which is how the insights panel, text search, likeness groups and
+    export all came to ignore it.
+
+    Args:
+        query_params: The request's query params, or a dict copy of them.
+
+    Returns:
+        Whether only soft-deleted pictures are in scope.
+    """
+    if is_truthy_flag(query_params.get("only_deleted")):
+        return True
+    if is_scrapheap_view_id(query_params.get("character_id")):
+        logger.warning(
+            "character_id=SCRAPHEAP is deprecated; use only_deleted=true instead"
+        )
+        return True
+    return False
+
+
 def collect_set_filter_ids(
     *,
     set_id_value: int | str | None,
@@ -103,7 +163,7 @@ def collect_set_filter_ids(
     seen: set[int] = set()
     for raw in raw_values:
         try:
-            parsed = int(raw)
+            parsed = parse_sqlite_int(raw)
         except (TypeError, ValueError):
             continue
         if parsed <= 0 or parsed in seen:
@@ -135,14 +195,22 @@ def fetch_set_candidate_ids(
     if not set_ids:
         return set()
 
-    rows = session.exec(
-        select(PictureSetMember.set_id, PictureSetMember.picture_id)
-        .join(Picture, Picture.id == PictureSetMember.picture_id)
-        .where(PictureSetMember.set_id.in_(set_ids))
-        .where(
-            Picture.deleted.is_(True) if deleted_only else Picture.deleted.is_(False)
-        )
-    ).all()
+    # Read a batch of sets at a time: ``set_ids`` is a query param with no cap,
+    # and the modes below are computed here, so the batches lose nothing.
+    rows = [
+        row
+        for set_chunk in chunked(set_ids)
+        for row in session.exec(
+            select(PictureSetMember.set_id, PictureSetMember.picture_id)
+            .join(Picture, Picture.id == PictureSetMember.picture_id)
+            .where(PictureSetMember.set_id.in_(set_chunk))
+            .where(
+                Picture.deleted.is_(True)
+                if deleted_only
+                else Picture.deleted.is_(False)
+            )
+        ).all()
+    ]
 
     members_by_set: dict[int, set[int]] = {sid: set() for sid in set_ids}
     for set_id_row, picture_id_row in rows:

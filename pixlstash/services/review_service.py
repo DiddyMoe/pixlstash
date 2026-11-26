@@ -31,7 +31,7 @@ from pixlstash.services.set_lock_service import (
     locked_sets_for_pictures,
 )
 from pixlstash.services.tag_scan_service import DEFAULT_MAX_TWIN_HAMMING
-from pixlstash.utils.near_neighbor import hamming_distance
+from pixlstash.utils.near_neighbor import hamming_distance, parse_dhash
 from pixlstash.utils.quality.tag_exclusion import (
     TagExcludedError,
     is_excluded,
@@ -43,6 +43,7 @@ from pixlstash.utils.service.filter_helpers import (
 )
 from pixlstash.utils.service.label_ledger import HUMAN, NEG, POS
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import in_json
 
 if TYPE_CHECKING:
     from pixlstash.vault import Vault
@@ -543,7 +544,7 @@ def _progress_map(session: Session, review_ids: list[int]) -> dict[int, dict]:
             is_locked.label("is_locked"),
             func.count().label("n"),
         )
-        .where(TagSuggestion.review_id.in_(review_ids))
+        .where(in_json(TagSuggestion.review_id, review_ids))
         .group_by(TagSuggestion.review_id, TagSuggestion.status, is_locked)
     ).all()
     for rid, status, locked_flag, n in rows:
@@ -955,19 +956,18 @@ def derive_kind(
     if s_stack is not None and s_stack == t_stack:
         return "pair"
     if s_hash and t_hash:
-        try:
-            if hamming_distance(int(s_hash, 16), int(t_hash, 16)) <= max_twin_hamming:
-                return "pair"
-        except (ValueError, TypeError) as exc:
-            # A malformed/non-hex perceptual hash can't be compared; fall back to
-            # "binary" instead of silently swallowing it (no-silent-pass rule).
+        s_value, t_value = parse_dhash(s_hash), parse_dhash(t_hash)
+        if s_value is None or t_value is None:
+            # A malformed perceptual hash can't be compared, so the pair is
+            # classified binary; logged rather than silently swallowed.
             logger.debug(
-                "derive_kind: unparseable perceptual hash (suspect=%r, twin=%r): "
-                "%s; classifying pair as binary",
+                "derive_kind: unparseable perceptual hash (suspect=%r, twin=%r); "
+                "classifying pair as binary",
                 s_hash,
                 t_hash,
-                exc,
             )
+        elif hamming_distance(s_value, t_value) <= max_twin_hamming:
+            return "pair"
     return "binary"
 
 
@@ -1033,7 +1033,13 @@ def list_review_suggestions(
         if status:
             q = q.where(TagSuggestion.status == status.upper())
         if picture_ids is not None:
-            q = q.where(TagSuggestion.picture_id.in_(picture_ids))
+            q = q.where(
+                TagSuggestion.picture_id.in_(
+                    scope_id_subquery(
+                        session, picture_ids, name="_pixlstash_review_list_ids"
+                    )
+                )
+            )
         q = (
             q.order_by(TagSuggestion.score.desc(), TagSuggestion.twin_sim.desc())
             .offset(offset)

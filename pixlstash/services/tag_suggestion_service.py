@@ -54,6 +54,7 @@ from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.utils.service.tag_prediction_utils import (
     recompute_anomaly_tag_uncertainty,
 )
+from pixlstash.utils.sql_chunking import in_json, not_in_json
 
 if TYPE_CHECKING:
     from pixlstash.vault import Vault
@@ -160,10 +161,16 @@ def list_suggestions(
         if source:
             q = q.where(TagSuggestion.source == source)
         if picture_ids is not None:
-            q = q.where(TagSuggestion.picture_id.in_(picture_ids))
+            q = q.where(
+                TagSuggestion.picture_id.in_(
+                    scope_id_subquery(
+                        session, picture_ids, name="_pixlstash_suggestion_list_ids"
+                    )
+                )
+            )
         removed = excluded_spellings(session, TagSuggestion.tag)
         if removed:
-            q = q.where(TagSuggestion.tag.notin_(removed))
+            q = q.where(not_in_json(TagSuggestion.tag, removed))
         q = (
             q.order_by(
                 TagSuggestion.score.desc(),
@@ -254,7 +261,7 @@ def get_tagger_confidences(
                 TagPrediction.predicted_at,
             ).where(
                 TagPrediction.picture_id.in_(prediction_scope),
-                TagPrediction.tag.in_(tagset),
+                in_json(TagPrediction.tag, tagset),
             )
         ).all()
         best: dict[tuple[int, str], tuple[float, object]] = {}
@@ -563,7 +570,12 @@ def _confidence_map(session: Session, pids: list[int], tag: str) -> dict[int, fl
             TagPrediction.picture_id,
             TagPrediction.confidence,
             TagPrediction.predicted_at,
-        ).where(TagPrediction.picture_id.in_(pids), TagPrediction.tag == tag)
+        ).where(
+            TagPrediction.picture_id.in_(
+                scope_id_subquery(session, pids, name="_pixlstash_confidence_map_ids")
+            ),
+            TagPrediction.tag == tag,
+        )
     ).all():
         prev = best.get(pid)
         if prev is None or (at is not None and (prev[1] is None or at > prev[1])):
@@ -726,7 +738,13 @@ def bulk_accept(
         if direction:
             q = q.where(TagSuggestion.direction == direction)
         if picture_ids is not None:
-            q = q.where(TagSuggestion.picture_id.in_(picture_ids))
+            q = q.where(
+                TagSuggestion.picture_id.in_(
+                    scope_id_subquery(
+                        session, picture_ids, name="_pixlstash_suggestion_bulk_ids"
+                    )
+                )
+            )
         if review_id is not None:
             q = q.where(TagSuggestion.review_id == review_id)
         rows = list(session.exec(q).all())

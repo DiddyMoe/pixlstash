@@ -8,7 +8,6 @@ Phase 2 §4.6). Character-likeness scoring lives in the sibling
 """
 
 import functools
-import json
 import pathlib
 from collections import defaultdict
 from dataclasses import dataclass
@@ -27,6 +26,7 @@ from pixlstash.db_models import (
     TagPrediction,
     User,
 )
+from pixlstash.db_models.face import read_stored_bbox
 from pixlstash.db_models.tag_prediction import feeds_anomaly_score
 from pixlstash.services.tagger_run_service import get_latest_tag_precisions
 from pixlstash.utils.quality.anomaly_penalty import ANOMALY_PENALTY_TAGS
@@ -37,7 +37,8 @@ from pixlstash.utils.quality.smart_score_utils import (
 )
 from pixlstash.utils.service.anomaly_thresholds import resolve_anomaly_apply_thresholds
 from pixlstash.utils.service.label_ledger import HUMAN, NEG, POS
-from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked, in_json
 from pixlstash.pixl_logging import get_logger
 
 logger = get_logger(__name__)
@@ -241,7 +242,9 @@ def read_scoring_anchors(session: Session) -> tuple[list, list]:
 def get_smart_score_penalised_tags_from_request(server, request):
     user_id = server.auth.get_user_id(request)
     if user_id is None:
-        return DEFAULT_SMART_SCORE_PENALIZED_TAGS
+        # A copy: the module-level seed is shared by every caller, and a
+        # request that edited the table it was handed would edit the seed.
+        return dict(DEFAULT_SMART_SCORE_PENALIZED_TAGS)
     # Read from the hub. NOTE: smart_score_penalised_tags is library-scoped by
     # plan §5 and its home is the vault's library_settings row, which migration
     # 0092 creates but nothing reads yet. Until that is wired, the hub's copy of
@@ -274,7 +277,11 @@ def fetch_applied_anomaly_tags(session: Session, picture_ids) -> dict:
         return applied
     rows = session.exec(
         select(Tag.picture_id, Tag.tag).where(
-            Tag.picture_id.in_(picture_ids),
+            Tag.picture_id.in_(
+                scope_id_subquery(
+                    session, picture_ids, name="_pixlstash_applied_anomaly_ids"
+                )
+            ),
             func.lower(Tag.tag).in_(ANOMALY_PENALTY_TAGS),
         )
     ).all()
@@ -348,7 +355,11 @@ def fetch_anomaly_confidences(
             TagPrediction.label_source,
             TagPrediction.model_version,
         ).where(
-            TagPrediction.picture_id.in_(picture_ids),
+            TagPrediction.picture_id.in_(
+                scope_id_subquery(
+                    session, picture_ids, name="_pixlstash_anomaly_confidence_ids"
+                )
+            ),
             func.lower(TagPrediction.tag).in_(ANOMALY_PENALTY_TAGS),
         )
     ).all()
@@ -437,6 +448,7 @@ def fetch_main_face_mpx(session: Session, picture_ids) -> dict:
     for chunk in chunked(ids):
         rows = session.exec(
             select(
+                Face.id,
                 Face.picture_id,
                 Face.bbox_,
                 Picture.width,
@@ -446,17 +458,16 @@ def fetch_main_face_mpx(session: Session, picture_ids) -> dict:
             .join(Picture, Picture.id == Face.picture_id)
             .where(Face.picture_id.in_(chunk), Face.bbox_.is_not(None))
         ).all()
-        for picture_id, raw, width, height, orientation in rows:
-            try:
-                x1, y1, x2, y2 = (float(v) for v in json.loads(raw))
-            except (TypeError, ValueError) as exc:
-                logger.warning(
-                    "Unreadable face box %r on picture %s (%s); ignored for resolution.",
-                    raw,
-                    picture_id,
-                    exc,
-                )
+        for face_id, picture_id, raw, width, height, orientation in rows:
+            # A box that is not four finite numbers (logged once) is left out:
+            # NaN or an infinity would score as the largest face, and an
+            # integer too large for a float raised OverflowError.
+            box = read_stored_bbox(
+                raw, owner="Face", row_id=face_id, picture_id=picture_id
+            )
+            if box is None:
                 continue
+            x1, y1, x2, y2 = (float(v) for v in box)
             area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
             # The box is in the picture as shown; a quarter turn swaps the file's
             # width and height.
@@ -615,10 +626,16 @@ def fetch_smart_score_data(
                 # Nothing to score, so the anchors are not read; every caller
                 # scores only when ``candidates`` is non-empty.
                 return [], [], [], {}
-            query = query.where(Picture.id.in_(candidate_ids))
+            query = query.where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, candidate_ids, name="_pixlstash_score_candidate_ids"
+                    )
+                )
+            )
 
         if format:
-            query = query.where(Picture.format.in_(format))
+            query = query.where(in_json(Picture.format, format))
 
         query = query.where(Picture.image_embedding.is_not(None))
 
@@ -694,10 +711,16 @@ def fetch_smart_score_unscored_ids(
         if candidate_ids is not None:
             if not candidate_ids:
                 return []
-            query = query.where(Picture.id.in_(candidate_ids))
+            query = query.where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, candidate_ids, name="_pixlstash_unscored_candidate_ids"
+                    )
+                )
+            )
 
         if format:
-            query = query.where(Picture.format.in_(format))
+            query = query.where(in_json(Picture.format, format))
 
         query = query.where(Picture.image_embedding.is_(None))
 
@@ -919,19 +942,31 @@ def find_pictures_by_smart_score(
         return []
 
     def fetch_final_pics(session, ids):
-        return session.exec(select(Picture).where(Picture.id.in_(ids))).all()
+        return session.exec(
+            select(Picture).where(
+                Picture.id.in_(
+                    scope_id_subquery(session, ids, name="_pixlstash_score_page_ids")
+                )
+            )
+        ).all()
 
     res_pics = server.vault.db.run_task(
         fetch_final_pics, final_ids, priority=DBPriority.IMMEDIATE
     )
+    # Imported here, not at the top: the listing module imports
+    # ``pixlstash.scoring``, so a module-level import is circular.
+    from pixlstash.routes.pictures._listing import stored_picture_dict
+
     pmap = {p.id: p for p in res_pics}
     metadata_fields = Picture.metadata_fields()
 
     results = []
     for pid in final_ids:
         if pid in pmap:
-            p = pmap[pid]
-            d = {field: getattr(p, field) for field in metadata_fields}
+            # Read through the column types: a stored value its column does
+            # not declare is null in its row, not a 500 for the page.
+            stored = stored_picture_dict(pmap[pid])
+            d = {field: stored.get(field) for field in metadata_fields}
             d["smartScore"] = score_map.get(pid)
             results.append(d)
 

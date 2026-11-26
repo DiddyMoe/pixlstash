@@ -44,6 +44,7 @@ from pixlstash.db_models import Picture, PictureSet, PictureSetMember
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import in_json
 
 logger = get_logger(__name__)
 
@@ -282,7 +283,7 @@ def locked_set_ids(session: Session, set_ids) -> set[int]:
         return set()
     rows = session.exec(
         select(PictureSet.id).where(
-            PictureSet.id.in_(sorted(ids)),
+            in_json(PictureSet.id, ids),
             PictureSet.locked.is_(True),
         )
     ).all()

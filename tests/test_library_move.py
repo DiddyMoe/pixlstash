@@ -31,9 +31,12 @@ from pixlstash.db_models import (
     Tag,
     UserToken,
 )
+from pixlstash.routes.pictures import _library_move
 from pixlstash.server import Server
+from pixlstash.services import import_dedup_service, import_publish_service
 from pixlstash.services.library_switch_service import LibrarySwitchError
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from tests.test_export_by_ids_api import VARIABLE_CEILING, _sqlite_variable_ceiling
 from tests.utils import reset_owner_auth
 
 API = "/api/v1"
@@ -95,6 +98,13 @@ def _png() -> bytes:
     """A picture no other test has made, so a duplicate is one on purpose."""
     buffer = io.BytesIO()
     Image.new("RGB", (8, 8), (next(_SHADE), 40, 90)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _bmp(colour) -> bytes:
+    """An uncompressed picture: two of them are the same size, byte for byte."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), colour).save(buffer, format="BMP")
     return buffer.getvalue()
 
 
@@ -337,6 +347,212 @@ class TestWhatTheOtherLibraryAlreadyHolds:
         assert _here(server, again).deleted is False
         (only,) = _there(server, other, sha)
         assert only["deleted"] is True
+
+    @pytest.mark.parametrize("scrapheaped", [False, True], ids=["live", "scrapheaped"])
+    def test_a_file_an_import_adds_there_during_the_copy_stays_here(
+        self, server, owner, other, monkeypatch, scrapheaped
+    ):
+        """The lookup and the copy run outside the import lock, so an import
+        can add the same file to the other library before the move inserts.
+        The look again under the lock finds it: the move's copy is removed,
+        the picture stays here, and the other library keeps the one row."""
+        data = _png()
+        picture_id = _add(server, data, tags=["here"])
+        sha = _here(server, picture_id).pixel_sha
+        real_imports = _library_move._create_picture_imports
+        racers, copies = [], []
+
+        def import_then_race(target_server, files, dest_folder, compared=None):
+            result = real_imports(target_server, files, dest_folder, compared=compared)
+            target = target_server.vault
+            racer = ImageUtils.create_picture_from_bytes(target.image_root, data)
+            racer.deleted = scrapheaped
+            racers.append(target.db.run_task(_insert, racer, ["racer"]))
+            copies.extend(
+                ImageUtils.resolve_picture_path(dest_folder, pic.file_path)
+                for pic in result[3].values()
+            )
+            return result
+
+        monkeypatch.setattr(_library_move, "_create_picture_imports", import_then_race)
+
+        response = _move(owner, other, [picture_id])
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        reported, not_reported = "skipped_already_there", "skipped_scrapheaped"
+        if scrapheaped:
+            reported, not_reported = not_reported, reported
+        assert body[reported] == [picture_id], body
+        assert (body["moved"], body[not_reported], body["failed"]) == ([], [], [])
+        assert _here(server, picture_id).deleted is False
+        assert len(copies) == 1 and not os.path.exists(copies[0])
+        (only,) = _there(server, other, sha)
+        assert (only["id"], only["deleted"], only["tags"]) == (
+            racers[0],
+            scrapheaped,
+            ["racer"],
+        )
+        assert only["on_disk"] is True
+
+
+class TestTheImportLock:
+    def test_the_copy_is_hashed_and_written_before_the_lock_is_taken(
+        self, server, owner, other, monkeypatch
+    ):
+        """The import lock is one per process, so a long video hashed or
+        copied under it would stall every import in every library. Only the
+        look again and the insert hold it."""
+        picture_id = _add(server, _png(), tags=["outside-the-lock"])
+        held: dict[str, set[bool]] = {}
+
+        def recording(name, func):
+            def wrapper(*args, **kwargs):
+                held.setdefault(name, set()).add(
+                    import_dedup_service._IMPORT_LOCK.locked()
+                )
+                return func(*args, **kwargs)
+
+            return wrapper
+
+        for name in (
+            "calculate_hash_from_bytes",
+            "calculate_full_hash_from_bytes",
+            "create_picture_from_bytes",
+        ):
+            monkeypatch.setattr(
+                ImageUtils, name, recording(name, getattr(ImageUtils, name))
+            )
+        monkeypatch.setattr(
+            import_publish_service,
+            "withdraw_imported_meanwhile",
+            recording("look again", import_publish_service.withdraw_imported_meanwhile),
+        )
+        # Called inside the insert, on the writer thread.
+        monkeypatch.setattr(
+            _library_move,
+            "filter_tag_names",
+            recording("insert", _library_move.filter_tag_names),
+        )
+
+        response = _move(owner, other, [picture_id])
+
+        assert response.status_code == 200, response.text
+        assert response.json()["moved"] == [picture_id]
+        assert held == {
+            "calculate_hash_from_bytes": {False},
+            "calculate_full_hash_from_bytes": {False},
+            "create_picture_from_bytes": {False},
+            "look again": {True},
+            "insert": {True},
+        }
+
+    def test_a_collision_compared_before_the_lock_costs_no_read_under_it(
+        self, server, owner, other, monkeypatch
+    ):
+        """A picture the other library held before, sharing the file's sampled
+        hash and size, is compared once, by the lookup before the import lock.
+        The look again under the lock knows it was compared and reads no file
+        for it: only a candidate added since the lookup is read there."""
+        forced = "forced-move-compared-collision"
+        there_already = _bmp((201, 17, 99))
+        moving = _bmp((99, 17, 201))
+        assert len(there_already) == len(moving)
+        monkeypatch.setattr(
+            ImageUtils,
+            "calculate_hash_from_bytes",
+            staticmethod(lambda *_args, **_kwargs: forced),
+        )
+        with server.library_switch.open_other_library(other.uuid) as (_library, vault):
+            candidate = ImageUtils.create_picture_from_bytes(
+                vault.image_root, there_already, pixel_sha=forced
+            )
+            vault.db.run_task(_insert, candidate, ["there-already"])
+            candidate_path = os.path.realpath(
+                ImageUtils.resolve_picture_path(vault.image_root, candidate.file_path)
+            )
+        # The row carries the sampled hash the move computes from its bytes.
+        picture_id = _add(server, moving, tags=["moving"], pixel_sha=forced)
+        real_full_hash = ImageUtils.calculate_full_hash_from_file_path
+        candidate_reads: list[bool] = []
+
+        def spy(path):
+            if os.path.realpath(path) == candidate_path:
+                candidate_reads.append(import_dedup_service._IMPORT_LOCK.locked())
+            return real_full_hash(path)
+
+        monkeypatch.setattr(
+            ImageUtils, "calculate_full_hash_from_file_path", staticmethod(spy)
+        )
+
+        response = _move(owner, other, [picture_id])
+
+        assert response.status_code == 200, response.text
+        assert response.json()["moved"] == [picture_id]
+        assert len(_there(server, other, forced)) == 2
+        # Compared before the lock, and not again under it.
+        assert candidate_reads == [False], candidate_reads
+
+
+class TestALongSelection:
+    def test_more_ids_than_sqlite_binds_at_once_are_read_and_read_again(
+        self, server, owner, other, monkeypatch
+    ):
+        """A request carries up to 1000 ids, past the 999 host parameters
+        SQLite binds before 3.32.0. Every id is read with its tag, and the
+        read after a failed Scrapheap step finds every one of them moved."""
+        count = VARIABLE_CEILING + 1
+
+        def seed(session: Session) -> list[int]:
+            now = datetime.now(timezone.utc)
+            pictures = [
+                Picture(
+                    file_path=f"/nonexistent/libmove-long-{n}.png",
+                    format="png",
+                    width=8,
+                    height=8,
+                    pixel_sha=f"libmove-long-{n}",
+                    imported_at=now,
+                )
+                for n in range(count)
+            ]
+            session.add_all(pictures)
+            session.flush()
+            for n, pic in enumerate(pictures):
+                session.add(Tag(tag=f"libmove-long-{n}", picture_id=pic.id))
+            session.commit()
+            return [int(pic.id) for pic in pictures]
+
+        ids = server.vault.db.run_task(seed)
+        read, scrapheaped = [], []
+        real_scrapheap = _library_move.scrapheap_pictures
+
+        def copy(target, source_root, row):
+            read.append((row.id, row.tags))
+            return "new"
+
+        def scrapheap_then_fail(*args):
+            # The soft delete commits, then a later step fails: the route reads
+            # the source again to say what happened.
+            scrapheaped.append(real_scrapheap(*args))
+            raise RuntimeError("example-post-commit-failure")
+
+        monkeypatch.setattr(_library_move, "_copy_into", copy)
+        monkeypatch.setattr(_library_move, "scrapheap_pictures", scrapheap_then_fail)
+
+        with _sqlite_variable_ceiling(server):
+            response = _move(owner, other, ids)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert read == [(pid, [f"libmove-long-{n}"]) for n, pid in enumerate(ids)]
+        assert scrapheaped == [(ids, [])]
+        assert body["moved"] == ids
+        assert (
+            body["copied_source_unknown"],
+            body["copied_but_not_moved"],
+            body["copied_but_locked"],
+        ) == ([], [], [])
 
 
 class TestWhatIsLeftBehind:
@@ -637,15 +853,77 @@ class TestRefusals:
         assert response.status_code == 409, response.text
         assert _here(server, picture_id).deleted is False
 
+    def test_the_active_library_refusal_says_why(self, server, owner):
+        """The service's own sentences still reach the owner: only text from
+        the layers below it is replaced."""
+        picture_id = _add(server, _png())
+        active = server.library_registry.active_library()
+
+        response = owner.post(
+            MOVE, json={"picture_ids": [picture_id], "library_uuid": active.uuid}
+        )
+
+        assert response.status_code == 409, response.text
+        assert "is the library that is already open" in response.json()["detail"]
+
     def test_an_unknown_library_is_a_404(self, server, owner):
+        """The detail is the server's sentence; the uuid as sent is not
+        repeated back."""
         picture_id = _add(server, _png())
 
         response = owner.post(
             MOVE,
-            json={"picture_ids": [picture_id], "library_uuid": "no-such-library"},
+            json={
+                "picture_ids": [picture_id],
+                "library_uuid": "example-no-such-library",
+            },
         )
 
         assert response.status_code == 404, response.text
+        assert response.json()["detail"] == "No attached library has that uuid."
+        assert _here(server, picture_id).deleted is False
+
+    def test_a_library_that_fails_to_open_answers_a_fixed_sentence(
+        self, server, owner, other, monkeypatch, caplog
+    ):
+        """The opening error's own text is logged with its traceback, never
+        returned."""
+        picture_id = _add(server, _png())
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("example-internal-detail")
+
+        monkeypatch.setattr(server, "build_vault", fail)
+        with caplog.at_level("ERROR"):
+            response = _move(owner, other, [picture_id])
+
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == (
+            "The other library could not be opened. Nothing was moved."
+        )
+        logged = [
+            record
+            for record in caplog.records
+            if record.name.endswith("_library_move") and record.exc_info
+        ]
+        assert logged, caplog.records
+        message = logged[0].getMessage()
+        # The cause's own words: the service's message names no exception.
+        assert "RuntimeError: example-internal-detail" in message
+        # Enough to find the library and the gesture again.
+        assert other.uuid in message
+        assert other.path in message
+        assert f"[{picture_id}]" in message
+        assert _here(server, picture_id).deleted is False
+
+    def test_an_id_sqlite_cannot_store_is_a_422(self, server, owner, other):
+        """``2**63`` overflowed the driver while binding (a 500)."""
+        picture_id = _add(server, _png())
+
+        response = _move(owner, other, [picture_id, 2**63])
+
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"][0]["loc"][-2:] == ["picture_ids", 1]
         assert _here(server, picture_id).deleted is False
 
     def test_a_move_is_refused_while_a_switch_holds_the_library(

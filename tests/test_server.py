@@ -2427,21 +2427,24 @@ def test_export_by_query_encodes_the_query_off_the_db_writer_thread(
 ):
     """``GET /pictures/export?query=`` encodes its query before queuing the search.
 
-    Export by query uses only the SBERT encoder, on ``"A photo of " + query``.
+    Export by query runs the search route's ``search_results``, so it encodes
+    as the search does.
     """
     encodes, searches, writer = _record_query_encoding(server, monkeypatch)
 
     _run_export(server, client, "a red bicycle")
 
     assert [(name, text) for name, text, _, _ in encodes] == [
-        ("sbert", "A photo of a red bicycle"),
-    ], "export must encode 'A photo of <query>' once, with SBERT only"
-    assert encodes[0][2] is not writer, (
-        "the export query encode ran on the DB writer thread"
-    )
+        ("sbert", "a red bicycle"),
+        ("clip", "a red bicycle"),
+    ], "export must encode the query as the search does, once per encoder"
+    for name, _, thread, _ in encodes:
+        assert thread is not writer, (
+            f"the export's {name} query encode ran on the DB writer thread"
+        )
     assert len(searches) == 1, searches
     assert searches[0]["query_embedding"] is encodes[0][3]
-    assert searches[0].get("clip_query_embedding") is None
+    assert searches[0]["clip_query_embedding"] is encodes[1][3]
 
 
 def _run_export(server, client, query):

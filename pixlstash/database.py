@@ -39,6 +39,7 @@ from pixlstash.utils.tag_reset_registry import TagResetRegistry
 from pixlstash.utils.quality.tag_exclusion import (
     SESSION_INFO_KEY as TAG_EXCLUSIONS_INFO_KEY,
 )
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.sqlite_uri import sqlite_url
 from pixlstash.utils.unprocessable_image_registry import UnprocessableImageRegistry
 
@@ -518,11 +519,14 @@ def _after_flush_layout_marker(session, flush_context) -> None:
     with session.no_autoflush:
         # Core UPDATE against the Table for the same reason the hash hook uses
         # one: it must not re-enter the ORM flush cycle that called it.
-        session.execute(
-            sa_update(Picture.__table__)
-            .where(Picture.__table__.c.id.in_(sorted(dirty_pids)))
-            .values(layout_check_due_at=due_at)
-        )
+        # Chunked: a bulk move or import dirties more pictures than SQLite
+        # binds in one statement, and a constant SET is the same per chunk.
+        for chunk in chunked(sorted(dirty_pids)):
+            session.execute(
+                sa_update(Picture.__table__)
+                .where(Picture.__table__.c.id.in_(chunk))
+                .values(layout_check_due_at=due_at)
+            )
         for pid in dirty_pids:
             # Expire it, or a picture already loaded keeps reading the old
             # value and setting that value again writes nothing.
@@ -559,13 +563,16 @@ def _after_flush_smart_score_reset(session, flush_context) -> None:
         return
     with session.no_autoflush:
         # Core UPDATE, as in the hooks above, so the flush cycle is not re-entered.
+        # Chunked like the layout marker: a face pass or a restore can move
+        # more boxes in one flush than SQLite binds in one statement.
         table = Picture.__table__
-        session.execute(
-            sa_update(table)
-            .where(table.c.id.in_(sorted(dirty_pids)))
-            .where(table.c.smart_score.is_not(None))
-            .values(smart_score=None)
-        )
+        for chunk in chunked(sorted(dirty_pids)):
+            session.execute(
+                sa_update(table)
+                .where(table.c.id.in_(chunk))
+                .where(table.c.smart_score.is_not(None))
+                .values(smart_score=None)
+            )
         for pid in dirty_pids:
             cached = session.identity_map.get(identity_key(Picture, pid))
             if cached is not None:
@@ -672,6 +679,42 @@ class DBPriority(IntEnum):
     IMMEDIATE = 0
 
 
+AGING_S = {
+    DBPriority.IMMEDIATE: 0.0,
+    DBPriority.HIGH: 0.25,
+    DBPriority.MEDIUM: 0.5,
+    DBPriority.LOW: 1.5,
+}
+"""Seconds of head start each priority gives up, as a writer-queue deadline.
+
+The writer runs the task with the earliest ``enqueued + AGING_S[priority]``,
+not the most urgent priority outright. Strict priority starved a LOW task for
+as long as anything above it kept arriving: a background run's LOW slice
+waited behind a stream of HIGH writes indefinitely. With a deadline, a task
+outranks any task enqueued more than its offset after it, so a LOW task waits
+at most 1.5 s behind newer IMMEDIATE work and 1.25 s behind newer HIGH work,
+however much keeps coming, while among tasks enqueued together the order is
+still IMMEDIATE, HIGH, MEDIUM, LOW. This is aging in its deadline form, as
+the Linux deadline I/O scheduler gives each request an expiry
+(https://en.wikipedia.org/wiki/Aging_(scheduling),
+https://docs.kernel.org/block/deadline-iosched.html); a fixed key per task
+keeps the heap valid without re-sorting
+(https://docs.python.org/3/library/heapq.html#priority-queue-implementation-notes).
+"""
+
+
+def _aging_s(priority) -> float:
+    """The deadline offset for *priority*.
+
+    A value between two named levels (a caller passing a bare int) ages as the
+    more urgent of them; one more urgent than IMMEDIATE ages as IMMEDIATE.
+    """
+    if priority in AGING_S:
+        return AGING_S[DBPriority(priority)]
+    urgent = [level for level in AGING_S if level <= priority]
+    return AGING_S[max(urgent)] if urgent else AGING_S[DBPriority.IMMEDIATE]
+
+
 # How long close() waits for the writer to finish the task in hand. A writer
 # still busy after that keeps the engine and releases it itself (see close()).
 _WRITER_JOIN_TIMEOUT_S = 10
@@ -699,13 +742,71 @@ class DatabaseUnavailableError(RuntimeError):
     """The vault database refused a task: it is closing, closed or its writer failed."""
 
 
+class WriterMeter:
+    """Writer time spent on the tasks submitted inside one :func:`writer_meter`.
+
+    The writer adds each such task's run time once it has run, before the
+    task's future settles, so a caller that waited on its tasks reads a total
+    that includes them. Time a task spent queued is not counted: this measures
+    how long the caller held the writer, not how long it waited for it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.seconds = 0.0
+        self.tasks = 0
+
+    def add(self, seconds: float) -> None:
+        """Count one task that held the writer for *seconds*."""
+        with self._lock:
+            self.seconds += seconds
+            self.tasks += 1
+
+
+_WRITER_METER: contextvars.ContextVar[Optional[WriterMeter]] = contextvars.ContextVar(
+    "pixlstash_writer_meter", default=None
+)
+
+
+@contextmanager
+def writer_meter():
+    """Meter the writer time of every task submitted inside the block.
+
+    A :class:`DatabaseTask` copies the caller's context when it is created,
+    so the meter follows a task through however many service layers submit
+    it, and a task submitted from another thread (another request) is never
+    counted. A background run uses it to size its next slice by the writer
+    time the last one actually took.
+
+    Yields:
+        The :class:`WriterMeter`, read after the tasks have settled.
+    """
+    meter = WriterMeter()
+    token = _WRITER_METER.set(meter)
+    try:
+        yield meter
+    finally:
+        _WRITER_METER.reset(token)
+
+
 # Database task for the queue
 class DatabaseTask:
+    """One unit of writer work, ordered on the queue by :attr:`sort_key`.
+
+    The key is ``(tier, deadline, sequence)``. Tier 0 holds the close sentinel
+    (``func is None``) and control tasks, which run before any ordinary task;
+    tier 1 holds the rest, earliest deadline first (see :data:`AGING_S`).
+    ``sequence`` keeps equal deadlines first-come, first-served.
+    """
+
     _sequence = itertools.count()
 
     def __init__(self, priority, func, args=(), kwargs=None, is_control=False):
         self.priority = priority
         self.sequence = next(self._sequence)
+        self.enqueued_at = time.monotonic()
+        tier = 0 if func is None or is_control else 1
+        self.sort_key = (tier, self.enqueued_at + _aging_s(priority), self.sequence)
         self.func = func
         self.args = args
         self.kwargs = kwargs or {}
@@ -723,17 +824,17 @@ class DatabaseTask:
     def __lt__(self, other):
         if not isinstance(other, DatabaseTask):
             return NotImplemented
-        return (self.priority, self.sequence) < (other.priority, other.sequence)
+        return self.sort_key < other.sort_key
 
     def __le__(self, other):
         if not isinstance(other, DatabaseTask):
             return NotImplemented
-        return (self.priority, self.sequence) <= (other.priority, other.sequence)
+        return self.sort_key <= other.sort_key
 
     def __eq__(self, other):
         if not isinstance(other, DatabaseTask):
             return NotImplemented
-        return (self.priority, self.sequence) == (other.priority, other.sequence)
+        return self.sort_key == other.sort_key
 
 
 def _task_label(func) -> str:
@@ -746,6 +847,18 @@ def _task_label(func) -> str:
 def _writer_failed_message(reason: str) -> str:
     """The refusal every task gets once the writer loop has failed."""
     return f"VaultDatabase writer has failed ({reason}); task refused."
+
+
+# What ``writer_status()`` says about a failure. The exception itself goes to
+# the server log only: its text can carry file paths and library content, and
+# the writer's status is served to the SPA (GET /workers/progress).
+SESSION_FAILURE_MESSAGE = (
+    "A database session failed and was discarded; the server log has the details."
+)
+WRITER_FAILURE_MESSAGE = (
+    "The database writer stopped on an unexpected error and refuses every "
+    "write; the server log has the details."
+)
 
 
 logger = get_logger(__name__)
@@ -843,11 +956,17 @@ def _levenshtein_internal(concatenated_tags, query, picture_id=None):
     matched_words = sum(1 for dist in query_dists if dist <= good_match_threshold)
     exact_matches = sum(1 for dist in query_dists if dist <= exact_match_threshold)
     coverage = matched_words / len(query_dists) if query_dists else 0.0
-    logger.info(
-        "Best Levenshtein distances for tags '%s': %s (picture_id=%s, best_k=%d, total_tags=%d, mean_best=%.4f, mean_query=%.4f, softmin=%.4f, coverage=%.2f, exact=%d, query_words=%s)",
+    # Runs once per candidate row of a scored search, so DEBUG only: at INFO
+    # it cost every search two records per row and wrote the search text and
+    # each picture's tags to the log. Every argument is already
+    # computed, so with DEBUG off the call costs only the level check.
+    logger.debug(
+        "Levenshtein score inputs (picture_id=%s): tags=%r best_dists=%s "
+        "best_k=%d total_tags=%d mean_best=%.4f mean_query=%.4f softmin=%.4f "
+        "coverage=%.2f exact=%d query_word_dists=%s",
+        picture_id,
         concatenated_tags,
         best_dists,
-        picture_id,
         best_k,
         len(tags),
         mean_best,
@@ -855,14 +974,8 @@ def _levenshtein_internal(concatenated_tags, query, picture_id=None):
         softmin_value,
         coverage,
         exact_matches,
-        d_query_words,
+        query_dist_map,
     )
-    if query_dist_map:
-        logger.info(
-            "Query word min distances (picture_id=%s): %s",
-            picture_id,
-            {word: round(dist, 4) for word, dist in query_dist_map.items()},
-        )
 
     # Prioritize query-word matches over non-matching tags.
     base_score = 0.75 * mean_query + 0.15 * softmin_value + 0.10 * mean_best
@@ -1278,10 +1391,12 @@ class VaultDatabase:
     ):
         self._db_path = db_path
         self.image_root = os.path.dirname(self._db_path)
-        # In-memory, process-lifetime set of pictures whose image file cannot be
-        # decoded (issue #585). Shared by task threads (marking) and finder
-        # threads (suppression); reachable from both via their ``self._db``.
-        self.unprocessable_images = UnprocessableImageRegistry()
+        # The pictures whose image file cannot be decoded or reached (issue
+        # #585), written through to this database's ``unprocessableimage``
+        # rows and read back on first use, after the engine exists. Shared by
+        # task threads (marking) and finder threads (suppression); reachable
+        # from both via their ``self._db``.
+        self.unprocessable_images = UnprocessableImageRegistry(self)
         # When each picture's tags were last reset, so a tag task that read the
         # picture before a retag does not write over it (#1361).
         self.tag_resets = TagResetRegistry()
@@ -1352,10 +1467,11 @@ class VaultDatabase:
         # across the writer join: a submit (possibly from a done-callback on
         # the writer thread itself) must never wait on that.
         self._admission_lock = threading.Lock()
-        # _state, _failed_reason, _writer_running and _release_pending
-        # change only under _admission_lock.
+        # _state, _failed_reason, _failed_at, _writer_running and
+        # _release_pending change only under _admission_lock.
         self._state = WriterState.OPEN
         self._failed_reason = None
+        self._failed_at = None
         self._writer_running = True
         self._release_pending = False
         # Writer-thread bookkeeping for writer_status(): (label, monotonic
@@ -1636,11 +1752,14 @@ class VaultDatabase:
         ``current_task_seconds`` the task in hand (None between tasks);
         ``last_session_failure`` the last session the writer had to discard
         (``at`` epoch seconds, ``task``, ``step``, ``error``); ``failed_reason``
-        why the writer loop failed, if it did.
+        and ``failed_at`` (epoch seconds) whether and when the writer loop
+        failed, None while it has not. ``error`` and ``failed_reason`` are
+        fixed sentences that point at the server log, where the exception was
+        logged with its traceback.
         """
         with self._admission_lock:
             state = self._state
-            failed_reason = self._failed_reason
+            failed_at = self._failed_at
         current = self._current_task
         last_failure = self._last_session_failure
         return {
@@ -1652,7 +1771,8 @@ class VaultDatabase:
                 round(time.monotonic() - current[1], 1) if current else None
             ),
             "last_session_failure": dict(last_failure) if last_failure else None,
-            "failed_reason": failed_reason,
+            "failed_reason": WRITER_FAILURE_MESSAGE if failed_at is not None else None,
+            "failed_at": failed_at,
         }
 
     @staticmethod
@@ -1750,7 +1870,8 @@ class VaultDatabase:
                 "VaultDatabase: skipped %s, cancelled before it started.", label
             )
             return
-        self._current_task = (label, time.monotonic())
+        started = time.monotonic()
+        self._current_task = (label, started)
         try:
             if self._state is not WriterState.OPEN:
                 result, error = (
@@ -1773,6 +1894,9 @@ class VaultDatabase:
                 result, error = self._run_in_session(task, label)
         finally:
             self._current_task = None
+        meter = task._context.get(_WRITER_METER)
+        if meter is not None:
+            meter.add(time.monotonic() - started)
         self._settle(task, label, result, error)
 
     def _invoke(self, task: DatabaseTask, label: str, *lead):
@@ -1842,7 +1966,7 @@ class VaultDatabase:
             "at": time.time(),
             "task": label,
             "step": step,
-            "error": repr(exc),
+            "error": SESSION_FAILURE_MESSAGE,
         }
         if session is None:
             return
@@ -1923,6 +2047,7 @@ class VaultDatabase:
             if self._state is WriterState.OPEN:
                 self._state = WriterState.FAILED
             self._failed_reason = f"{type(exc).__name__}: {exc}"
+            self._failed_at = time.time()
             message = _writer_failed_message(self._failed_reason)
         if task is not None and task.func is not None and not task.future.done():
             if task.future.running() or task.future.set_running_or_notify_cancel():

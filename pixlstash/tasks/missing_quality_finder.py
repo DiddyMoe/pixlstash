@@ -1,4 +1,3 @@
-from sqlmodel import Session
 import time
 
 from pixlstash.worker_config import QUALITY_MAX_INFLIGHT
@@ -112,7 +111,3 @@ class MissingQualityFinder(BaseTaskFinder):
             return None
 
         return QualityTask(database=self._db, pictures=selected)
-
-    @staticmethod
-    def _count_missing_quality(session: Session) -> int:
-        return QualityTask.count_missing_quality(session)

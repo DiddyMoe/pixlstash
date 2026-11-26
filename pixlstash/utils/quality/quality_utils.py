@@ -151,9 +151,9 @@ class QualityUtils:
         # two statements instead of N individual gets + adds.  Reset
         # size_bin_index alongside likeness_parameters: the likeness-parameters
         # finder treats size_bin_index IS NULL as the sole pending-work
-        # indicator (see LikenessParameterUtils.find_next_work), so clearing the
-        # blob without clearing the index would leave the picture invisible to
-        # the finder and its likeness_parameters permanently NULL.
+        # indicator (see LikenessParametersTask.pending_parameter_clauses), so
+        # clearing the blob without clearing the index would leave the picture
+        # invisible to the finder and its likeness_parameters permanently NULL.
         session.exec(delete(Quality).where(Quality.picture_id.in_(surviving_ids)))
         session.exec(
             sa_update(Picture)

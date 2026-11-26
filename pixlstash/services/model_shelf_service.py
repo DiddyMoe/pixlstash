@@ -96,7 +96,7 @@ from pixlstash.utils.known_base_models import (
     modality_of,
     rank,
 )
-from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sql_chunking import chunked, in_json
 from pixlstash.utils.workflow_ids import MANUAL_PREFIX
 
 logger = get_logger(__name__)
@@ -2154,7 +2154,7 @@ def lora_people(vault, digests) -> set[int]:
                 select(AdapterAttachment.entity_id).where(
                     AdapterAttachment.entity_type == ENTITY_CHARACTER,
                     AdapterAttachment.entity_id.in_(select(Character.id)),
-                    func.lower(AdapterAttachment.adapter_sha256).in_(wanted),
+                    in_json(func.lower(AdapterAttachment.adapter_sha256), wanted),
                 )
             ).all()
         )
@@ -2951,7 +2951,7 @@ def folder_removal_consequences(
                 if table is None:
                     continue
                 for entity_id, name in session.exec(
-                    select(table.id, table.name).where(table.id.in_(ids))
+                    select(table.id, table.name).where(in_json(table.id, ids))
                 ).all():
                     found[(entity_type, int(entity_id))] = name or ""
             return found

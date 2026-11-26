@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
-from sqlalchemy import func, update as sa_update
+from sqlalchemy import update as sa_update
 from sqlmodel import Session, delete, select
 
 from pixlstash.db_models.picture import (
@@ -18,6 +18,8 @@ from pixlstash.db_models.picture_likeness import PictureLikeness, PictureLikenes
 from pixlstash.db_models.quality import Quality
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
+from pixlstash.utils.near_neighbor import parse_dhash
+from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.pixl_logging import get_logger
 
 logger = get_logger(__name__)
@@ -49,79 +51,6 @@ class LikenessParameterUtils:
         self._db = database
 
     @staticmethod
-    def find_next_work(
-        session: Session, scan_limit: int
-    ) -> Optional[List[Tuple[int, int, int]]]:
-        """Return up to *scan_limit* (id, width, height) tuples for pictures missing all params.
-
-        All parameters are written atomically, so ``size_bin_index IS NULL`` is
-        the sole pending-work indicator.  A picture is only offered once its own
-        quality metrics exist, so every parameter row is written once, with real
-        quality values.  Returns ``None`` when idle.
-        """
-        return LikenessParameterUtils._find_size_bin_batch(session, scan_limit)
-
-    @staticmethod
-    def count_pending_parameters(session: Session) -> int:
-        """Return a count of pictures missing likeness parameters.
-
-        With all parameters written atomically, ``size_bin_index IS NULL`` is
-        the single authoritative indicator.  Pictures without width/height are
-        excluded because they can never receive a ``size_bin_index``.
-        """
-        result = session.exec(
-            select(func.count())
-            .select_from(Picture)
-            .where(Picture.size_bin_index.is_(None))
-            .where(Picture.width.is_not(None))
-            .where(Picture.height.is_not(None))
-        ).one()
-        if isinstance(result, (tuple, list)):
-            return result[0]
-        return result or 0
-
-    @staticmethod
-    def has_pending_work(session: Session) -> bool:
-        """Return True if there are pictures with pending likeness parameters."""
-        return LikenessParameterUtils.count_pending_parameters(session) > 0
-
-    @staticmethod
-    def _find_size_bin_batch(
-        session: Session, max_ids: int
-    ) -> Optional[List[Tuple[int, int, int]]]:
-        """Return up to *max_ids* (id, width, height) tuples for pictures missing size_bin_index.
-
-        Each picture gets its own size_bin_index computed from its dimensions,
-        so there is no need to group by exact resolution.  Processing a flat
-        batch of BATCH_SIZE pictures instead of one per unique resolution gives
-        a 100-128x throughput improvement when pictures have diverse dimensions.
-        """
-        # The inverse of QualityTask.count_missing_quality's per-row predicate:
-        # that counts pictures with no Quality row or a NULL sharpness, so
-        # "quality done" is a Quality row whose sharpness is set (a failed
-        # calculation writes -1.0 and is done too). ix_picture_size_bin_index
-        # drives the probe; ix_quality_picture_id serves the EXISTS.
-        quality_done = (
-            select(Quality.id)
-            .where(Quality.picture_id == Picture.id, Quality.sharpness.is_not(None))
-            .exists()
-        )
-        rows = session.exec(
-            select(Picture.id, Picture.width, Picture.height)
-            .where(
-                Picture.size_bin_index.is_(None)
-                & Picture.width.is_not(None)
-                & Picture.height.is_not(None)
-                & quality_done
-            )
-            .order_by(Picture.id)
-            .limit(max_ids)
-        ).all()
-        if not rows:
-            return None
-        return [(int(pid), int(w), int(h)) for pid, w, h in rows]
-
-    @staticmethod
     def fetch_blobs_for_ids(
         session: Session, ids: List[int]
     ) -> Dict[int, Optional[bytes]]:
@@ -131,7 +60,11 @@ class LikenessParameterUtils:
         serialised write queue only has to run the bare bulk UPDATE.
         """
         rows = session.exec(
-            select(Picture.id, Picture.likeness_parameters).where(Picture.id.in_(ids))
+            select(Picture.id, Picture.likeness_parameters).where(
+                Picture.id.in_(
+                    scope_id_subquery(session, ids, name="_pixlstash_likeness_blob_ids")
+                )
+            )
         ).all()
         result: Dict[int, Optional[bytes]] = {int(pid): blob for pid, blob in rows}
         for pid in ids:
@@ -196,7 +129,15 @@ class LikenessParameterUtils:
         # restrict the write to ids that still exist and skip the rest.
         ids = [u["id"] for u in updates]
         existing = set(
-            session.exec(select(Picture.id).where(Picture.id.in_(ids))).all()
+            session.exec(
+                select(Picture.id).where(
+                    Picture.id.in_(
+                        scope_id_subquery(
+                            session, ids, name="_pixlstash_likeness_write_ids"
+                        )
+                    )
+                )
+            ).all()
         )
         live_updates = [u for u in updates if u["id"] in existing]
         missing = [pid for pid in ids if pid not in existing]
@@ -228,7 +169,11 @@ class LikenessParameterUtils:
                 Quality.luminance_entropy,
                 Quality.dominant_hue,
             ).where(
-                Quality.picture_id.in_(ids),
+                Quality.picture_id.in_(
+                    scope_id_subquery(
+                        session, ids, name="_pixlstash_likeness_quality_ids"
+                    )
+                ),
             )
         ).all()
         quality_by_id: Dict[int, Dict[str, float]] = {}
@@ -289,7 +234,13 @@ class LikenessParameterUtils:
                 Picture.perceptual_hash,
                 Picture.file_path,
             )
-            .where(Picture.id.in_(ids))
+            .where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, ids, name="_pixlstash_likeness_param_ids"
+                    )
+                )
+            )
             .group_by(
                 Picture.id,
                 Picture.width,
@@ -345,11 +296,11 @@ class LikenessParameterUtils:
                 and isinstance(phash_value, str)
                 and len(phash_value) >= PHASH_HEX_LEN
             ):
-                try:
-                    full_value = int(phash_value[:PHASH_HEX_LEN], 16)
+                full_value = parse_dhash(phash_value[:PHASH_HEX_LEN])
+                if full_value is not None:
                     max_value = float((2**PHASH_BITS) - 1)
                     phash_prefix = full_value / max_value if max_value else 0.0
-                except ValueError:
+                else:
                     phash_prefix = LIKENESS_PARAMETER_SENTINEL
             else:
                 phash_prefix = LIKENESS_PARAMETER_SENTINEL
@@ -374,7 +325,15 @@ class LikenessParameterUtils:
         if not updates_by_id:
             return
         ids = list(updates_by_id.keys())
-        pics = session.exec(select(Picture).where(Picture.id.in_(ids))).all()
+        pics = session.exec(
+            select(Picture).where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, ids, name="_pixlstash_likeness_metadata_ids"
+                    )
+                )
+            )
+        ).all()
         for pic in pics:
             updates = updates_by_id.get(int(pic.id), {})
             if "created_at" in updates and pic.created_at is None:
@@ -454,10 +413,13 @@ class LikenessParameterUtils:
             return
         unique_ids = sorted({int(pid) for pid in ids})
         # Count pairs being deleted so we can observe churn
+        reset_scope = scope_id_subquery(
+            session, unique_ids, name="_pixlstash_likeness_reset_ids"
+        )
         deleted = session.exec(
             delete(PictureLikeness).where(
-                (PictureLikeness.picture_id_a.in_(unique_ids))
-                | (PictureLikeness.picture_id_b.in_(unique_ids))
+                (PictureLikeness.picture_id_a.in_(reset_scope))
+                | (PictureLikeness.picture_id_b.in_(reset_scope))
             )
         )
         deleted_count = deleted.rowcount if hasattr(deleted, "rowcount") else "?"

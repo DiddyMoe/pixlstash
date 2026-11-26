@@ -16,6 +16,7 @@ from pixlstash.task_runner import TaskCancelledError
 from pixlstash.utils.sql_chunking import not_in_json
 
 from .base_task_finder import BaseDeferringFinder, SimpleMissingFinder
+from .pipeline_scope import pipeline_picture_clauses
 from .text_embedding_task import TextEmbeddingTask
 
 
@@ -40,6 +41,15 @@ class MissingTextEmbeddingFinder(SimpleMissingFinder, BaseDeferringFinder):
     ):
         super().__init__(database)
         self._engine_getter = engine_getter
+
+    @staticmethod
+    def missing_text_embedding_clauses() -> tuple:
+        """WHERE terms for the pictures still owed a text embedding, before the
+        per-row waits on tags and description: this finder's and the progress
+        count's (``Vault._count_missing_text_embeddings``), so the two count the
+        same pictures. Served by ``ix_picture_text_embedding_missing``, which
+        carries no ``deleted`` column, hence the ``IS NOT`` spelling."""
+        return (Picture.text_embedding.is_(None), *pipeline_picture_clauses())
 
     def finder_name(self) -> str:
         return "MissingTextEmbeddingFinder"
@@ -67,7 +77,7 @@ class MissingTextEmbeddingFinder(SimpleMissingFinder, BaseDeferringFinder):
             ),
         )
         # Served by ix_picture_text_embedding_missing; the rest are filters.
-        query = query.where(Picture.text_embedding.is_(None))
+        query = query.where(*self.missing_text_embedding_clauses())
         # Per-row stage dependencies, in place of a barrier on the whole tag
         # and description stages: wait for THIS picture's tags and description.
         # A stage that is switched off never delivers, so it is not waited for

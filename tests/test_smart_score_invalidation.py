@@ -1060,6 +1060,12 @@ def test_identical_threshold_offset_save_is_a_noop():
 def _prepare_for_scoring(server, pic_id):
     """Give the picture an embedding and clear its score so the finder picks it up."""
 
+    # An embedding with a NULL score is exactly what the live SMART_SCORE finder
+    # claims, so a running planner scores the row before the caller's assertions
+    # (CI run 45564843727, backend-full block 5: 2.98 where NULL was expected).
+    # Same settle as _set_smart_score; a no-op when the caller already settled.
+    stop_planner_and_settle(server)
+
     def _apply(session):
         pic = session.get(Picture, pic_id)
         pic.image_embedding = np.random.rand(512).astype(np.float32).tobytes()

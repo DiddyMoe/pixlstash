@@ -5,7 +5,9 @@ SQLite limits how many bound parameters a single statement may carry
 Any ``WHERE col IN (:a, :b, ...)`` built from a caller-sized id list can cross
 that cap and fail at execution time. A load is chunked; an exclusion cannot be
 (``NOT IN`` over one chunk says nothing about the others), so it binds the
-whole set as one JSON array instead.
+whole set as one JSON array instead. So does a membership test that must stay
+in one statement (an ``IN`` under a ``GROUP BY ... LIMIT``, or beside an id
+chunk that already fills the statement).
 
 The limit and the chunker used to be redeclared in five modules, each with its
 own copy of this rationale and no shared value to change. They live here now.
@@ -43,7 +45,7 @@ def chunked(seq: Sequence[T], size: int = SQLITE_ID_CHUNK) -> Iterator[Sequence[
         yield seq[start : start + size]
 
 
-def not_in_json(column, values: Collection[int]) -> ColumnElement:
+def not_in_json(column, values: Collection) -> ColumnElement:
     """``column NOT IN values`` with *values* bound as ONE JSON array.
 
     Compiles to ``column NOT IN (SELECT value FROM json_each(:param))``, so the
@@ -52,10 +54,13 @@ def not_in_json(column, values: Collection[int]) -> ColumnElement:
     it per row, which keeps the exclusion ahead of an ``ORDER BY ... LIMIT``
     without a scan per value.
 
+    The match is SQLite's ``=``, so text compares case-sensitively, as in
+    :func:`in_json`.
+
     Args:
-        column: The column to test, e.g. ``Picture.id``.
-        values: Integer ids to exclude. Sorted before encoding so equal sets
-            bind byte-identical text.
+        column: The column to test, e.g. ``Picture.id`` or ``Tag.tag``.
+        values: Integers or strings to exclude (ids, tag names). Sorted before
+            encoding so equal sets bind byte-identical text.
 
     Returns:
         The predicate. An empty *values* excludes nothing and is a valid
@@ -63,3 +68,30 @@ def not_in_json(column, values: Collection[int]) -> ColumnElement:
     """
     rows = func.json_each(json.dumps(sorted(values))).table_valued("value")
     return column.not_in(select(rows.c.value))
+
+
+def in_json(column, values: Collection) -> ColumnElement:
+    """``column IN values`` with *values* bound as ONE JSON array.
+
+    The membership twin of :func:`not_in_json`, and the same statement shape:
+    ``column IN (SELECT value FROM json_each(:param))``, one parameter however
+    many values there are. For a list that has to stay in one statement, where
+    :func:`chunked` would change the answer (a ``GROUP BY ... ORDER BY ...
+    LIMIT`` over the whole list) or would share the statement with an id chunk
+    that already uses the room (a user's tag vocabulary beside 900 ids).
+
+    The match is SQLite's ``=``, so text compares case-sensitively: lower both
+    sides yourself, e.g. ``in_json(func.lower(Tag.tag), lowered_names)``.
+
+    Args:
+        column: The column or expression to test, e.g. ``Picture.id`` or
+            ``func.lower(Tag.tag)``.
+        values: Integers or strings to match. Sorted before encoding so equal
+            sets bind byte-identical text; repeats change nothing.
+
+    Returns:
+        The predicate. An empty *values* matches nothing and is a valid
+        clause, so callers need no special case for it.
+    """
+    rows = func.json_each(json.dumps(sorted(values))).table_valued("value")
+    return column.in_(select(rows.c.value))

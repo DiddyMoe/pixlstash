@@ -6,17 +6,15 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from sqlalchemy import func
-from sqlmodel import Session, delete, select
+from sqlmodel import Session
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.near_neighbor import parse_dhash
 from pixlstash.db_models.picture import (
     LikenessParameter,
-    Picture,
 )
 from pixlstash.db_models.picture_likeness import (
     PictureLikeness,
-    PictureLikenessQueue,
 )
 
 logger = get_logger(__name__)
@@ -26,7 +24,7 @@ logger = get_logger(__name__)
 class BulkCandidateArrays:
     """Pre-decoded, cached candidate data passed to every LikenessTask in a sweep.
 
-    Built once per sweep from ``build_bulk_arrays``; all arrays are read-only
+    Built once per sweep by ``LikenessTask.build_bulk_arrays``; all arrays are read-only
     and can be shared safely across concurrent tasks.
     """
 
@@ -79,96 +77,7 @@ class LikenessUtils:
         self._db = database
 
     @staticmethod
-    def get_next_work_batch(session: Session, max_a: int) -> List[Tuple]:
-        """Fetch the next batch of pictures from the likeness queue."""
-        rows = session.exec(
-            select(
-                PictureLikenessQueue.picture_id,
-                Picture.perceptual_hash,
-                Picture.width,
-                Picture.height,
-                Picture.size_bytes,
-                Picture.likeness_parameters,
-                Picture.created_at,
-                Picture.image_embedding,
-            )
-            .join(Picture, Picture.id == PictureLikenessQueue.picture_id)
-            .where(Picture.image_embedding.is_not(None))
-            .where(Picture.likeness_parameters.is_not(None))
-            .where(Picture.perceptual_hash.is_not(None))
-            .order_by(PictureLikenessQueue.queued_at)
-            .limit(max_a)
-        ).all()
-        if not rows:
-            return []
-
-        queued_ids = [int(row[0]) for row in rows]
-        if queued_ids:
-            session.exec(
-                delete(PictureLikenessQueue).where(
-                    PictureLikenessQueue.picture_id.in_(queued_ids)
-                )
-            )
-            session.commit()
-
-        batch = []
-        for row in rows:
-            (
-                pic_id,
-                phash_a,
-                width_a,
-                height_a,
-                size_a,
-                params_blob,
-                created_at,
-                emb_blob,
-            ) = row
-            batch.append(
-                (
-                    int(pic_id),
-                    None,
-                    None,
-                    phash_a,
-                    width_a,
-                    height_a,
-                    size_a,
-                    params_blob,
-                    created_at,
-                    emb_blob,
-                )
-            )
-
-        return batch
-
-    @staticmethod
-    def fetch_bulk_candidate_data(session: Session) -> List[Tuple]:
-        """Fetch all candidate pictures for bulk likeness computation."""
-        return session.exec(
-            select(
-                Picture.id,
-                Picture.likeness_parameters,
-                Picture.image_embedding,
-                Picture.perceptual_hash,
-            )
-            .where(Picture.deleted.is_(False))
-            .where(Picture.image_embedding.is_not(None))
-            .where(Picture.likeness_parameters.is_not(None))
-            .where(Picture.perceptual_hash.is_not(None))
-        ).all()
-
-    @staticmethod
-    def build_bulk_arrays(session: Session) -> Optional["BulkCandidateArrays"]:
-        """Fetch and decode all candidates into pre-computed numpy arrays.
-
-        Called once per sweep by the finder and cached.  Decoding the 28k
-        embedding blobs (2 KB each) takes ~200-500 ms; caching removes this
-        cost from every subsequent task in the same sweep.
-        """
-        rows = LikenessUtils.fetch_bulk_candidate_data(session)
-        return LikenessUtils._decode_bulk_rows(rows)
-
-    @staticmethod
-    def _decode_bulk_rows(rows: List[Tuple]) -> Optional["BulkCandidateArrays"]:
+    def decode_bulk_rows(rows: List[Tuple]) -> Optional["BulkCandidateArrays"]:
         """Decode raw DB rows into a ``BulkCandidateArrays`` struct."""
         if not rows:
             return None
@@ -185,9 +94,14 @@ class LikenessUtils:
             phash_str = str(row[3]) if row[3] else None
             if vec is None or emb is None or not phash_str:
                 continue
-            try:
-                phash_val = int(phash_str, 16)
-            except ValueError:
+            phash_val = parse_dhash(phash_str)
+            if phash_val is None:
+                # The uint64 pack below would raise on it and drop every row.
+                logger.debug(
+                    "Skipping picture %s: unparseable perceptual hash %r.",
+                    pic_id,
+                    phash_str,
+                )
                 continue
             ids_list.append(pic_id)
             param_rows.append(vec)
@@ -417,27 +331,6 @@ class LikenessUtils:
         session.commit()
 
     @staticmethod
-    def seed_queue(session: Session) -> None:
-        """Seed the likeness queue with all pictures if it is empty."""
-        queued_count = session.exec(
-            select(func.count()).select_from(PictureLikenessQueue)
-        ).one()
-        if queued_count and int(queued_count) > 0:
-            return
-        likeness_count = session.exec(
-            select(func.count()).select_from(PictureLikeness)
-        ).one()
-        if likeness_count and int(likeness_count) > 0:
-            return
-        rows = session.exec(select(Picture.id)).all()
-        ids = [
-            int(row[0]) if isinstance(row, (tuple, list)) else int(row) for row in rows
-        ]
-        logger.debug("LikenessTask: seeding queue with %d pictures", len(ids))
-        PictureLikenessQueue.enqueue(session, ids)
-        session.commit()
-
-    @staticmethod
     def decode_embedding(blob) -> Optional[np.ndarray]:
         """Decode a raw embedding blob to a numpy array."""
         return LikenessUtils._decode_embedding(blob)
@@ -486,15 +379,10 @@ class LikenessUtils:
     @classmethod
     def _phash_similarity(cls, hash_a: str, hash_b: str) -> float:
         """Return the normalised perceptual hash similarity between two hex hashes."""
-        try:
-            int_a = int(hash_a, 16)
-            int_b = int(hash_b, 16)
-        except Exception as exc:
+        int_a, int_b = parse_dhash(hash_a), parse_dhash(hash_b)
+        if int_a is None or int_b is None:
             logger.debug(
-                "Could not parse perceptual hash pair (%r, %r): %s.",
-                hash_a,
-                hash_b,
-                exc,
+                "Could not parse perceptual hash pair (%r, %r).", hash_a, hash_b
             )
             return 0.0
         distance = (int_a ^ int_b).bit_count()

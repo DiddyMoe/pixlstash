@@ -15,6 +15,7 @@ from sqlmodel import select
 from pixlstash.db_models import Picture
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.service.scope_table import scope_id_subquery
 
 logger = get_logger(__name__)
 
@@ -137,7 +138,15 @@ class MaintenanceMixin:
 
         def delete_rows(session, ids: list[int]):
             deleted_count = 0
-            pictures = session.exec(select(Picture).where(Picture.id.in_(ids))).all()
+            pictures = session.exec(
+                select(Picture).where(
+                    Picture.id.in_(
+                        scope_id_subquery(
+                            session, ids, name="_pixlstash_missing_file_ids"
+                        )
+                    )
+                )
+            ).all()
             for pic in pictures:
                 session.delete(pic)
                 deleted_count += 1

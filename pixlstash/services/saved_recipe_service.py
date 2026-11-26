@@ -38,7 +38,7 @@ from pixlstash.utils.query.predicate_filter import (
     NOT_MADE_BY,
     workflow_keys_predicate,
 )
-from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sql_chunking import chunked, in_json
 from pixlstash.utils.workflow_ids import MANUAL_PREFIX
 from pixlstash.services.workflow_hash import normalized_filename
 
@@ -489,7 +489,7 @@ def reorder_in_session(session: Session, recipe_ids: list[int]) -> Optional[list
     rows = {
         row.id: row
         for row in session.exec(
-            select(SavedRecipe).where(SavedRecipe.id.in_(recipe_ids))
+            select(SavedRecipe).where(in_json(SavedRecipe.id, recipe_ids))
         ).all()
     }
     if len(rows) != len(recipe_ids):

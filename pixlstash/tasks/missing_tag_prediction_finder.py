@@ -15,6 +15,7 @@ from pixlstash.task_runner import TaskCancelledError
 from pixlstash.utils.quality.tag_exclusion import excluded_spellings
 from pixlstash.utils.sql_chunking import not_in_json
 from .base_task_finder import BaseDeferringFinder, SimpleMissingFinder
+from .pipeline_scope import pipeline_picture_clauses
 from .tag_prediction_backfill_task import TagPredictionBackfillTask
 from .task_type import TaskType
 
@@ -115,9 +116,12 @@ class MissingTagPredictionFinder(SimpleMissingFinder, BaseDeferringFinder):
         )
 
     @staticmethod
-    def _fetch_missing_predictions(
-        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
-    ) -> list:
+    def missing_prediction_clauses(session: Session) -> tuple:
+        """WHERE terms for the pictures with real tags and no prediction rows:
+        this finder's and the progress count's
+        (``Vault._count_missing_tag_predictions``), so the two count the same
+        pictures. Takes the session to read the removed-from-tagging spellings.
+        """
         has_sentinel = Tag.tag.like(
             TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
         )
@@ -126,16 +130,21 @@ class MissingTagPredictionFinder(SimpleMissingFinder, BaseDeferringFinder):
         # to back-fill; selecting it would repeat on every sweep.
         removed = excluded_spellings(session, Tag.tag)
         if removed:
-            real_tag.append(~Tag.tag.in_(removed))
-        has_real_tag = Picture.tags.any(and_(*real_tag))
-        no_prediction = ~Picture.tag_predictions.any()
+            real_tag.append(not_in_json(Tag.tag, removed))
+        return (
+            Picture.tags.any(and_(*real_tag)),
+            ~Picture.tag_predictions.any(),
+            *pipeline_picture_clauses(deleted_index=True),
+        )
+
+    @staticmethod
+    def _fetch_missing_predictions(
+        session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
+    ) -> list:
         return session.exec(
             select(Picture)
             .where(
-                has_real_tag,
-                no_prediction,
-                Picture.deleted.is_(False),
-                Picture.file_path.is_not(None),
+                *MissingTagPredictionFinder.missing_prediction_clauses(session),
                 not_in_json(Picture.id, exclude_ids),
             )
             .options(load_only(Picture.id, Picture.file_path))

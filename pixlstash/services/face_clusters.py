@@ -39,6 +39,7 @@ from sqlmodel import Session, delete, select
 
 from pixlstash.db_models import Character, CharacterReferenceMember, Face, Picture
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.service.scope_table import scope_id_subquery
 
 logger = get_logger(__name__)
 
@@ -258,7 +259,11 @@ def _carrying_face(session: Session, character_id: int, picture_ids) -> set[int]
         .join(Picture, Face.picture_id == Picture.id)
         .where(
             Face.character_id == character_id,
-            Face.picture_id.in_(list(picture_ids)),
+            Face.picture_id.in_(
+                scope_id_subquery(
+                    session, picture_ids, name="_pixlstash_carrying_face_ids"
+                )
+            ),
             Face.features.is_not(None),
             Picture.deleted.is_(False),
         )
@@ -448,7 +453,9 @@ def reference_cluster_faces(
         select(Face)
         .where(
             Face.character_id == character_id,
-            Face.picture_id.in_(ids),
+            Face.picture_id.in_(
+                scope_id_subquery(session, ids, name="_pixlstash_reference_face_ids")
+            ),
             Face.features.is_not(None),
         )
         .order_by(Face.picture_id, Face.id)

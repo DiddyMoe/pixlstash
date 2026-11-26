@@ -2127,6 +2127,10 @@ class _EngineVault:
         self.written: list[list[dict]] = []
         self._engine = engine
 
+    # scan_tag refuses a tag the owner removed from tagging, read off
+    # VaultDatabase.tag_exclusions (pixlstash/database.py); none is removed here.
+    tag_exclusions = frozenset()
+
     def run_immediate_read_task(self, fn, *args):
         with Session(self._engine) as session:
             return fn(session, *args)
