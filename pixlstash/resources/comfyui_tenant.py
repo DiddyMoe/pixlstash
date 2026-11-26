@@ -40,6 +40,7 @@ import requests
 from pixlstash.pixl_logging import get_logger
 from pixlstash.resources.arbiter import Tenant, arbiter
 from pixlstash.resources.ledger import UNMEASURED_DEVICE, ledger
+from pixlstash.utils.bounded_http import bounded_get, bounded_request
 
 logger = get_logger(__name__)
 
@@ -48,6 +49,12 @@ STATS_TTL_S = 1.0
 #: How long a failed read stands: a hung ComfyUI costs one timeout per this,
 #: not one per progress poll. An explicit fresh read (``max_age_s=0``) still asks.
 FAILED_READ_TTL_S = 10.0
+#: How long one ``/system_stats`` or ``/queue`` read may take in all, body
+#: included, so a ComfyUI that trickles its answer is given up on.
+READ_DEADLINE_S = 10.0
+#: The most a ``/system_stats``, ``/queue`` or ``/free`` answer may be. A
+#: queue carries every pending prompt's whole graph.
+READ_MAX_BYTES = 32 * 1024 * 1024
 #: How long a same-host decision stands before it is checked again.
 MAPPING_TTL_S = 60.0
 #: How closely ComfyUI's free memory must track the NVML card's.
@@ -131,9 +138,7 @@ class ComfyUIProbe:
     # ── reads ────────────────────────────────────────────────────────────
 
     def _get(self, path: str):
-        response = requests.get(f"{self._base_url}{path}", timeout=5, proxies=_NO_PROXY)
-        response.raise_for_status()
-        return response.json()
+        return _read_json(f"{self._base_url}{path}")
 
     def _read(self, path: str, what: str) -> dict | None:
         """*path*'s answer, or None when ComfyUI cannot be read."""
@@ -540,13 +545,17 @@ class ComfyUIProbe:
             return None
         before = self.usage_mb() or 0
         try:
-            response = requests.post(
+            response = bounded_request(
+                "POST",
                 f"{self._base_url}/free",
                 json={"unload_models": True, "free_memory": True},
                 timeout=10,
+                deadline_s=10,
+                max_bytes=READ_MAX_BYTES,
                 proxies=_NO_PROXY,
             )
-            response.raise_for_status()
+            if response.status_code != 200:
+                raise requests.HTTPError(f"/free answered {response.status_code}")
         except requests.RequestException as exc:
             logger.warning(
                 "ComfyUI at %s could not be asked to free memory: %s",
@@ -573,6 +582,22 @@ class ComfyUIProbe:
             last,
         )
         return max(0, before - last)
+
+
+def _read_json(url: str):
+    """*url*'s JSON answer, read within ``READ_DEADLINE_S`` and
+    ``READ_MAX_BYTES``; any answer but a 200 is ``requests.HTTPError``, a
+    redirect included, since it is not followed."""
+    response = bounded_get(
+        url,
+        deadline_s=READ_DEADLINE_S,
+        max_bytes=READ_MAX_BYTES,
+        timeout=5,
+        proxies=_NO_PROXY,
+    )
+    if response.status_code != 200:
+        raise requests.HTTPError(f"{url} answered {response.status_code}")
+    return response.json()
 
 
 def _ttl(value, max_age_s: float) -> float:
