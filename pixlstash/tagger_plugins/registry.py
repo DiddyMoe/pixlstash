@@ -16,6 +16,7 @@ from platformdirs import user_data_dir
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tagger_plugins.base import TaggerPlugin
+from pixlstash.utils.model_utils import MODEL_CONSTRUCTION_LOCK
 
 logger = get_logger(__name__)
 
@@ -309,7 +310,11 @@ class TaggerPluginManager:
         Errors are caught and recorded without re-raising.
         """
         try:
-            module = importlib.import_module(module_path)
+            # The lock itself, not ``ml_imports()``: that one stops locking
+            # after its line's first clean run, and this line imports a
+            # different plugin (and its ML stack) on every call.
+            with MODEL_CONSTRUCTION_LOCK:
+                module = importlib.import_module(module_path)
             cls = getattr(module, class_name)
             instance = cls()
             plugin_name = (instance.name or "").strip()
@@ -410,7 +415,10 @@ class TaggerPluginManager:
         displaced = sys.modules.get(module_name)
         sys.modules[module_name] = module
         try:
-            spec.loader.exec_module(module)
+            # The lock itself, as in `_load_plugin`: every call runs a
+            # different user module body, and most of them import torch.
+            with MODEL_CONSTRUCTION_LOCK:
+                spec.loader.exec_module(module)
         except BaseException:
             if displaced is not None:
                 sys.modules[module_name] = displaced

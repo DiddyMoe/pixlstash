@@ -18,7 +18,7 @@ from pixlstash.utils.accelerator import (
     is_apple_silicon,
     physical_memory_mb,
 )
-from pixlstash.utils.model_utils import from_pretrained_local_first
+from pixlstash.utils.model_utils import from_pretrained_local_first, ml_imports
 from pixlstash.utils.service.caption_utils import sanitise_tag
 
 logger = get_logger(__name__)
@@ -321,13 +321,15 @@ class JoyCaptionService:
         try:
             # bitsandbytes is required for NF4/INT8 quantisation.
             if self._precision in ("nf4", "int8"):
-                import bitsandbytes  # noqa: F401 - validates availability
+                with ml_imports():
+                    import bitsandbytes  # noqa: F401 - validates availability
 
-            from transformers import (
-                AutoProcessor,
-                BitsAndBytesConfig,
-                LlavaForConditionalGeneration,
-            )
+            with ml_imports():
+                from transformers import (
+                    AutoProcessor,
+                    BitsAndBytesConfig,
+                    LlavaForConditionalGeneration,
+                )
 
             logger.info(
                 "[JoyCaption] Loading model %s (precision=%s, device=%s) …",
@@ -725,7 +727,13 @@ class JoyCaptionPlugin(TaggerPlugin):
     def needs_download(self, parameters: dict[str, Any] | None = None) -> bool:
         """Return ``True`` if the base model is not yet in the HF cache."""
         try:
-            from huggingface_hub import try_to_load_from_cache  # type: ignore[import]
+            # Named, and from the defining module rather than the lazy package
+            # top: the download route asks this on the request thread, which
+            # must not wait on a model load (see ``ml_imports``).
+            with ml_imports("huggingface_hub.file_download"):
+                from huggingface_hub.file_download import (  # type: ignore[import]
+                    try_to_load_from_cache,
+                )
 
             result = try_to_load_from_cache(
                 _MODEL_NAME, "config.json", revision=_MODEL_REVISION
@@ -748,7 +756,8 @@ class JoyCaptionPlugin(TaggerPlugin):
             progress_callback: Optional progress reporting callback.
         """
         try:
-            from huggingface_hub import snapshot_download  # type: ignore[import]
+            with ml_imports():
+                from huggingface_hub import snapshot_download  # type: ignore[import]
 
             logger.info("[JoyCaption] Starting download of %s …", _MODEL_NAME)
             snapshot_download(
@@ -803,7 +812,11 @@ class JoyCaptionPlugin(TaggerPlugin):
     def list_downloaded_artifacts(self) -> list[dict[str, Any]]:
         """Return one entry per downloaded artifact in the HF cache."""
         try:
-            from huggingface_hub import scan_cache_dir  # type: ignore[import]
+            # Named, and from the defining module rather than the lazy package
+            # top: the tagger list (GET /taggers) runs this on the request
+            # thread, which must not wait on a model load (see ``ml_imports``).
+            with ml_imports("huggingface_hub.utils"):
+                from huggingface_hub.utils import scan_cache_dir  # type: ignore[import]
 
             cache_info = scan_cache_dir()
             for repo in cache_info.repos:
@@ -828,7 +841,10 @@ class JoyCaptionPlugin(TaggerPlugin):
         if artifact_id != "base":
             raise ValueError(f"Unknown JoyCaption artifact: {artifact_id!r}")
         try:
-            from huggingface_hub import scan_cache_dir  # type: ignore[import]
+            # Named for the same reason as ``list_downloaded_artifacts``: the
+            # delete route runs this on the request thread.
+            with ml_imports("huggingface_hub.utils"):
+                from huggingface_hub.utils import scan_cache_dir  # type: ignore[import]
 
             cache_info = scan_cache_dir()
             delete_strategy = cache_info.delete_revisions(

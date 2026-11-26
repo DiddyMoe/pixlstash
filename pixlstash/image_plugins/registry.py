@@ -12,6 +12,7 @@ from platformdirs import user_data_dir
 
 from pixlstash.image_plugins.base import ImagePlugin
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.model_utils import MODEL_CONSTRUCTION_LOCK
 
 logger = get_logger(__name__)
 
@@ -152,7 +153,12 @@ class ImagePluginManager:
                 )
                 return None
             module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            # The lock itself, not ``ml_imports()``, which stops locking after
+            # its line's first clean run: every call here runs a different
+            # plugin's module body, which can import cv2 (built-ins do) or
+            # torch (a user plugin may).
+            with MODEL_CONSTRUCTION_LOCK:
+                spec.loader.exec_module(module)
             return module
         except Exception as exc:
             message = f"Failed to import plugin module: {exc}"

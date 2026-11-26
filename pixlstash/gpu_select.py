@@ -186,6 +186,8 @@ def apply(path: str | None = None, nvml=pynvml) -> str | None:
             f"rather than the GPU chosen in Settings ({chosen}).",
         )
         return None
+    # Membership, not loaded_module(): an import of torch that has only begun
+    # is already too late, and this module imports nothing of PixlStash.
     if "torch" in sys.modules:
         _note(
             logging.ERROR,

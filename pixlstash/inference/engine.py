@@ -23,6 +23,7 @@ from pixlstash.utils.accelerator import (
     normalise_device,
     resolve_device,
 )
+from pixlstash.utils.model_utils import ml_imports
 
 if TYPE_CHECKING:
     from pixlstash.tagger_plugins.clip_service import ClipService
@@ -612,7 +613,10 @@ class InferenceEngine:
         from pixlstash.tagger_plugins.clip_service import ClipService
         from pixlstash.tagger_plugins.sbert import SBertService
         from pixlstash.tagger_plugins.pixlstash_tagger import PixlStashTaggerService
-        from pixlstash.tagger_plugins.wd14 import WD14Service
+
+        # wd14's module body imports torch and onnxruntime: a first ML import.
+        with ml_imports():
+            from pixlstash.tagger_plugins.wd14 import WD14Service
         from pixlstash.tagger_plugins.florence2 import Florence2Service
 
         model_dir = builtin_model_dir()

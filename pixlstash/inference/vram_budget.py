@@ -11,6 +11,7 @@ from pixlstash.utils.accelerator import (
     is_accelerated,
     normalise_device,
 )
+from pixlstash.utils.model_utils import ml_imports
 from pixlstash.utils.vram_utils import query_total_vram_mb, vram_limited_batch_cap
 
 logger = get_logger(__name__)
@@ -186,7 +187,10 @@ class VramBudget:
         # Local import: torch costs seconds to import and is only needed once a
         # budget is actually being set on a CUDA device. Importing it at module
         # scope would make the API server and every test pay for it at startup.
-        import torch
+        # Named because saving the budget in settings runs this on the request
+        # thread, which must not wait on a model load once torch is in.
+        with ml_imports("torch"):
+            import torch
 
         try:
             free_bytes, _ = torch.cuda.mem_get_info()

@@ -255,7 +255,12 @@ def test_a_clip_load_holds_the_construction_lock(monkeypatch):
         sys.modules,
         "open_clip",
         SimpleNamespace(
-            create_model_and_transforms=_create, get_tokenizer=lambda name: object()
+            create_model_and_transforms=_create,
+            # A repo nothing has downloaded: the load misses the cache.
+            get_pretrained_cfg=lambda name, tag: {
+                "hf_hub": "example-org/example-clip/"
+            },
+            get_tokenizer=lambda name: object(),
         ),
     )
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import platform
 import re
+import sys
 import threading
 from contextlib import contextmanager
+from types import CodeType, ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -16,7 +18,9 @@ from pixlstash.pixl_logging import get_logger
 
 logger = get_logger(__name__)
 
-#: Held for the construction of every PyTorch model in this process.
+#: Held for the construction of every PyTorch model in this process, and for
+#: the first run of every function-local import of an ML package
+#: (:func:`ml_imports`).
 #:
 #: Building a model goes through an empty-weights ("meta" device) mode that is
 #: process-wide, not per thread. Two loads at once - the text embedder and
@@ -25,8 +29,170 @@ logger = get_logger(__name__)
 #: every caption then fails with "Tensor.item() cannot be called on meta
 #: tensors". Reproduced 8/8 with the two loads overlapping, 0/3 without. Loads
 #: are rare and already seconds long, so serialising them costs little.
-#: Reentrant because a loader may nest helpers.
+#: Reentrant because a loader may nest helpers, and because an import block
+#: runs inside a load.
+#:
+#: One lock for both jobs, not two, because they are the same job: building a
+#: model imports more of the ML stack (``transformers`` resolves every model
+#: class lazily), so a separate import lock would leave construction-time
+#: imports racing first imports elsewhere, and two locks would need an order.
 MODEL_CONSTRUCTION_LOCK = threading.RLock()
+
+#: Import blocks that have completed once. See :func:`ml_imports`.
+_COMPLETED_IMPORT_SITES: set[tuple[CodeType, int]] = set()
+
+
+class _MLImportBlock:
+    """Context manager returned by :func:`ml_imports`."""
+
+    __slots__ = ("_site", "_modules", "_locked")
+
+    def __init__(self, site: tuple[CodeType, int], modules: tuple[str, ...]):
+        self._site = site
+        self._modules = modules
+        self._locked = False
+
+    def __enter__(self) -> None:
+        if self._site in _COMPLETED_IMPORT_SITES:
+            return
+        if self._modules and all(map(_loaded_with_parents, self._modules)):
+            return
+        MODEL_CONSTRUCTION_LOCK.acquire()
+        self._locked = True
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._locked:
+            if exc_type is None:
+                _COMPLETED_IMPORT_SITES.add(self._site)
+            MODEL_CONSTRUCTION_LOCK.release()
+        return False
+
+
+def ml_imports(*modules: str) -> _MLImportBlock:
+    """Serialise the first run of a function-local import of an ML package.
+
+    Wrap every import of torch, transformers, open_clip and the rest of the
+    ML stack that is deferred to a function body::
+
+        with ml_imports():
+            import open_clip
+            from open_clip.transform import PreprocessCfg
+
+    CPython only half-protects concurrent imports. Each module has its own
+    lock, and when two threads import modules that import each other, the
+    deadlock detector hands one of them the other's partially initialised
+    module instead of waiting (``_lock_unlock_module`` in
+    ``importlib/_bootstrap.py``). ``accelerate``, which both the
+    ``sentence_transformers`` and the ``open_clip`` stacks import, has such a
+    cycle, and the first search after start-up failed with ``cannot import name
+    'AcceleratorState' from partially initialized module 'accelerate.state'``.
+    Taking :data:`MODEL_CONSTRUCTION_LOCK` means one thread at a time imports
+    the stack, so no thread can ever be handed a half-built module.
+
+    The lock is only taken until the block has completed once: after that its
+    modules are in ``sys.modules`` whole and running it again imports nothing,
+    so the hot paths that re-run ``import torch`` pay a set lookup. A block
+    that raised is not marked complete; CPython removes a module whose import
+    failed, so the next run imports it again, under the lock. The block is
+    identified by the line that calls this, so keep it to import statements.
+
+    A block may also run while a module is being imported (a plugin or a test
+    that builds a service at module scope). That thread then waits for this
+    lock while holding the module's CPython import lock, which deadlocks only
+    if the lock's holder goes on to import that same module. It cannot: code
+    under this lock imports only the ML stack, which never imports PixlStash,
+    and ``image_loading_dataset_prepper``, whose body never enters a block.
+    Keep it that way: never import, under this lock, a module whose body
+    enters a block.
+
+    A block that a route or a poll runs names the modules it imports from:
+    ``with ml_imports("torch"):``. The lock is also held across every model
+    construction, downloads included, so an unnamed block that has not run yet
+    waits for the whole of a first-launch download, and a progress poll that
+    waits that long freezes the Tasks panel. When every named module, and each
+    package above it, is already loaded whole (:func:`loaded_module`), the
+    block's statements cannot run a module body, so it skips the lock. A module
+    that is not loaded yet, or is still being imported, takes the lock as
+    before. Name the module each statement imports from, not the top of a lazy
+    package: ``huggingface_hub`` imports a submodule the first time one of its
+    names is read, so ``from huggingface_hub import scan_cache_dir`` can still
+    run a module body after ``huggingface_hub`` is loaded. Write
+    ``from huggingface_hub.utils import scan_cache_dir`` under
+    ``ml_imports("huggingface_hub.utils")`` instead.
+    ``tests/test_ml_first_import_race.py`` checks both rules.
+
+    Args:
+        modules: For a block on a request path, the modules its statements
+            import from. Leave empty everywhere else.
+
+    Returns:
+        The context manager for the ``with`` statement.
+    """
+    caller = sys._getframe(1)
+    return _MLImportBlock((caller.f_code, caller.f_lineno), modules)
+
+
+def _loaded_with_parents(name: str) -> bool:
+    """Return whether *name* and every package above it are loaded whole.
+
+    ``import a.b`` hands back ``a``, so a half-built ``a`` matters as much as
+    a half-built ``a.b`` does.
+
+    Args:
+        name: A module's full dotted name.
+
+    Returns:
+        True when :func:`loaded_module` returns a module for each prefix.
+    """
+    parts = name.split(".")
+    return all(
+        loaded_module(".".join(parts[:depth])) is not None
+        for depth in range(1, len(parts) + 1)
+    )
+
+
+def loaded_module(name: str) -> ModuleType | None:
+    """Return the module *name* if it has been imported, whole; else None.
+
+    For code that has work to do only once something else has loaded an ML
+    package (torch, mostly) and must not pay for importing it: ask
+    ``loaded_module("torch")`` rather than reading ``sys.modules``.
+
+    This never imports, never waits and never raises. While another thread is
+    still running a module's body, its ``sys.modules`` entry is the half-built
+    module, and reading ``torch.cuda`` off it raises AttributeError; such an
+    entry answers None, as if the module were not loaded yet. The test is the
+    one CPython's own import fast path makes before it hands out a cached
+    module: ``_find_and_load`` in ``importlib/_bootstrap.py`` (3.11, 3.12 and
+    3.13 alike) treats an entry whose ``__spec__._initializing`` is true as
+    still loading, and ``_load_unlocked`` sets that flag *before* it puts the
+    module in ``sys.modules`` and clears it only once the body has run. The
+    attribute is private, but it is the contract ``import.c``'s own shortcut
+    relies on (the comment in ``_load_unlocked`` says so).
+
+    It used to call ``importlib.import_module``, which waits for an import in
+    flight and, if that import fails, imports the module again itself. A poll
+    on the planner thread then ran torch's body a second time and raised its
+    error into the planner's loop, ending it. A caller here only ever has work
+    to do once the module is loaded, so None (try again on the next poll) is
+    the right answer both while the import runs and after it failed; the
+    thread that imports owns that import's error.
+
+    Args:
+        name: The module's full dotted name.
+
+    Returns:
+        The module, or None when it was never imported, is still being
+        imported, its import failed, or a test blocked it
+        (``sys.modules[name] = None``). An object a test planted under *name*
+        is returned as it is.
+    """
+    module = sys.modules.get(name)
+    if module is None:
+        return None
+    if getattr(getattr(module, "__spec__", None), "_initializing", False):
+        return None
+    return module
 
 
 def _transformers_logging():
@@ -39,7 +205,8 @@ def _transformers_logging():
     suite - pay for it at startup.
     """
     try:
-        from transformers import logging as transformers_logging
+        with ml_imports():
+            from transformers import logging as transformers_logging
     except Exception as exc:  # pragma: no cover - optional dependency behaviour
         logger.debug(
             "Transformers logging unavailable (%s); model load reports stay unmuted.",
@@ -119,7 +286,8 @@ def load_sentence_transformer(*args, **kwargs) -> SentenceTransformer:
     """Load a SentenceTransformer model, suppressing benign load warnings."""
     # Local import: see _transformers_logging() for why the ML stack is not
     # imported at module scope.
-    from sentence_transformers import SentenceTransformer
+    with ml_imports():
+        from sentence_transformers import SentenceTransformer
 
     with MODEL_CONSTRUCTION_LOCK, quiet_transformers_load_report():
         return SentenceTransformer(*args, **kwargs)

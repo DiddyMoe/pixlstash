@@ -24,18 +24,20 @@ from ``server.py``, ``startup_checks.py`` and ``config_service.py``, all of whic
 sit on the API server's import path where importing torch costs seconds of
 start-up for a question that is usually "is there an accelerator" and nothing
 more. :func:`_torch` imports it on demand; the functions that can only have work
-to do in a process that already loaded torch read :data:`sys.modules` instead and
-never import it at all. This mirrors ``pixlstash.utils.vram_utils``, which
-documents the same reasoning.
+to do in a process that already loaded torch take it only if loaded
+(:func:`~pixlstash.utils.model_utils.loaded_module`, which never waits: while
+another thread is still importing torch it answers None, as if torch were not
+loaded yet) and never import it at all. This mirrors
+``pixlstash.utils.vram_utils``, which documents the same reasoning.
 """
 
 import os
 import platform
-import sys
 from typing import Any
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.resources import cuda_checkpoint
+from pixlstash.utils.model_utils import loaded_module, ml_imports
 
 logger = get_logger(__name__)
 
@@ -68,7 +70,7 @@ def _resolve_torch(torch_module: Any = _UNSET, allow_import: bool = True):
     """
     if torch_module is not _UNSET:
         return torch_module
-    return _torch() if allow_import else sys.modules.get("torch")
+    return _torch() if allow_import else loaded_module("torch")
 
 
 #: The CPU. Not an accelerator; the answer when there is none.
@@ -143,13 +145,15 @@ def _torch():
     Returns:
         The ``torch`` module, or ``None``.
     """
-    torch = sys.modules.get("torch")
-    if torch is not None:
-        return torch
+    # No ``sys.modules.get("torch")`` shortcut: while another thread is still
+    # running torch's module body, that entry is the half-built module and
+    # reading ``torch.cuda`` off it raises. The plain import below waits for
+    # torch to finish instead. Naming torch lets the block skip the model lock
+    # once torch is loaded whole, so resolving a device never waits on a model
+    # load; a torch still being imported is not whole and takes the lock.
     try:
-        import torch  # noqa: PLC0415 - see the module docstring
-
-        return torch
+        with ml_imports("torch"):
+            import torch  # noqa: PLC0415 - see the module docstring
     except Exception as exc:
         logger.warning(
             "Could not import torch to detect the accelerator (%s: %s); "
@@ -159,6 +163,7 @@ def _torch():
             exc,
         )
         return None
+    return torch
 
 
 def _probe(torch, attribute: str) -> bool:
@@ -314,7 +319,7 @@ def supports_fp16(device) -> bool:
 def empty_accelerator_cache(device=None) -> bool:
     """Flush the accelerator allocator's cache back to the driver.
 
-    ``torch`` is looked up in :data:`sys.modules` rather than imported: a
+    ``torch`` is taken only if loaded (``loaded_module``), never imported: a
     process that never imported it cannot have allocated device memory, so
     there is nothing to flush, and importing torch here purely to discover that
     would cost seconds on paths (teardown, the idle sweep, most of the test
@@ -329,7 +334,7 @@ def empty_accelerator_cache(device=None) -> bool:
         the host has no accelerator (callers use this to skip their own cache
         bookkeeping).
     """
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     if torch is None or cuda_checkpoint.suspended():
         # Suspended for a training run (#2557), the flush would block the
         # caller until the run ends; nothing of ours is on the card anyway.
@@ -432,7 +437,7 @@ def accelerator_total_memory_mb(device=None, torch_module: Any = _UNSET) -> int:
       pool, not a private allocation, which is exactly why it has to be read
       from the driver rather than assumed.
 
-    ``torch`` is read from :data:`sys.modules` and never imported: this is
+    ``torch`` is taken only if loaded (``loaded_module``), never imported: this is
     reached from config validation long before any model loads, and paying
     seconds of torch import there to refine a figure would be a bad trade. On
     Apple Silicon without torch, a share of physical RAM is the same quantity
@@ -522,7 +527,7 @@ def is_device_error(error: BaseException, device=None) -> bool:
     if name is not None and not is_accelerated(name):
         return False
     words = DEVICE_ERROR_WORDS.get(name, ALL_DEVICE_ERROR_WORDS)
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     if torch is not None:
         # PyTorch's typed OOM deliberately does not promise a backend name in
         # its message, so type identity is checked first and separately.
@@ -749,7 +754,7 @@ def clamp_accelerator_memory(device, budget_mb: int | None) -> bool:
     """
     if normalise_device(device) != MPS:
         return False
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     set_fraction = getattr(
         getattr(torch, "mps", None), "set_per_process_memory_fraction", None
     )

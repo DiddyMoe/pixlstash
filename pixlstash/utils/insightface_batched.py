@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from pixlstash.utils.model_utils import ml_imports
+
 
 @dataclass
 class FaceResult:
@@ -99,7 +101,8 @@ class BatchedFaceRunner:
         # import. This module sits on the server's import path, and a caller
         # only reaches here with an already-prepared FaceAnalysis app - so
         # insightface is resident by then anyway.
-        from insightface.utils import face_align
+        with ml_imports():
+            from insightface.utils import face_align
 
         # ── Phase 1: detection - one image at a time (ONNX batch dim = 1) ──
         detections: list[tuple[np.ndarray | None, np.ndarray, np.ndarray | None]] = []

@@ -10,17 +10,17 @@ machine.
 """
 
 import subprocess
-import sys
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.accelerator import (
-    MPS,
     ALL_DEVICE_ERROR_WORDS,
+    MPS,
     accelerator_total_memory_mb,
     empty_accelerator_cache,
     is_accelerated,
     is_apple_silicon,
 )
+from pixlstash.utils.model_utils import loaded_module
 
 logger = get_logger(__name__)
 
@@ -152,7 +152,7 @@ def is_vram_oom(error: BaseException) -> bool:
     type for the same condition, so the message is checked as well - and the
     wrapped-cause chain with it, because ``raise RuntimeError(...) from oom``
     is exactly how a plugin reports one. ``torch`` is read from
-    :data:`sys.modules` for the same reason as in :func:`empty_device_cache`: a
+    ``loaded_module`` for the same reason as in :func:`empty_device_cache`: a
     process that never imported it cannot have raised its OOM.
 
     Args:
@@ -161,7 +161,7 @@ def is_vram_oom(error: BaseException) -> bool:
     Returns:
         ``True`` for a GPU OOM, which callers treat as transient and retry.
     """
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     oom_type = getattr(torch, "OutOfMemoryError", None) if torch else None
     seen = set()
     current: BaseException | None = error

@@ -23,6 +23,7 @@ from pixlstash.utils.accelerator import (
     normalise_device,
     resolve_device,
 )
+from pixlstash.utils.model_utils import ml_imports
 
 _UNSET: Any = object()
 _torch_mod: Any = _UNSET
@@ -41,7 +42,8 @@ def _torch():
     global _torch_mod
     if _torch_mod is _UNSET:
         try:
-            import torch
+            with ml_imports():
+                import torch
         except Exception:
             _torch_mod = None
         else:
@@ -58,7 +60,8 @@ def _ort():
     global _ort_mod
     if _ort_mod is _UNSET:
         try:
-            import onnxruntime as ort
+            with ml_imports():
+                import onnxruntime as ort
         except Exception:
             _ort_mod = None
         else:

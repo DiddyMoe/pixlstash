@@ -32,6 +32,7 @@ import time
 from typing import Optional
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.model_utils import ml_imports
 from pixlstash.utils.path_utils import resolve_path_within
 
 logger = get_logger(__name__)
@@ -316,7 +317,8 @@ def ensure_model_pack_available(model_pack: str) -> None:
         pack_dir,
     )
     try:
-        from huggingface_hub import snapshot_download  # type: ignore[import]
+        with ml_imports():
+            from huggingface_hub import snapshot_download  # type: ignore[import]
 
         os.makedirs(pack_dir, exist_ok=True)
         # AuraFace lays its .onnx files at the repo root, so the snapshot contents

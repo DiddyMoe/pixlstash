@@ -26,6 +26,7 @@ from pixlstash.utils.image_processing.face_utils import FaceUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.utils.insightface_batched import BatchedFaceRunner
 from pixlstash.utils.media_files import SUPPORTED_IMAGE_EXTS
+from pixlstash.utils.model_utils import ml_imports
 from pixlstash.utils.insightface_model_utils import (
     DEFAULT_MODEL_PACK,
     ensure_model_pack_available,
@@ -375,9 +376,10 @@ class FaceExtractionTask(BaseTask):
         # Local imports: insightface (which drags in onnxruntime) and torch each
         # cost seconds to import, and this module is on the server's import
         # path. Both are only needed once face detection actually initialises.
-        import onnxruntime as ort
-        import torch
-        from insightface.app import FaceAnalysis
+        with ml_imports():
+            import onnxruntime as ort
+            import torch
+            from insightface.app import FaceAnalysis
 
         # Validate the configured pack and provision it on disk (no-op for
         # auto-downloaded packs like buffalo_l) before constructing FaceAnalysis.

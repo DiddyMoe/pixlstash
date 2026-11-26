@@ -20,6 +20,7 @@ from pixlstash.utils.accelerator import (
     accelerator_total_memory_mb,
     available_accelerator,
 )
+from pixlstash.utils.model_utils import ml_imports
 from pixlstash.utils.path_utils import LibraryRootsUnavailable
 
 if TYPE_CHECKING:
@@ -154,7 +155,11 @@ def collect_vram_from_torch(payload: dict) -> bool:
         True if device-memory data was successfully collected, False otherwise.
     """
     try:
-        import torch
+        # Local: torch costs seconds and the stats route is on the API path.
+        # Named, so a progress poll never waits on a model load once torch
+        # is in.
+        with ml_imports("torch"):
+            import torch
 
         accelerator = available_accelerator(torch)
         if accelerator == MPS:

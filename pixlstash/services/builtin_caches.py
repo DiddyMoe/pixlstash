@@ -74,6 +74,7 @@ from pixlstash.utils.insightface_model_utils import (
     insightface_root,
     recorded_insightface_root,
 )
+from pixlstash.utils.model_utils import ml_imports
 
 logger = get_logger(__name__)
 
@@ -163,7 +164,10 @@ def huggingface_cache_dir() -> Optional[str]:
     if override:
         return override
     try:
-        from huggingface_hub.constants import HF_HUB_CACHE
+        # Named: the model-folder listing route runs this, and must not wait
+        # on a model download once the module is in.
+        with ml_imports("huggingface_hub.constants"):
+            from huggingface_hub.constants import HF_HUB_CACHE
 
         return str(HF_HUB_CACHE)
     except ImportError as exc:
@@ -317,7 +321,8 @@ def declare_huggingface_cache(hub, folder_path: str) -> Optional[int]:
         The ``model_folder.id``, or None if the cache could not be read.
     """
     try:
-        from huggingface_hub import scan_cache_dir
+        with ml_imports():
+            from huggingface_hub import scan_cache_dir
     except ImportError as exc:
         logger.info(
             "huggingface_hub is not installed (%s); its cache will not be "

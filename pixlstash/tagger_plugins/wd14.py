@@ -24,6 +24,7 @@ from pixlstash.utils.accelerator import (
     normalise_device,
     onnx_execution_providers,
 )
+from pixlstash.utils.model_utils import ml_imports
 from pixlstash.utils.service.caption_utils import naturalize_tags, sanitise_tag
 
 logger = get_logger(__name__)
@@ -100,7 +101,8 @@ class WD14Service:
 
     def download(self, force_download: bool = False) -> None:
         """Download the ONNX model and tag CSV from HuggingFace."""
-        from huggingface_hub import hf_hub_download
+        with ml_imports():
+            from huggingface_hub import hf_hub_download
 
         os.makedirs(self._model_location, exist_ok=True)
         onnx_path = os.path.join(self._model_location, "model.onnx")
@@ -439,7 +441,10 @@ class WD14Service:
         undesired_tags: set,
         out_results: dict,
     ) -> None:
-        from pixlstash.image_loading_dataset_prepper import ImageLoadingDatasetPrepper
+        with ml_imports():
+            from pixlstash.image_loading_dataset_prepper import (
+                ImageLoadingDatasetPrepper,
+            )
 
         if not preloaded_map:
             return
@@ -511,7 +516,10 @@ class WD14Service:
         undesired_tags: set,
         out_results: dict,
     ):
-        from pixlstash.image_loading_dataset_prepper import ImageLoadingDatasetPrepper
+        with ml_imports():
+            from pixlstash.image_loading_dataset_prepper import (
+                ImageLoadingDatasetPrepper,
+            )
 
         if not remaining_paths:
             return [], False
