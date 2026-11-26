@@ -2,6 +2,8 @@
 
 import concurrent.futures
 import os
+import stat
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -20,9 +22,15 @@ from pixlstash.db_models.tag import (
     description_caption_content,
     is_tag_sentinel,
 )
+from pixlstash.services import import_dedup_service
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.tasks.base_task import BaseTask
-from pixlstash.tasks.missing_file_purge_task import MissingFilePurgeTask
+from pixlstash.tasks.missing_file_purge_task import (
+    REMOVAL_CHECK_MAX_AGE_S,
+    REMOVAL_ROUNDS,
+    MissingFilePurgeTask,
+    file_is_present,
+)
 from pixlstash.services.folder_structure_commit_service import root_import_answered
 from pixlstash.utils.caption_file_utils import (
     DEFAULT_DESCRIPTION_SUFFIX,
@@ -38,10 +46,13 @@ from pixlstash.utils.caption_file_utils import (
     recorded_sidecar,
     resolve_typed_sidecar,
     suffixes_collide,
-    write_sidecar,
     writeback_path,
 )
-from pixlstash.utils.image_processing.image_utils import ImageUtils, THUMBNAIL_EXTENSION
+from pixlstash.utils.image_processing.image_utils import (
+    ImageUtils,
+    THUMBNAIL_EXTENSION,
+    is_in_progress_file_name,
+)
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.utils.media_files import (
     has_hidden_component,
@@ -55,6 +66,7 @@ from pixlstash.services.layout_move_service import (
 )
 from pixlstash.services.move_reconciliation_service import record_pending_reviews
 from pixlstash.utils.library_layout import DEFAULT_LAYOUT, parse_layout
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.reference_folder_watcher import ROOT_INTERNAL_DIRS
 from pixlstash.utils.path_utils import path_is_within
 from pixlstash.utils.quality.tag_exclusion import (
@@ -65,6 +77,7 @@ from pixlstash.utils.quality.tag_exclusion import (
 from pixlstash.utils.service.smart_score_invalidation import (
     invalidate_on_anomaly_change,
 )
+from pixlstash.utils.sql_chunking import chunked
 
 logger = get_logger(__name__)
 
@@ -75,6 +88,11 @@ logger = get_logger(__name__)
 VIEWS_MARKER_NAME = ".pixlstash-views"
 
 _BUILD_CHUNK_SIZE = 128
+
+# Picture ids per ``IN (...)`` on the writer, well under SQLite's bound-variable
+# limit (999 on older builds).
+_ID_CHUNK_SIZE = 500
+
 _MAX_BUILD_WORKERS = 8
 
 # Top-level directories PixlStash itself writes under the library root, and so
@@ -91,9 +109,147 @@ _ROOT_INTERNAL_DIRS = ROOT_INTERNAL_DIRS
 # keeps the mtime, so a moved file is followed at once.
 _ROOT_SETTLE_S = 60.0
 
+# A root file whose content the library already holds is left where it is, so
+# every root scan finds it again; re-reading its bytes for the full SHA-256 each
+# time is the bulk of a scan with copies in it, under the import lock. Its
+# fingerprint is kept per root, keyed by what a write changes (size, mtime,
+# ctime, inode), and only the copies the last scan of that root found are kept.
+# ``ctime`` cannot be set back by a program, so a rewrite that restores the
+# mtime still misses.
+_StatKey = tuple[int, int, int, int]
+_root_copy_fingerprints: dict[
+    str, dict[str, tuple[_StatKey, import_dedup_service.ContentFingerprint]]
+] = {}
+_root_copy_fingerprints_lock = threading.Lock()
+
+# A fingerprint taken while the file's ctime is this recent is not kept: a
+# write landing in the same timestamp tick as the stat leaves the key unchanged
+# (git's "racy clean" entry, https://git-scm.com/docs/racy-git).
+_RACY_STAT_S = 2.0
+
+# An import's in-progress file older than this was left by a process that died
+# mid-write: no live import takes a day between writing a file and publishing
+# it. The scan removes it; it is never a picture.
+_IN_PROGRESS_ORPHAN_AGE_S = 24 * 3600.0
+
+# A vanished file's row is hard-deleted only on a look at the disk at most this
+# old when the delete runs, and looked at up to this many times per scan: the
+# rule MissingFilePurgeTask follows too, defined there (see its comment). Module
+# names of their own, so a test can tighten the scan's alone.
+_REMOVAL_CHECK_MAX_AGE_S = REMOVAL_CHECK_MAX_AGE_S
+_REMOVAL_ROUNDS = REMOVAL_ROUNDS
+
 
 def _is_supported_file(file_path: str) -> bool:
     return is_supported_media_file(file_path)
+
+
+def _sidecar_basis(
+    picture: Picture, folder_id: int | None, tags: tuple[str, ...]
+) -> tuple:
+    """Return the row state a scan's sidecar decisions rest on.
+
+    The stored path, owner and scrapheap flag say which picture it is; the
+    description, the tags and the sidecar bookkeeping are what the reconcile
+    compared against disk or is about to replace. A route that exported or
+    imported sidecars, or edited the tags or description, after the scan read
+    the row changes at least one of them, and the scan's write, decided from
+    the older state, would overwrite that newer one. The tags are needed on
+    their own: a tag edit on a folder that does not sync tags writes no
+    sidecar, so nothing else in the row moves.
+
+    Args:
+        picture: The row, as read by the scan or as it stands on the writer.
+        folder_id: The folder that owns it (None for the image root).
+        tags: The picture's tag names, sorted, from :func:`_tag_basis`.
+
+    Returns:
+        A tuple to compare for equality.
+    """
+    return (
+        picture.file_path,
+        folder_id,
+        picture.deleted,
+        picture.description,
+        tags,
+        picture.tags_file,
+        picture.tags_file_mtime,
+        picture.description_file,
+        picture.description_file_mtime,
+    )
+
+
+def _tag_basis(rows) -> dict[int, tuple[str, ...]]:
+    """Group ``(picture_id, tag)`` rows into each picture's sorted tag names.
+
+    Every row counts, sentinels and tags removed from tagging included: the
+    sidecar write deletes them all, so any change to them is a change the
+    write would overwrite.
+    """
+    grouped: dict[int, list[str]] = {}
+    for picture_id, tag in rows:
+        grouped.setdefault(picture_id, []).append(tag)
+    return {picture_id: tuple(sorted(tags)) for picture_id, tags in grouped.items()}
+
+
+def _stat_key(path: str) -> _StatKey:
+    st = os.stat(path)
+    return (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+
+
+def _create_sidecar(path: str, content: str) -> float | None:
+    """Create the sidecar *path* holding *content*, never replacing a file there.
+
+    The scan exports only where it found no sidecar, but a route that edits
+    the picture may write one between that look and this write. Replacing it
+    would put back the tags or description the scan read over that edit, and
+    the next scan would read them in as the owner's. Opening with ``"x"`` makes
+    the check and the create one step. Unlike ``write_sidecar`` the file is
+    written in place rather than renamed in, so another program can see it
+    part-written for the moment the write takes.
+
+    Args:
+        path: The sidecar to create.
+        content: What to write.
+
+    Returns:
+        The new file's modification time, or ``None`` when it was not created.
+    """
+    try:
+        handle = open(path, "x", encoding="utf-8")
+    except FileExistsError:
+        logger.info(
+            "Sidecar %s appeared after this scan looked for it; it is left as it "
+            "is, and the next scan reads it.",
+            path,
+        )
+        return None
+    except OSError as exc:
+        logger.warning("Could not create sidecar %s: %s", path, exc)
+        return None
+    with handle:
+        try:
+            handle.write(content)
+            handle.flush()
+            return os.fstat(handle.fileno()).st_mtime
+        except OSError as exc:
+            write_error = exc
+    # The part-written file is this scan's own, created above.
+    logger.warning(
+        "Could not write sidecar %s (%s); removing the part-written file.",
+        path,
+        write_error,
+    )
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        logger.warning(
+            "Could not remove the part-written sidecar %s (%s); the next scan "
+            "may read it in.",
+            path,
+            exc,
+        )
+    return None
 
 
 class ReferenceFolderScanTask(BaseTask):
@@ -170,6 +326,10 @@ class ReferenceFolderScanTask(BaseTask):
         # The folder's layout, loaded at the start of _run_task(); None means
         # "no layout", same as an unset column (v1.11 Phase 5).
         self._layout = None
+        # The root copies this scan found, as _root_copy_fingerprints keeps them.
+        self._copy_fingerprints: dict[
+            str, tuple[_StatKey, import_dedup_service.ContentFingerprint]
+        ] = {}
 
     def _run_task(self):
         resolved = self._resolved_path
@@ -350,9 +510,11 @@ class ReferenceFolderScanTask(BaseTask):
                 ):
                     unscanned_roots.append(full)
                     continue
-                if os.path.islink(full):
-                    # os.walk does not descend a directory symlink, so nothing
-                    # under it was looked at either.
+                if is_link_or_missing(full):
+                    # Pruned: os.walk does not descend a directory symlink, and
+                    # a Windows junction it would, so a link of either kind
+                    # leads nowhere this scan looks, and nothing under it was
+                    # looked at either.
                     unscanned_roots.append(full)
                     continue
                 kept.append(name)
@@ -374,6 +536,9 @@ class ReferenceFolderScanTask(BaseTask):
                 unscanned_roots.append(root)
                 continue
             for file_name in files:
+                if is_in_progress_file_name(file_name):
+                    self._sweep_in_progress_file(os.path.join(root, file_name))
+                    continue
                 if is_hidden_entry(file_name) or file_name.endswith(_thumb_suffix):
                     continue
                 full_path = os.path.join(root, file_name)
@@ -573,11 +738,18 @@ class ReferenceFolderScanTask(BaseTask):
         if override_path_shas:
 
             def clear_ledger(session: Session, shas: list[str]) -> int:
-                result = session.exec(
-                    delete(DeletedFileLog).where(DeletedFileLog.path_sha.in_(shas))
-                )
+                # Re-adding a folder can bring back more files than SQLite
+                # binds in one statement: one DELETE per chunk, one commit.
+                cleared = 0
+                for sha_chunk in chunked(shas):
+                    result = session.exec(
+                        delete(DeletedFileLog).where(
+                            DeletedFileLog.path_sha.in_(sha_chunk)
+                        )
+                    )
+                    cleared += int(result.rowcount or 0)
                 session.commit()
-                return int(result.rowcount or 0)
+                return cleared
 
             cleared = self._db.run_task(
                 clear_ledger, sorted(override_path_shas), priority=DBPriority.LOW
@@ -620,9 +792,18 @@ class ReferenceFolderScanTask(BaseTask):
             # file_path, so an orphan there is permanent), and the row never
             # becomes NULL-width, which is what an in-flight
             # ThumbnailGenerationTask would otherwise be free to overwrite.
-            carried_thumbnails = {
-                old: self._carry_thumbnail(self._stored(old), self._stored(new))
-                for old, new in moved_paths.items()
+            #
+            # Only a move the writer applied is carried, and only after it
+            # committed: a pair skipped as stale belongs to a row that is now
+            # somewhere else, and a bitmap renamed for it would sit under
+            # sha(new path) where no row ever looks. Whether there is a bitmap
+            # to carry is looked up here, off the writer, so the writer knows
+            # which rows to blank without touching the disk itself.
+            image_root = self._db.image_root
+            has_thumbnail = {
+                old: ImageUtils.find_thumbnail(image_root, self._stored(old))
+                is not None
+                for old in moved_paths
             }
 
             def apply_moves(
@@ -638,7 +819,7 @@ class ReferenceFolderScanTask(BaseTask):
                 # the writer, where nothing else can change the row before this
                 # transaction commits.
                 current: list[tuple[Picture, str, bool, str]] = []
-                for pic_id, new_path, thumbnail_carried, old_path, seen in pairs:
+                for pic_id, new_path, thumbnail_present, old_path, seen in pairs:
                     pic = session.get(Picture, pic_id)
                     if pic is None:
                         # The row went between the scan's read and this write -
@@ -666,7 +847,7 @@ class ReferenceFolderScanTask(BaseTask):
                             new_path,
                         )
                         continue
-                    current.append((pic, new_path, thumbnail_carried, old_path))
+                    current.append((pic, new_path, thumbnail_present, old_path))
                 # Which of these moves did PixlStash make itself? The layout
                 # engine (v1.11 Phase 4b) journals every file it moves, and a
                 # move that is ours is NOT the owner reorganising their library:
@@ -692,7 +873,7 @@ class ReferenceFolderScanTask(BaseTask):
                 applied: list[int] = []
                 external: list[int] = []
                 external_moves: list[tuple[int, str, str]] = []
-                for pic, new_path, thumbnail_carried, old_path in current:
+                for pic, new_path, thumbnail_present, old_path in current:
                     pic_id = pic.id
                     applied.append(pic_id)
                     pic.file_path = self._stored(new_path)
@@ -701,7 +882,7 @@ class ReferenceFolderScanTask(BaseTask):
                     # initialises it from the path.  Leaving it alone would make
                     # a renamed file download under its old name.
                     pic.original_file_name = os.path.basename(new_path)
-                    if not thumbnail_carried:
+                    if not thumbnail_present:
                         # No bitmap to carry, so point the sweep at it instead of
                         # at a thumbnail that is not there.
                         pic.thumbnail_width = None
@@ -728,7 +909,7 @@ class ReferenceFolderScanTask(BaseTask):
                 (
                     existing_by_path[old].id,
                     new,
-                    carried_thumbnails.get(old, False),
+                    has_thumbnail[old],
                     old,
                     (existing_by_path[old].file_path, folder_id),
                 )
@@ -742,6 +923,9 @@ class ReferenceFolderScanTask(BaseTask):
             moved_picture_ids, external_moved_picture_ids = self._db.run_task(
                 apply_moves, move_pairs, priority=DBPriority.LOW
             )
+            self._carry_applied_thumbnails(
+                moved_paths, existing_by_path, has_thumbnail, set(moved_picture_ids)
+            )
             logger.info(
                 "Reference folder %s: followed %d moved file(s), %d of them "
                 "moved by PixlStash itself.",
@@ -754,13 +938,15 @@ class ReferenceFolderScanTask(BaseTask):
             # it by path and would otherwise reconcile at the old location.  A
             # pair apply_moves did not apply is dropped from this pass entirely:
             # its row is no longer what this scan read, so neither its old path
-            # nor its sidecars are this scan's to act on.
+            # nor its sidecars are this scan's to act on. The row's own path is
+            # set to what apply_moves stored, so the sidecar write can tell this
+            # row from one another writer has moved since.
             applied = set(moved_picture_ids)
             for old_path, new_path in moved_paths.items():
                 picture = existing_by_path.pop(old_path)
                 if picture.id not in applied:
                     continue
-                picture.file_path = new_path
+                picture.file_path = self._stored(new_path)
                 existing_by_path[new_path] = picture
             removed_paths -= moved_paths.keys()
             new_paths -= set(moved_paths.values())
@@ -824,67 +1010,11 @@ class ReferenceFolderScanTask(BaseTask):
                     len(settling),
                 )
                 still_missing = []
-            # Each id carries what the decision rested on - the row's stored
-            # path, owner and scrapheap flag as read - for delete_removed to
-            # check.
-            removals = [
-                (pic.id, (pic.file_path, folder_id, pic.deleted))
-                for pic in still_missing
-            ]
-
-            def delete_removed(
-                session: Session, decisions: list[tuple[int, tuple]]
-            ) -> list[int]:
-                # Decided from rows read before this write was queued. A row
-                # another writer has since repointed, re-owned or scrapheaped
-                # may now name a live file, and deleting it by id would take its
-                # tags, score and set membership with it. Only a row still as
-                # the scan read it is deleted; the next scan judges the rest as
-                # they are. The decision also rested on the file being absent,
-                # and a file put back at the same path leaves the row as it was
-                # read, so the path is looked at again too. Checked on the
-                # writer, where nothing else can change the row before this
-                # transaction commits.
-                deleted: list[int] = []
-                for pic_id, seen in decisions:
-                    pic = session.get(Picture, pic_id)
-                    if pic is None:
-                        continue
-                    if (pic.file_path, pic.reference_folder_id, pic.deleted) != seen:
-                        logger.info(
-                            "Reference folder %s: picture %d changed after this "
-                            "scan read it (now at %s); not deleting it. The next "
-                            "scan will reconcile it.",
-                            self._folder_path,
-                            pic_id,
-                            pic.file_path,
-                        )
-                        continue
-                    # lexists, because the walk lists symlinked files, dangling
-                    # ones included.
-                    if os.path.lexists(self._on_disk(pic.file_path)):
-                        logger.info(
-                            "Reference folder %s: picture %d is back at %s; not "
-                            "deleting it.",
-                            self._folder_path,
-                            pic_id,
-                            pic.file_path,
-                        )
-                        continue
-                    session.delete(pic)
-                    deleted.append(pic_id)
-                session.commit()
-                return deleted
-
-            if removals:
-                removed_ids = self._db.run_task(
-                    delete_removed, removals, priority=DBPriority.LOW
-                )
-                logger.info(
-                    "Reference folder %s: removed %d stale picture records.",
-                    self._folder_path,
-                    len(removed_ids),
-                )
+            # The decision also rested on the file being absent, and a file put
+            # back at the same path since the walk leaves the row as it was
+            # read, so the path is looked at again, close to the delete and
+            # never on the writer (see `_delete_vanished`).
+            removed_ids = self._delete_vanished(still_missing, folder_id)
 
         # --- Handle new files ---
         imported_picture_ids: list[int] = []
@@ -892,10 +1022,37 @@ class ReferenceFolderScanTask(BaseTask):
             pending_paths = sorted(new_paths)
             for i in range(0, len(pending_paths), _BUILD_CHUNK_SIZE):
                 chunk_paths = pending_paths[i : i + _BUILD_CHUNK_SIZE]
+                # The image root is where every import publishes, so a file
+                # there whose content the library already holds is a copy, not
+                # a new picture. The copies are left out before the chunk is
+                # built, so none is hashed for a thumbnail, and the lookup is
+                # made again under the import lock, which every import path
+                # holds from its lookup to its insert, right before the
+                # insert: hashing and rendering a chunk takes seconds, and
+                # every other import would wait for them. A reference folder
+                # is indexed by path, copies and all, so it skips neither.
+                # What the look before the build compared each file with, so
+                # the look under the lock reads no file for those again.
+                compared: dict[str, tuple[_StatKey, frozenset[int]]] = {}
+                if self._is_root:
+                    chunk_paths = self._without_library_copies(chunk_paths, compared)
                 chunk_pictures = self._build_picture_chunk(chunk_paths, folder_id)
                 if not chunk_pictures:
                     continue
-                imported_picture_ids.extend(self._insert_pictures(chunk_pictures))
+                if not self._is_root:
+                    imported_picture_ids.extend(self._insert_pictures(chunk_pictures))
+                    continue
+                with import_dedup_service.serialised_import():
+                    chunk_pictures = self._without_imported_meanwhile(
+                        chunk_pictures, compared
+                    )
+                    if chunk_pictures:
+                        imported_picture_ids.extend(
+                            self._insert_pictures(chunk_pictures)
+                        )
+        if self._is_root:
+            with _root_copy_fingerprints_lock:
+                _root_copy_fingerprints[resolved] = self._copy_fingerprints
 
         if imported_picture_ids:
             logger.info(
@@ -912,10 +1069,6 @@ class ReferenceFolderScanTask(BaseTask):
         #   write - when the folder syncs that type and a picture with content
         #           has no sidecar yet, the file is created on disk (export).
         # An empty sidecar is never created.
-        tags_by_pic: dict[int, list[str]] = {}
-        if sync_tags:
-            tags_by_pic = self._fetch_folder_tags(folder_id)
-
         caption_updates: list[dict] = []
         # The root reconciles an already-indexed picture only once the owner
         # turned sync on: with it off, a stray .txt that appears beside a
@@ -928,11 +1081,22 @@ class ReferenceFolderScanTask(BaseTask):
             if self._is_root and not (sync_tags or sync_descriptions)
             else existing_by_path.items()
         )
+        # Read before any sidecar is, so a tag edit that lands while the scan
+        # looks at the disk is one the writer sees as newer.
+        tags_by_pic: dict[int, list[str]] = {}
+        tag_basis: dict[int, tuple[str, ...]] = {}
+        if sidecar_candidates:
+            tags_by_pic, tag_basis = self._fetch_folder_tags(folder_id)
         for file_path, pic in sidecar_candidates:
             if file_path in removed_paths or pic.deleted:
                 # Don't touch sidecar data for removed/scrapheap pictures.
                 continue
-            update: dict = {"pic_id": pic.id}
+            # What the sidecar decisions rested on, as read, for
+            # apply_caption_updates to check.
+            update: dict = {
+                "pic_id": pic.id,
+                "seen": _sidecar_basis(pic, folder_id, tag_basis.get(pic.id, ())),
+            }
             self._reconcile_sidecar(
                 update,
                 file_path,
@@ -953,7 +1117,7 @@ class ReferenceFolderScanTask(BaseTask):
                 sync=sync_descriptions,
                 export_content=description_caption_content(pic.description),
             )
-            if len(update) > 1:
+            if len(update) > 2:
                 caption_updates.append(update)
 
         caption_updated_picture_ids: list[int] = []
@@ -962,7 +1126,7 @@ class ReferenceFolderScanTask(BaseTask):
             def apply_caption_updates(
                 session: Session,
                 updates: list[dict],
-            ) -> None:
+            ) -> list[int]:
                 # A sidecar re-sync writes confirmed tags/description onto EXISTING
                 # pictures; a picture frozen by a locked set is read-only, so skip
                 # it (background task - skip-and-log rather than raising 423).
@@ -973,25 +1137,68 @@ class ReferenceFolderScanTask(BaseTask):
                         len(locked),
                         sorted(locked),
                     )
+                # Decided from rows read before this write was queued. A row
+                # another writer has since moved, re-owned, scrapheaped,
+                # removed, or whose tags, description or sidecars a route
+                # rewrote is no longer what this scan reconciled against:
+                # writing the scan's tags, description or sidecar path onto it
+                # would overwrite the newer state. Checked on the writer, where
+                # nothing else can change the row before this transaction
+                # commits; the next scan judges it as it is.
+                skipped = set(locked)
+                update_ids = [u["pic_id"] for u in updates]
+                current_tags: dict[int, tuple[str, ...]] = {}
+                for i in range(0, len(update_ids), _ID_CHUNK_SIZE):
+                    current_tags.update(
+                        _tag_basis(
+                            session.exec(
+                                select(Tag.picture_id, Tag.tag).where(
+                                    Tag.picture_id.in_(
+                                        update_ids[i : i + _ID_CHUNK_SIZE]
+                                    )
+                                )
+                            ).all()
+                        )
+                    )
+                for u in updates:
+                    pic_db = session.get(Picture, u["pic_id"])
+                    if pic_db is None:
+                        skipped.add(u["pic_id"])
+                        continue
+                    now = _sidecar_basis(
+                        pic_db,
+                        pic_db.reference_folder_id,
+                        current_tags.get(u["pic_id"], ()),
+                    )
+                    if now != u["seen"]:
+                        logger.info(
+                            "Reference folder %s: picture %d changed after this "
+                            "scan read it (now at %s); not applying its sidecar "
+                            "changes. The next scan will reconcile it.",
+                            self._folder_path,
+                            u["pic_id"],
+                            pic_db.file_path,
+                        )
+                        skipped.add(u["pic_id"])
                 # A Tag row feeds the scorer's anomaly penalty and a cached
                 # smart score is never recomputed on its own, so a sidecar
                 # edit is wrapped like every other tag mutation.
                 retagged = [
                     u["pic_id"]
                     for u in updates
-                    if "new_tags" in u and u["pic_id"] not in locked
+                    if "new_tags" in u and u["pic_id"] not in skipped
                 ]
                 exclusions = session_tag_exclusions(session)
                 left_out = 0
+                written: list[int] = []
                 with invalidate_on_anomaly_change(
                     session, retagged, context="sidecar tag sync"
                 ):
                     for u in updates:
-                        if u["pic_id"] in locked:
+                        if u["pic_id"] in skipped:
                             continue
                         pic_db = session.get(Picture, u["pic_id"])
-                        if pic_db is None:
-                            continue
+                        written.append(u["pic_id"])
                         if "tags_file" in u:
                             pic_db.tags_file = u["tags_file"]
                             pic_db.tags_file_mtime = u["tags_file_mtime"]
@@ -1033,15 +1240,18 @@ class ReferenceFolderScanTask(BaseTask):
                     )
                 session.commit()
                 self._db.tag_resets.mark_reset(retagged)
+                return written
 
-            self._db.run_task(
+            # Only the pictures actually written are reported: a locked or
+            # stale one kept its data, and counting it would tell the grid to
+            # refresh a picture that did not change.
+            caption_updated_picture_ids = self._db.run_task(
                 apply_caption_updates, caption_updates, priority=DBPriority.LOW
             )
-            caption_updated_picture_ids = [u["pic_id"] for u in caption_updates]
             logger.info(
                 "Reference folder %s: reconciled sidecar data for %d existing pictures.",
                 self._folder_path,
-                len(caption_updates),
+                len(caption_updated_picture_ids),
             )
 
         # Clear the one-shot explicit-re-import flag now that a scan has
@@ -1060,7 +1270,7 @@ class ReferenceFolderScanTask(BaseTask):
             # What was actually deleted, not what merely vanished from the
             # listing: a repaired or deferred row is neither.
             "removed_count": len(removed_ids),
-            "caption_updated_count": len(caption_updates),
+            "caption_updated_count": len(caption_updated_picture_ids),
             "caption_updated_picture_ids": caption_updated_picture_ids,
             "imported_picture_ids": imported_picture_ids,
             "moved_picture_ids": moved_picture_ids,
@@ -1072,6 +1282,407 @@ class ReferenceFolderScanTask(BaseTask):
                 external_moved_picture_ids if self._layout is not None else []
             ),
         }
+
+    def _without_library_copies(
+        self,
+        file_paths: list[str],
+        compared: dict[str, tuple[_StatKey, frozenset[int]]],
+    ) -> list[str]:
+        """The image-root files whose content no picture already holds.
+
+        A file whose sampled hash, size and full SHA-256 match a picture (live
+        or in the Scrapheap), or an earlier file of *file_paths* that is
+        imported, is left on disk untouched and not imported, with one log
+        line naming it and the picture or file. A file that cannot be hashed
+        is kept, so the build step reports it as it reports any other.
+
+        A copy's fingerprint is reused from the last scan while its stat key
+        is unchanged (see ``_root_copy_fingerprints``); the match itself is
+        made again every time, so a copy whose picture has gone is imported.
+
+        Each kept file that was compared with candidate pictures goes into
+        *compared*, by its stored path: its stat key when it was read, and
+        the ids of those candidates. Their content is not the file's, so
+        :meth:`_without_imported_meanwhile` reads neither again while the
+        stat key holds. Only a stat key a write could not have hidden is
+        recorded, the one the fingerprint cache keeps.
+        """
+        with _root_copy_fingerprints_lock:
+            known = _root_copy_fingerprints.get(self._resolved_path, {})
+        fingerprints: dict[str, import_dedup_service.ContentFingerprint] = {}
+        stat_keys: dict[str, _StatKey] = {}
+        for path in file_paths:
+            try:
+                key = _stat_key(path)
+                cached = known.get(path)
+                if cached is not None and cached[0] == key:
+                    fingerprints[path] = cached[1]
+                    stat_keys[path] = key
+                    continue
+                fingerprint = (
+                    ImageUtils.calculate_hash_from_file_path(path),
+                    key[0],
+                    ImageUtils.calculate_full_hash_from_file_path(path),
+                )
+                fingerprints[path] = fingerprint
+                # Kept only if nothing wrote the file while it was read, and
+                # the key is old enough that a write cannot share its tick.
+                if _stat_key(path) == key and (
+                    time.time_ns() - key[2] >= _RACY_STAT_S * 1e9
+                ):
+                    stat_keys[path] = key
+            except OSError as exc:
+                logger.warning(
+                    "Root scan: could not hash %s to compare it with the library: %s",
+                    path,
+                    exc,
+                )
+        if not fingerprints:
+            return file_paths
+        candidates = self._db.run_immediate_read_task(
+            import_dedup_service.load_match_candidates_in_session,
+            [(sampled, size) for sampled, size, _full in fingerprints.values()],
+        )
+        live, scrapheaped = import_dedup_service.partition_confirmed_matches(
+            candidates, fingerprints.values(), self._db.image_root
+        )
+        kept: list[str] = []
+        # The first file of each content this chunk imports: the library
+        # lookup cannot see it before the chunk's insert, so a second file
+        # with the same content is a copy of it, not a new picture.
+        first_by_fingerprint: dict[import_dedup_service.ContentFingerprint, str] = {}
+        for path in file_paths:
+            fingerprint = fingerprints.get(path)
+            match = live.get(fingerprint) or scrapheaped.get(fingerprint)
+            first = first_by_fingerprint.get(fingerprint)
+            if match is None and first is None:
+                if fingerprint is not None:
+                    first_by_fingerprint[fingerprint] = path
+                    rows = candidates.get((fingerprint[0], fingerprint[1]))
+                    if rows and path in stat_keys:
+                        compared[self._stored(path)] = (
+                            stat_keys[path],
+                            frozenset(row.id for row in rows),
+                        )
+                kept.append(path)
+                continue
+            if path in stat_keys:
+                self._copy_fingerprints[path] = (stat_keys[path], fingerprint)
+            if match is None:
+                logger.info(
+                    "Root scan: not importing %s: it has the content of %s, "
+                    "imported in the same scan. The file is left where it is.",
+                    path,
+                    first,
+                )
+                continue
+            logger.info(
+                "Root scan: not importing %s: its content is already picture %d%s. "
+                "The file is left where it is.",
+                path,
+                match.id,
+                " (in the Scrapheap)" if match.deleted else "",
+            )
+        return kept
+
+    def _without_imported_meanwhile(
+        self,
+        pictures: list[Picture],
+        compared: dict[str, tuple[_StatKey, frozenset[int]]],
+    ) -> list[Picture]:
+        """The built root *pictures* whose content no picture holds now.
+
+        Call under :func:`import_dedup_service.serialised_import`, right before
+        :meth:`_insert_pictures`. :meth:`_without_library_copies` looked before
+        the chunk was built and outside the lock, so an import that inserted
+        the same content since then is found here, by the lookup every holder
+        of the lock makes: on the sampled hash and size the build stored, then
+        the full SHA-256 for a picture with a candidate only. The common case
+        under the lock is one indexed read. A dropped picture's file is left
+        where it is, as a copy is, and the thumbnail the build wrote for its
+        path goes unless the match is that same path.
+
+        A candidate :meth:`_without_library_copies` already compared a file
+        with, as *compared* records it, is no candidate for that file while
+        the file's stat key is the one it had then: a sampled-hash collision with a picture the
+        library held before costs no read under the lock. A candidate added
+        since, a file the look could not hash, and a file written since are
+        compared here as before.
+        """
+        keyed = [p for p in pictures if p.pixel_sha and p.size_bytes is not None]
+        if not keyed:
+            return pictures
+        candidates = self._db.run_immediate_read_task(
+            import_dedup_service.load_match_candidates_in_session,
+            [(p.pixel_sha, p.size_bytes) for p in keyed],
+        )
+        fingerprints: dict[int, import_dedup_service.ContentFingerprint] = {}
+        # Per key, the candidates some picture has not been compared with.
+        needed: dict[import_dedup_service.ContentKey, set[int]] = {}
+        for pic in keyed:
+            key = (pic.pixel_sha, pic.size_bytes)
+            if key not in candidates:
+                continue
+            path = self._on_disk(pic.file_path)
+            seen: frozenset[int] = frozenset()
+            earlier = compared.get(pic.file_path)
+            if earlier is not None:
+                try:
+                    if _stat_key(path) == earlier[0]:
+                        seen = earlier[1]
+                except OSError as exc:
+                    logger.warning(
+                        "Root scan: could not stat %s to tell whether it changed "
+                        "since it was compared with the library: %s",
+                        path,
+                        exc,
+                    )
+            fresh = {row.id for row in candidates[key]} - seen
+            if not fresh:
+                continue
+            try:
+                full_sha = ImageUtils.calculate_full_hash_from_file_path(path)
+            except OSError as exc:
+                # Kept, as the look before the build keeps a file it cannot
+                # hash: never dropped on evidence that could not be read.
+                logger.warning(
+                    "Root scan: could not hash %s to compare it with the library "
+                    "again before indexing it: %s",
+                    path,
+                    exc,
+                )
+                continue
+            fingerprints[id(pic)] = (pic.pixel_sha, pic.size_bytes, full_sha)
+            needed.setdefault(key, set()).update(fresh)
+        if not fingerprints:
+            return pictures
+        # A candidate one picture needs is compared with every picture of its
+        # key; it is read once either way, and a file it was compared with
+        # before still does not match it.
+        live, scrapheaped = import_dedup_service.partition_confirmed_matches(
+            {
+                key: [row for row in candidates[key] if row.id in ids]
+                for key, ids in needed.items()
+            },
+            fingerprints.values(),
+            self._db.image_root,
+        )
+        kept: list[Picture] = []
+        for pic in pictures:
+            fingerprint = fingerprints.get(id(pic))
+            match = (
+                (live.get(fingerprint) or scrapheaped.get(fingerprint))
+                if fingerprint is not None
+                else None
+            )
+            if match is None:
+                kept.append(pic)
+                continue
+            # Not "imported while the scan read the file": the match may be a
+            # picture the look before the lock could not compare the file with,
+            # or one the file was rewritten into a copy of since.
+            logger.info(
+                "Root scan: not importing %s: picture %d%s already holds its "
+                "content. The file is left where it is.",
+                self._on_disk(pic.file_path),
+                match.id,
+                " (in the Scrapheap)" if match.deleted else "",
+            )
+            if match.file_path != pic.file_path:
+                self._remove_built_thumbnail(pic.file_path)
+        return kept
+
+    def _remove_built_thumbnail(self, stored_path: str) -> None:
+        """Remove the thumbnail :meth:`_build_picture` wrote for a path left unindexed."""
+        thumb = ImageUtils.get_thumbnail_path(self._db.image_root, stored_path)
+        if not thumb or not os.path.lexists(thumb):
+            return
+        try:
+            os.remove(thumb)
+        except OSError as exc:
+            logger.warning(
+                "Root scan: could not remove the thumbnail %s built for %s, "
+                "which is not indexed: %s",
+                thumb,
+                stored_path,
+                exc,
+            )
+
+    def _delete_vanished(
+        self, vanished: list[Picture], folder_id: int | None
+    ) -> list[int]:
+        """Hard-delete the rows of *vanished* whose files are still gone; return their ids.
+
+        Check-then-act across two systems with no shared transaction: the
+        disk, which must never be looked at on the writer (a stat can block
+        for as long as a network share or a spun-down disk likes, and the
+        writer holds every other write in the library), and the database.
+        So the look is made here, on the scan thread, and stamped; the delete
+        on the writer is conditional on what the look rested on, the row as
+        read (another writer may have repointed, re-owned or scrapheaped it)
+        **and** the look's age: a row whose look is older than
+        :data:`_REMOVAL_CHECK_MAX_AGE_S` when the delete runs is refused, so
+        a write queue that kept the delete waiting cannot turn an old look
+        into a delete of a file that came back meanwhile. A refused row is
+        looked at again, up to :data:`_REMOVAL_ROUNDS` times, and then kept
+        for the next scan. Looks are sent in groups that are flushed before
+        their oldest look is half the limit old, so a slow disk spends its
+        time here and not in the delete's window.
+
+        The delete is HIGH: the condition is a deadline, and LOW waits behind
+        every import and thumbnail write by design. Each delete is a short
+        transaction over at most ``_ID_CHUNK_SIZE`` rows.
+
+        After the delete the paths are looked at once more (CWE-367's
+        "recheck after use"): a file put back inside the window has lost its
+        row, which is said in a warning; the next scan indexes it as new.
+        """
+        removed: list[int] = []
+        pending = [pic for pic in vanished if pic.id is not None]
+        by_id = {pic.id: pic for pic in pending}
+
+        def delete_removed(
+            session: Session, decisions: list[tuple[int, tuple, float]]
+        ) -> tuple[list[int], list[int]]:
+            # A row another writer has since repointed, re-owned or
+            # scrapheaped may now name a live file, and deleting it by id
+            # would take its tags, score and set membership with it. Only a
+            # row still as the scan read it is deleted; the next scan judges
+            # the rest as they are. Checked on the writer, where nothing else
+            # can change the row before this transaction commits. The disk is
+            # never touched from here: a look older than the limit is
+            # returned as stale for the scan to repeat.
+            deleted: list[int] = []
+            stale: list[int] = []
+            oldest = None
+            for pic_id, seen, checked_at in decisions:
+                pic = session.get(Picture, pic_id)
+                if pic is None:
+                    continue
+                if (pic.file_path, pic.reference_folder_id, pic.deleted) != seen:
+                    logger.info(
+                        "Reference folder %s: picture %d changed after this "
+                        "scan read it (now at %s); not deleting it. The next "
+                        "scan will reconcile it.",
+                        self._folder_path,
+                        pic_id,
+                        pic.file_path,
+                    )
+                    continue
+                if time.monotonic() - checked_at > _REMOVAL_CHECK_MAX_AGE_S:
+                    stale.append(pic_id)
+                    continue
+                session.delete(pic)
+                deleted.append(pic_id)
+                oldest = checked_at if oldest is None else min(oldest, checked_at)
+            if deleted:
+                # Flushed first, so the age is judged with the DELETEs (and
+                # their cascades) already run: only the COMMIT follows.
+                session.flush()
+                if time.monotonic() - oldest > _REMOVAL_CHECK_MAX_AGE_S:
+                    session.rollback()
+                    return [], stale + deleted
+            session.commit()
+            return deleted, stale
+
+        def flush(batch: list[tuple[int, tuple, float]]) -> list[int]:
+            deleted, stale = self._db.run_task(
+                delete_removed, batch, priority=DBPriority.HIGH
+            )
+            removed.extend(deleted)
+            for pic_id in deleted:
+                path = self._on_disk(by_id[pic_id].file_path)
+                if file_is_present(path):
+                    logger.warning(
+                        "Reference folder %s: %s came back while its record "
+                        "(picture %d) was being removed; the next scan indexes "
+                        "it as a new picture.",
+                        self._folder_path,
+                        path,
+                        pic_id,
+                    )
+            return stale
+
+        for _ in range(_REMOVAL_ROUNDS):
+            if not pending:
+                break
+            stale_ids: list[int] = []
+            batch: list[tuple[int, tuple, float]] = []
+            for pic in pending:
+                # The walk lists symlinked files, dangling ones included, so
+                # present means the purge sweep's present: see file_is_present.
+                if file_is_present(self._on_disk(pic.file_path)):
+                    logger.info(
+                        "Reference folder %s: picture %d is back at %s; not "
+                        "deleting it.",
+                        self._folder_path,
+                        pic.id,
+                        pic.file_path,
+                    )
+                    continue
+                batch.append(
+                    (pic.id, (pic.file_path, folder_id, pic.deleted), time.monotonic())
+                )
+                if (
+                    len(batch) >= _ID_CHUNK_SIZE
+                    or time.monotonic() - batch[0][2] >= _REMOVAL_CHECK_MAX_AGE_S / 2
+                ):
+                    stale_ids.extend(flush(batch))
+                    batch = []
+            if batch:
+                stale_ids.extend(flush(batch))
+            pending = [by_id[pic_id] for pic_id in stale_ids]
+        if pending:
+            logger.info(
+                "Reference folder %s: %d vanished picture(s) were not deleted: "
+                "the database was too busy to act on a look at the disk within "
+                "%.1f s, %d times. Keeping their records for the next scan.",
+                self._folder_path,
+                len(pending),
+                _REMOVAL_CHECK_MAX_AGE_S,
+                _REMOVAL_ROUNDS,
+            )
+        if removed:
+            logger.info(
+                "Reference folder %s: removed %d stale picture records.",
+                self._folder_path,
+                len(removed),
+            )
+        return removed
+
+    def _sweep_in_progress_file(self, path: str) -> None:
+        """Remove an import's in-progress file that a dead process left behind.
+
+        Only a regular file past :data:`_IN_PROGRESS_ORPHAN_AGE_S`: a younger
+        one may belong to an import still running, and a link is not ours.
+        """
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(info.st_mode):
+            return
+        age_s = time.time() - info.st_mtime
+        if age_s < _IN_PROGRESS_ORPHAN_AGE_S:
+            return
+        try:
+            os.remove(path)
+        except OSError as exc:
+            logger.warning(
+                "Folder scan of %s: could not remove %s, left by an import "
+                "that did not finish: %s",
+                self._folder_path,
+                path,
+                exc,
+            )
+            return
+        logger.info(
+            "Folder scan of %s: removed %s, left %.0f h ago by an import that "
+            "did not finish.",
+            self._folder_path,
+            path,
+            age_s / 3600,
+        )
 
     def _on_disk(self, stored: str) -> str:
         """The walked path for a stored ``Picture.file_path``, inverse of :meth:`_stored`."""
@@ -1090,15 +1701,21 @@ class ReferenceFolderScanTask(BaseTask):
             return path
         return os.path.relpath(path, self._resolved_path).replace(os.sep, "/")
 
-    def _fetch_folder_tags(self, folder_id: int) -> dict[int, list[str]]:
-        """Return ``{picture_id: [tag, ...]}`` for this folder's pictures.
+    def _fetch_folder_tags(
+        self, folder_id: int | None
+    ) -> tuple[dict[int, list[str]], dict[int, tuple[str, ...]]]:
+        """Return this folder's tags to export, and every picture's tag basis.
 
-        Used only when the folder exports tags, so the export step knows what to
-        write into newly-created sidecars.  Sentinel/placeholder tags are
-        excluded.  A single join avoids the SQLite bound-variable limit.
+        The first map, ``{picture_id: [tag, ...]}``, is what the export step
+        writes into newly created sidecars: sentinel and excluded tags are left
+        out. The second is :func:`_tag_basis` of every row, which the writer
+        compares to tell a tag edit made after this read. A single join avoids
+        the SQLite bound-variable limit.
         """
 
-        def fetch(session: Session) -> dict[int, list[str]]:
+        def fetch(
+            session: Session,
+        ) -> tuple[dict[int, list[str]], dict[int, tuple[str, ...]]]:
             owner = (
                 Picture.reference_folder_id.is_(None)
                 if folder_id is None
@@ -1120,7 +1737,7 @@ class ReferenceFolderScanTask(BaseTask):
                     and not is_excluded(tag, exclusions)
                 ):
                     out.setdefault(pic_id, []).append(tag)
-            return out
+            return out, _tag_basis(rows)
 
         return self._db.run_task(fetch, priority=DBPriority.LOW)
 
@@ -1188,7 +1805,7 @@ class ReferenceFolderScanTask(BaseTask):
             target = writeback_path(file_path, sidecar_type, suffix, None)
             if target is None:
                 return
-            new_mtime = write_sidecar(target, export_content)
+            new_mtime = _create_sidecar(target, export_content)
             if new_mtime is not None:
                 update[path_key] = target
                 update[mtime_key] = new_mtime
@@ -1232,6 +1849,63 @@ class ReferenceFolderScanTask(BaseTask):
             )
             return False
 
+    def _carry_applied_thumbnails(
+        self,
+        moved_paths: dict[str, str],
+        existing_by_path: dict[str, Picture],
+        has_thumbnail: dict[str, bool],
+        applied_ids: set[int],
+    ) -> None:
+        """Carry the bitmaps of the moves ``apply_moves`` committed, and no others.
+
+        A pair the writer skipped is left alone: its row now names some other
+        path, and the bitmap at ``sha(old path)`` is the one that row, or the
+        writer that moved it, still expects. A carry that fails after the move
+        committed leaves the row with dimensions and no bitmap at its new
+        name, so the dimensions are blanked for ``MissingThumbnailFinder`` -
+        but only on a row still at the path this scan gave it.
+
+        Args:
+            moved_paths: Old on-disk path to new on-disk path, as matched.
+            existing_by_path: The scan's rows, still keyed by the old path.
+            has_thumbnail: Whether a bitmap was found for each old path before
+                the write; only those are carried.
+            applied_ids: Ids of the pictures ``apply_moves`` actually moved.
+        """
+        failed: list[tuple[int, str]] = []
+        for old, new in moved_paths.items():
+            picture = existing_by_path[old]
+            if picture.id not in applied_ids or not has_thumbnail[old]:
+                continue
+            new_stored = self._stored(new)
+            if not self._carry_thumbnail(self._stored(old), new_stored):
+                failed.append((picture.id, new_stored))
+        if not failed:
+            return
+
+        def blank_uncarried(session: Session, rows: list[tuple[int, str]]) -> int:
+            blanked = 0
+            for pic_id, stored_path in rows:
+                pic = session.get(Picture, pic_id)
+                if pic is None or pic.file_path != stored_path:
+                    # Gone or moved again since: whoever moved it owns its
+                    # thumbnail now.
+                    continue
+                pic.thumbnail_width = None
+                pic.thumbnail_height = None
+                session.add(pic)
+                blanked += 1
+            session.commit()
+            return blanked
+
+        blanked = self._db.run_task(blank_uncarried, failed, priority=DBPriority.LOW)
+        logger.info(
+            "Reference folder %s: %d moved picture(s) will regenerate their "
+            "thumbnail because the bitmap could not be carried.",
+            self._folder_path,
+            blanked,
+        )
+
     def _match_moved_paths(
         self,
         existing_by_path: dict[str, Picture],
@@ -1253,12 +1927,14 @@ class ReferenceFolderScanTask(BaseTask):
 
         Only a 1:1 match on ``(pixel_sha, size_bytes)`` counts as a move, and
         only when no unchanged file in the folder shares that key either.
-        Scrapheap rows are never the *source* of a move (a hidden soft-deleted
-        row would otherwise swallow an unrelated new file of the same content)
-        but do count as unchanged files blocking one, since their file is still
-        on disk.  A present file whose ``pixel_sha`` has not been backfilled yet
-        blocks every candidate of its own size, since it could be a copy of any
-        of them.
+        Scrapheap rows are matched like live ones, so a file the owner moved
+        while its picture sat in the Scrapheap stays that picture, still in the
+        Scrapheap, with its tags and curation; the cost is that the same
+        content arriving just as a binned file is deleted reads as that move
+        too. An unchanged Scrapheap file also counts as a file blocking a
+        match, since it is still on disk.  A present file whose ``pixel_sha``
+        has not been backfilled yet blocks every candidate of its own size,
+        since it could be a copy of any of them.
         Identical pixels at several paths are genuine copies, and the rows
         behind them can differ in tags, sets and scores - pairing them by guess
         would move one picture's work onto another picture's file, which is the
@@ -1292,17 +1968,20 @@ class ReferenceFolderScanTask(BaseTask):
         # for exactly this reason.  Here a false pair is worse than the bug
         # being fixed: a lost row is visible, one picture's tags and
         # memberships silently rebound onto another picture's file are not.
-        # Scrapheap rows are not move candidates.  ``fetch_existing`` loads
-        # ``deleted=True`` pictures on purpose, so without this a hidden
-        # scrapheap row whose file really was deleted would swallow an unrelated
-        # new file of the same content: the arrival is taken out of
-        # ``new_paths`` as "a move", and what the user gets is not a new picture
-        # but a soft-deleted one they cannot see.  Leaving them in
-        # ``removed_paths`` keeps the ordinary cleanup path unchanged.
+        # Scrapheap rows are move candidates too (``fetch_existing`` loads
+        # ``deleted=True`` pictures on purpose). Left out, a binned picture
+        # whose file the owner moved is a removal plus a new file: the row is
+        # hard-deleted with its tags and curation, and the file comes back as a
+        # live picture the owner had already thrown out. Matched, the row
+        # follows the file and keeps its Scrapheap state. The price is the
+        # other reading of the same evidence - a binned file deleted while
+        # identical content arrives - which now also stays in the Scrapheap
+        # instead of appearing as new; the content is the content the owner
+        # binned, so that is the side to err on.
         gone_by_key: dict[tuple[str, int | None], list[str]] = {}
         for path in removed_paths:
             picture = existing_by_path[path]
-            if picture.pixel_sha and not picture.deleted:
+            if picture.pixel_sha:
                 key = (picture.pixel_sha, picture.size_bytes)
                 gone_by_key.setdefault(key, []).append(path)
         if not gone_by_key:
@@ -1313,7 +1992,7 @@ class ReferenceFolderScanTask(BaseTask):
         # Without this, deleting A and separately adding an identical C while
         # an identical B sits untouched in the folder reads as a clean 1:1.
         #
-        # Scrapheap rows *do* count here, unlike above.  Their file is still on
+        # Scrapheap rows count here as they do above.  Their file is still on
         # disk, so it is a real identical file the arrival could be a copy of;
         # counting it only ever refuses a match, which is the safe direction.
         stable_counts: dict[tuple[str, int | None], int] = {}
@@ -1521,7 +2200,9 @@ class ReferenceFolderScanTask(BaseTask):
             try:
                 with Image.open(file_path) as img:
                     img_format = img.format or "PNG"
-                    width, height = img.size
+                    # As stored, not turned: what a JPEG records, and what the
+                    # frontend swaps for orientations 5-8.
+                    width, height = ImageUtils.stored_size(img)
                     rendered = ImageUtils.render_thumbnail(img)
                     if rendered is not None:
                         thumbnail_bytes, bmp_w, bmp_h, crop = rendered

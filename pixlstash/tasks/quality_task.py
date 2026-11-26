@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Collection
 
 import numpy as np
+from PIL import Image, UnidentifiedImageError
 from sqlmodel import Session, select
 from sqlalchemy import func
 
@@ -13,9 +14,11 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture, Quality
 from pixlstash.utils.quality.quality_utils import QualityUtils
 from pixlstash.utils.image_processing.image_utils import ImageUtils
-from pixlstash.utils.image_processing.media_load import file_read_error
+from pixlstash.utils.image_processing.media_load import LoadFailure
+from pixlstash.utils.unprocessable_image_registry import load_signed
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask
+from pixlstash.tasks.pipeline_scope import pipeline_picture_clauses
 from pixlstash.utils.sql_chunking import not_in_json
 
 
@@ -269,6 +272,16 @@ class QualityTask(BaseTask):
         }
 
     @staticmethod
+    def missing_quality_clauses() -> tuple:
+        """WHERE terms, over ``Picture`` outer-joined to ``Quality``, for the
+        pictures still owed a quality score: the finder's and the progress
+        count's, so the two count the same pictures."""
+        return (
+            Quality.sharpness.is_(None),
+            *pipeline_picture_clauses(deleted_index=True),
+        )
+
+    @staticmethod
     def _find_pictures_missing_quality(
         session: Session, limit: int, exclude_ids: Collection[int] = frozenset()
     ):
@@ -280,9 +293,7 @@ class QualityTask(BaseTask):
                 Quality,
                 Quality.picture_id == Picture.id,
             )
-            .where(Quality.sharpness.is_(None))
-            .where(Picture.deleted.is_(False))
-            .where(Picture.file_path.is_not(None))
+            .where(*QualityTask.missing_quality_clauses())
             .where(not_in_json(Picture.id, exclude_ids))
             .order_by(Picture.format, Picture.width, Picture.height)
             .limit(limit)
@@ -301,9 +312,7 @@ class QualityTask(BaseTask):
                 Quality,
                 Quality.picture_id == Picture.id,
             )
-            .where(Quality.sharpness.is_(None))
-            .where(Picture.deleted.is_(False))
-            .where(Picture.file_path.is_not(None))
+            .where(*QualityTask.missing_quality_clauses())
             .where(not_in_json(Picture.id, exclude_ids))
         ).one()
         if isinstance(result, (tuple, list)):
@@ -323,43 +332,18 @@ class QualityTask(BaseTask):
             file_path = ImageUtils.resolve_picture_path(
                 self._db.image_root, pic.file_path
             )
-            img = ImageUtils.load_image_or_video(file_path)
-            if img is None:
-                # Raising here aborted the whole batch (good pictures included)
-                # and left every column unset, so the finder re-selected the
-                # same corrupt picture on every sweep (#585). Mark it and move
-                # on: _compute writes sentinel quality values for unloadable
-                # images, and _filter_and_claim skips it once marked. Only a
-                # file whose bytes can be read is corrupt: one that cannot be
-                # read right now (no file descriptor left, an I/O error) is not
-                # marked, so the other stages still try it; it is held out only
-                # while its location is unmounted.
-                read_error = file_read_error(file_path) if file_path else None
-                registry = getattr(self._db, "unprocessable_images", None)
-                if registry is not None and read_error is None:
-                    registry.mark_unprocessable(
-                        getattr(pic, "id", None),
-                        str(file_path),
-                        reason="quality source could not be decoded",
-                    )
-                    continue
-                if registry is not None:
-                    registry.mark_unreachable(
-                        getattr(pic, "id", None),
-                        str(file_path),
-                        reason="quality source location is not mounted",
-                    )
+            if not file_path:
                 logger.warning(
-                    "QualityTask: cannot infer metadata for picture id=%s path=%s: %s",
+                    "QualityTask: cannot infer metadata for picture id=%s: no "
+                    "resolvable file path (%s)",
                     pic.id,
                     pic.file_path,
-                    "file could not be loaded"
-                    if read_error is None
-                    else f"file could not be read ({read_error.strerror}); not marked undecodable",
                 )
                 continue
-
-            height, width = img.shape[:2]
+            size = self._stored_size(pic, str(file_path))
+            if size is None:
+                continue
+            width, height = size
             ext = os.path.splitext(pic.file_path or "")[1].lstrip(".").upper()
             fmt = pic.format if pic.format is not None else (ext or None)
             if fmt is None:
@@ -388,4 +372,87 @@ class QualityTask(BaseTask):
                 session.add(db_pic)
             session.commit()
 
-        self._db.run_task(persist_metadata, to_update)
+        # A background write, as the batch's quality write is: behind a user's.
+        self._db.run_task(persist_metadata, to_update, priority=DBPriority.LOW)
+
+    def _stored_size(self, pic, file_path: str) -> "tuple[int, int] | None":
+        """*pic*'s ``(width, height)`` as stored on disk, or ``None`` when it will not load.
+
+        Stored, not EXIF-transposed: the convention import and the reference
+        scan record ``Picture.width``/``height`` in
+        (``ImageUtils.stored_size``), and the one readers that need the
+        displayed size swap for (orientation 5-8). The classified load applies
+        no orientation, but Pillow turns a TIFF with orientation 5-8 as it
+        decodes it, so the size is read from the file's header once the load
+        has succeeded. A file whose EXIF orientation cannot be applied still
+        has one.
+
+        A load that fails is handled by cause, and the classified load is the
+        registry's evidence, so the gate does not decode the file again.
+        Raising here aborted the whole batch (good pictures included) and left
+        every column unset, so the finder re-selected the same corrupt picture
+        on every sweep (#585): _compute writes sentinel quality values for an
+        unloadable image, and _filter_and_claim skips it once marked.
+
+        - bytes that do not decode, by this loader or the shared one (a real
+          video named ``.png``): ``mark_unprocessable``;
+        - an I/O error: marked unreachable if its location is unmounted (the
+          registry checks), otherwise left to retry, as is running out of
+          memory or an unclassified failure.
+        """
+        loaded = load_signed(file_path, multiframe_count=1)
+        failure = loaded.result.failure
+        if failure is None:
+            try:
+                with Image.open(file_path) as img:
+                    return ImageUtils.stored_size(img)
+            except UnidentifiedImageError:
+                # Not a still Pillow opens: a video, whose frame no EXIF turns.
+                logger.debug(
+                    "QualityTask: picture id=%s is not a still; its frame size "
+                    "is its stored size",
+                    pic.id,
+                )
+                return loaded.result.frames[0].size
+            except OSError as exc:
+                # Decoded a moment ago, so the file moved or changed since.
+                logger.warning(
+                    "QualityTask: cannot read the stored size of picture id=%s "
+                    "path=%s (%s: %s); left to retry",
+                    pic.id,
+                    pic.file_path,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None
+        if failure.permanent:
+            # The extension may lie; the shared loader decodes what the other
+            # stages can, so nothing they read is marked from here.
+            array = ImageUtils.load_image_or_video(file_path)
+            if array is not None:
+                height, width = array.shape[:2]
+                return int(width), int(height)
+        registry = getattr(self._db, "unprocessable_images", None)
+        if registry is not None and failure.permanent:
+            registry.mark_unprocessable(
+                getattr(pic, "id", None),
+                file_path,
+                reason=f"quality source could not be decoded ({failure.value})",
+                load=loaded,
+            )
+            return None
+        if registry is not None and failure is LoadFailure.IO_ERROR:
+            registry.mark_unreachable(
+                getattr(pic, "id", None),
+                file_path,
+                reason="quality source location is not mounted",
+            )
+        logger.warning(
+            "QualityTask: cannot infer metadata for picture id=%s path=%s: %s (%s)%s",
+            pic.id,
+            pic.file_path,
+            failure.value,
+            loaded.result.error,
+            "" if failure.permanent else "; not marked undecodable",
+        )
+        return None

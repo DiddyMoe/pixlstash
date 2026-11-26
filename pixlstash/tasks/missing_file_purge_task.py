@@ -1,8 +1,10 @@
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, select
 
+from pixlstash.database import DBPriority
 from pixlstash.db_models import DeletedFileLog, Picture
 from pixlstash.db_models.picture_move import RETENTION_S, PictureMove
 from pixlstash.pixl_logging import get_logger
@@ -16,18 +18,51 @@ from pixlstash.utils.sql_chunking import chunked
 
 logger = get_logger(__name__)
 
+# A vanished file's row is deleted only on a look at the disk at most this old
+# when the delete runs. The look cannot be made on the writer (a stat can block
+# as long as a dropped share likes, and the writer holds every write in the
+# library), and the filesystem and the database share no transaction, so the
+# check and the delete cannot be one atomic step; what can be bounded is the
+# time between them (CWE-367's mitigation). The writer refuses a row whose look
+# is older, and the caller looks again. A file put back within this window of
+# the commit is the residual race, caught by the look after the delete. Shared
+# by this sweep and the reference-folder scan's ``_delete_vanished``.
+REMOVAL_CHECK_MAX_AGE_S = 1.0
+
+# Looks (and delete attempts) per vanished row in one pass. A row the writer was
+# too busy to delete in time on every round is kept for the next pass.
+REMOVAL_ROUNDS = 3
+
+
+def file_is_present(path: str) -> bool:
+    """Whether a picture's file is present, as the reference-folder scan sees it.
+
+    The one meaning of "present" for every check that decides whether a row is
+    deleted over a missing file: this sweep's and the scan's. ``lexists``, not
+    ``isfile``, because the scan's walk lists a symlinked *file* in ``files``,
+    a dangling one included, so the scan keeps the row of a picture whose path
+    is a dangling link. A dangling link usually points into a drive or share
+    that is not mounted right now, and a purge writes ``file_removed=True``,
+    which bars the path from restore and from routine re-import: following the
+    link here would purge exactly the rows the scan keeps.
+    """
+    return os.path.lexists(path)
+
 
 class MissingFilePurgeTask(BaseTask):
     """Low-priority task that removes picture records whose files no longer exist.
 
-    For each picture in the batch whose file is absent from the filesystem the
-    task:
+    For each picture in the batch whose file is absent from the filesystem
+    (:func:`file_is_present`) the task:
 
     1. Inserts a row into ``deleted_file_log`` (if one does not already exist
        for that ``file_path``).
     2. Deletes the picture row from the ``picture`` table.
 
     The task operates at ``TaskPriority.LOW`` so it never starves active work.
+    The delete itself follows the reference-folder scan's rule: the disk is
+    looked at off the writer, and the delete is conditional on that look being
+    fresh (see :meth:`_purge`).
     """
 
     BATCH_SIZE = 250
@@ -55,13 +90,14 @@ class MissingFilePurgeTask(BaseTask):
     def _run_task(self):
         image_root = self._db.image_root
         missing = []
+        on_disk: dict = {}
         unreachable = 0
         for pic in self._pictures:
             if not pic.file_path:
                 continue
             try:
                 resolved = ImageUtils.resolve_picture_path(image_root, pic.file_path)
-                if os.path.isfile(resolved):
+                if file_is_present(resolved):
                     continue
                 if file_location_is_unreachable(resolved):
                     # The file is absent because its LOCATION is absent - an
@@ -82,6 +118,7 @@ class MissingFilePurgeTask(BaseTask):
                     )
                     continue
                 missing.append(pic)
+                on_disk[pic.id] = resolved
             except Exception as exc:
                 logger.debug(
                     "MissingFilePurgeTask: could not resolve path for picture %s: %s",
@@ -104,7 +141,10 @@ class MissingFilePurgeTask(BaseTask):
         repaired = 0
         if repairs:
             repaired = self._db.run_task(
-                self._repair_moved_pictures, repairs, image_root
+                self._repair_moved_pictures,
+                repairs,
+                image_root,
+                priority=DBPriority.LOW,
             )
             logger.info(
                 "MissingFilePurgeTask: repaired %s picture(s) the layout engine "
@@ -121,7 +161,7 @@ class MissingFilePurgeTask(BaseTask):
             len(self._pictures),
         )
 
-        purged = self._db.run_task(self._purge_pictures, missing, image_root)
+        purged = self._purge(missing, on_disk)
         logger.info("MissingFilePurgeTask: purged %s picture record(s).", purged)
         return {"purged": purged, "repaired": repaired, "deferred": deferred}
 
@@ -221,7 +261,7 @@ class MissingFilePurgeTask(BaseTask):
                 )
                 deferred += 1
                 continue
-            if os.path.isfile(landed):
+            if file_is_present(landed):
                 repairs.append(
                     (pic.id, landed_path, pic.id in came_back, pic.file_path)
                 )
@@ -327,22 +367,107 @@ class MissingFilePurgeTask(BaseTask):
         session.commit()
         return repaired
 
+    def _purge(self, pictures: list, on_disk: dict) -> int:
+        """Purge the rows of *pictures* whose files are still gone; return the count.
+
+        Check-then-act across two systems with no shared transaction, as the
+        reference-folder scan's ``_delete_vanished``: the disk must never be
+        looked at on the writer, and the delete must not rest on an old look.
+        So each file is looked at here, off the writer, and the look stamped;
+        :meth:`_purge_pictures` refuses a row whose look is older than
+        :data:`REMOVAL_CHECK_MAX_AGE_S` when it runs, and such a row is looked
+        at again, up to :data:`REMOVAL_ROUNDS` times, then kept for the next
+        pass. Looks are sent in groups flushed before their oldest look is
+        half the limit old.
+
+        The delete is HIGH, although the task is LOW: the condition is a
+        deadline, and LOW waits behind every import and thumbnail write. Each
+        is one short transaction over at most :attr:`BATCH_SIZE` rows.
+
+        After the delete each path is looked at once more (CWE-367's "recheck
+        after use"): a file put back inside the window has lost its row, which
+        is said in a warning.
+
+        Args:
+            pictures: The rows as read, each found missing by :meth:`_run_task`.
+            on_disk: Picture id to the path :meth:`_run_task` resolved for it.
+        """
+        purged: list[int] = []
+        pending = [pic for pic in pictures if pic.id is not None]
+        by_id = {pic.id: pic for pic in pending}
+
+        def flush(batch: list[tuple]) -> list[int]:
+            deleted, stale = self._db.run_task(
+                self._purge_pictures, batch, priority=DBPriority.HIGH
+            )
+            purged.extend(deleted)
+            for pic_id in deleted:
+                if file_is_present(on_disk[pic_id]):
+                    logger.warning(
+                        "MissingFilePurgeTask: %s came back while its record "
+                        "(picture %s) was being purged. The deletion ledger now "
+                        "lists the path, so a routine folder scan will not "
+                        "import it again; re-adding the folder does.",
+                        on_disk[pic_id],
+                        pic_id,
+                    )
+            return stale
+
+        for _ in range(REMOVAL_ROUNDS):
+            if not pending:
+                break
+            stale_ids: list[int] = []
+            batch: list[tuple] = []
+            for pic in pending:
+                if file_is_present(on_disk[pic.id]):
+                    logger.info(
+                        "MissingFilePurgeTask: not purging picture %s - its file "
+                        "is back at %s.",
+                        pic.id,
+                        pic.file_path,
+                    )
+                    continue
+                batch.append((pic, time.monotonic()))
+                if time.monotonic() - batch[0][1] >= REMOVAL_CHECK_MAX_AGE_S / 2:
+                    stale_ids.extend(flush(batch))
+                    batch = []
+            if batch:
+                stale_ids.extend(flush(batch))
+            pending = [by_id[pic_id] for pic_id in stale_ids]
+        if pending:
+            logger.info(
+                "MissingFilePurgeTask: %d missing picture(s) were not purged: the "
+                "database was too busy to act on a look at the disk within %.1f s, "
+                "%d times. Keeping their records for the next pass.",
+                len(pending),
+                REMOVAL_CHECK_MAX_AGE_S,
+                REMOVAL_ROUNDS,
+            )
+        return len(purged)
+
     @staticmethod
-    def _purge_pictures(session: Session, pictures: list, image_root) -> int:
+    def _purge_pictures(
+        session: Session, decisions: list[tuple]
+    ) -> tuple[list[int], list[int]]:
         """Delete picture rows and log them to deleted_file_log.
 
-        *pictures* are the rows as read before this write was queued. One that
-        another writer has since repointed, re-owned or scrapheaped may name a
-        live file now, so it is neither deleted nor logged - the ledger entry
-        would bar its old path from ever being imported again - and is left for
-        the next pass to judge as it is. The same goes for a row whose file is
-        back at its path, resolved against *image_root* as :meth:`_run_task`
-        resolved it: the purge rested on that file being absent.
+        Each decision is ``(picture, checked_at)``: the row as read before this
+        write was queued, and the ``time.monotonic()`` of the look that found
+        its file gone. One that another writer has since repointed, re-owned or
+        scrapheaped may name a live file now, so it is neither deleted nor
+        logged - the ledger entry would bar its old path from ever being
+        imported again - and is left for the next pass to judge as it is. One
+        whose look is older than :data:`REMOVAL_CHECK_MAX_AGE_S` is returned as
+        stale, for :meth:`_purge` to look again: the disk is never touched from
+        here. Returns ``(purged_ids, stale_ids)``.
         """
-        purged = 0
+        purged: list[int] = []
+        stale: list[int] = []
+        written: list[int] = []
+        oldest = None
         now = datetime.now(timezone.utc)
 
-        for pic in pictures:
+        for pic, checked_at in decisions:
             db_pic = session.get(Picture, pic.id)
             if db_pic is not None and (
                 db_pic.file_path,
@@ -356,16 +481,11 @@ class MissingFilePurgeTask(BaseTask):
                     db_pic.file_path,
                 )
                 continue
-            if os.path.isfile(
-                ImageUtils.resolve_picture_path(image_root, pic.file_path)
-            ):
-                logger.info(
-                    "MissingFilePurgeTask: not purging picture %s - its file is "
-                    "back at %s.",
-                    pic.id,
-                    pic.file_path,
-                )
+            if time.monotonic() - checked_at > REMOVAL_CHECK_MAX_AGE_S:
+                stale.append(pic.id)
                 continue
+            written.append(pic.id)
+            oldest = checked_at if oldest is None else min(oldest, checked_at)
             # Log the deletion only if not already recorded. The path is stored
             # as an opaque hash (path_sha), never in cleartext.
             if pic.file_path:
@@ -397,7 +517,14 @@ class MissingFilePurgeTask(BaseTask):
 
             if db_pic is not None:
                 session.delete(db_pic)
-                purged += 1
+                purged.append(pic.id)
 
+        if written:
+            # Flushed first, so the age is judged with the writes (and their
+            # cascades) already run: only the COMMIT follows.
+            session.flush()
+            if time.monotonic() - oldest > REMOVAL_CHECK_MAX_AGE_S:
+                session.rollback()
+                return [], stale + written
         session.commit()
-        return purged
+        return purged, stale

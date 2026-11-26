@@ -510,11 +510,12 @@ def test_undecodable_pictures_cannot_wedge_the_face_finder(tmp_path):
             count=FACE_EXTRACTION_BATCH_LIMIT + 3,
             with_faces=False,
         )
-        for picture_id in ids[:FACE_EXTRACTION_BATCH_LIMIT]:
-            vault.db.unprocessable_images.mark_unprocessable(
-                picture_id,
-                str(tmp_path / f"p{picture_id}.png"),
-                reason="test: undecodable",
+        for index, picture_id in enumerate(ids[:FACE_EXTRACTION_BATCH_LIMIT]):
+            # The registry marks only bytes that do not decode.
+            path = tmp_path / f"p{index}.png"
+            path.write_bytes(b"test-not-a-png")
+            assert vault.db.unprocessable_images.mark_unprocessable(
+                picture_id, str(path), reason="test: undecodable"
             )
         finder = MissingFaceExtractionFinder(vault.db, lambda: _StubEngine())
 
@@ -731,6 +732,38 @@ def test_tag_probe_is_served_by_the_tag_index(tmp_path):
         assert not any("TEMP B-TREE" in line.upper() for line in plan), plan
 
 
+def test_awaiting_tagging_count_is_served_by_the_tag_index(tmp_path):
+    """``TagTask.count_missing_tags`` reads the sentinel as the finder does.
+
+    The "waiting for the tagger" number runs on every progress poll. With the
+    sentinel matched by ``LIKE ... ESCAPE`` it walked every picture and probed
+    its tags; the half-open range seeks ``ix_tag_tag`` instead, and counts the
+    same rows the probe above selects.
+    """
+    from pixlstash.tasks.tag_task import TagTask
+
+    with Vault(image_root=str(tmp_path)) as vault:
+        ids = _seed(vault, tmp_path, count=3, with_faces=True)
+        _add_rows(vault, [Tag(picture_id=ids[0], tag=make_tag_sentinel())])
+
+        with _StatementRecorder(vault.db._engine, "select count(*)") as rec:
+            counted = vault.db.run_immediate_read_task(
+                lambda s: TagTask.count_missing_tags(s)
+            )
+
+        assert counted == 1
+        statement = next(st for st in rec.statements if _TAG_PROBE in st)
+        plan = _explain(
+            vault, statement, rec.parameters[rec.statements.index(statement)]
+        )
+        assert any("ix_tag_tag" in line for line in plan), plan
+        assert not any(line.startswith("SCAN tag") for line in plan), plan
+        # A LIKE kept beside the range (as an OR, or alone) shows up as a
+        # per-picture probe of ``tag``: a correlated subquery, run once for
+        # every picture the outer loop visits.
+        assert not any("CORRELATED" in line for line in plan), plan
+
+
 def test_tagging_starts_per_picture_as_soon_as_its_faces_are_known(tmp_path):
     """A picture whose face row exists is tagged while its neighbour, still in
     the face stage, is not - and a no-face sentinel row counts as known.
@@ -868,14 +901,15 @@ _LIKENESS_PROBE = "picture.size_bin_index is null"
 
 def _likeness_candidates(vault) -> set[int]:
     from pixlstash.tasks.likeness_parameters_task import LikenessParametersTask
-    from pixlstash.utils.likeness.likeness_parameter_utils import (
-        LikenessParameterUtils,
+    from pixlstash.tasks.missing_likeness_parameters_finder import (
+        MissingLikenessParametersFinder,
     )
 
     rows = vault.db.run_immediate_read_task(
-        LikenessParameterUtils.find_next_work, LikenessParametersTask.SCAN_LIMIT
+        MissingLikenessParametersFinder._fetch_pending,
+        LikenessParametersTask.SCAN_LIMIT,
     )
-    return {pid for pid, _w, _h in (rows or [])}
+    return {pid for pid, _w, _h in rows}
 
 
 def test_likeness_parameter_probe_is_served_by_the_size_bin_index(tmp_path):
@@ -1011,6 +1045,8 @@ def suppressed_library(tmp_path_factory):
         eligible = [pid for pid, _ in rows[_SUPPRESSED_COUNT:]]
         paths = dict(rows)
         for picture_id in suppressed:
+            # The registry marks only bytes that do not decode.
+            Path(paths[picture_id]).write_bytes(b"test-not-a-png")
             assert vault.db.unprocessable_images.mark_unprocessable(
                 picture_id, paths[picture_id], reason="test: undecodable"
             )
@@ -1133,7 +1169,10 @@ def test_a_repaired_file_is_offered_again_once_the_cached_set_expires(
         )
     finally:
         # Suppressed again at its new signature, as the other tests expect.
-        registry.mark_unprocessable(repaired, str(path), reason="test: undecodable")
+        path.write_bytes(b"test-not-a-png")
+        assert registry.mark_unprocessable(
+            repaired, str(path), reason="test: undecodable"
+        )
 
 
 @pytest.mark.parametrize("stage", ["description", "quality"])

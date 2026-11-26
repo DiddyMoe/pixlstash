@@ -30,6 +30,7 @@ import errno
 import logging
 import os
 import shutil
+import struct
 import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -39,18 +40,21 @@ import pytest
 from PIL import Image as PILImage
 from sqlmodel import Session
 
-from pixlstash.db_models import Picture
+from pixlstash.db_models import Picture, make_tag_sentinel
 from pixlstash.task_runner import TaskCancelledError
 from pixlstash.tasks.base_task import TaskStatus
 from pixlstash.tasks import image_embedding_task as embedding_module
 from pixlstash.tasks.base_task_finder import BaseTaskFinder
 from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
 from pixlstash.tasks.missing_image_embedding_finder import MissingImageEmbeddingFinder
+from pixlstash.tasks.missing_tag_finder import MissingTagFinder
 from pixlstash.tasks.missing_thumbnail_finder import MissingThumbnailFinder
 from pixlstash.tasks.quality_task import QualityTask
+from pixlstash.tasks.thumbnail_generation_task import ThumbnailGenerationTask
 from pixlstash.tasks.task_outcome import Outcome, Reason, RetryHold, outcomes_payload
 from pixlstash.utils.image_processing import media_load
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils import unprocessable_image_registry as unprocessable_module
 from pixlstash.utils.unprocessable_image_registry import UnprocessableImageRegistry
 from pixlstash.vault import Vault
 
@@ -444,24 +448,147 @@ def test_a_source_that_cannot_be_read_is_not_marked(tmp_path, monkeypatch, attem
         assert not vault.db.unprocessable_images.is_suppressed(pic_id)
 
 
-def test_a_thumbnail_source_that_cannot_be_read_is_not_selected_again(
+def test_a_thumbnail_source_that_cannot_be_read_is_held_until_it_reads(
     tmp_path, monkeypatch
 ):
-    """MissingThumbnailFinder has no retry hold, so a source it cannot load is marked.
+    """MissingThumbnailFinder has no retry hold, so a source it cannot read is held.
 
     A file that cannot be read (no permission, a bad sector) fails the same way
-    on every sweep. Left unmarked, it would be selected again on every sweep
-    (#585).
+    on every sweep. Left alone, it would be selected again on every sweep
+    (#585). It is held as *unreadable*, never pinned as undecodable, and the
+    hold lifts the moment the file reads again: no restart, no change to the
+    file.
     """
     corrupt_path = _write_corrupt_jpeg(tmp_path / "corrupt.jpg")
 
     with Vault(image_root=str(tmp_path)) as vault:
         pic_id = _seed_picture(vault, corrupt_path)
-        _refuse_reads(monkeypatch, errno.EACCES)
+        registry = vault.db.unprocessable_images
+        registry.ACTIVE_CACHE_TTL_S = 0.0
+        with monkeypatch.context() as patch:
+            _refuse_reads(patch, errno.EACCES)
 
-        _thumbnail_attempt(vault, pic_id, corrupt_path)
+            _thumbnail_attempt(vault, pic_id, corrupt_path)
 
-        assert MissingThumbnailFinder(vault.db).find_task() is None
+            assert MissingThumbnailFinder(vault.db).find_task() is None
+            [(_, held_mtime, held_size)] = registry.snapshot().values()
+            assert held_mtime is held_size is unprocessable_module._UNREADABLE
+
+        task = MissingThumbnailFinder(vault.db).find_task()
+        assert task is not None and task.params["picture_ids"] == [pic_id]
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="POSIX permission bits; root reads a mode-0 file anyway",
+)
+def test_a_thumbnail_source_without_read_permission_is_never_marked_corrupt(
+    tmp_path,
+):
+    """The review's probe: chmod 000, a thumbnail attempt, chmod 644.
+
+    The good picture used to be pinned as undecodable to its signature, and
+    ``chmod`` does not move ``(mtime, size)``, so it stayed out until the file
+    was rewritten. Now its thumbnail is made on the next sweep after the read
+    permission is back.
+    """
+    path = tmp_path / "good.png"
+    PILImage.new("RGB", (16, 16), "blue").save(path)
+
+    with Vault(image_root=str(tmp_path)) as vault:
+        pic_id = _seed_picture(vault, str(path))
+        registry = vault.db.unprocessable_images
+        registry.ACTIVE_CACHE_TTL_S = 0.0
+        os.chmod(path, 0)
+        try:
+            _thumbnail_attempt(vault, pic_id, str(path))
+            assert registry.is_suppressed(pic_id)
+            [(_, held_mtime, _)] = registry.snapshot().values()
+            assert held_mtime is unprocessable_module._UNREADABLE
+        finally:
+            os.chmod(path, 0o644)
+
+        finder = MissingThumbnailFinder(vault.db)
+        task = finder.find_task()
+        assert task is not None and task.params["picture_ids"] == [pic_id]
+        assert task._run_task() == {"changed_count": 1}
+        assert registry.snapshot() == {}
+
+
+def _raise(exc):
+    def raiser(*args, **kwargs):
+        raise exc
+
+    return raiser
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError(errno.EIO, os.strerror(errno.EIO)),
+        PermissionError(errno.EACCES, os.strerror(errno.EACCES)),
+        PermissionError(errno.EPERM, os.strerror(errno.EPERM)),
+        FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT)),
+        TimeoutError(errno.ETIMEDOUT, os.strerror(errno.ETIMEDOUT)),
+        OSError(errno.ENOSPC, os.strerror(errno.ENOSPC)),
+        OSError(errno.ESTALE, os.strerror(errno.ESTALE)),
+        MemoryError(),
+        RuntimeError("test-unclassified"),
+        None,
+    ],
+    ids=[
+        "EIO",
+        "EACCES",
+        "EPERM",
+        "ENOENT",
+        "ETIMEDOUT",
+        "ENOSPC",
+        "ESTALE",
+        "MemoryError",
+        "unclassified",
+        "decodes-now",
+    ],
+)
+def test_a_mark_is_refused_unless_the_bytes_do_not_decode(
+    tmp_path, monkeypatch, failure
+):
+    """Every caller routes through ``mark_unprocessable``, so it checks for itself.
+
+    The caller's own load may have failed for any reason; the tag and quality
+    stages use a loader that answers ``None`` for all of them. The registry
+    decodes the file again and pins it only when that decode fails on bytes
+    it could read. A failure the machine caused, or a file that decodes now,
+    leaves the picture free to be retried.
+    """
+    good = tmp_path / "good.png"
+    PILImage.new("RGB", (8, 8), "green").save(good)
+    registry = UnprocessableImageRegistry()
+    if failure is not None:
+        monkeypatch.setattr(media_load.Image, "open", _raise(failure))
+
+    assert registry.mark_unprocessable(1, str(good), reason="test fixture") is False
+    assert not registry.is_suppressed(1)
+    assert registry.snapshot() == {}
+
+
+def test_a_mark_is_recorded_when_the_bytes_read_and_do_not_decode(tmp_path):
+    """The positive control for the refusals above, on one registry."""
+    corrupt = _write_corrupt_jpeg(tmp_path / "corrupt.jpg")
+    registry = UnprocessableImageRegistry()
+
+    assert registry.mark_unprocessable(1, corrupt, reason="test fixture") is True
+    assert registry.is_suppressed(1)
+
+
+def test_an_unreadable_hold_is_refused_for_a_file_that_reads_or_is_gone(tmp_path):
+    """The unreadable hold is for a file that is there and will not read."""
+    registry = UnprocessableImageRegistry()
+    readable = _write_corrupt_jpeg(tmp_path / "readable.jpg")
+
+    assert registry.hold_unreadable(1, readable, reason="test") is False
+    assert registry.hold_unreadable(2, str(tmp_path / "gone.jpg")) is False
+    assert registry.hold_unreadable(3, str(tmp_path / "away" / "x.jpg")) is False
+    assert registry.snapshot() == {}
 
 
 def test_a_picture_on_an_unmounted_drive_is_held_until_the_drive_is_back(tmp_path):
@@ -704,7 +831,7 @@ def test_an_unavailable_backend_holds_the_finder_not_the_pictures(
 
 @pytest.mark.parametrize(
     "how",
-    ["runner-cancelled", "cancelled-before-start", "deferred"],
+    ["runner-cancelled", "deferred"],
 )
 def test_a_picture_that_was_not_attempted_is_not_held(
     hold_vault, make_finder, caplog, how
@@ -716,8 +843,6 @@ def test_a_picture_that_was_not_attempted_is_not_held(
     error = None
     if how == "runner-cancelled":
         error = TaskCancelledError("test-stopped")
-        task.status = TaskStatus.CANCELLED
-    elif how == "cancelled-before-start":
         task.status = TaskStatus.CANCELLED
     else:
         task.status = TaskStatus.COMPLETED
@@ -805,7 +930,7 @@ def test_no_new_batch_while_a_decode_outlives_its_task(
     stuck, behind = (_new_picture(hold_vault, name) for name in names)
     started, release = threading.Event(), threading.Event()
     seen = []
-    load = embedding_module.load_pil_classified
+    load = embedding_module.load_signed
 
     def blocking_load(path, **kwargs):
         seen.append(os.path.basename(path))
@@ -814,7 +939,7 @@ def test_no_new_batch_while_a_decode_outlives_its_task(
             release.wait(10)
         return load(path, **kwargs)
 
-    monkeypatch.setattr(embedding_module, "load_pil_classified", blocking_load)
+    monkeypatch.setattr(embedding_module, "load_signed", blocking_load)
     task = ImageEmbeddingTask(
         database=hold_vault.db,
         clip_workflow=None,
@@ -868,14 +993,14 @@ def test_no_new_batch_when_a_task_leaves_a_decode_running_during_the_query(
     stuck = _new_picture(hold_vault, name)
     _new_picture(hold_vault, "test-fresh-during-query.png")
     started, release = threading.Event(), threading.Event()
-    load = embedding_module.load_pil_classified
+    load = embedding_module.load_signed
 
     def blocking_load(path, **kwargs):
         started.set()
         release.wait(10)
         return load(path, **kwargs)
 
-    monkeypatch.setattr(embedding_module, "load_pil_classified", blocking_load)
+    monkeypatch.setattr(embedding_module, "load_signed", blocking_load)
     task = ImageEmbeddingTask(
         database=hold_vault.db,
         clip_workflow=None,
@@ -925,3 +1050,346 @@ def test_the_retry_hold_doubles_up_to_its_cap_with_a_half_delay_floor():
 
     low.clear("k")
     assert low.hold("k") == 2.0
+
+
+class _TagDb:
+    """The reads ``MissingTagFinder.find_task`` makes, over a fixed set of rows."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.unprocessable_images = SimpleNamespace(
+            active_suppressed_ids=set, is_suppressed=lambda _pid: False
+        )
+        self.tag_resets = SimpleNamespace(current=lambda: 0)
+
+    def run_immediate_read_task(self, fn, *args):
+        return self.rows
+
+
+def _pending_tag(pid: int, engine_name: str | None = None):
+    return SimpleNamespace(
+        id=pid,
+        width=64,
+        height=64,
+        tags=[SimpleNamespace(tag=make_tag_sentinel(engine_name))],
+    )
+
+
+def test_a_tagger_that_cannot_load_is_held_back_not_retried_at_once(clock):
+    """A TagTask that fails outright holds its plugin, not every sweep.
+
+    ``ensure_active_plugin_ready`` raises when the tagger cannot load, which
+    fails the whole task and leaves every sentinel in place. With no hold the
+    next sweep rebuilt the same batch and loaded the tagger again, for ever.
+    The hold follows ``MissingImageEmbeddingFinder``'s backend hold: doubling
+    from 2 s, one hold for tasks that fail together, lifted by a success, none
+    for a cancelled task, and per plugin, so a retag requested with another
+    plugin still runs while the configured one is held.
+    """
+    rows = [_pending_tag(1), _pending_tag(2)]
+    engine = SimpleNamespace(
+        tagger_settings={"active_tag_plugin": "wd14"},
+        tagging_workflow=SimpleNamespace(suggested_task_size=lambda: 1),
+    )
+    db = _TagDb(rows)
+    finder = MissingTagFinder(
+        db,
+        lambda: engine,
+        backend_hold=RetryHold(cap_s=60.0, clock=clock, rng=lambda: 0.0),
+    )
+    load_failed = RuntimeError("test-the tagger could not be loaded")
+
+    first, second = finder.find_task(), finder.find_task()
+    assert first is not None and second is not None
+    finder.on_task_complete(first, load_failed)
+    finder.on_task_complete(second, load_failed)
+    assert finder.find_task() is None, "no batch while the plugin is held"
+
+    clock.now += 2.01
+    probe = finder.find_task()
+    assert probe is not None, "one 2 s hold for both failed tasks"
+    finder.on_task_complete(probe, load_failed)
+    clock.now += 3.99
+    assert finder.find_task() is None, "the next probe waits 4 s"
+
+    # Another plugin's pictures are not held with it.
+    db.rows = [_pending_tag(1), _pending_tag(3, "test-other-plugin")]
+    other = finder.find_task()
+    assert other is not None and other.params["picture_ids"] == [3]
+
+    # A cancelled task says nothing about its plugin.
+    finder.on_task_complete(other, TaskCancelledError("test-cancelled"))
+    assert finder.find_task().params["picture_ids"] == [3]
+
+    # Two tasks in flight: one fails and holds the plugin, the other then
+    # succeeds, and the hold is lifted at once.
+    clock.now += 0.02
+    db.rows = [_pending_tag(1), _pending_tag(2)]
+    failing, succeeding = finder.find_task(), finder.find_task()
+    assert failing.params["picture_ids"] == [1]
+    assert succeeding.params["picture_ids"] == [2]
+    finder.on_task_complete(failing, load_failed)
+    assert finder.find_task() is None
+    finder.on_task_complete(succeeding, None)
+    assert finder.find_task() is not None, "a success lifts the hold at once"
+
+
+def _write_unwritable_exif_png(path, colour=(90, 140, 210)) -> str:
+    """A 40x30 PNG with orientation 6 in EXIF Pillow reads but cannot write.
+
+    Beside the orientation is one LONG8 tag: ``ImageOps.exif_transpose``
+    raises ``struct.error`` writing the EXIF back. The loaders' own turn
+    writes nothing, so the picture loads, turned to 30x40.
+    """
+
+    def entry(tag, kind, value):
+        return struct.pack("<HHI", tag, kind, 1) + value
+
+    exif = (
+        b"II"
+        + struct.pack("<HI", 42, 8)
+        + struct.pack("<H", 2)
+        + entry(274, 3, struct.pack("<HH", 6, 0))
+        + entry(0x9999, 16, struct.pack("<I", 0))
+        + struct.pack("<I", 0)
+    )
+    PILImage.new("RGB", (40, 30), colour).save(path, "PNG", exif=exif)
+    return str(path)
+
+
+# The size of a picture whose EXIF turn the ``turn_fails`` fixture makes raise.
+_UNTURNABLE_SIZE = (37, 23)
+
+
+def _write_unturnable_png(path) -> str:
+    """A PNG that decodes, of the size ``turn_fails`` refuses to turn.
+
+    Its EXIF header does not parse, which Pillow shows as stored but FFmpeg
+    refuses, so the loaders' video fallback cannot read it either: with the
+    turn raising, ``load_image_or_video`` answers ``None`` while the bytes
+    decode.
+    """
+    PILImage.new("RGB", _UNTURNABLE_SIZE, (90, 140, 210)).save(
+        path, "PNG", exif=b"XX" + b"\x00" * 30
+    )
+    return str(path)
+
+
+@pytest.fixture
+def turn_fails(monkeypatch):
+    """``ImageUtils.apply_exif_orientation`` raises for a frame of _UNTURNABLE_SIZE.
+
+    No known file makes the turn raise on a frame that decodes: an EXIF header
+    that does not parse, the one that did, is now shown as stored. The hold is
+    for whatever else may, so the turn is made to raise, for that size only, so
+    the same file rewritten at another size orients and loads. The loaders and
+    the task's probe both call it, as for a real failure.
+    """
+    real_turn = ImageUtils.apply_exif_orientation
+
+    def turn(img):
+        if img.size == _UNTURNABLE_SIZE:
+            raise ValueError("test-the EXIF turn fails")
+        return real_turn(img)
+
+    monkeypatch.setattr(ImageUtils, "apply_exif_orientation", staticmethod(turn))
+
+
+def _thumbnail_sweep(finder):
+    """Run the task the finder builds now and settle it; return (task, result)."""
+    task = finder.find_task()
+    if task is None:
+        return None, None
+    task.result = task._run_task()
+    task.status = TaskStatus.COMPLETED
+    finder.on_task_complete(task, None)
+    return task, task.result
+
+
+@pytest.mark.parametrize("lifted_by", ["file-rewritten", "hold-expired"])
+def test_a_picture_whose_exif_orientation_fails_is_held_until_the_file_changes(
+    hold_vault, clock, turn_fails, lifted_by
+):
+    """A file that decodes but whose EXIF turn raises.
+
+    ``load_image_or_video`` answers ``None`` for it, the thumbnail stays NULL,
+    and nothing about the file changes between sweeps, so before the hold it
+    was selected on every sweep. It is not a registry mark (the bytes decode):
+    the finder holds it with a RetryHold until the file's signature moves, and
+    the hold is never permanent.
+    """
+    path = _write_unturnable_png(
+        os.path.join(hold_vault.db.image_root, f"test-unorientable-{lifted_by}.png")
+    )
+    pid = _seed_picture(hold_vault, path)
+    assert ImageUtils.load_image_or_video(path) is None
+    finder = MissingThumbnailFinder(
+        hold_vault.db, retry_hold=RetryHold(clock=clock, rng=lambda: 0.0)
+    )
+
+    task, result = _thumbnail_sweep(finder)
+    assert pid in task.params["picture_ids"]
+    stat = os.stat(path)
+    assert (pid, path, stat.st_mtime_ns, stat.st_size) in result[
+        ThumbnailGenerationTask.ORIENTATION_FAILED
+    ]
+    assert not hold_vault.db.unprocessable_images.is_suppressed(pid)
+    assert pid not in _found(finder), "held: not offered on the next sweep"
+    # The first hold is d/2 with d = base * 2**1: 2 s, then 4 s.
+    clock.now += 1.99
+    assert pid not in _found(finder)
+
+    if lifted_by == "file-rewritten":
+        PILImage.new("RGB", (48, 32), (200, 40, 40)).save(path, "PNG")
+    else:
+        clock.now += 0.02
+    task, result = _thumbnail_sweep(finder)
+    assert task is not None and pid in task.params["picture_ids"]
+    if lifted_by == "file-rewritten":
+        assert ThumbnailGenerationTask.ORIENTATION_FAILED not in result
+        assert pid not in _found(finder), "regenerated, so no longer missing"
+    else:
+        assert pid not in _found(finder), "held again, for longer"
+        clock.now += 3.98
+        assert pid not in _found(finder)
+        clock.now += 0.03
+        assert pid in _found(finder)
+
+
+def test_a_picture_whose_exif_cannot_be_written_back_gets_an_upright_thumbnail(
+    hold_vault, clock
+):
+    """Its orientation reads, so it is turned and not held.
+
+    ``ImageOps.exif_transpose`` raised writing such EXIF back, so the picture
+    had no thumbnail and was held as an orientation failure on every sweep.
+    """
+    path = _write_unwritable_exif_png(
+        os.path.join(hold_vault.db.image_root, "test-unwritable-exif.png")
+    )
+    pid = _seed_picture(hold_vault, path)
+    finder = MissingThumbnailFinder(
+        hold_vault.db, retry_hold=RetryHold(clock=clock, rng=lambda: 0.0)
+    )
+
+    task, result = _thumbnail_sweep(finder)
+
+    assert pid in task.params["picture_ids"]
+    assert all(
+        entry[0] != pid
+        for entry in result.get(ThumbnailGenerationTask.ORIENTATION_FAILED, [])
+    )
+
+    def thumbnail_size(session: Session):
+        picture = session.get(Picture, pid)
+        return picture.thumbnail_width, picture.thumbnail_height
+
+    assert hold_vault.db.run_task(thumbnail_size) == (30, 40), "turned upright"
+    assert pid not in _found(finder), "has its thumbnail, so no longer missing"
+
+
+@pytest.mark.parametrize("ending", ["cancelled", "failed"])
+def test_a_thumbnail_task_that_did_not_finish_leaves_the_holds_as_they_were(
+    hold_vault, clock, turn_fails, ending
+):
+    """A failed or cancelled task's result says nothing about its pictures."""
+    path = _write_unturnable_png(
+        os.path.join(hold_vault.db.image_root, f"test-unorientable-{ending}.png")
+    )
+    pid = _seed_picture(hold_vault, path)
+    finder = MissingThumbnailFinder(
+        hold_vault.db, retry_hold=RetryHold(clock=clock, rng=lambda: 0.0)
+    )
+    _thumbnail_sweep(finder)
+    assert pid not in _found(finder)
+
+    clock.now += 2.01
+    task = finder.find_task()
+    assert pid in task.params["picture_ids"]
+    if ending == "cancelled":
+        task.status = TaskStatus.CANCELLED
+        finder.on_task_complete(task, TaskCancelledError("test-cancelled"))
+    else:
+        task.status = TaskStatus.FAILED
+        finder.on_task_complete(task, RuntimeError("test-the batch failed"))
+    # The claim is released and the expired hold is not renewed or cleared.
+    assert pid in _found(finder)
+
+
+def test_a_picture_held_after_the_candidates_were_read_is_not_claimed(
+    hold_vault, clock, monkeypatch, turn_fails
+):
+    """The hold lands between the finder's read and its claim.
+
+    A task completing in that gap holds its pictures and then releases their
+    claims, so the claim check lets them through: the hold is checked again
+    after the claim, and the claim is undone.
+    """
+    path = _write_unturnable_png(
+        os.path.join(hold_vault.db.image_root, "test-unorientable-race.png")
+    )
+    pid = _seed_picture(hold_vault, path)
+    finder = MissingThumbnailFinder(
+        hold_vault.db, retry_hold=RetryHold(clock=clock, rng=lambda: 0.0)
+    )
+    _, result = _thumbnail_sweep(finder)
+    held = result.get(ThumbnailGenerationTask.ORIENTATION_FAILED, [])
+    assert pid in [entry[0] for entry in held], "the sweep held the picture"
+    # The read ran before the hold existed.
+    monkeypatch.setattr(finder, "_held_picture_ids", lambda: set())
+
+    task = finder.find_task()
+    assert task is None or pid not in task.params["picture_ids"]
+    assert pid not in finder._claimed_picture_ids
+
+
+def test_the_quality_backfill_records_stored_sizes_and_marks_from_one_decode(
+    hold_vault, monkeypatch
+):
+    """The backfill loads through the classified loader, once per picture.
+
+    ``Picture.width``/``height`` are the size as stored, as import records them,
+    so a phone photo with orientation 6 keeps its on-disk 40x30, and so does
+    one whose EXIF Pillow cannot write back. An undecodable
+    file is marked with that same load as the gate's evidence: one decode.
+    """
+    root = hold_vault.db.image_root
+    rotated = os.path.join(root, "test-backfill-rotated.jpg")
+    image = PILImage.new("RGB", (40, 30), "blue")
+    exif = image.getexif()
+    exif[274] = 6
+    image.save(rotated, exif=exif)
+    unorientable = _write_unwritable_exif_png(
+        os.path.join(root, "test-backfill-unorientable.png")
+    )
+    corrupt = _write_corrupt_jpeg(os.path.join(root, "test-backfill-corrupt.jpg"))
+    pics = [
+        _MetadatalessPic(_seed_picture(hold_vault, path), path)
+        for path in (rotated, unorientable, corrupt)
+    ]
+    decodes = []
+    real = unprocessable_module.load_pil_classified
+
+    def counting(path, *, multiframe_count):
+        decodes.append(path)
+        return real(path, multiframe_count=multiframe_count)
+
+    monkeypatch.setattr(unprocessable_module, "load_pil_classified", counting)
+
+    QualityTask(
+        database=hold_vault.db, pictures=pics
+    )._backfill_missing_picture_metadata(pics)
+
+    assert [(pic.width, pic.height) for pic in pics] == [
+        (40, 30),
+        (40, 30),
+        (None, None),
+    ]
+    assert decodes.count(corrupt) == 1, "the gate reused the backfill's load"
+    registry = hold_vault.db.unprocessable_images
+    assert registry.is_suppressed(pics[2].id)
+    assert not registry.is_suppressed(pics[0].id)
+    assert not registry.is_suppressed(pics[1].id)
+    stat = os.stat(corrupt)
+    _, mtime_ns, size = registry.snapshot()[pics[2].id]
+    assert (mtime_ns, size) == (stat.st_mtime_ns, stat.st_size)

@@ -13,12 +13,11 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.services.scrapheap_service import file_location_is_unreachable
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
+from pixlstash.tasks.pipeline_scope import pipeline_picture_clauses
 from pixlstash.tasks.task_outcome import Outcome, Reason, id_sample, outcomes_payload
 from pixlstash.utils.image_processing.image_utils import ImageUtils
-from pixlstash.utils.image_processing.media_load import (
-    LoadFailure,
-    load_pil_classified,
-)
+from pixlstash.utils.image_processing.media_load import LoadFailure
+from pixlstash.utils.unprocessable_image_registry import load_signed
 from pixlstash.utils.vram_utils import is_vram_oom
 
 if TYPE_CHECKING:
@@ -43,9 +42,10 @@ def describable_picture_clauses() -> tuple:
     The Scrapheap term is ``deleted IS NOT 1``, which no index serves, so the
     finder's probe still reads ``ix_picture_description_pending``: beside
     ``deleted IS 0`` SQLite takes ``ix_picture_deleted`` instead. ``deleted`` is
-    never NULL, so the two select the same rows.
+    never NULL, so the two select the same rows. This is the pipeline-wide
+    rule, :func:`pipeline_picture_clauses`.
     """
-    return (Picture.deleted.is_not(True), Picture.file_path.is_not(None))
+    return pipeline_picture_clauses()
 
 
 class DescriptionTask(BaseTask):
@@ -438,7 +438,10 @@ class DescriptionTask(BaseTask):
                 logger.error("DescriptionTask: picture %s has no file path", pic.id)
                 settled[pic.id] = (Outcome.FAILED_RETRYABLE, Reason.LOAD_ERROR)
                 continue
-            failure = load_pil_classified(full_path, multiframe_count=1).failure
+            # The registry's evidence too, so the gate does not decode the
+            # file a second time.
+            loaded = load_signed(full_path, multiframe_count=1)
+            failure = loaded.result.failure
             if failure is None:
                 continue
             if failure is LoadFailure.IO_ERROR:
@@ -458,6 +461,7 @@ class DescriptionTask(BaseTask):
                     pic.id,
                     full_path,
                     reason=f"image could not be decoded ({failure.value})",
+                    load=loaded,
                 )
         if settled:
             logger.warning(

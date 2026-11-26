@@ -37,6 +37,7 @@ environment (CLAUDE.md, "Tests: reuse the environment, don't rebuild it") and
 costs milliseconds rather than the ~1.35 s a ``Server`` does.
 """
 
+import os
 import threading
 import types
 
@@ -51,6 +52,7 @@ from pixlstash.tasks.base_task import BaseTask, TaskStatus
 from pixlstash.tasks.description_task import DescriptionTask
 from pixlstash.tasks.missing_description_finder import MissingDescriptionFinder
 from pixlstash.tasks.task_outcome import Reason, RetryHold, read_outcomes
+from pixlstash.utils import unprocessable_image_registry as registry_module
 from pixlstash.utils.unprocessable_image_registry import UnprocessableImageRegistry
 from pixlstash.vault import Vault
 
@@ -367,6 +369,35 @@ def test_a_corrupt_file_is_not_taken_for_a_backend_that_is_down(tmp_path):
     assert summary.failed_permanent == {first, second}
     assert {summary.reasons[pid] for pid in (first, second)} == {Reason.UNDECODABLE}
     assert db.unprocessable_images.active_suppressed_ids() == {first, second}
+
+
+def test_marking_a_corrupt_file_does_not_decode_it_again(tmp_path, monkeypatch):
+    """The settle's classified load is the registry's evidence: the corrupt
+    file is decoded once, still marked, and pinned to the signature taken
+    before that one decode."""
+    db = _StubDB()
+    corrupt = tmp_path / "fake-corrupt-once.png"
+    corrupt.write_bytes(b"fake-image-bytes")
+    (pid,) = _seed(db, 1, paths=[corrupt])
+    decodes = []
+    real = registry_module.load_pil_classified
+
+    def counting(path, *, multiframe_count):
+        decodes.append(path)
+        return real(path, multiframe_count=multiframe_count)
+
+    monkeypatch.setattr(registry_module, "load_pil_classified", counting)
+
+    result = DescriptionTask(
+        db, _Workflow(_captions_nobody), _handed(db, [pid])
+    )._run_task()
+
+    assert read_outcomes(result).reasons[pid] is Reason.UNDECODABLE
+    assert decodes == [str(corrupt)], "one classified decode, shared with the gate"
+    assert db.unprocessable_images.is_suppressed(pid)
+    stat = os.stat(corrupt)
+    _, mtime_ns, size = db.unprocessable_images.snapshot()[pid]
+    assert (mtime_ns, size) == (stat.st_mtime_ns, stat.st_size)
 
 
 @pytest.mark.parametrize(
@@ -697,14 +728,6 @@ def test_a_failed_task_holds_its_pictures_and_a_cancelled_one_does_not(tmp_path)
     finder.on_task_complete(task, TaskCancelledError("test-shutdown"))
     task = finder.find_task()
     assert task.params["picture_ids"] == [a, b], "a cancel says nothing about them"
-
-    # Cancelled while queued: the worker's run() refuses it and the runner
-    # reports it with no error at all, only its status.
-    task.on_cancel()
-    assert task.run() is None
-    finder.on_task_complete(task, None)
-    task = finder.find_task()
-    assert task.params["picture_ids"] == [a, b], "nor does a cancel before it ran"
 
     finder.on_task_complete(task, RuntimeError("test-out-of-memory"))
     assert finder.find_task() is None

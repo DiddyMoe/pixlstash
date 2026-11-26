@@ -12,6 +12,7 @@ work onto another picture's file.
 """
 
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -40,7 +41,10 @@ from pixlstash.services import move_reconciliation_service
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.library_layout import DEFAULT_LAYOUT, format_layout
 from pixlstash.tasks import TaskType
+from pixlstash.tasks import missing_file_purge_task
 from pixlstash.tasks.missing_file_purge_task import MissingFilePurgeTask
+from pixlstash.database import DBPriority
+from pixlstash.tasks import reference_folder_scan_task
 from pixlstash.tasks.reference_folder_scan_task import ReferenceFolderScanTask
 
 # ``Server.__init__`` calls ``vault.start()``, so the planner is live for the
@@ -82,7 +86,7 @@ def server():
             yield srv
 
 
-def _make_folder(server, folder_dir, layout=None):
+def _make_folder(server, folder_dir, layout=None, **fields):
     """Register a reference folder that the background scanner will leave alone.
 
     ``ReferenceFolderScanFinder`` selects on ``last_scanned``, not on status: a
@@ -109,6 +113,7 @@ def _make_folder(server, folder_dir, layout=None):
             status="active",
             last_scanned=time.time(),
             layout=layout,
+            **fields,
         )
         session.add(folder)
         session.commit()
@@ -268,7 +273,9 @@ class _WriteBetween:
     lands on a row that has already been judged. Handed to the task as its
     database, this makes that window deterministic: when the task submits the
     writer callback named ``callback_name``, ``before`` runs first, as a write
-    of its own.
+    of its own. A read the task makes through ``run_immediate_read_task`` is
+    matched by name too, for a window that has to open before the task's own
+    look at the disk rather than before its write.
     """
 
     def __init__(self, db, callback_name, before):
@@ -280,11 +287,18 @@ class _WriteBetween:
     def __getattr__(self, name):
         return getattr(self._db, name)
 
-    def run_task(self, func, *args, **kwargs):
+    def _fire_before(self, func):
         if not self.fired and getattr(func, "__name__", None) == self._callback_name:
             self.fired = True
             self._before()
+
+    def run_task(self, func, *args, **kwargs):
+        self._fire_before(func)
         return self._db.run_task(func, *args, **kwargs)
+
+    def run_immediate_read_task(self, func, *args, **kwargs):
+        self._fire_before(func)
+        return self._db.run_immediate_read_task(func, *args, **kwargs)
 
 
 class _StatementsOf:
@@ -370,6 +384,49 @@ def test_moved_file_keeps_its_picture(server, tmp_path):
     )
     assert after[0].original_file_name == "final_042.png", (
         "a renamed file must not keep downloading under its old name"
+    )
+
+
+def test_a_bitmap_that_cannot_be_carried_is_regenerated(server, tmp_path, monkeypatch):
+    """A followed move whose bitmap rename fails is left for the thumbnail sweep.
+
+    The bitmap is carried after the move commits, so a failed rename leaves a
+    row at its new path with the old dimensions and no bitmap under its new
+    path-derived name. Blanking the dimensions is what puts it back in front of
+    ``MissingThumbnailFinder``; kept, the grid asks for a thumbnail that is not
+    there for good.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    original = _make_image(os.path.join(folder_dir, "mira_042.png"), (10, 20, 30))
+    _run_scan(server, folder_id, folder_dir)
+    indexed = _pictures(server, folder_dir)
+    picture_id = indexed[0].id
+    assert indexed[0].thumbnail_width is not None, "the import rendered a bitmap"
+    image_root = server.vault.db.image_root
+    old_thumb = ImageUtils.find_thumbnail(image_root, original)
+    assert old_thumb is not None
+
+    real_replace = os.replace
+
+    def _refuse_the_bitmap(src, dst, *args, **kwargs):
+        if os.fspath(src) == old_thumb:
+            raise OSError(5, "Input/output error", src)
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", _refuse_the_bitmap)
+    moved_to = os.path.join(folder_dir, "final", "final_042.png")
+    os.makedirs(os.path.dirname(moved_to))
+    os.rename(original, moved_to)
+
+    result = _run_scan(server, folder_id, folder_dir)
+
+    assert result["moved_picture_ids"] == [picture_id], result
+    after = _pictures(server, folder_dir)
+    assert [(p.id, p.file_path) for p in after] == [(picture_id, moved_to)]
+    assert not os.path.exists(ImageUtils.get_thumbnail_path(image_root, moved_to))
+    assert (after[0].thumbnail_width, after[0].thumbnail_height) == (None, None), (
+        "a row with no bitmap at its new name must be left for regeneration"
     )
 
 
@@ -491,12 +548,14 @@ def test_a_removal_is_not_saved_by_an_unrelated_write(server, tmp_path):
 
 
 def test_a_removal_is_not_made_on_a_file_that_came_back(server, tmp_path):
-    """A row whose file is back at its path by the time of the delete is kept.
+    """A row whose file is back at its path after the walk is kept.
 
     The removal rests on the file being absent as well as on the row. A file
     put back at the same path leaves the row exactly as the scan read it, so
-    only a fresh look at the disk on the writer shows the decision no longer
-    holds.
+    only a fresh look at the disk after the walk shows the decision no longer
+    holds. That look is made before the delete is queued, off the writer (see
+    ``test_a_slow_disk_never_holds_the_writer``), so the file comes back while
+    the scan consults the move journal: after the walk, before the look.
     """
     folder_dir = str(tmp_path / "refs")
     folder_id = _make_folder(server, folder_dir)
@@ -514,7 +573,7 @@ def test_a_removal_is_not_made_on_a_file_that_came_back(server, tmp_path):
     os.rename(original, parked)
 
     database = _WriteBetween(
-        server.vault.db, "delete_removed", lambda: os.rename(parked, original)
+        server.vault.db, "_load_move_journal", lambda: os.rename(parked, original)
     )
     result = _run_scan(server, folder_id, folder_dir, database=database)
 
@@ -531,6 +590,159 @@ def test_a_removal_is_not_made_on_a_file_that_came_back(server, tmp_path):
     rescan = _run_scan(server, folder_id, folder_dir)
     assert rescan["new_count"] == 0, rescan
     assert rescan["removed_count"] == 0, rescan
+
+
+def _hold_the_writer(server, seconds: float):
+    """Queue a write that keeps the writer busy for *seconds*, ahead of the scan's."""
+
+    def busy(session: Session):
+        time.sleep(seconds)
+
+    return server.vault.db.submit_task(busy, priority=DBPriority.IMMEDIATE)
+
+
+def test_a_delete_kept_waiting_is_not_made_on_a_file_that_came_back(
+    server, tmp_path, monkeypatch
+):
+    """A look at the disk counts only while it is fresh when the delete runs.
+
+    The scan looks for the vanished file off the writer, then queues the
+    delete. A writer busy with other work keeps the delete waiting, and a file
+    put back in that wait used to lose its row to a look made before it
+    returned. The writer now refuses a look older than the limit, and the scan
+    looks again and finds the file.
+    """
+    monkeypatch.setattr(reference_folder_scan_task, "_REMOVAL_CHECK_MAX_AGE_S", 0.2)
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    original = _make_image(os.path.join(folder_dir, "mira_042.png"), (10, 20, 30))
+    _make_image(os.path.join(folder_dir, "kept.png"), (200, 100, 50))
+    _run_scan(server, folder_id, folder_dir)
+    picture_id = next(
+        p.id for p in _pictures(server, folder_dir) if p.file_path == original
+    )
+    set_id = _curate(server, picture_id, "Kept waiting removal set")
+    parked = str(tmp_path / "parked" / "mira_042.png")
+    os.makedirs(os.path.dirname(parked))
+    os.rename(original, parked)
+    busy = []
+
+    def _back_while_the_writer_is_busy():
+        busy.append(_hold_the_writer(server, 0.6))
+        os.rename(parked, original)
+
+    database = _WriteBetween(
+        server.vault.db, "delete_removed", _back_while_the_writer_is_busy
+    )
+    result = _run_scan(server, folder_id, folder_dir, database=database)
+    busy[0].result(timeout=10)
+
+    assert database.fired, "the file must come back after the scan looked"
+    assert _curation(server, picture_id) == {
+        "file_path": original,
+        "description": "keepme",
+        "score": 4,
+        "set_ids": [set_id],
+        "tags": ["mira"],
+    }, "a row whose file is back when the delete runs must not be deleted"
+    assert result["removed_count"] == 0, result
+
+
+def test_a_delete_kept_waiting_is_still_made_when_the_file_stays_gone(
+    server, tmp_path, monkeypatch
+):
+    """The refusal above costs a second look, not the removal.
+
+    A busy writer makes the first look stale; the scan looks again, the file
+    is still gone, and the row is deleted in the same scan.
+    """
+    monkeypatch.setattr(reference_folder_scan_task, "_REMOVAL_CHECK_MAX_AGE_S", 0.2)
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    doomed = _make_image(os.path.join(folder_dir, "gone.png"), (10, 20, 30))
+    _make_image(os.path.join(folder_dir, "kept.png"), (200, 100, 50))
+    _run_scan(server, folder_id, folder_dir)
+    picture_id = next(
+        p.id for p in _pictures(server, folder_dir) if p.file_path == doomed
+    )
+    os.remove(doomed)
+    busy = []
+    database = _WriteBetween(
+        server.vault.db,
+        "delete_removed",
+        lambda: busy.append(_hold_the_writer(server, 0.6)),
+    )
+
+    result = _run_scan(server, folder_id, folder_dir, database=database)
+    busy[0].result(timeout=10)
+
+    assert database.fired
+    assert result["removed_count"] == 1, result
+    assert server.vault.db.run_task(lambda s: s.get(Picture, picture_id)) is None
+
+
+def test_a_slow_disk_never_holds_the_writer(server, tmp_path, monkeypatch):
+    """The scan's look at the disk is made off the writer.
+
+    Whether a vanished file came back is a stat, and a stat can block for as
+    long as the filesystem likes: a network share that dropped, a disk spinning
+    up. Made on the writer, it holds every other write in the library - an
+    upload, a tag, a score - until the disk answers. Here the stat blocks until
+    released, and another write has to complete in the meantime.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    doomed = _make_image(os.path.join(folder_dir, "gone.png"), (10, 20, 30))
+    _make_image(os.path.join(folder_dir, "kept.png"), (200, 100, 50))
+    _run_scan(server, folder_id, folder_dir)
+    picture_id = next(
+        p.id for p in _pictures(server, folder_dir) if p.file_path == doomed
+    )
+    os.remove(doomed)
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_lexists = os.path.lexists
+
+    def _slow_lexists(path):
+        if os.fspath(path) == doomed:
+            entered.set()
+            release.wait(timeout=60)
+        return real_lexists(path)
+
+    monkeypatch.setattr(os.path, "lexists", _slow_lexists)
+    outcome: dict = {}
+
+    def _scan():
+        outcome["result"] = _run_scan(server, folder_id, folder_dir)
+
+    def _relabel(session: Session):
+        folder = session.get(ReferenceFolder, folder_id)
+        folder.label = "relabelled while the disk was slow"
+        session.add(folder)
+        session.commit()
+
+    scanner = threading.Thread(target=_scan, name="slow-disk-scan")
+    writer_client = threading.Thread(
+        target=lambda: server.vault.db.run_task(_relabel), name="other-write"
+    )
+    scanner.start()
+    try:
+        assert entered.wait(timeout=60), "the scan never looked at the file"
+        writer_client.start()
+        writer_client.join(timeout=10)
+        held = writer_client.is_alive()
+    finally:
+        release.set()
+        scanner.join(timeout=60)
+        writer_client.join(timeout=60)
+
+    assert not held, "another write waited on the scan's stat"
+    assert not scanner.is_alive()
+    assert outcome["result"]["removed_count"] == 1, outcome
+    assert server.vault.db.run_task(lambda s: s.get(Picture, picture_id)) is None
+    label = server.vault.db.run_task(lambda s: s.get(ReferenceFolder, folder_id).label)
+    assert label == "relabelled while the disk was slow"
 
 
 def test_a_move_overtaken_by_a_newer_one_keeps_the_newer_path(server, tmp_path):
@@ -583,6 +795,13 @@ def test_a_move_overtaken_by_a_newer_one_keeps_the_newer_path(server, tmp_path):
     )
     assert os.path.isfile(newest)
     assert picture_id not in result["moved_picture_ids"], result
+    image_root = server.vault.db.image_root
+    assert not os.path.exists(ImageUtils.get_thumbnail_path(image_root, renamed)), (
+        "a move the writer skipped must not carry the bitmap to a path no row names"
+    )
+    assert ImageUtils.find_thumbnail(image_root, original) is not None, (
+        "the bitmap stays where the writer that moved the row last left it"
+    )
     journal = server.vault.db.run_task(
         lambda s: s.exec(
             select(PictureMove).where(PictureMove.picture_id == picture_id)
@@ -696,10 +915,11 @@ def test_the_purge_sweep_keeps_a_row_repointed_after_it_looked(server, tmp_path)
 def test_the_purge_sweep_keeps_a_row_whose_file_came_back(server, tmp_path):
     """A file back at its path by the time of the purge keeps its row.
 
-    The row is untouched, so only a fresh look at the disk on the writer shows
-    the purge no longer holds. Purging anyway would also write a
-    ``file_removed=True`` ledger row that keeps the live file out of the
-    library for good.
+    The file returns after the sweep's first look, while it reads the move
+    journal. The row is untouched, so only the fresh look the purge takes, off
+    the writer and just before queueing the delete, shows the purge no longer
+    holds. Purging anyway would also write a ``file_removed=True`` ledger row
+    that keeps the live file out of the library for good.
     """
     folder_dir = str(tmp_path / "refs")
     folder_id = _make_folder(server, folder_dir)
@@ -716,7 +936,7 @@ def test_the_purge_sweep_keeps_a_row_whose_file_came_back(server, tmp_path):
     os.rename(original, parked)
 
     database = _WriteBetween(
-        server.vault.db, "_purge_pictures", lambda: os.rename(parked, original)
+        server.vault.db, "_load_move_journal", lambda: os.rename(parked, original)
     )
     result = MissingFilePurgeTask(database=database, pictures=snapshot)._run_task()
 
@@ -781,6 +1001,203 @@ def test_the_purge_sweep_does_not_repair_over_a_newer_path(server, tmp_path):
         "tags": ["mira"],
     }
     assert result == {"purged": 0, "repaired": 0, "deferred": 0}, result
+
+
+def _purge_one(server, tmp_path, name):
+    """A curated reference-folder picture whose file is then removed.
+
+    Returns ``(picture_id, path, snapshot, set_id)``; the snapshot is the row as
+    the sweep's finder would have read it, after the file went.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    path = _make_image(os.path.join(folder_dir, name), (10, 20, 30))
+    _run_scan(server, folder_id, folder_dir)
+    picture_id = _pictures(server, folder_dir)[0].id
+    set_id = _curate(server, picture_id, f"Purge set {name}")
+    os.remove(path)
+    snapshot = server.vault.db.run_immediate_read_task(
+        lambda s: [s.get(Picture, picture_id)]
+    )
+    return picture_id, path, snapshot, set_id
+
+
+@pytest.mark.parametrize(
+    "left_behind",
+    [
+        pytest.param(
+            "dangling-link",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32",
+                reason="creating a symlink needs privileges on Windows",
+            ),
+        ),
+        "nothing",
+    ],
+)
+def test_the_purge_sweep_and_the_scan_agree_on_what_is_present(
+    server, tmp_path, left_behind
+):
+    """One meaning of "present" for the purge sweep and the folder scan.
+
+    The scan's walk lists a symlinked file, a dangling one included, so it
+    keeps the row of a picture whose path is now a dangling link (a link into a
+    drive that is not mounted, typically). The purge used to follow the link,
+    find no file, and purge the row with a ``file_removed=True`` ledger entry
+    the scan's next pass then honoured. Both sides now ask ``lexists``. With
+    nothing at the path, the purge still purges.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    path = _make_image(os.path.join(folder_dir, "mira_042.png"), (10, 20, 30))
+    _run_scan(server, folder_id, folder_dir)
+    picture_id = _pictures(server, folder_dir)[0].id
+    set_id = _curate(server, picture_id, f"Present set {left_behind}")
+    os.remove(path)
+    if left_behind == "dangling-link":
+        os.symlink(str(tmp_path / "unmounted" / "mira_042.png"), path)
+        assert os.path.lexists(path) and not os.path.exists(path)
+    snapshot = server.vault.db.run_immediate_read_task(
+        lambda s: [s.get(Picture, picture_id)]
+    )
+
+    result = MissingFilePurgeTask(
+        database=server.vault.db, pictures=snapshot
+    )._run_task()
+
+    if left_behind == "nothing":
+        assert result == {"purged": 1, "repaired": 0, "deferred": 0}, result
+        assert _curation(server, picture_id) is None
+        assert [row.file_removed for row in _ledger_rows(server, path)] == [True]
+        return
+    assert result == {"purged": 0, "repaired": 0, "deferred": 0}, result
+    assert _ledger_rows(server, path) == []
+    scan = _run_scan(server, folder_id, folder_dir)
+    assert (scan["removed_count"], scan["new_count"]) == (0, 0), scan
+    assert _curation(server, picture_id) == {
+        "file_path": path,
+        "description": "keepme",
+        "score": 4,
+        "set_ids": [set_id],
+        "tags": ["mira"],
+    }, "both sweeps keep the row of a dangling link"
+
+
+def test_a_purge_kept_waiting_is_not_made_on_a_file_that_came_back(
+    server, tmp_path, monkeypatch
+):
+    """The purge's look at the disk counts only while it is fresh at the delete.
+
+    The sweep looks off the writer, then queues the delete. A writer busy with
+    other work keeps it waiting, and a file put back in that wait would lose its
+    row (and be barred from re-import by the ledger) to a look made before it
+    returned. The writer refuses a look older than the limit; the sweep looks
+    again and finds the file.
+    """
+    monkeypatch.setattr(missing_file_purge_task, "REMOVAL_CHECK_MAX_AGE_S", 0.2)
+    picture_id, path, snapshot, set_id = _purge_one(server, tmp_path, "back.png")
+    parked = str(tmp_path / "parked.png")
+    _make_image(parked, (10, 20, 30))
+    busy = []
+
+    def _back_while_the_writer_is_busy():
+        busy.append(_hold_the_writer(server, 0.6))
+        os.rename(parked, path)
+
+    database = _WriteBetween(
+        server.vault.db, "_purge_pictures", _back_while_the_writer_is_busy
+    )
+    result = MissingFilePurgeTask(database=database, pictures=snapshot)._run_task()
+    busy[0].result(timeout=10)
+
+    assert database.fired, "the file must come back after the sweep looked"
+    assert result == {"purged": 0, "repaired": 0, "deferred": 0}, result
+    assert _curation(server, picture_id) == {
+        "file_path": path,
+        "description": "keepme",
+        "score": 4,
+        "set_ids": [set_id],
+        "tags": ["mira"],
+    }
+    assert _ledger_rows(server, path) == []
+
+
+def test_a_purge_kept_waiting_is_still_made_when_the_file_stays_gone(
+    server, tmp_path, monkeypatch
+):
+    """The refusal above costs a second look, not the purge."""
+    monkeypatch.setattr(missing_file_purge_task, "REMOVAL_CHECK_MAX_AGE_S", 0.2)
+    picture_id, path, snapshot, _ = _purge_one(server, tmp_path, "gone.png")
+    busy = []
+    database = _WriteBetween(
+        server.vault.db,
+        "_purge_pictures",
+        lambda: busy.append(_hold_the_writer(server, 0.6)),
+    )
+
+    result = MissingFilePurgeTask(database=database, pictures=snapshot)._run_task()
+    busy[0].result(timeout=10)
+
+    assert database.fired
+    assert result == {"purged": 1, "repaired": 0, "deferred": 0}, result
+    assert _curation(server, picture_id) is None
+
+
+def test_the_purge_sweep_never_looks_at_the_disk_on_the_writer(
+    server, tmp_path, monkeypatch
+):
+    """Every look the purge takes at a file is made on the sweep's own thread.
+
+    A stat can block as long as a dropped share likes, and the writer holds
+    every other write in the library while it waits. The purge used to look
+    again on the writer, inside the delete's transaction.
+    """
+    picture_id, path, snapshot, _ = _purge_one(server, tmp_path, "slow.png")
+    lookers = []
+    real_lexists = os.path.lexists
+
+    def _recording_lexists(candidate):
+        if os.fspath(candidate) == path:
+            lookers.append(threading.current_thread())
+        return real_lexists(candidate)
+
+    monkeypatch.setattr(os.path, "lexists", _recording_lexists)
+    result = MissingFilePurgeTask(
+        database=server.vault.db, pictures=snapshot
+    )._run_task()
+
+    assert result == {"purged": 1, "repaired": 0, "deferred": 0}, result
+    assert lookers, "the purge never looked at the file"
+    assert set(lookers) == {threading.current_thread()}, lookers
+
+
+def test_a_file_back_after_the_purge_looked_is_reported(server, tmp_path, caplog):
+    """The residual race: a file put back between the fresh look and the commit.
+
+    The filesystem and the database share no transaction, so this window is
+    bounded (by ``REMOVAL_CHECK_MAX_AGE_S``), not closed. The row is purged on
+    a look that was true when it was taken, and the look after the delete says
+    so, naming the path the ledger now bars from routine re-import.
+    """
+    picture_id, path, snapshot, _ = _purge_one(server, tmp_path, "late.png")
+    parked = str(tmp_path / "parked-late.png")
+    _make_image(parked, (10, 20, 30))
+    database = _WriteBetween(
+        server.vault.db, "_purge_pictures", lambda: os.rename(parked, path)
+    )
+
+    with caplog.at_level("WARNING", logger=missing_file_purge_task.__name__):
+        result = MissingFilePurgeTask(database=database, pictures=snapshot)._run_task()
+
+    assert database.fired
+    assert result == {"purged": 1, "repaired": 0, "deferred": 0}, result
+    assert _curation(server, picture_id) is None
+    assert any(
+        record.levelname == "WARNING"
+        and path in record.getMessage()
+        and "came back" in record.getMessage()
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
 
 
 # The blob columns on ``picture``. The scan compares paths, hashes and sidecar
@@ -920,40 +1337,53 @@ def test_a_sampled_hash_collision_of_a_different_size_is_not_a_move(server, tmp_
     )
 
 
-def test_a_scrapheap_row_does_not_swallow_an_unrelated_new_file(server, tmp_path):
-    """A soft-deleted row must not claim a new file of the same content.
+@pytest.mark.parametrize("scrapheap", [False, True], ids=["live", "scrapheap"])
+def test_a_moved_file_keeps_its_picture_in_or_out_of_the_scrapheap(
+    server, tmp_path, scrapheap
+):
+    """A picture in the Scrapheap follows its file as a live one does.
 
-    ``fetch_existing`` loads ``deleted=True`` rows on purpose, so without the
-    exclusion a hidden scrapheap picture whose file really was deleted pairs
-    with an unrelated arrival: the new path is taken out of ``new_paths`` as a
-    move, and what the user gets is not a new picture but a soft-deleted one
-    they cannot see.
+    ``fetch_existing`` loads ``deleted=True`` rows on purpose, and the flag
+    says nothing about where the file is. Left out of the matching, a binned
+    picture whose file moved is deleted outright as a removal - its tags,
+    description, score and sets with it - and the file comes back as a new,
+    live picture with none of them: emptying the Scrapheap by renaming a file.
+    The move keeps the flag, so a binned picture stays binned.
     """
     folder_dir = str(tmp_path / "refs")
     folder_id = _make_folder(server, folder_dir)
-    doomed = _make_image(os.path.join(folder_dir, "binned.png"), (10, 20, 30))
-
+    original = _make_image(os.path.join(folder_dir, "binned.png"), (10, 20, 30))
     _run_scan(server, folder_id, folder_dir)
-    indexed = _pictures(server, folder_dir)
-    assert [os.path.basename(p.file_path) for p in indexed] == ["binned.png"]
+    picture_id = _pictures(server, folder_dir)[0].id
+    set_id = _curate(server, picture_id, f"Moved set ({scrapheap})")
 
     def _scrapheap(session: Session):
-        pic = session.get(Picture, indexed[0].id)
+        pic = session.get(Picture, picture_id)
         pic.deleted = True
         session.add(pic)
         session.commit()
 
-    server.vault.db.run_task(_scrapheap)
+    if scrapheap:
+        server.vault.db.run_task(_scrapheap)
+    moved_to = os.path.join(folder_dir, "sorted", "renamed.png")
+    os.makedirs(os.path.dirname(moved_to))
+    os.rename(original, moved_to)
 
-    # The binned file goes, and an unrelated file of the same content arrives.
-    os.remove(doomed)
-    _make_image(os.path.join(folder_dir, "fresh.png"), (10, 20, 30))
-    _run_scan(server, folder_id, folder_dir)
+    result = _run_scan(server, folder_id, folder_dir)
 
-    live = [p for p in _pictures(server, folder_dir) if not p.deleted]
-    assert [os.path.basename(p.file_path) for p in live] == ["fresh.png"], (
-        "the arrival is its own picture, not a scrapheap row quietly relabelled"
-    )
+    assert result["moved_picture_ids"] == [picture_id], result
+    assert result["new_count"] == 0, result
+    assert result["removed_count"] == 0, result
+    assert [(p.id, p.deleted) for p in _pictures(server, folder_dir)] == [
+        (picture_id, scrapheap)
+    ], "one row, the same one, with its Scrapheap flag as it was"
+    assert _curation(server, picture_id) == {
+        "file_path": moved_to,
+        "description": "keepme",
+        "score": 4,
+        "set_ids": [set_id],
+        "tags": ["mira"],
+    }
 
 
 def test_an_unhashed_unchanged_file_blocks_matching(server, tmp_path):
@@ -1429,3 +1859,150 @@ def test_removing_a_folder_deletes_its_pictures_and_keeps_its_files(server, tmp_
     assert os.path.exists(doomed_file), "the owner's file must stay on disk"
 
     assert server.vault.db.run_task(lambda s: s.get(Picture, kept_id)) is not None
+
+
+def test_a_sidecar_export_is_not_recorded_on_a_row_that_moved_since(server, tmp_path):
+    """Sidecar bookkeeping decided at one path is not written onto a moved row.
+
+    The scan exports a tags sidecar beside the file it read and records the
+    sidecar's path on the row later, by id. If the row was moved in between,
+    recording it would tie the picture at its new path to a sidecar beside a
+    file it no longer is - and the next scan would read that file's tags back
+    onto it. A row that changed is left for the next scan, and is not reported
+    as updated either.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir, sync_tags=True)
+    original = _make_image(os.path.join(folder_dir, "mira_042.png"), (10, 20, 30))
+    _run_scan(server, folder_id, folder_dir)
+    picture_id = _pictures(server, folder_dir)[0].id
+    _tag(server, picture_id, "mira")
+    newest = os.path.join(folder_dir, "final", "final_042.png")
+
+    def _move_on():
+        os.makedirs(os.path.dirname(newest))
+        os.rename(original, newest)
+        _repoint(server, picture_id, newest)
+
+    database = _WriteBetween(server.vault.db, "apply_caption_updates", _move_on)
+    result = _run_scan(server, folder_id, folder_dir, database=database)
+
+    assert database.fired, "the move must land inside the window under test"
+    row = server.vault.db.run_task(lambda s: s.get(Picture, picture_id))
+    assert row.file_path == newest
+    assert (row.tags_file, row.tags_file_mtime) == (None, None), (
+        "the sidecar beside the old path must not be recorded on the moved row"
+    )
+    assert _tags(server, picture_id) == ["mira"]
+    assert result["caption_updated_picture_ids"] == [], result
+    assert result["caption_updated_count"] == 0, result
+
+
+def test_a_moved_file_gets_its_sidecar_recorded_in_the_same_scan(server, tmp_path):
+    """The scan that follows a move also records the sidecar it exports there.
+
+    The sidecar pass runs after the move is applied and checks each row against
+    what it read. The row it walks has to carry the path the move stored, or
+    the check sees its own move as another writer's and leaves the row for the
+    next scan: the sidecar is on disk beside the file, the row does not know it.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir, sync_tags=True)
+    original = _make_image(os.path.join(folder_dir, "lune_007.png"), (91, 92, 93))
+    _run_scan(server, folder_id, folder_dir)
+    picture_id = _pictures(server, folder_dir)[0].id
+    _tag(server, picture_id, "lune")
+    moved_to = os.path.join(folder_dir, "final", "final_007.png")
+    os.makedirs(os.path.dirname(moved_to))
+    os.rename(original, moved_to)
+
+    result = _run_scan(server, folder_id, folder_dir)
+
+    row = server.vault.db.run_task(lambda s: s.get(Picture, picture_id))
+    assert row.file_path == moved_to
+    assert row.tags_file is not None, "the sidecar exported beside it is recorded"
+    assert os.path.dirname(row.tags_file) == os.path.dirname(moved_to)
+    assert os.path.isfile(row.tags_file)
+    assert result["caption_updated_picture_ids"] == [picture_id], result
+
+
+def test_a_locked_picture_is_not_counted_as_updated(server, tmp_path):
+    """A picture a locked set freezes keeps its data and is not reported.
+
+    The sidecar pass skips a locked picture rather than write to it. Reporting
+    it anyway tells an open grid to refresh a picture that did not change, and
+    the count in the scan's result overstates what the scan did.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir, sync_tags=True)
+    _make_image(os.path.join(folder_dir, "mira_042.png"), (10, 20, 30))
+    _run_scan(server, folder_id, folder_dir)
+    picture_id = _pictures(server, folder_dir)[0].id
+    _tag(server, picture_id, "mira")
+
+    def _lock(session: Session):
+        picture_set = PictureSet(name="Locked sidecar set", locked=True)
+        session.add(picture_set)
+        session.commit()
+        session.add(PictureSetMember(set_id=picture_set.id, picture_id=picture_id))
+        session.commit()
+        return picture_set.id
+
+    def _unlock(session: Session, set_id: int):
+        session.get(PictureSet, set_id).locked = False
+        session.commit()
+
+    set_id = server.vault.db.run_task(_lock)
+    try:
+        result = _run_scan(server, folder_id, folder_dir)
+    finally:
+        server.vault.db.run_task(_unlock, set_id)
+
+    row = server.vault.db.run_task(lambda s: s.get(Picture, picture_id))
+    assert row.tags_file is None, "a locked picture's row must not be written"
+    assert result["caption_updated_picture_ids"] == [], result
+    assert result["caption_updated_count"] == 0, result
+
+
+def test_a_junction_in_a_reference_folder_is_not_walked_and_not_read_as_emptied(
+    server, tmp_path, monkeypatch
+):
+    """A Windows junction is a link: the scan neither indexes what it leads to
+    nor reads it as a subtree the owner emptied.
+
+    ``os.walk`` does not descend a directory symlink but does descend a
+    junction, and ``islink`` says False for one. Simulated on Linux by giving
+    the directory's ``lstat`` the junction reparse tag. Wrong if the file added
+    behind the junction is indexed, or if the picture indexed there before it
+    became one loses its row.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    inner = os.path.join(folder_dir, "linked")
+    _make_image(os.path.join(inner, "before.png"), (31, 41, 59))
+    _run_scan(server, folder_id, folder_dir)
+    assert [os.path.basename(p.file_path) for p in _pictures(server, folder_dir)] == [
+        "before.png"
+    ]
+
+    real_lstat = os.lstat
+
+    class _JunctionStat:
+        def __init__(self, info):
+            self._info = info
+            self.st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+        def __getattr__(self, name):
+            return getattr(self._info, name)
+
+    def lstat(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        return _JunctionStat(info) if os.fspath(path) == inner else info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    _make_image(os.path.join(inner, "behind.png"), (26, 53, 58))
+    _run_scan(server, folder_id, folder_dir)
+
+    assert [os.path.basename(p.file_path) for p in _pictures(server, folder_dir)] == [
+        "before.png"
+    ]
