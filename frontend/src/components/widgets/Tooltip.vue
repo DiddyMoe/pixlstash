@@ -6,6 +6,7 @@
     :location="layerSide() || location"
     :attach="layer || false"
     :open-delay="openDelay"
+    :close-delay="closeDelay"
     :max-width="maxWidth"
     :disabled="disabled || !(text || $slots.default)"
     :activator-props="activatorProps"
@@ -36,6 +37,9 @@ function tooltipDelays() {
     const style = getComputedStyle(document.documentElement);
     delays = {
       openDelay: cssDurationMs(style, "--tooltip-delay"),
+      // Closing is at once. Said, because Vuetify's tooltip has no default for
+      // it and times the close with `Number(undefined)`, a NaN timeout.
+      closeDelay: 0,
       // Vuetify writes the space available as an inline `max-width`, which
       // beats the class rule below: handed the token, it takes the smaller.
       maxWidth: parseFloat(style.getPropertyValue("--tooltip-max-w")) || undefined,
@@ -84,6 +88,7 @@ import {
   watchEffect,
 } from "vue";
 import { VTooltip } from "vuetify/components";
+import { isImeComposing } from "../../utils/imeComposition.js";
 
 /**
  * The one tooltip surface (docs/design/buttons.md, "Tooltips").
@@ -123,7 +128,7 @@ const instance = getCurrentInstance();
 const open = ref(false);
 const tipRef = ref(null);
 
-const { openDelay, maxWidth } = tooltipDelays();
+const { openDelay, closeDelay, maxWidth } = tooltipDelays();
 
 const description = computed(() =>
   props.describe && props.text ? props.text : "",
@@ -368,7 +373,8 @@ function close() {
 }
 
 function onDocumentKeydown(e) {
-  if (e.key === "Escape") close();
+  // Escape that cancels an input method's composition is the field's.
+  if (e.key === "Escape" && !isImeComposing(e)) close();
 }
 </script>
 

@@ -24,6 +24,7 @@ workflow, and the A1111 branch - plus the picture-list filter that resolves
 a workflow to the variants that made its pictures.
 """
 
+import contextvars
 import gc
 import hashlib
 import io
@@ -58,6 +59,16 @@ from tests.authz_guard import no_spa_fallback  # noqa: F401
 from tests.utils import upload_pictures_and_wait
 
 API = "/api/v1"
+
+# Marks the test's own requests. TestClient runs each handler in a context
+# copied from the caller's (a sync handler in an AnyIO worker thread, an async
+# one in the portal thread), so the mark follows the request; a background
+# worker of the shared server starts with an empty context and never carries
+# it. A no-dial assertion that recorded every thread failed when a planner
+# worker resolved a host mid-test.
+_IN_TEST_REQUEST: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "in_test_request", default=False
+)
 
 pytestmark = pytest.mark.usefixtures("no_spa_fallback")
 
@@ -911,37 +922,43 @@ class TestTheReadOnlyWorkflowListing:
         alpha, beta, set_id = self._setup(server, client)
         shared = auto_workflow_id(CORE_SHARED, "")
         other = auto_workflow_id(CORE_OTHER, "")
-        # Nothing here may reach ComfyUI or any other host. Every HTTP client
-        # the app uses resolves through getaddrinfo first; patching connect
-        # instead hangs Windows, whose event-loop socketpair is a real connect.
+        # Nothing these requests do may reach ComfyUI or any other host. Every
+        # HTTP client the app uses resolves through getaddrinfo first; patching
+        # connect instead hangs Windows, whose event-loop socketpair is a real
+        # connect. Only a lookup made in a request's own context is recorded:
+        # the shared server's workers may resolve hosts of their own meanwhile.
         dialled = []
 
         def refuse(host, *args, **kwargs):
-            dialled.append(host)
+            if _IN_TEST_REQUEST.get():
+                dialled.append(host)
             raise OSError(f"test refuses to resolve {host}")
 
         monkeypatch.setattr(socket, "getaddrinfo", refuse)
-
-        scoped = self._listing(
-            self._reader(
-                server, client, resource_type="picture_set", resource_id=set_id
+        marked = _IN_TEST_REQUEST.set(True)
+        try:
+            scoped = self._listing(
+                self._reader(
+                    server, client, resource_type="picture_set", resource_id=set_id
+                )
             )
-        )
-        assert set(scoped) == {shared}
-        assert scoped[shared]["picture_count"] == 1
-        [variant] = scoped[shared]["variants"]
-        assert variant == {
-            "picture_count": 1,
-            "example_picture_id": alpha,
-            "loras": [{"node_id": "5", "name": "example-style"}],
-        }
+            assert set(scoped) == {shared}
+            assert scoped[shared]["picture_count"] == 1
+            [variant] = scoped[shared]["variants"]
+            assert variant == {
+                "picture_count": 1,
+                "example_picture_id": alpha,
+                "loras": [{"node_id": "5", "name": "example-style"}],
+            }
 
-        everything = self._listing(self._reader(server, client))
-        assert {shared, other} <= set(everything)
-        assert everything[other]["picture_count"] == 1
-        # An A1111 file has no graph to read LoRAs off.
-        assert everything[other]["variants"][0]["example_picture_id"] == beta
-        assert everything[other]["variants"][0]["loras"] is None
+            everything = self._listing(self._reader(server, client))
+            assert {shared, other} <= set(everything)
+            assert everything[other]["picture_count"] == 1
+            # An A1111 file has no graph to read LoRAs off.
+            assert everything[other]["variants"][0]["example_picture_id"] == beta
+            assert everything[other]["variants"][0]["loras"] is None
+        finally:
+            _IN_TEST_REQUEST.reset(marked)
         assert dialled == []
 
         # The scope's other door stays shut: the owner-only listing refuses
@@ -1740,3 +1757,22 @@ def test_a_scoped_token_cannot_ask_which_projects_exist(env, monkeypatch):
     r = scoped.get(f"{API}/pictures")
     assert r.status_code == 200, r.text
     assert "X-PixlStash-Library" not in r.headers
+
+
+def test_a_workflow_nested_past_the_parser_is_no_workflow(env):
+    """Both ComfyUI chunks hold JSON nested deeper than the parser recurses,
+    which raises RecursionError rather than ValueError. The picture still
+    imports, and the Recipe read answers that it carries no workflow rather
+    than failing."""
+    _server, client, _pic_id = env
+    deep = "[" * 100_000 + "]" * 100_000
+    img = Image.new("RGB", (256, 256), (30, 160, 70))
+    meta = PngInfo()
+    meta.add_text("workflow", deep)
+    meta.add_text("prompt", deep)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", pnginfo=meta)
+    pic_id = _upload_one(client, "deep.png", buf.getvalue())
+    r = client.get(f"{API}/comfyui/pictures/{pic_id}/workflow")
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "No ComfyUI workflow found in picture metadata"

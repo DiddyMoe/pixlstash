@@ -39,13 +39,13 @@ from pixlstash.db_models import Face, Picture, Quality
 from pixlstash.db_models.picture_likeness import PictureLikeness
 from pixlstash.pixl_logging import get_logger
 from pixlstash.server import Server
+from pixlstash.tasks.likeness_parameters_task import LikenessParametersTask
 from pixlstash.tasks.likeness_task import LikenessTask
 from pixlstash.tasks.quality_task import QualityTask
 from pixlstash.tasks.smart_score_task import SmartScoreTask
 from pixlstash.tasks.tag_task import TagTask
 from pixlstash.tasks.task_type import TaskType
 from pixlstash.utils.image_processing.image_utils import ImageUtils
-from pixlstash.utils.likeness.likeness_parameter_utils import LikenessParameterUtils
 from tests.utils import upload_pictures_and_wait, poll_until_zero
 
 logger = get_logger(__name__)
@@ -104,9 +104,9 @@ _NEAR_DUPLICATE_COSINE = 0.95
 # re-tuning weights until the number looks better.  Re-weighting was swept and cannot
 # reach 0.70.  Changing the bar upward is only legitimate alongside a scoring change
 # that earns it.
-# Note this file is in DEFERRED_FROM_GATE (tests/test_ci_shards.py), so this assertion
-# does not block a PR: its only CI home is the release-prep sweep, which is
-# informational.  That is how it stayed red at 0.55-vs-0.70 for a whole release cycle.
+# This file used to be in DEFERRED_FROM_GATE (tests/test_ci_shards.py), where its only CI
+# home was the informational release-prep sweep.  That is how it stayed red at
+# 0.55-vs-0.70 for a whole release cycle.  It is gated now, so this assertion blocks a PR.
 _MIN_TAU_B_LOWER_BOUND = -0.10
 
 
@@ -483,7 +483,7 @@ def test_full_pipeline_on_real_pictures():
             # ------------------------------------------------------------------ #
             _poll_until_zero(
                 server,
-                LikenessParameterUtils.count_pending_parameters,
+                LikenessParametersTask.count_pending,
                 "likeness parameters",
             )
             logger.info("Likeness parameters complete for all pictures.")

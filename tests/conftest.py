@@ -2,8 +2,10 @@
 Pytest configuration and fixtures for test suite.
 """
 
+import errno
 import gc
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -16,7 +18,9 @@ import traceback
 import warnings
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pixlstash
 import pytest
@@ -30,6 +34,7 @@ from pixlstash.server import Server, _log_install_detection_once
 from pixlstash.tasks.face_extraction_task import FaceExtractionTask
 from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
 from pixlstash.tasks.tag_task import TagTask
+from pixlstash.utils import comfyui_url
 from tests.process_teardown import exit_if_enabled, remember_session
 
 # pytest appends the phase it is in to PYTEST_CURRENT_TEST.
@@ -660,6 +665,344 @@ def no_object_info_map_outlives_its_test():
     comfyui_routes._forget_cached_object_info()
 
 
+@pytest.fixture(autouse=True)
+def no_logged_refusal_outlives_its_test():
+    """Start every test with no saved-address refusal remembered as logged.
+
+    ``comfyui_url.request_base`` logs a refused saved address once per
+    connection until it changes, in a process global keyed by connection id.
+    Every test server saves its address under the same id, so without this a
+    test that asserts the log line passes or fails by what an earlier test in
+    the shard happened to refuse.
+    """
+    comfyui_url.forget_logged_refusals()
+    yield
+    comfyui_url.forget_logged_refusals()
+
+
+@dataclass(frozen=True)
+class _BlockedConnect:
+    """One TCP connect the connect guard refused, and who made it."""
+
+    # The running test as PYTEST_CURRENT_TEST names it, phase included, or
+    # "<between tests>". A background thread is charged to whichever test was
+    # running when it connected, which is why the caller is recorded too.
+    nodeid: str
+    thread: str
+    address: str
+    reason: str
+    # The innermost frame of each of the innermost pixlstash/ files (up to
+    # _CALLER_DEPTH, innermost first), else the innermost tests/ frame, else
+    # the innermost frame at all: where the missing stub belongs.
+    caller: str
+    # Innermost frame in tests/ ("" on a thread no test frame is on).
+    test_frame: str
+
+
+# Every connect the guard refused this session, from whichever thread made it.
+_blocked_connects: list[_BlockedConnect] = []
+_blocked_connects_lock = threading.Lock()
+
+# Where a refused connect's caller is looked for. Not `_OWNED_ROOTS`: the
+# checkout root also holds `.venv`, and the frame that names the fix is never
+# urllib3's.
+_PACKAGE_ROOT = Path(pixlstash.__file__).resolve().parent
+_TESTS_ROOT = Path(__file__).resolve().parent
+
+# The hosts CI's model cache is filled from (scripts/prefetch_ci_models.py): the
+# HuggingFace hub and its download CDNs, a leading dot taking in every
+# subdomain, and the GitHub release delivery InsightFace's face pack comes
+# from. CI's shards fetch whatever model their restored cache lacks from these
+# during the tests themselves (ci.yml, `warm_models`: warming is "an
+# optimisation, never a correctness gate"), so the guard lets them through.
+_MODEL_HOSTS = (
+    ".huggingface.co",
+    ".hf.co",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+
+# Every address a model host resolved to this session, as `_ip_of` spells it.
+_model_host_addresses: set = set()
+
+
+def _is_model_host(name: str) -> bool:
+    name = name.lower().rstrip(".")
+    return any(
+        name == host.lstrip(".") or (host.startswith(".") and name.endswith(host))
+        for host in _MODEL_HOSTS
+    )
+
+
+def _ip_of(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The IP ``host`` spells, an IPv4-mapped IPv6 one as its IPv4, else None."""
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])  # drop an IPv6 zone index
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _connect_refusal(address: tuple, comfyui_port: int) -> str | None:
+    """Why the connect guard refuses a TCP connect to ``address``, else None.
+
+    No name is resolved here, because a lookup is already reaching the network:
+    ``localhost`` is loopback, an IP literal is judged by ``ipaddress``, and any
+    other name counts as off this machine. The clients the product uses
+    (urllib3, httpx, ``socket.create_connection``) resolve before they connect,
+    so a real request arrives here as a literal, and one a model host resolved
+    to (``_MODEL_HOSTS``) passes.
+    """
+    host, port = address[0], address[1]
+    if isinstance(host, (bytes, bytearray)):
+        host = bytes(host).decode("ascii", "replace")
+    ip = _ip_of(host)
+    if ip is None:
+        loopback = host.lower() == "localhost"
+    else:
+        loopback = ip.is_loopback
+    if not loopback:
+        if ip in _model_host_addresses:
+            return None
+        return "not a loopback address"
+    if port == comfyui_port:
+        return "the default ComfyUI address"
+    return None
+
+
+def _frame_label(entry, root: Path, path: Path) -> str:
+    return f"{path.relative_to(root.parent).as_posix()}:{entry.lineno} in {entry.name}"
+
+
+# The code the OS answers a connect to a closed port with: Winsock's own on
+# Windows (what a real refusal there carries), POSIX's everywhere else.
+_REFUSED_ERRNO = (
+    errno.WSAECONNREFUSED if sys.platform == "win32" else errno.ECONNREFUSED
+)
+
+# How many pixlstash/ files a caller names, each by its innermost frame. The
+# innermost file is usually the shared HTTP helper (`bounded_http`), four or
+# more frames deep on its own; the seam a test stubs is in the next file out.
+_CALLER_DEPTH = 4
+
+# How many distinct addresses the session-end report lists per caller.
+_LISTED_ADDRESSES = 3
+
+
+def _connect_sites(stack: list) -> tuple[str, str]:
+    """The (caller, test frame) of a refused connect, innermost first."""
+    product = []
+    named = set()
+    test = ""
+    for entry in reversed(stack):
+        path = Path(entry.filename).resolve()
+        if path.is_relative_to(_PACKAGE_ROOT):
+            if path not in named and len(product) < _CALLER_DEPTH:
+                named.add(path)
+                product.append(_frame_label(entry, _PACKAGE_ROOT, path))
+        elif not test and path.is_relative_to(_TESTS_ROOT):
+            test = _frame_label(entry, _TESTS_ROOT, path)
+            break
+    if product or test:
+        return " <- ".join(product) or test, test
+    innermost = stack[-1]
+    return f"{innermost.filename}:{innermost.lineno} in {innermost.name}", test
+
+
+@pytest.fixture(autouse=True, scope="session")
+def no_test_connects_to_comfyui_or_off_this_machine():
+    """No test opens a TCP connection to the default ComfyUI or off this machine.
+
+    The connect guard. Every ``socket.socket.connect`` and ``connect_ex`` on an
+    IPv4/IPv6 stream socket is judged before it reaches the OS. A loopback
+    address on the default ComfyUI port (``DEFAULT_COMFYUI_URL``, 8188), or any
+    address that is not loopback, is refused with ``ConnectionRefusedError``
+    (``connect_ex`` returns its errno), which is what CI answers for
+    8188. Servers a test binds on loopback itself - free ports, sandbox
+    fixtures, local HTTP stubs - and UDP and Unix sockets pass untouched, and
+    so do the hosts CI's model cache is filled from (``_MODEL_HOSTS``), which
+    the shards are documented to fetch a missing model from mid-test.
+    Without it, a test that forgets a ComfyUI stub reads whatever ComfyUI the
+    developer is running. Under WSL's mirrored networking a connect to a closed
+    fixed port on 127.0.0.1 also does not refuse: it hangs until the client
+    times out, which is how a 10 s template-listing read cost three workflow
+    tests 20-40 s each. Each refusal is recorded (test, thread, address,
+    caller) and listed at session end by ``_report_blocked_connects``. The
+    guard is a backstop: a test about "ComfyUI is down" stubs that seam
+    explicitly, and the guard's own tests (``tests/test_connect_guard.py``)
+    claim their refusals through the ``blocked_connects`` fixture.
+
+    Reported, not failed. The refusal already gives the test the answer a
+    machine with nothing listening there gives, so its outcome stands on its
+    own; failing it as well would rest on ``PYTEST_CURRENT_TEST``, which is
+    process-wide and charges a background thread's connect to whichever test
+    happened to be running, and would turn every module with an unstubbed seam
+    red at once rather than letting each be fixed at the caller the report
+    names. The report also goes to the GitHub annotations and step summary.
+
+    Session-scoped so module- and session-scoped server fixtures are covered
+    too. pytest-socket was the alternative: its per-test blocking misses
+    exactly those, and it raises a RuntimeError rather than the refusal CI
+    gives, so a dependency would buy nothing this does not do.
+    """
+    from pixlstash.routes import comfyui as comfyui_routes
+
+    comfyui_port = urlsplit(comfyui_routes.DEFAULT_COMFYUI_URL).port
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_getaddrinfo = socket.getaddrinfo
+
+    def noting_getaddrinfo(host, port, *args, **kwargs):
+        # Notes where a model host resolved to, so its connect can pass.
+        found = real_getaddrinfo(host, port, *args, **kwargs)
+        if isinstance(host, (bytes, bytearray)):
+            host = bytes(host).decode("ascii", "replace")
+        if isinstance(host, str) and _is_model_host(host):
+            noted = {_ip_of(str(info[4][0])) for info in found}
+            _model_host_addresses.update(noted - {None})
+        return found
+
+    def refusal(sock, address):
+        if sock.type != socket.SOCK_STREAM or sock.family not in (
+            socket.AF_INET,
+            socket.AF_INET6,
+        ):
+            return None
+        if not isinstance(address, tuple) or len(address) < 2:
+            # Not an address the real connect accepts either: let it raise
+            # its own TypeError.
+            return None
+        reason = _connect_refusal(address, comfyui_port)
+        if reason is None:
+            return None
+        # Two frames up is whoever called connect / connect_ex.
+        caller, test_frame = _connect_sites(traceback.extract_stack(sys._getframe(2)))
+        host, port = address[0], address[1]
+        shown = (
+            f"[{host}]:{port}" if sock.family == socket.AF_INET6 else f"{host}:{port}"
+        )
+        record = _BlockedConnect(
+            nodeid=os.environ.get("PYTEST_CURRENT_TEST", "<between tests>"),
+            thread=threading.current_thread().name,
+            address=shown,
+            reason=reason,
+            caller=caller,
+            test_frame=test_frame,
+        )
+        with _blocked_connects_lock:
+            _blocked_connects.append(record)
+        return ConnectionRefusedError(
+            _REFUSED_ERRNO,
+            f"Connection refused by the test connect guard ({reason}): {shown}",
+        )
+
+    def guarded_connect(sock, address):
+        refused = refusal(sock, address)
+        if refused is not None:
+            raise refused
+        return real_connect(sock, address)
+
+    def guarded_connect_ex(sock, address):
+        refused = refusal(sock, address)
+        if refused is not None:
+            return refused.errno
+        return real_connect_ex(sock, address)
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(socket.socket, "connect", guarded_connect)
+    patch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    patch.setattr(socket, "getaddrinfo", noting_getaddrinfo)
+    try:
+        yield
+    finally:
+        patch.undo()
+
+
+@pytest.fixture
+def blocked_connects(request):
+    """This test's refused connects, taken off the session-end report.
+
+    Yields a callable returning the records charged to this test so far. For
+    the connect guard's own tests, whose refusals are the point rather than a
+    missing stub. A model-host address first noted during the test is
+    forgotten after it, so a stand-in resolution cannot let a later test's
+    connect through.
+    """
+    nodeid = request.node.nodeid
+    model_host_addresses = set(_model_host_addresses)
+
+    def charged_here(record):
+        return _PYTEST_PHASE.sub("", record.nodeid) == nodeid
+
+    def mine():
+        with _blocked_connects_lock:
+            return [record for record in _blocked_connects if charged_here(record)]
+
+    yield mine
+    with _blocked_connects_lock:
+        _blocked_connects[:] = [
+            record for record in _blocked_connects if not charged_here(record)
+        ]
+    _model_host_addresses.intersection_update(model_host_addresses)
+
+
+def _report_blocked_connects(session) -> None:
+    """List every connect the guard refused, grouped by the line that made it.
+
+    Reported, not failed, for the reasons in
+    ``no_test_connects_to_comfyui_or_off_this_machine``: the test's outcome is
+    already settled by the refusal, so what is left is a missing stub, and the
+    caller line below is where it belongs.
+    """
+    with _blocked_connects_lock:
+        blocked = list(_blocked_connects)
+    if not blocked:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+
+    by_caller: dict[str, list[_BlockedConnect]] = {}
+    for record in blocked:
+        by_caller.setdefault(record.caller, []).append(record)
+    title = f"{len(blocked)} connect(s) refused by the test connect guard"
+    reporter.write_sep("=", title, yellow=True, bold=True)
+    for caller, records in sorted(by_caller.items(), key=lambda item: -len(item[1])):
+        # A name with many addresses is tried at each in turn: list a few.
+        addresses = sorted({f"{r.address} ({r.reason})" for r in records})
+        listed = ", ".join(addresses[:_LISTED_ADDRESSES])
+        if len(addresses) > _LISTED_ADDRESSES:
+            listed += f" and {len(addresses) - _LISTED_ADDRESSES} more address(es)"
+        reporter.write_line(f"  {len(records)}x {caller} -> {listed}")
+        # A background thread's connect is charged to whichever test was
+        # running, so its thread is shown with the test it was charged to.
+        tests = sorted(
+            {
+                _PYTEST_PHASE.sub("", r.nodeid)
+                + ("" if r.thread == "MainThread" else f" (thread {r.thread})")
+                for r in records
+            }
+        )
+        for nodeid in tests[:5]:
+            reporter.write_line(f"      {nodeid}")
+        if len(tests) > 5:
+            reporter.write_line(f"      ... and {len(tests) - 5} more test(s)")
+    remedy = (
+        "Each was refused at once, as a closed port refuses, so no test above "
+        "waited on it, but each is a ComfyUI or network seam the test did not "
+        "stub. Stub it at the caller listed (see "
+        "no_test_connects_to_comfyui_or_off_this_machine in tests/conftest.py)."
+    )
+    reporter.write_line(remedy)
+    reporter.write_line(
+        f"::warning title=Connects refused by the test guard::{title}. {remedy}"
+    )
+    _append_step_summary(f"### {title}\n\n{remedy}\n")
+
+
 class _NoGpusLedger:
     """A machine with no GPU, for the suite's one VRAM arbiter."""
 
@@ -1045,6 +1388,8 @@ def pytest_sessionfinish(session, exitstatus):
     _stop_tqdm_monitors()
 
     gc.collect()
+
+    _report_blocked_connects(session)
 
     _enforce_no_leaked_threads(session)
 

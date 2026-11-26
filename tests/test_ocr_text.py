@@ -142,6 +142,15 @@ def test_line_regions_split_into_word_boxes_by_character_share():
 def server():
     with tempfile.TemporaryDirectory() as temp_dir:
         with Server(f"{temp_dir}/server-config.json") as srv:
+            # Every test here drives OcrTask and MissingOcrFinder by hand, on
+            # pictures whose files are made-up paths under a directory that
+            # does not exist. A live sweep that reaches them marks them
+            # unreachable in the vault's shared UnprocessableImageRegistry, and
+            # SQLite hands the same ids to the next test's pictures, so a later
+            # `find_task()` leaves them out (CI run 45564843727, backend-full
+            # block 4). Hold every finder for the module's lifetime; the planner
+            # itself keeps running.
+            srv.vault._work_planner.hold("tests.test_ocr_text", None)
             yield srv
 
 

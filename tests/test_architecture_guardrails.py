@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import tempfile
 import warnings
 from pathlib import Path
@@ -186,7 +187,12 @@ def test_services_no_direct_db_calls():
         "pixlstash/services/restore/full_restore.py",  # vault-injection pattern; owns DB-swap lifecycle
         "pixlstash/services/restore/resource_restore.py",  # vault-injection pattern; per-resource upsert
         "pixlstash/services/restore/preview.py",  # vault-injection pattern; restore previews + hash compare
+        "pixlstash/services/restore/__init__.py",  # vault-injection pattern; the drain's thin read of _runs_waiting_in_session, between planner stop and task drain, outside any caller session
         "pixlstash/services/comfyui_service.py",  # vault-injection pattern; owns ComfyUI output-import orchestration
+        # vault-injection pattern; plan_generated_outputs wraps two *_in_session
+        # reads around scrapheap_service.restore_pictures, a recorded write in its
+        # own transaction that must commit between them, so no caller session fits.
+        "pixlstash/services/import_publish_service.py",
         "pixlstash/services/scrapheap_service.py",  # vault-injection pattern; thin wrappers around the *_in_session purge/retention functions
         "pixlstash/services/scrapheap_run_service.py",  # vault-injection pattern; start_run's thin wrapper around scrapheap_ids_in_session, the selection a run fixes before it is queued
         # The op-log's whole point is that capture -> mutation -> capture ->
@@ -3118,9 +3124,11 @@ _PRIVATE_ADDRESS_FLAT_DIRS = (".", "frontend")
 # the same rule that keeps the authz coverage matrix in docs/ proper).
 # The electron/ entries are build outputs, gitignored in electron/.gitignore: a
 # local build bundles a Python interpreter and its third-party site-packages
-# there, and nothing in them can be pushed.
+# there, and nothing in them can be pushed. Every entry is a directory and ends
+# in a slash, because the test is a string prefix: without it "docs/reviews"
+# also skipped docs/reviews-notes.md, which is pushed like any other doc.
 _PRIVATE_ADDRESS_SKIP = (
-    "docs/reviews",
+    "docs/reviews/",
     "electron/dist/",
     "electron/dist-test/",
     "electron/release/",
@@ -3302,6 +3310,11 @@ def test_private_address_guardrail_has_teeth(tmp_path):
     (vendored / "net.d.ts").write_text(f"// Subnet: {_TEETH_OFFENDER}\n")
     (tmp_path / "app" / "main.js").write_text(f"// host {_TEETH_OFFENDER}\n")
     (tmp_path / "app" / "node_modules_notes.md").write_text(f"{_TEETH_OFFENDER}\n")
+    # A skipped directory is skipped as a directory: a file whose name merely
+    # starts with its name is pushed, and read.
+    (tmp_path / "docs" / "reviews").mkdir(parents=True)
+    (tmp_path / "docs" / "reviews" / "branch.md").write_text(f"{_TEETH_OFFENDER}\n")
+    (tmp_path / "docs" / "reviews-notes.md").write_text(f"{_TEETH_OFFENDER}\n")
 
     offenders = _private_address_offenders(tmp_path, tmp_path)
     caught = {o.split(":", 1)[0].replace("\\", "/") for o in offenders}
@@ -3313,7 +3326,31 @@ def test_private_address_guardrail_has_teeth(tmp_path):
         "sentence.md",
         "app/main.js",
         "app/node_modules_notes.md",
+        "docs/reviews-notes.md",
     }, f"the guardrail reported the wrong set of files: {offenders}"
+
+
+def test_private_address_skips_hold_no_tracked_file():
+    """A skipped directory is skipped because nothing in it can be pushed.
+
+    Each entry of ``_PRIVATE_ADDRESS_SKIP`` is gitignored. A file force-added
+    under one would be pushed and never scanned, so the skip list holds only
+    while git tracks nothing there.
+    """
+    proc = subprocess.run(
+        ["git", "ls-files", "--", *_PRIVATE_ADDRESS_SKIP],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"git ls-files failed: {proc.stderr.strip()}"
+    tracked = proc.stdout.split()
+    assert not tracked, (
+        "these tracked files sit under a directory the private-address scan "
+        f"skips, so a push carries them unscanned: {tracked}. Untrack them, or "
+        "take the directory off _PRIVATE_ADDRESS_SKIP."
+    )
 
 
 def test_private_address_guardrail_reads_a_named_file_of_any_kind(tmp_path):
@@ -4095,18 +4132,43 @@ def test_sqlite_connection_string_guardrail_has_teeth():
 # the event-loop tests in ``tests/test_operation_log.py`` and
 # ``tests/test_likeness_and_face_search.py`` cover the routes that had one.
 
-# Calls that block their thread until a database task or a task runner
-# finishes.
+# Calls that block their thread: on the event loop each one stalls every
+# other request for as long as it takes.
 _BLOCKING_DATABASE_WAITS = frozenset(
     {
+        # Until a database task or a task runner finishes.
         "result_or_throw",
         "run_control_task",
         "run_immediate_read_task",
         "run_recorded_metadata_task",
         "run_task",
         "submit_and_wait",
+        # Synchronous SQL: the hub's own helpers (``HubDatabase.fetchone``,
+        # ``fetchall``, ``transaction``) and a session's or connection's
+        # statement.
+        "exec",
+        "execute",
+        "fetchall",
+        "fetchone",
+        "transaction",
+        # File and image work: the model-icon store.
+        "store_icon",
+        # A plugin registry's ``reload``, which imports every plugin module.
+        "reload",
     }
 )
+
+# Calls that hand a job to a pool and return its future; ``.result()`` on one
+# of those blocks until the job is done.
+_FUTURE_RETURNING_SUBMITS = frozenset({"submit", "submit_task"})
+
+
+def _call_name(func: ast.expr) -> str | None:
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
 
 
 def _blocking_waits_in_coroutines(source: str) -> list[tuple[int, str, str]]:
@@ -4115,12 +4177,31 @@ def _blocking_waits_in_coroutines(source: str) -> list[tuple[int, str, str]]:
     A wait inside a nested ``def`` or ``lambda`` is not the coroutine's own:
     it runs wherever that function is handed, which is how
     ``run_in_threadpool`` takes it. Passing the method itself
-    (``run_in_threadpool(db.run_task, ...)``) is not a call either.
+    (``run_in_threadpool(db.run_task, ...)``) is not a call either. Three
+    shapes do run on the loop and are followed: a nested ``def`` or a
+    ``lambda`` the coroutine calls itself, a ``functools.partial`` of a wait
+    that it calls (reported under the wrapped name), and ``.result()`` on the
+    future of a ``submit``/``submit_task``, whether chained or held in a name.
     """
     hits = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.AsyncFunctionDef):
             continue
+        nested_defs = {
+            child.name: child
+            for child in ast.walk(node)
+            if isinstance(child, ast.FunctionDef) and child is not node
+        }
+        futures = {
+            target.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Assign)
+            and isinstance(child.value, ast.Call)
+            and _call_name(child.value.func) in _FUTURE_RETURNING_SUBMITS
+            for target in child.targets
+            if isinstance(target, ast.Name)
+        }
+        followed: set[int] = set()
         pending = list(node.body)
         while pending:
             current = pending.pop()
@@ -4128,15 +4209,32 @@ def _blocking_waits_in_coroutines(source: str) -> list[tuple[int, str, str]]:
                 continue
             if isinstance(current, ast.Call):
                 func = current.func
-                name = (
-                    func.attr
-                    if isinstance(func, ast.Attribute)
-                    else func.id
-                    if isinstance(func, ast.Name)
-                    else None
-                )
+                name = _call_name(func)
                 if name in _BLOCKING_DATABASE_WAITS:
                     hits.append((current.lineno, node.name, name))
+                if name == "result" and isinstance(func, ast.Attribute):
+                    receiver = func.value
+                    if (
+                        isinstance(receiver, ast.Call)
+                        and _call_name(receiver.func) in _FUTURE_RETURNING_SUBMITS
+                    ) or (isinstance(receiver, ast.Name) and receiver.id in futures):
+                        hits.append((current.lineno, node.name, "result"))
+                if isinstance(func, ast.Lambda):
+                    pending.append(func.body)
+                elif (
+                    isinstance(func, ast.Call)
+                    and _call_name(func.func) == "partial"
+                    and func.args
+                    and _call_name(func.args[0]) in _BLOCKING_DATABASE_WAITS
+                ):
+                    hits.append((current.lineno, node.name, _call_name(func.args[0])))
+                elif (
+                    isinstance(func, ast.Name)
+                    and func.id in nested_defs
+                    and func.id not in followed
+                ):
+                    followed.add(func.id)
+                    pending.extend(nested_defs[func.id].body)
             pending.extend(ast.iter_child_nodes(current))
     return sorted(hits)
 
@@ -4178,11 +4276,41 @@ def test_coroutine_wait_guardrail_has_teeth():
             "submit_and_wait"
         ),
         "async def h(db):\n    return db.run_control_task(f)\n": "run_control_task",
+        # The shapes this guard's first cut missed.
+        "async def h(db):\n    return db.submit_task(f).result()\n": "result",
+        "async def h(db):\n    fut = db.submit_task(f)\n    return fut.result()\n": (
+            "result"
+        ),
+        "async def h(db):\n    return (lambda: db.run_task(f))()\n": "run_task",
+        "async def h(db):\n    def _tail():\n        return db.run_task(f)\n"
+        "    return _tail()\n": "run_task",
+        "async def h(db):\n    return functools.partial(db.run_task, f)()\n": (
+            "run_task"
+        ),
+        "async def h(hub):\n    return hub.fetchone('SELECT 1')\n": "fetchone",
+        "async def h(hub):\n    return hub.fetchall('SELECT 1')\n": "fetchall",
+        "async def h(hub):\n    with hub.transaction() as c:\n        c.close()\n": (
+            "transaction"
+        ),
+        "async def h(session):\n    return session.exec(q).all()\n": "exec",
+        "async def h(conn):\n    return conn.execute('SELECT 1')\n": "execute",
+        "async def h(hub_path, data):\n    return store_icon(hub_path, data)\n": (
+            "store_icon"
+        ),
+        "async def h(manager):\n    manager.reload()\n": "reload",
     }
     for snippet, call in planted.items():
         assert [hit[2] for hit in _blocking_waits_in_coroutines(snippet)] == [call], (
             snippet
         )
+
+
+def test_coroutine_wait_guardrail_spares_worker_handoffs():
+    """The same calls handed to a worker are not flagged.
+
+    Its own test so a guard that stops skipping nested defs and lambdas fails
+    here, not behind the first must-flag fixture that it double counts.
+    """
     sanctioned = [
         "async def h(db):\n    return await run_in_threadpool(db.run_task, f, 1)\n",
         "async def h(db):\n    def _tail():\n        return db.run_task(f)\n"
@@ -4192,6 +4320,969 @@ def test_coroutine_wait_guardrail_has_teeth():
         "def h(db):\n    return db.run_task(f)\n",
         "async def h(loop, runner, t):\n"
         "    return await loop.run_in_executor(None, runner.submit_and_wait, t)\n",
+        "async def h(db):\n"
+        "    return await run_in_threadpool(functools.partial(db.run_task, f))\n",
+        "async def h(db):\n    return await asyncio.wrap_future(db.submit_task(f))\n",
+        # Each new blocking call, handed to a worker instead.
+        "async def h(hub):\n"
+        "    return await run_in_threadpool(hub.fetchone, 'SELECT 1')\n",
+        "async def h(hub):\n"
+        "    return await run_in_threadpool(lambda: hub.fetchall('SELECT 1'))\n",
+        "async def h(hub):\n    def _tail():\n        with hub.transaction() as c:\n"
+        "            c.execute('SELECT 1')\n"
+        "    return await run_in_threadpool(_tail)\n",
+        "async def h(hub_path, data):\n"
+        "    return await run_in_threadpool(store_icon, hub_path, data)\n",
+        "async def h(manager):\n    await run_in_threadpool(manager.reload)\n",
+        "async def h(db):\n"
+        "    return await run_in_threadpool(lambda: db.submit_task(f).result())\n",
+        "async def h(tasks):\n    done, _ = await asyncio.wait(tasks)\n"
+        "    return [t.result() for t in done]\n",
     ]
     for snippet in sanctioned:
         assert _blocking_waits_in_coroutines(snippet) == [], snippet
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: the Scrapheap scope has one parser
+# ---------------------------------------------------------------------------
+
+_SCRAPHEAP_SCOPE_OWNER = "pixlstash/utils/service/filter_helpers.py"
+
+# Every picture query that a Scrapheap view can send. Each must read its scope
+# through ``request_targets_scrapheap``: stats, search, likeness-groups and
+# export once compared ``character_id`` inline and ignored ``only_deleted``, so
+# the Scrapheap panel counted the live library.
+_SCRAPHEAP_SCOPE_READERS = {
+    ("pixlstash/routes/pictures/_misc.py", "get_picture_stats"),
+    ("pixlstash/routes/pictures/_misc.py", "get_likeness_groups"),
+    ("pixlstash/routes/pictures/_search.py", "search_results"),
+    ("pixlstash/routes/pictures/_listing.py", "select_pictures_for_listing"),
+    ("pixlstash/utils/service/export_utils.py", "_parse_export_params"),
+}
+
+
+def _scrapheap_literals(source: str) -> list[int]:
+    """Lines where *source* spells the Scrapheap pseudo id as a string."""
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and node.value == "SCRAPHEAP"
+    ]
+
+
+def _functions_calling(source: str, callee: str) -> set[str]:
+    """Names of the functions in *source* whose own body calls *callee*."""
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call) and (
+                getattr(inner.func, "id", None) == callee
+                or getattr(inner.func, "attr", None) == callee
+            ):
+                found.add(node.name)
+                break
+    return found
+
+
+def test_the_scrapheap_pseudo_id_is_spelled_only_by_its_owner():
+    hits = []
+    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel == _SCRAPHEAP_SCOPE_OWNER:
+            continue
+        for lineno in _scrapheap_literals(path.read_text(encoding="utf-8")):
+            hits.append(f"{rel}:{lineno}")
+    assert not hits, (
+        'An inline "SCRAPHEAP" comparison reads the Scrapheap scope without '
+        "only_deleted. Use request_targets_scrapheap(query_params) for a "
+        "query's scope, or is_scrapheap_view_id / SCRAPHEAP_VIEW_ID from "
+        f"{_SCRAPHEAP_SCOPE_OWNER}:\n" + "\n".join(hits)
+    )
+
+
+def test_every_scrapheap_view_query_reads_its_scope_through_the_parser():
+    missing = []
+    for rel, name in sorted(_SCRAPHEAP_SCOPE_READERS):
+        source = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        if name not in _functions_calling(source, "request_targets_scrapheap"):
+            missing.append(f"{rel} :: {name}")
+    assert not missing, (
+        "These picture queries no longer read the Scrapheap scope through "
+        "request_targets_scrapheap, so only_deleted=true can be ignored and the "
+        "view reads the live library:\n" + "\n".join(missing)
+    )
+
+
+def test_the_scrapheap_scope_guardrail_has_teeth():
+    """Both scans report the shape that let four endpoints miss the heap."""
+    inline = (
+        "def stats(request, character_id):\n"
+        "    only_deleted = False\n"
+        '    if character_id == "SCRAPHEAP":\n'
+        "        only_deleted = True\n"
+    )
+    assert _scrapheap_literals(inline) == [3]
+    assert _functions_calling(inline, "request_targets_scrapheap") == set()
+    parsed = (
+        "def stats(request):\n"
+        "    return request_targets_scrapheap(request.query_params)\n"
+        "def other(request):\n"
+        "    return helpers.request_targets_scrapheap(request.query_params)\n"
+    )
+    assert _scrapheap_literals(parsed) == []
+    assert _functions_calling(parsed, "request_targets_scrapheap") == {
+        "stats",
+        "other",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: a handler's own body read goes through one helper
+# ---------------------------------------------------------------------------
+
+#: The files that may call ``request.json()`` themselves. The helper is where
+#: a handler's read lives. The authz gate reads ids from a body before the
+#: handler runs and answers a malformed one with no ids, leaving the handler's
+#: own parse to refuse it, so its read must not raise a 422 of its own.
+_RAW_JSON_READ_OWNERS = {
+    "pixlstash/routes/_helpers.py",
+    "pixlstash/authz/gate.py",
+}
+
+
+def _raw_json_reads(source: str) -> list[int]:
+    """Lines where *source* calls ``request.json()``."""
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "json"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "request"
+    ]
+
+
+def test_a_handler_reads_its_own_body_through_the_helper():
+    hits = []
+    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel in _RAW_JSON_READ_OWNERS:
+            continue
+        for lineno in _raw_json_reads(path.read_text(encoding="utf-8")):
+            hits.append(f"{rel}:{lineno}")
+    assert not hits, (
+        "A raw request.json() answers a body that is not JSON with a 500, and "
+        "hands a list or a string to code expecting a dict. Read the body with "
+        "read_json_object(request) from pixlstash/routes/_helpers.py, which "
+        "answers both with a 422:\n" + "\n".join(hits)
+    )
+
+
+def test_the_raw_json_read_guardrail_has_teeth():
+    raw = (
+        "async def patch(request):\n"
+        "    data = await request.json()\n"
+        '    return data.get("name")\n'
+    )
+    assert _raw_json_reads(raw) == [2]
+    sanctioned = (
+        "async def patch(request):\n"
+        "    data = await read_json_object(request)\n"
+        "    return response.json()\n"
+    )
+    assert _raw_json_reads(sanctioned) == []
+
+
+# ----------------------------------------------------------------------
+# A fixed https host rests on the certificate check
+# ----------------------------------------------------------------------
+
+#: The fixed hosts asked with ``redirects=0`` and no address check: each rests
+#: on TLS verifying the name in the constant (``utils/bounded_http``'s module
+#: docstring). ``(file, constant)``.
+_FIXED_HTTPS_HOSTS = (
+    ("pixlstash/services/civitai_lookup.py", "CIVITAI_BY_HASH"),
+    ("pixlstash/telemetry/sender.py", "TELEMETRY_ENDPOINT"),
+    ("pixlstash/training/preset_updates.py", "SITE_URL"),
+    ("pixlstash/plugin_install.py", "CODELOAD_ZIP_URL"),
+)
+
+
+def _tls_verify_overrides(source: str) -> list[int]:
+    """Lines that set ``requests``' ``verify``: a keyword, an attribute
+    assignment (``session.verify = ...``) or a ``"verify"`` dict key bound
+    for ``**kwargs``."""
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.keyword) and node.arg == "verify":
+            lines.append(node.value.lineno)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(
+                isinstance(target, ast.Attribute) and target.attr == "verify"
+                for target in targets
+            ):
+                lines.append(node.lineno)
+        elif isinstance(node, ast.Dict) and any(
+            isinstance(key, ast.Constant) and key.value == "verify" for key in node.keys
+        ):
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
+def _module_string(source: str, name: str) -> str | None:
+    """The string a module-level ``name = "..."`` assigns, or None."""
+    for node in ast.parse(source).body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            return node.value.value
+    return None
+
+
+def test_nothing_in_pixlstash_sets_tls_verification():
+    """The fixed hosts make no address check because the certificate check
+    stands in for it. Wrong if any code can turn that check off or point it
+    at another trust store."""
+    hits = []
+    for path in sorted(PIXLSTASH_DIR.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for line in _tls_verify_overrides(source):
+            hits.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{line}")
+    assert not hits, (
+        "These set requests' `verify`. The fixed https hosts rest on the "
+        "certificate check (utils/bounded_http's module docstring), so it may "
+        "not be changed:\n" + "\n".join(hits)
+    )
+
+
+@pytest.mark.parametrize("rel,name", _FIXED_HTTPS_HOSTS)
+def test_each_fixed_host_is_an_https_constant(rel, name):
+    value = _module_string((REPO_ROOT / rel).read_text(encoding="utf-8"), name)
+    assert value is not None, f"{rel} no longer assigns {name} a string literal"
+    assert value.startswith("https://"), (
+        f"{rel} {name} is {value!r}: a fixed host without an address check "
+        "must be https, so TLS verifies the name"
+    )
+
+
+def test_the_fixed_host_guardrail_has_teeth():
+    source = (
+        "requests.get(url, verify=False)\n"
+        "session.verify = '/home/me/test-ca.pem'\n"
+        "kwargs = {'verify': False}\n"
+        "image.verify()\n"
+        "check(verify_ok=True)\n"
+    )
+    assert _tls_verify_overrides(source) == [1, 2, 3]
+    assert _module_string('URL = "http://example.invalid"\n', "URL") == (
+        "http://example.invalid"
+    )
+    assert _module_string('URL = f"https://{host}"\n', "URL") is None
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: a Python-side IN list is bounded or goes through json_each
+# ---------------------------------------------------------------------------
+# ``col.in_(values)`` binds one parameter per value, and SQLite refuses a
+# statement past SQLITE_LIMIT_VARIABLE_NUMBER (999 before 3.32). A list that
+# grows with the library (every person, every project, every watch folder)
+# must go through ``in_json`` / ``not_in_json`` (utils/sql_chunking.py), which
+# binds one JSON array, or be read in ``chunked`` pieces.
+#
+# The scan proves a bound from the argument's shape alone:
+#
+# - a SQL expression: ``select``/``union``, ``.subquery()``/``.cte()``, a
+#   helper named ``*_subquery``/``*_stmt``/``*_query``, a method chain on one
+#   of those, or a parameter annotated ``Select``;
+# - a literal tuple, list or set display (its length is in the source) or an
+#   UPPER_CASE constant;
+# - a chunk: a piece of ``chunked(...)``, or a slice ``xs[:CAP]`` /
+#   ``xs[i : i + CAP]`` with an int or UPPER_CASE cap;
+# - ``list``/``tuple``/``sorted``/``set``/``frozenset`` of one of those, or a
+#   comprehension over one.
+#
+# A name counts as its bindings in the nearest enclosing scope that binds it.
+# One that is also grown in place (``.append``, ``.extend``, ``.add``,
+# ``.update``, ``.insert``, ``+=``) proves nothing. Anything else needs an
+# entry in _IN_LIST_ALLOWLIST naming the bound that holds it. The scan is a
+# tripwire, not a proof: a list handed to a helper that grows it is not
+# followed.
+
+_IN_LIST_METHODS = frozenset({"in_", "notin_", "not_in"})
+_IN_LIST_SQL_BUILDERS = frozenset(
+    {"select", "sa_select", "union", "union_all", "except_", "intersect"}
+)
+_IN_LIST_SQL_METHODS = frozenset({"subquery", "scalar_subquery", "cte"})
+_IN_LIST_SQL_HELPER_SUFFIXES = ("_subquery", "_stmt", "_query")
+_IN_LIST_SIZE_KEEPING = frozenset({"list", "tuple", "sorted", "set", "frozenset"})
+_IN_LIST_GROWERS = frozenset({"append", "extend", "add", "update", "insert"})
+_IN_LIST_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_IN_LIST_PROVEN = frozenset({"sql", "literal", "chunk"})
+
+
+def _is_upper_name(name: str) -> bool:
+    stripped = name.lstrip("_")
+    return bool(stripped) and stripped.isupper()
+
+
+def _is_cap(node: ast.expr) -> bool:
+    """An int literal or an UPPER_CASE constant."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, int) and not isinstance(node.value, bool)
+    if isinstance(node, ast.Name):
+        return _is_upper_name(node.id)
+    return isinstance(node, ast.Attribute) and _is_upper_name(node.attr)
+
+
+class _InListShapes:
+    """Classify the argument of each ``.in_`` call in one module."""
+
+    def __init__(self, tree: ast.Module):
+        self.tree = tree
+        self.parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        self.resolving: set[tuple[str, int]] = set()
+
+    def scopes(self, node: ast.AST) -> list[ast.AST]:
+        found = []
+        while node in self.parents:
+            node = self.parents[node]
+            if isinstance(node, _IN_LIST_SCOPES):
+                found.append(node)
+        found.append(self.tree)
+        return found
+
+    def own_nodes(self, scope: ast.AST):
+        pending = list(ast.iter_child_nodes(scope))
+        while pending:
+            node = pending.pop()
+            yield node
+            if not isinstance(node, _IN_LIST_SCOPES + (ast.ClassDef,)):
+                pending.extend(ast.iter_child_nodes(node))
+
+    def bindings(self, name: str, at: ast.AST) -> list[tuple[str, ast.expr | None]]:
+        """``(how, value)`` for each binding of *name* in its nearest scope."""
+        for scope in self.scopes(at):
+            found: list[tuple[str, ast.expr | None]] = []
+            if isinstance(scope, _IN_LIST_SCOPES):
+                args = scope.args
+                for param in [
+                    *args.posonlyargs,
+                    *args.args,
+                    *args.kwonlyargs,
+                    args.vararg,
+                    args.kwarg,
+                ]:
+                    if param is not None and param.arg == name:
+                        annotation = (
+                            ast.unparse(param.annotation) if param.annotation else ""
+                        )
+                        found.append(
+                            ("sql" if "Select" in annotation else "opaque", None)
+                        )
+            for node in self.own_nodes(scope):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == name:
+                            found.append(("value", node.value))
+                        elif isinstance(target, (ast.Tuple, ast.List)) and any(
+                            isinstance(e, ast.Name) and e.id == name
+                            for e in target.elts
+                        ):
+                            found.append(("opaque", None))
+                elif isinstance(node, ast.AnnAssign) and (
+                    isinstance(node.target, ast.Name) and node.target.id == name
+                ):
+                    if node.value is not None:
+                        found.append(("value", node.value))
+                elif isinstance(node, ast.AugAssign) and (
+                    isinstance(node.target, ast.Name) and node.target.id == name
+                ):
+                    found.append(("opaque", None))
+                elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and (
+                    isinstance(node.target, ast.Name) and node.target.id == name
+                ):
+                    found.append(("element", node.iter))
+                elif isinstance(node, ast.NamedExpr) and node.target.id == name:
+                    found.append(("value", node.value))
+                elif isinstance(node, ast.withitem) and (
+                    isinstance(node.optional_vars, ast.Name)
+                    and node.optional_vars.id == name
+                ):
+                    found.append(("opaque", None))
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _IN_LIST_GROWERS
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == name
+                ):
+                    found.append(("opaque", None))
+            if found:
+                return found
+        return []
+
+    def kind(self, expr: ast.expr, depth: int = 0) -> str | None:
+        """``sql``, ``literal``, ``chunk``, ``none`` or ``None`` (unproven)."""
+        if depth > 40:
+            return None
+        if isinstance(expr, ast.Constant):
+            return "none" if expr.value is None else "literal"
+        if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+            if any(isinstance(e, ast.Starred) for e in expr.elts):
+                return None
+            return "literal"
+        if isinstance(expr, (ast.Name, ast.Attribute)) and _is_cap(expr):
+            return "literal"
+        if isinstance(expr, ast.IfExp):
+            return self.merge(
+                [self.kind(expr.body, depth + 1), self.kind(expr.orelse, depth + 1)]
+            )
+        if isinstance(expr, ast.Subscript) and isinstance(expr.slice, ast.Slice):
+            lower, upper = expr.slice.lower, expr.slice.upper
+            if upper is None or expr.slice.step is not None:
+                return None
+            if lower is None and _is_cap(upper):
+                return "chunk"
+            if (
+                lower is not None
+                and isinstance(upper, ast.BinOp)
+                and isinstance(upper.op, ast.Add)
+                and ast.dump(upper.left) == ast.dump(lower)
+                and _is_cap(upper.right)
+            ):
+                return "chunk"
+            return None
+        if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            if len(expr.generators) != 1:
+                return None
+            source = expr.generators[0].iter
+            return self.element_kind(source, expr) or self.kind(source, depth + 1)
+        if isinstance(expr, ast.Call):
+            func = expr.func
+            name = _call_name(func)
+            if (
+                isinstance(func, ast.Name)
+                and name in _IN_LIST_SIZE_KEEPING
+                and len(expr.args) == 1
+            ):
+                return self.kind(expr.args[0], depth + 1)
+            if (
+                name in _IN_LIST_SQL_BUILDERS
+                or name in _IN_LIST_SQL_METHODS
+                or (name or "").endswith(_IN_LIST_SQL_HELPER_SUFFIXES)
+            ):
+                return "sql"
+            if isinstance(func, ast.Attribute):
+                # A method on a statement is a statement; on the statement
+                # being resolved (``stmt = stmt.where(...)``) it adds nothing.
+                receiver = self.kind(func.value, depth + 1)
+                return receiver if receiver in ("sql", "self") else None
+            return None
+        if isinstance(expr, ast.Name):
+            return self.name_kind(expr, depth)
+        return None
+
+    def name_kind(self, name: ast.Name, depth: int) -> str | None:
+        binds = self.bindings(name.id, name)
+        if not binds:
+            return None
+        key = (name.id, id(self.scopes(name)[0]))
+        if key in self.resolving:
+            # ``stmt = stmt.where(...)``: the other bindings decide.
+            return "self"
+        self.resolving.add(key)
+        try:
+            kinds = []
+            for how, value in binds:
+                if how == "value":
+                    kinds.append(self.kind(value, depth + 1))
+                elif how == "sql":
+                    kinds.append("sql")
+                elif how == "element":
+                    kinds.append(self.element_kind(value, name))
+                else:
+                    kinds.append(None)
+        finally:
+            self.resolving.discard(key)
+        return self.merge([k for k in kinds if k != "self"] or [None])
+
+    @staticmethod
+    def merge(kinds: list[str | None]) -> str | None:
+        if None in kinds:
+            return None
+        proven = set(kinds) - {"none"}
+        if not proven:
+            return "none"
+        return proven.pop() if len(proven) == 1 else "mixed"
+
+    def element_kind(self, source: ast.expr, at: ast.AST) -> str | None:
+        """``chunk`` when *source* yields pieces of ``chunked(...)``."""
+        if isinstance(source, ast.Call) and _call_name(source.func) == "chunked":
+            return "chunk"
+        if isinstance(source, ast.Name):
+            binds = self.bindings(source.id, at)
+            if binds and all(
+                how == "value"
+                and isinstance(value, ast.Call)
+                and _call_name(value.func) in _IN_LIST_SIZE_KEEPING
+                and len(value.args) == 1
+                and isinstance(value.args[0], ast.Call)
+                and _call_name(value.args[0].func) == "chunked"
+                for how, value in binds
+            ):
+                return "chunk"
+        return None
+
+
+def _enclosing_name(node: ast.AST, parents: dict) -> str:
+    names = []
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(node.name)
+    return ".".join(reversed(names)) or "<module>"
+
+
+def _unproven_in_lists(source: str) -> list[tuple[int, str, str]]:
+    """``(lineno, function, argument)`` for each ``.in_`` with no proven bound."""
+    tree = ast.parse(source)
+    shapes = _InListShapes(tree)
+    hits = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _IN_LIST_METHODS
+            and node.args
+        ):
+            argument = node.args[0]
+            if shapes.kind(argument) in _IN_LIST_PROVEN | {"mixed"}:
+                continue
+            hits.append(
+                (
+                    node.lineno,
+                    _enclosing_name(node, shapes.parents),
+                    ast.unparse(argument),
+                )
+            )
+    return sorted(hits)
+
+
+def _scan_unproven_in_lists(root: Path, base: Path) -> dict[tuple, list[int]]:
+    """``{(path, function, argument): [lineno, ...]}`` under *root*."""
+    found: dict[tuple, list[int]] = {}
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(base).as_posix()
+        for lineno, function, argument in _unproven_in_lists(
+            path.read_text(encoding="utf-8")
+        ):
+            found.setdefault((rel, function, argument), []).append(lineno)
+    return found
+
+
+_ONE_ID = "every caller passes one id"
+_PAGE_ROWS = "rows of one page, capped by MAX_PAGE_SIZE (200)"
+_FINDER_BATCH = "one finder batch, at most the task's BATCH_SIZE"
+_TAG_TASK = (
+    "a TagTask holds one finder batch or one picture (vault.py, the "
+    "single-picture retag)"
+)
+_LAYOUT_BATCH = (
+    "callers pass one id, a chunk, or at most 200 (BATCH_SIZE, "
+    "MIGRATION_BATCH, MOVE_TO_MATCH_MAX_IDS)"
+)
+_CHUNK_SUBSET = "a subset of one ``chunked`` piece"
+_SHEET = "a character sheet: at most MAX_SHEETS (32) sheets of a few panels"
+
+# (path, function, argument) -> the bound that holds it. One entry covers every
+# call in that function with that argument.
+_IN_LIST_ALLOWLIST = {
+    ("pixlstash/db_models/detection.py", "Detection.find", "value"): _ONE_ID,
+    ("pixlstash/db_models/face.py", "Face.find", "value"): _ONE_ID,
+    ("pixlstash/db_models/picture.py", "Picture.fetch_features", "picture_scope"): (
+        "a scope_id_subquery past SQLITE_ID_CHUNK, the raw list below it"
+    ),
+    ("pixlstash/db_models/picture.py", "_column_filter_clause", "value"): (
+        "a Select (isinstance branch) or the temp-table path Picture.find takes "
+        "past SQLITE_ID_CHUNK"
+    ),
+    (
+        "pixlstash/migrations/versions/0052_drop_import_excluded_sentinel.py",
+        "upgrade",
+        "converted_ids",
+    ): "released migration, kept: CLAUDE.md forbids modifying it",
+    (
+        "pixlstash/routes/picture_sets.py",
+        "create_router.get_picture_set_thumbnail.fetch_picture_paths",
+        "picture_ids",
+    ): "the set's top pictures, .limit(3)",
+    (
+        "pixlstash/routes/pictures/_character_likeness.py",
+        "register_routes.get_picture_character_likeness.fetch_faces",
+        "ids",
+    ): "the faces of one picture",
+    ("pixlstash/routes/tags.py", "create_router.bulk_fetch_tags.fetch", "ids"): (
+        "the request ids cut to [:200]"
+    ),
+    (
+        "pixlstash/routes/tags.py",
+        "create_router.remove_tag_from_picture_everywhere.update_picture",
+        "tag_ids",
+    ): "the rows of one tag on one picture",
+    (
+        "pixlstash/scoring/character_likeness.py",
+        "_penalised_tag_weight",
+        "[literal(name, literal_execute=True) for name in weights]",
+    ): "literal_execute renders the fixed penalty table inline, binding nothing",
+    (
+        "pixlstash/scoring/character_likeness.py",
+        "select_reference_faces_for_character",
+        "selected_face_ids",
+    ): "at most max_refs reference faces",
+    (
+        "pixlstash/scoring/character_likeness.py",
+        "select_reference_faces_for_character",
+        "selected_picture_ids",
+    ): "the pictures of at most max_refs reference faces",
+    (
+        "pixlstash/services/character_sheet.py",
+        "file_on_character_in_session",
+        "picture_ids",
+    ): _SHEET,
+    (
+        "pixlstash/services/character_sheet.py",
+        "sheet_face_boxes_in_session",
+        "picture_ids",
+    ): _SHEET,
+    (
+        "pixlstash/services/character_sheet.py",
+        "sheet_faces_in_session",
+        "picture_ids",
+    ): (_SHEET),
+    (
+        "pixlstash/services/character_sheet.py",
+        "sheet_faces_in_session",
+        "set(reference_picture_ids) - set(faces)",
+    ): "at most four reference pictures",
+    (
+        "pixlstash/services/dedup_auto_stack_service.py",
+        "_prune_ended_runs",
+        "list(stale)",
+    ): ("ended runs past HISTORY_KEPT, pruned on every write"),
+    (
+        "pixlstash/services/dedup_tier_service.py",
+        "_tier_filter",
+        "[tier.value for tier in policy.tiers]",
+    ): "the policy's tiers, a fixed enum",
+    (
+        "pixlstash/services/dedup_tier_service.py",
+        "obsolete_scan_group_ids_in_session",
+        "sorted(completed)",
+    ): "the completed scan tiers, a fixed enum",
+    (
+        "pixlstash/services/dedup_tier_service.py",
+        "page_queue_in_session",
+        "[row.signature for row in rows]",
+    ): _PAGE_ROWS,
+    (
+        "pixlstash/services/dedup_tier_service.py",
+        "page_queue_in_session",
+        "group_ids",
+    ): (_PAGE_ROWS),
+    ("pixlstash/services/dedup_tier_service.py", "page_queue_in_session", "wanted"): (
+        "a subset of VERDICT_ORDER"
+    ),
+    (
+        "pixlstash/services/folder_structure_commit_service.py",
+        "_pending_with_faces",
+        "picture_ids",
+    ): "one ``chunked`` piece or None",
+    (
+        "pixlstash/services/folder_structure_commit_service.py",
+        "local_import_pictures.insert",
+        "[p.file_path for p in built]",
+    ): "one build batch of _BUILD_CHUNK_SIZE (128)",
+    ("pixlstash/services/layout_move_service.py", "describe_drift", "ids"): _ONE_ID,
+    ("pixlstash/services/layout_move_service.py", "picture_facets", "ids"): (
+        _LAYOUT_BATCH
+    ),
+    ("pixlstash/services/layout_move_service.py", "plan_match_moves", "ids"): (
+        _LAYOUT_BATCH
+    ),
+    ("pixlstash/services/layout_move_service.py", "plan_moves", "ids"): _LAYOUT_BATCH,
+    (
+        "pixlstash/services/restore/preview.py",
+        "PreviewMixin._annotate_shown_revert_tags",
+        "shown_ids",
+    ): "the shown preview rows, capped by MAX_RESOURCES (200)",
+    (
+        "pixlstash/services/restore/preview.py",
+        "PreviewMixin._annotate_shown_revert_tags._load_live",
+        "shown_ids",
+    ): "the shown preview rows, capped by MAX_RESOURCES (200)",
+    (
+        "pixlstash/services/scrapheap_run_service.py",
+        "_prune_in_session",
+        "list(stale)",
+    ): ("ended runs past HISTORY_KEPT, pruned on every write"),
+    (
+        "pixlstash/services/search_query_service.py",
+        "fetch_tag_counts_for_pictures._fetch",
+        "picture_ids",
+    ): "the top hits, capped by _MAX_TOP_N (500)",
+    (
+        "pixlstash/services/smart_sets.py",
+        "smart_sets_to_refresh_in_session",
+        "list(set_ids)",
+    ): "refresh_smart_sets passes one set id or None",
+    ("pixlstash/services/tag_group_service.py", "_picture_counts", "within"): (
+        "every caller passes a select"
+    ),
+    (
+        "pixlstash/services/tag_prediction_service.py",
+        "reset_pictures_tags._reset",
+        "present",
+    ): _CHUNK_SUBSET,
+    (
+        "pixlstash/services/tag_prediction_service.py",
+        "retag_face_crops._retag_chunk",
+        "chunk",
+    ): "the caller loops over ``chunked``",
+    ("pixlstash/services/tag_scan_service.py", "scan_tag._load", "sorted(equiv)"): (
+        "one tag and its DEFAULT_TAG_MERGES equivalents"
+    ),
+    (
+        "pixlstash/tasks/comfyui_extraction_task.py",
+        "ComfyUIExtractionTask._run_task.fetch_fresh",
+        "ids",
+    ): "one batch of BATCH_SIZE (32)",
+    (
+        "pixlstash/tasks/layout_move_task.py",
+        "LayoutMoveTask._clear_due",
+        "[int(pid) for pid in picture_ids]",
+    ): "one batch of BATCH_SIZE (200)",
+    (
+        "pixlstash/tasks/missing_description_finder.py",
+        "MissingDescriptionFinder._fetch_missing_descriptions",
+        "[*held_values, make_description_sentinel(None)]",
+    ): "one sentinel per installed description engine",
+    (
+        "pixlstash/tasks/missing_description_finder.py",
+        "MissingDescriptionFinder._fetch_missing_descriptions",
+        "held_values",
+    ): "one sentinel per installed description engine",
+    (
+        "pixlstash/tasks/missing_tag_finder.py",
+        "MissingTagFinder._fetch_missing_tags",
+        "[make_tag_sentinel(p) for p in sorted(held_plugins)]",
+    ): "one sentinel per installed tagger plugin",
+    (
+        "pixlstash/tasks/picture_import_task.py",
+        "PictureImportTask._apply_character.apply_character",
+        "ids",
+    ): "one import batch of _DEDUP_BATCH (64)",
+    (
+        "pixlstash/tasks/picture_import_task.py",
+        "PictureImportTask._apply_project.apply_project",
+        "ids",
+    ): "one import batch of _DEDUP_BATCH (64)",
+    (
+        "pixlstash/tasks/picture_import_task.py",
+        "PictureImportTask._apply_set.apply_set",
+        "ids",
+    ): "one import batch of _DEDUP_BATCH (64)",
+    ("pixlstash/tasks/prompt_match_task.py", "_fetch_inputs", "picture_ids"): (
+        _FINDER_BATCH
+    ),
+    (
+        "pixlstash/tasks/reference_folder_scan_task.py",
+        "ReferenceFolderScanTask._insert_pictures.insert_pictures",
+        "[p.file_path for p in pictures_batch]",
+    ): "one build batch of _BUILD_CHUNK_SIZE (128)",
+    (
+        "pixlstash/tasks/smart_score_task.py",
+        "SmartScoreTask._fetch_score_data",
+        "candidate_ids",
+    ): _FINDER_BATCH,
+    (
+        "pixlstash/tasks/smart_score_task.py",
+        "SmartScoreTask._persist_scores",
+        "unchanged",
+    ): (_FINDER_BATCH),
+    (
+        "pixlstash/tasks/tag_exclusion_cleanup_task.py",
+        "TagExclusionCleanupTask._plan_sidecars",
+        "picture_ids",
+    ): "one batch of BATCH_SIZE (200)",
+    (
+        "pixlstash/tasks/tag_exclusion_cleanup_task.py",
+        "TagExclusionCleanupTask._remove_batch",
+        "picture_ids",
+    ): "one batch of BATCH_SIZE (200)",
+    (
+        "pixlstash/tasks/tag_prediction_backfill_task.py",
+        "TagPredictionBackfillTask._backfill_predictions",
+        "attempted_picture_ids",
+    ): _FINDER_BATCH,
+    (
+        "pixlstash/tasks/tag_prediction_backfill_task.py",
+        "TagPredictionBackfillTask._backfill_predictions",
+        "unscored_ids",
+    ): _FINDER_BATCH,
+    ("pixlstash/tasks/tag_task.py", "TagTask._add_tags_bulk", "list(candidate_ids)"): (
+        _TAG_TASK
+    ),
+    (
+        "pixlstash/tasks/tag_task.py",
+        "TagTask._add_tags_bulk",
+        "list(existing_picture_ids)",
+    ): _TAG_TASK,
+    (
+        "pixlstash/tasks/tag_task.py",
+        "TagTask._add_tags_bulk._write",
+        "[pid for pid, _ in batch]",
+    ): _TAG_TASK,
+    (
+        "pixlstash/tasks/tag_task.py",
+        "TagTask._fetch_faces_for_pictures",
+        "picture_ids",
+    ): (_TAG_TASK),
+    (
+        "pixlstash/tasks/tag_task.py",
+        "TagTask._write_predictions_from_tags",
+        "picture_ids",
+    ): _TAG_TASK,
+    (
+        "pixlstash/tasks/text_embedding_task.py",
+        "TextEmbeddingTask._run_task.fetch_fresh",
+        "ids",
+    ): _FINDER_BATCH,
+    (
+        "pixlstash/utils/quality/quality_utils.py",
+        "QualityUtils.update_quality",
+        "surviving_ids",
+    ): "one QualityTask batch",
+    (
+        "pixlstash/utils/quality/quality_utils.py",
+        "QualityUtils.update_quality",
+        "valid_ids",
+    ): "one QualityTask batch",
+    (
+        "pixlstash/vault.py",
+        "Vault._process_pending_character_assignments._assign_if_pending",
+        "picture_ids",
+    ): "FACE_EXTRACTION_BATCH_LIMIT (100) or one ``chunked`` piece",
+    ("pixlstash/vault.py", "Vault.reset_descriptions._set_sentinels", "present"): (
+        _CHUNK_SUBSET
+    ),
+}
+
+
+def test_every_python_side_in_list_is_bounded():
+    """No ``.in_`` under ``pixlstash/`` binds a list that grows with the library."""
+    found = _scan_unproven_in_lists(PIXLSTASH_DIR, REPO_ROOT)
+    offenders = [
+        f"  {rel}:{','.join(map(str, lines))}: {function}: .in_({argument})"
+        for (rel, function, argument), lines in sorted(found.items())
+        if (rel, function, argument) not in _IN_LIST_ALLOWLIST
+    ]
+    assert not offenders, (
+        "An IN list built in Python binds one SQLite variable per value and "
+        "fails past SQLITE_LIMIT_VARIABLE_NUMBER (999 on older builds). Use "
+        "in_json / not_in_json (utils/sql_chunking.py) or read in chunked "
+        "pieces (docs/backend_architecture.md §10.2). If the list "
+        "has a hard cap, add (path, function, argument) to _IN_LIST_ALLOWLIST "
+        "with the cap:\n" + "\n".join(offenders)
+    )
+
+
+def test_in_list_allowlist_has_no_dead_entries():
+    """An entry that no longer matches a call would re-permit the next one."""
+    found = _scan_unproven_in_lists(PIXLSTASH_DIR, REPO_ROOT)
+    stale = sorted(set(_IN_LIST_ALLOWLIST) - set(found))
+    assert not stale, (
+        "these _IN_LIST_ALLOWLIST entries match no unproven .in_ call and must "
+        "be removed:\n  " + "\n  ".join(map(repr, stale))
+    )
+
+
+_IN_LIST_FLAGGED = {
+    "a parameter": "def f(s, ids):\n    s.exec(select(T).where(T.id.in_(ids)))\n",
+    "a tag set": (
+        "def f(s, hidden):\n"
+        "    tags = {t.lower() for t in hidden}\n"
+        "    return func.lower(Tag.tag).in_(tags)\n"
+    ),
+    "an attribute": "def f(s, req):\n    return T.id.in_(req.ids)\n",
+    "a call": "def f(s):\n    return T.id.not_in(load_ids(s))\n",
+    "a grown literal": (
+        "def f(s, rows):\n"
+        "    ids = []\n"
+        "    for r in rows:\n"
+        "        ids.append(r.id)\n"
+        "    return T.id.in_(ids)\n"
+    ),
+    "an augmented literal": (
+        "def f(s, rows):\n    ids = [0]\n    ids += rows\n    return T.id.in_(ids)\n"
+    ),
+    "a starred display": "def f(s, ids):\n    return T.id.in_([*ids, 0])\n",
+    "a slice without a cap": "def f(s, ids, n):\n    return T.id.in_(ids[:n])\n",
+    "a loop over the list itself": (
+        "def f(s, ids):\n    for one in ids:\n        T.id.notin_(one)\n"
+    ),
+    "a statement then rows": (
+        "def f(s):\n"
+        "    ids = select(T.id)\n"
+        "    ids = s.exec(ids).all()\n"
+        "    return T.id.in_(ids)\n"
+    ),
+}
+
+_IN_LIST_SPARED = {
+    "a select": "def f(s):\n    return T.id.in_(select(U.id).where(U.x == 1))\n",
+    "a refined statement": (
+        "def f(s, x):\n"
+        "    q = select(U.id)\n"
+        "    if x:\n"
+        "        q = q.where(U.x == x)\n"
+        "    return T.id.in_(q)\n"
+    ),
+    "a subquery helper": "def f(s, ids):\n    return T.id.in_(scope_id_subquery(s, ids))\n",
+    "a Select parameter": "def f(within: Select):\n    return T.id.in_(within)\n",
+    "a literal": "def f(s):\n    return T.state.in_(['A', 'B'])\n",
+    "a constant": "def f(s):\n    return T.state.notin_(ACTIVE_STATUSES)\n",
+    "a chunk": (
+        "def f(s, ids):\n"
+        "    for piece in chunked(ids):\n"
+        "        s.exec(select(T).where(T.id.in_(piece)))\n"
+    ),
+    "a capped slice": (
+        "def f(s, ids):\n"
+        "    for i in range(0, len(ids), CHUNK):\n"
+        "        T.id.in_(ids[i : i + CHUNK])\n"
+        "    return T.id.in_(ids[:200])\n"
+    ),
+    "sorted of a constant": "def f(s):\n    return T.tag.in_(sorted(TAGS))\n",
+}
+
+
+def test_in_list_guardrail_has_teeth():
+    for shape, source in _IN_LIST_FLAGGED.items():
+        assert len(_unproven_in_lists(source)) >= 1, shape
+    for shape, source in _IN_LIST_SPARED.items():
+        assert _unproven_in_lists(source) == [], shape

@@ -416,8 +416,21 @@ Tracked so they aren't forgotten — weighted by blast radius:
   - *Real two-tab / two-device observation (§19.2)* — automated coverage uses
     the no-client-id lever to fake "external"; genuine concurrent same-owner
     clients are observed manually.
-  - *Network reconnect (§19.5)* — DevTools offline/online and the **known gap**
-    that events during downtime are lost (no replay) are not in the harness.
+  - *Network reconnect (§19.5)* — DevTools offline/online is not in the
+    harness. Events sent during downtime are not replayed; instead, 1.5 s after
+    a reconnect the grid reads the view's ids once and compares them with what
+    it shows (stream views: All media, the Scrapheap and the other browsed
+    views). Pictures that left are removed in place, new and re-sorted ones go
+    on the *New pictures* and *View changed externally* pills. When that read
+    covers only part of a long view, the cards it did not see are read again
+    by id: a card the server still lists has moved and goes on the pill, a
+    card it does not list is gone and is removed. That holds under every sort,
+    the character-likeness sort included. Search and id-list views
+    (text search, likeness groups, the picture, face and set likeness
+    searches) re-run their own load read whole and compare it the same way.
+    The reads and the comparison are unit-tested against a mocked stream
+    (`ImageGridReconnectReconcile.test.js`); a real drop and reconnect is
+    observed manually.
   - *Storage-denied `clientId` (§19.6, #501)* — private-window `sessionStorage`
     denial regenerates the client id per reload; this narrow misclassification
     edge is manual. See `docs/reviews/2026-06-grid-refresh-cleanup-plan.md` §7.

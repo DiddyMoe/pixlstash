@@ -11,6 +11,10 @@
 // targets (e.g. `node scripts/sync-node-versions.mjs electron`); with no args it
 // syncs both. Mirrors what .github/workflows/windows-installer.yml does for the
 // Inno Setup build.
+//
+// `--check` writes nothing: it names every manifest that disagrees with
+// pyproject.toml and exits 1, so a gate can ask without editing the tree. Any
+// other option is refused (exit 2) rather than read as a directory name.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -18,6 +22,17 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..');
 const pyprojectPath = join(repoRoot, 'pyproject.toml');
+
+const args = process.argv.slice(2);
+const check = args.includes('--check');
+const unknown = args.filter((arg) => arg.startsWith('-') && arg !== '--check');
+if (unknown.length) {
+  console.error(
+    `sync-node-versions: unknown option ${unknown.join(' ')} ` +
+      '(usage: sync-node-versions.mjs [--check] [electron] [frontend])',
+  );
+  process.exit(2);
+}
 
 const pyproject = readFileSync(pyprojectPath, 'utf8');
 // The version lives in the [project] table: `version = "1.6.0"`. Match the
@@ -54,7 +69,8 @@ const version = pep440ToSemver(pep440);
 const fromNote = version !== pep440 ? ` (from ${pep440})` : '';
 
 // Rewrite a single JSON file via a mutator, preserving 2-space indentation and a
-// trailing newline. Returns whether anything changed.
+// trailing newline; under --check the file is only compared. Returns whether
+// anything changed (or, under --check, would have).
 function updateJson(path, mutate) {
   let raw;
   try {
@@ -65,13 +81,13 @@ function updateJson(path, mutate) {
   }
   const data = JSON.parse(raw);
   const changed = mutate(data);
-  if (changed) {
+  if (changed && !check) {
     writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
   }
   return changed;
 }
 
-const targets = process.argv.slice(2);
+const targets = args.filter((arg) => !arg.startsWith('-'));
 const dirs = targets.length ? targets : ['electron', 'frontend'];
 
 let anyChange = false;
@@ -100,12 +116,25 @@ for (const dir of dirs) {
 
   if (pkgChanged || lockChanged) {
     anyChange = true;
-    console.log(`sync-node-versions: ${dir} -> ${version}${fromNote}`);
+    if (check) {
+      const stale = [pkgChanged && 'package.json', lockChanged && 'package-lock.json']
+        .filter(Boolean)
+        .map((name) => `${dir}/${name}`);
+      console.error(
+        `sync-node-versions: ${stale.join(' and ')} not at ${version}${fromNote}`,
+      );
+    } else {
+      console.log(`sync-node-versions: ${dir} -> ${version}${fromNote}`);
+    }
   } else {
     console.log(`sync-node-versions: ${dir} already at ${version}`);
   }
 }
 
+if (check && anyChange) {
+  console.error('sync-node-versions: run it without --check to sync them');
+  process.exit(1);
+}
 if (!anyChange) {
   console.log('sync-node-versions: nothing to do');
 }

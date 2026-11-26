@@ -5,7 +5,7 @@
 // control's own, it listens for `focus` (which does not bubble), and it knows
 // nothing of a tip nested inside another.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import { createVuetify } from "vuetify";
 import * as components from "vuetify/components";
@@ -105,6 +105,32 @@ describe("Tooltip", () => {
     await settle();
     expect(w.findComponent(components.VTooltip).exists()).toBe(true);
     expect(document.body.textContent).toContain("Scan now");
+    w.unmount();
+  });
+
+  // Vuetify's tooltip has no close delay of its own and times the close with
+  // `Number(undefined)`: a NaN timeout, which Node warns about.
+  it("closes when the pointer leaves, timing no step with a NaN delay", async () => {
+    const w = mountHost(
+      `<button>Scan<Tooltip text="Scan now" activator="parent" /></button>`,
+    );
+    await flushPromises();
+    const btn = w.find("button");
+    await btn.trigger("mouseenter");
+    await settle();
+    const tip = w.findComponent(components.VTooltip);
+    expect(tip.props("modelValue")).toBe(true);
+
+    const timers = vi.spyOn(window, "setTimeout");
+    try {
+      await btn.trigger("mouseleave");
+      await settle();
+      expect(tip.props("modelValue")).toBe(false);
+      const delays = timers.mock.calls.map(([, ms]) => ms);
+      expect(delays.filter((ms) => !Number.isFinite(ms ?? 0))).toEqual([]);
+    } finally {
+      timers.mockRestore();
+    }
     w.unmount();
   });
 

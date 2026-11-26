@@ -247,8 +247,8 @@ def wait_likeness_settled(server, timeout_s=_DEFAULT_TIMEOUT_S):
     ``LikenessParameterUtils.reset_likeness_for_pictures`` (which DELETEs every
     pair touching a picture and re-queues it), then ``LikenessTask`` recomputes
     real pairs. Both race with a seeded fixture. Waiting on the parameter stage
-    alone is not enough: ``count_pending_parameters`` reads 0 in the gaps
-    between per-picture embedding batches, and ``MissingLikenessFinder`` then
+    alone is not enough: ``LikenessParametersTask.count_pending`` reads 0 in
+    the gaps between per-picture embedding batches, and ``MissingLikenessFinder`` then
     seeds the queue and writes real pairs for the pictures that *are* ready -
     which collides with the fixture's own INSERT on the
     ``(picture_id_a, picture_id_b)`` unique constraint.
@@ -300,7 +300,7 @@ def seed_likeness_stable(server, seed_fn):
 
     Deletes any pipeline-computed pairs and drains the queue *inside* the seed
     transaction so no observer ever sees an empty-table/empty-queue state (which
-    would re-trigger ``LikenessUtils.seed_queue``). Wiping first also means the
+    would re-trigger ``LikenessTask.seed_queue``). Wiping first also means the
     fixture's own INSERTs cannot collide with a real pair the pipeline already
     computed for the same picture ids. After commit the queue is empty and the
     seeded pairs are present, so ``MissingLikenessFinder`` has no further work

@@ -67,6 +67,12 @@ WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 TESTS_DIR = REPO_ROOT / "tests"
 DURATIONS_PATH = TESTS_DIR / "ci_test_durations.json"
 
+# Every nested pytest this module starts runs in REPO_ROOT, so with the cache
+# plugin on each one rewrote the checkout's .pytest_cache (lastfailed, nodeids)
+# as a side effect of a test, racing any other pytest sharing that checkout.
+# Same flag tests/test_process_teardown.py passes its nested run.
+_PYTEST = (sys.executable, "-m", "pytest", "-p", "no:cacheprovider")
+
 # These workflows can publish packages/images/pages, create release issues or
 # PRs, attach signed artifacts, mint OIDC tokens, or consume release-signing
 # secrets. Their action and shell boundaries therefore need stronger invariants
@@ -200,51 +206,21 @@ RELEASE_CRITICAL_MUST_BLOCK = frozenset(
 # into the ci.yml gate is the intended direction of travel; the end state is an
 # empty list and a gate that just says `tests/`.
 #
-# Known-red as of this writing: test_smart_score_invalidation.py races an async
-# invalidation that has not landed yet and returns a DIFFERENT pass count
-# depending on machine load (see ci.yml's `backend` job comment, measured
-# 2026-07-26: 41 passed idle, 4 failed under two concurrent workloads). It is
-# not merely deferred, it fails deterministically on a loaded runner, which is
-# exactly the gate's condition. That is what blocks the flip.
+# Every entry carries the reason it is not gated yet. A file comes off this
+# list only after a local run of the whole file is green; a red file stays
+# here until its cause is fixed.
 DEFERRED_FROM_GATE = frozenset(
     {
-        "test_anomaly_penalty.py",
-        "test_anomaly_thresholds_cache.py",
-        "test_api_coverage.py",
-        "test_batch_apply_scores.py",
-        "test_build_desktop_runtime.py",
-        "test_default_device_override.py",
-        "test_detection_florence.py",
-        "test_detection_model.py",
-        "test_docker_windows_host_paths.py",
-        "test_face_detection_extreme_aspect_ratio.py",
-        "test_face_extraction_speed.py",
-        "test_full_pipeline.py",
-        "test_gfs_snapshot_schedule.py",
-        "test_guest_scoring.py",
-        "test_image_plugins_api.py",
-        "test_impossible_clear.py",
-        "test_impossible_filter.py",
-        "test_insightface_model_pack.py",
-        "test_justified_thumbnails.py",
-        "test_near_neighbor.py",
-        "test_person_tags.py",
-        "test_predicate_filter.py",
-        "test_quality_task_shutdown.py",
-        "test_reference_folder_listing_count_parity.py",
-        "test_reference_folder_sidecars.py",
-        "test_server_external_listener.py",
-        "test_server_simple.py",
+        # Intermittent ImportError (2 of 4 local runs): the search route's
+        # sentence_transformers load and EmbedPreload's open_clip import both
+        # lazily import accelerate on different threads. Production defect,
+        # not a test defect; gate the file once the first imports are serialised.
+        "test_scrapheap_scope_params.py",
+        # Red in CI run 45564843727 block 5 (fixed: _prepare_for_scoring now
+        # settles the planner). Still not gated: one whole-file run on a loaded
+        # machine failed test_full_backfill_emits_once_at_drain_not_per_batch,
+        # with the assertion lost to a timeout; not yet reproduced or explained.
         "test_smart_score_invalidation.py",
-        "test_snapshot_compression.py",
-        "test_stack_position_invariant.py",
-        "test_startup_banner_encoding.py",
-        "test_stats_api.py",
-        "test_tag_health_api.py",
-        "test_tag_predictions_api.py",
-        "test_tag_suggestions_api.py",
-        "test_tagger_runs_api.py",
-        "test_user_settings_tagger_settings.py",
     }
 )
 
@@ -945,7 +921,7 @@ def test_shards_partition_the_collected_suite():
 
     def collect(*extra: str) -> list[str]:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "--collect-only", "-q", *targets, *extra],
+            [*_PYTEST, "--collect-only", "-q", *targets, *extra],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -1037,7 +1013,7 @@ def test_block_shards_partition_the_collected_suite():
 
     def collect(*extra: str) -> list[str]:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "--collect-only", "-q", *targets, *extra],
+            [*_PYTEST, "--collect-only", "-q", *targets, *extra],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -1078,9 +1054,7 @@ def test_shard_modes_are_mutually_exclusive():
     """
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "pytest",
+            *_PYTEST,
             "--collect-only",
             "-q",
             str(TESTS_DIR / "test_scope_table.py"),
@@ -1572,7 +1546,7 @@ def test_test_time_budget_annotates_without_failing_the_run(tmp_path):
     )
     summary = tmp_path / "step-summary.md"
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", target, "--ci-shard=1/100000000"],
+        [*_PYTEST, "-q", target, "--ci-shard=1/100000000"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -1696,9 +1670,7 @@ def test_shard_selection_is_reproducible_across_processes():
     def collect() -> list[str]:
         result = subprocess.run(
             [
-                sys.executable,
-                "-m",
-                "pytest",
+                *_PYTEST,
                 "--collect-only",
                 "-q",
                 *targets,
@@ -1746,9 +1718,7 @@ def test_invalid_shard_spec_is_rejected(option, spec):
     """
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "pytest",
+            *_PYTEST,
             "--collect-only",
             "-q",
             str(TESTS_DIR / "test_scope_table.py"),
