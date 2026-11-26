@@ -5448,11 +5448,16 @@ checking the string the caller sent lets `~/link-to-etc` through — and `POST
 /libraries` then writes a database into whatever folder that names. The
 sibling that gets this right is `validate_reference_folder_accessible`, which
 realpaths first; `_safe_folder` follows it, not `GET /filesystem/browse`'s
-ordering. A relative path is refused explicitly before resolution, because
-`resolve_path` calls `abspath` and would otherwise resolve it against the
-*server's* working directory. `filesystem_roots` is honoured for the same reason
-`POST /filesystem/folders` honours it: an operator who confined the picker did
-not mean "except for the route that can write a vault anywhere".
+ordering. Resolving does not settle a Windows namespace prefix: `realpath`
+keeps a `\\?\` the caller wrote, so `\\?\C:\Windows` would match no entry. The
+blocklist, `canonical_path`, `path_is_within` and the hub's two library overlap
+checks therefore compare `path_utils.plain_spelling`, which drops a `\\?\`,
+`\\.\` or `\??\` prefix in front of a drive or a share; a volume GUID path has no plain
+spelling and is compared as given. A relative path is refused explicitly before
+resolution, because `resolve_path` calls `abspath` and would otherwise resolve
+it against the *server's* working directory. `filesystem_roots` is honoured for
+the same reason `POST /filesystem/folders` honours it: an operator who confined
+the picker did not mean "except for the route that can write a vault anywhere".
 
 `POST /libraries` **re-inspects the path itself** rather than trusting the
 picker's answer, so a folder that became covered in between is still refused —

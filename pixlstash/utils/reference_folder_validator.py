@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from sqlmodel import select
 
 from pixlstash.db_models.reference_folder import ReferenceFolder
+from pixlstash.utils.path_utils import plain_spelling
 
 if TYPE_CHECKING:
     from sqlmodel import Session
@@ -106,8 +107,9 @@ def validate_reference_folder_path(path: str) -> str | None:
     # resolution belongs here rather than at each call site, which is how seven
     # of them came to be missing it. `realpath` never raises: an unmounted or
     # not-yet-created path resolves as far as it exists, which keeps the Docker
-    # pending-mount callers working.
-    norm = os.path.normcase(os.path.realpath(os.path.normpath(path)))
+    # pending-mount callers working. Compared by its plain spelling, because a
+    # `\\?\` prefix the caller wrote survives realpath and matches no entry.
+    norm = os.path.normcase(plain_spelling(os.path.realpath(os.path.normpath(path))))
 
     for alias in _RESOLVED_ALIASES:
         alias_norm = os.path.normcase(os.path.normpath(alias))
@@ -136,13 +138,14 @@ def canonical_path(path: str) -> str:
     registered root - the overlap this function exists to catch, reached by
     spelling instead of by symlink. It is identity on POSIX, so the gate cannot
     see the difference, which is exactly why it is applied unconditionally
-    rather than per-platform.
+    rather than per-platform. ``plain_spelling`` drops a ``\\\\?\\`` prefix for
+    the same reason: ``\\\\?\\C:\\Photos`` is ``C:\\Photos`` spelled another way.
 
     Comparison only. The value is never stored or shown: a row keeps the real
     case so the scan walks the directory the owner named, and every refusal
     message quotes the caller's own spelling.
     """
-    return os.path.normcase(os.path.realpath(os.path.normpath(path)))
+    return os.path.normcase(plain_spelling(os.path.realpath(os.path.normpath(path))))
 
 
 def data_folder_conflict_detail(

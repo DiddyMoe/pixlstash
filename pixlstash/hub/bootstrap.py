@@ -25,6 +25,7 @@ from typing import Callable, Optional
 from pixlstash.hub.db import HubDatabase, default_hub_path
 from pixlstash.hub.engine import HubEngine
 from pixlstash.utils.media_files import has_media_files
+from pixlstash.utils.path_utils import plain_spelling
 from pixlstash.utils.sqlite_uri import sqlite_file_uri
 from pixlstash.hub.registry import (
     Library,
@@ -830,7 +831,7 @@ def _same_folder_key(path: str) -> str:
     missing ``Photos/Lib`` and a typed ``photos/lib`` must still read as one
     folder on Windows and macOS.
     """
-    path = os.path.normcase(os.path.normpath(path))
+    path = os.path.normcase(plain_spelling(os.path.normpath(path)))
     return path.casefold() if sys.platform == "darwin" else path
 
 

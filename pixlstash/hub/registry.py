@@ -32,6 +32,7 @@ from pixlstash.hub.db import HubDatabase
 from pixlstash.startup_permissions import mkdir_private
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.links import is_link_or_missing
+from pixlstash.utils.path_utils import plain_spelling
 from pixlstash.utils.sqlite_uri import sqlite_file_uri
 
 logger = get_logger(__name__)
@@ -1517,6 +1518,7 @@ class LibraryRegistry:
 
 def _is_within(inner: str, outer: str) -> bool:
     """True when *inner* is *outer* itself or a path below it."""
+    inner, outer = plain_spelling(inner), plain_spelling(outer)
     try:
         return os.path.commonpath([inner, outer]) == outer
     except ValueError:

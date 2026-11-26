@@ -18,9 +18,11 @@ refusal presents to a desktop user as their pictures failing to load.
 """
 
 import json
+import ntpath
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -29,6 +31,8 @@ from sqlmodel import delete, select
 from pixlstash.db_models import Picture
 from pixlstash.db_models.reference_folder import ReferenceFolder, ReferenceFolderStatus
 from pixlstash.db_models.snapshot import Snapshot
+from pixlstash.hub import bootstrap, registry
+from pixlstash.hub.registry import LibraryOverlapError, LibraryRegistry
 from pixlstash.server import Server
 from pixlstash.services.operation_log_service import apply_orientation
 from pixlstash.services.scrapheap_service import (
@@ -39,7 +43,8 @@ from pixlstash.utils.path_utils import LibraryRootsUnavailable
 from pixlstash.utils.caption_file_utils import SIDECAR_TYPE_TAGS, writeback_path
 from pixlstash.utils.image_processing.orientation import read_orientation
 from pixlstash.utils.media_files import has_hidden_component
-from pixlstash.utils.path_utils import path_is_within, real_path
+from pixlstash.utils import path_utils, reference_folder_validator
+from pixlstash.utils.path_utils import path_is_within, plain_spelling, real_path
 from pixlstash.utils.reference_folder_validator import (
     canonical_path,
     validate_reference_folder_path,
@@ -334,6 +339,163 @@ def test_canonical_path_folds_case_where_the_filesystem_does(tmp_path, monkeypat
     monkeypatch.setattr(reference_folder_validator, "os", _CaseFoldingOs())
 
     assert canonical_path(str(real)) == canonical_path(shouted)
+
+
+class _PatchedNtPath:
+    """``ntpath`` with its ``realpath`` replaced; everything else falls through."""
+
+    def __init__(self, realpath):
+        self.realpath = realpath
+
+    def __getattr__(self, attr):
+        return getattr(ntpath, attr)
+
+
+class _WindowsOs:
+    r"""``os`` as it is on Windows, for the modules that compare paths.
+
+    Swapped in for each module's own ``os`` name, for the reason
+    :class:`_CaseFoldingOs` gives. On POSIX ``ntpath.realpath`` is ``abspath``
+    and resolves nothing, so a prefix the caller wrote reaches the comparison
+    as Windows' ``realpath`` leaves it: Windows keeps a ``\\?\`` it was given.
+    """
+
+    name = "nt"
+    path = ntpath
+    sep = "\\"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+
+@pytest.fixture
+def windows_paths(monkeypatch):
+    """The comparing modules on Windows path rules, with the Windows blocklist."""
+    for module in (path_utils, reference_folder_validator, registry, bootstrap):
+        monkeypatch.setattr(module, "os", _WindowsOs())
+    monkeypatch.setattr(
+        reference_folder_validator,
+        "_get_blocklist",
+        lambda: reference_folder_validator._WINDOWS_BLOCKLIST,
+    )
+
+
+@pytest.mark.parametrize(
+    "given, expected",
+    [
+        (_EXTENDED + "C:\\a", "C:\\a"),
+        ("\\\\.\\C:\\a", "C:\\a"),
+        (_EXTENDED + "unc\\host\\share\\a", "\\\\host\\share\\a"),
+        # No plain spelling exists for these, so they are compared as given.
+        (_EXTENDED + "Volume{0}\\a", _EXTENDED + "Volume{0}\\a"),
+        ("\\\\.\\pipe\\x", "\\\\.\\pipe\\x"),
+    ],
+    ids=["drive", "device-drive", "share", "volume-guid", "pipe"],
+)
+def test_plain_spelling_drops_a_namespace_prefix_only_where_one_exists(
+    given, expected, monkeypatch
+):
+    """Wrong if a prefixed drive or share keeps its prefix, or if a path with
+    no plain spelling is rewritten into one it does not have."""
+    monkeypatch.setattr(path_utils, "os", _WindowsOs())
+    assert plain_spelling(given) == expected
+
+
+def test_plain_spelling_leaves_a_posix_path_alone():
+    """Only Windows reads the prefix: ``//?/C:/a`` is an ordinary POSIX path."""
+    if os.name == "nt":
+        pytest.skip("asserts the POSIX branch")
+    assert plain_spelling("//?/C:/a") == "//?/C:/a"
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        _EXTENDED + "C:\\Windows\\System32",
+        "//?/C:/Windows/System32",
+        "\\\\.\\c:\\program files\\App",
+        "\\??\\C:\\Windows\\System32",
+    ],
+    ids=["extended", "extended-slashes", "device-lowercase", "nt-object"],
+)
+def test_windows_blocklist_refuses_a_system_folder_spelled_with_a_prefix(
+    given, windows_paths
+):
+    r"""Wrong if ``\\?\C:\Windows`` passes: it is ``C:\Windows``, and the
+    route behind the check goes on to scan or write there."""
+    assert validate_reference_folder_path(given) is not None
+
+
+def test_windows_blocklist_still_accepts_an_ordinary_prefixed_folder(windows_paths):
+    """A prefix is not itself a refusal, and dropping it must not turn a
+    sibling of an entry into a match."""
+    assert validate_reference_folder_path(_EXTENDED + "C:\\Pictures") is None
+    assert validate_reference_folder_path(_EXTENDED + "C:\\Windowsill") is None
+
+
+def test_path_is_within_reads_a_prefixed_spelling_as_the_folder(windows_paths):
+    r"""Wrong if ``\\?\C:\lib\x`` reads as outside ``C:\lib``: the overlap
+    refusal for a watch or reference folder then answers no."""
+    assert path_is_within(_EXTENDED + "C:\\lib\\x", "C:\\lib")
+    assert path_is_within("C:\\lib\\x", _EXTENDED + "C:\\lib")
+    assert not path_is_within(_EXTENDED + "C:\\libx", "C:\\lib")
+    assert not path_is_within(_EXTENDED + "D:\\lib\\x", "C:\\lib")
+
+
+def test_path_is_within_compares_a_resolved_path_raced_twice_plainly(
+    windows_paths, monkeypatch
+):
+    r"""The resolved check, reached only when the lexical one says no.
+
+    ``C:\link`` is a junction to ``C:\lib``, and a folder made under it while
+    ``realpath`` ran, twice, leaves the resolved path prefixed. Wrong if that
+    reads as outside the root.
+    """
+
+    def _junction_raced(path):
+        resolved = ntpath.normpath(path).replace("link", "lib")
+        if resolved.endswith("\\x"):
+            return _EXTENDED + resolved
+        return resolved
+
+    monkeypatch.setattr(_WindowsOs, "path", _PatchedNtPath(_junction_raced))
+    assert path_is_within("C:\\link\\x", "C:\\lib")
+    assert not path_is_within("C:\\link\\x", "C:\\other")
+
+
+def test_canonical_path_compares_a_prefixed_spelling_equal(windows_paths):
+    r"""Wrong if ``\\?\C:\Photos`` and ``C:\Photos`` compare unequal: a second
+    reference folder over the same files is then accepted as free."""
+    assert canonical_path(_EXTENDED + "C:\\Photos") == canonical_path("C:\\Photos")
+    assert canonical_path(_EXTENDED + "C:\\Photos") != canonical_path("C:\\Photo")
+
+
+def test_a_prefixed_library_folder_overlapping_a_watch_folder_is_refused(
+    windows_paths, monkeypatch
+):
+    r"""Wrong if a library at ``\\?\C:\watch\lib`` is accepted under the watch
+    folder ``C:\watch``: the watch folder then imports, and may delete, its
+    pictures."""
+    monkeypatch.setattr(registry, "read_vault_folder_roots", lambda _: ["C:\\watch"])
+    hub = SimpleNamespace(
+        list_libraries=lambda include_detached: [
+            SimpleNamespace(name="Main", path="C:\\main")
+        ]
+    )
+    with pytest.raises(LibraryOverlapError):
+        LibraryRegistry.refuse_overlapping_watch_or_reference_folder(
+            hub, _EXTENDED + "C:\\watch\\lib"
+        )
+    LibraryRegistry.refuse_overlapping_watch_or_reference_folder(
+        hub, _EXTENDED + "C:\\watchers"
+    )
+
+
+def test_a_prefixed_replacement_folder_overlapping_a_library_is_seen(windows_paths):
+    r"""Wrong if ``\\?\C:\lib\new`` reads as clear of ``C:\lib``: a new library
+    there would shadow the missing one when its drive comes back."""
+    assert bootstrap._folders_overlap(_EXTENDED + "C:\\lib\\new", "C:\\lib")
+    assert not bootstrap._folders_overlap(_EXTENDED + "C:\\libx", "C:\\lib")
 
 
 # ---------------------------------------------------------------------------
