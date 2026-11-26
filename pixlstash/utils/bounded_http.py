@@ -16,11 +16,13 @@ the deadline. The body is asked for, and read, undecoded
 import functools
 import http.client
 import io
+import ipaddress
 import json as jsonlib
 import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -38,6 +40,10 @@ class ResponseTooLarge(requests.RequestException):
 
 class ReadDeadlineExceeded(requests.Timeout):
     """The answer was still arriving when the caller's deadline passed."""
+
+
+class RedirectRefused(requests.RequestException):
+    """A redirect led somewhere :func:`vet_redirect_target` does not allow."""
 
 
 class _DeadlinePassed(TimeoutError):
@@ -208,6 +214,124 @@ class HandRedirectSession(requests.Session):
 
     def resolve_redirects(self, resp, req, *args, **kwargs):
         return iter(())
+
+
+def _wire_url(url: str) -> str:
+    """*url* as ``requests`` sends it: a non-ASCII host in its ``xn--`` form,
+    the escapes requoted.
+
+    Raises:
+        requests.RequestException: ``requests`` would not send *url*.
+    """
+    prepared = requests.PreparedRequest()
+    prepared.prepare_url(url, None)
+    return prepared.url or ""
+
+
+def _is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Global (not loopback, private, link-local, shared, documentation or
+    unspecified) and not multicast: ``is_global`` alone admits multicast."""
+    return address.is_global and not address.is_multicast
+
+
+def vet_redirect_target(current_url: str, location: str) -> str:
+    """The absolute URL a redirect from *current_url* to *location* leads to,
+    once checked: https, a host and no user name, and every address the host
+    resolves to public (:func:`_is_public`).
+
+    The scheme, host and user name are read as ``requests`` will send them
+    (:func:`_wire_url`), so the host checked is the host asked: ``urlsplit``
+    reads ``https://10.0.0.1\\@example.com/`` as ``example.com`` where
+    ``requests`` asks ``10.0.0.1``. A user name either parse finds is refused.
+    The request resolves the host again when it connects, so a name that
+    answers with another address the second time is not caught here;
+    :func:`get_vetted` checks the address it connects to.
+
+    Raises:
+        RedirectRefused: a check failed. The message names only the host.
+    """
+    target = urljoin(current_url, location.strip())
+    plain = "The redirect named no plain host, so it was not followed."
+    try:
+        wire = urlsplit(_wire_url(target))
+        raw = urlsplit(target)
+    except (requests.RequestException, ValueError) as exc:
+        raise RedirectRefused(plain) from exc
+    host = wire.hostname or ""
+    if wire.scheme != "https":
+        raise RedirectRefused(
+            f"The redirect to {host or 'an unnamed host'} is not https, "
+            "so it was not followed."
+        )
+    named_user = any(
+        part is not None
+        for part in (wire.username, wire.password, raw.username, raw.password)
+    )
+    if not host or named_user:
+        raise RedirectRefused(plain)
+    try:
+        infos = socket.getaddrinfo(host, wire.port or 443, type=socket.SOCK_STREAM)
+    except (OSError, ValueError) as exc:
+        raise RedirectRefused(
+            f"The redirect to {host} could not be resolved, so it was not followed."
+        ) from exc
+    for info in infos:
+        if not _is_public(ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])):
+            raise RedirectRefused(
+                f"The redirect to {host} leads to a private or local address, "
+                "so it was not followed."
+            )
+    return target
+
+
+class _PrivatePeer(Exception):
+    """A connect reached an address :func:`_is_public` refuses. Not an
+    ``OSError``, as :class:`RedirectRefused` is: urllib3 and requests would
+    turn that into a ``ConnectionError``, and they pass this up unchanged."""
+
+
+def _public_peer_pool(pool_cls: type) -> type:
+    """*pool_cls* with connections that close and raise :class:`_PrivatePeer`
+    when the address connected to is not public."""
+
+    class _Connection(pool_cls.ConnectionCls):
+        def _new_conn(self):
+            sock = super()._new_conn()
+            peer = ipaddress.ip_address(str(sock.getpeername()[0]).split("%", 1)[0])
+            if not _is_public(peer):
+                sock.close()
+                raise _PrivatePeer(self.host)
+            return sock
+
+    class _Pool(pool_cls):
+        ConnectionCls = _Connection
+
+    return _Pool
+
+
+def get_vetted(url: str, **kwargs) -> requests.Response:
+    """``requests.get(url, **kwargs)`` for a URL :func:`vet_redirect_target`
+    passed, refused when the address it connects to is not public: the vet
+    and the connect each resolve the host, and the answers can differ.
+
+    A connection through a proxy reaches the proxy, so it is not checked.
+
+    Raises:
+        RedirectRefused: the address connected to is private or local.
+    """
+    adapter = HTTPAdapter()
+    # The direct pools only: a proxy manager's peer is the proxy.
+    _wrap_pools(adapter.poolmanager, _public_peer_pool)
+    try:
+        with requests.Session() as session:
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            return session.get(url, **kwargs)
+    except _PrivatePeer as exc:
+        raise RedirectRefused(
+            f"The redirect to {exc.args[0]} leads to a private or local address, "
+            "so it was not followed."
+        ) from exc
 
 
 def _receive(response: requests.Response, url: str, end: float) -> bytes:

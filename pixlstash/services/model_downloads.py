@@ -50,7 +50,7 @@ import time
 import uuid
 from functools import lru_cache
 from typing import Callable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import requests
 
@@ -72,6 +72,7 @@ from pixlstash.services.model_mover import (
     require_space,
 )
 from pixlstash.utils.adapter_header import folder_name_role
+from pixlstash.utils.bounded_http import get_vetted, vet_redirect_target
 from pixlstash.utils.path_utils import resolve_path_within
 
 logger = get_logger(__name__)
@@ -556,19 +557,6 @@ def model_page(url: str) -> Optional[str]:
     return f"https://{parsed.netloc}{repo}" if sep and repo.count("/") >= 2 else None
 
 
-def _left_https(url: str, response) -> bool:
-    """Whether an https link was redirected onto plain http at any hop.
-
-    The list's links are https. A plain hop in the middle of the chain lets
-    anyone on that network point the rest of it somewhere else, so every hop
-    counts, not only where it ended.
-    """
-    hops = [hop.url for hop in response.history] + [response.url]
-    return url.startswith("https://") and not all(
-        hop.startswith("https://") for hop in hops
-    )
-
-
 def _live_hop(url: str) -> bool:
     """Whether a live link may be asked at *url*: https on Hugging Face."""
     parsed = urlparse(url)
@@ -583,28 +571,32 @@ def _live_hop(url: str) -> bool:
 
 
 def _open(url: str, live: bool) -> requests.Response:
-    """GET *url* as a stream; for a *live* link, redirects followed by hand,
-    each hop's host checked (:func:`_live_hop`) before it is asked."""
+    """GET *url* as a stream, redirects followed by hand: each hop must be
+    public https (:func:`vet_redirect_target`), and for a *live* link on
+    Hugging Face (:func:`_live_hop`), before it is asked, and must connect to
+    a public address (:func:`get_vetted`)."""
     kwargs = {
         "stream": True,
         "timeout": _TIMEOUT_SECONDS,
+        "allow_redirects": False,
         # Content-Length counts the bytes sent and requests decodes what it
         # is sent, so a compressed body would outgrow the space checked for it.
         "headers": {"User-Agent": "PixlStash", "Accept-Encoding": "identity"},
     }
-    if not live:
-        return requests.get(url, **kwargs)
-    for _hop in range(_MAX_HOPS):
-        if not _live_hop(url):
+    for hop in range(_MAX_HOPS):
+        if live and not _live_hop(url):
             raise ValueError(
                 f"The link led to {urlparse(url).netloc or url}, which is not "
                 "Hugging Face, so it was not followed."
             )
-        response = requests.get(url, allow_redirects=False, **kwargs)
+        # The first link is the caller's own; only a hop a server named is
+        # vetted.
+        response = (get_vetted if hop else requests.get)(url, **kwargs)
         if not response.is_redirect:
             return response
-        url = urljoin(url, response.headers.get("Location", ""))
+        location = response.headers.get("Location", "")
         response.close()
+        url = vet_redirect_target(url, location)
     raise ValueError(f"The link redirected more than {_MAX_HOPS} times.")
 
 
@@ -631,8 +623,6 @@ def _fetch(
                 "PixlStash picks it up from there."
             )
         response.raise_for_status()
-        if _left_https(url, response):
-            raise ValueError("The download was redirected away from https.")
         if response.headers.get("Content-Encoding", "identity") != "identity":
             raise ValueError(
                 "The link sent the file compressed, so its size cannot be checked."

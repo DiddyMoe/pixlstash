@@ -6,6 +6,7 @@ server will not: dribble its status line or headers, or send without end.
 
 import contextlib
 import gzip
+import ipaddress
 import socket
 import threading
 import time
@@ -18,13 +19,18 @@ from pixlstash.services import (
     comfyui_service,
     comfyui_templates,
 )
+from pixlstash.utils import bounded_http
 from pixlstash.utils.bounded_http import (
     ERROR_BODY_BYTES,
     ReadDeadlineExceeded,
+    RedirectRefused,
     ResponseTooLarge,
     bounded_get,
     bounded_request,
+    get_vetted,
+    vet_redirect_target,
 )
+from tests.network_vectors import PRIVATE_10_IPV4
 
 NO_PROXY = {"http": None, "https": None, "all": None}
 
@@ -337,3 +343,70 @@ def test_the_comfyui_probe_reads_a_dribbled_answer_as_no_answer():
         result = comfyui_service.probe_comfyui(peer.url, timeout=0.5)
         assert result["reachable"] is False
         assert "did not answer within 0.5 seconds" in result["detail"]
+
+
+def _resolves_to(monkeypatch, address):
+    """Every host name resolves to *address*, without asking DNS; an address
+    literal resolves to itself."""
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        try:
+            found = str(ipaddress.ip_address(host))
+        except ValueError:
+            found = address
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (found, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://127.0.0.1/x",
+        "https://10.0.0.1/x",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://224.0.0.1/x",
+        "https://[::ffff:127.0.0.1]/x",
+        "https://2130706433/x",
+        "https://0x7f.1/x",
+        "http://8.8.8.8/x",
+        "https://user@8.8.8.8/x",
+        # urlsplit reads this host as 8.8.8.8; requests asks 10.0.0.1 instead.
+        "https://10.0.0.1\\@8.8.8.8/x",
+    ],
+)
+def test_a_redirect_off_public_https_is_refused(location):
+    with pytest.raises(RedirectRefused):
+        vet_redirect_target("https://example.com/a", location)
+
+
+def test_a_redirect_to_a_name_with_a_private_address_is_refused(monkeypatch):
+    _resolves_to(monkeypatch, PRIVATE_10_IPV4)
+    with pytest.raises(RedirectRefused, match="cdn.example.com"):
+        vet_redirect_target("https://example.com/a", "https://cdn.example.com/x")
+
+
+def test_a_redirect_is_judged_by_the_host_requests_will_ask(monkeypatch):
+    """urlsplit reads the host as ``10.0.0.1\\.example.com``, a name;
+    requests asks 10.0.0.1 instead."""
+    _resolves_to(monkeypatch, "8.8.8.8")
+    with pytest.raises(RedirectRefused, match="private"):
+        vet_redirect_target("https://example.com/a", "https://10.0.0.1\\.example.com/x")
+
+
+def test_a_redirect_to_public_https_is_followed(monkeypatch):
+    _resolves_to(monkeypatch, "8.8.8.8")
+    assert (
+        vet_redirect_target("https://example.com/a", "https://cdn.example.com/x")
+        == "https://cdn.example.com/x"
+    )
+    assert vet_redirect_target("https://8.8.8.8/a/b", "c") == "https://8.8.8.8/a/c"
+
+
+def test_a_vetted_hop_whose_peer_is_public_is_answered(monkeypatch):
+    """Loopback stands in for a public peer, as no test reaches one."""
+    monkeypatch.setattr(bounded_http, "_is_public", lambda address: True)
+    ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+    with _Peer(lambda conn, _: conn.sendall(ok)) as peer:
+        response = get_vetted(f"{peer.url}/x", timeout=5, proxies=NO_PROXY)
+    assert response.content == b"ok"

@@ -1,0 +1,1 @@
+- Fixed: a model download is no longer redirected to a private network address.

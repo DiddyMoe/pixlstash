@@ -1,3 +1,4 @@
+import io
 import os
 import shutil
 import threading
@@ -18,6 +19,7 @@ from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
 from pixlstash.tasks.task_outcome import Outcome, Reason
 from pixlstash.utils.image_processing.media_load import LoadFailure
 from pixlstash.vault import Vault
+from tests.test_model_downloads import serve_bytes
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
 
@@ -633,6 +635,52 @@ def test_a_scorer_failure_keeps_the_embedding_and_retries_the_score(
     for pid in pids:
         embedding, score = _stored(shared_vault, pid)
         assert embedding is not None and score is None
+
+
+def _scorer_bytes() -> bytes:
+    buffer = io.BytesIO()
+    torch.save(torch.nn.Linear(4, 1).state_dict(), buffer)
+    return buffer.getvalue()
+
+
+def _point_the_scorer_at(monkeypatch, url, path):
+    """The aesthetic scorer is looked for at *path* and downloaded from *url*."""
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_model", None)
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_disabled", False)
+    monkeypatch.setattr(
+        ImageEmbeddingTask,
+        "AESTHETIC_SUPPORTED_CLIP",
+        {embedding_module.CLIP_MODEL_NAME},
+    )
+    monkeypatch.setattr(
+        ImageEmbeddingTask,
+        "_aesthetic_config",
+        classmethod(lambda cls: {"url": url, "path": str(path), "dim": 4}),
+    )
+
+
+def test_the_scorer_download_lands_and_loads(monkeypatch, tmp_path):
+    path = tmp_path / "scorer.pth"
+    with serve_bytes(_scorer_bytes()) as url:
+        _point_the_scorer_at(monkeypatch, url, path)
+        ImageEmbeddingTask(database=None, clip_workflow=None, batch=[])._ensure_model()
+    assert path.is_file()
+    assert ImageEmbeddingTask._aesthetic_model is not None
+
+
+def test_the_scorer_download_follows_no_redirect_off_https(monkeypatch, tmp_path):
+    """Wrong if the http:// address the redirect names is asked, or a file
+    is saved."""
+    asked = []
+    path = tmp_path / "scorer.pth"
+    with serve_bytes(_scorer_bytes(), asked=asked) as plain:
+        with serve_bytes(b"", status=302, headers={"Location": plain}) as url:
+            _point_the_scorer_at(monkeypatch, url, path)
+            ImageEmbeddingTask(
+                database=None, clip_workflow=None, batch=[]
+            )._ensure_model()
+    assert asked == []
+    assert not path.exists()
 
 
 def test_a_picture_whose_row_is_gone_is_not_reported_done(shared_vault, no_scorer):

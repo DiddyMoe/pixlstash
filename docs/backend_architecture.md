@@ -12466,9 +12466,10 @@ an address of its choosing.
   would resolve outside the folder, is already there, or is already being
   downloaded. Bytes stream to `<name>.pixlstash-partial`, SHA-256'd on the way
   in; a `text/html` answer (a login page), a response with no
-  `Content-Length` (no space check is possible) and a redirect from https to
-  http fail at once, and a body short of its `Content-Length` is raised by
-  urllib3. Then, under `SHELF_IO_LOCK`
+  `Content-Length` (no space check is possible) and a redirect to anything
+  but https on a public address (every address its host resolves to is
+  checked before it is asked, `vet_redirect_target`) fail at once, and a body
+  short of its `Content-Length` is raised by urllib3. Then, under `SHELF_IO_LOCK`
   (waited for, since the bytes are already here), `publish_no_clobber` and
   `register_file` with that digest; bytes the scanner cannot read as a model
   are removed again, and so is a published file the hub refuses to register
