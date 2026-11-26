@@ -1,5 +1,4 @@
 import math
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -7,13 +6,14 @@ from typing import TYPE_CHECKING
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.resources import cuda_checkpoint
-from pixlstash.task_runner import TaskCancelledError
+from pixlstash.task_runner import TaskCancelledError, TaskRunnerStopped
 from pixlstash.tasks.task_outcome import (
     LOG_ID_LIMIT,
     OutcomeSummary,
     id_sample,
     read_outcomes,
 )
+from pixlstash.utils.model_utils import loaded_module
 
 if TYPE_CHECKING:
     from pixlstash.tasks.task_type import TaskType
@@ -64,7 +64,8 @@ class _PassStats:
 
 
 class _PlannerStopping(Exception):
-    """Raised inside a finder's turn when shutdown began part-way through it.
+    """Raised inside a finder's turn when shutdown began part-way through it,
+    or when the task runner has stopped and no finder could submit anyway.
 
     Distinguishes "abandon the whole cycle" from the finder failures the cycle
     is meant to survive, which are logged and skipped so the sweep continues.
@@ -80,6 +81,10 @@ class WorkPlanner:
     # How long stop() waits for the loop thread, and how long start() waits for
     # a previous thread that is still winding down.
     STOP_JOIN_TIMEOUT_S = 5.0
+    # How often the loop has the task runner replace a worker that died. Not
+    # every refill tick (50 ms): a worker that dies the moment it starts is
+    # restarted, and logged, at most this often.
+    LANE_REPAIR_INTERVAL_S = 5.0
 
     @staticmethod
     def work_finders(
@@ -90,6 +95,11 @@ class WorkPlanner:
         notifier=None,
     ):
         from pixlstash.tasks import TaskType
+        from pixlstash.tasks.dedup_scan_finder import DedupScanFinder
+        from pixlstash.tasks.layout_move_finder import LayoutMoveFinder
+        from pixlstash.tasks.missing_comfyui_extraction_finder import (
+            MissingComfyUIExtractionFinder,
+        )
         from pixlstash.tasks.missing_description_finder import MissingDescriptionFinder
         from pixlstash.tasks.missing_face_extraction_finder import (
             MissingFaceExtractionFinder,
@@ -97,51 +107,45 @@ class WorkPlanner:
         from pixlstash.tasks.missing_face_model_refresh_finder import (
             MissingFaceModelRefreshFinder,
         )
+        from pixlstash.tasks.missing_file_purge_finder import MissingFilePurgeFinder
         from pixlstash.tasks.missing_image_embedding_finder import (
             MissingImageEmbeddingFinder,
         )
+        from pixlstash.tasks.missing_likeness_finder import MissingLikenessFinder
         from pixlstash.tasks.missing_likeness_parameters_finder import (
             MissingLikenessParametersFinder,
         )
-        from pixlstash.tasks.missing_likeness_finder import MissingLikenessFinder
+        from pixlstash.tasks.missing_ocr_finder import MissingOcrFinder
+        from pixlstash.tasks.missing_orientation_finder import MissingOrientationFinder
+        from pixlstash.tasks.missing_pixel_sha_finder import MissingPixelShaFinder
+        from pixlstash.tasks.missing_prompt_match_finder import (
+            MissingPromptMatchFinder,
+        )
         from pixlstash.tasks.missing_quality_finder import MissingQualityFinder
-        from pixlstash.tasks.missing_text_embedding_finder import (
-            MissingTextEmbeddingFinder,
+        from pixlstash.tasks.missing_snapshot_identity_scrub_finder import (
+            MissingSnapshotIdentityScrubFinder,
+        )
+        from pixlstash.tasks.missing_source_face_likeness_finder import (
+            MissingSourceFaceLikenessCharacterFinder,
+        )
+        from pixlstash.tasks.missing_stack_cohesion_finder import (
+            MissingStackCohesionFinder,
         )
         from pixlstash.tasks.missing_tag_finder import MissingTagFinder
         from pixlstash.tasks.missing_tag_prediction_finder import (
             MissingTagPredictionFinder,
         )
+        from pixlstash.tasks.missing_text_embedding_finder import (
+            MissingTextEmbeddingFinder,
+        )
+        from pixlstash.tasks.missing_text_score_finder import MissingTextScoreFinder
+        from pixlstash.tasks.missing_thumbnail_finder import MissingThumbnailFinder
         from pixlstash.tasks.missing_watch_folder_import_finder import (
             MissingWatchFolderImportFinder,
-        )
-        from pixlstash.tasks.missing_comfyui_extraction_finder import (
-            MissingComfyUIExtractionFinder,
-        )
-        from pixlstash.tasks.missing_source_face_likeness_finder import (
-            MissingSourceFaceLikenessCharacterFinder,
-        )
-        from pixlstash.tasks.missing_file_purge_finder import MissingFilePurgeFinder
-        from pixlstash.tasks.missing_snapshot_identity_scrub_finder import (
-            MissingSnapshotIdentityScrubFinder,
         )
         from pixlstash.tasks.reference_folder_scan_finder import (
             ReferenceFolderScanFinder,
         )
-        from pixlstash.tasks.missing_text_score_finder import MissingTextScoreFinder
-        from pixlstash.tasks.missing_prompt_match_finder import (
-            MissingPromptMatchFinder,
-        )
-        from pixlstash.tasks.missing_ocr_finder import MissingOcrFinder
-        from pixlstash.tasks.missing_thumbnail_finder import MissingThumbnailFinder
-        from pixlstash.tasks.missing_pixel_sha_finder import MissingPixelShaFinder
-        from pixlstash.tasks.missing_orientation_finder import MissingOrientationFinder
-        from pixlstash.tasks.dedup_scan_finder import DedupScanFinder
-        from pixlstash.tasks.missing_stack_cohesion_finder import (
-            MissingStackCohesionFinder,
-        )
-        from pixlstash.tasks.layout_move_finder import LayoutMoveFinder
-
         from pixlstash.utils.path_mapper import PathMapper
 
         effective_path_mapper = path_mapper if path_mapper is not None else PathMapper()
@@ -269,6 +273,12 @@ class WorkPlanner:
         self._thread = None
 
         self._interval_s = self.MIN_INTERVAL_S
+        self._next_lane_repair_at = 0.0
+        # Lane repairs that have failed in a row, and the exception type of the
+        # last one: only the first and a change of kind are logged at warning,
+        # and the recovery says how many there were (``_repair_dead_lanes``).
+        self._lane_repair_failures = 0
+        self._lane_repair_failure_type: type[BaseException] | None = None
         self._finder_order_idx = 0
         self._inflight_by_finder = {}
         self._finder_by_task_id = {}
@@ -485,7 +495,12 @@ class WorkPlanner:
         while not self._stop.is_set():
             held_for = self._held_for()
             if held_for > 0:
-                self._wake.wait(held_for)
+                # A hold keeps finders from submitting; it does not stop the
+                # lanes needing repair. A worker that dies while the planner is
+                # held, with work already queued behind it, would otherwise wait
+                # out the hold (up to a minute per wake, renewed by its owner).
+                self._repair_dead_lanes()
+                self._wake.wait(min(held_for, self.LANE_REPAIR_INTERVAL_S))
                 self._wake.clear()
                 continue
             try:
@@ -503,7 +518,23 @@ class WorkPlanner:
                 )
                 submitted = False
 
-            self._sample_gpu_busy()
+            self._repair_dead_lanes()
+            try:
+                self._sample_gpu_busy()
+            except Exception:
+                # Sampling is a log figure. An error here must not end the
+                # loop thread (that stops every finder until a restart), so it
+                # turns sampling off for the run, the same sticky n/a an NVML
+                # error already gives, and is logged once with its traceback.
+                self._gpu_util_unavailable = True
+                with self._lock:
+                    bursts = sorted(self._pass_stats)
+                logger.exception(
+                    "[PIPELINE_PASS] GPU-busy sampling raised; reporting n/a "
+                    "for the rest of this run, the planner keeps running. "
+                    "Bursts in flight: %s",
+                    bursts,
+                )
             if submitted:
                 self._interval_s = self.MIN_INTERVAL_S
             else:
@@ -516,6 +547,64 @@ class WorkPlanner:
             self._wake.clear()
 
         logger.info("WorkPlanner stopped.")
+
+    def _repair_dead_lanes(self) -> None:
+        """Have the task runner replace any worker that died; bounded.
+
+        Otherwise a dead lane healed only on the next ``submit``: a GPU worker
+        lost while every GPU finder was at its in-flight limit left that work
+        queued behind no worker until something else was submitted. At most
+        once per ``LANE_REPAIR_INTERVAL_S``; a stopped runner stays stopped
+        (``TaskRunner.replace_dead_workers``).
+        """
+        now = time.monotonic()
+        if now < self._next_lane_repair_at:
+            return
+        self._next_lane_repair_at = now + self.LANE_REPAIR_INTERVAL_S
+        try:
+            self._task_runner.replace_dead_workers()
+        except Exception as exc:
+            # Whatever the repair raises (a replacement thread that cannot
+            # start, today), the loop thread must outlive it: it is the only
+            # thing that schedules background work (see ``_run``). The next
+            # repair tries again. The runner has already logged a thread that
+            # would not start at error, with its traceback, before re-raising
+            # it (``TaskRunner._replace_worker``), so this is a warning
+            # without one: what it adds is that the planner keeps retrying.
+            # A failure that persists would log every interval for as long as
+            # it lasts, so only the first of a run of failures is a warning,
+            # and so is one of another kind than the failure before it (a
+            # fault in the runner's bookkeeping behind a thread limit, say),
+            # which debug would hide until a recovery that may never come.
+            # Repeats are debug, and the recovery says how many there were.
+            self._lane_repair_failures += 1
+            kind_changed = type(exc) is not self._lane_repair_failure_type
+            self._lane_repair_failure_type = type(exc)
+            if self._lane_repair_failures == 1 or kind_changed:
+                logger.warning(
+                    "WorkPlanner could not replace a dead task-runner worker "
+                    "(%d failed attempt(s) in a row); trying again every "
+                    "%.0fs, and logging only a failure of another kind, or the "
+                    "recovery, from here on: %s: %s",
+                    self._lane_repair_failures,
+                    self.LANE_REPAIR_INTERVAL_S,
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                logger.debug(
+                    "WorkPlanner lane repair failed again (%d in a row): %s: %s",
+                    self._lane_repair_failures,
+                    type(exc).__name__,
+                    exc,
+                )
+            return
+        if self._lane_repair_failures:
+            logger.info(
+                "WorkPlanner lane repair succeeded after %d failed attempt(s).",
+                self._lane_repair_failures,
+            )
+            self._lane_repair_failures = 0
 
     def _run_finders_once(self) -> bool:
         # One immutable snapshot per cycle. The finder set is mutated from other
@@ -682,6 +771,16 @@ class WorkPlanner:
                 # remains a real error and is re-raised.
                 if self._stop.is_set():
                     raise _PlannerStopping from submit_exc
+                if isinstance(submit_exc, TaskRunnerStopped):
+                    # Not this finder's failure: no finder can submit until
+                    # the runner runs again. One line per cycle, rather than a
+                    # traceback per finder.
+                    logger.warning(
+                        "WorkPlanner: the task runner has stopped; nothing is "
+                        "submitted until it runs again (%s).",
+                        submit_exc,
+                    )
+                    raise _PlannerStopping from submit_exc
                 raise
 
             if submitted_task_id and submitted_task_id != task_id:
@@ -725,7 +824,7 @@ class WorkPlanner:
 
         Runs once per planner cycle, so it costs one NVML query while any
         finder has work out and nothing at all when the planner is idle. torch
-        is looked up in ``sys.modules`` rather than imported: it is kept off
+        is taken only if loaded (``loaded_module``), never imported: it is kept off
         the boot path on purpose, and a GPU that no engine has touched yet has
         nothing worth sampling.
         """
@@ -733,7 +832,7 @@ class WorkPlanner:
             active = list(self._pass_stats.values())
         if not active or self._gpu_util_unavailable:
             return
-        torch = sys.modules.get("torch")
+        torch = loaded_module("torch")
         if torch is None:
             # Not sticky: torch arrives with the first model load, and a burst
             # that started before it simply has fewer samples.

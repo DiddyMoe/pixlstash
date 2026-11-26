@@ -46,12 +46,12 @@ export or dedup query that relies on the existing exclusion.
 
 **One import decides at a time.** An import looks up matches, decides which
 files are new and then inserts them. Two imports of the same new content that
-overlap would both decide "new" and both insert. Each batch of a staged
-import, and a ComfyUI generation import, hold :func:`serialised_import` from
-the lookup to the insert, so the second one looks up after the first one's
-rows exist. The one-shot import route, the watch folder and plugin or
-edit-copy outputs do not take it, so they can still add the same new picture
-as an overlapping import. The database cannot enforce this
+overlap would both decide "new" and both insert. Each import holds
+:func:`serialised_import` from the lookup to the insert, so the second one
+looks up after the first one's rows exist: each batch of a staged import, the
+one-shot import route, each batch of a watch-folder pass, plugin, edit-copy
+and character-sheet outputs, a ComfyUI generation import, and each picture a
+library move copies into the target library. The database cannot enforce this
 instead: ``pixel_sha`` is not unique, because a sampled-hash collision is two
 different pictures that both belong in the library.
 """
@@ -246,3 +246,88 @@ def confirmed_match(
         candidates, [fingerprint], image_root
     )
     return live.get(fingerprint) or scrapheaped.get(fingerprint)
+
+
+@dataclass(frozen=True)
+class OutputImportPlan:
+    """What an import of generated outputs does with each output, by index.
+
+    Every output index is in exactly one of ``matched_ids``, ``new_indexes``
+    and ``copy_of``.
+
+    Attributes:
+        matched_ids: Output index to the library picture that already holds
+            its content: a live match, or a scrapheaped one this plan brought
+            back.
+        new_indexes: The outputs to insert, the first of each new content, in
+            output order.
+        copy_of: Output index to the index in ``new_indexes`` of the earlier
+            output in the same batch with the same content.
+        restored_ids: The scrapheaped pictures this plan brought back.
+    """
+
+    matched_ids: dict[int, int]
+    new_indexes: list[int]
+    copy_of: dict[int, int]
+    restored_ids: frozenset[int]
+
+
+def plan_output_imports(
+    fingerprints: list[ContentFingerprint],
+    live: dict[ContentFingerprint, ShaMatch],
+    scrapheaped: dict[ContentFingerprint, ShaMatch],
+    *,
+    back_ids: frozenset[int] | set[int],
+    restored_ids: frozenset[int] | set[int],
+) -> OutputImportPlan:
+    """Decide which generated outputs are new, on the confirmed match.
+
+    The one decision for outputs PixlStash makes itself (plugin runs, edit
+    copies, character sheets). The caller holds :func:`serialised_import`
+    from the lookup to the insert of ``new_indexes``, and supplies what the
+    database said: ``live`` and ``scrapheaped`` from
+    :func:`load_match_candidates_in_session` confirmed by
+    :func:`partition_confirmed_matches` (an output is a match only when a
+    picture has the same sampled hash, size and full SHA-256; a sampled-hash
+    collision is a new picture), then ``back_ids``, the scrapheaped matches
+    that are live again: the ones its restore brought back
+    (``restored_ids``), as a ComfyUI generation does, and the ones
+    ``scrapheap_service.existing_picture_ids_in_session`` finds the owner
+    restored meanwhile. A scrapheaped match not in ``back_ids`` was purged
+    meanwhile, so its output is new (a purged file is never a match, see the
+    module docstring).
+    Identical outputs in one batch become one picture.
+
+    Args:
+        fingerprints: ``(sampled hash, size, full hash)`` per output, in order.
+        live: Fingerprint to its confirmed live match.
+        scrapheaped: Fingerprint to its confirmed scrapheaped match, where
+            there is no live one.
+        back_ids: The scrapheaped matches that are live again.
+        restored_ids: Of those, the ones the caller's restore brought back.
+
+    Returns:
+        The plan, keyed by output index.
+    """
+    matched_ids: dict[int, int] = {}
+    new_indexes: list[int] = []
+    copy_of: dict[int, int] = {}
+    first_index: dict[ContentFingerprint, int] = {}
+    for index, fingerprint in enumerate(fingerprints):
+        match = live.get(fingerprint)
+        heaped = scrapheaped.get(fingerprint)
+        if match is None and heaped is not None and heaped.id in back_ids:
+            match = heaped
+        if match is not None:
+            matched_ids[index] = match.id
+        elif fingerprint in first_index:
+            copy_of[index] = first_index[fingerprint]
+        else:
+            first_index[fingerprint] = index
+            new_indexes.append(index)
+    return OutputImportPlan(
+        matched_ids=matched_ids,
+        new_indexes=new_indexes,
+        copy_of=copy_of,
+        restored_ids=frozenset(restored_ids),
+    )

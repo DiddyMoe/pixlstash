@@ -11,6 +11,30 @@ from pixlstash.utils.vram_utils import is_vram_oom
 
 logger = get_logger(__name__)
 
+# What a failed task carries as its ``error``. That field is served (an import's
+# status, a model folder's ``scan_error``), and an exception's text can carry
+# file paths and library content, so it stays in the server log.
+TASK_FAILURE_MESSAGE = "The task failed; the server log has the details."
+
+
+class PublicTaskFailure(Exception):
+    """A task failure whose message the server composed, so it may be served.
+
+    ``BaseTask.run`` serves ``public_message`` as the task's ``error`` instead
+    of ``TASK_FAILURE_MESSAGE``, and does so for this type only. Build the
+    message from values the server counted or chose ("The import stopped
+    after 3 new picture(s) were added."), never from an exception's text, a
+    path or library content. Raise it ``from`` the underlying exception: the
+    cause stays in the server log, which ``run`` writes with ``exc_info``.
+
+    Attributes:
+        public_message: The sentence served as the task's ``error``.
+    """
+
+    def __init__(self, public_message: str):
+        super().__init__(public_message)
+        self.public_message = public_message
+
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -44,7 +68,8 @@ class BaseTask(ABC):
         type: Task type label.
         params: Input parameters used by task logic.
         result: Optional task result.
-        error: Optional task error string.
+        error: ``TASK_FAILURE_MESSAGE`` once the task has failed (a
+            ``PublicTaskFailure``'s own message when it raised one), else None.
         status: Current task status.
         created_at: Task creation time.
         started_at: Task execution start time.
@@ -146,7 +171,18 @@ class BaseTask(ABC):
         except BaseException as exc:
             # BaseException, so a task raising SystemExit is FAILED like any
             # other failure rather than left RUNNING; re-raised for the runner.
-            self.error = str(exc)
+            logger.warning(
+                "Task %s (%s) failed on attempt %d: %s",
+                self.id,
+                self.type,
+                self.attempts_used,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            if isinstance(exc, PublicTaskFailure):
+                self.error = exc.public_message
+            else:
+                self.error = TASK_FAILURE_MESSAGE
             self.status = TaskStatus.FAILED
             raise
         finally:

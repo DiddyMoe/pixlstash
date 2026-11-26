@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from pixlstash.task_runner import TaskRunner
+from pixlstash.task_runner import TaskRunner, TaskRunnerStopped
 from pixlstash.tasks import TaskType, smart_score_task
 from pixlstash.tasks.base_task import BaseTask
 from pixlstash.tasks.base_task_finder import BaseTaskFinder
@@ -16,6 +16,7 @@ from pixlstash.tasks.smart_score_task import SmartScoreTask
 from pixlstash.tasks.tag_task import TagTask
 from pixlstash.tasks.task_outcome import Outcome, Reason, outcomes_payload
 from pixlstash.vault import Vault
+from pixlstash import work_planner as work_planner_module
 from pixlstash.work_planner import WorkPlanner
 
 
@@ -50,11 +51,15 @@ class _OneShotFinder:
 class _FastCompleteRunner:
     def __init__(self):
         self.on_submit = None
+        self.repairs = 0
 
     def submit(self, task):
         if callable(self.on_submit):
             self.on_submit(task)
         return task.id
+
+    def replace_dead_workers(self):
+        self.repairs += 1
 
 
 def test_inflight_decrements_when_task_completes_during_submit():
@@ -143,6 +148,9 @@ class _IdleFinder:
 class _NullRunner:
     def submit(self, task):
         return getattr(task, "id", None)
+
+    def replace_dead_workers(self):
+        return None
 
 
 def _stopped(planner):
@@ -642,13 +650,19 @@ class _VaultWorkerProbe:
 
     Building a real ``Vault`` costs a Server; these two methods only read the
     planner, so binding them to a stub keeps the check in this fast module.
+    They also call the dead-lane helpers, bound here with no task runner, so
+    the lane check passes and this test answers for the planner and finder
+    alone; tests/test_vault_worker_lanes.py covers the lanes.
     """
 
     is_worker_running = Vault.is_worker_running
     worker_unavailable_reason = Vault.worker_unavailable_reason
+    _dead_lane = Vault._dead_lane
+    _replace_dead_lane = Vault._replace_dead_lane
 
     def __init__(self, work_planner):
         self._work_planner = work_planner
+        self._task_runner = None
 
 
 def test_is_worker_running_answers_per_worker_type():
@@ -835,7 +849,8 @@ def test_snapshot_identity_task_marks_a_missing_archive_done(tmp_path):
     vault = _vault_with_snapshots(tmp_path, [(1, False)])
 
     class _WritableStub(_StubDatabase):
-        def run_task(self, func, *args, **kwargs):
+        # `priority` orders the real writer queue; it is not func's argument.
+        def run_task(self, func, *args, priority=None, **kwargs):
             from sqlmodel import Session, create_engine
 
             engine = create_engine(f"sqlite:///{self._vault_path}")
@@ -959,6 +974,8 @@ class _TwoTaskFinder(_OneShotFinder):
 def test_a_finder_burst_emits_exactly_one_pipeline_pass_line(caplog):
     runner = _FastCompleteRunner()
     finder = _TwoTaskFinder()
+    drains = []
+    finder.on_all_tasks_complete = lambda: drains.append("drained")
     planner = WorkPlanner(task_runner=runner, task_finders=[finder])
     runner.on_submit = lambda task: planner.on_task_complete(task, None)
 
@@ -970,6 +987,8 @@ def test_a_finder_burst_emits_exactly_one_pipeline_pass_line(caplog):
         assert planner._run_finders_once() is False
         assert planner._run_finders_once() is False
 
+    # One burst is drained once: a dry sweep after the drain owes nothing.
+    assert drains == ["drained"], drains
     line = _one_line(caplog, "[PIPELINE_PASS]")
     # These tasks say nothing about their pictures, so none of the six is
     # counted as done: they are attempted and unknown.
@@ -1376,3 +1395,336 @@ def test_a_finder_whose_tasks_end_at_once_gives_up_its_turn():
 
     assert endless.finds == endless.max_inflight_tasks() + 1
     assert other.finds == 1
+
+
+# --- Dead-lane repair and a stopped runner -----------------------------------
+
+
+def test_the_planner_tick_replaces_a_dead_task_runner_lane():
+    """A dead lane heals without waiting for a submission to repair it."""
+    runner = TaskRunner(name="planner-repair-test", num_workers=1)
+    runner.start()
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    try:
+        gpu = runner._gpu_worker
+        runner._gpu_queue.put((0, -1))  # fails the worker loop, outside a task
+        gpu.join(5)
+        assert runner.lane_health()["gpu"]["alive"] == 0
+
+        planner.start()
+        deadline = time.monotonic() + 10
+        while runner.lane_health()["gpu"]["alive"] == 0:
+            assert time.monotonic() < deadline, "the planner never repaired it"
+            time.sleep(0.02)
+        assert runner.lane_health()["gpu"]["restarts"] == 1
+    finally:
+        _stopped(planner)
+        runner.stop()
+
+
+def test_the_planner_repairs_lanes_at_most_once_per_interval():
+    runner = _FastCompleteRunner()
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    planner._repair_dead_lanes()
+    planner._repair_dead_lanes()
+    assert runner.repairs == 1, "repaired on every tick: a crash loop would spin"
+    planner._next_lane_repair_at = 0.0
+    planner._repair_dead_lanes()
+    assert runner.repairs == 2
+
+
+def test_the_planner_repair_never_reopens_a_stopped_runner(caplog):
+    runner = TaskRunner(name="planner-stopped-test", num_workers=1)
+    runner.start()
+    runner.stop()
+    with caplog.at_level(logging.ERROR, logger="pixlstash.task_runner"):
+        WorkPlanner(task_runner=runner, task_finders=[])._repair_dead_lanes()
+    health = runner.lane_health()
+    assert not health["running"]
+    assert health["gpu"]["alive"] == 0
+    # A replacement started after stop() sees the stop flag and leaves at once,
+    # so aliveness alone cannot tell "nothing started" from "started and
+    # gone". Nothing may have been started at all: no restart counted and no
+    # replacement logged.
+    assert health["cpu"]["restarts"] == 0
+    assert health["gpu"]["restarts"] == 0
+    assert "started a replacement" not in caplog.text
+
+
+class _UnrepairableRunner(_NullRunner):
+    def __init__(self):
+        self.repairs = 0
+
+    def replace_dead_workers(self):
+        self.repairs += 1
+        raise RuntimeError("can't start new thread")
+
+
+def test_a_repair_that_cannot_start_a_thread_is_logged_and_tried_again(caplog):
+    runner = _UnrepairableRunner()
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    with caplog.at_level(logging.WARNING, logger="pixlstash.work_planner"):
+        planner._repair_dead_lanes()
+    assert "could not replace a dead task-runner worker" in caplog.text
+    planner._next_lane_repair_at = 0.0
+    planner._repair_dead_lanes()
+    assert runner.repairs == 2, "a failed repair was not tried again"
+
+
+class _FlakyRepairRunner(_NullRunner):
+    """Repairs fail ``fail_times`` times with a non-RuntimeError, then succeed.
+
+    ``fail_again`` makes the next ``fail_times`` repairs fail once more.
+    """
+
+    def __init__(self, fail_times):
+        self.repairs = 0
+        self.fail_times = fail_times
+        self.failed = 0
+
+    def replace_dead_workers(self):
+        self.repairs += 1
+        if self.failed < self.fail_times:
+            self.failed += 1
+            raise OSError("example-lane-repair-failure")
+
+    def fail_again(self, times):
+        self.fail_times += times
+
+
+def _repair_records(caplog, planner, times):
+    """Run *times* due repairs and return the planner's records from them."""
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="pixlstash.work_planner"):
+        for _ in range(times):
+            planner._next_lane_repair_at = 0.0
+            planner._repair_dead_lanes()
+    return [r for r in caplog.records if r.name == "pixlstash.work_planner"]
+
+
+def _assert_one_logged_run(records, failures):
+    """*failures* failed repairs then a recovery: one warning, debug, info."""
+    assert [r for r in records if r.levelno >= logging.ERROR] == [], (
+        "the planner logged an error; the runner owns the traceback"
+    )
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "(1 failed attempt(s) in a row)" in warnings[0].getMessage()
+    assert "example-lane-repair-failure" in warnings[0].getMessage()
+    assert warnings[0].exc_info is None, "a second traceback for one failure"
+    repeats = [r for r in records if "failed again" in r.getMessage()]
+    assert [r.levelno for r in repeats] == [logging.DEBUG] * (failures - 1)
+    recovered = [r for r in records if "succeeded after" in r.getMessage()]
+    assert len(recovered) == 1
+    assert recovered[0].levelno == logging.INFO
+    assert f"after {failures} failed attempt(s)" in recovered[0].getMessage()
+
+
+def test_a_repair_that_keeps_failing_logs_once_then_its_recovery(caplog):
+    runner = _FlakyRepairRunner(fail_times=3)
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    _assert_one_logged_run(_repair_records(caplog, planner, 4), failures=3)
+    assert runner.repairs == 4
+
+
+def test_a_lane_that_fails_again_after_its_recovery_is_logged_again(caplog):
+    """The recovery ends the run: a later failure is the first of a new one.
+
+    Without the reset the second run would be all debug, nothing at the
+    default level, and its recovery would report both runs' failures.
+    """
+    runner = _FlakyRepairRunner(fail_times=3)
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    _assert_one_logged_run(_repair_records(caplog, planner, 4), failures=3)
+
+    runner.fail_again(2)
+    _assert_one_logged_run(_repair_records(caplog, planner, 3), failures=2)
+    assert runner.repairs == 7
+
+
+class _ChangingFaultRunner(_NullRunner):
+    """Repairs raise each of ``errors`` in turn, then succeed."""
+
+    def __init__(self, *errors):
+        self.errors = list(errors)
+
+    def replace_dead_workers(self):
+        if self.errors:
+            raise self.errors.pop(0)
+
+
+def test_a_repair_failing_with_another_kind_of_error_is_logged_again(caplog):
+    """A new kind of failure inside a run is not hidden at debug.
+
+    A thread limit then a fault in the runner's own bookkeeping: the fault may
+    never recover, so debug would keep it out of the log for good.
+    """
+    runner = _ChangingFaultRunner(
+        RuntimeError("can't start new thread"),
+        RuntimeError("can't start new thread"),
+        AttributeError("example-bookkeeping-fault"),
+        AttributeError("example-bookkeeping-fault"),
+    )
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    records = _repair_records(caplog, planner, 5)
+    assert [(r.levelno, r.getMessage().rsplit(": ", 1)[-1]) for r in records] == [
+        (logging.WARNING, "can't start new thread"),
+        (logging.DEBUG, "can't start new thread"),
+        (logging.WARNING, "example-bookkeeping-fault"),
+        (logging.DEBUG, "example-bookkeeping-fault"),
+        (logging.INFO, "WorkPlanner lane repair succeeded after 4 failed attempt(s)."),
+    ]
+    assert "(3 failed attempt(s) in a row)" in records[2].getMessage()
+
+
+def test_one_failed_repair_logs_one_traceback(caplog, monkeypatch):
+    """The runner logs the start failure with its traceback; the planner not.
+
+    Both used to log it at error with ``exc_info``: two tracebacks for one
+    event. The worker's own death is a separate event, logged before
+    the capture starts.
+    """
+    runner = TaskRunner(name="planner-one-traceback-test", num_workers=1)
+    runner.start()
+    try:
+        gpu = runner._gpu_worker
+        runner._gpu_queue.put((0, -1))  # fails the worker loop, outside a task
+        gpu.join(5)
+        assert runner.lane_health()["gpu"]["alive"] == 0
+
+        def _cannot_start_thread(*args, **kwargs):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(runner, "_start_worker", _cannot_start_thread)
+        planner = WorkPlanner(task_runner=runner, task_finders=[])
+        caplog.clear()
+        with (
+            caplog.at_level(logging.DEBUG, logger="pixlstash.task_runner"),
+            caplog.at_level(logging.DEBUG, logger="pixlstash.work_planner"),
+        ):
+            planner._repair_dead_lanes()
+        tracebacks = [r for r in caplog.records if r.exc_info is not None]
+        assert [(r.name, r.levelno) for r in tracebacks] == [
+            ("pixlstash.task_runner", logging.ERROR)
+        ], [r.getMessage() for r in tracebacks]
+        assert "could not be started (gpu lane)" in tracebacks[0].getMessage()
+        planner_records = [
+            r for r in caplog.records if r.name == "pixlstash.work_planner"
+        ]
+        assert [r.levelno for r in planner_records] == [logging.WARNING]
+        assert "can't start new thread" in planner_records[0].getMessage()
+    finally:
+        monkeypatch.undo()
+        runner.stop()
+
+
+def test_a_planner_thread_outlives_a_repair_that_raises_any_error():
+    runner = _FlakyRepairRunner(fail_times=10**6)
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    planner.LANE_REPAIR_INTERVAL_S = 0.0
+    planner.start()
+    try:
+        deadline = time.monotonic() + 5
+        while runner.repairs < 3:
+            assert time.monotonic() < deadline, "the planner stopped repairing"
+            assert planner.is_running(), "a repair error ended the planner"
+            time.sleep(0.02)
+        assert planner.is_running()
+    finally:
+        _stopped(planner)
+        planner.stop()
+
+
+def test_a_held_planner_still_repairs_dead_lanes():
+    """A hold stops finders submitting, not lane repair."""
+    runner = _FastCompleteRunner()
+    submitted = []
+    runner.on_submit = submitted.append
+    planner = WorkPlanner(task_runner=runner, task_finders=[_OneShotFinder()])
+    planner.hold("test", 60)
+    planner.start()
+    try:
+        deadline = time.monotonic() + 3
+        while runner.repairs == 0:
+            assert time.monotonic() < deadline, "no repair while held"
+            time.sleep(0.02)
+        assert submitted == [], "the hold let a finder submit"
+    finally:
+        _stopped(planner)
+        planner.stop()
+
+
+def test_a_planner_thread_outlives_gpu_sampling_that_raises(caplog, monkeypatch):
+    """An error from the GPU-busy sample turns sampling off; the loop goes on.
+
+    The sample's own lookup raising stands for any error it lets out (before
+    this change, ``loaded_module`` re-raised a failed torch import from here).
+    """
+    planner = WorkPlanner(task_runner=_FastCompleteRunner(), task_finders=[])
+    planner._pass_stats["TestFinder"] = work_planner_module._PassStats(
+        started_at=time.perf_counter()
+    )
+    lookups = []
+
+    def _raising_lookup(name):
+        lookups.append(name)
+        raise OSError("example-sampling-failure")
+
+    monkeypatch.setattr(work_planner_module, "loaded_module", _raising_lookup)
+    cycles = []
+    real_run_finders_once = planner._run_finders_once
+
+    def _counting_cycle():
+        cycles.append(1)
+        return real_run_finders_once()
+
+    monkeypatch.setattr(planner, "_run_finders_once", _counting_cycle)
+    with caplog.at_level(logging.ERROR, logger="pixlstash.work_planner"):
+        planner.start()
+        try:
+            deadline = time.monotonic() + 5
+            while len(cycles) < 4:
+                assert time.monotonic() < deadline, "the planner stopped cycling"
+                time.sleep(0.02)
+            assert planner.is_running(), "a sampling error ended the planner"
+            assert planner._gpu_util_unavailable is True
+        finally:
+            _stopped(planner)
+            planner.stop()
+    assert lookups == ["torch"], "sampling was not turned off after the error"
+    sampled = [
+        r for r in caplog.records if "GPU-busy sampling raised" in r.getMessage()
+    ]
+    assert len(sampled) == 1, [r.getMessage() for r in sampled]
+    assert "example-sampling-failure" in caplog.text
+
+
+class _StoppedRunner(_NullRunner):
+    def submit(self, task):
+        raise TaskRunnerStopped("TaskRunner test is stopped.")
+
+
+def test_a_stopped_runner_ends_the_cycle_with_one_warning(caplog):
+    """No finder can submit to a stopped runner: one line, not a traceback each."""
+    first = _OneShotFinder()
+    released = []
+    first.on_task_complete = lambda task, error: released.append(error)
+    behind = []
+
+    class _Behind(_IdleFinder):
+        def find_task(self):
+            behind.append(1)
+            return None
+
+    planner = WorkPlanner(
+        task_runner=_StoppedRunner(), task_finders=[first, _Behind("Behind")]
+    )
+    with caplog.at_level(logging.WARNING, logger="pixlstash.work_planner"):
+        assert planner._run_finders_once() is False
+
+    assert len(released) == 1, "the unsubmitted task kept its claims"
+    assert behind == [], "the cycle went on sweeping finders that cannot submit"
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == [], [r.getMessage() for r in errors]
+    stopped = [r for r in caplog.records if "task runner has stopped" in r.getMessage()]
+    assert len(stopped) == 1

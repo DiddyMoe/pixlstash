@@ -2,6 +2,7 @@
 
 from typing import TYPE_CHECKING
 
+from pixlstash.database import DBPriority
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
 from pixlstash.utils.service.smart_score_invalidation import (
@@ -42,7 +43,9 @@ class PendingScoreInvalidationTask(BaseTask):
         return TaskPriority.HIGH
 
     def _run_task(self):
-        cleared = self._vault.db.run_task(apply_pending_invalidations)
+        cleared = self._vault.db.run_task(
+            apply_pending_invalidations, priority=DBPriority.LOW
+        )
         if cleared:
             logger.info(
                 "PendingScoreInvalidationTask: cleared %d stale smart score(s)",

@@ -92,13 +92,30 @@ def start_cleanup(vault, names, generation: int) -> dict:
 
     Returns the job as the status route reports it. With no task runner the
     job is recorded as ``not_started`` and the status reads ``interrupted``.
+    The job is listed before it is submitted, so a submission that raises
+    (a dead worker whose replacement cannot start) marks it ``not_started``
+    too before the error reaches the caller: left ``queued``, it would read
+    as running and ``retry_cleanup`` would refuse with 409 until a restart.
     """
     task = TagExclusionCleanupTask(vault, names, generation)
     with _LOCK:
         jobs = _JOBS.setdefault(vault.library_uuid, [])
         jobs.append(task)
         del jobs[:-JOBS_KEPT]
-    if vault.submit_task(task) is None:
+    try:
+        task_id = vault.submit_task(task)
+    except BaseException as exc:
+        task.mark_not_started()
+        logger.error(
+            "Submitting the cleanup of %s in library %s raised %s: %s; the job "
+            "is marked not started and reads as interrupted until retried.",
+            sorted(task.params["names"]),
+            vault.library_uuid,
+            type(exc).__name__,
+            exc,
+        )
+        raise
+    if task_id is None:
         task.mark_not_started()
         logger.warning(
             "No task runner took the cleanup of %s in library %s; it reads as "
@@ -115,7 +132,10 @@ def retry_cleanup(vault, names=None) -> dict:
     Raises:
         HTTPException: ``422`` when a name is not removed from tagging,
             ``409`` while a job is still running here.
+        TaskAdmissionRefused: A library restore has paused task admission
+            (409), asked before the job is listed.
     """
+    vault.refuse_while_admission_paused()
     excluded = vault.db.tag_exclusions
     wanted = excluded if names is None else frozenset(normalise_tag(n) for n in names)
     if not wanted <= excluded:
@@ -139,7 +159,11 @@ def remove_penalised_tag(server, user_id: int, name: str) -> dict:
 
     Raises:
         HTTPException: ``404`` when *name* is neither penalised nor removed.
+        TaskAdmissionRefused: A library restore has paused task admission
+            (409). Asked before the owner's settings are written, since the
+            removal exists to start the cleanup job.
     """
+    server.vault.refuse_while_admission_paused()
     result, newly = _change_owner_settings(server, user_id, name, None)
     return {**result, "cleanup": _carry_on(server.vault, newly, result["excluded"])}
 

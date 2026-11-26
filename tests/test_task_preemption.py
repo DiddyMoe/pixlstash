@@ -9,6 +9,7 @@ must end as exactly ``TaskCancelledError``, whatever it raised on the way out.
 A real ``TaskRunner`` with plain fake tasks: no ``Server``, nothing to load.
 """
 
+import logging
 import queue
 import threading
 import time
@@ -18,7 +19,13 @@ import pytest
 
 from pixlstash.resources.arbiter import LeaseState, ResourceArbiter
 from pixlstash.resources.ledger import DeviceReading
-from pixlstash.task_runner import TaskCancelledError, TaskRunner
+from pixlstash.task_runner import (
+    LANE_FAILURE_MESSAGE,
+    TASK_HANDLING_FAILURE_MESSAGE,
+    TaskCancelledError,
+    TaskRunner,
+    TaskRunnerStopped,
+)
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority, TaskStatus
 from pixlstash.tasks.missing_ocr_finder import MissingOcrFinder
 from pixlstash.vault import Vault
@@ -113,7 +120,16 @@ def runner():
     runner.stop()
 
 
-def _until(condition, seconds=5.0):
+# How long a test waits on the runner before calling it hung. A condition that
+# holds returns at once, so this bounds a hang rather than timing the runner.
+# After every GPU-queue task the worker empties the device cache, runs a full
+# gc.collect() and trims the heap, and in a process that has already run a
+# shard's worth of tests that costs well over a second a task: a few seconds
+# is not enough for a test that waits on three tasks in turn.
+_HANG_GUARD_S = 30.0
+
+
+def _until(condition, seconds=_HANG_GUARD_S):
     deadline = time.monotonic() + seconds
     while not condition() and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -150,6 +166,28 @@ def test_a_preempted_batch_is_found_again_rather_than_deferred(runner):
     runner.runner.preempt_gpu("preempted by Training")
     assert _until(lambda: "OcrTask" in runner.endings)
     assert finder._deferred == set(), "a preempted batch was deferred for the session"
+
+
+def test_a_task_preempted_before_its_body_starts_ends_as_cancelled(runner):
+    """The preemption can land after the runner registered the task and before
+    ``run()`` reads its cancel: the body never starts, and the ending is the
+    same ``TaskCancelledError`` naming the preemption, not a success."""
+
+    class _PreemptedOnTheThreshold(_GpuTask):
+        def run(self, on_vram_oom=None):
+            # Registered by now: the preemption lands before run()'s check.
+            runner.runner.preempt_gpu("preempted by Training")
+            return super().run(on_vram_oom=on_vram_oom)
+
+    task = _PreemptedOnTheThreshold("OcrTask")
+    runner.runner.submit(task)
+
+    assert _until(lambda: "OcrTask" in runner.endings)
+    assert not task.started.is_set()
+    assert task.status == TaskStatus.CANCELLED
+    error = runner.endings["OcrTask"]
+    assert type(error) is TaskCancelledError, error
+    assert "preempted by Training" in str(error)
 
 
 def test_interactive_work_is_never_preempted(runner):
@@ -546,6 +584,42 @@ def test_an_unload_queued_before_the_setting_is_switched_back_on_is_skipped(runn
     assert unloaded == []
 
 
+def _cannot_start_a_worker(*args):
+    # What TaskRunner.submit raises when a dead worker's replacement cannot start.
+    raise RuntimeError("can't start new thread")
+
+
+def test_making_room_keeps_what_it_paused_when_the_unload_cannot_be_queued():
+    """The arbiter records the paused GPU work from what the yield returns."""
+    unloaded = []
+    lease = SimpleNamespace(id="lease-1", label="Portrait", state=LeaseState.WAITING)
+    vault = _vault_on(
+        SimpleNamespace(
+            preempt_gpu=lambda reason: ["CaptionTask"],
+            gpu_worker_alive=lambda: True,
+            submit=_cannot_start_a_worker,
+        ),
+        lambda: unloaded.append("unload"),
+    )
+    assert Vault._yield_gpu(vault, lease) == ["CaptionTask"]
+    assert unloaded == [], "unloaded beside the live GPU worker"
+
+
+def test_the_idle_sweep_does_not_fail_its_request_when_the_unload_cannot_be_queued():
+    """Raised on, it failed the progress poll or the settings save that swept."""
+    unloaded = []
+    vault = _vault_on(
+        SimpleNamespace(
+            has_active_gpu_tasks=lambda: False,
+            gpu_worker_alive=lambda: True,
+            submit=_cannot_start_a_worker,
+        ),
+        lambda: unloaded.append("unload"),
+    )
+    Vault._maybe_aggressive_unload(vault, {})
+    assert unloaded == [], "unloaded beside the live GPU worker"
+
+
 def test_stop_leaves_the_models_to_a_worker_that_outlived_the_wait(monkeypatch):
     """``TaskRunner.stop()`` gives up after 60 s; a flush beside it would crash."""
     released = []
@@ -558,6 +632,7 @@ def test_stop_leaves_the_models_to_a_worker_that_outlived_the_wait(monkeypatch):
             _changed_tags_notify_lock=threading.Lock(),
             _changed_tags_flush_timer=None,
             _changed_tags_pending_ids=set(),
+            _cancel_changed_tags_flush=lambda: None,
             _started=False,
             _task_runner=SimpleNamespace(gpu_worker_alive=lambda alive=alive: alive),
             _disable_background_workers=False,
@@ -629,7 +704,7 @@ def test_a_requeue_count_past_the_float_limit_gets_the_capped_delay():
     runner = TaskRunner(
         name="requeue-cap", resource_arbiter=_Refusing(_NoCard(), usage=lambda: None)
     )
-    task = _QuickGpuTask()
+    task = _as_queued(runner, _QuickGpuTask())
     runner._requeue_counts[task.id] = 1100
     try:
         run_now, lease = runner._admit(task, queue.PriorityQueue())
@@ -768,6 +843,14 @@ def fake_timers(monkeypatch):
     return timers
 
 
+def _as_queued(runner, task):
+    """*task*, stamped as ``submit`` stamps what it queues, for a test that
+    drives ``_admit`` or ``_handle`` directly."""
+    with runner._active_task_lock:
+        runner._stamp_locked(task)
+    return task
+
+
 def _settling_runner(name, arbiter=None):
     """A runner and the endings its callbacks saw, ``task id -> [error, ...]``."""
     runner = TaskRunner(
@@ -788,7 +871,7 @@ def test_a_task_refused_over_a_thousand_times_keeps_the_capped_backoff(fake_time
         "requeue-cycles", _NeverRoom(_NoCard(), usage=lambda: None)
     )
     work_queue = queue.PriorityQueue()
-    task = _QuickGpuTask()
+    task = _as_queued(runner, _QuickGpuTask())
     for _ in range(1100):
         runner._handle(task, work_queue)
         fake_timers.made[-1].fire()
@@ -806,7 +889,7 @@ def test_a_backoff_that_cannot_start_leaves_no_entry_behind(fake_timers):
     runner, _endings = _settling_runner(
         "timer-fails", _NeverRoom(_NoCard(), usage=lambda: None)
     )
-    task = _QuickGpuTask()
+    task = _as_queued(runner, _QuickGpuTask())
     with pytest.raises(RuntimeError, match="test-cannot-start-thread"):
         runner._admit(task, queue.PriorityQueue())
     assert task.id not in runner._requeued
@@ -853,7 +936,7 @@ def test_failing_a_task_takes_it_out_of_its_backoff(fake_timers):
     runner, endings = _settling_runner(
         "fail-backoff", _NeverRoom(_NoCard(), usage=lambda: None)
     )
-    task = _QuickGpuTask()
+    task = _as_queued(runner, _QuickGpuTask())
     assert runner._admit(task, queue.PriorityQueue()) == (False, None)
     timer = fake_timers.made[-1]
 
@@ -864,6 +947,43 @@ def test_failing_a_task_takes_it_out_of_its_backoff(fake_timers):
     assert runner.cancel_pending_tasks() == 0
     assert task.status == TaskStatus.FAILED
     assert len(endings[task.id]) == 1
+
+
+def test_a_task_the_runner_could_not_handle_keeps_the_error_in_the_log(caplog):
+    """The error a client reads (an import's status, a folder scan's) is the
+    fixed message; the exception, which can name files, goes to the log only."""
+    runner, endings = _settling_runner("fail-message")
+    task = _QuickGpuTask()
+    secret = "test-handling-failure in /home/me/library/private.png"
+
+    with caplog.at_level(logging.ERROR, logger="pixlstash.task_runner"):
+        runner._fail_unhandled(task, RuntimeError(secret))
+
+    assert task.status == TaskStatus.FAILED
+    assert task.error == TASK_HANDLING_FAILURE_MESSAGE
+    assert secret not in task.error
+    logged = [r for r in caplog.records if secret in r.getMessage()]
+    assert len(logged) == 1 and logged[0].exc_info is not None
+    assert len(endings[task.id]) == 1
+
+
+@pytest.mark.parametrize("submit", ["submit", "submit_and_wait"])
+def test_a_stopped_runner_refuses_a_task_with_its_own_error(submit):
+    """A caller can tell a stopped runner from any other ``RuntimeError``.
+
+    It is still a ``RuntimeError``, so a caller catching that stays correct.
+    """
+    runner, endings = _settling_runner("stopped-refuses")
+    runner.stop()
+    task = _QuickGpuTask()
+
+    with pytest.raises(TaskRunnerStopped, match="stopped-refuses"):
+        getattr(runner, submit)(task)
+
+    assert issubclass(TaskRunnerStopped, RuntimeError)
+    # Refused, not queued: nothing settles it and nothing ran it.
+    assert task.id not in endings
+    assert task.status == TaskStatus.PENDING
 
 
 def test_a_task_that_already_settled_is_not_cancelled_again():
@@ -948,7 +1068,7 @@ def test_a_task_the_cpu_cannot_record_stays_set_for_the_gpu(fake_timers):
     runner, _endings = _settling_runner(
         "spill-fails", _CpuLedgerFails(_NoCard(), usage=lambda: None)
     )
-    task = _SpillableGpuTask()
+    task = _as_queued(runner, _SpillableGpuTask())
     assert runner._admit(task, queue.PriorityQueue()) == (False, None)
     assert task.on_cpu is False, "switched to the CPU, then sent to wait for the GPU"
     assert task.id in runner._requeued
@@ -1053,7 +1173,9 @@ def test_a_worker_that_dies_is_reported_and_replaced(lane):
         assert (health["running"], health["degraded"]) == (True, True)
         assert health[lane]["alive"] == 0
         assert health["last_failure"]["worker"] == dead.name
-        assert health["last_failure"]["error"].startswith("ValueError")
+        # The cause goes to the log; the health served to the SPA carries
+        # the fixed message, never the exception's own text.
+        assert health["last_failure"]["error"] == LANE_FAILURE_MESSAGE
 
         task = _QuickGpuTask() if lane == "gpu" else _QuickCpuTask()
         runner.submit(task)
@@ -1192,3 +1314,261 @@ def test_a_backoff_ending_just_after_a_cancel_drains_is_cancelled_too(cancel):
     assert task.status == TaskStatus.CANCELLED, "landed on a queue already drained"
     assert len(endings[task.id]) == 1
     assert work_queue.empty()
+
+
+# ── cancelling a task held in admission (FU-2) ─────────────────────────────
+# A worker takes its task off the queue outside any lock, then asks the
+# arbiter for memory. A cancel landing in that window finds the task neither
+# queued nor running; the cancel generation stamped at submission catches it
+# when it tries to register.
+
+
+class _HeldAdmission(ResourceArbiter):
+    """Holds the worker inside ``try_light`` until released, then grants or refuses."""
+
+    def __init__(self, grant):
+        super().__init__(_NoCard(), usage=lambda: None)
+        self.grant = grant
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def try_light(self, *args, **kwargs):
+        self.entered.set()
+        self.release.wait(5)
+        if not self.grant:
+            return None
+        return super().try_light(*args, **kwargs)
+
+
+class _RecordingGpuTask(_QuickGpuTask):
+    def __init__(self):
+        super().__init__()
+        self.ran = threading.Event()
+
+    def _run_task(self):
+        self.ran.set()
+        return "done"
+
+
+@pytest.mark.parametrize(
+    ("cancel", "grant"),
+    [
+        ("cancel_pending_tasks", True),
+        ("cancel_pending_tasks", False),
+        ("preempt_gpu", True),
+        ("preempt_gpu", False),
+        # A refused task's backoff already re-checks the stop.
+        ("stop", True),
+    ],
+)
+def test_a_cancel_landing_while_a_task_is_held_in_admission_cancels_it(cancel, grant):
+    arbiter = _HeldAdmission(grant)
+    runner, endings = _settling_runner(f"held-admission-{cancel}", arbiter)
+    runner.start()
+    task = _RecordingGpuTask()
+    stopper = None
+    try:
+        runner.submit(task)
+        assert arbiter.entered.wait(5)
+        if cancel == "stop":
+            # stop() joins the worker, which is held: from another thread.
+            stopper = threading.Thread(target=runner.stop)
+            stopper.start()
+            assert _until(lambda: runner._stop.is_set())
+        elif cancel == "preempt_gpu":
+            runner.preempt_gpu("preempted by test")
+        else:
+            runner.cancel_pending_tasks()
+        arbiter.release.set()
+        # A refused task's backoff is 1 s; it would run once that ends.
+        assert _until(lambda: task.id in endings, 3), "never settled"
+        time.sleep(1.5)
+    finally:
+        arbiter.release.set()
+        if stopper is not None:
+            stopper.join(10)
+        runner.stop()
+    assert not task.ran.is_set(), "ran after it was cancelled"
+    assert task.status == TaskStatus.CANCELLED
+    assert len(endings[task.id]) == 1
+    assert type(endings[task.id][0]) is TaskCancelledError
+    assert runner._requeued == {}
+
+
+def test_a_task_submitted_after_a_cancel_still_runs():
+    """The generation is the one in force at submission, not a sticky flag."""
+    runner, endings = _settling_runner("after-cancel")
+    runner.start()
+    try:
+        runner.cancel_pending_tasks()
+        runner.preempt_gpu("preempted by test")
+        task = _RecordingGpuTask()
+        runner.submit(task)
+        assert _until(lambda: task.id in endings)
+    finally:
+        runner.stop()
+    assert task.status == TaskStatus.COMPLETED
+    assert endings[task.id] == [None]
+
+
+# ── preempt_gpu skips a task that has already finished (FU-4) ──────────────
+
+
+class _FinishedButHeld(_QuickGpuTask):
+    """Ends as if after a GPU out-of-memory retry, so ``_handle`` announces the
+    recovery while the task is still registered active: done, not yet gone."""
+
+    def _run_task(self):
+        self.vram_oom_attempts = 1
+        return "done"
+
+
+def test_preempt_does_not_stop_a_task_that_has_already_finished():
+    announcing = threading.Event()
+    release = threading.Event()
+
+    def notifier(event_type, payload):
+        if payload.get("recovered"):
+            announcing.set()
+            release.wait(5)
+
+    runner = TaskRunner(
+        name="preempt-finished",
+        notifier=notifier,
+        resource_arbiter=ResourceArbiter(_NoCard(), usage=lambda: None),
+    )
+    endings = {}
+    runner.add_task_complete_callback(
+        lambda task, error: endings.setdefault(task.id, []).append(error)
+    )
+    runner.start()
+    task = _FinishedButHeld()
+    try:
+        runner.submit(task)
+        assert announcing.wait(5)
+        assert task._done_event.is_set()
+        assert task in runner.get_active_tasks_of_type(task.type)
+
+        assert runner.preempt_gpu("preempted by test") == []
+        assert runner._preempted == {}
+    finally:
+        release.set()
+        assert _until(lambda: task.id in endings)
+        runner.stop()
+    assert task.status == TaskStatus.COMPLETED
+    assert endings[task.id] == [None]
+
+
+# ── draining the runner before the library is swapped ──────────────────────
+
+
+class _BatchWriter(BaseTask):
+    """Writes one item at a time and, when asked to stop, flushes what it has.
+
+    The flush is the write a real batch does on its way out (the tags or
+    embeddings it already computed): it must land before the drain returns,
+    never after.
+    """
+
+    def __init__(self, writes):
+        super().__init__(task_type="TagTask")
+        self.writes = writes
+        self.started = threading.Event()
+
+    @property
+    def queue_type(self):
+        return QueueType.GPU
+
+    def _run_task(self):
+        self.started.set()
+        for item in range(500):
+            if self._cancel_event.is_set():
+                break
+            self.writes.append(("item", item))
+            time.sleep(0.01)
+        time.sleep(0.2)
+        self.writes.append(("flush", None))
+        return "done"
+
+
+def test_a_drained_runner_writes_nothing_after_the_drain_succeeds():
+    runner, endings = _settling_runner("drain")
+    writes: list = []
+    heard = []
+
+    def slow_owner(task, error):
+        # An owner that takes its time, as a finder writing its outcome does.
+        time.sleep(0.3)
+        heard.append(task.id)
+
+    runner.add_task_complete_callback(slow_owner)
+    runner.start()
+    batch = _BatchWriter(writes)
+    queued = _RecordingGpuTask()
+    try:
+        runner.submit(batch)
+        assert batch.started.wait(5)
+        assert _until(lambda: len(writes) >= 3)
+        runner.submit(queued)
+
+        result = runner.pause_and_drain(timeout_s=5, reason="library restore")
+        written_at_return = len(writes)
+
+        assert result.drained is True
+        assert result.still_running == ()
+        assert writes[-1] == ("flush", None), "returned before the batch flushed"
+        assert batch.id in heard, "returned before the owner heard"
+        time.sleep(0.5)
+        assert len(writes) == written_at_return
+        assert not queued.ran.is_set()
+        assert type(endings[queued.id][0]) is TaskCancelledError
+
+        # Paused: a submission now is cancelled rather than run.
+        during = _RecordingGpuTask()
+        runner.submit(during)
+        assert during.status == TaskStatus.CANCELLED
+        assert type(endings[during.id][0]) is TaskCancelledError
+        assert "library restore" in str(endings[during.id][0])
+
+        runner.resume_admission("library restore")
+        after = _RecordingGpuTask()
+        runner.submit(after)
+        assert _until(lambda: after.id in endings)
+        assert after.status == TaskStatus.COMPLETED
+    finally:
+        runner.stop()
+    assert not during.ran.is_set()
+
+
+def test_a_drain_that_times_out_names_the_task_still_running():
+    runner, endings = _settling_runner("drain-timeout")
+    runner.start()
+    stuck = _HeldGpuTask()
+    try:
+        runner.submit(stuck)
+        assert stuck.started.wait(5)
+
+        started = time.monotonic()
+        result = runner.pause_and_drain(timeout_s=0.3, reason="library restore")
+        took = time.monotonic() - started
+
+        assert result.drained is False
+        assert [(t.task_id, t.task_type) for t in result.still_running] == [
+            (stuck.id, "CaptionTask")
+        ]
+        assert took < 2.0, "the timeout was not honoured"
+        # Still paused after a failed drain: the caller decides.
+        refused = _RecordingGpuTask()
+        runner.submit(refused)
+        assert refused.status == TaskStatus.CANCELLED
+
+        stuck.release.set()
+        assert _until(lambda: stuck.id in endings)
+        runner.resume_admission("library restore")
+        later = _RecordingGpuTask()
+        runner.submit(later)
+        assert _until(lambda: later.id in endings)
+        assert later.status == TaskStatus.COMPLETED
+    finally:
+        stuck.release.set()
+        runner.stop()

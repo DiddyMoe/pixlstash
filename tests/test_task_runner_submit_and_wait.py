@@ -5,6 +5,7 @@ No ``Server`` here: a bare runner with fake tasks reaches everything under test.
 """
 
 import threading
+import time
 
 import pytest
 
@@ -32,7 +33,13 @@ class _GpuTask(BaseTask):
 
 
 def test_a_timed_out_task_is_skipped_when_the_worker_reaches_it():
+    """Skipped, and settled as the cancellation it is: an owner told of it with
+    no error would take it for a task that finished and wrote nothing."""
     runner = TaskRunner(name="test-runner")
+    endings = {}
+    runner.add_task_complete_callback(
+        lambda task, error: endings.setdefault(task.id, error)
+    )
     runner.start()
     gate = threading.Event()
     blocker = _GpuTask(gate)
@@ -47,6 +54,13 @@ def test_a_timed_out_task_is_skipped_when_the_worker_reaches_it():
         assert late._done_event.wait(timeout=30), "the worker never reached it"
         assert not late.ran.is_set(), "a task nobody waits for still ran"
         assert late.status == TaskStatus.CANCELLED
+        # The waiter is woken before the owners are told.
+        deadline = time.monotonic() + 10
+        while late.id not in endings and time.monotonic() < deadline:
+            time.sleep(0.01)
+        ending = endings.get(late.id)
+        assert isinstance(ending, TaskCancelledError), ending
+        assert "cancelled before it started" in str(ending)
     finally:
         gate.set()
         runner.stop()

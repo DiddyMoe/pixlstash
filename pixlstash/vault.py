@@ -13,7 +13,7 @@ from typing import Collection, Optional
 from concurrent.futures import Future
 
 from sqlmodel import Session, select
-from sqlalchemy import func, and_, or_, update
+from sqlalchemy import func, or_, update
 
 
 from .database import DBPriority, VaultDatabase
@@ -26,9 +26,6 @@ from .db_models import (
     PictureSet,
     ReferenceFolder,
     Snapshot,
-    Tag,
-    TAG_SENTINEL_LIKE_PATTERN,
-    TAG_SENTINEL_ESCAPE_CHAR,
     DESCRIPTION_SENTINEL_LIKE_PATTERN,
     DESCRIPTION_SENTINEL_ESCAPE_CHAR,
     make_description_sentinel,
@@ -41,14 +38,21 @@ from .utils.image_processing.image_utils import ImageUtils
 from .tasks.description_task import describable_picture_clauses
 from .tasks.face_extraction_task import FaceExtractionTask
 from .tasks.image_embedding_task import ImageEmbeddingTask
+from .tasks.likeness_parameters_task import LikenessParametersTask
 from .tasks.likeness_task import LikenessTask
+from .tasks.missing_comfyui_extraction_finder import MissingComfyUIExtractionFinder
+from .tasks.missing_face_extraction_finder import MissingFaceExtractionFinder
+from .tasks.missing_tag_prediction_finder import MissingTagPredictionFinder
+from .tasks.missing_text_embedding_finder import MissingTextEmbeddingFinder
+from .tasks.missing_thumbnail_finder import MissingThumbnailFinder
 from .tasks.ocr_task import OcrTask
+from .tasks.orientation_task import OrientationTask
+from .tasks.pipeline_scope import pipeline_picture_clauses
 from .tasks.quality_task import QualityTask
 from .tasks.smart_score_task import SmartScoreTask
-from .utils.likeness.likeness_parameter_utils import LikenessParameterUtils
 from .tasks.base_task import TaskStatus
 from .tasks.device_release_task import DeviceReleaseTask
-from .task_runner import TaskRunner
+from .task_runner import TaskRunner, TaskRunnerStopped
 from .resources import cuda_checkpoint
 from .resources.aitoolkit_tenant import AiToolkitProbe
 from .resources.arbiter import Lease, LeaseKind, Tenant, arbiter
@@ -75,16 +79,21 @@ from pixlstash.services.set_lock_service import (
 )
 from pixlstash.utils.sql_chunking import chunked, not_in_json
 from pixlstash.utils.quality.tag_exclusion import (
-    excluded_spellings,
     exclusion_generation,
     exclusions_from_tagger_settings,
 )
-from pixlstash.services.scrapheap_run_service import ScrapheapRunRegistry
+from pixlstash.services.scrapheap_run_service import (
+    ScrapheapRunRegistry,
+    recover_runs,
+)
 from pixlstash.services.scrapheap_service import DEFAULT_RETENTION_DAYS
+from pixlstash.services.import_publish_service import PublishedPictures
 from pixlstash.services.workflow_ghost_service import DEFAULT_GHOST_RETENTION
 from pixlstash.services.snapshot_service import SnapshotService
 from pixlstash.utils.service.export_utils import ExportUtils
 from pixlstash.services.training_service import ADOPT_QUIET_S, TrainingService
+from pixlstash.services import comfyui_connections
+from pixlstash.utils.comfyui_url import SavedComfyUIAddressInvalid
 from pixlstash.services.comfyui_service import RUN_CLIENT_ID
 from pixlstash.services.stack_detector import set_cover
 from pixlstash.hub import training_runs
@@ -93,11 +102,20 @@ from pixlstash.services.model_mover import SHELF_IO_LOCK, publish_no_clobber
 from pixlstash.utils.aitoolkit_run import read_run
 from pixlstash.services.managed_model_store import find_download_folder
 from pixlstash.services.model_shelf_service import (
+    UnknownAttachmentEntityError,
     fetch_attachments,
     replace_attachments,
 )
 from pixlstash.db_models.adapter_attachment import ENTITY_CHARACTER, ENTITY_SET
 from pixlstash.services.restore import RestoreService
+from pixlstash.services.restore._models import TASK_LABELS, task_label
+from pixlstash.services.library_generation_coordinator import (
+    LibraryNotReadyError,
+    SwitchState,
+)
+from pixlstash.services.folder_structure_commit_service import (
+    reconcile_pending_people_with_faces,
+)
 from pixlstash.services.dedup_auto_stack_service import (
     interrupt_orphaned_runs_in_session,
 )
@@ -114,6 +132,23 @@ from pixlstash.services.model_folder_scanner import SHELF_MODEL_SUFFIXES
 
 logger = get_logger(__name__)
 
+# Each worker-progress row carries its task's label, and a refusal that names
+# the work in the way reads the same table. A TaskType with no label is a
+# programming error: checked here, where both modules are already imported
+# (``pixlstash.tasks`` imports the snapshot service, which imports the restore
+# package, so the restore models cannot import ``TaskType`` themselves).
+_unlabelled_task_types = sorted(
+    worker_type.value
+    for worker_type in TaskType
+    if worker_type.value not in TASK_LABELS
+)
+if _unlabelled_task_types:  # pragma: no cover - import-time invariant
+    raise RuntimeError(
+        "Every TaskType needs a label in TASK_LABELS (these have none): "
+        f"{_unlabelled_task_types}"
+    )
+del _unlabelled_task_types
+
 #: How long making room waits, on the arbiter's thread, for the GPU batch in
 #: flight to end and the models to unload; past it they unload when the batch
 #: ends, without the arbiter waiting.
@@ -128,6 +163,24 @@ FACE_FOLLOWUP_STOP_WAIT_S = 10.0
 #: The GPU worker task that unloads the models and suspends the CUDA context
 #: while a training run has the card (#2557).
 CUDA_SUSPEND_TASK = "SuspendCuda"
+
+#: The worker types whose tasks queue on the task runner's GPU lane (their
+#: ``BaseTask.queue_type``); every other worker type queues on the CPU lane.
+#: tests/test_vault_worker_lanes.py checks it against the task classes.
+GPU_LANE_WORKER_TYPES = frozenset(
+    {
+        TaskType.FACE_EXTRACTION,
+        TaskType.FACE_MODEL_REFRESH,
+        TaskType.DETECTION,
+        TaskType.TAGGER,
+        TaskType.TAG_PREDICTION_BACKFILL,
+        TaskType.DESCRIPTION,
+        TaskType.TEXT_EMBEDDING,
+        TaskType.IMAGE_EMBEDDING,
+        TaskType.PROMPT_MATCH,
+        TaskType.OCR,
+    }
+)
 
 
 def _move_trained_attachment(
@@ -153,7 +206,35 @@ def _move_trained_attachment(
     held = fetch_attachments(vault, sha256=new_sha).get(new_sha, [])
     kept = [(a["entity_type"], a["entity_id"]) for a in held]
     if entity not in kept:
-        replace_attachments(vault, new_sha, kept + [entity])
+        try:
+            replace_attachments(vault, new_sha, kept + [entity])
+        except UnknownAttachmentEntityError:
+            # The run outlived its set or character: deleted while it trained,
+            # or gone with a restore to a snapshot older than it. The LoRA is
+            # on the shelf already, so the run is not failed for it.
+            logger.warning(
+                "Training run %s (%s): its %s %s no longer exists in this "
+                "library, so LoRA %s stays on the shelf unattached.",
+                run.get("id"),
+                run.get("name"),
+                entity[0],
+                entity[1],
+                new_sha,
+                exc_info=True,
+            )
+
+
+class NotTheActiveLibraryError(LibraryNotReadyError):
+    """The vault finalizing a training run is no longer the active library.
+
+    A run imports only into the library that trained it, which is the vault
+    whose training service watched it. Once a switch has published another
+    vault, this one refuses, and the run's row stays for the reconcile the next
+    time its library opens.
+    """
+
+    def __str__(self) -> str:
+        return f"This vault is not the active library (admission {self.state.value})"
 
 
 class Vault:
@@ -280,6 +361,13 @@ class Vault:
         # Vault built without a Server - tests, the CLI tools - and the restore
         # path treats that as "nothing to reset".
         self.auth_service = None
+        # The server's LibraryGenerationCoordinator, attached by whoever
+        # publishes this vault as the active library (``Server.__init__`` and
+        # the library switch). A vault write that runs outside a request holds
+        # one of its read leases, so a restore or a switch waits for it. Stays
+        # ``None`` for a vault nobody published: tests, the CLI tools, and the
+        # library ``open_other_library`` opens to read.
+        self.library_coordinator = None
 
         self._engine: InferenceEngine | None = None
         self._force_cpu = force_cpu
@@ -338,6 +426,8 @@ class Vault:
         self._changed_tags_pending_ids: set[int] = set()
         self._changed_tags_flush_timer: threading.Timer | None = None
         self._changed_tags_flush_delay_s = 2.0
+        # Set while quiesce_background_writers has the watcher stopped.
+        self._ref_folder_watcher_quiesced = False
         self._event_listeners = []
         self._event_listeners_lock = threading.Lock()
         self._path_mapper = path_mapper
@@ -358,6 +448,10 @@ class Vault:
         # workers can still answer "no run" rather than raise; it refuses to
         # start one (scrapheap_run_service.start_run).
         self.scrapheap_runs = ScrapheapRunRegistry()
+        # Set by the first start(), which closes the runs a previous process
+        # left active; start() runs more than once per vault (Server init and
+        # lifespan), and a later call must not interrupt this process's runs.
+        self._runs_recovered = False
 
         if disable_background_workers:
             logger.info(
@@ -380,6 +474,8 @@ class Vault:
         # Lease ids PixlStash made room for, each holding the planner.
         self._yield_holds: set[str] = set()
         self._cuda_suspend_task: Optional[DeviceReleaseTask] = None
+        # Suspends in a row a worker that could not start kept off the queue.
+        self._cuda_suspend_queue_failures = 0
         self._task_runner = TaskRunner(
             name="vault-task-runner",
             num_workers=worker_config.NUM_WORKERS,
@@ -518,10 +614,6 @@ class Vault:
             # `comfyui_models IS NULL` predicate -- it is only the WORKFLOW scan
             # it cannot do, because without a hub there is nowhere to file a
             # graph.
-            from pixlstash.tasks.missing_comfyui_extraction_finder import (
-                MissingComfyUIExtractionFinder,
-            )
-
             self._planner_work_finders[TaskType.COMFYUI_EXTRACTION] = (
                 MissingComfyUIExtractionFinder(
                     database=self.db,
@@ -590,26 +682,49 @@ class Vault:
 
         Must be called once after configuration is complete (e.g. from
         ``Server.lifespan``).  Idempotent: subsequent calls are no-ops.
-        When ``disable_background_workers=True`` this method is a no-op.
+        When ``disable_background_workers=True`` only the run records are
+        reconciled; no worker starts.
         """
+        if not self._runs_recovered:
+            self._runs_recovered = True
+            # An auto-stack or Scrapheap run the previous process left pending or
+            # running has no task to own it any more. Close it as interrupted
+            # before the planner can queue it: a run is never resumed, the user
+            # decides whether to run again. Before the no-worker return, so a
+            # server without workers still reports how such a run ended rather
+            # than showing it running forever.
+            self.db.run_task(
+                interrupt_orphaned_runs_in_session, priority=DBPriority.IMMEDIATE
+            )
+            recover_runs(self)
         if self._disable_background_workers or self._started:
             return
-        # An auto-stack run the previous process left pending or running has no
-        # task to own it any more. Close it as interrupted before the planner can
-        # queue it: a run is never resumed, the user decides whether to run again.
-        self.db.run_task(
-            interrupt_orphaned_runs_in_session, priority=DBPriority.IMMEDIATE
-        )
+        # A pending person on a picture that already has faces is never offered
+        # again by the face finder; close what a crash or a timed-out stop left.
+        reconcile_pending_people_with_faces(self)
         # A trainer that outlived the restart gets its card before PixlStash's
         # own GPU workers start, so none of them loads a model under it.
         self.training_service.adopt_live_runs()
-        self._task_runner.start()
-        self._work_planner.start()
+        if self._task_runner.start():
+            self._work_planner.start()
+        else:
+            # Refused beside a worker that outlived the last stop, or during a
+            # stop (logged by the runner). The planner is not started: every
+            # cycle would claim work, have the stopped runner refuse it and
+            # release it again, warning each time. Background work is then
+            # reported as unavailable with the planner not alive ("restart
+            # the server", ``worker_unavailable_reason``), and every
+            # submission is refused as stopped (``submit_task`` answers None).
+            # The watchers below still start.
+            logger.error(
+                "The task runner did not start (a stop is still under way, or a "
+                "worker from its last stop is still running); the work planner "
+                "is not started either. Background work is off until a restart."
+            )
         self._arbiter.add_yielder(self._yield_gpu)
         self._arbiter.add_listener(self._on_resource_lease)
         self._arbiter.set_suspender(self._queue_cuda_suspend)
-        self._ref_folder_watcher.start()
-        self._start_existing_folder_watches()
+        self._start_reference_folder_watches()
         if self._model_folder_watcher is not None:
             self._model_folder_watcher.start()
         # Reconcile before the training worker starts: a trainer that survived a
@@ -974,6 +1089,65 @@ class Vault:
         self._closed = True
         self.stop()
 
+    def quiesce_background_writers(self, timeout_s: float) -> list[str]:
+        """Stop the vault's own writers that no task or lease fences.
+
+        For a full restore, after the task runner has drained: the changed-tags
+        flush timer, the reference-folder watcher, and face extraction's
+        follow-ups. The first two would act on ids from the database the
+        restore replaces; a follow-up is a write still queued after its task
+        ended, which the drain does not see. ``resume_background_writers``
+        undoes it, on whichever database file is then live.
+
+        Args:
+            timeout_s: How long to wait for the face follow-ups.
+
+        Returns:
+            What is still running: ``["face extraction follow-up"]`` when a
+            follow-up outlived the wait, else ``[]``. The caller refuses the
+            restore rather than swap the file under it.
+        """
+        self._cancel_changed_tags_flush()
+        if self._started and self._ref_folder_watcher is not None:
+            # Marked first: a stop that raises partway has still marked the
+            # watcher stopped, and the resume must start a new observer.
+            self._ref_folder_watcher_quiesced = True
+            self._ref_folder_watcher.stop()
+        if self._wait_for_face_followups(timeout_s):
+            return ["face extraction follow-up"]
+        return []
+
+    def resume_background_writers(self) -> None:
+        """Restart what ``quiesce_background_writers`` stopped.
+
+        The reference-folder watches are read again from the live database,
+        because a restore may have replaced the folders they named. The
+        changed-tags timer re-arms on the next change; follow-ups need nothing.
+        Does nothing for a watcher the quiesce did not stop, so a restore may
+        call it on every exit path, including after a quiesce that raised.
+        """
+        if self._started and self._ref_folder_watcher_quiesced:
+            self._ref_folder_watcher_quiesced = False
+            self._start_reference_folder_watches()
+
+    def _start_reference_folder_watches(self) -> None:
+        """Start the reference-folder watcher and watch every folder it has."""
+        self._ref_folder_watcher.start()
+        self._start_existing_folder_watches()
+
+    def _cancel_changed_tags_flush(self) -> None:
+        """Cancel the changed-tags flush timer and drop the ids it would send.
+
+        The event names pictures in the current database; sent after a restore
+        or a close it would name rows that are not those pictures, or none.
+        """
+        with self._changed_tags_notify_lock:
+            timer = self._changed_tags_flush_timer
+            self._changed_tags_flush_timer = None
+            self._changed_tags_pending_ids.clear()
+        if timer is not None:
+            timer.cancel()
+
     def stop(self) -> None:
         """Stop background workers and release all resources.
 
@@ -985,12 +1159,7 @@ class Vault:
         follow-ups: the face writes still on the writer and the pending-person
         matches they queue when they land (see `_after_face_writes_land`).
         """
-        with self._changed_tags_notify_lock:
-            timer = self._changed_tags_flush_timer
-            self._changed_tags_flush_timer = None
-            self._changed_tags_pending_ids.clear()
-        if timer is not None:
-            timer.cancel()
+        self._cancel_changed_tags_flush()
         # A snapshot copies and compresses off the writer and can take minutes.
         # Cancel it first so it removes its files and ends before the workers
         # are joined and the database is closed under it.
@@ -1206,7 +1375,7 @@ class Vault:
             self._library_uuid,
             self.image_root,
             request_gpu=self._request_training_gpu,
-            import_run=self._import_training_run,
+            import_run=self._import_training_run_under_lease,
             notify=self.notify,
             config_provider=self._training_config_provider,
             dataset_builder=dataset_builder,
@@ -1241,7 +1410,70 @@ class Vault:
             "python": user.ai_toolkit_python,
         }
 
-    def _import_training_run(self, run_dir: str, info: dict) -> dict:
+    def _import_training_run_under_lease(self, run_dir: str, info: dict) -> dict:
+        """Import a finished run into the active library, leased only to attach it.
+
+        The run starts only while this vault is the active library and no
+        restore or switch holds admission. Its checkpoints then go to the shelf
+        with no lease held: the shelf is the hub's, which a restore or a switch
+        does not replace, and hashing and copying a large LoRA can outlast the
+        time a switch waits for its readers. The attachment to the run's set or
+        character writes this vault's database, so it alone is leased.
+
+        Refused at the attachment, the LoRA is on the shelf and unattached. The
+        caller asks again, and :meth:`_import_training_run` answers that retry
+        from the shelf and attaches it then.
+
+        Args:
+            run_dir: The ai-toolkit run folder holding the checkpoints.
+            info: The run's fields, as :meth:`_import_training_run`.
+
+        Returns:
+            What :meth:`_import_training_run` returns.
+
+        Raises:
+            LibraryNotReadyError: A restore or a switch holds admission (SWITCHING:
+                the caller asks again), or no coherent library is open
+                (UNAVAILABLE). Raised at the start nothing was imported; raised
+                at the attachment the LoRA is on the shelf, unattached.
+            NotTheActiveLibraryError: Another vault is the active library.
+        """
+        coordinator = self.library_coordinator
+        if coordinator is None:
+            logger.info(
+                "Training run %s imports without a library lease: no coordinator "
+                "is attached to the vault at %s.",
+                info.get("id"),
+                self.image_root,
+            )
+            return self._import_training_run(run_dir, info)
+        # Admitted, then given back at once: the lease answers whether the run
+        # may start, and is not held over the copy.
+        # A lease is granted only while admission is READY: that is the state
+        # the refusal below reports, not ``coordinator.state`` read afterwards
+        # outside its lock, where a switch begun since would read as SWITCHING.
+        lease = coordinator.acquire_read_or_raise()
+        try:
+            if lease.vault is not self:
+                raise NotTheActiveLibraryError(SwitchState.READY)
+        finally:
+            coordinator.release_read(lease)
+        result = self._import_training_run(run_dir, info, attach=False)
+        cover_sha = result.get("cover_sha256")
+        if cover_sha is None:
+            return result
+        lease = coordinator.acquire_read_or_raise()
+        try:
+            if lease.vault is not self:
+                raise NotTheActiveLibraryError(SwitchState.READY)
+            _move_trained_attachment(self, info, None, cover_sha)
+        finally:
+            coordinator.release_read(lease)
+        return result
+
+    def _import_training_run(
+        self, run_dir: str, info: dict, *, attach: bool = True
+    ) -> dict:
         """Bring a finished ai-toolkit run onto the model shelf as the job's LoRA.
 
         The one path a trained LoRA takes onto the shelf: the run importer, into
@@ -1249,11 +1481,17 @@ class Vault:
         LoRA download follows), with provenance ``trained``. The cover (stack
         position 0) is then attached to the job's character or set.
 
+        A first run whose bare final is on the shelf already (an earlier import
+        of it was cut short before its end state or its attachment) answers from
+        the shelf and imports nothing: its cover is the head of its stack.
+
         Args:
             run_dir: The ai-toolkit run folder holding the checkpoints.
             info: The run's fields (``id``, ``name``, ``set_id``,
                 ``character_id``). ``id`` is the hub ``training_run`` row every
                 imported model is stamped with.
+            attach: Attach the cover to the run's set or character. False when
+                the caller attaches it under a lease of its own.
 
         Returns:
             ``{"stack_id", "imported", "cover_sha256"}``. ``cover_sha256`` is
@@ -1267,6 +1505,46 @@ class Vault:
         hub = self._hub
         if hub is None:
             raise RuntimeError("No model shelf is open to receive the trained LoRA.")
+        if info.get("continued_from_step") is None:
+            with SHELF_IO_LOCK:
+                final = hub.fetchone(
+                    "SELECT sha256, stack_id FROM model "
+                    "WHERE training_run_id = ? AND training_step IS NULL",
+                    (info["id"],),
+                )
+                if final is not None:
+                    imported = hub.fetchone(
+                        "SELECT COUNT(*) AS n FROM model WHERE training_run_id = ?",
+                        (info["id"],),
+                    )["n"]
+                    head = (
+                        None
+                        if final["stack_id"] is None
+                        else hub.fetchone(
+                            "SELECT sha256 FROM model "
+                            "WHERE training_run_id = ? AND stack_id = ? "
+                            "ORDER BY stack_position IS NULL, stack_position, id "
+                            "LIMIT 1",
+                            (info["id"], final["stack_id"]),
+                        )
+                    )
+            if final is not None:
+                cover_sha = final["sha256"] if head is None else head["sha256"]
+                logger.info(
+                    "Training run %s (%s) is on the shelf already (stack %s, %d "
+                    "file(s)); nothing is imported again.",
+                    info["id"],
+                    info.get("name"),
+                    final["stack_id"],
+                    imported,
+                )
+                if attach:
+                    _move_trained_attachment(self, info, None, cover_sha)
+                return {
+                    "stack_id": final["stack_id"],
+                    "imported": imported,
+                    "cover_sha256": cover_sha,
+                }
         folder = find_download_folder(hub)
         if folder is None:
             raise RuntimeError("No model folder is set up to receive the trained LoRA.")
@@ -1373,7 +1651,7 @@ class Vault:
                 info.get("name"),
             )
 
-        if cover_sha is not None:
+        if cover_sha is not None and attach:
             _move_trained_attachment(self, info, None, cover_sha)
 
         return {
@@ -1585,6 +1863,10 @@ class Vault:
             job_id=job_uuid,
         )
 
+    # Whether the last _watch_comfyui found the saved address refused, so its
+    # warning is said once per change rather than once per training run.
+    _comfyui_address_refused = False
+
     def _watch_comfyui(self) -> None:
         """Point the arbiter's ComfyUI probe at the owner's ComfyUI.
 
@@ -1609,7 +1891,26 @@ class Vault:
                 exc,
             )
             return
-        url = (getattr(user, "comfyui_url", None) or "").rstrip("/")
+        try:
+            url = comfyui_connections.current_base(user, None)
+        except SavedComfyUIAddressInvalid:
+            # Nothing is sent to an address the normaliser refuses, and the
+            # run goes ahead without ComfyUI's memory in view, as with none
+            # saved. request_base has logged the connection id.
+            if not self._comfyui_address_refused:
+                logger.warning(
+                    "The saved ComfyUI address is not valid, so training runs "
+                    "wait without ComfyUI's memory in view until it is set "
+                    "again in Settings"
+                )
+            self._comfyui_address_refused = True
+            return
+        if self._comfyui_address_refused:
+            logger.info(
+                "The saved ComfyUI address was set again or cleared; it is "
+                "no longer refused"
+            )
+        self._comfyui_address_refused = False
         if url:
             comfyui_probe(RUN_CLIENT_ID, url)
 
@@ -1928,11 +2229,61 @@ class Vault:
 
         self.db.submit_task(op, priority=DBPriority.IMMEDIATE)
 
+    def runs_background_work(self) -> bool:
+        """Whether this vault has a task runner to take background tasks.
+
+        ``False`` when the server started with ``disable_background_workers``:
+        :meth:`submit_task` then returns ``None`` and nothing runs. A caller
+        that must refuse before it spends anything (a run's confirm token, a
+        recorded run row) asks this first. A runner that has stopped still
+        answers ``True``; its :meth:`submit_task` then returns ``None``.
+        """
+        return self._task_runner is not None
+
+    def refuse_while_admission_paused(self) -> None:
+        """Raise ``TaskAdmissionRefused`` now if a restore has paused admission.
+
+        For a request that spends something before it submits its task (a
+        purge's single-use confirm token): asked first, the refusal comes
+        before the spend. A look only; see ``TaskRunner.refuse_while_paused``.
+        Nothing to refuse without a runner.
+
+        Raises:
+            TaskAdmissionRefused: Admission is paused.
+        """
+        if self._task_runner is not None:
+            self._task_runner.refuse_while_paused()
+
     def submit_task(self, task):
-        """Submit an in-memory task to the shared task runner."""
+        """Submit an in-memory task to the shared task runner.
+
+        Returns:
+            The task id, or None when nothing will run it: there is no runner
+            (``disable_background_workers``), or it has stopped (a shutdown, a
+            library switch, or a ``start()`` refused beside a worker that
+            outlived the last stop). Every caller takes None as "not taken";
+            the stop is logged here, once, with the task.
+
+        Raises:
+            RuntimeError: A dead worker's replacement thread could not start
+                (see ``TaskRunner.submit``). Not a stop, so not None.
+            TaskAdmissionRefused: The task is a person's and a library restore
+                has paused admission (see ``TaskRunner.submit``). Not None
+                either: the caller undoes what it set up for the task, and the
+                person is told to try again (the server answers 409).
+        """
         if self._task_runner is None:
             return None
-        return self._task_runner.submit(task)
+        try:
+            return self._task_runner.submit(task)
+        except TaskRunnerStopped as exc:
+            logger.warning(
+                "Task %s (%s) not queued: the task runner has stopped (%s).",
+                task.id,
+                task.type,
+                exc,
+            )
+            return None
 
     @staticmethod
     def _release_task_library_lease(task, error):
@@ -2211,13 +2562,21 @@ class Vault:
         def _settled() -> None:
             match: Future | None = None
             try:
-                failures = [f.exception() for f in writes if f.exception() is not None]
-                if failures:
+                # `Future.exception()` raises CancelledError on a cancelled
+                # future, so ask `cancelled()` first.
+                cancelled = [f for f in writes if f.cancelled()]
+                failures = [
+                    f.exception()
+                    for f in writes
+                    if not f.cancelled() and f.exception() is not None
+                ]
+                if cancelled or failures:
                     logger.warning(
-                        "Face rows for pictures %s did not land (%s); not "
-                        "announcing them and leaving their pending people "
-                        "waiting.",
+                        "Face rows for pictures %s did not land (%d cancelled, "
+                        "failures %s); not announcing them and leaving their "
+                        "pending people waiting.",
                         picture_ids,
+                        len(cancelled),
                         failures,
                     )
                     return
@@ -2254,20 +2613,28 @@ class Vault:
             self._face_followups.pop(tail, None)
         tail.set_result(None)
 
-    def _wait_for_face_followups(self) -> None:
-        """Wait, up to ``FACE_FOLLOWUP_STOP_WAIT_S``, for face extraction's
-        follow-ups to finish, so closing the writer does not drop a queued
+    def _wait_for_face_followups(self, timeout_s: float | None = None) -> int:
+        """Wait for face extraction's follow-ups to finish, so closing the
+        writer (or a restore swapping its file) does not drop a queued
         pending-person match. Never called from the writer thread, which is
-        what finishes them."""
+        what finishes them.
+
+        Args:
+            timeout_s: How long to wait; ``None`` is ``FACE_FOLLOWUP_STOP_WAIT_S``,
+                read when called.
+
+        Returns:
+            How many follow-ups are still unfinished.
+        """
+        if timeout_s is None:
+            timeout_s = FACE_FOLLOWUP_STOP_WAIT_S
         with self._face_followups_lock:
             waiting = list(self._face_followups)
         if not waiting:
-            return
-        _, unfinished = concurrent.futures.wait(
-            waiting, timeout=FACE_FOLLOWUP_STOP_WAIT_S
-        )
+            return 0
+        _, unfinished = concurrent.futures.wait(waiting, timeout=timeout_s)
         if not unfinished:
-            return
+            return 0
         with self._face_followups_lock:
             left = sorted(
                 {
@@ -2277,13 +2644,15 @@ class Vault:
                 }
             )
         logger.warning(
-            "Stopping with %s face extraction follow-up(s) unfinished after "
-            "%.1f s, for pictures %s: the writer closes without their "
-            "pending-person match, and those pictures keep their pending people.",
+            "%s face extraction follow-up(s) unfinished after %.1f s, for "
+            "pictures %s. A close goes ahead without their pending-person "
+            "match, and those pictures keep their pending people; a restore "
+            "refuses rather than replace the database under them.",
             len(unfinished),
-            FACE_FOLLOWUP_STOP_WAIT_S,
+            timeout_s,
             left,
         )
+        return len(unfinished)
 
     def _process_pending_character_assignments(
         self, picture_ids: list[int], *, wait: bool = True
@@ -2312,6 +2681,9 @@ class Vault:
         """
 
         def _assign_if_pending(session: Session) -> bool:
+            # Bound directly: *picture_ids* is one face-extraction batch
+            # (FACE_EXTRACTION_BATCH_LIMIT, 100) or one ``chunked`` piece from
+            # the folder-structure commit, under SQLite's parameter limit.
             pending = session.exec(
                 select(Picture).where(
                     Picture.id.in_(picture_ids),
@@ -2484,19 +2856,23 @@ class Vault:
         to be alive, and a finder for this task type has to still be registered
         with it. Ignoring the argument meant a dead planner and a detached
         finder produced the same answer, and callers reported whichever symptom
-        they happened to name.
+        they happened to name. The lane its tasks queue on also needs a live
+        worker; `worker_unavailable_reason` holds all three checks.
         """
-        if not self._work_planner or not self._work_planner.is_running():
-            return False
-        return self._work_planner.has_finder(worker_type)
+        return self.worker_unavailable_reason(worker_type) is None
 
     def worker_unavailable_reason(self, worker_type: TaskType) -> str | None:
         """Why *worker_type* is not schedulable, or None when it is.
 
-        Callers that refuse a request need to say which of the two conditions
-        failed; "the worker is not running" reads as a configuration choice and
-        has sent every investigation of a dead planner thread down the wrong
-        path.
+        Callers that refuse a request need to say which condition failed; "the
+        worker is not running" reads as a configuration choice and has sent
+        every investigation of a dead planner thread down the wrong path.
+
+        A lane whose workers have all exited is replaced here
+        (`_replace_dead_lane`) rather than reported: a refusal that waited for
+        the next ``submit()`` to replace it would itself hold back the
+        submission that does. A replacement that cannot start is logged, and
+        the lane is reported dead, never raised to the caller.
         """
         if not self._work_planner:
             return "the background work planner was never started"
@@ -2507,10 +2883,82 @@ class Vault:
             )
         if not self._work_planner.has_finder(worker_type):
             return f"no {worker_type} finder is registered with the work planner"
+        try:
+            lane = self._replace_dead_lane(worker_type)
+        except RuntimeError as exc:
+            # replace_dead_workers raises when a replacement thread cannot start
+            # (Thread.start). The runner logged that failure with its traceback;
+            # the lane is read again, since a repair can fail on one slot after
+            # another came back.
+            lane = self._dead_lane(worker_type)
+            logger.error(
+                "Checking %s, the task runner could not start a replacement "
+                "worker: %s: %s. %s",
+                worker_type.value,
+                type(exc).__name__,
+                exc,
+                f"Its {lane.upper()} lane still has no live worker, so it is "
+                "reported unavailable."
+                if lane is not None
+                else "Its lane has a live worker, so it is still available.",
+            )
+        if lane is not None:
+            return (
+                f"the task runner's {lane.upper()} worker has exited and could "
+                "not be replaced; restart the server"
+            )
         return None
+
+    def _dead_lane(self, worker_type: TaskType) -> str | None:
+        """The runner lane *worker_type* queues on, when it has no live worker.
+
+        Read from ``TaskRunner.lane_health`` on every call, never cached: the
+        next ``submit()`` or planner tick replaces a dead worker, and the answer
+        clears with it.
+
+        Returns:
+            ``"gpu"`` or ``"cpu"`` while the runner is meant to be running and
+            that lane's ``alive`` is 0; None otherwise, including when there is
+            no runner or it is stopped (nothing is meant to run then).
+        """
+        runner = self._task_runner
+        if runner is None:
+            return None
+        health = runner.lane_health()
+        lane = "gpu" if worker_type in GPU_LANE_WORKER_TYPES else "cpu"
+        if health["running"] and health[lane]["alive"] == 0:
+            return lane
+        return None
+
+    def _replace_dead_lane(self, worker_type: TaskType) -> str | None:
+        """Replace the dead workers of *worker_type*'s lane, if it has none alive.
+
+        ``TaskRunner.replace_dead_workers`` is the runner's repair path: it
+        logs each replacement with the lane's restart count (``lane_health``
+        keeps the last failure), and it never reopens a runner that a stop
+        landing meanwhile has closed.
+
+        Returns:
+            The lane, when it still has no live worker afterwards; else None.
+        """
+        lane = self._dead_lane(worker_type)
+        if lane is None:
+            return None
+        logger.error(
+            "The task runner's %s lane has no live worker while %s needs it; "
+            "replacing it now.",
+            lane,
+            worker_type.value,
+        )
+        self._task_runner.replace_dead_workers()
+        return self._dead_lane(worker_type)
 
     def _is_worker_active(self, worker_type: TaskType) -> bool:
         if not self._work_planner or not self._work_planner.is_running():
+            return False
+        # Work queued on a lane with no live worker is not being done, however
+        # many tasks the planner counts in flight for it.
+        if self._dead_lane(worker_type) is not None:
             return False
         finder = self._planner_work_finders.get(worker_type)
         if finder is None:
@@ -2545,17 +2993,19 @@ class Vault:
 
     def _build_worker_progress_snapshot(self) -> dict:
         progress = {}
-        # Counted once per snapshot. It used to be re-counted for every worker
-        # type (39 full counts per poll), although only the picture-scoped
-        # branches below read it.
-        library_total = int(
+        # The total of every per-picture row: the pictures the pipeline works
+        # on, live and with a file (``pipeline_picture_clauses``), the set each
+        # of those finders draws from. Counting the whole table put the
+        # Scrapheap in every total, so a library of 500 live pictures read
+        # "1,500 / 1,500". Counted once per snapshot, not once per worker type.
+        pipeline_total = int(
             self.db.run_immediate_read_task(self._count_total_pictures) or 0
         )
         for worker_type in TaskType.all():
             # When set by a branch below, this overrides the finder-based
             # activity check (used by user-triggered tasks that have no finder).
             worker_active_override = None
-            total = library_total
+            total = pipeline_total
             if worker_type == TaskType.DESCRIPTION:
                 missing = int(
                     self.db.run_immediate_read_task(self._count_missing_descriptions)
@@ -2849,6 +3299,9 @@ class Vault:
             )
             progress[worker_type.value] = {
                 "label": label,
+                # What a person calls the task; ``label`` is the progress
+                # state, which the panel maps to its own words.
+                "task_label": task_label(worker_type.value),
                 "current": max(total - missing, 0),
                 "total": total,
                 "remaining": max(missing, 0),
@@ -2861,7 +3314,11 @@ class Vault:
 
     @staticmethod
     def _count_total_pictures(session: Session) -> int:
-        result = session.exec(select(func.count()).select_from(Picture)).one()
+        """The total of the per-picture progress rows: the pictures the
+        pipeline works on (live, with a file), not the whole table."""
+        result = session.exec(
+            select(func.count()).select_from(Picture).where(*pipeline_picture_clauses())
+        ).one()
         if isinstance(result, (tuple, list)):
             return result[0]
         return result or 0
@@ -2891,15 +3348,15 @@ class Vault:
             return result[0]
         return result or 0
 
-    @staticmethod
-    def _count_missing_orientations(session: Session) -> int:
-        """Mirrors ``OrientationTask.find_pictures_missing_orientation``."""
+    def _count_missing_orientations(self, session: Session) -> int:
+        """The pictures ``OrientationTask.find_pictures_missing_orientation``
+        will hand out: its own clauses, less the suppressed pictures it skips."""
+        suppressed_ids = self.db.unprocessable_images.active_suppressed_ids()
         result = session.exec(
             select(func.count())
             .select_from(Picture)
-            .where(Picture.orientation.is_(None))
-            .where(Picture.deleted.is_(False))
-            .where(Picture.file_path.is_not(None))
+            .where(*OrientationTask.missing_orientation_clauses())
+            .where(not_in_json(Picture.id, suppressed_ids))
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]
@@ -2918,9 +3375,7 @@ class Vault:
         stmt = (
             select(func.count())
             .select_from(Picture)
-            .where(Picture.thumbnail_width.is_(None))
-            .where(Picture.deleted.is_(False))
-            .where(Picture.file_path.is_not(None))
+            .where(*MissingThumbnailFinder.missing_thumbnail_clauses())
             .where(not_in_json(Picture.id, suppressed_ids))
         )
         result = session.exec(stmt).one()
@@ -2956,50 +3411,49 @@ class Vault:
             return result[0]
         return result or 0
 
-    @staticmethod
-    def _count_missing_tags(session: Session) -> int:
-        has_sentinel = Tag.tag.like(
-            TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
-        )
-        result = session.exec(
-            select(func.count())
-            .select_from(Picture)
-            .where(Picture.tags.any(has_sentinel))
-        ).one()
-        if isinstance(result, (tuple, list)):
-            return result[0]
-        return result or 0
+    def _count_missing_tags(self, session: Session) -> int:
+        # The finder's own count (`TagTask.count_missing_tags`): this used to
+        # count every sentinel, scrapheaped, file-less, locked and unreadable
+        # pictures included, none of which the tagger will ever take, so the
+        # bar never reached done. Imported here as `retag_picture_interactive`
+        # imports it: `tag_task` pulls in the inference stack.
+        from pixlstash.tasks.tag_task import TagTask
 
-    @staticmethod
-    def _count_missing_tag_predictions(session: Session) -> int:
+        return TagTask.count_missing_tags(
+            session, self.db.unprocessable_images.active_suppressed_ids()
+        )
+
+    def _count_missing_tag_predictions(self, session: Session) -> int:
         """Count pictures with real tags but no tag-prediction rows.
 
         These were tagged before predictions were written inline (or by a
         different engine then); the MissingTagPredictionFinder back-fills them.
+        Its own clauses, less the suppressed pictures it skips.
         """
-        has_sentinel = Tag.tag.like(
-            TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
-        )
-        real_tag = [Tag.tag.is_not(None), ~has_sentinel]
-        # Mirrors the finder: only removed-from-tagging tags is nothing to do.
-        removed = excluded_spellings(session, Tag.tag)
-        if removed:
-            real_tag.append(~Tag.tag.in_(removed))
-        has_real_tag = Picture.tags.any(and_(*real_tag))
-        no_prediction = ~Picture.tag_predictions.any()
+        suppressed_ids = self.db.unprocessable_images.active_suppressed_ids()
         result = session.exec(
             select(func.count())
             .select_from(Picture)
-            .where(has_real_tag, no_prediction, Picture.deleted.is_(False))
+            .where(
+                *MissingTagPredictionFinder.missing_prediction_clauses(session),
+                not_in_json(Picture.id, suppressed_ids),
+            )
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]
         return result or 0
 
-    @staticmethod
-    def _count_missing_feature_extractions(session: Session) -> int:
+    def _count_missing_feature_extractions(self, session: Session) -> int:
+        """The pictures ``MissingFaceExtractionFinder`` will hand out: its own
+        clauses, less the suppressed pictures it skips."""
+        suppressed_ids = self.db.unprocessable_images.active_suppressed_ids()
         result = session.exec(
-            select(func.count()).select_from(Picture).where(~Picture.faces.any())
+            select(func.count())
+            .select_from(Picture)
+            .where(
+                *MissingFaceExtractionFinder.missing_face_clauses(),
+                not_in_json(Picture.id, suppressed_ids),
+            )
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]
@@ -3013,34 +3467,52 @@ class Vault:
 
     @staticmethod
     def _count_total_described(session: Session) -> int:
+        """The text-embedding row's total: the described pictures the pipeline
+        works on (live, with a file)."""
         result = session.exec(
             select(func.count())
             .select_from(Picture)
-            .where(Picture.description.is_not(None))
+            .where(Picture.description.is_not(None), *pipeline_picture_clauses())
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]
         return result or 0
 
-    @staticmethod
-    def _count_missing_text_embeddings(session: Session) -> int:
+    def _count_missing_text_embeddings(self, session: Session) -> int:
+        """Described pictures ``MissingTextEmbeddingFinder`` has still to embed:
+        its own clauses, less the suppressed pictures it skips. A picture whose
+        description or tags are still pending is counted: it is waiting, and
+        the finder takes it once they land."""
+        suppressed_ids = self.db.unprocessable_images.active_suppressed_ids()
         result = session.exec(
             select(func.count())
             .select_from(Picture)
-            .where(Picture.description.is_not(None))
-            .where(Picture.text_embedding.is_(None))
+            .where(
+                Picture.description.is_not(None),
+                *MissingTextEmbeddingFinder.missing_text_embedding_clauses(),
+                not_in_json(Picture.id, suppressed_ids),
+            )
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]
         return result or 0
 
-    @staticmethod
-    def _count_missing_comfyui_extraction(session: Session) -> int:
+    def _count_missing_comfyui_extraction(self, session: Session) -> int:
+        """The pictures the registered ComfyUI finder will hand out: its own
+        clauses, on the predicate it is running now (the workflow scan once a
+        hub is attached, until it stands down), less the suppressed pictures it
+        skips. Counted on ``comfyui_models`` alone it read done while a workflow
+        scan still had the library to go."""
+        finder = self._planner_work_finders.get(TaskType.COMFYUI_EXTRACTION)
+        scanning_workflows = finder.scanning_workflows if finder is not None else False
+        suppressed_ids = self.db.unprocessable_images.active_suppressed_ids()
         result = session.exec(
             select(func.count())
             .select_from(Picture)
-            .where(Picture.comfyui_models.is_(None))
-            .where(Picture.deleted.is_(False))
+            .where(
+                *MissingComfyUIExtractionFinder.unscanned_clauses(scanning_workflows)
+            )
+            .where(not_in_json(Picture.id, suppressed_ids))
         ).one()
         if isinstance(result, (tuple, list)):
             return result[0]
@@ -3054,15 +3526,20 @@ class Vault:
             session, suppressed_ids=suppressed_ids
         )
 
-    @staticmethod
-    def _count_pending_likeness_parameters(session: Session) -> int:
-        return LikenessParameterUtils.count_pending_parameters(session)
+    def _count_pending_likeness_parameters(self, session: Session) -> int:
+        """The pictures owed likeness parameters that the finder will offer:
+        an unprocessable one still waiting on its quality score never gets
+        it, so it is left out and "remaining" can reach 0."""
+        return LikenessParametersTask.count_pending(
+            session, self.db.unprocessable_images.active_suppressed_ids()
+        )
 
-    @staticmethod
-    def _count_missing_text_score(session: Session) -> int:
+    def _count_missing_text_score(self, session: Session) -> int:
         from pixlstash.tasks.text_score_task import TextScoreTask
 
-        return TextScoreTask.count_missing_text_score(session)
+        return TextScoreTask.count_missing_text_score(
+            session, self.db.unprocessable_images.active_suppressed_ids()
+        )
 
     @staticmethod
     def _count_pending_likeness_queue(session: Session) -> int:
@@ -3151,7 +3628,7 @@ class Vault:
         task = DeviceReleaseTask("UnloadModels", self.unload_models, when=when)
         try:
             runner.submit(task)
-        except RuntimeError as exc:
+        except TaskRunnerStopped as exc:
             # The runner is closed. Vault.stop() releases the models once the
             # GPU worker has exited; if the worker outlives the stop it skips
             # the release rather than flush under it, and nothing unloads them.
@@ -3160,6 +3637,25 @@ class Vault:
                 "releases the models if the GPU worker exits; if it outlived the "
                 "stop they stay resident until the process exits: %s",
                 exc,
+            )
+            return None
+        except RuntimeError as exc:
+            # submit() raises this, before it touches the task, when a dead
+            # worker's replacement thread cannot start (Thread.start). Not a
+            # stop, and not run here instead: the GPU worker was alive a moment
+            # ago, and a flush beside it kills a Metal process. Raised on, it
+            # failed the request that asked for the idle unload (the worker
+            # progress poll, or switching "keep models in memory" off after the
+            # setting was saved), and lost the make-room yield the GPU work it
+            # had just paused (_yield_gpu).
+            logger.error(
+                "Model unload %s not queued: the task runner could not start a "
+                "replacement worker (%s: %s). It is not run beside the live GPU "
+                "worker; the models stay loaded until an unload is queued again.",
+                task.id,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
             )
             return None
         return task
@@ -3278,12 +3774,39 @@ class Vault:
         )
         try:
             runner.submit(task)
-        except RuntimeError as exc:
+        except TaskRunnerStopped as exc:
             logger.warning(
                 "Could not queue the CUDA suspend, the task runner is stopped: %s",
                 exc,
             )
             return
+        except RuntimeError as exc:
+            # A dead worker's replacement could not start (Thread.start); see
+            # TaskRunner.submit. The arbiter asks again on its next pass, which
+            # may get the worker back. Raised on, it failed every pass with a
+            # traceback, every POLL_S for the length of the training run; like
+            # the runner's own repair log, the first in a row is the error.
+            self._cuda_suspend_queue_failures += 1
+            failures = self._cuda_suspend_queue_failures
+            if failures == 1:
+                logger.error(
+                    "CUDA suspend not queued: the task runner could not start a "
+                    "replacement worker (%s: %s). PixlStash keeps its CUDA "
+                    "context; the arbiter asks again on each pass, and only the "
+                    "first failure in a row is logged here.",
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "CUDA suspend not queued again (%d in a row): %s: %s",
+                    failures,
+                    type(exc).__name__,
+                    exc,
+                )
+            return
+        self._cuda_suspend_queue_failures = 0
         self._cuda_suspend_task = task
 
     def _unload_and_suspend(self) -> None:
@@ -3346,25 +3869,36 @@ class Vault:
                 priority=DBPriority.IMMEDIATE,
             )
 
-        picture = ImageUtils.create_picture_from_file(
-            image_root_path=logo_dest_folder,
-            source_file_path=logo_src,
-        )
-        picture.description = "PixlStash Logo"
-        picture.imported_at = datetime.datetime.now(datetime.timezone.utc)
-
-        assert picture.file_path
-
-        def add_picture(session: Session, picture: Picture):
+        def add_picture(
+            session: Session, picture: Picture, published: PublishedPictures
+        ):
             session.add(picture)
             session.commit()
+            published.mark_committed()
             session.refresh(picture)
             return picture
 
-        picture = self.db.run_task(
-            lambda session: add_picture(session, picture),
-            priority=DBPriority.IMMEDIATE,
-        )
+        # A seed picture whose insert does not commit has its file removed
+        # again: left behind, the next root scan would index it as a picture
+        # without its description.
+        with PublishedPictures(logo_dest_folder, "Default data") as published:
+            picture = published.add(
+                ImageUtils.create_picture_from_file(
+                    image_root_path=logo_dest_folder,
+                    source_file_path=logo_src,
+                )
+            )
+            picture.description = "PixlStash Logo"
+            picture.imported_at = datetime.datetime.now(datetime.timezone.utc)
+
+            assert picture.file_path
+
+            picture = self.db.run_task(
+                add_picture,
+                picture,
+                published,
+                priority=DBPriority.IMMEDIATE,
+            )
 
         if add_tagger_test_images:
             # Add all pictures/TaggerTest*.png
@@ -3377,17 +3911,23 @@ class Vault:
                         "pictures",
                         file,
                     )
-                    pic = ImageUtils.create_picture_from_file(
-                        image_root_path=logo_dest_folder,
-                        source_file_path=src_path,
-                    )
-                    pic.description = os.path.basename(src_path)
-                    pic.imported_at = datetime.datetime.now(datetime.timezone.utc)
-                    assert pic.file_path
-                    self.db.run_task(
-                        add_picture,
-                        pic,
-                        priority=DBPriority.IMMEDIATE,
-                    )
+                    with PublishedPictures(
+                        logo_dest_folder, "Default data"
+                    ) as published:
+                        pic = published.add(
+                            ImageUtils.create_picture_from_file(
+                                image_root_path=logo_dest_folder,
+                                source_file_path=src_path,
+                            )
+                        )
+                        pic.description = os.path.basename(src_path)
+                        pic.imported_at = datetime.datetime.now(datetime.timezone.utc)
+                        assert pic.file_path
+                        self.db.run_task(
+                            add_picture,
+                            pic,
+                            published,
+                            priority=DBPriority.IMMEDIATE,
+                        )
                     logger.debug(f"Imported default picture: {pic.file_path}")
         logger.info("Imported default data into the vault.")
