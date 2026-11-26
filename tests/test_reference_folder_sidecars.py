@@ -24,13 +24,18 @@ from sqlmodel import Session, delete, select
 from pixlstash.db_models import Picture, ReferenceFolder, Tag
 from pixlstash.routes.reference_folders import _validate_sidecar_suffix
 from pixlstash.server import Server
-from pixlstash.tasks.reference_folder_scan_task import ReferenceFolderScanTask
+from pixlstash.tasks import TaskType
+from pixlstash.tasks.reference_folder_scan_task import (
+    ReferenceFolderScanTask,
+    _create_sidecar,
+)
 from pixlstash.tasks.tag_task import TagTask
 from pixlstash.utils.caption_file_utils import (
     SIDECAR_TYPE_TAGS,
     classify_sidecar,
     detect_folder_suffixes,
     is_safe_sidecar_suffix,
+    parse_caption_tags,
     resolve_typed_sidecar,
     sidecar_path,
     writeback_path,
@@ -258,6 +263,21 @@ def server():
     with tempfile.TemporaryDirectory() as temp_dir:
         config_path = os.path.join(temp_dir, "server-config.json")
         with Server(config_path) as srv:
+            # These tests scan by hand, and the routes they drive write the
+            # same sidecars a background scan reconciles. A background scan of
+            # a test's folder is not kept out by the ``last_scanned`` stamp
+            # alone: the wipe hands the next test's folder an id an earlier
+            # test registered, a route-registered watch of that id outlives
+            # the wipe, and its debounced event marks the new row due. A scan
+            # that read the rows before the export route and wrote after the
+            # import route overwrote the imported description (the CI flake in
+            # test_metadata_export_and_import_tags_and_descriptions_by_subfolder).
+            # The product side of that race is pinned by
+            # test_a_scan_never_overwrites_sidecars_a_route_rewrote_meanwhile.
+            srv.vault._planner_work_finders.pop(TaskType.REFERENCE_FOLDER_SCAN)
+            # detach_finders() edits the planner's structures under its own
+            # lock, so this is safe against the loop thread running now.
+            srv.vault._work_planner.detach_finders((TaskType.REFERENCE_FOLDER_SCAN,))
             yield srv
 
 
@@ -989,3 +1009,214 @@ def test_metadata_export_and_import_tags_and_descriptions_by_subfolder(
     assert _picture_tags(server, in_pic_id) == ["changed", "tags"]
     assert _picture(server, in_pic_id).description == "Changed description."
     assert _picture_tags(server, out_pic_id) == ["outside"]
+
+
+class _WritesBetween:
+    """Runs a write of the test's own before the scan submits a named callback.
+
+    The scan reads the rows, compares them with the disk, and only then queues
+    the write that acts on the comparison. Handed to the task as its database,
+    this lands ``before[name]()`` ahead of the callback called ``name``, once
+    each, so the window a route write falls into is deterministic.
+    """
+
+    def __init__(self, db, before):
+        self._db = db
+        self._before = dict(before)
+        self.fired: list[str] = []
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def _fire_before(self, func):
+        name = getattr(func, "__name__", None)
+        hook = self._before.pop(name, None)
+        if hook is not None:
+            self.fired.append(name)
+            hook()
+
+    def run_task(self, func, *args, **kwargs):
+        self._fire_before(func)
+        return self._db.run_task(func, *args, **kwargs)
+
+    def run_immediate_read_task(self, func, *args, **kwargs):
+        self._fire_before(func)
+        return self._db.run_immediate_read_task(func, *args, **kwargs)
+
+
+def test_a_scan_never_overwrites_sidecars_a_route_rewrote_meanwhile(server, tmp_path):
+    """The export and import routes run while a scan holds rows read before them.
+
+    The scan read the picture with no sidecars. The export route then writes
+    them, the scan finds them on disk and decides to import them, and the owner
+    edits both and imports through the route before the scan's write lands.
+    That write must not put the exported (older) values back.
+    """
+    client = _login_client(server)
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    img = _make_image(folder_dir, "in.png")
+    pic_id = _index_picture(
+        server, folder_id, img, tags=["first", "tag"], description="First."
+    )
+    tags_path = os.path.join(folder_dir, "in_tags.txt")
+    description_path = os.path.join(folder_dir, "in_description.txt")
+    body = {"scope_path": folder_dir, "types": ["tags", "descriptions"]}
+
+    def _export():
+        resp = client.post(f"/reference-folders/{folder_id}/metadata/export", json=body)
+        assert resp.status_code == 200, resp.text
+        assert _read(description_path) == "First."
+
+    def _edit_and_import():
+        _write(tags_path, "changed, tags")
+        _write(description_path, "Changed.")
+        resp = client.post(f"/reference-folders/{folder_id}/metadata/import", json=body)
+        assert resp.status_code == 200, resp.text
+
+    db = _WritesBetween(
+        server.vault.db,
+        {
+            "fetch_deleted_path_shas": _export,
+            "apply_caption_updates": _edit_and_import,
+        },
+    )
+    task = ReferenceFolderScanTask(
+        database=db,
+        folder_id=folder_id,
+        folder_path=folder_dir,
+        resolved_path=folder_dir,
+    )
+    result = task._run_task()
+
+    assert db.fired == ["fetch_deleted_path_shas", "apply_caption_updates"], (
+        "the scan never opened both windows, so nothing here was tested"
+    )
+    pic = _picture(server, pic_id)
+    assert pic.description == "Changed.", (
+        "the scan wrote the exported description over the one the import set"
+    )
+    assert _picture_tags(server, pic_id) == ["changed", "tags"]
+    assert (pic.description_file, pic.tags_file) == (description_path, tags_path)
+    assert pic.description_file_mtime == os.stat(description_path).st_mtime
+    assert pic_id not in result["caption_updated_picture_ids"]
+
+
+def _scan_with_writes_between(server, folder_id, folder_dir, before):
+    db = _WritesBetween(server.vault.db, before)
+    task = ReferenceFolderScanTask(
+        database=db,
+        folder_id=folder_id,
+        folder_path=folder_dir,
+        resolved_path=folder_dir,
+    )
+    return db, task._run_task()
+
+
+def _add_tag(server, pic_id, tag):
+    def _add(session: Session):
+        session.add(Tag(picture_id=pic_id, tag=tag))
+        session.commit()
+
+    server.vault.db.run_task(_add)
+
+
+@pytest.mark.parametrize("edited", [False, True], ids=["untouched", "edited"])
+def test_a_scan_never_overwrites_a_tag_edit_made_after_it_read_the_tags(
+    server, tmp_path, edited
+):
+    """A tag edit on a folder that does not sync tags writes no sidecar.
+
+    The scan read the picture's tags, found a tags file it had not read in,
+    and queued the import. A tag the owner added before that write landed
+    moves nothing in the picture row, so only the tags themselves show the
+    row is not the one the scan compared. Untouched, the same scan imports
+    the file, which is what proves the window was the one that mattered.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    img = _make_image(folder_dir, "in.png")
+    pic_id = _index_picture(server, folder_id, img, tags=["first"])
+    tags_path = os.path.join(folder_dir, "in_tags.txt")
+    _write(tags_path, "file, tags")
+
+    before = {"apply_caption_updates": lambda: _add_tag(server, pic_id, "edited")}
+    db, result = _scan_with_writes_between(
+        server, folder_id, folder_dir, before if edited else {}
+    )
+
+    pic = _picture(server, pic_id)
+    if not edited:
+        assert _picture_tags(server, pic_id) == ["file", "tags"]
+        assert pic.tags_file == tags_path
+        assert pic_id in result["caption_updated_picture_ids"]
+        return
+    assert db.fired == ["apply_caption_updates"], (
+        "the scan never opened the window, so nothing here was tested"
+    )
+    assert _picture_tags(server, pic_id) == ["edited", "first"], (
+        "the scan wrote the file's tags over a tag added after it read them"
+    )
+    assert pic.tags_file is None
+    assert pic_id not in result["caption_updated_picture_ids"]
+
+
+def test_a_scan_never_replaces_a_sidecar_a_tag_edit_created_meanwhile(
+    server, tmp_path, monkeypatch
+):
+    """The export looks for a sidecar, then creates one; a route can write between.
+
+    A tag edit on a folder that syncs tags creates the missing sidecar and
+    records its mtime. A scan that then replaced the file with the tags it
+    read earlier would have its own row write skipped (the row changed), and
+    the next scan would read the older tags back in from the replaced file,
+    undoing the edit. The window is opened where the export picks its target,
+    which is after the scan saw no file there.
+    """
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir, sync_tags=True)
+    img = _make_image(folder_dir, "in.png")
+    pic_id = _index_picture(server, folder_id, img, tags=["first"])
+    tags_path = os.path.join(folder_dir, "in_tags.txt")
+    opened: list[str] = []
+
+    def _edit_while_exporting(*args, **kwargs):
+        target = writeback_path(*args, **kwargs)
+        if target == tags_path and not opened:
+            opened.append(target)
+            _add_tag(server, pic_id, "edited")
+            sync_picture_sidecar(server, pic_id)
+        return target
+
+    monkeypatch.setattr(
+        "pixlstash.tasks.reference_folder_scan_task.writeback_path",
+        _edit_while_exporting,
+    )
+    _run_scan(server, folder_id, folder_dir)
+    monkeypatch.undo()
+
+    assert opened == [tags_path], "the export never ran, so nothing here was tested"
+    edited_text = _read(tags_path)
+    assert sorted(parse_caption_tags(edited_text)) == ["edited", "first"], (
+        "the scan replaced the sidecar the tag edit wrote"
+    )
+    _run_scan(server, folder_id, folder_dir)
+    assert _picture_tags(server, pic_id) == ["edited", "first"], (
+        "the next scan read the scan's stale export back in over the edit"
+    )
+    assert _read(tags_path) == edited_text
+
+
+def test_create_sidecar_never_replaces_a_file(tmp_path, caplog):
+    path = str(tmp_path / "in_tags.txt")
+    _write(path, "theirs")
+
+    with caplog.at_level("INFO"):
+        assert _create_sidecar(path, "ours") is None
+
+    assert _read(path) == "theirs"
+    assert any(path in r.getMessage() for r in caplog.records)
+    created = str(tmp_path / "new_tags.txt")
+    mtime = _create_sidecar(created, "ours")
+    assert _read(created) == "ours"
+    assert mtime == os.stat(created).st_mtime

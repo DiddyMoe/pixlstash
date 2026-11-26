@@ -38,6 +38,11 @@
           <span class="ifs-folder">
             <span class="ifs-name">{{ folder.label || folder.folder }}</span>
             <FolderPath :path="folder.folder" />
+            <!-- The server's own sentence: which rule the folder breaks as it
+                 resolves now. The column beside it has room for one word. -->
+            <span v-if="folder.refused" class="ifs-why">{{
+              folder.refused
+            }}</span>
           </span>
           <span class="ifs-meta">{{
             folder.delete_after_import ? "Delete original" : "Keep original"
@@ -175,6 +180,7 @@ import AppButton from "../widgets/AppButton.vue";
 import AppDialog from "../widgets/AppDialog.vue";
 import AppInput from "../widgets/AppInput.vue";
 import Segmented from "../widgets/Segmented.vue";
+import { useConfirm } from "../../composables/useConfirm";
 import FolderBrowser from "../editors/FolderBrowser.vue";
 import FolderPath from "./FolderPath.vue";
 import {
@@ -200,6 +206,7 @@ const AFTER_IMPORT_OPTIONS = [
 
 const store = useImportFoldersStore();
 const noticeStore = useNoticeStore();
+const { confirm } = useConfirm();
 
 const editorOpen = ref(false);
 const editorFolder = ref(null); // null = add, a folder = edit
@@ -241,15 +248,20 @@ watch(
   { immediate: true },
 );
 
-// Nothing can be imported from the folder: it is not on disk, or it is and the
-// server is not allowed to list it.
+// Nothing can be imported from the folder: the path rules refuse it as it
+// resolves now, it is not on disk, or it is and the server may not list it.
 function unavailable(folder) {
-  return Boolean(folder.missing || folder.unreadable);
+  return Boolean(folder.refused || folder.missing || folder.unreadable);
 }
 
+// One short word per state, so the longest fits the Latest column rather than
+// running into Imported. Refused comes first: the watcher reads and
+// deletes nothing in a refused folder whether or not it is on disk, and
+// putting the folder back would not change that.
 function latestLabel(folder) {
-  if (folder.missing) return "Folder not found";
-  if (folder.unreadable) return "Folder can't be read";
+  if (folder.refused) return "Refused";
+  if (folder.missing) return "Not found";
+  if (folder.unreadable) return "Can't be read";
   if (!folder.last_imported_at) return "Nothing yet";
   return relativeDate(folder.last_imported_at);
 }
@@ -303,12 +315,12 @@ async function saveEditor() {
 
 async function removeFolder(folder) {
   const name = folder.label || folder.folder;
-  if (
-    !window.confirm(
-      `Stop watching "${name}"? What it already imported stays in the library.`,
-    )
-  )
-    return;
+  const ok = await confirm({
+    title: `Stop watching "${name}"?`,
+    message: `PixlStash will stop watching "${name}". What it already imported stays in the library.`,
+    confirmLabel: "Stop watching",
+  });
+  if (!ok) return;
   try {
     await deleteFolder("import", folder.id);
     await store.refresh();
@@ -419,6 +431,13 @@ async function removeFolder(folder) {
 .ifs-folder :deep(.fp) {
   font-size: var(--text-xs);
   color: rgba(var(--v-theme-on-surface), 0.7);
+}
+
+/* Why a refused folder is refused, under its path in the status text colour. */
+.ifs-why {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: rgb(var(--v-theme-surface-error));
 }
 
 .ifs-meta {

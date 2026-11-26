@@ -8,6 +8,7 @@ drops what they deleted - the same code path a reference folder gets, with
 ``Picture.file_path`` kept relative to the root.
 """
 
+import json
 import os
 import tempfile
 import time
@@ -49,6 +50,13 @@ _CONFLICTING_FINDERS = (
 def server():
     with tempfile.TemporaryDirectory() as temp_dir:
         config_path = os.path.join(temp_dir, "server-config.json")
+        # No automatic snapshots. A fresh vault's DAILY snapshot is due at once,
+        # and it writes then deletes `snapshots/.tmp/.../snapshot.sqlite-journal`
+        # under the root that `_settle_root` walks and backdates: the walk lists
+        # the journal and utime() finds it gone (CI runs 45499046614, 45388205378).
+        # Off from boot rather than detached later, so none can be mid-flight.
+        with open(config_path, "w") as fh:
+            json.dump({"daily_snapshots": False}, fh)
         with Server(config_path) as srv:
             for task_type in _CONFLICTING_FINDERS:
                 srv.vault._planner_work_finders.pop(task_type)
@@ -432,7 +440,7 @@ def test_a_move_pixlstash_recorded_is_repointed_not_deleted(server):
     elsewhere in the root, hash pairing refuses, and without the journal the row
     (tags, sets, score) is hard-deleted just before the engine repoints it."""
     root = server.vault.image_root
-    original = _make_image(os.path.join(root, "jrn", "a.png"), (31, 32, 33))
+    original = _make_image(os.path.join(root, "jrn", "a.png"), (61, 62, 63))
     twin = os.path.join(root, "jrn", "twin.png")
     with open(original, "rb") as fh:
         payload = fh.read()
@@ -441,6 +449,9 @@ def test_a_move_pixlstash_recorded_is_repointed_not_deleted(server):
     old = time.time() - 600
     os.utime(twin, (old, old))
     _run_root_scan(server)
+    # The twin has a.png's content and is in the same scan: one picture, the
+    # twin left on disk, where it still makes hash pairing refuse below.
+    assert [p.file_path for p in _managed(server, "jrn/")] == ["jrn/a.png"]
     moving = next(p for p in _managed(server, "jrn/") if p.file_path == "jrn/a.png")
     _tag(server, moving.id, "keepme")
 
@@ -467,7 +478,7 @@ def test_a_move_pixlstash_recorded_is_repointed_not_deleted(server):
         "the twin makes hash pairing refuse"
     )
     after = _managed(server, "jrn/")
-    assert sorted(p.file_path for p in after) == ["jrn/a2.png", "jrn/twin.png"], (
+    assert sorted(p.file_path for p in after) == ["jrn/a2.png"], (
         "the journal says PixlStash moved it: repointed, not deleted and "
         "re-imported as a second row"
     )
@@ -591,7 +602,7 @@ def test_the_purge_sweep_leaves_root_owned_rows_to_the_scan(server):
     sweep must never delete a root-owned row, or it races the scan's deferral
     and writes file_removed=True on a file the owner only renamed."""
     root = server.vault.image_root
-    _make_image(os.path.join(root, "swp", "s.png"), (51, 52, 53))
+    _make_image(os.path.join(root, "swp", "s.png"), (71, 72, 73))
     _run_root_scan(server)
     assert _managed(server, "swp/")
 

@@ -10,7 +10,10 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models.import_folder import ImportFolder
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.video_utils import VideoUtils
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.media_files import SUPPORTED_IMAGE_EXTS
+from pixlstash.utils.reference_folder_validator import validate_reference_folder_path
+from pixlstash.utils.sql_chunking import in_json
 
 from .base_task_finder import BaseTaskFinder
 from .watch_folder_import_task import WatchFolderImportTask
@@ -28,9 +31,11 @@ def watch_folder_state(folder: str) -> tuple[bool, OSError | None]:
     the two is set.
 
     The folder listing and the scan both use this, so the row in Settings and
-    what the scan does agree. It asks the filesystem only: the path rules are
-    not consulted and the path is used as given, so a link is judged by the
-    directory it points at, the same way the scan reads it.
+    what the scan does agree on whether the folder can be read. It asks the
+    filesystem only and uses the path as given, so a link is judged by the
+    directory it points at, the same way the scan reads it. The path rules are
+    a separate check: the scan applies ``validate_reference_folder_path`` before
+    it calls this, and does not walk a folder the rules refuse.
     """
     try:
         folder_stat = os.stat(folder)
@@ -111,6 +116,10 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
         self._unreadable_by_folder: dict[
             int, frozenset[tuple[str | None, int | None]]
         ] = {}
+        # Folder id -> the path-rule refusal its latest scan met, so a folder
+        # that stays refused is reported once, not on every planner cycle. Same
+        # thread as ``_unreadable_by_folder``.
+        self._refused_by_folder: dict[int, str] = {}
 
     def finder_name(self) -> str:
         return "MissingWatchFolderImportFinder"
@@ -119,6 +128,7 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
         db_folders = self._load_db_watch_folders()
         if not db_folders:
             self._unreadable_by_folder.clear()
+            self._refused_by_folder.clear()
             return None
         return self._find_task_from_db(db_folders)
 
@@ -150,6 +160,8 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
         registered = {int(entry.id) for entry in watch_folders if entry.id is not None}
         for removed in self._unreadable_by_folder.keys() - registered:
             del self._unreadable_by_folder[removed]
+        for removed in self._refused_by_folder.keys() - registered:
+            del self._refused_by_folder[removed]
 
         for entry in watch_folders:
             if entry.id is None:
@@ -158,6 +170,16 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
             delete_after_import = bool(entry.delete_after_import)
 
             if not folder:
+                continue
+            # The rule the add route checked, applied again on every scan: a
+            # folder accepted once can come to resolve into a refused directory
+            # later (a link retargeted, a mount moved, a row written before the
+            # rule existed), and the add-time check alone then let the scan walk
+            # it and import from it. Resolved inside the helper, so a link is
+            # judged by where it points. Not walked and not marked checked.
+            refusal = validate_reference_folder_path(folder)
+            self._note_refused(int(entry.id), folder, refusal)
+            if refusal is not None:
                 continue
             missing, access_error = watch_folder_state(folder)
             if missing:
@@ -172,7 +194,15 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
             # is given, and the files inside are then never offered: nothing
             # imports and nothing says why. Collect the errors and report them.
             unreadable: list[OSError] = []
-            for root, _, files in os.walk(folder, onerror=unreadable.append):
+            for root, dirs, files in os.walk(folder, onerror=unreadable.append):
+                # os.walk never descends a directory symlink, but it does a
+                # Windows junction, which leads out of the watch folder the
+                # same way. Pruned so neither one is offered from.
+                dirs[:] = [
+                    name
+                    for name in dirs
+                    if not is_link_or_missing(os.path.join(root, name))
+                ]
                 for file_name in files:
                     file_path = os.path.join(root, file_name)
                     if not self._is_supported_file(file_path):
@@ -234,6 +264,33 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
             for path in normalized:
                 self._pending_stats.pop(path, None)
                 self._dispatched_stats.pop(path, None)
+
+    def _note_refused(self, folder_id: int, folder: str, refusal: str | None) -> None:
+        """Report that the path rules refuse *folder*, when that changes.
+
+        Gated on change for the reason ``_note_unreadable`` is: the scan runs
+        every planner cycle. One warning when the refusal starts or its reason
+        changes, one info line when the folder is allowed again.
+        """
+        previous = self._refused_by_folder.get(folder_id)
+        if refusal is not None and refusal != previous:
+            logger.warning(
+                "MissingWatchFolderImportFinder: not scanning watch folder %s: "
+                "%s. Nothing is imported from it until it points somewhere the "
+                "path rules allow.",
+                folder,
+                refusal,
+            )
+        elif previous is not None and refusal is None:
+            logger.info(
+                "MissingWatchFolderImportFinder: watch folder %s is allowed by "
+                "the path rules again",
+                folder,
+            )
+        if refusal is not None:
+            self._refused_by_folder[folder_id] = refusal
+        else:
+            self._refused_by_folder.pop(folder_id, None)
 
     def _note_unreadable(
         self, folder_id: int, folder: str, errors: list[OSError]
@@ -369,7 +426,7 @@ class MissingWatchFolderImportFinder(BaseTaskFinder):
     def _persist_db_last_checked(self, updates: dict[int, float]):
         def update(session: Session, values: dict[int, float]):
             folders = session.exec(
-                select(ImportFolder).where(ImportFolder.id.in_(list(values.keys())))
+                select(ImportFolder).where(in_json(ImportFolder.id, values.keys()))
             ).all()
             for folder in folders:
                 next_ts = values.get(int(folder.id))

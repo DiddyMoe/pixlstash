@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 
@@ -23,6 +23,12 @@ vi.mock("../widgets/AppDialog.vue", () => ({
 }));
 
 import ImportFoldersSection from "./ImportFoldersSection.vue";
+import {
+  activeConfirm,
+  registerConfirmHost,
+  resolveConfirm,
+  unregisterConfirmHost,
+} from "../../composables/useConfirm";
 
 const RENDERS = {
   id: 3,
@@ -56,6 +62,12 @@ beforeEach(() => {
   api.listReferenceFolders.mockResolvedValue({ folders: [], in_docker: false });
   api.createFolder.mockResolvedValue({});
   api.patchFolder.mockResolvedValue({});
+  api.deleteFolder.mockReset().mockResolvedValue({});
+});
+
+afterEach(() => {
+  unregisterConfirmHost();
+  vi.restoreAllMocks();
 });
 
 describe("ImportFoldersSection", () => {
@@ -65,7 +77,7 @@ describe("ImportFoldersSection", () => {
     const row = wrapper.find(".ifs-list .ifs-row");
     expect(row.text()).toContain("ComfyUI output");
     expect(row.text()).toContain("Keep original");
-    expect(row.text()).toContain("Folder not found");
+    expect(row.find("[role='status']").text()).toBe("Not found");
     expect(row.text()).toContain("12");
   });
 
@@ -84,7 +96,31 @@ describe("ImportFoldersSection", () => {
     await flushPromises();
     const status = wrapper.find(".ifs-list .ifs-row [role='status']");
     expect(status.exists()).toBe(true);
-    expect(status.text()).toBe("Folder can't be read");
+    expect(status.text()).toBe("Can't be read");
+  });
+
+  it("names a refused folder's rule under its path, ahead of any other state", async () => {
+    const rule = "Path is in a restricted system directory: /etc";
+    api.listImportFolders.mockResolvedValue({
+      folders: [
+        // Refused and gone from disk: the refusal is what the user must fix.
+        { ...RENDERS, id: 3, missing: true, refused: rule },
+        // Refused while readable on disk.
+        { ...RENDERS, id: 4, label: "Linked", missing: false, refused: rule },
+        { ...RENDERS, id: 5, label: "Plain", missing: false },
+      ],
+    });
+    const wrapper = mountSection();
+    await flushPromises();
+    const rows = wrapper.findAll(".ifs-list .ifs-row");
+    for (const row of rows.slice(0, 2)) {
+      expect(row.find("[role='status']").text()).toBe("Refused");
+      expect(row.find(".ifs-why").text()).toBe(rule);
+    }
+    // A folder the rules accept carries no reason line and no status.
+    expect(rows[2].find(".ifs-why").exists()).toBe(false);
+    expect(rows[2].find("[role='status']").exists()).toBe(false);
+    expect(rows[2].text()).toContain("Nothing yet");
   });
 
   it("adds a folder named after its last component when no name is given", async () => {
@@ -124,5 +160,46 @@ describe("ImportFoldersSection", () => {
       delete_after_import: false,
     });
     expect(wrapper.find(".ifs-form__error").text()).toContain("overlaps");
+  });
+
+  it("asks in the app's dialog before it stops watching, and removes nothing on no", async () => {
+    registerConfirmHost();
+    const nativeConfirm = vi.spyOn(window, "confirm");
+    const wrapper = mountSection();
+    await flushPromises();
+
+    await button(wrapper, "Remove").trigger("click");
+    await flushPromises();
+    expect(activeConfirm.value.options).toMatchObject({
+      title: 'Stop watching "ComfyUI output"?',
+      message:
+        'PixlStash will stop watching "ComfyUI output". What it already imported stays in the library.',
+      confirmLabel: "Stop watching",
+      danger: false,
+    });
+    resolveConfirm(false);
+    await flushPromises();
+    expect(api.deleteFolder).not.toHaveBeenCalled();
+
+    await button(wrapper, "Remove").trigger("click");
+    await flushPromises();
+    expect(api.deleteFolder).not.toHaveBeenCalled();
+    resolveConfirm(true);
+    await flushPromises();
+    expect(api.deleteFolder).toHaveBeenCalledWith("import", 3);
+    expect(nativeConfirm).not.toHaveBeenCalled();
+  });
+
+  it("names the folder in the browser's confirm when the app's dialog is not mounted", async () => {
+    unregisterConfirmHost();
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const wrapper = mountSection();
+    await flushPromises();
+
+    await button(wrapper, "Remove").trigger("click");
+    await flushPromises();
+    expect(nativeConfirm).toHaveBeenCalledTimes(1);
+    expect(nativeConfirm.mock.calls[0][0]).toContain('"ComfyUI output"');
+    expect(api.deleteFolder).not.toHaveBeenCalled();
   });
 });

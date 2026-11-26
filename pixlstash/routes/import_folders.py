@@ -24,6 +24,7 @@ from pixlstash.utils.reference_folder_validator import (
     data_folder_conflict_detail,
     validate_reference_folder_path,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -59,6 +60,11 @@ class ImportFolderResponse(BaseModel):
     # a parent, a stale mount), so nothing in it is imported. Never true
     # together with ``missing``.
     unreadable: bool = False
+    # Why the path rules refuse the folder as it resolves now (a link in its
+    # path re-pointed into a restricted system directory, say), or None. The
+    # watcher neither reads nor deletes anything in a refused folder; the
+    # check is the same ``validate_reference_folder_path`` the scan runs.
+    refused: Optional[str] = None
 
 
 class ImportFoldersListResponse(BaseModel):
@@ -115,6 +121,7 @@ def create_router(server) -> APIRouter:
             last_imported_at=last_imported_at,
             missing=missing,
             unreadable=access_error is not None,
+            refused=validate_reference_folder_path(folder.folder),
         )
 
     def _notify_changed(request: Request) -> None:
@@ -255,7 +262,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
     )
     def update_import_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ImportFolderUpdateRequest = Body(...),
     ):
@@ -287,7 +294,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
         response_model=ImportFolderDeleteResponse,
     )
-    def delete_import_folder(folder_id: int, request: Request):
+    def delete_import_folder(folder_id: SqliteInt, request: Request):
 
         def remove(session: Session):
             folder = session.get(ImportFolder, folder_id)

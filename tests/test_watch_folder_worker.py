@@ -1,21 +1,36 @@
 import errno
+import io
+import itertools
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest import mock
 
+import cv2
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from sqlmodel import select
 
 from pixlstash.server import Server
 from pixlstash.db_models.import_folder import ImportFolder
 from pixlstash.db_models.picture import Picture
+from pixlstash.db_models.tag import Tag
+from pixlstash.services import import_dedup_service
 from pixlstash.tasks import missing_watch_folder_import_finder
+from pixlstash.tasks import watch_folder_import_task
+from pixlstash.tasks.watch_folder_import_task import WatchFolderImportTask
+from pixlstash.utils.image_processing.image_utils import (
+    ImageUtils,
+    is_in_progress_file_name,
+)
 from pixlstash.utils import reference_folder_validator
 
 API_PREFIX = "/api/v1"
@@ -358,7 +373,7 @@ def test_watch_folder_retries_after_transient_hash_failure(monkeypatch):
     could never become a candidate again. The fix has the task report the failed
     path back to the finder, which forgets it and re-discovers it on the next
     scan. We simulate the transient failure by making
-    ``ImageUtils.calculate_hash_from_file_path`` raise once for the target file,
+    ``ImageUtils.calculate_hash_from_open_file`` raise once for the target file,
     then succeed, and assert the file is eventually imported.
     """
     from pixlstash.utils.image_processing.image_utils import ImageUtils
@@ -390,23 +405,24 @@ def test_watch_folder_retries_after_transient_hash_failure(monkeypatch):
         os.utime(target_dst, (old_ts, old_ts))
 
         target_normcase = os.path.normcase(os.path.abspath(target_dst))
-        real_calculate_hash = ImageUtils.calculate_hash_from_file_path
+        real_calculate_hash = ImageUtils.calculate_hash_from_open_file
         failed_once = {"done": False}
 
-        def flaky_calculate_hash(file_path):
+        def flaky_calculate_hash(handle, source_label=None):
             if (
                 not failed_once["done"]
-                and os.path.normcase(os.path.abspath(file_path)) == target_normcase
+                and source_label is not None
+                and os.path.normcase(os.path.abspath(source_label)) == target_normcase
             ):
                 failed_once["done"] = True
                 raise PermissionError(
-                    f"[Errno 13] Permission denied (simulated): {file_path}"
+                    f"[Errno 13] Permission denied (simulated): {source_label}"
                 )
-            return real_calculate_hash(file_path)
+            return real_calculate_hash(handle, source_label=source_label)
 
         monkeypatch.setattr(
             ImageUtils,
-            "calculate_hash_from_file_path",
+            "calculate_hash_from_open_file",
             staticmethod(flaky_calculate_hash),
         )
 
@@ -793,6 +809,75 @@ def test_watch_folder_scan_warns_once_per_folder_it_cannot_read(tmp_path, caplog
             path.chmod(0o700)
 
 
+def test_watch_folder_scan_skips_a_folder_the_path_rules_refuse(tmp_path, caplog):
+    """The scan applies the add route's path rule on every pass.
+
+    ``POST /import-folders`` refuses a folder in a restricted system directory,
+    but the scan used to take the stored row as given, so a folder that came to
+    resolve into one later - a link retargeted, a mount moved, a row written
+    before the rule - was walked and imported from. The scan now checks
+    ``validate_reference_folder_path`` itself: a refused folder offers no file,
+    is not marked checked, and is reported once while the refusal holds.
+    """
+    allowed = tmp_path / "allowed"
+    target = tmp_path / "target"
+    for folder in (allowed, target):
+        folder.mkdir()
+        Image.new("RGB", (1, 1)).save(folder / "picture.png")
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    rows = [
+        ImportFolder(id=1, folder=str(link), label="link"),
+        ImportFolder(id=2, folder=str(allowed), label="allowed"),
+    ]
+    database = mock.Mock()
+    finder = missing_watch_folder_import_finder.MissingWatchFolderImportFinder(
+        database=database
+    )
+    logger_name = missing_watch_folder_import_finder.logger.name
+
+    def logged(level, folder):
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == logger_name
+            and record.levelno == level
+            and str(folder) in record.getMessage()
+        ]
+
+    def scan():
+        database.run_task.reset_mock()
+        assert finder._find_task_from_db(rows) is None
+        ((_, checked), _) = database.run_task.call_args
+        return set(checked)
+
+    def offered(folder):
+        return os.path.normcase(os.path.abspath(folder / "picture.png"))
+
+    refuse_target = mock.patch.object(
+        reference_folder_validator,
+        "_get_blocklist",
+        return_value=frozenset({os.path.realpath(target)}),
+    )
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        with refuse_target:
+            assert scan() == {2}
+            assert scan() == {2}
+        # The allowed folder was walked; the link into the refused one was not.
+        assert offered(allowed) in finder._pending_stats
+        assert offered(link) not in finder._pending_stats
+        (warning,) = logged(logging.WARNING, link)
+        assert "restricted system directory" in warning
+        assert logged(logging.WARNING, allowed) == []
+
+        # The rule stops refusing it: one info line, and the scan walks it.
+        assert scan() == {1, 2}
+        assert offered(link) in finder._pending_stats
+        (allowed_again,) = logged(logging.INFO, link)
+        assert "allowed by the path rules again" in allowed_again
+        assert len(logged(logging.WARNING, link)) == 1
+
+
 def test_watch_folder_listing_refuses_rather_than_reporting_none():
     """#1177 item 59's import-folder sibling, from the review of #1201.
 
@@ -853,8 +938,9 @@ def test_import_folder_listing_tells_an_unreadable_folder_from_a_missing_one():
 
     The answer comes from the filesystem alone. A folder whose parent the
     server may not enter is there but unreadable, not missing; a link into a
-    directory the path rules refuse is still readable, because the scan reads
-    it, so calling it unreadable would be false.
+    directory the path rules refuse is still readable, so calling it unreadable
+    would be false. The scan does not walk it: that refusal is the path rules',
+    checked separately (``test_watch_folder_scan_skips_a_folder_the_path_rules_refuse``).
     """
     with tempfile.TemporaryDirectory() as temp_dir:
         locked = os.path.join(temp_dir, "locked")
@@ -909,16 +995,964 @@ def test_import_folder_listing_tells_an_unreadable_folder_from_a_missing_one():
                         listed = client.get(f"{API_PREFIX}/import-folders")
                     assert listed.status_code == 200, listed.text
                     state = {
-                        row["folder"]: (row["missing"], row["unreadable"])
+                        row["folder"]: (
+                            row["missing"],
+                            row["unreadable"],
+                            row["refused"] is not None,
+                        )
                         for row in listed.json()["folders"]
                     }
+                    # The link is readable, but listed as refused: the watcher
+                    # will not touch it, so it must not look healthy.
                     assert state == {
-                        locked: (False, True),
-                        readable: (False, False),
-                        not_there_yet: (True, False),
-                        behind_locked_parent: (False, True),
-                        link: (False, False),
+                        locked: (False, True, False),
+                        readable: (False, False, False),
+                        not_there_yet: (True, False, False),
+                        behind_locked_parent: (False, True, False),
+                        link: (False, False, True),
                     }
         finally:
             os.chmod(locked, 0o700)
             os.chmod(gate, 0o700)
+
+
+# ---------------------------------------------------------------------------
+# Delete-after-import removes only the exact file it imported
+# ---------------------------------------------------------------------------
+
+# Every picture these tests write has its own colour, so none of them is a
+# duplicate of another on the shared server.
+_watch_colours = itertools.count(1)
+
+
+@pytest.fixture(scope="module")
+def watch_server():
+    """One server for the task-boundary delete tests below.
+
+    They run the task directly on candidates they build, so no watch folder is
+    registered and the finder offers nothing of its own.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with Server(os.path.join(temp_dir, "server-config.json")) as server:
+            yield server
+
+
+def _write_picture(path) -> bytes:
+    colour = next(_watch_colours)
+    buffer = io.BytesIO()
+    Image.new("RGB", (6, 6), (colour % 256, colour // 256, 77)).save(
+        buffer, format="PNG"
+    )
+    data = buffer.getvalue()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return data
+
+
+def _watch_pass(server, file_path, root) -> dict:
+    task = WatchFolderImportTask(
+        server.vault.db,
+        [
+            {
+                "file_path": str(file_path),
+                "delete_after_import": True,
+                "import_source_folder": str(root),
+            }
+        ],
+        1,
+    )
+    return task._run_task()
+
+
+def _after_insert(monkeypatch, server, action):
+    """Run *action* once the task's insert has committed, before it deletes."""
+    database = server.vault.db
+    real_run_task = database.run_task
+
+    def run_task(func, *args, **kwargs):
+        result = real_run_task(func, *args, **kwargs)
+        if getattr(func, "__name__", "") == "insert_pictures":
+            action()
+        return result
+
+    monkeypatch.setattr(database, "run_task", run_task)
+
+
+def _picture_ids_with_bytes(server, data: bytes) -> list[int]:
+    sha = ImageUtils.calculate_full_hash_from_bytes(data)
+    pictures = server.vault.db.run_task(lambda session: Picture.find(session))
+    root = server.vault.image_root
+    return [
+        pic.id
+        for pic in pictures
+        if pic.file_path
+        and ImageUtils.calculate_full_hash_from_file_path(
+            ImageUtils.resolve_picture_path(root, pic.file_path)
+        )
+        == sha
+    ]
+
+
+def test_delete_after_import_removes_the_file_it_imported(watch_server, tmp_path):
+    """The positive control: nothing changed, so the imported file goes."""
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    data = _write_picture(file_path)
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, data) == [picture_id]
+    assert not os.path.lexists(file_path)
+
+
+def _replace_file(ctx):
+    _write_picture(ctx.file_path.with_suffix(".tmp"))
+    os.replace(ctx.file_path.with_suffix(".tmp"), ctx.file_path)
+
+
+def _rewrite_in_place(ctx):
+    with open(ctx.file_path, "ab") as handle:
+        handle.write(b"appended after the read")
+
+
+def _refuse_by_the_rules(ctx):
+    refused = frozenset({os.path.realpath(ctx.root)})
+    ctx.monkeypatch.setattr(
+        reference_folder_validator, "_get_blocklist", lambda: refused
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [_replace_file, _rewrite_in_place, _refuse_by_the_rules],
+    ids=["replaced", "rewritten", "rules-refuse"],
+)
+def test_delete_after_import_keeps_a_file_that_changed_before_the_delete(
+    watch_server, tmp_path, monkeypatch, change
+):
+    """Each check runs again at delete time, after the rows are committed.
+
+    The name now leads to a different file, the same file holds different
+    bytes, or the path rules refuse the folder: the picture is imported and
+    the file on disk stays.
+    """
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    data = _write_picture(file_path)
+    ctx = SimpleNamespace(file_path=file_path, root=root, monkeypatch=monkeypatch)
+    _after_insert(monkeypatch, watch_server, lambda: change(ctx))
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, data) == [picture_id]
+    assert os.path.isfile(file_path)
+
+
+def _link_to_real(ctx):
+    os.symlink(ctx.real_root, ctx.root, target_is_directory=True)
+
+
+def _link_above(ctx):
+    # The watch folder itself is a plain directory; one above it is a link.
+    os.symlink(ctx.real_root.parent, ctx.tmp_path / "linked-parent")
+    ctx.root = ctx.tmp_path / "linked-parent" / ctx.real_root.name
+
+
+def _link_re_pointed_before_the_scan(ctx):
+    # Registered as a link to an allowed folder, re-pointed before the scan at
+    # another allowed folder the owner never registered.
+    os.symlink(ctx.real_root, ctx.root, target_is_directory=True)
+    os.unlink(ctx.root)
+    os.symlink(ctx.other_dir, ctx.root, target_is_directory=True)
+    ctx.read = ctx.other_dir
+
+
+def _link_re_pointed_after_the_insert(ctx):
+    os.symlink(ctx.real_root, ctx.root, target_is_directory=True)
+
+    def _re_point():
+        os.unlink(ctx.root)
+        os.symlink(ctx.other_dir, ctx.root, target_is_directory=True)
+
+    ctx.after_insert = _re_point
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        _link_to_real,
+        _link_above,
+        _link_re_pointed_before_the_scan,
+        _link_re_pointed_after_the_insert,
+    ],
+    ids=["link", "link-above", "re-pointed-before-scan", "re-pointed-after-insert"],
+)
+def test_a_watch_folder_reached_through_a_link_is_imported_but_never_deleted_from(
+    watch_server, tmp_path, monkeypatch, layout
+):
+    """Where a link leads can change at any time, and was checked only once,
+    when the folder was registered: delete-after-import never follows one."""
+    real_root = tmp_path / "parent" / "real"
+    other_dir = tmp_path / "elsewhere"
+    ctx = SimpleNamespace(
+        tmp_path=tmp_path,
+        root=tmp_path / "watch",
+        real_root=real_root,
+        other_dir=other_dir,
+        read=real_root,
+        after_insert=None,
+    )
+    data = {
+        real_root: _write_picture(real_root / "picture.png"),
+        other_dir: _write_picture(other_dir / "picture.png"),
+    }
+    layout(ctx)
+    if ctx.after_insert is not None:
+        _after_insert(monkeypatch, watch_server, ctx.after_insert)
+
+    result = _watch_pass(watch_server, ctx.root / "picture.png", ctx.root)
+
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, data[ctx.read]) == [picture_id]
+    for folder, content in data.items():
+        with open(folder / "picture.png", "rb") as handle:
+            assert handle.read() == content, f"{folder} lost its file"
+
+
+def _file_link_out(root, outside):
+    os.makedirs(root)
+    os.symlink(outside / "picture.png", root / "picture.png")
+    return root / "picture.png"
+
+
+def _parent_link_out(root, outside):
+    os.makedirs(root)
+    os.symlink(outside, root / "sub", target_is_directory=True)
+    return root / "sub" / "picture.png"
+
+
+@pytest.mark.parametrize(
+    "layout", [_file_link_out, _parent_link_out], ids=["file-link", "parent-link"]
+)
+def test_a_link_out_of_the_watch_folder_is_neither_read_nor_deleted(
+    watch_server, tmp_path, layout
+):
+    """A file reached through a link that leaves the folder is not touched."""
+    outside = tmp_path / "outside"
+    data = _write_picture(outside / "picture.png")
+    file_path = layout(tmp_path / "watch", outside)
+
+    result = _watch_pass(watch_server, file_path, tmp_path / "watch")
+
+    assert result["imported_picture_ids"] == []
+    assert _picture_ids_with_bytes(watch_server, data) == []
+    with open(outside / "picture.png", "rb") as handle:
+        assert handle.read() == data
+
+
+def test_a_watch_pass_looks_up_matches_off_the_writer_and_sees_earlier_batches(
+    watch_server, tmp_path, monkeypatch
+):
+    """Each file is looked up twice: before the lock, while the pass reads it,
+    and again under the import lock, right before the insert. Neither lookup
+    may queue behind background writes, and both see the pictures the batch
+    before added."""
+    monkeypatch.setattr(watch_folder_import_task, "_IMPORT_BATCH", 1)
+    real_lookup = import_dedup_service.load_match_candidates_in_session
+    lookups = []
+
+    def _spy(session, keys, *args, **kwargs):
+        lookups.append(
+            {
+                "keys": tuple(sorted(keys)),
+                "on_writer": threading.current_thread()
+                is watch_server.vault.db._task_worker,
+                "rows_visible": len(session.exec(select(Picture.id)).all()),
+            }
+        )
+        return real_lookup(session, keys, *args, **kwargs)
+
+    monkeypatch.setattr(import_dedup_service, "load_match_candidates_in_session", _spy)
+    root = tmp_path / "watch"
+    paths = [root / "first.png", root / "second.png"]
+    for path in paths:
+        _write_picture(path)
+    task = WatchFolderImportTask(
+        watch_server.vault.db,
+        [{"file_path": str(path), "import_source_folder": str(root)} for path in paths],
+        len(paths),
+    )
+
+    result = task._run_task()
+
+    assert len(result["imported_picture_ids"]) == 2
+    assert lookups, "the pass looked nothing up"
+    assert [lookup for lookup in lookups if lookup["on_writer"]] == [], lookups
+    rows_seen: dict[tuple, list[int]] = {}
+    for lookup in lookups:
+        rows_seen.setdefault(lookup["keys"], []).append(lookup["rows_visible"])
+    first, second = rows_seen.values()
+    assert set(second) == {max(first) + 1}, lookups
+
+
+def _caption_and_tags(server, picture_id) -> tuple[str | None, list[str]]:
+    def read(session):
+        picture = session.get(Picture, picture_id)
+        tags = session.exec(select(Tag.tag).where(Tag.picture_id == picture_id))
+        return picture.description, sorted(tags.all())
+
+    return server.vault.db.run_task(read)
+
+
+@pytest.mark.parametrize("where, read", [("outside", False), ("watch/captions", True)])
+def test_a_caption_link_is_read_only_when_it_stays_in_the_watch_folder(
+    watch_server, tmp_path, where, read
+):
+    """A caption file named after the picture is read by path, so a link
+    leading out of the folder would bring that file's text into the library.
+    The picture is imported either way; a link that stays inside is read."""
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    data = _write_picture(file_path)
+    caption = tmp_path / where / "caption_description.txt"
+    os.makedirs(caption.parent, exist_ok=True)
+    caption.write_text(f"example-caption from {where}", encoding="utf-8")
+    os.symlink(caption, root / "picture_description.txt")
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, data) == [picture_id]
+    description, tags = _caption_and_tags(watch_server, picture_id)
+    assert description == (f"example-caption from {where}" if read else None)
+    assert not any("example-caption" in tag for tag in tags)
+
+
+def _swap_after_check(monkeypatch, checked_path, swap):
+    """Run *swap* once, right after the task has resolved and checked
+    *checked_path*: the window a link swapped in after the check would use."""
+    real_resolved = watch_folder_import_task._resolved_source
+    done = []
+
+    def _resolved_source(file_path, root, image_root):
+        result = real_resolved(file_path, root, image_root)
+        if not done and os.fspath(file_path) == os.fspath(checked_path):
+            done.append(file_path)
+            swap()
+        return result
+
+    monkeypatch.setattr(watch_folder_import_task, "_resolved_source", _resolved_source)
+    return done
+
+
+def _no_swap(ctx):
+    return ctx.root / "picture.png"
+
+
+def _file_swapped_for_a_link(ctx):
+    def swap():
+        os.symlink(ctx.outside / "picture.png", ctx.root / "link.tmp")
+        os.replace(ctx.root / "link.tmp", ctx.root / "picture.png")
+
+    ctx.swap = swap
+    return ctx.root / "picture.png"
+
+
+def _parent_swapped_for_a_link(ctx):
+    os.makedirs(ctx.root / "sub")
+    os.replace(ctx.root / "picture.png", ctx.root / "sub" / "picture.png")
+
+    def swap():
+        os.rename(ctx.root / "sub", ctx.root / "sub-moved")
+        os.symlink(ctx.outside, ctx.root / "sub", target_is_directory=True)
+
+    ctx.swap = swap
+    return ctx.root / "sub" / "picture.png"
+
+
+@pytest.mark.parametrize(
+    "layout, imported",
+    [
+        (_no_swap, True),
+        (_file_swapped_for_a_link, False),
+        (_parent_swapped_for_a_link, False),
+    ],
+    ids=["control", "file-swapped", "parent-swapped"],
+)
+def test_a_link_swapped_in_after_the_check_is_never_read(
+    watch_server, tmp_path, monkeypatch, layout, imported
+):
+    """The bytes hashed and copied come from the file the check passed.
+
+    A file or a directory above it swapped for a link out of the watch folder
+    between the check and the read would otherwise bring the outside file into
+    the library (and its name would be a delete candidate). The control: with
+    nothing swapped the same file is imported.
+    """
+    ctx = SimpleNamespace(root=tmp_path / "watch", outside=tmp_path / "outside")
+    inside = _write_picture(ctx.root / "picture.png")
+    outside = _write_picture(ctx.outside / "picture.png")
+    ctx.swap = None
+    file_path = layout(ctx)
+    swapped = _swap_after_check(monkeypatch, file_path, ctx.swap) if ctx.swap else None
+
+    result = _watch_pass(watch_server, file_path, ctx.root)
+
+    assert swapped is None or swapped, "the swap never ran: the race was not staged"
+    assert _picture_ids_with_bytes(watch_server, outside) == []
+    if imported:
+        (picture_id,) = result["imported_picture_ids"]
+        assert _picture_ids_with_bytes(watch_server, inside) == [picture_id]
+    else:
+        assert result["imported_picture_ids"] == []
+    with open(ctx.outside / "picture.png", "rb") as handle:
+        assert handle.read() == outside, "the outside file was touched"
+
+
+@pytest.mark.parametrize("replacement", ["link", "file"])
+def test_a_file_swapped_after_it_was_opened_is_imported_as_opened(
+    watch_server, tmp_path, monkeypatch, replacement
+):
+    """Once open, the name is not read again: the sampled hash, the copy and
+    the identity delete-after-import looks for come from the open file. Wrong
+    if the library holds the other bytes, if the recorded hash is the other
+    file's, or if the name, now a link or another file, is deleted."""
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    inside = _write_picture(file_path)
+    other_path = tmp_path / "outside" / "picture.png"
+    other = _write_picture(other_path)
+    real_open = watch_folder_import_task._open_checked
+    swapped = []
+
+    def _open_checked(real_path):
+        handle = real_open(real_path)
+        if not swapped and real_path == os.path.realpath(file_path):
+            swapped.append(real_path)
+            if replacement == "link":
+                os.symlink(other_path, root / "swap.tmp")
+            else:
+                shutil.copyfile(other_path, root / "swap.tmp")
+            os.replace(root / "swap.tmp", file_path)
+        return handle
+
+    monkeypatch.setattr(watch_folder_import_task, "_open_checked", _open_checked)
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    assert swapped, "the swap never ran: the race was not staged"
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, inside) == [picture_id]
+    assert _picture_ids_with_bytes(watch_server, other) == []
+    picture = watch_server.vault.db.run_task(
+        lambda session: session.get(Picture, picture_id)
+    )
+    assert picture.pixel_sha == ImageUtils.calculate_hash_from_bytes(inside)
+    assert os.path.lexists(file_path), "the swapped-in name was deleted"
+    with open(file_path, "rb") as handle:
+        assert handle.read() == other
+    with open(other_path, "rb") as handle:
+        assert handle.read() == other
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_a_fifo_in_place_of_a_checked_file_is_refused_without_waiting(tmp_path):
+    """Opened O_NONBLOCK, so the open returns at once; then refused, as it is
+    not a regular file. Wrong if it opens (or if the test hangs)."""
+    fifo = tmp_path / "picture.png"
+    os.mkfifo(fifo)
+
+    with pytest.raises(OSError, match="not a regular file"):
+        watch_folder_import_task._open_checked(str(fifo))
+
+
+def test_the_windows_checked_open_refuses_a_path_that_became_a_link(tmp_path):
+    """Windows has no dir_fd, so the checked path is opened by name and then
+    confirmed to be the file that name holds, with no link on the way. Run
+    here directly: the fallback is plain path code. The control opens."""
+    plain = tmp_path / "watch" / "picture.png"
+    data = _write_picture(plain)
+    outside = tmp_path / "outside" / "picture.png"
+    _write_picture(outside)
+    with watch_folder_import_task._open_checked_by_path(str(plain)) as handle:
+        assert handle.read() == data
+
+    os.symlink(outside, tmp_path / "watch" / "link.tmp")
+    os.replace(tmp_path / "watch" / "link.tmp", plain)
+    with pytest.raises(OSError, match="changed while it was opened"):
+        watch_folder_import_task._open_checked_by_path(str(plain))
+
+    os.unlink(plain)
+    os.rename(tmp_path / "watch", tmp_path / "watch-moved")
+    os.symlink(tmp_path / "outside", tmp_path / "watch", target_is_directory=True)
+    with pytest.raises(OSError, match="changed while it was opened"):
+        watch_folder_import_task._open_checked_by_path(str(plain))
+
+
+def test_the_windows_checked_open_refuses_a_link_gone_before_the_check(
+    tmp_path, monkeypatch
+):
+    """A link in place for the open and swapped back before the check: the
+    name is a regular file again and resolves to itself, so only the open
+    file's index against the name's tells them apart. Staged by opening the
+    outside file where the name is opened. Wrong if it opens."""
+    plain = tmp_path / "watch" / "picture.png"
+    _write_picture(plain)
+    outside = tmp_path / "outside" / "picture.png"
+    _write_picture(outside)
+    opened = []
+
+    def _open_through_the_link(path, mode):
+        assert path == str(plain)
+        opened.append(open(outside, mode))
+        return opened[-1]
+
+    monkeypatch.setattr(
+        watch_folder_import_task, "open", _open_through_the_link, raising=False
+    )
+
+    with pytest.raises(OSError, match="changed while it was opened"):
+        watch_folder_import_task._open_checked_by_path(str(plain))
+    assert opened and opened[0].closed, "the refused handle was left open"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses the POSIX null device")
+def test_the_windows_checked_open_refuses_a_file_that_is_not_regular():
+    """The null device is its own name, resolves to itself and is not a link,
+    so only the regular-file requirement refuses it. Wrong if it opens."""
+    with pytest.raises(OSError, match="changed while it was opened"):
+        watch_folder_import_task._open_checked_by_path(os.devnull)
+
+
+def _caption_swapped_for(target_text):
+    def swap(ctx):
+        if target_text is None:
+            os.symlink(ctx.outside_caption, ctx.root / "caption.tmp")
+        else:
+            (ctx.root / "caption.tmp").write_text(target_text, encoding="utf-8")
+        os.replace(ctx.root / "caption.tmp", ctx.caption)
+
+    return swap
+
+
+@pytest.mark.parametrize(
+    "swap, description",
+    [
+        (
+            _caption_swapped_for("example-caption rewritten"),
+            "example-caption rewritten",
+        ),
+        (_caption_swapped_for(None), None),
+    ],
+    ids=["control-rewritten", "link-out"],
+)
+def test_a_caption_swapped_for_a_link_after_its_check_is_not_read(
+    watch_server, tmp_path, monkeypatch, swap, description
+):
+    """A caption file is read from the file its own check passed.
+
+    Swapped for a link out of the watch folder after the check, the outside
+    text must not become the picture's description or tags. The control: a
+    caption rewritten in place is still read, so captions are not simply off.
+    """
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    data = _write_picture(file_path)
+    ctx = SimpleNamespace(
+        root=root,
+        caption=root / "picture_description.txt",
+        outside_caption=tmp_path / "outside" / "caption.txt",
+    )
+    ctx.caption.write_text("example-caption inside", encoding="utf-8")
+    os.makedirs(ctx.outside_caption.parent)
+    ctx.outside_caption.write_text("example-caption from outside", encoding="utf-8")
+    swapped = _swap_after_check(monkeypatch, ctx.caption, lambda: swap(ctx))
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    assert swapped, "the caption was never checked: the race was not staged"
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, data) == [picture_id]
+    got_description, tags = _caption_and_tags(watch_server, picture_id)
+    assert got_description == description
+    assert not any("outside" in tag for tag in tags)
+
+
+def test_a_junction_on_the_way_to_the_watch_folder_counts_as_a_link(
+    tmp_path, monkeypatch
+):
+    """``os.path.islink`` is False for a Windows junction, which needs only
+    write access to make. No junction exists on Linux, so the reparse tag is
+    simulated, as tests/test_hub_engine.py does for the hub path."""
+    root = tmp_path / "junction" / "watch"
+    root.mkdir(parents=True)
+    junction = str(tmp_path / "junction")
+    mount_point_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+    real_lstat = os.lstat
+
+    class _JunctionStat:
+        def __init__(self, info):
+            self._info = info
+            self.st_reparse_tag = mount_point_tag
+
+        def __getattr__(self, name):
+            return getattr(self._info, name)
+
+    assert watch_folder_import_task._link_on_the_way_to(str(root)) is None
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        stat, "IO_REPARSE_TAG_MOUNT_POINT", mount_point_tag, raising=False
+    )
+    monkeypatch.setattr(
+        os,
+        "lstat",
+        lambda p, *a, **k: (
+            _JunctionStat(real_lstat(p, *a, **k))
+            if str(p) == junction
+            else real_lstat(p, *a, **k)
+        ),
+    )
+
+    assert watch_folder_import_task._link_on_the_way_to(str(root)) == junction
+
+
+# ---------------------------------------------------------------------------
+# Publishing a watched file into the library
+# ---------------------------------------------------------------------------
+
+
+def _write_video(path, fourcc: str) -> None:
+    colour = next(_watch_colours)
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*fourcc), 5.0, (32, 24))
+    if not writer.isOpened():
+        pytest.skip(f"no OpenCV {fourcc} encoder in this environment")
+    for index in range(3):
+        writer.write(np.full((24, 32, 3), (colour * 7 + index * 40) % 256, np.uint8))
+    writer.release()
+
+
+@pytest.mark.parametrize(
+    "ext, fourcc", [(".webm", "VP80"), (".mov", "mp4v"), (".mkv", "XVID")]
+)
+def test_a_watched_video_keeps_its_own_container(watch_server, tmp_path, ext, fourcc):
+    root = tmp_path / "watch"
+    root.mkdir()
+    file_path = root / f"clip{ext}"
+    _write_video(file_path, fourcc)
+    data = file_path.read_bytes()
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    (picture_id,) = result["imported_picture_ids"]
+    picture = watch_server.vault.db.run_task(
+        lambda session: session.get(Picture, picture_id)
+    )
+    assert picture.is_video
+    assert picture.format == ext[1:].upper()
+    assert picture.file_path.endswith(ext)
+    published = ImageUtils.resolve_picture_path(
+        watch_server.vault.image_root, picture.file_path
+    )
+    with open(published, "rb") as handle:
+        assert handle.read() == data
+
+
+def _rival_arrives_as_the_name_is_taken(monkeypatch, rival: bytes) -> list[str]:
+    """Write *rival* at a picture's final name just before the import takes it."""
+    arrived: list[str] = []
+
+    def _wrap(real):
+        def publish(src, dst, *args, **kwargs):
+            if is_in_progress_file_name(
+                os.path.basename(str(src))
+            ) and not is_in_progress_file_name(os.path.basename(str(dst))):
+                with open(dst, "xb") as handle:
+                    handle.write(rival)
+                arrived.append(str(dst))
+            return real(src, dst, *args, **kwargs)
+
+        return publish
+
+    monkeypatch.setattr(os, "link", _wrap(os.link))
+    monkeypatch.setattr(os, "replace", _wrap(os.replace))
+    return arrived
+
+
+def test_a_file_that_takes_the_name_while_publishing_is_never_replaced(
+    watch_server, tmp_path, monkeypatch
+):
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    data = _write_picture(file_path)
+    rival = b"test-rival-bytes"
+    arrived = _rival_arrives_as_the_name_is_taken(monkeypatch, rival)
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    assert len(arrived) == 1, arrived
+    with open(arrived[0], "rb") as handle:
+        assert handle.read() == rival
+    assert result["imported_picture_ids"] == []
+    assert _picture_ids_with_bytes(watch_server, data) == []
+    assert os.path.exists(file_path), "a file that did not import is kept"
+    assert not [
+        name
+        for name in os.listdir(os.path.dirname(arrived[0]))
+        if is_in_progress_file_name(name)
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot fsync a directory")
+def test_a_published_picture_is_on_disk_before_and_after_it_takes_its_name(
+    watch_server, tmp_path, monkeypatch
+):
+    """The bytes are flushed before the name points at them, the name after."""
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    _write_picture(file_path)
+    events: list[tuple[str, tuple[int, int]]] = []
+    real_fsync, real_link = os.fsync, os.link
+
+    def fsync(fd):
+        info = os.fstat(fd)
+        events.append(("fsync", (info.st_dev, info.st_ino)))
+        return real_fsync(fd)
+
+    def link(src, dst, *args, **kwargs):
+        result = real_link(src, dst, *args, **kwargs)
+        events.append(("publish", (0, 0)))
+        return result
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "link", link)
+
+    result = _watch_pass(watch_server, file_path, root)
+
+    (picture_id,) = result["imported_picture_ids"]
+    picture = watch_server.vault.db.run_task(
+        lambda session: session.get(Picture, picture_id)
+    )
+    published = ImageUtils.resolve_picture_path(
+        watch_server.vault.image_root, picture.file_path
+    )
+    file_info, dir_info = os.stat(published), os.stat(os.path.dirname(published))
+    file_key = (file_info.st_dev, file_info.st_ino)
+    dir_key = (dir_info.st_dev, dir_info.st_ino)
+    order = [event for event in events if event[1] in (file_key, dir_key, (0, 0))]
+    publish_at = order.index(("publish", (0, 0)))
+    assert ("fsync", file_key) in order[:publish_at], order
+    assert ("fsync", dir_key) in order[publish_at:], order
+
+
+def test_an_import_folder_id_sqlite_cannot_store_is_a_422(watch_server):
+    """``2**63`` overflowed the driver while binding (a 500); the largest
+    storable id still reaches the handler, which answers 404."""
+    with TestClient(watch_server.api) as client:
+        response = client.post(
+            f"{API_PREFIX}/login",
+            json={"username": "testuser", "password": "testpassword"},
+        )
+        assert response.status_code == 200, response.text
+        for folder_id, status in ((2**63, 422), (2**63 - 1, 404)):
+            patched = client.patch(
+                f"{API_PREFIX}/import-folders/{folder_id}", json={"label": "x"}
+            )
+            assert patched.status_code == status, patched.text
+            deleted = client.delete(f"{API_PREFIX}/import-folders/{folder_id}")
+            assert deleted.status_code == status, deleted.text
+
+
+# ── A file published for a picture that is not saved, and the seen paths ──
+
+
+def _library_files_with_bytes(server, data: bytes) -> list[str]:
+    """Every file under the image root with the content *data*, row or not."""
+    sha = ImageUtils.calculate_full_hash_from_bytes(data)
+    found = []
+    for dirpath, _dirs, names in os.walk(server.vault.image_root):
+        for name in names:
+            path = os.path.join(dirpath, name)
+            if ImageUtils.calculate_full_hash_from_file_path(path) == sha:
+                found.append(path)
+    return found
+
+
+class _RecordingFinder:
+    """Stands in for the finder: records what the task hands back."""
+
+    def __init__(self):
+        self.handed_back: list[str] = []
+
+    def discard_seen_paths(self, paths):
+        self.handed_back.extend(paths)
+
+
+def _watch_task(server, paths, root, finder, delete_after_import=False):
+    return WatchFolderImportTask(
+        server.vault.db,
+        [
+            {
+                "file_path": str(path),
+                "delete_after_import": delete_after_import,
+                "import_source_folder": str(root),
+            }
+            for path in paths
+        ],
+        len(paths),
+        finder=finder,
+    )
+
+
+def _fail_the_insert(monkeypatch, server):
+    """Make the watch task's insert fail at its commit, as a full disk would."""
+    database = server.vault.db
+    real_run_task = database.run_task
+
+    def run_task(func, *args, **kwargs):
+        if getattr(func, "__name__", "") == "insert_pictures":
+            real_insert = func
+
+            def func(session, *inner_args):
+                def commit():
+                    raise RuntimeError("test-insert-failure")
+
+                session.commit = commit
+                return real_insert(session, *inner_args)
+
+        return real_run_task(func, *args, **kwargs)
+
+    monkeypatch.setattr(database, "run_task", run_task)
+
+
+def test_a_watched_file_that_fails_after_its_copy_leaves_no_file_and_is_offered_again(
+    watch_server, tmp_path, monkeypatch
+):
+    """The copy in the library goes with the failure, and the finder forgets
+    the file so a later scan retries it; the rest of the pass imports."""
+    root = tmp_path / "watch"
+    failing, fine = root / "failing.png", root / "fine.png"
+    failing_data = _write_picture(failing)
+    fine_data = _write_picture(fine)
+    real_attach = watch_folder_import_task.attach_sidecars
+
+    def attach_sidecars(pic, file_path, **kwargs):
+        if file_path == str(failing):
+            raise OSError("test-sidecar-failure")
+        return real_attach(pic, file_path, **kwargs)
+
+    monkeypatch.setattr(watch_folder_import_task, "attach_sidecars", attach_sidecars)
+    finder = _RecordingFinder()
+
+    result = _watch_task(watch_server, [failing, fine], root, finder)._run_task()
+
+    assert _library_files_with_bytes(watch_server, failing_data) == []
+    assert finder.handed_back == [str(failing)]
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, fine_data) == [picture_id]
+
+
+def test_a_failed_watch_insert_removes_the_batch_files_and_offers_every_file_again(
+    watch_server, tmp_path, monkeypatch
+):
+    root = tmp_path / "watch"
+    paths = [root / "first.png", root / "second.png"]
+    datas = [_write_picture(path) for path in paths]
+    _fail_the_insert(monkeypatch, watch_server)
+    finder = _RecordingFinder()
+    task = _watch_task(watch_server, paths, root, finder, delete_after_import=True)
+
+    with pytest.raises(RuntimeError, match="test-insert-failure"):
+        task._run_task()
+
+    for data in datas:
+        assert _library_files_with_bytes(watch_server, data) == []
+        assert _picture_ids_with_bytes(watch_server, data) == []
+    assert sorted(finder.handed_back) == sorted(str(path) for path in paths)
+    assert all(os.path.exists(path) for path in paths), "nothing imported, kept"
+
+
+def test_a_watch_task_cancelled_before_it_ran_offers_its_files_again(
+    watch_server, tmp_path
+):
+    root = tmp_path / "watch"
+    paths = [root / "first.png", root / "second.png"]
+    for path in paths:
+        _write_picture(path)
+    finder = _RecordingFinder()
+
+    _watch_task(watch_server, paths, root, finder).on_cancel()
+
+    assert sorted(finder.handed_back) == sorted(str(path) for path in paths)
+
+
+def test_a_watch_pass_cancelled_midway_offers_the_files_it_did_not_reach_again(
+    watch_server, tmp_path, monkeypatch
+):
+    """Cancelled once the first batch is saved: that file is imported and not
+    handed back, the two the pass never reached are."""
+    monkeypatch.setattr(watch_folder_import_task, "_IMPORT_BATCH", 1)
+    root = tmp_path / "watch"
+    paths = [root / "first.png", root / "second.png", root / "third.png"]
+    first_data = _write_picture(paths[0])
+    for path in paths[1:]:
+        _write_picture(path)
+    finder = _RecordingFinder()
+    task = _watch_task(watch_server, paths, root, finder)
+    _after_insert(monkeypatch, watch_server, task.on_cancel)
+
+    result = task._run_task()
+
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, first_data) == [picture_id]
+    assert sorted(finder.handed_back) == sorted(str(path) for path in paths[1:])
+
+
+def test_a_watch_pass_cancelled_inside_a_batch_offers_the_rest_of_it_again(
+    watch_server, tmp_path, monkeypatch
+):
+    root = tmp_path / "watch"
+    paths = [root / "first.png", root / "second.png", root / "third.png"]
+    first_data = _write_picture(paths[0])
+    for path in paths[1:]:
+        _write_picture(path)
+    finder = _RecordingFinder()
+    task = _watch_task(watch_server, paths, root, finder)
+    real_create = ImageUtils.create_picture_from_file
+
+    def create_then_cancel(*args, **kwargs):
+        pic = real_create(*args, **kwargs)
+        task.on_cancel()
+        return pic
+
+    monkeypatch.setattr(ImageUtils, "create_picture_from_file", create_then_cancel)
+
+    result = task._run_task()
+
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, first_data) == [picture_id]
+    assert sorted(finder.handed_back) == sorted(str(path) for path in paths[1:])
+
+
+def test_identical_watched_files_in_one_pass_become_one_picture(watch_server, tmp_path):
+    """The second file's content is the first's copy, which the library lookup
+    cannot see before the batch's insert; it is skipped and kept on disk."""
+    root = tmp_path / "watch"
+    first, second = root / "first.png", root / "nested" / "second.png"
+    data = _write_picture(first)
+    os.makedirs(second.parent, exist_ok=True)
+    shutil.copyfile(first, second)
+    finder = _RecordingFinder()
+
+    result = _watch_task(
+        watch_server, [first, second], root, finder, delete_after_import=True
+    )._run_task()
+
+    (picture_id,) = result["imported_picture_ids"]
+    assert _picture_ids_with_bytes(watch_server, data) == [picture_id]
+    assert len(_library_files_with_bytes(watch_server, data)) == 1
+    assert not os.path.exists(first)
+    assert os.path.exists(second), "a skipped file is kept"
+    assert finder.handed_back == []
