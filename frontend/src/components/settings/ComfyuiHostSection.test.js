@@ -319,3 +319,32 @@ describe("the table of connections", () => {
     expect(byTestId(wrapper, "comfyui-host").exists()).toBe(true);
   });
 });
+
+// `GET /comfyui/connections` marks a saved address the backend now refuses
+// (`address_valid: false`): nothing is sent there until it is set again.
+describe("a saved address the backend no longer accepts", () => {
+  const GOOD = entry("good", "This PC", "http://127.0.0.1:8188/", {
+    address_valid: true,
+  });
+  const BAD = entry("bad", "Old box", "http://user@192.0.2.20:8188/", {
+    address_valid: false,
+  });
+
+  it("names the invalid row, and only that row, as invalid", async () => {
+    comfyui.listComfyuiConnections.mockResolvedValue(list([GOOD, BAD], "good"));
+    const wrapper = await mountPane();
+    const lines = wrapper.findAll('[data-testid="comfyui-address-invalid"]');
+    expect(lines).toHaveLength(1);
+    expect(lines[0].classes()).toContain("cf-error");
+    expect(lines[0].text()).toContain("Old box: this address is no longer accepted");
+    expect(lines[0].text()).toContain("Edit address");
+    expect(lines[0].text()).not.toContain("This PC");
+  });
+
+  it("says nothing for rows whose address is valid", async () => {
+    comfyui.listComfyuiConnections.mockResolvedValue(list([GOOD], "good"));
+    const wrapper = await mountPane();
+    expect(byTestId(wrapper, "comfyui-connection-good").exists()).toBe(true);
+    expect(byTestId(wrapper, "comfyui-address-invalid").exists()).toBe(false);
+  });
+});

@@ -88,3 +88,33 @@ describe("requestFailure", () => {
     });
   });
 });
+
+// utils/apiClient.js marks the saved-address 409 once its notice is up; the
+// sentence is then the card's alone.
+describe("an error the saved-address notice has already shown", () => {
+  const shown = () => ({
+    ...err("The saved ComfyUI address is not valid.", 409),
+    message: "Request failed with status code 409",
+    savedAddressNoticed: true,
+  });
+
+  it("gives no detail and leaves the caller's copy", () => {
+    expect(errorDetail(shown())).toBe("");
+    expect(errorMessage(shown(), "Could not load the packs.")).toBe(
+      "Could not load the packs.",
+    );
+    expect(requestFailure(shown())).toEqual({
+      kind: "conflict",
+      status: 409,
+      detail: "",
+      code: null,
+    });
+  });
+
+  it("leaves an unmarked 409 its detail", () => {
+    const plain = err("Preview again.", 409);
+    expect(errorDetail(plain)).toBe("Preview again.");
+    expect(errorMessage(plain, "fallback")).toBe("Preview again.");
+    expect(requestFailure(plain).detail).toBe("Preview again.");
+  });
+});

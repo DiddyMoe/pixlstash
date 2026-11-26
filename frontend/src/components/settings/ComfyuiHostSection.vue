@@ -9,7 +9,7 @@
 // Invariant: an address is only ever saved after the backend has proven a
 // ComfyUI answers there (`POST /comfyui/probe`). On this machine nothing has
 // to be typed: with no connection, the usual ports are probed on open.
-import { nextTick, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { VIcon, VProgressCircular } from "vuetify/components";
 import { isReadOnly } from "../../utils/apiClient";
 import { patchUserConfig } from "../../api/config";
@@ -52,6 +52,12 @@ let detectRun = 0;
 // `GET /comfyui/connections`.
 const connections = ref([]);
 const current = ref(null);
+// Rows whose saved address the backend no longer accepts (an older build
+// saved it, or it was set by hand): nothing is sent there until it is set
+// again. `address_valid` is computed on the server per row.
+const invalidRows = computed(() =>
+  connections.value.filter((c) => c.address_valid === false),
+);
 const table = ref(null);
 
 const scheme = ref("http");
@@ -246,6 +252,18 @@ watch(
           Add connection
         </AppButton>
       </div>
+      <p
+        v-for="row in invalidRows"
+        :key="row.id"
+        class="cf-error"
+        data-testid="comfyui-address-invalid"
+      >
+        <v-icon size="16" class="cf-error__icon">mdi-alert-rhombus-outline</v-icon>
+        <span
+          >{{ row.name }}: this address is no longer accepted, so nothing is
+          sent to it. Set it again with Edit address in its ⋯ menu.</span
+        >
+      </p>
       <ComfyuiConnectionsTable
         ref="table"
         :connections="connections"

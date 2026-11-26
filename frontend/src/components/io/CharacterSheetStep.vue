@@ -1874,7 +1874,9 @@ async function checkCard(card, reference) {
     return {
       sizes: [],
       inputs: [],
-      problem: `Couldn't check ${card.name || "this workflow"}: ${errorMessage(e)}`,
+      // A saved-address 409 brings no sentence of its own here (its notice
+      // gave the reason), so the fallback is what follows the colon.
+      problem: `Couldn't check ${card.name || "this workflow"}: ${errorMessage(e, "the check did not finish")}`,
       // Never answered, so not remembered: the next open checks it again.
       failed: true,
       assist: null,

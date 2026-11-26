@@ -13,7 +13,11 @@ import { rememberTheme } from "./utils/themeMemory";
 import { storeToRefs } from "pinia";
 import { useRoute, useRouter } from "vue-router";
 import { useReviewRoute } from "./composables/useReviewRoute";
-import { isReadOnly, sessionContext } from "./utils/apiClient";
+import {
+  isReadOnly,
+  sessionContext,
+  setSettingsOpener,
+} from "./utils/apiClient";
 import { getInstallId } from "./api/telemetry";
 import { defaultInstallType } from "./utils/telemetryPayload";
 import { useSelectionStore } from "./stores/useSelectionStore";
@@ -30,6 +34,7 @@ import { useProjectStore } from "./stores/useProjectStore";
 import { useWsStore } from "./stores/useWsStore";
 import { useReviewSessionsStore } from "./stores/useReviewSessionsStore";
 import { useSnapshotsStore } from "./stores/useSnapshotsStore";
+import { useScrapheapRunStore } from "./stores/useScrapheapRunStore";
 import { useTasksStore } from "./stores/useTasksStore";
 import { useOperationStore } from "./stores/useOperationStore";
 import { useEntityListsStore } from "./stores/useEntityListsStore";
@@ -67,6 +72,7 @@ import WorkflowsSidebar from "./components/panels/WorkflowsSidebar.vue";
 import TitleBar from "./components/TitleBar.vue";
 import PhotosImportDialog from "./components/io/PhotosImportDialog.vue";
 import RestoreConfirmDialog from "./components/widgets/RestoreConfirmDialog.vue";
+import SnapshotsWithDeletedDialog from "./components/widgets/SnapshotsWithDeletedDialog.vue";
 import TelemetryConsentDialog from "./components/dialogs/TelemetryConsentDialog.vue";
 import ImageGrid from "./components/views/ImageGrid.vue";
 import StatsSidebar from "./components/panels/StatsSidebar.vue";
@@ -158,6 +164,7 @@ const projectStore = useProjectStore();
 const wsStore = useWsStore();
 const reviewSessionsStore = useReviewSessionsStore();
 const snapshotsStore = useSnapshotsStore();
+const scrapheapRunStore = useScrapheapRunStore();
 const tasksStore = useTasksStore();
 const entityLists = useEntityListsStore();
 const operationStore = useOperationStore();
@@ -957,6 +964,9 @@ onMounted(async () => {
       openSettingsDialog(),
     );
   }
+  // The saved-address notice (utils/apiClient.js) offers "Open Settings" only
+  // once the shell has handed it this opener.
+  setSettingsOpener(openSettingsDialog);
   refreshSidebar();
   updateMaxColumns();
   connectUpdatesSocket();
@@ -1110,6 +1120,16 @@ defineExpose({
           :snapshot-id="snapshotsStore.restoreDialogSnapshotId"
           :resources="snapshotsStore.restoreDialogResources"
           @confirmed="onRestoreConfirmed"
+        />
+        <!-- After a purge, the snapshots that still hold what it destroyed.
+             Here, not in the grid: the run may end in any view. -->
+        <SnapshotsWithDeletedDialog
+          v-model="scrapheapRunStore.snapshotsWithDeletedOpen"
+          :snapshots="scrapheapRunStore.snapshotsWithDeleted"
+          :dont-show-again="userPrefsStore.hidePurgeSnapshotWarning"
+          @update:dont-show-again="
+            userPrefsStore.setHidePurgeSnapshotWarning($event)
+          "
         />
         <!-- The centre column and the right rail: everything a picture opened
              in the lightbox may cover (#2163). The title bar and the left

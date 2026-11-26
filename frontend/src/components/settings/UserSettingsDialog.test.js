@@ -192,6 +192,53 @@ describe("UserSettingsDialog library navigation", () => {
     expect(wrapper.find(".compute-stub").exists()).toBe(true);
   });
 
+  it("moves an open dialog to the pane a notice asks for", async () => {
+    // Notices sit above the dialog, so the saved-address notice's "Open
+    // Settings" can ask for the ComfyUI pane while Settings is already open on
+    // another one.
+    sessionContext.value = { scope: "ALL" };
+    const wrapper = mountDialog();
+    await nextTick();
+    await wrapper.find("#settings-nav-appearance").trigger("click");
+    expect(
+      wrapper.find("#settings-nav-appearance").attributes("aria-current"),
+    ).toBe("page");
+
+    await wrapper.setProps({ initialTab: "comfyui" });
+
+    expect(wrapper.find("#settings-nav-comfyui").attributes("aria-current")).toBe(
+      "page",
+    );
+    expect(
+      wrapper.find("#settings-nav-appearance").attributes("aria-current"),
+    ).toBeUndefined();
+  });
+
+  it("moves an open dialog back to a pane asked for again", async () => {
+    // Opened on ComfyUI from a notice, clicked away to Appearance, and the
+    // notice asks for ComfyUI again: the pane named is the same, so only the
+    // request count changes.
+    sessionContext.value = { scope: "ALL" };
+    const wrapper = mount(UserSettingsDialog, {
+      props: { open: true, initialTab: "comfyui", tabRequest: 1 },
+      global: { stubs: { VIcon: true } },
+    });
+    await nextTick();
+    await wrapper.find("#settings-nav-appearance").trigger("click");
+    expect(
+      wrapper.find("#settings-nav-appearance").attributes("aria-current"),
+    ).toBe("page");
+
+    await wrapper.setProps({ tabRequest: 2 });
+
+    expect(wrapper.find("#settings-nav-comfyui").attributes("aria-current")).toBe(
+      "page",
+    );
+    expect(
+      wrapper.find("#settings-nav-appearance").attributes("aria-current"),
+    ).toBeUndefined();
+  });
+
   it("splits ComfyUI and Compute into two desktop panes", async () => {
     // `isDesktop` is read when the module is evaluated, so the bridge has to
     // be in place before the import.

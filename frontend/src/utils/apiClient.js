@@ -1,6 +1,8 @@
 import axios from 'axios';
 import {computed, ref} from 'vue';
 
+import {useNoticeStore} from '../stores/useNoticeStore';
+
 // Centralised authentication state
 const isAuthenticated = ref(false);
 
@@ -397,6 +399,55 @@ apiClient.interceptors.response.use((response) => response, (error) => {
   return Promise.reject(error);
 });
 
+// ── A saved ComfyUI address that no longer passes the check ─────────────────
+// The backend answers 409 with exactly this detail when the address the owner
+// saved (by an older build, or by hand) is refused today, and sends nothing
+// (`SAVED_ADDRESS_INVALID` in pixlstash/utils/comfyui_url.py;
+// tests/test_saved_comfyui_address_reads.py fails if the two drift). Another
+// 409 is an ordinary conflict and is left to the caller.
+const SAVED_ADDRESS_INVALID =
+    'The saved ComfyUI address is not valid, so nothing was sent to it. ' +
+    'Set the address again in Settings.';
+const SAVED_ADDRESS_NOTICE_KEY = 'saved-comfyui-address-invalid';
+const SAVED_ADDRESS_NOTICE_TEXT =
+    'The saved ComfyUI address is not valid, so nothing is sent to it until ' +
+    'it is set again in Settings > ComfyUI.';
+
+// The settings dialog is opened by the app shell, not a route, so the shell
+// hands this module its opener. Until it has, the notice names the place
+// without a button rather than offering one that does nothing.
+let _settingsOpener = null;
+
+/**
+ * Register the app shell's settings opener, for the notice's action.
+ * @param {Function|null} opener - called with a settings nav entry id.
+ */
+function setSettingsOpener(opener) {
+  _settingsOpener = typeof opener === 'function' ? opener : null;
+}
+
+apiClient.interceptors.response.use((response) => response, (error) => {
+  const response = error?.response;
+  if (response?.status === 409 &&
+      response?.data?.detail === SAVED_ADDRESS_INVALID) {
+    // Said once, by this notice: errorDetail, errorMessage and requestFailure
+    // read the mark and leave the sentence to the card, so no caller repeats it.
+    error.savedAddressNoticed = true;
+    // One card however many requests met the bad address at once (the key
+    // coalesces them), with the way to fix it.
+    const opener = _settingsOpener;
+    useNoticeStore().push({
+      level: 'error',
+      text: SAVED_ADDRESS_NOTICE_TEXT,
+      key: SAVED_ADDRESS_NOTICE_KEY,
+      action: opener ?
+          {label: 'Open Settings', handler: () => opener('comfyui')} :
+          null,
+    });
+  }
+  return Promise.reject(error);
+});
+
 export {
   apiClient,
   activateShareToken,
@@ -413,6 +464,7 @@ export {
   operationBatchHeaders,
   sessionContext,
   setRequestClientId,
+  setSettingsOpener,
   toBackendWebSocketUrl,
   apiBaseUrl as API_BASE_URL,
 };

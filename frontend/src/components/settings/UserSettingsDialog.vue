@@ -44,12 +44,19 @@ const props = defineProps({
   showKeyboardHint: { type: Boolean, default: true },
   thumbnailMode: { type: String, default: "square" },
   /**
-   * Nav entry to land on when the dialog opens. Lets a caller deep-link to a
-   * setting from where it matters (e.g. the scrapheap header's "change" link).
+   * Nav entry to land on when the dialog opens, or to move to when it changes
+   * while the dialog is open. Lets a caller deep-link to a setting from where
+   * it matters (e.g. the scrapheap header's "change" link).
    * Falls back to Appearance when empty or when the entry is not visible in
    * this session (read-only / non-desktop).
    */
   initialTab: { type: String, default: "" },
+  /**
+   * Bumped by the owner on every tab request, so a second request for the
+   * same `initialTab` still moves an open dialog back to it after the user
+   * has clicked to another pane.
+   */
+  tabRequest: { type: Number, default: 0 },
 });
 
 const emit = defineEmits([
@@ -206,9 +213,13 @@ const MERGED_TABS = {
   sharing: "privacy",
 };
 
+// The requested tab is watched as well as the open flag: a notice's "Open
+// Settings" can ask for a pane while the dialog is already open (notices sit
+// above modals), and that request must move the dialog to it. `tabRequest`
+// covers a request for the pane already named, which changes nothing else.
 watch(
-  () => dialogOpen.value,
-  async (isOpen) => {
+  () => [dialogOpen.value, props.initialTab, props.tabRequest],
+  async ([isOpen]) => {
     if (!isOpen) return;
     // Only honour a requested tab that actually exists in this session - a
     // read-only or browser session hides several entries, and landing on a

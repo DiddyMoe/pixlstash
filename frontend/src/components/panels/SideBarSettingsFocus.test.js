@@ -138,3 +138,22 @@ describe("closing Settings", () => {
     region.remove();
   });
 });
+
+describe("asking for a Settings pane", () => {
+  it("tells the dialog again when the same pane is asked for twice", async () => {
+    // The pane name does not change between the two, so the request count is
+    // what moves an open dialog back to it.
+    const wrapper = await mountSidebar();
+    const dialog = wrapper.findComponent({ name: "UserSettingsDialog" });
+
+    wrapper.vm.openSettingsDialog("models");
+    await wrapper.vm.$nextTick();
+    const first = dialog.props("tabRequest");
+    wrapper.vm.openSettingsDialog("models");
+    await wrapper.vm.$nextTick();
+
+    expect(dialog.props("initialTab")).toBe("models");
+    expect(dialog.props("tabRequest")).toBeGreaterThan(first);
+    wrapper.unmount();
+  });
+});

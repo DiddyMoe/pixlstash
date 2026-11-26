@@ -14,7 +14,8 @@
 import { isLockedRefusal, lockedSetsSentence } from "./dedup";
 
 /**
- * The server's sentence for a rejection, or "" when it did not give one.
+ * The server's sentence for a rejection, or "" when it did not give one, or
+ * when the saved-address notice has already shown it.
  *
  * Always a string. A structured locked-set refusal becomes the sentence naming
  * the sets; any other non-string detail becomes "", so the caller's own
@@ -24,6 +25,8 @@ import { isLockedRefusal, lockedSetsSentence } from "./dedup";
  * @returns {string}
  */
 export function errorDetail(err) {
+  // The saved-address notice already said it (utils/apiClient.js).
+  if (err?.savedAddressNoticed) return "";
   const detail = err?.response?.data?.detail;
   if (typeof detail === "string") return detail.trim();
   if (isLockedRefusal(err)) return lockedSetsSentence(detail?.sets);
@@ -42,6 +45,9 @@ export function errorDetail(err) {
  * @returns {string}
  */
 export function errorMessage(err, fallback) {
+  // Not the transport's "Request failed with status code 409" either: the
+  // notice gave the reason, the caller's copy says what failed.
+  if (err?.savedAddressNoticed) return fallback;
   return errorDetail(err) || err?.message || fallback;
 }
 
@@ -79,6 +85,8 @@ export function requestFailure(err) {
     if (typeof served.message === "string") detail = served.message.trim();
     if (typeof served.code === "string") code = served.code;
   }
+  // The saved-address notice already said it (utils/apiClient.js).
+  if (err?.savedAddressNoticed) detail = "";
   let kind;
   if (
     err?.code === "ERR_CANCELED" ||
