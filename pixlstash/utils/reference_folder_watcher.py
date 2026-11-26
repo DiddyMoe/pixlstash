@@ -88,19 +88,61 @@ class ReferenceFolderWatcher:
             int | None, threading.Timer
         ] = {}  # folder_id → debounce timer
         self._lock = threading.Lock()
+        # Set by stop(): no debounce timer is armed and no callback starts.
+        self._stopped = False
+        # Bumped by stop(). A timer armed before it never calls back, even one
+        # that fired as stop() ran and gets the lock only after a restart.
+        self._generation = 0
+        # Callbacks past their debounce, still running; stop() waits them out.
+        self._callbacks_running = 0
+        self._callbacks_idle = threading.Condition(self._lock)
 
     def start(self) -> None:
-        """Start the underlying filesystem observer thread."""
-        self._observer.start()
+        """Start the observer thread; after a stop(), a new one with no watches.
+
+        A watchdog observer is a thread and cannot be started twice, so a
+        restart builds a fresh observer. The caller schedules the watches again
+        (the vault re-reads them from its database, which a restore may have
+        replaced). A watch scheduled while stopped belonged to the old observer
+        and is dropped with it.
+
+        Raises:
+            RuntimeError: The watcher is already running. watchdog would
+                otherwise try to start each watch's emitter again and, when
+                that fails, hang joining the running emitter.
+        """
+        with self._lock:
+            if self._stopped:
+                self._observer = Observer()
+                self._watches.clear()
+                self._stopped = False
+            observer = self._observer
+            if observer.is_alive():
+                raise RuntimeError("The folder watcher is already running.")
+        observer.start()
 
     def stop(self) -> None:
-        """Stop the observer and cancel any pending debounce timers."""
+        """Stop the observer, drop every watch and wait out a running callback.
+
+        On return no callback is running and none will start until start(): a
+        debounce timer still armed is cancelled, and one that had already fired
+        is waited for. Never call this from the callback, which would wait on
+        itself.
+        """
         with self._lock:
+            self._stopped = True
+            self._generation += 1
             for timer in self._timers.values():
                 timer.cancel()
             self._timers.clear()
-        self._observer.stop()
-        self._observer.join()
+            self._watches.clear()
+            observer = self._observer
+        # Outside our lock, for the reason given in `watch_folder`.
+        observer.stop()
+        observer.join()
+        with self._lock:
+            while self._callbacks_running:
+                self._callbacks_idle.wait()
 
     def watch_folder(self, folder_id: int | None, resolved_path: str) -> None:
         """Begin watching *resolved_path* for the given *folder_id*.
@@ -125,6 +167,7 @@ class ReferenceFolderWatcher:
                 return
             # Reserve the id so a concurrent caller cannot schedule it twice.
             self._watches[folder_id] = None
+            observer = self._observer
         handler = _ChangeHandler(
             folder_id,
             self._schedule_rescan,
@@ -139,20 +182,21 @@ class ReferenceFolderWatcher:
         # same moment (seen as a hung library switch, `_start_existing_folder_
         # watches` waiting forever).
         try:
-            watch = self._observer.schedule(handler, resolved_path, recursive=True)
+            watch = observer.schedule(handler, resolved_path, recursive=True)
         except Exception:
             with self._lock:
                 self._watches.pop(folder_id, None)
             raise
         with self._lock:
-            if folder_id not in self._watches:
-                # Unwatched while the watch was being scheduled.
+            if folder_id not in self._watches or self._observer is not observer:
+                # Unwatched, or the watcher restarted on a new observer, while
+                # the watch was being scheduled.
                 stale = watch
             else:
                 self._watches[folder_id] = watch
                 stale = None
         if stale is not None:
-            self._observer.unschedule(stale)
+            observer.unschedule(stale)
             return
         logger.debug(
             "ReferenceFolderWatcher: watching folder %s at %s",
@@ -176,27 +220,37 @@ class ReferenceFolderWatcher:
             timer = self._timers.pop(folder_id, None)
             if timer:
                 timer.cancel()
+            observer = self._observer
         # Outside our lock, for the reason given in `watch_folder`.
         if watch:
-            self._observer.unschedule(watch)
+            observer.unschedule(watch)
 
     def _schedule_rescan(self, folder_id: int | None) -> None:
         """Debounce a rescan notification for *folder_id*."""
         with self._lock:
+            if self._stopped:
+                return
             existing = self._timers.pop(folder_id, None)
             if existing:
                 existing.cancel()
             timer = threading.Timer(
-                self._debounce_s, self._trigger_rescan, args=(folder_id,)
+                self._debounce_s,
+                self._trigger_rescan,
+                args=(folder_id, self._generation),
             )
             timer.daemon = True
             self._timers[folder_id] = timer
             timer.start()
 
-    def _trigger_rescan(self, folder_id: int | None) -> None:
+    def _trigger_rescan(self, folder_id: int | None, generation: int) -> None:
         """Invoke the caller's callback after the debounce window has elapsed."""
         with self._lock:
+            if generation != self._generation:
+                # Fired as stop() cancelled it: its folder id is the old watch
+                # map's, and the timer in its slot (if any) is a newer one.
+                return
             self._timers.pop(folder_id, None)
+            self._callbacks_running += 1
         logger.debug(
             "ReferenceFolderWatcher: change detected - triggering rescan for folder %s",
             folder_id,
@@ -209,6 +263,10 @@ class ReferenceFolderWatcher:
                 folder_id,
                 exc,
             )
+        finally:
+            with self._lock:
+                self._callbacks_running -= 1
+                self._callbacks_idle.notify_all()
 
 
 class _ChangeHandler(FileSystemEventHandler):

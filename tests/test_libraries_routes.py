@@ -7,6 +7,7 @@ much a regression as leaking host layout to a remote one.
 
 import importlib
 import io
+import logging
 import os
 import tempfile
 import threading
@@ -536,6 +537,7 @@ class TestSwitching:
             json={"uuid": "00000000-0000-4000-8000-000000000000"},
         )
         assert response.status_code == 404
+        assert response.json()["detail"] == "No attached library has that uuid."
 
     def test_a_library_that_cannot_be_opened_is_409_and_changes_nothing(
         self, server, tmp_path
@@ -551,6 +553,9 @@ class TestSwitching:
         response = client.post(f"{API}/libraries/active", json={"uuid": library.uuid})
 
         assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail.startswith('"Broken" no longer looks like a library: ')
+        assert str(tmp_path) not in detail, "a refusal names no server folder"
         assert server.vault is before, "the session stays on its library"
 
     def test_overlapping_switch_posts_finish_without_deadlock(
@@ -872,11 +877,42 @@ class TestInspect:
         assert response.status_code == 400
 
     def test_a_folder_that_is_not_there_is_a_404(self, server, tmp_path):
+        absent = str(tmp_path / "test-absent-folder")
         response = _owner(server).get(
-            f"{API}/libraries/inspect", params={"path": str(tmp_path / "absent")}
+            f"{API}/libraries/inspect", params={"path": absent}
         )
 
         assert response.status_code == 404
+        # The path is the caller's own text, resolved but never found: the
+        # answer does not hand it back.
+        assert response.json()["detail"] == "That path is not a folder."
+        assert "test-absent-folder" not in response.text
+        added = _owner(server).post(f"{API}/libraries", json={"path": absent})
+        assert added.status_code == 404
+        assert added.json()["detail"] == "That path is not a folder."
+
+    def test_a_folder_pixlstash_cannot_write_is_a_403_in_a_fixed_sentence(
+        self, server, tmp_path, monkeypatch, caplog
+    ):
+        folder = tmp_path / "test-locked-folder"
+        folder.mkdir()
+
+        def refuse(*_args, **_kwargs):
+            raise PermissionError(13, "Permission denied", str(folder / "vault.db"))
+
+        monkeypatch.setattr(server.library_registry, "create", refuse)
+        with caplog.at_level(logging.ERROR, logger="pixlstash.routes.libraries"):
+            response = _owner(server).post(
+                f"{API}/libraries", json={"path": str(folder)}
+            )
+
+        assert response.status_code == 403
+        assert response.json()["detail"] == (
+            "PixlStash is not allowed to write to that folder."
+        )
+        assert "test-locked-folder" not in response.text
+        logged = [r for r in caplog.records if "Could not add" in r.getMessage()]
+        assert logged and isinstance(logged[0].exc_info[1], PermissionError)
 
     def test_a_remote_owner_is_refused_and_a_local_one_is_not(self, server, tmp_path):
         """Both directions: over-blocking the owner on their own machine is a regression too."""
@@ -1095,6 +1131,13 @@ class TestRenaming:
         )
 
         assert response.status_code == 409
+        # Names are unique without regard to case; the answer names the one
+        # that is stored, not the text that came in.
+        response = _owner(server).patch(
+            f"{API}/libraries/{other['uuid']}", json={"name": "TAKEN"}
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == 'Another library is already named "Taken".'
 
     def test_an_empty_name_is_refused(self, server, added_libraries, tmp_path):
         library = added_libraries(_add(_owner(server), tmp_path / "keeps-its-name"))
@@ -1235,17 +1278,41 @@ class TestDetaching:
         response = _owner(server).delete(f"{API}/libraries/{library['uuid']}")
 
         assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "PixlStash is switching library. Try again in a moment."
+        )
         assert server.library_registry.by_uuid(library["uuid"]).attached is True
-        # `Retry-After` is set on the exception and deliberately not asserted
-        # here: `Server._add_cors_exception_handler` rebuilds every HTTPException
-        # as a JSONResponse and drops `exc.headers`, so no route's headers reach
-        # a client today - the authz gate's own switch 503 loses the same one.
-        # Pre-existing and worth its own change; the header stays so it works
-        # the day that is fixed.
+        # FastAPI's default HTTPException handler forwards `exc.headers`
+        # (#1097 removed the handler that dropped them), so the client is told
+        # when to ask again.
+        assert response.headers["retry-after"] == "2"
+
+    def test_a_restore_in_flight_says_so_when_it_defers_the_detach(
+        self, server, added_libraries, tmp_path, monkeypatch
+    ):
+        """A full restore holds the coordinator in SWITCHING too; the person is
+        told it is a restore, in the sentence the admission middleware uses.
+        """
+        library = added_libraries(_add(_owner(server), tmp_path / "mid-restore"))
+        monkeypatch.setattr(
+            type(server.library_switch), "is_switching", property(lambda _self: True)
+        )
+        monkeypatch.setattr(server.library_coordinator, "restoring", True)
+
+        response = _owner(server).delete(f"{API}/libraries/{library['uuid']}")
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "PixlStash is restoring the library. Try again in a moment."
+        )
+        assert server.library_registry.by_uuid(library["uuid"]).attached is True
+        assert response.headers["retry-after"] == "2"
 
     def test_an_unknown_uuid_is_a_404(self, server):
         response = _owner(server).delete(f"{API}/libraries/not-a-library")
         assert response.status_code == 404
+        # The path segment is the caller's text, unchecked: not repeated back.
+        assert response.json()["detail"] == "No attached library has that uuid."
 
     def test_a_remote_owner_is_refused_and_a_local_one_is_not(
         self, server, added_libraries, tmp_path

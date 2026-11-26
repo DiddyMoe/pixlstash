@@ -20,7 +20,9 @@ from pixlstash.services.downloads_intake import (
 from pixlstash.services.managed_model_store import find_default_folder
 from pixlstash.services.model_folder_scanner import ModelFolderScanner
 from pixlstash.services.model_mover import SHELF_IO_LOCK
+from pixlstash.task_runner import TaskCancelledError
 from pixlstash.tasks import downloads_intake_finder
+from pixlstash.tasks.base_task import TaskStatus
 from pixlstash.tasks.downloads_intake_finder import DownloadsIntakeFinder
 
 
@@ -223,6 +225,37 @@ def test_the_finder_waits_for_a_file_to_settle_then_moves_it(hub, folders, monke
     assert finder.find_task() is None
 
 
+def test_a_header_nested_past_the_parser_stays_in_downloads(
+    hub, folders, monkeypatch, caplog
+):
+    """JSON nested deeper than the parser recurses raises RecursionError, not
+    ValueError. The file does not read as whole, so it stays where it is and
+    the finder moves the file beside it."""
+    downloads, _, default_id = folders
+    monkeypatch.setattr(downloads_intake_finder, "_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(DownloadsIntakeFinder, "SETTLE_SECONDS", 0.0)
+    finder = DownloadsIntakeFinder(hub)
+    blob = b"[" * 100_000 + b"]" * 100_000
+    deep = downloads / "Deep.safetensors"
+    deep.write_bytes(struct.pack("<Q", len(blob)) + blob)
+    write_adapter(downloads / "Good.safetensors")
+
+    with caplog.at_level("INFO"):
+        assert finder.find_task() is None
+        task = finder.find_task()
+    assert task is not None
+    task._run_task()
+    finder.on_task_complete(task, None)
+
+    assert _located(hub, default_id) == {"Good.safetensors"}
+    assert deep.exists()
+    assert any(
+        "Deep.safetensors does not read as a whole safetensors file yet"
+        in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def test_the_finder_never_hands_out_a_file_still_changing(hub, folders, monkeypatch):
     downloads, _, _ = folders
     monkeypatch.setattr(downloads_intake_finder, "_CHECK_INTERVAL_S", 0.0)
@@ -251,6 +284,36 @@ def test_a_file_kept_out_by_a_busy_shelf_is_offered_again(hub, folders, monkeypa
     assert again is not None, "a busy file was dropped instead of retried"
     again._run_task()
     assert _located(hub, default_id) == {"Retry.safetensors"}
+
+
+def test_a_file_whose_task_was_cancelled_before_it_started_is_offered_again(
+    hub, folders, monkeypatch
+):
+    """A restore's drain or a stop can cancel the task after the runner took it
+    and before its body ran: nothing moved, and the runner reports it as a
+    cancellation. The file is offered again, not forgotten until it changes."""
+    downloads, _, default_id = folders
+    monkeypatch.setattr(downloads_intake_finder, "_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(DownloadsIntakeFinder, "SETTLE_SECONDS", 0.0)
+    finder = DownloadsIntakeFinder(hub)
+    write_adapter(downloads / "Drained.safetensors")
+    finder.find_task()
+    task = finder.find_task()
+    task.on_cancel()
+    assert task.run() is None
+    assert task.status == TaskStatus.CANCELLED
+    finder.on_task_complete(
+        task, TaskCancelledError("test-cancelled before it started")
+    )
+    assert _located(hub, default_id) == set()
+
+    assert finder.find_task() is None, "the clock starts again"
+    again = finder.find_task()
+    assert again is not None, "a cancelled file was dropped instead of offered"
+    assert again.params["paths"] == task.params["paths"]
+    again._run_task()
+    finder.on_task_complete(again, None)
+    assert _located(hub, default_id) == {"Drained.safetensors"}
 
 
 def test_a_file_left_in_downloads_is_not_retried_every_sweep(hub, folders, monkeypatch):

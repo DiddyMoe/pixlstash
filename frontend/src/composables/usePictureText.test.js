@@ -22,6 +22,7 @@ import {
   wordBoxRect,
   wordLayerStyle,
 } from "./usePictureText";
+import { useNoticeStore } from "../stores/useNoticeStore";
 
 const w = (text, matched = false) => ({
   text,
@@ -179,6 +180,26 @@ describe("usePictureText - landing", () => {
     await settle();
     await text.readAgain();
     expect(text.readAgainBusy.value).toBe(false);
+  });
+
+  it("a read again a restore refused says so", async () => {
+    getPictureText.mockResolvedValue(PLAIN);
+    readPictureText.mockRejectedValue({
+      response: {
+        status: 409,
+        data: {
+          detail:
+            "Not started: a library restore is in progress. Try again once it has finished.",
+        },
+      },
+    });
+    const { text } = setup();
+    await settle();
+    await text.readAgain();
+    expect(text.readAgainBusy.value).toBe(false);
+    expect(useNoticeStore().notices.at(-1).text).toBe(
+      "Couldn't read the text again. Not started: a library restore is in progress. Try again once it has finished.",
+    );
   });
 
   it("read again is busy for its own picture only", async () => {

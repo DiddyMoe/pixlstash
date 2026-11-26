@@ -10,6 +10,7 @@ load-bearing and preserved verbatim.
 
 import os
 import shutil
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -20,7 +21,7 @@ from sqlalchemy import (
     update as sa_update,
 )
 
-from pixlstash.database import create_configured_engine
+from pixlstash.database import DBPriority, create_configured_engine
 from pixlstash.db_models import (
     DeletedFileLog,
     Face,
@@ -39,11 +40,21 @@ from pixlstash.db_models.picture_likeness import (
 from pixlstash.db_models.snapshot import Snapshot
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
+from pixlstash.services.dedup_auto_stack_service import (
+    interrupt_restored_runs_in_session,
+)
+from pixlstash.services.scrapheap_run_service import reload_runs
 from pixlstash.services.workflow_ghost_service import requeue_library_ghosts
 from pixlstash.utils.path_utils import resolve_path_within
+from pixlstash.utils.sql_chunking import chunked
 
 from ._models import (
+    RECONCILE_RUNS_FAILED_MESSAGE,
+    RESTORE_FAILED_MESSAGE,
+    LibraryFence,
+    LibrarySwitch,
     RestoreInProgressError,
+    RestoreRefusedError,
     RestoreReport,
     SafetySnapshotFailedError,
     _MAX_MISSING_RATIO_FOR_CLEANUP,
@@ -66,11 +77,14 @@ class FullRestoreMixin:
         dry_run: bool = False,
         allow_without_safety: bool = False,
         restore_request_lease: int | None = None,
+        library_fence: LibraryFence | None = None,
     ) -> RestoreReport:
         """Replace the live database with a snapshot snapshot.
 
         Steps:
         1. Take an OPPORTUNISTIC safety snapshot of the current state.
+           Runs after steps 2 and 3, which refuse a restore that cannot
+           finish before anything is paused (``_preflight_full_restore``).
         2. Upgrade the snapshot schema to the current Alembic head.
         3. Scan snapshot Picture rows; collect missing-file IDs.
         4. Dispose the live engine, copy the snapshot over the live DB, and
@@ -81,13 +95,20 @@ class FullRestoreMixin:
         6. Delete rows whose files are missing and perform post-swap cleanup.
         7. Reset the in-memory authentication state the swap invalidated (see
            ``_reset_auth_state``); clients sign in again afterwards.
-        8. Reopen authentication only after every finalisation step succeeds.
-        9. Resume the TaskRunner and emit ``RESTORE_COMPLETED``.
+        8. Close the Scrapheap and Auto-stack runs the snapshot holds as
+           active (see ``_reconcile_background_runs``), then reopen
+           authentication once the auth reset has succeeded. A failure to
+           close the runs is logged and noted in the report's ``errors``; it
+           does not keep sign-in closed.
+        9. Reopen library admission with a new generation, resume the
+           TaskRunner and the planner, and only then emit
+           ``RESTORE_COMPLETED``.
 
         Args:
             snapshot_id: ID of the snapshot to restore.
-            dry_run: If True, perform all steps except the actual DB swap and
-                return a report without modifying the live database.
+            dry_run: If True, run steps 2 and 3 only and return their report.
+                Nothing is paused, no safety snapshot is taken and no
+                lifecycle event is emitted.
             allow_without_safety: If True, proceed even when the safety
                 snapshot in step 1 fails. The safety snapshot is the only
                 rollback if the restore breaks something, so the default is
@@ -99,13 +120,42 @@ class FullRestoreMixin:
                 HTTP restore request. The barrier excludes it from the drain
                 after closing new admissions, avoiding a self-deadlock. Direct
                 service callers leave this as ``None``.
+            library_fence: The server's library coordinator and the request's
+                own read lease (see ``_library_switched``). With it, library
+                admission is closed for the whole restore and reopened with a
+                new generation after the swap, so no writer that is not a task
+                (an import thread, a folder mapping commit, a ComfyUI output
+                import) writes from the old file into the new one. The CLI
+                restore has no server and passes ``None``.
 
         Returns:
             A ``RestoreReport`` summarising the operation.
 
+        Background work is held off for the whole restore except a dry run.
+        The refusals that cost nothing come first, in this order: work
+        somebody started is queued or running (an import, a Scrapheap run, a
+        picture-menu action, a request waiting on a task, or a pending
+        Auto-stack or duplicate-scan run), then steps 2 and 3. Then library
+        admission closes (``_library_switched``), the planner stops and the
+        TaskRunner is drained (``_background_work_paused``), all before
+        step 1, so nothing a task or a lease holder writes can land between
+        the captures and the swap. Both waits share one ``_DRAIN_TIMEOUT_S``
+        deadline; if either is still waiting at it the restore is refused
+        before step 1. ``RESTORE_STARTED`` is emitted only after the drain,
+        so a refused restore emits no lifecycle event at all.
+
         Raises:
-            ValueError: If the snapshot is not found or the snapshot file is
-                missing from disk.
+            SnapshotNotFoundError: If the snapshot is not found or the snapshot
+                file is missing from disk.
+            WorkInProgressError: If work somebody started was queued or
+                running; nothing was paused or changed.
+            LibraryStillInUseError: If work still held the library when
+                admission had waited until the deadline; nothing was changed.
+            BackgroundWorkStillRunningError: If a background task was still
+                running when the drain timed out; nothing was changed.
+            RestoreRefusedError: If the library folder is unreadable or most
+                of the snapshot's files are missing; nothing was paused or
+                changed.
             SafetySnapshotFailedError: If the safety snapshot fails and
                 ``allow_without_safety`` is False.
         """
@@ -128,21 +178,15 @@ class FullRestoreMixin:
                 "progress": 0.0,
             }
             try:
-                # A snapshot that finishes while this restore runs waits to
-                # register its row until the restore has ended, and so lands
-                # in the restored database. Registered mid-restore, its row
-                # would be lost in the swap and its files orphaned. The safety
-                # snapshot taken below runs on this thread and re-enters the
-                # lock.
-                with self._vault.snapshot_service.hold_registrations():
-                    return self._restore_full_inner(
-                        snapshot_id,
-                        dry_run,
-                        vault_root,
-                        report,
-                        allow_without_safety,
-                        restore_request_lease,
-                    )
+                return self._restore_full_inner(
+                    snapshot_id,
+                    dry_run,
+                    vault_root,
+                    report,
+                    allow_without_safety,
+                    restore_request_lease,
+                    library_fence,
+                )
             finally:
                 self._active_job = None
         finally:
@@ -156,6 +200,7 @@ class FullRestoreMixin:
         report: "RestoreReport",
         allow_without_safety: bool,
         restore_request_lease: int | None,
+        library_fence: LibraryFence | None = None,
     ) -> "RestoreReport":
         """Inner implementation of full restore (called from restore_full).
 
@@ -164,6 +209,9 @@ class FullRestoreMixin:
             dry_run: If True skip DB swap.
             vault_root: Vault root path.
             report: Pre-constructed RestoreReport to populate.
+            allow_without_safety: See ``restore_full``.
+            restore_request_lease: See ``restore_full``.
+            library_fence: See ``restore_full``.
 
         Returns:
             Populated RestoreReport.
@@ -171,44 +219,219 @@ class FullRestoreMixin:
         cp = self._get_snapshot_or_raise(snapshot_id)
         abs_snapshot = resolve_path_within(vault_root, cp.relative_path)
         if not os.path.exists(abs_snapshot):
-            raise ValueError(f"Snapshot file not found on disk: {abs_snapshot}")
+            raise self._snapshot_file_missing(snapshot_id, abs_snapshot)
 
-        # Emit STARTED only AFTER the snapshot is known to exist (and the
-        # lock was already acquired in the outer ``restore_full``) - a 404
-        # or 409 must not leave the UI with ``activeJob`` set forever.
-        # Anything that throws or early-returns from here on emits FAILED
-        # so the frontend can clear ``activeJob``.
-        started_payload = {"snapshot_id": snapshot_id, "resource_type": "full"}
-        self._emit_lifecycle(EventType.RESTORE_STARTED, started_payload)
+        # Every refusal that costs nothing to find comes first: work somebody
+        # started, then the checks on the snapshot itself. None of them stops
+        # background work, closes admission or takes the safety snapshot, and
+        # none emits an event, so a refused restore reloads no tab.
+        if not dry_run:
+            self._refuse_while_somebody_started_work()
+        upgraded_snapshot, missing_ids = self._preflight_full_restore(
+            snapshot_id, abs_snapshot, vault_root, report, allow_without_safety
+        )
         try:
-            return self._restore_full_steps(
+            if dry_run:
+                # A dry run changes nothing, so it stops here: no drain, no
+                # safety snapshot and no lifecycle events.
+                logger.info("RestoreService: dry_run=True - skipping DB swap.")
+                return report
+            return self._restore_full_drained(
                 snapshot_id,
-                dry_run,
                 vault_root,
                 report,
                 allow_without_safety,
-                abs_snapshot,
+                upgraded_snapshot,
+                missing_ids,
                 restore_request_lease,
+                library_fence,
             )
-        except Exception as exc:
+        finally:
+            # The swap moves the upgraded copy into place and removes its
+            # folder; on any exit before it the copy is still here.
+            shutil.rmtree(os.path.dirname(upgraded_snapshot), ignore_errors=True)
+
+    def _restore_full_drained(
+        self,
+        snapshot_id: int,
+        vault_root: str,
+        report: "RestoreReport",
+        allow_without_safety: bool,
+        upgraded_snapshot: str,
+        missing_ids: list[int],
+        restore_request_lease: int | None,
+        library_fence: LibraryFence | None,
+    ) -> "RestoreReport":
+        """Close admission, drain background work, then run the restore.
+
+        ``RESTORE_STARTED`` is emitted only once every refusal has passed:
+        admission is closed and the drain has finished. A client that sees it
+        drops what it read under the old library, so a restore refused after
+        it would cost every other open tab a reload. ``RESTORE_FAILED``
+        follows only a ``RESTORE_STARTED``.
+        """
+        # One deadline for both waits below, so together they add no more than
+        # ``_DRAIN_TIMEOUT_S`` before the auth gate's own drain.
+        deadline = time.monotonic() + self._DRAIN_TIMEOUT_S
+        started_payload = {"snapshot_id": snapshot_id, "resource_type": "full"}
+        started = False
+        try:
+            # Library admission closes first: a lease holder (an import
+            # thread, a staging commit) may be waiting on a task, so it must
+            # finish while the TaskRunner still runs. The drain comes next,
+            # before the registration hold: a running snapshot task that
+            # reaches registration would block on the hold, and the drain
+            # would then wait on it until it timed out. The drain looks again
+            # for work somebody started as it pauses.
+            with (
+                self._library_switched(library_fence, deadline) as switch,
+                self._background_work_paused(deadline),
+                # A snapshot that finishes while this restore runs waits to
+                # register its row until the restore has ended, and so lands
+                # in the restored database. Registered mid-restore, its row
+                # would be lost in the swap and its files orphaned. The safety
+                # snapshot taken below runs on this thread and re-enters the
+                # lock.
+                self._vault.snapshot_service.hold_registrations(),
+            ):
+                self._emit_lifecycle(EventType.RESTORE_STARTED, started_payload)
+                started = True
+                self._restore_full_steps(
+                    snapshot_id,
+                    vault_root,
+                    report,
+                    allow_without_safety,
+                    upgraded_snapshot,
+                    missing_ids,
+                    restore_request_lease,
+                    switch,
+                )
+            # Only once the blocks above have exited: library admission is
+            # READY with the new generation (``publish_ready``) and background
+            # work is admitted again. A client reloads on this event, so sent
+            # earlier its first requests were refused.
             self._emit_lifecycle(
-                EventType.RESTORE_FAILED,
-                {**started_payload, "error": str(exc)},
+                EventType.RESTORE_COMPLETED,
+                {
+                    "snapshot_id": snapshot_id,
+                    "resource_type": "full",
+                    "missing_files_count": report.missing_files_count,
+                },
             )
+            logger.info(
+                "RestoreService: full restore from snapshot %d completed "
+                "(%d missing files).",
+                snapshot_id,
+                report.missing_files_count,
+            )
+            return report
+        except Exception as exc:
+            if started:
+                self._emit_restore_failed(started_payload, exc, RESTORE_FAILED_MESSAGE)
             raise
+
+    def _preflight_full_restore(
+        self,
+        snapshot_id: int,
+        abs_snapshot: str,
+        vault_root: str,
+        report: "RestoreReport",
+        allow_without_safety: bool,
+    ) -> tuple[str, list[int]]:
+        """Upgrade the snapshot and refuse a restore it cannot finish.
+
+        Runs before admission closes and before the drain, so the refusals
+        here cost the person nothing: the schema upgrade failing, the library
+        folder being unreadable, or most of the snapshot's files missing.
+
+        Returns:
+            The upgraded copy's path and the snapshot picture ids whose files
+            are missing. The caller removes the copy's folder; on a refusal
+            here it is already gone.
+
+        Raises:
+            RuntimeError: If the schema upgrade failed.
+            RestoreRefusedError: If the library folder is unreadable or most of
+                the snapshot's files are missing.
+        """
+        # Upgrade snapshot schema to head.
+        upgraded_snapshot = self._upgrade_snapshot_schema(abs_snapshot)
+        if upgraded_snapshot is None:
+            report.errors.append("Schema upgrade failed; aborting restore.")
+            raise RuntimeError("Schema upgrade failed; aborting restore.")
+        try:
+            # Find missing-file Picture IDs from the snapshot. Raises if
+            # vault_root is unreachable (transient mount failure).
+            missing_ids, total_pictures = self._find_missing_file_ids(
+                upgraded_snapshot, vault_root
+            )
+            report.missing_files_count = len(missing_ids)
+            if missing_ids:
+                logger.info(
+                    "RestoreService: %d picture file(s) missing on disk; "
+                    "those rows will be dropped after restore.",
+                    len(missing_ids),
+                )
+            # Pictures in the permanent-deletion ledger were deleted on
+            # purpose: they must not count toward the missing-file ratio
+            # below - an intentional purge is not a mount failure. The ledger
+            # is read again after the drain, for the rows the swap drops.
+            path_shas, pixel_shas = self._load_deleted_file_index()
+            deleted_ids = self._find_permanently_deleted_ids(
+                upgraded_snapshot, path_shas, pixel_shas
+            )
+            # Safety check: if a suspiciously large fraction of files are
+            # flagged as missing, this is almost certainly a partial-mount
+            # failure rather than legitimate deletions. Refuse to wipe
+            # metadata for that many pictures unless the caller has
+            # explicitly opted in to "I know my data looks wrong, proceed".
+            # Skipped when the snapshot is too small for the ratio to mean
+            # anything (a one-picture snapshot whose file the user deleted
+            # is legitimately 100% missing).
+            suspicious_missing = set(missing_ids) - deleted_ids
+            if (
+                total_pictures >= _MIN_PICTURES_FOR_MISSING_RATIO_CHECK
+                and len(suspicious_missing) / total_pictures
+                > _MAX_MISSING_RATIO_FOR_CLEANUP
+                and not allow_without_safety
+            ):
+                ratio_pct = 100.0 * len(suspicious_missing) / total_pictures
+                logger.warning(
+                    "RestoreService: refused restoring snapshot %d: %d of %d "
+                    "pictures missing on disk.",
+                    snapshot_id,
+                    len(suspicious_missing),
+                    total_pictures,
+                )
+                raise RestoreRefusedError(
+                    f"Not restored: {len(suspicious_missing)} of "
+                    f"{total_pictures} pictures in this snapshot "
+                    f"({ratio_pct:.0f}%) are missing from the library folder. "
+                    "That usually means the folder is not fully reachable, "
+                    "such as a network drive that is not connected. Check "
+                    "the folder and try again."
+                )
+        except BaseException:
+            shutil.rmtree(os.path.dirname(upgraded_snapshot), ignore_errors=True)
+            raise
+        return upgraded_snapshot, missing_ids
 
     def _restore_full_steps(
         self,
         snapshot_id: int,
-        dry_run: bool,
         vault_root: str,
         report: "RestoreReport",
         allow_without_safety: bool,
-        abs_snapshot: str,
+        upgraded_snapshot: str,
+        missing_ids: list[int],
         restore_request_lease: int | None,
+        switch: LibrarySwitch,
     ) -> "RestoreReport":
-        """The body of full restore steps 1-9 (separated so the lifecycle
-        wrapper in ``_restore_full_inner`` stays narrow)."""
+        """The body of full restore steps 1 and 3a-8, run with admission
+        closed and background work drained (separated so the lifecycle
+        wrapper in ``_restore_full_drained`` stays narrow); steps 2 and 3
+        ran in ``_preflight_full_restore`` and step 9 is the wrapper's, once
+        its blocks have exited."""
         db = self._vault.db
 
         # 1. Safety snapshot of current state.
@@ -221,43 +444,29 @@ class FullRestoreMixin:
             self._vault.snapshot_service.create_snapshot("OPPORTUNISTIC")
         except Exception as exc:
             if not allow_without_safety:
-                msg = (
-                    f"Safety snapshot failed and allow_without_safety=False; "
-                    f"refusing to proceed without a rollback point: {exc}"
+                logger.error(
+                    "RestoreService: safety snapshot failed before restoring "
+                    "snapshot %d; refusing to proceed without a rollback point.",
+                    snapshot_id,
+                    exc_info=True,
                 )
-                logger.error("RestoreService: %s", msg, exc_info=True)
-                raise SafetySnapshotFailedError(msg) from exc
+                raise SafetySnapshotFailedError(
+                    "The safety snapshot failed, so the restore did not start: "
+                    "without it there is no rollback point. The server log has "
+                    "the details."
+                ) from exc
             logger.warning(
                 "RestoreService: safety snapshot failed; proceeding because "
                 "allow_without_safety=True (no rollback will be available): %s",
                 exc,
             )
 
-        # 2. Upgrade snapshot schema to head.
-        upgraded_snapshot = self._upgrade_snapshot_schema(abs_snapshot)
-        if upgraded_snapshot is None:
-            report.errors.append("Schema upgrade failed; aborting restore.")
-            raise RuntimeError("Schema upgrade failed; aborting restore.")
-
-        # 3. Find missing-file Picture IDs from the snapshot.
-        # Raises if vault_root is unreachable (transient mount failure).
-        missing_ids, total_pictures = self._find_missing_file_ids(
-            upgraded_snapshot, vault_root
-        )
-        report.missing_files_count = len(missing_ids)
-        if missing_ids:
-            logger.info(
-                "RestoreService: %d picture file(s) missing on disk; "
-                "those rows will be dropped after restore.",
-                len(missing_ids),
-            )
-
         # 3a. Cross-check the snapshot against the permanent-deletion ledger.
         #     Pictures whose file path or content hash is recorded in
         #     deleted_file_log were intentionally, permanently deleted: they
         #     must never be resurrected (even if the file somehow lingers on
-        #     disk), and they must not count toward the missing-file ratio
-        #     below - an intentional purge is not a mount failure.
+        #     disk). Read again here, with background work drained, so a
+        #     purge that landed after the pre-flight is counted.
         path_shas, pixel_shas = self._load_deleted_file_index()
         deleted_ids = self._find_permanently_deleted_ids(
             upgraded_snapshot, path_shas, pixel_shas
@@ -269,38 +478,6 @@ class FullRestoreMixin:
                 "permanent-deletion ledger; they will not be restored.",
                 len(deleted_ids),
             )
-
-        # Safety check: if a suspiciously large fraction of files are
-        # flagged as missing, this is almost certainly a partial-mount
-        # failure rather than legitimate deletions. Refuse to wipe
-        # metadata for that many pictures unless the caller has
-        # explicitly opted in to "I know my data looks wrong, proceed".
-        # Known permanent deletions are excluded - they are expected to be
-        # gone, so they never read as a mount failure.
-        # Skipped when the snapshot is too small for the ratio to mean
-        # anything (a one-picture snapshot whose file the user deleted
-        # is legitimately 100% missing).
-        suspicious_missing = set(missing_ids) - deleted_ids
-        if (
-            total_pictures >= _MIN_PICTURES_FOR_MISSING_RATIO_CHECK
-            and len(suspicious_missing) / total_pictures
-            > _MAX_MISSING_RATIO_FOR_CLEANUP
-            and not allow_without_safety
-        ):
-            ratio_pct = 100.0 * len(suspicious_missing) / total_pictures
-            raise RuntimeError(
-                f"{len(suspicious_missing)} of {total_pictures} pictures "
-                f"({ratio_pct:.0f}%) are missing on disk - refusing to "
-                "overwrite the live DB and drop metadata for that many "
-                "pictures, this looks like a network mount issue. If you "
-                "really did delete that many files, pass "
-                "allow_without_safety=True."
-            )
-
-        if dry_run:
-            logger.info("RestoreService: dry_run=True - skipping DB swap.")
-            shutil.rmtree(os.path.dirname(upgraded_snapshot), ignore_errors=True)
-            return report
 
         # 3b. Capture the live likeness pipeline state BEFORE the swap so
         #     the file swap doesn't reset progress-tracking to whatever
@@ -371,24 +548,11 @@ class FullRestoreMixin:
         # be on disk, so it would otherwise survive the swap).
         drop_ids = sorted(set(missing_ids) | deleted_ids)
 
-        # 4. Pause background work, then route the DB swap through the writer
-        #    queue so it is serialised with all other DB operations and no
-        #    competing connection can hold a lock during the file swap.
+        # 4. Route the DB swap through the writer queue so it is serialised
+        #    with all other DB operations and no competing connection can hold
+        #    a lock during the file swap. Background work has been held off
+        #    since before step 1 (``_background_work_paused``).
         live_db_path = db._db_path
-        planner = self._vault._work_planner
-        task_runner = self._vault._task_runner
-
-        if planner is not None:
-            planner.stop()
-            logger.info("RestoreService: WorkPlanner stopped for full restore.")
-
-        if task_runner is not None:
-            cancelled = task_runner.cancel_pending_tasks()
-            if cancelled:
-                logger.info(
-                    "RestoreService: cancelled %d pending background task(s).",
-                    cancelled,
-                )
 
         # 3e. Capture the RESOLVED paths of every LIVE, non-deleted picture. These
         #     are the files currently in active use - including content that was
@@ -414,9 +578,9 @@ class FullRestoreMixin:
         #     imported/managed pictures store RELATIVE - and also covers ``./`` /
         #     ``//`` prefixes, symlinks, and case differences. Raw file_paths are
         #     read under the DB lock (cheap); the filesystem resolution runs here,
-        #     off the lock. Captured AFTER the planner/task-runner are stopped so a
-        #     background import in the capture→swap window can't add a live picture
-        #     the guard would miss.
+        #     off the lock. Captured with background work drained so a background
+        #     task in the capture→swap window can't add a live picture the guard
+        #     would miss.
         from pixlstash.utils.image_processing.image_utils import ImageUtils
 
         def _resolved_key(fp: Optional[str]) -> Optional[str]:
@@ -568,27 +732,31 @@ class FullRestoreMixin:
                 # silently leaving the dropped rows behind. ``all_drop_ids``
                 # covers missing-on-disk files, permanent deletions (minus
                 # live-active rescues), and scrapheap ghosts that shadow a live
-                # added-after file.
-                for child_model in (
-                    Tag,
-                    Face,
-                    PictureSetMember,
-                    PictureProjectMember,
-                ):
-                    session.execute(
-                        sa_delete(child_model).where(
-                            child_model.picture_id.in_(all_drop_ids)
+                # added-after file. Chunked: the ledger alone can name more
+                # pictures than one statement may bind, and each chunk drops
+                # its dependents before its pictures, so FK order holds.
+                dropped = 0
+                for chunk in chunked(all_drop_ids):
+                    for child_model in (
+                        Tag,
+                        Face,
+                        PictureSetMember,
+                        PictureProjectMember,
+                    ):
+                        session.execute(
+                            sa_delete(child_model).where(
+                                child_model.picture_id.in_(chunk)
+                            )
                         )
-                    )
-                result = session.execute(
-                    sa_delete(Picture).where(Picture.id.in_(all_drop_ids))
-                )
+                    dropped += session.execute(
+                        sa_delete(Picture).where(Picture.id.in_(chunk))
+                    ).rowcount
                 logger.info(
                     "RestoreService: dropped %d picture row(s) after restore "
                     "(%d missing-file, %d permanently deleted, %d scrapheap "
                     "ghost(s) shadowing a live added-after file - files kept; "
                     "%d ledger match(es) rescued as live).",
-                    result.rowcount,
+                    dropped,
                     len(missing_ids),
                     len(deleted_ids) - len(rescued_ids),
                     len(shadow_ids),
@@ -724,56 +892,80 @@ class FullRestoreMixin:
         if auth_service is not None:
             auth_service.close_auth_for_restore(restore_request_lease)
 
-        # Steps 4-8 wrapped in try/finally so the planner always restarts -
-        # if _do_swap or the cleanup raises, leaving the planner stopped
-        # would silently halt every background worker (daily snapshots,
-        # missing-file detection, embedding generation, ...) until restart.
+        # The planner restarts and admission resumes when
+        # ``_background_work_paused`` exits, on success and on any failure
+        # here, including the auth gate's drain timing out above.
+        # From here on the file may be the snapshot's, so library admission
+        # reopens with a new generation whatever happens next.
+        switch.swap_attempted = True
+        db.run_control_task(_do_swap)
+        # Clear API tokens before anything else touches the swapped-in DB,
+        # so no later failure in the cleanup below can leave a restored
+        # token row in place.  ``run_control_task`` has returned, so the
+        # swap has finished and released ``exclusive_engine_access``; this
+        # writer task opens its session on the re-created engine.
+        db.run_task(self._clear_guest_state, priority=0)
+        self._clear_hub_api_tokens()
+        db.run_task(_post_restore_cleanup, priority=0)
+        # Before authentication reopens, so no endpoint reports a run the
+        # snapshot recorded as active (see ``_reconcile_background_runs``).
+        # A failure here must not keep sign-in closed: the restored database
+        # is final, and the auth reset below is what decides whether
+        # credentials may be admitted again.
         try:
-            db.run_control_task(_do_swap)
-            # Clear API tokens before anything else touches the swapped-in DB,
-            # so no later failure in the cleanup below can leave a restored
-            # token row in place.  ``run_control_task`` has returned, so the
-            # swap has finished and released ``exclusive_engine_access``; this
-            # writer task opens its session on the re-created engine.
-            db.run_task(self._clear_guest_state, priority=0)
-            self._clear_hub_api_tokens()
-            db.run_task(_post_restore_cleanup, priority=0)
-            # Rebuild process-local auth state only after the restored database
-            # is in its final form. A reset failure is fatal and intentionally
-            # leaves the gate closed; reporting success would be fail-open.
-            self._reset_auth_state()
-            if auth_service is not None:
-                auth_service.reopen_auth_after_restore()
-            # The swap dropped every picture the snapshot did not have without
-            # deleting a row, so no trigger queued their instance hashes. Queue
-            # every ghost this library holds; the cascade re-checks each one's
-            # cover against the restored pictures.
-            requeue_library_ghosts(
-                db,
-                getattr(self._vault, "hub", None),
-                getattr(self._vault, "library_uuid", None),
+            self._reconcile_background_runs()
+        except Exception:
+            logger.error(
+                "RestoreService: could not close the runs snapshot %d recorded "
+                "as active; the Scrapheap run history is cleared until a "
+                "restart, which closes them.",
+                snapshot_id,
+                exc_info=True,
             )
-        finally:
-            if planner is not None:
-                planner.start()
-                logger.info("RestoreService: WorkPlanner restarted after full restore.")
-
-        self._emit_lifecycle(
-            EventType.RESTORE_COMPLETED,
-            {
-                "snapshot_id": snapshot_id,
-                "resource_type": "full",
-                "missing_files_count": report.missing_files_count,
-            },
-        )
-
-        logger.info(
-            "RestoreService: full restore from snapshot %d completed "
-            "(%d missing files).",
-            snapshot_id,
-            report.missing_files_count,
+            # The registry may still hold runs of the replaced database.
+            self._vault.scrapheap_runs.reload([])
+            report.errors.append(RECONCILE_RUNS_FAILED_MESSAGE)
+        # Rebuild process-local auth state only after the restored database
+        # is in its final form. A reset failure is fatal and intentionally
+        # leaves the gate closed; reporting success would be fail-open.
+        self._reset_auth_state()
+        if auth_service is not None:
+            auth_service.reopen_auth_after_restore()
+        # The swap dropped every picture the snapshot did not have without
+        # deleting a row, so no trigger queued their instance hashes. Queue
+        # every ghost this library holds; the cascade re-checks each one's
+        # cover against the restored pictures.
+        requeue_library_ghosts(
+            db,
+            getattr(self._vault, "hub", None),
+            getattr(self._vault, "library_uuid", None),
         )
         return report
+
+    def _reconcile_background_runs(self) -> None:
+        """Close the run rows the swap brought back active, and reload runs.
+
+        A snapshot taken while a Scrapheap or Auto-stack run was going holds
+        its row as ``pending`` or ``running``. After the swap no task owns it:
+        every task was drained before the restore began. Left alone, the row
+        reads as a run in progress and blocks a new one until a restart. This
+        does what start-up does (``Vault.start``): mark such rows interrupted,
+        with the ``library_restored`` code rather than start-up's, then read the newest ended Scrapheap runs back, so the registry and the
+        restored rows agree. The registry's runs are replaced rather than
+        merged because they were recorded in the database the swap replaced;
+        the registry object is kept, because request code and tasks hold it
+        (``reload_runs``).
+        """
+        auto_stack = self._vault.db.run_task(
+            interrupt_restored_runs_in_session, priority=DBPriority.IMMEDIATE
+        )
+        scrapheap = reload_runs(self._vault)
+        logger.info(
+            "RestoreService: marked %d Auto-stack and %d Scrapheap run(s) from "
+            "the snapshot interrupted after the restore.",
+            auto_stack,
+            scrapheap,
+        )
 
     def _reset_auth_state(self) -> None:
         """Drop the in-memory authentication state the DB swap invalidated.
@@ -901,7 +1093,7 @@ class FullRestoreMixin:
             apply a ratio-based safety check before deleting metadata.
 
         Raises:
-            RuntimeError: If ``vault_root`` is not currently a readable
+            RestoreRefusedError: If ``vault_root`` is not currently a readable
                 directory. Treating a transient mount failure as "all files
                 are missing" would wipe metadata for the entire vault, so
                 we refuse rather than scan.
@@ -909,10 +1101,15 @@ class FullRestoreMixin:
         from pixlstash.utils.image_processing.image_utils import ImageUtils
 
         if not os.path.isdir(vault_root):
-            raise RuntimeError(
-                f"Vault root {vault_root!r} is not a readable directory; "
-                "refusing to scan for missing files. If the vault is on a "
-                "network mount, verify it is mounted before retrying."
+            logger.error(
+                "RestoreService: the library folder %s is not a readable "
+                "directory; refusing to scan for missing files.",
+                vault_root,
+            )
+            raise RestoreRefusedError(
+                "The library folder is not a readable directory, so the "
+                "restore did not start. If the library is on a network mount, "
+                "check that it is mounted and try again."
             )
 
         missing: list[int] = []

@@ -116,13 +116,17 @@ BOUNDARY_HIGH = 0.65
 MISMATCH_LIKENESS_THRESHOLD = 0.95
 
 # Per-vault rebuild state; keyed by id(vault) so multiple Server instances in
-# one process (tests) don't share a progress bar.
+# one process (tests) don't share a progress bar. ``queued_task`` is the id of
+# the rebuild task that raised ``building`` and has not started its body yet:
+# the flag is that task's to take down if the runner cancels it first.
 _LOCK = threading.Lock()
 _STATES: dict[int, dict] = {}
 
 
 def _state(vault: "Vault") -> dict:
-    return _STATES.setdefault(id(vault), {"building": False, "progress": 0.0})
+    return _STATES.setdefault(
+        id(vault), {"building": False, "progress": 0.0, "queued_task": None}
+    )
 
 
 def get_status(vault: "Vault") -> dict:
@@ -635,7 +639,11 @@ def rebuild_tag_health(vault: "Vault") -> dict:
 
 
 def _run_rebuild_guarded(vault: "Vault") -> dict:
-    """Task body: rebuild with the building flag held; always clears it."""
+    """Task body: rebuild with the building flag held; always clears it.
+
+    While ``building`` is up no other rebuild starts, so the flag, and any
+    ``queued_task`` not yet taken, are this rebuild's to take down.
+    """
     try:
         return rebuild_tag_health(vault)
     finally:
@@ -643,6 +651,47 @@ def _run_rebuild_guarded(vault: "Vault") -> dict:
             state = _state(vault)
             state["building"] = False
             state["progress"] = 1.0
+            state["queued_task"] = None
+
+
+def claim_queued_rebuild(vault: "Vault", task_id: str) -> bool:
+    """Hand the raised ``building`` flag to the rebuild task *task_id* as it starts.
+
+    Returns:
+        True when the task still held the flag: its body runs the rebuild and
+        takes the flag down when it ends. False when the runner cancelled the
+        task before it got here (:func:`abandon_queued_rebuild` has taken the
+        flag down, and a later rebuild may hold it now): the body must not
+        rebuild.
+    """
+    with _LOCK:
+        state = _state(vault)
+        if state["queued_task"] != task_id:
+            return False
+        state["queued_task"] = None
+        return True
+
+
+def abandon_queued_rebuild(vault: "Vault", task_id: str) -> bool:
+    """Take ``building`` down for the rebuild task *task_id*, which will not run.
+
+    For a task the runner cancels before it starts (a restore's drain, a stop,
+    a submit while admission is paused) and for one that never queued. Does
+    nothing once the task's body has claimed the flag (the rebuild does not
+    stop part-way and takes the flag down when it ends) or when another
+    rebuild holds it.
+
+    Returns:
+        True when the flag was this task's and went down.
+    """
+    with _LOCK:
+        state = _state(vault)
+        if state["queued_task"] != task_id:
+            return False
+        state["building"] = False
+        state["progress"] = 0.0
+        state["queued_task"] = None
+        return True
 
 
 def start_rebuild(vault: "Vault") -> dict:
@@ -654,15 +703,44 @@ def start_rebuild(vault: "Vault") -> dict:
     """
     from pixlstash.tasks.tag_health_rebuild_task import TagHealthRebuildTask
 
+    task = TagHealthRebuildTask(vault)
     with _LOCK:
         state = _state(vault)
         if state["building"]:
             return {"building": True, "progress": state["progress"]}
         state["building"] = True
         state["progress"] = 0.0
+        state["queued_task"] = task.id
 
-    task = TagHealthRebuildTask(vault)
-    if vault.submit_task(task) is None:
+    # The flag is up and the task holds it until its body claims it. A task
+    # the runner cancels unrun takes it down in its ``on_cancel`` - which is
+    # how a submit while admission is paused ends, though it returns the
+    # task's id. One that never queued takes it down here, or every later
+    # request would answer "building" until a restart.
+    try:
+        task_id = vault.submit_task(task)
+    except BaseException as exc:
+        # A dead worker whose replacement cannot start, or a person's rebuild
+        # refused while a restore holds admission.
+        abandon_queued_rebuild(vault, task.id)
+        logger.error(
+            "tag_health rebuild for library %s not started: submitting it "
+            "raised %s: %s",
+            vault.library_uuid,
+            type(exc).__name__,
+            exc,
+        )
+        raise
+    if task_id is None:
+        if vault.runs_background_work():
+            # The runner has stopped (a shutdown or a library switch): the
+            # vault is going away, so nothing rebuilds on it now. The flag goes
+            # back down, or every later request would answer "building".
+            logger.warning(
+                "tag_health rebuild not started: the task runner has stopped"
+            )
+            abandon_queued_rebuild(vault, task.id)
+            return get_status(vault)
         logger.warning(
             "tag_health rebuild: task runner unavailable; rebuilding synchronously"
         )

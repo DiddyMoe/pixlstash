@@ -7,10 +7,17 @@ from pydantic import BaseModel, ConfigDict
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.restore import (
+    RESOURCE_RESTORE_FAILED_MESSAGE,
+    RESTORE_FAILED_MESSAGE,
+    LibraryFence,
     MissingDependenciesError,
     RestoreInProgressError,
+    RestoreRefusedError,
     SafetySnapshotFailedError,
+    SnapshotNotFoundError,
+    UnsupportedResourceTypeError,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -22,10 +29,22 @@ _PREVIEW_RESOURCE_LIMIT = 200
 # 10k-image selection floods the writer queue with metadata-hash backfills.
 _HASH_COMPARE_PICTURE_LIMIT = 1000
 
+# What a client is told when a preview fails unexpectedly; the cause is logged.
+_PREVIEW_FAILED_MESSAGE = (
+    "The preview could not be computed; the server log has the details."
+)
+
 
 # ----------------------------------------------------------------------
 # Response models (declared so Scalar renders real 200 bodies, not null)
 # ----------------------------------------------------------------------
+
+
+class RestoreResourceItem(BaseModel):
+    """One resource named in a batch preview or batch restore body."""
+
+    type: str
+    id: SqliteInt
 
 
 class SnapshotResponse(BaseModel):
@@ -170,6 +189,37 @@ def _serialize_preview(preview, is_compatible: bool = True) -> dict:
     }
 
 
+def _restore_service_error(
+    exc: Exception, failed_message: str, what: str, *args: Any
+) -> HTTPException:
+    """The HTTPException a client sees for an exception from the restore service.
+
+    The typed errors carry messages the service composed from fixed text and
+    validated values, so they are passed on. Anything else is logged with its
+    traceback and *what* (a %-format naming the operation, with *args*) and
+    answered with the fixed *failed_message*.
+    """
+    if isinstance(exc, SnapshotNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, UnsupportedResourceTypeError):
+        return HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, MissingDependenciesError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "missing_dependencies",
+                "message": str(exc),
+                "missing": exc.missing,
+            },
+        )
+    if isinstance(exc, SafetySnapshotFailedError):
+        return HTTPException(status_code=412, detail=str(exc))
+    if isinstance(exc, (RestoreInProgressError, RestoreRefusedError)):
+        return HTTPException(status_code=409, detail=str(exc))
+    logger.error(what + " failed", *args, exc_info=exc)
+    return HTTPException(status_code=500, detail=failed_message)
+
+
 def create_router(server) -> APIRouter:
     """Create the snapshots APIRouter.
 
@@ -236,8 +286,12 @@ def create_router(server) -> APIRouter:
                 kind="MANUAL", label=label
             )
         except Exception as exc:
-            logger.error("Failed to create snapshot: %s", exc, exc_info=True)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            logger.error("Failed to create a manual snapshot", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="The snapshot could not be created; the server log has "
+                "the details.",
+            ) from exc
         manifest = server.vault.snapshot_service.load_manifest(cp.id)
         live_schema = server.vault.snapshot_service.get_live_schema_version()
         return _serialize_snapshot(cp, manifest, live_schema)
@@ -248,7 +302,7 @@ def create_router(server) -> APIRouter:
 
     @router.patch("/snapshots/{snapshot_id}", response_model=SnapshotResponse)
     def rename_snapshot(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
         label: Optional[str] = Body(default=None, embed=True),
     ):
@@ -268,7 +322,7 @@ def create_router(server) -> APIRouter:
     # ------------------------------------------------------------------
 
     @router.delete("/snapshots/{snapshot_id}", status_code=204)
-    def delete_snapshot(snapshot_id: int, request: Request):
+    def delete_snapshot(snapshot_id: SqliteInt, request: Request):
         """Delete a snapshot and its snapshot files.
 
         Any snapshot may be deleted, including the most recent DAILY / WEEKLY /
@@ -283,13 +337,12 @@ def create_router(server) -> APIRouter:
         try:
             server.vault.snapshot_service.delete_snapshot(snapshot_id)
         except Exception as exc:
-            logger.error(
-                "Failed to delete snapshot %d: %s",
-                snapshot_id,
-                exc,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            logger.error("Failed to delete snapshot %d", snapshot_id, exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="The snapshot could not be deleted; the server log has "
+                "the details.",
+            ) from exc
 
     # ------------------------------------------------------------------
     # GET /snapshots/{id}/restore/preview  (full-restore dry-run preview)
@@ -299,7 +352,7 @@ def create_router(server) -> APIRouter:
         "/snapshots/{snapshot_id}/restore/preview",
         response_model=RestorePreviewResponse,
     )
-    def preview_full_restore(snapshot_id: int, request: Request):
+    def preview_full_restore(snapshot_id: SqliteInt, request: Request):
         """Return a dry-run preview of a full restore.
 
         No data is written.  The response includes a summary of what would
@@ -309,16 +362,13 @@ def create_router(server) -> APIRouter:
         """
         try:
             preview = server.vault.restore_service.preview_full(snapshot_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
-            logger.error(
-                "preview_full for snapshot %d failed: %s",
-                snapshot_id,
+            raise _restore_service_error(
                 exc,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+                _PREVIEW_FAILED_MESSAGE,
+                "preview_full for snapshot %d",
+                snapshot_id,
+            ) from exc
         cp = server.vault.snapshot_service.get_snapshot(snapshot_id)
         live_schema = server.vault.snapshot_service.get_live_schema_version()
         is_compatible = True
@@ -335,9 +385,9 @@ def create_router(server) -> APIRouter:
         response_model=RestorePreviewResponse,
     )
     def preview_resource_restore(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         resource_type: str,
-        resource_id: int,
+        resource_id: SqliteInt,
         request: Request,
     ):
         """Return a dry-run preview of a single-resource restore.
@@ -348,18 +398,15 @@ def create_router(server) -> APIRouter:
             preview = server.vault.restore_service.preview_resource(
                 snapshot_id, resource_type, resource_id
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            logger.error(
-                "preview_resource for snapshot %d (%s/%s) failed: %s",
+            raise _restore_service_error(
+                exc,
+                _PREVIEW_FAILED_MESSAGE,
+                "preview_resource for snapshot %d (%r/%d)",
                 snapshot_id,
                 resource_type,
                 resource_id,
-                exc,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            ) from exc
         cp = server.vault.snapshot_service.get_snapshot(snapshot_id)
         live_schema = server.vault.snapshot_service.get_live_schema_version()
         is_compatible = True
@@ -376,9 +423,9 @@ def create_router(server) -> APIRouter:
         response_model=RestorePreviewResponse,
     )
     def preview_batch_restore(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
-        resources: List[dict] = Body(embed=True),
+        resources: List[RestoreResourceItem] = Body(embed=True),
     ):
         """Return a dry-run preview for a batch of resources.
 
@@ -387,17 +434,16 @@ def create_router(server) -> APIRouter:
         Requires owner-level (full, unscoped) access.
         """
         try:
-            preview = server.vault.restore_service.preview_batch(snapshot_id, resources)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.error(
-                "preview_batch for snapshot %d failed: %s",
-                snapshot_id,
-                exc,
-                exc_info=True,
+            preview = server.vault.restore_service.preview_batch(
+                snapshot_id, [item.model_dump() for item in resources]
             )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            raise _restore_service_error(
+                exc,
+                _PREVIEW_FAILED_MESSAGE,
+                "preview_batch for snapshot %d",
+                snapshot_id,
+            ) from exc
         cp = server.vault.snapshot_service.get_snapshot(snapshot_id)
         live_schema = server.vault.snapshot_service.get_live_schema_version()
         is_compatible = True
@@ -413,7 +459,7 @@ def create_router(server) -> APIRouter:
         "/snapshots/{snapshot_id}/restore", response_model=RestoreReportResponse
     )
     def restore_snapshot(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
         dry_run: bool = Body(default=False, embed=True),
         allow_without_safety: bool = Body(default=False, embed=True),
@@ -439,21 +485,22 @@ def create_router(server) -> APIRouter:
                 restore_request_lease=getattr(
                     request.state, "restore_admission_lease", None
                 ),
+                # The admission middleware leased this ACTIVE_VAULT request;
+                # the restore closes library admission and must not wait for
+                # its own lease.
+                library_fence=LibraryFence(
+                    coordinator=server.library_coordinator,
+                    own_lease=request.state.library_lease,
+                    describe_holders=server.library_switch.describe_library_holders,
+                ),
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except RestoreInProgressError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except SafetySnapshotFailedError as exc:
-            raise HTTPException(status_code=412, detail=str(exc)) from exc
         except Exception as exc:
-            logger.error(
-                "Full restore of snapshot %d failed: %s",
-                snapshot_id,
+            raise _restore_service_error(
                 exc,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+                RESTORE_FAILED_MESSAGE,
+                "Full restore of snapshot %d",
+                snapshot_id,
+            ) from exc
         return {
             "snapshot_id": report.snapshot_id,
             "resource_type": report.resource_type,
@@ -472,9 +519,9 @@ def create_router(server) -> APIRouter:
         "/snapshots/{snapshot_id}/restore/batch", response_model=RestoreReportResponse
     )
     def restore_batch(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
-        resources: List[dict] = Body(embed=True),
+        resources: List[RestoreResourceItem] = Body(embed=True),
         confirm_restore_dependencies: bool = Body(default=False, embed=True),
     ):
         """Restore a batch of resources from a snapshot in one operation.
@@ -497,30 +544,16 @@ def create_router(server) -> APIRouter:
         try:
             report = server.vault.restore_service.restore_batch(
                 snapshot_id,
-                resources,
+                [item.model_dump() for item in resources],
                 confirm_restore_dependencies=confirm_restore_dependencies,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except RestoreInProgressError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except MissingDependenciesError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "missing_dependencies",
-                    "message": str(exc),
-                    "missing": exc.missing,
-                },
-            ) from exc
         except Exception as exc:
-            logger.error(
-                "Batch restore from snapshot %d failed: %s",
-                snapshot_id,
+            raise _restore_service_error(
                 exc,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+                RESOURCE_RESTORE_FAILED_MESSAGE,
+                "Batch restore from snapshot %d",
+                snapshot_id,
+            ) from exc
         return {
             "snapshot_id": report.snapshot_id,
             "resource_type": report.resource_type,
@@ -539,9 +572,9 @@ def create_router(server) -> APIRouter:
         "/snapshots/{snapshot_id}/hash-compare", response_model=HashCompareResponse
     )
     def hash_compare(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
-        picture_ids: List[int] = Body(embed=True),
+        picture_ids: List[SqliteInt] = Body(embed=True),
     ):
         """Compare live metadata_hash values against a snapshot snapshot.
 
@@ -569,16 +602,13 @@ def create_router(server) -> APIRouter:
             result = server.vault.restore_service.compare_hashes(
                 snapshot_id, picture_ids
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
-            logger.error(
-                "hash-compare for snapshot %d failed: %s",
-                snapshot_id,
+            raise _restore_service_error(
                 exc,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+                "The comparison could not be made; the server log has the details.",
+                "hash-compare for snapshot %d",
+                snapshot_id,
+            ) from exc
         return result
 
     # ------------------------------------------------------------------
@@ -590,9 +620,9 @@ def create_router(server) -> APIRouter:
         response_model=RestoreReportResponse,
     )
     def restore_resource(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         resource_type: str,
-        resource_id: int,
+        resource_id: SqliteInt,
         request: Request,
         confirm_restore_dependencies: bool = Body(default=False, embed=True),
     ):
@@ -620,29 +650,15 @@ def create_router(server) -> APIRouter:
                 resource_id,
                 confirm_restore_dependencies=confirm_restore_dependencies,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except RestoreInProgressError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except MissingDependenciesError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "missing_dependencies",
-                    "message": str(exc),
-                    "missing": exc.missing,
-                },
-            ) from exc
         except Exception as exc:
-            logger.error(
-                "Per-resource restore of snapshot %d (%s/%s) failed: %s",
+            raise _restore_service_error(
+                exc,
+                RESOURCE_RESTORE_FAILED_MESSAGE,
+                "Per-resource restore of snapshot %d (%r/%d)",
                 snapshot_id,
                 resource_type,
                 resource_id,
-                exc,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            ) from exc
         return {
             "snapshot_id": report.snapshot_id,
             "resource_type": report.resource_type,

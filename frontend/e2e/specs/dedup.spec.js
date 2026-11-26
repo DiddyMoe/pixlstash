@@ -20,32 +20,14 @@
 // `DedupGroup` row is only ever written by the scan task the same disabled
 // planner never runs. See that script's own docstring for the full reasoning.
 
-import { execFileSync } from 'node:child_process'
-import { dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { clearDedupState, runSeedScript } from '../fixtures/dedupSeed.js'
 import { test, expect } from '../fixtures/test.js'
-
-const __dirname = dirname(fileURLToPath(import.meta.url))
-const SEED_SCRIPT = resolve(__dirname, '../seed_dedup_fixture.py')
-const REPO_ROOT = resolve(__dirname, '../../..')
 
 // Three groups of three: three is the smallest size that can prove both halves
 // of the exclusion floor, because it accepts exactly one exclusion and then
 // refuses the next.
 const SEED_GROUPS = 3
 const SEED_COPIES = 2
-
-/** Run the seed script and parse its JSON report. */
-function runSeedScript(args) {
-  const python = process.env.PIXLSTASH_PYTHON || 'python'
-  const stdout = execFileSync(python, [SEED_SCRIPT, ...args], {
-    // The backend is launched from `frontend/`, so the repo is not on
-    // `sys.path` there. The seed imports the same pixlstash the server runs.
-    env: { ...process.env, PYTHONPATH: REPO_ROOT },
-    encoding: 'utf8',
-  })
-  return JSON.parse(stdout)
-}
 
 /** Seed the duplicates and detect them, returning the scan's own report. */
 function seedDuplicates() {
@@ -88,7 +70,7 @@ test.describe.serial('duplicates queue (§21)', () => {
   // set counting copies that later specs then fail to export or tag-health, so
   // the seed is undone here rather than left for the next file to survive.
   test.afterAll(() => {
-    runSeedScript(['--cleanup'])
+    clearDedupState()
   })
 
   test('opens with the first group focused and walks it with the arrows', async ({

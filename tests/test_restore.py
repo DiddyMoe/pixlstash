@@ -13,6 +13,7 @@ from contextlib import closing
 
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, create_engine, delete, select
@@ -41,8 +42,14 @@ from pixlstash.db_models.snapshot import Snapshot
 from pixlstash.server import Server
 from pixlstash.trusted_sqlite import TrustedSQLiteLocation
 from pixlstash.db_models.user_token import UserToken
+from pixlstash.middleware.library_admission import BUSY_DETAIL, BUSY_RETRY_AFTER
 from pixlstash.services import scrapheap_service
 from pixlstash.services import snapshot_service as snapshot_service_module
+from pixlstash.services.library_generation_coordinator import SwitchState
+from pixlstash.services.restore import (
+    UNSUPPORTED_RESOURCE_TYPE_MESSAGE,
+    UnsupportedResourceTypeError,
+)
 from pixlstash.utils.snapshot_compression import (
     compress_snapshot,
     materialize_snapshot,
@@ -1140,12 +1147,15 @@ def test_restore_resource_project_rejected(server):
     proj_id = server.vault.db.run_task(_setup)
     cp = server.vault.snapshot_service.create_snapshot("MANUAL")
 
-    with pytest.raises(ValueError, match="Unsupported resource_type 'project'"):
+    # The message lists what is supported and never echoes the request.
+    with pytest.raises(UnsupportedResourceTypeError) as restore_exc:
         server.vault.restore_service.restore_resource(cp.id, "project", proj_id)
+    assert str(restore_exc.value) == UNSUPPORTED_RESOURCE_TYPE_MESSAGE
 
     # preview_resource must also reject.
-    with pytest.raises(ValueError, match="Unsupported resource_type 'project'"):
+    with pytest.raises(UnsupportedResourceTypeError) as preview_exc:
         server.vault.restore_service.preview_resource(cp.id, "project", proj_id)
+    assert str(preview_exc.value) == UNSUPPORTED_RESOURCE_TYPE_MESSAGE
 
 
 def test_restore_batch_skips_project_entries(server):
@@ -1919,10 +1929,11 @@ def test_full_restore_refuses_when_most_files_missing(server):
 
     with pytest.raises(RuntimeError) as exc_info:
         server.vault.restore_service.restore_full(cp.id)
-    msg = str(exc_info.value).lower()
-    assert "missing" in msg and "mount" in msg, (
-        f"Refusal must explain the mount-failure heuristic; got: {exc_info.value}"
+    msg = str(exc_info.value)
+    assert "7 of 10 pictures" in msg and "not fully reachable" in msg, (
+        f"Refusal must explain the unreachable-folder heuristic; got: {msg}"
     )
+    assert "allow_without_safety" not in msg, "a person cannot pass a flag"
 
     # Live DB untouched - all 10 rows still present (no swap happened).
     count_after = server.vault.db.run_immediate_read_task(
@@ -3616,14 +3627,28 @@ def _empty_scrapheap_via_http(server):
         json={"username": "owner", "password": "example-owner-password"},
     )
     assert login.status_code == 200, login.text
-    # The destructive endpoint refuses without the single-use confirm_token the
-    # preview mints, so drive the real preview -> confirm flow.
-    preview = client.post("/api/v1/pictures/scrapheap/delete-preview", json={})
+    # The synchronous endpoint refuses the whole heap (that is a purge run), so
+    # name every picture in it. It also refuses without the single-use
+    # confirm_token the preview mints, so drive the real preview -> confirm flow.
+    ids = server.vault.db.run_task(
+        lambda session: sorted(
+            session.exec(select(Picture.id).where(Picture.deleted.is_(True))).all()
+        )
+    )
+    if not ids:
+        # Nothing in the heap to name, and the endpoint refuses an empty list
+        # (400). Emptying an empty heap destroys nothing, which is what the old
+        # whole-heap call answered; a stale row the restore resurrected would
+        # be in ``ids`` and go through the endpoint below.
+        return {"deleted_count": 0, "picture_ids": []}
+    preview = client.post(
+        "/api/v1/pictures/scrapheap/delete-preview", json={"ids": ids}
+    )
     assert preview.status_code == 200, preview.text
     resp = client.request(
         "DELETE",
         "/api/v1/pictures/scrapheap",
-        json={"confirm_token": preview.json()["confirm_token"]},
+        json={"picture_ids": ids, "confirm_token": preview.json()["confirm_token"]},
     )
     assert resp.status_code == 200, resp.text
     # The endpoint deletes files in a FastAPI BackgroundTask; TestClient runs
@@ -4376,7 +4401,11 @@ def test_full_restore_closes_auth_before_swap_and_across_queue_gap(server, monke
         )
         assert cookie_response.status_code == 503, cookie_response.text
         assert token_response.status_code == 503, token_response.text
-        assert cookie_response.headers["Retry-After"] == "5"
+        # No credential is read while authentication is closed, so a signed-in
+        # caller gets the same busy answer as one with no credentials.
+        for response in (cookie_response, token_response):
+            assert response.json() == {"detail": BUSY_DETAIL}
+            assert response.headers["Retry-After"] == BUSY_RETRY_AFTER
     finally:
         release_token_clear.set()
         thread.join(timeout=20)
@@ -4417,9 +4446,149 @@ def test_share_link_is_unavailable_while_restore_admission_is_closed(server):
     try:
         response = anonymous.get(share_url)
         assert response.status_code == 503, response.text
-        assert response.headers["Retry-After"] == "5"
+        assert response.json() == {"detail": BUSY_DETAIL}
+        assert response.headers["Retry-After"] == BUSY_RETRY_AFTER
     finally:
         server.auth.reopen_auth_after_restore()
+
+    assert anonymous.get(share_url).status_code == 200
+    deleted = owner.delete(f"/api/v1/users/me/token/{created['token_id']}")
+    assert deleted.status_code == 200, deleted.text
+
+
+def _what_a_caller_sees(response):
+    return (
+        response.status_code,
+        response.content,
+        response.headers.get("Retry-After"),
+        response.headers.get("content-type"),
+    )
+
+
+@pytest.mark.parametrize(
+    "admission_held",
+    [True, False],
+    ids=["restore in progress", "auth left closed after the swap"],
+)
+def test_before_authentication_a_restore_reads_as_a_library_switch(
+    server, admission_held
+):
+    """CWE-204: a caller with no credentials, on the routes that answer
+    without a library (sign-in, session check) and on a share link, gets
+    exactly what an ACTIVE_VAULT request gets during a plain library switch,
+    so a restore cannot be told from a switch."""
+    from fastapi.testclient import TestClient
+
+    owner = TestClient(server.api, raise_server_exceptions=True)
+    login = owner.post(
+        "/api/v1/login",
+        json={"username": "owner", "password": "example-owner-password"},
+    )
+    assert login.status_code == 200, login.text
+    _pic, created = _create_picture_share(owner, server, "share-parity.jpg")
+    share_url = f"http://testserver/share/{created['token']}.jpg"
+    anonymous = TestClient(server.api)
+
+    def _requests():
+        return {
+            "check-session": anonymous.get("/api/v1/check-session"),
+            "login": anonymous.post(
+                "/api/v1/login",
+                json={"username": "owner", "password": "example-wrong-password"},
+            ),
+            "share link": anonymous.get(share_url),
+        }
+
+    # The routes resolve and answer while nothing holds the library, so the
+    # 503s below come from the restore, not from a dead path.
+    before = _requests()
+    assert before["check-session"].status_code == 401, before["check-session"].text
+    assert before["check-session"].json() == {"detail": "Invalid session"}
+    assert before["login"].status_code == 401, before["login"].text
+    assert before["share link"].status_code == 200, before["share link"].text
+
+    coordinator = server.library_coordinator
+    coordinator.begin_switch(timeout=5)
+    try:
+        switch = anonymous.get("/api/v1/pictures")
+    finally:
+        coordinator.restore_ready()
+    assert switch.status_code == 503, switch.text
+    assert switch.json() == {"detail": BUSY_DETAIL}
+
+    if admission_held:
+        coordinator.begin_switch(timeout=5, restoring=True)
+    server.auth.close_auth_for_restore()
+    try:
+        during = _requests()
+    finally:
+        server.auth.reopen_auth_after_restore()
+        if admission_held:
+            coordinator.restore_ready()
+
+    for name, response in during.items():
+        assert _what_a_caller_sees(response) == _what_a_caller_sees(switch), name
+
+    assert anonymous.get(share_url).status_code == 200
+    deleted = owner.delete(f"/api/v1/users/me/token/{created['token_id']}")
+    assert deleted.status_code == 200, deleted.text
+
+
+@pytest.mark.parametrize("restoring", [True, False], ids=["restore", "switch"])
+def test_a_request_admitted_just_before_a_restore_is_refused_by_the_gate(
+    server, monkeypatch, restoring
+):
+    """CWE-204 through the whole stack: a share link admitted just before
+    admission closes meets the authz gate while the restore or switch waits
+    for its lease, and is told only that PixlStash is busy. The owner's
+    request, met the same way, is told which work holds the library, so both
+    answers come from the gate's refusal."""
+    owner = TestClient(server.api, raise_server_exceptions=True)
+    login = owner.post(
+        "/api/v1/login",
+        json={"username": "owner", "password": "example-owner-password"},
+    )
+    assert login.status_code == 200, login.text
+    _pic, created = _create_picture_share(owner, server, "gate-mid-drain.jpg")
+    share_url = f"http://testserver/share/{created['token']}.jpg"
+    anonymous = TestClient(server.api)
+    # Both routes answer while nothing holds the library, so the 503s below
+    # come from the gate, not from a dead path.
+    assert anonymous.get(share_url).status_code == 200
+    assert owner.get("/api/v1/pictures").status_code == 200
+
+    coordinator = server.library_coordinator
+    admit = coordinator.acquire_read_or_raise
+
+    def _admitted_then_closed(client, url):
+        closed = []
+
+        def _admit_then_close():
+            lease = admit()
+            if not closed:
+                closed.append(lease)
+                coordinator.begin_switch(timeout=5, exclude=lease, restoring=restoring)
+            return lease
+
+        monkeypatch.setattr(coordinator, "acquire_read_or_raise", _admit_then_close)
+        try:
+            response = client.get(url)
+        finally:
+            monkeypatch.setattr(coordinator, "acquire_read_or_raise", admit)
+            coordinator.restore_ready()
+        assert closed, "admission never closed behind the request"
+        return response
+
+    share = _admitted_then_closed(anonymous, share_url)
+    assert share.status_code == 503, share.text
+    assert share.json() == {"detail": BUSY_DETAIL}
+    assert share.headers["Retry-After"] == BUSY_RETRY_AFTER
+
+    owned = _admitted_then_closed(owner, "/api/v1/pictures")
+    work = "restoring the library" if restoring else "switching library"
+    assert owned.status_code == 503, owned.text
+    assert owned.json() == {"detail": f"PixlStash is {work}. Try again in a moment."}
+    assert owned.headers["Retry-After"] == BUSY_RETRY_AFTER
 
     assert anonymous.get(share_url).status_code == 200
     deleted = owner.delete(f"/api/v1/users/me/token/{created['token_id']}")
@@ -4571,7 +4740,14 @@ def test_full_restore_drains_an_admitted_share_before_swap(server, monkeypatch):
 
 
 def test_full_restore_drains_an_admitted_http_request_before_swap(server, monkeypatch):
-    """The restore request excludes itself but waits for older API traffic."""
+    """The restore request excludes itself but waits for older API traffic.
+
+    The older request holds a library read lease, so the restore waits for it
+    at library admission, before the auth gate's own drain: admission is
+    closed (503) and auth not yet closed until that request has finished. The
+    request itself meets the authz gate while admission is closed and answers
+    503, as it would during a library switch.
+    """
     from fastapi.testclient import TestClient
 
     restore_client = TestClient(server.api, raise_server_exceptions=True)
@@ -4597,10 +4773,12 @@ def test_full_restore_drains_an_admitted_http_request_before_swap(server, monkey
     admitted = threading.Event()
     release_request = threading.Event()
     close_started = threading.Event()
+    switch_started = threading.Event()
     swap_started = threading.Event()
     original_admitted = server.auth._auth_middleware_admitted
     original_close = server.auth.close_auth_for_restore
     original_swap = server.vault.restore_service._swap_database
+    original_begin_switch = server.library_coordinator.begin_switch
 
     async def _pause_after_admission(
         request, call_next, allow_origins, allow_origin_regex
@@ -4625,6 +4803,15 @@ def test_full_restore_drains_an_admitted_http_request_before_swap(server, monkey
         close_started.set()
         return original_close(restore_request_lease)
 
+    switched_for_restore = []
+
+    def _begin_switch_and_signal(timeout, exclude=None, restoring=False):
+        switched_for_restore.append(restoring)
+        switch_started.set()
+        return original_begin_switch(
+            timeout=timeout, exclude=exclude, restoring=restoring
+        )
+
     def _swap_and_signal(live_db_path, new_db_path):
         swap_started.set()
         return original_swap(live_db_path, new_db_path)
@@ -4633,6 +4820,9 @@ def test_full_restore_drains_an_admitted_http_request_before_swap(server, monkey
         server.auth, "_auth_middleware_admitted", _pause_after_admission
     )
     monkeypatch.setattr(server.auth, "close_auth_for_restore", _close_and_signal)
+    monkeypatch.setattr(
+        server.library_coordinator, "begin_switch", _begin_switch_and_signal
+    )
     monkeypatch.setattr(
         server.vault.restore_service, "_swap_database", _swap_and_signal
     )
@@ -4658,10 +4848,13 @@ def test_full_restore_drains_an_admitted_http_request_before_swap(server, monkey
     try:
         assert admitted.wait(10), "request never acquired its admission lease"
         restore_thread.start()
-        assert close_started.wait(20), "restore never began the admission drain"
-        assert server.auth.is_auth_closed_for_restore()
+        assert switch_started.wait(20), "restore never began closing admission"
         assert not swap_started.wait(0.2), (
             "database swapped before prior request drained"
+        )
+        assert server.library_coordinator.state is SwitchState.SWITCHING
+        assert not close_started.is_set(), (
+            "auth gate closed before the older request left the library"
         )
         unavailable = TestClient(server.api).get("/api/v1/session/context")
         assert unavailable.status_code == 503, unavailable.text
@@ -4681,10 +4874,22 @@ def test_full_restore_drains_an_admitted_http_request_before_swap(server, monkey
 
     assert not blocked_thread.is_alive(), "admitted request did not finish"
     assert not restore_thread.is_alive(), "restore did not finish after drain"
-    assert blocked_outcome["response"].status_code == 200
+    # It had not reached the authz gate when the restore closed admission, so
+    # the gate refuses it as the middleware does during a restore: 503, come
+    # back shortly, never an answer from the file being replaced. The restore
+    # still waited for it to leave before closing auth and swapping (asserted
+    # above).
+    assert blocked_outcome["response"].status_code == 503
+    assert blocked_outcome["response"].headers["Retry-After"] == "2"
+    assert blocked_outcome["response"].json()["detail"] == (
+        "PixlStash is restoring the library. Try again in a moment."
+    )
+    # The restore says it is one, so library admission can say so too.
+    assert switched_for_restore == [True]
     assert restore_outcome["response"].status_code == 200, restore_outcome[
         "response"
     ].text
+    assert close_started.is_set()
     assert swap_started.is_set()
 
     # Both pre-restore credential forms require fresh authentication after the

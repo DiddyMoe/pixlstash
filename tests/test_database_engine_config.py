@@ -25,11 +25,15 @@ import pixlstash.database as database
 from pixlstash.database import (
     SQLITE_BUSY_TIMEOUT_S,
     SQLITE_CACHE_SIZE_KIB,
+    SESSION_FAILURE_MESSAGE,
+    WRITER_FAILURE_MESSAGE,
     DatabaseUnavailableError,
+    DBPriority,
     VaultDatabase,
     WriterState,
     create_configured_engine,
 )
+from pixlstash.db_models import Picture, Tag
 from pixlstash.services.restore.schema_upgrade import _alembic_config
 from pixlstash.utils.sqlite_uri import sqlite_url
 from tests.utils import URI_HOSTILE_FOLDER
@@ -236,6 +240,47 @@ def test_custom_sql_functions_are_registered_on_every_variant(tmp_path, kwargs):
         engine.dispose()
 
 
+def test_a_scored_search_logs_nothing_at_info_from_the_levenshtein_udf(
+    vault_db, caplog
+):
+    """The tag-distance UDF runs once per candidate row, so it logs at DEBUG.
+
+    At INFO it wrote two records per row on every search, with the search text
+    and each picture's tags in them. The DEBUG record is asserted too,
+    once per tagged picture, so the search is known to have reached the UDF.
+    """
+    tags = {"red fox": ["fox", "red"], "blue car": ["car", "blue"], "owl": ["owl"]}
+
+    def seed(session):
+        for description, words in tags.items():
+            picture = Picture(file_path=f"{description}.png", description=description)
+            session.add(picture)
+            session.flush()
+            session.add_all(Tag(picture_id=picture.id, tag=word) for word in words)
+        session.commit()
+
+    def search(session):
+        return Picture.semantic_search(
+            session,
+            query="red fox",
+            query_words=["red", "fox"],
+            query_embedding=None,
+        )
+
+    vault_db.run_task(seed)
+    with caplog.at_level(logging.DEBUG, logger="pixlstash.database"):
+        results = vault_db.run_task(search)
+
+    assert results, "the search must score at least one picture"
+    udf_records = [
+        record
+        for record in caplog.records
+        if record.name == "pixlstash.database"
+        and record.funcName == "_levenshtein_internal"
+    ]
+    assert [record.levelno for record in udf_records] == [logging.DEBUG] * len(tags)
+
+
 def test_vault_opens_and_migrates_in_a_folder_with_uri_characters(tmp_path):
     """A raw path was cut at ``?``: the vault was created beside the folder,
     under a truncated name, and the real file was left without Alembic."""
@@ -425,13 +470,14 @@ def test_session_setup_failure_settles_and_writer_continues(
         assert caught.value is raised[index]
     _assert_writer_still_runs(writer_db)
     failure = writer_db.writer_status()["last_session_failure"]
-    assert (failure["step"], failure["error"]) == ("open", repr(raised[2]))
+    # The status is served to the SPA: a fixed sentence, the exception logged.
+    assert (failure["step"], failure["error"]) == ("open", SESSION_FAILURE_MESSAGE)
 
 
 def test_rollback_failure_keeps_original_exception(writer_db, monkeypatch):
     """A rollback that fails must not replace the callback's exception, must
     not leave its write behind, and must not stop the writer."""
-    raised = _inject_session_fault(monkeypatch, writer_db, "rollback")
+    _inject_session_fault(monkeypatch, writer_db, "rollback")
     error = ValueError("test-callback-error")
 
     def insert_then_raise(session):
@@ -449,14 +495,15 @@ def test_rollback_failure_keeps_original_exception(writer_db, monkeypatch):
     # with its connection.
     assert "test-rolled-back" not in _rows(writer_db)
     failure = writer_db.writer_status()["last_session_failure"]
-    assert (failure["step"], failure["error"]) == ("rollback", repr(raised[0]))
+    # The status is served to the SPA: a fixed sentence, the exception logged.
+    assert (failure["step"], failure["error"]) == ("rollback", SESSION_FAILURE_MESSAGE)
     _assert_writer_still_runs(writer_db)
 
 
 def test_close_failure_after_commit_returns_result(writer_db, monkeypatch):
     """The commit already happened, so the caller gets the result rather than
     an exception that would make a committed write look retryable."""
-    raised = _inject_session_fault(monkeypatch, writer_db, "close")
+    _inject_session_fault(monkeypatch, writer_db, "close")
 
     def insert_and_commit(session):
         _insert(session, "test-committed")
@@ -466,7 +513,8 @@ def test_close_failure_after_commit_returns_result(writer_db, monkeypatch):
     assert writer_db.submit_task(insert_and_commit).result(timeout=5) == "test-result"
     assert "test-committed" in _rows(writer_db)
     failure = writer_db.writer_status()["last_session_failure"]
-    assert (failure["step"], failure["error"]) == ("close", repr(raised[0]))
+    # The status is served to the SPA: a fixed sentence, the exception logged.
+    assert (failure["step"], failure["error"]) == ("close", SESSION_FAILURE_MESSAGE)
     _assert_writer_still_runs(writer_db)
 
 
@@ -582,7 +630,16 @@ def test_loop_failure_fails_closed(writer_db, monkeypatch, caplog):
     status = writer_db.writer_status()
     assert status["state"] == WriterState.FAILED
     assert status["alive"] is False
-    assert status["failed_reason"] == "RuntimeError: test-loop-fault"
+    # Served to the SPA: a fixed sentence and the time, never the exception's
+    # text, which the refusal and the log keep.
+    assert status["failed_reason"] == WRITER_FAILURE_MESSAGE
+    assert time.time() - 60 < status["failed_at"] <= time.time()
+    assert any(
+        r.levelno == logging.CRITICAL
+        and r.exc_info
+        and "test-loop-fault" in str(r.exc_info[1])
+        for r in caplog.records
+    )
     refused = writer_db.submit_task(lambda _session: "test-refused")
     assert refused.done()
     with pytest.raises(DatabaseUnavailableError, match="test-loop-fault"):
@@ -829,9 +886,10 @@ def test_close_during_engine_read_access_releases_when_it_ends(guarded_db, monke
 
 def test_close_settles_every_queued_task(guarded_db, monkeypatch):
     """Work queued behind a busy writer is refused by close(), never run and
-    never left pending. Normal tasks sort after close()'s IMMEDIATE sentinel,
-    so only the drain settles them; a control task is IMMEDIATE too and was
-    queued first, so the writer takes it before the sentinel and refuses it."""
+    never left pending. Normal tasks sort after close()'s sentinel, which sits
+    in the first tier with control tasks, so only the drain settles them; the
+    control task shares that tier and was queued first, so the writer takes it
+    before the sentinel and refuses it."""
     db, guard = guarded_db
     held, release = _hold_writer(db)
     ran = []
@@ -983,7 +1041,142 @@ def test_writer_status_reports_the_task_in_hand(writer_db):
     assert status["current_task"] == (f"{__name__}._hold_writer.<locals>.hold")
     assert status["current_task_seconds"] >= 0
     assert status["queue_depth"] == 1
-    assert status["failed_reason"] is None
+    assert (status["failed_reason"], status["failed_at"]) == (None, None)
     assert held.result(timeout=5) == "test-held"
     assert queued.result(timeout=5) == "test-queued"
     assert writer_db.writer_status()["current_task"] is None
+
+
+# ── writer queue order: priority with deadline aging ─────────────────────────
+
+
+def _recorder(order, name):
+    def record(_session=None):
+        order.append(name)
+        return name
+
+    return record
+
+
+def test_work_enqueued_together_runs_most_urgent_first(writer_db):
+    """Within the aging window the priorities keep their order."""
+    order = []
+    held, release = _hold_writer(writer_db)
+    try:
+        futures = [
+            writer_db.submit_task(_recorder(order, level.name), priority=level)
+            for level in (
+                DBPriority.LOW,
+                DBPriority.MEDIUM,
+                DBPriority.HIGH,
+                DBPriority.IMMEDIATE,
+            )
+        ]
+    finally:
+        release.set()
+    assert held.result(timeout=5) == "test-held"
+    wait(futures, timeout=5)
+    assert order == ["IMMEDIATE", "HIGH", "MEDIUM", "LOW"]
+
+
+def test_an_old_low_task_outruns_new_urgent_work_but_not_a_control_task(writer_db):
+    """Past its 1.5 s offset a LOW task is due before fresh IMMEDIATE work.
+
+    A control task (the restore's file swap) and the close sentinel sit in a
+    tier of their own and are never aged past.
+    """
+    order = []
+    held, release = _hold_writer(writer_db)
+    try:
+        low = writer_db.submit_task(_recorder(order, "low"), priority=DBPriority.LOW)
+        aged = database.DatabaseTask(DBPriority.LOW, _recorder(order, "unqueued"))
+        time.sleep(database.AGING_S[DBPriority.LOW] + 0.1)
+        # close()'s sentinel, built the way close() builds it, is never aged past.
+        assert database.DatabaseTask(DBPriority.IMMEDIATE, None) < aged
+        urgent = writer_db.submit_task(
+            _recorder(order, "immediate"), priority=DBPriority.IMMEDIATE
+        )
+        control = writer_db.submit_control_task(_recorder(order, "control"))
+    finally:
+        release.set()
+    assert held.result(timeout=5) == "test-held"
+    wait([low, urgent, control], timeout=5)
+    assert order == ["control", "low", "immediate"]
+
+
+def test_a_stream_of_high_writes_cannot_starve_a_low_task(writer_db):
+    """Three writers that always have HIGH work queued; one LOW task.
+
+    Under strict priority the LOW task never runs while they keep going: each
+    looper resubmits as soon as its task returns, so a HIGH task is always
+    waiting when the writer picks. With aging it is due within its 1.5 s
+    offset of being queued, plus the task in hand.
+    """
+    stop = threading.Event()
+
+    def busy(_session):
+        time.sleep(0.02)
+
+    def loop():
+        while not stop.is_set():
+            writer_db.submit_task(busy, priority=DBPriority.HIGH).result(timeout=10)
+
+    loopers = [_start(loop) for _ in range(3)]
+    try:
+        time.sleep(0.2)
+        queued_at = time.monotonic()
+        low = writer_db.submit_task(
+            lambda _session: "test-low", priority=DBPriority.LOW
+        )
+        assert low.result(timeout=3) == "test-low"
+        waited = time.monotonic() - queued_at
+    finally:
+        stop.set()
+        for looper in loopers:
+            looper.join(timeout=5)
+    assert waited < 3
+    assert not any(looper.is_alive() for looper in loopers)
+
+
+# ── writer meter ─────────────────────────────────────────────────────────────
+
+
+def test_the_writer_meter_counts_the_run_time_of_its_own_tasks(writer_db):
+    """Each task's writer time is in the total by the time its future settles.
+
+    The time a task waited in the queue is not: the meter says how long its
+    caller held the writer, which is what a background run sizes a slice by.
+    """
+    held, release = _hold_writer(writer_db)
+    with database.writer_meter() as meter:
+        queued = writer_db.submit_task(lambda _session: time.sleep(0.05))
+        time.sleep(0.25)
+        release.set()
+        queued.result(timeout=5)
+        assert meter.tasks == 1
+        assert 0.05 <= meter.seconds < 0.25
+        writer_db.run_control_task(lambda: time.sleep(0.03))
+    assert held.result(timeout=5) == "test-held"
+    assert meter.tasks == 2
+    assert meter.seconds >= 0.08
+
+
+def test_the_writer_meter_ignores_tasks_from_outside_its_block(writer_db):
+    """Another thread's writes, and writes after the block, are not counted."""
+    inside = threading.Event()
+    done = threading.Event()
+
+    def another_request():
+        assert inside.wait(timeout=5)
+        writer_db.submit_task(lambda _session: time.sleep(0.05)).result(timeout=5)
+        done.set()
+
+    other = _start(another_request)
+    with database.writer_meter() as meter:
+        inside.set()
+        assert done.wait(timeout=5)
+        writer_db.run_task(lambda _session: None)
+    other.join(timeout=5)
+    writer_db.run_task(lambda _session: time.sleep(0.05))
+    assert meter.tasks == 1
+    assert meter.seconds < 0.05

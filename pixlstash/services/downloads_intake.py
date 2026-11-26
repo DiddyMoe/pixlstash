@@ -141,7 +141,13 @@ def safetensors_complete(path: str) -> bool:
             if header_len == 0 or 8 + header_len > size:
                 return False
             header = json.loads(handle.read(header_len))
-    except (OSError, ValueError, UnicodeDecodeError, struct.error) as exc:
+    except (
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+        struct.error,
+        RecursionError,
+    ) as exc:
         logger.info(
             "%s does not read as a whole safetensors file yet (%s); leaving it "
             "where it is.",

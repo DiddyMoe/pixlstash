@@ -33,10 +33,14 @@ from pixlstash.db_models.snapshot import Snapshot
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.snapshot_compression import is_compressed
+from pixlstash.utils.sql_chunking import chunked
 
 from ._models import (
+    PREVIEW_INCOMPLETE_WARNING,
+    UNSUPPORTED_RESOURCE_TYPE_MESSAGE,
     ResourcePreview,
     RestorePreview,
+    UnsupportedResourceTypeError,
     _SUPPORTED_RESOURCE_TYPES,
 )
 from .schema_upgrade import (
@@ -69,13 +73,13 @@ class PreviewMixin:
             200), and warnings.
 
         Raises:
-            ValueError: If the snapshot or snapshot file is not found.
+            SnapshotNotFoundError: The snapshot row or its file is not found.
         """
         vault_root = self._vault.image_root
         cp = self._get_snapshot_or_raise(snapshot_id)
         abs_snapshot = resolve_path_within(vault_root, cp.relative_path)
         if not os.path.exists(abs_snapshot):
-            raise ValueError(f"Snapshot file not found on disk: {abs_snapshot}")
+            raise self._snapshot_file_missing(snapshot_id, abs_snapshot)
 
         preview = RestorePreview(
             snapshot_id=snapshot_id,
@@ -103,7 +107,7 @@ class PreviewMixin:
                     exc,
                     exc_info=True,
                 )
-                preview.warnings.append(f"Preview computation error: {exc}")
+                preview.warnings.append(PREVIEW_INCOMPLETE_WARNING)
             finally:
                 snap_engine.dispose()
         finally:
@@ -127,29 +131,25 @@ class PreviewMixin:
 
         Args:
             snapshot_id: ID of the snapshot.
-            resource_type: One of ``'picture'``, ``'picture_set'``,
-                ``'project'``, or ``'character'``.
+            resource_type: One of ``_SUPPORTED_RESOURCE_TYPES``
+                (``'picture'``, ``'picture_set'``, ``'character'``).
             resource_id: Primary key of the resource.
 
         Returns:
             A ``RestorePreview`` for the targeted resource.
 
         Raises:
-            ValueError: If the snapshot/snapshot is not found or
-                ``resource_type`` is invalid.
+            UnsupportedResourceTypeError: ``resource_type`` is not supported.
+            SnapshotNotFoundError: The snapshot row or its file is not found.
         """
         if resource_type not in _SUPPORTED_RESOURCE_TYPES:
-            raise ValueError(
-                f"Unsupported resource_type '{resource_type}'. "
-                f"Supported: {', '.join(_SUPPORTED_RESOURCE_TYPES)}. "
-                "Use the full restore for project-level recovery."
-            )
+            raise UnsupportedResourceTypeError(UNSUPPORTED_RESOURCE_TYPE_MESSAGE)
 
         vault_root = self._vault.image_root
         cp = self._get_snapshot_or_raise(snapshot_id)
         abs_snapshot = resolve_path_within(vault_root, cp.relative_path)
         if not os.path.exists(abs_snapshot):
-            raise ValueError(f"Snapshot file not found on disk: {abs_snapshot}")
+            raise self._snapshot_file_missing(snapshot_id, abs_snapshot)
 
         preview = RestorePreview(
             snapshot_id=snapshot_id,
@@ -183,7 +183,7 @@ class PreviewMixin:
                     exc,
                     exc_info=True,
                 )
-                preview.warnings.append(f"Preview computation error: {exc}")
+                preview.warnings.append(PREVIEW_INCOMPLETE_WARNING)
             finally:
                 snap_engine.dispose()
         finally:
@@ -218,7 +218,7 @@ class PreviewMixin:
         cp = self._get_snapshot_or_raise(snapshot_id)
         abs_snapshot = resolve_path_within(vault_root, cp.relative_path)
         if not os.path.exists(abs_snapshot):
-            raise ValueError(f"Snapshot file not found on disk: {abs_snapshot}")
+            raise self._snapshot_file_missing(snapshot_id, abs_snapshot)
 
         preview = RestorePreview(
             snapshot_id=snapshot_id,
@@ -252,7 +252,7 @@ class PreviewMixin:
                     exc,
                     exc_info=True,
                 )
-                preview.warnings.append(f"Preview computation error: {exc}")
+                preview.warnings.append(PREVIEW_INCOMPLETE_WARNING)
             finally:
                 snap_engine.dispose()
         finally:
@@ -292,7 +292,7 @@ class PreviewMixin:
         cp = self._get_snapshot_or_raise(snapshot_id)
         snapshot_path = os.path.join(self._vault.image_root, cp.relative_path)
         if not os.path.exists(snapshot_path):
-            raise ValueError(f"Snapshot file not found for snapshot {snapshot_id}")
+            raise self._snapshot_file_missing(snapshot_id, snapshot_path)
 
         # Fetch live hashes, computing and persisting any that are NULL so
         # existing pictures (pre-migration) can be compared correctly. NULL
@@ -301,12 +301,16 @@ class PreviewMixin:
         # snapshots and the per-row execute path saturated the writer queue
         # with single-row updates.
         def _get_live_hashes(session: Session) -> dict[int, str | None]:
-            rows = session.execute(
-                select(Picture.id, Picture.metadata_hash).where(
-                    Picture.id.in_(picture_ids)
+            # Chunked: the route allows more ids than one statement may bind.
+            hashes: dict[int, str | None] = {}
+            for chunk in chunked(picture_ids):
+                hashes.update(
+                    session.execute(
+                        select(Picture.id, Picture.metadata_hash).where(
+                            Picture.id.in_(chunk)
+                        )
+                    ).all()
                 )
-            ).all()
-            hashes: dict[int, str | None] = {pid: h for pid, h in rows}
             to_persist: list[dict] = []
             missing = [pid for pid, h in hashes.items() if h is None]
             if missing:
@@ -383,11 +387,15 @@ class PreviewMixin:
                 try:
                     _snap_engine = snapshot_engine(snapshot_path)
                     with Session(_snap_engine) as snap_session:
-                        snap_rows = snap_session.execute(
-                            select(Picture.id, Picture.metadata_hash).where(
-                                Picture.id.in_(picture_ids)
-                            )
-                        ).all()
+                        snap_rows = [
+                            row
+                            for chunk in chunked(picture_ids)
+                            for row in snap_session.execute(
+                                select(Picture.id, Picture.metadata_hash).where(
+                                    Picture.id.in_(chunk)
+                                )
+                            ).all()
+                        ]
                         missing_in_snapshot: list[int] = []
                         for pid, h in snap_rows:
                             if h is not None:

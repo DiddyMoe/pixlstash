@@ -17,9 +17,17 @@ from starlette.requests import Request
 from pixlstash.database import DBPriority
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
+from pixlstash.services.library_generation_coordinator import (
+    LibraryNotReadyError,
+    SwitchState,
+)
 from pixlstash.services.smart_sets import (
     apply_members_in_session,
     smart_sets_to_refresh_in_session,
+)
+from pixlstash.utils.service.library_lease import (
+    UNAVAILABLE_RETRIES,
+    PinnedVaultServer,
 )
 
 logger = get_logger(__name__)
@@ -142,6 +150,14 @@ def refresh_smart_sets(server, set_ids: Iterable[int] | None = None) -> list[int
 class SmartSetRefresher:
     """Runs :func:`refresh_smart_sets` after library events, gathered.
 
+    Each refresh holds a library read lease, as a request does, so a library
+    switch or a full restore waits for it and it never writes members into a
+    library file that replaced the one it read. While admission is SWITCHING
+    the refresh waits one more window, for as long as that lasts; while no
+    coherent library is open (UNAVAILABLE) it waits one more window at most
+    ``UNAVAILABLE_RETRIES`` times, then gives up until the next library
+    event.
+
     Attributes:
         server: The server whose current vault is refreshed.
     """
@@ -151,6 +167,8 @@ class SmartSetRefresher:
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
         self._closed = False
+        # Windows waited in a row while no coherent library was open.
+        self._unavailable_tries = 0
 
     def on_event(self, event_type: EventType, data=None) -> None:
         """A vault event: schedule a refresh if pictures may have changed."""
@@ -158,6 +176,10 @@ class SmartSetRefresher:
             return
         if isinstance(data, dict) and data.get("source") == SMART_SET_SOURCE:
             return
+        self._arm()
+
+    def _arm(self) -> None:
+        """Schedule one refresh a window from now, unless one is pending."""
         with self._lock:
             if self._closed or self._timer is not None:
                 return
@@ -178,7 +200,56 @@ class SmartSetRefresher:
             self._timer = None
             if self._closed:
                 return
+        # Built after this refresher during start-up (server.py), so an event
+        # in between finds none yet and waits one more window for it.
+        coordinator = getattr(self.server, "library_coordinator", None)
+        if coordinator is None:
+            logger.info(
+                "Smart set refresh waits %.0f s: the library is being opened.",
+                REFRESH_WINDOW_S,
+            )
+            self._arm()
+            return
         try:
-            refresh_smart_sets(self.server)
+            lease = coordinator.acquire_read_or_raise()
+        except LibraryNotReadyError as exc:
+            self._wait_for_the_library(exc.state)
+            return
+        with self._lock:
+            self._unavailable_tries = 0
+        try:
+            refresh_smart_sets(PinnedVaultServer(self.server, lease.vault))
         except Exception as exc:
             logger.warning("Smart set refresh failed: %s", exc, exc_info=True)
+        finally:
+            coordinator.release_read(lease)
+
+    def _wait_for_the_library(self, state: SwitchState) -> None:
+        """Admission refused the lease in *state*: wait a window, or give up."""
+        if state is SwitchState.SWITCHING:
+            logger.info(
+                "Smart set refresh waits %.0f s: the library is being switched "
+                "or restored.",
+                REFRESH_WINDOW_S,
+            )
+            self._arm()
+            return
+        with self._lock:
+            self._unavailable_tries += 1
+            tries = self._unavailable_tries
+            if tries > UNAVAILABLE_RETRIES:
+                self._unavailable_tries = 0
+        if tries > UNAVAILABLE_RETRIES:
+            logger.warning(
+                "Smart sets were not refreshed: no library was open after %d "
+                "tries. The next library event refreshes them.",
+                tries,
+            )
+            return
+        logger.info(
+            "Smart set refresh waits %.0f s: no library is open (wait %d of %d).",
+            REFRESH_WINDOW_S,
+            tries,
+            UNAVAILABLE_RETRIES,
+        )
+        self._arm()

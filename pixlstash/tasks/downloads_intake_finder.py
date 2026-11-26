@@ -112,7 +112,14 @@ class DownloadsIntakeFinder(BaseTaskFinder):
 
     def on_task_complete(self, task, error) -> None:
         """Forget what the task did not get to, so it is offered again."""
-        retry = (task.params or {}).get("paths", []) if error else task.retry_paths
+        # One that raised or was cancelled (before it started, too: the runner
+        # settles that as a cancellation) cannot say which paths it took in,
+        # so all of them are offered again; one that finished names its own.
+        retry = (
+            (task.params or {}).get("paths", [])
+            if error is not None
+            else task.retry_paths
+        )
         with self._lock:
             for path in retry:
                 self._dispatched.pop(path, None)

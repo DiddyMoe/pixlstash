@@ -9,6 +9,7 @@ transaction (restoring missing parents first when the caller confirms).
 
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlmodel import Session, select
@@ -34,11 +35,16 @@ from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.quality.tag_exclusion import is_excluded, session_tag_exclusions
+from pixlstash.utils.sql_chunking import chunked, in_json
 
 from ._models import (
+    RESOURCE_RESTORE_FAILED_MESSAGE,
+    UNSUPPORTED_RESOURCE_TYPE_MESSAGE,
     MissingDependenciesError,
     RestoreInProgressError,
+    RestoreRefusedError,
     RestoreReport,
+    UnsupportedResourceTypeError,
     _SUPPORTED_RESOURCE_TYPES,
 )
 from .schema_upgrade import snapshot_engine
@@ -50,6 +56,25 @@ logger = get_logger(__name__)
 # exists only so the join rows travel with the parent from the snapshot session
 # to the live one (issue #125).
 _PROJECT_IDS_KEY = "__project_ids"
+
+
+@dataclass
+class _ResourceRows:
+    """What a per-resource restore read from the snapshot, to be written.
+
+    Attributes:
+        report: The resource's report; the read fills the skip counts, the
+            write the upsert counts.
+        snap_rows: Output of ``_collect_rows_for_upsert``.
+        valid_picture_ids: The pictures to restore: in the snapshot, with a
+            file on disk and not permanently deleted.
+        candidate_parents: Output of ``_collect_candidate_parents``.
+    """
+
+    report: RestoreReport
+    snap_rows: dict
+    valid_picture_ids: list[int]
+    candidate_parents: dict[str, list[dict]]
 
 
 class ResourceRestoreMixin:
@@ -96,11 +121,18 @@ class ResourceRestoreMixin:
             A ``RestoreReport`` summarising the operation.
 
         Raises:
-            ValueError: If the snapshot is not found or ``resource_type`` is
-                unsupported.
+            SnapshotNotFoundError: If the snapshot or its file is not found.
+            UnsupportedResourceTypeError: If ``resource_type`` is unsupported.
             RestoreInProgressError: If another restore is already running.
+            WorkInProgressError: If work somebody started was queued or
+                running; nothing was paused or written.
+            BackgroundWorkStillRunningError: If a background task was still
+                running when the drain timed out; nothing was written.
             MissingDependenciesError: If parents are missing in live and
-                ``confirm_restore_dependencies`` is False.
+                ``confirm_restore_dependencies`` is False. Checked before the
+                drain, so background work is left alone; a parent deleted
+                while the drain waited is caught by the write's own check,
+                after the drain.
         """
         if not self._restore_lock.acquire(blocking=False):
             raise RestoreInProgressError(
@@ -112,15 +144,15 @@ class ResourceRestoreMixin:
             cp = self._get_snapshot_or_raise(snapshot_id)
             abs_snapshot = resolve_path_within(vault_root, cp.relative_path)
             if not os.path.exists(abs_snapshot):
-                raise ValueError(f"Snapshot file not found on disk: {abs_snapshot}")
+                raise self._snapshot_file_missing(snapshot_id, abs_snapshot)
 
             if resource_type not in _SUPPORTED_RESOURCE_TYPES:
-                raise ValueError(
-                    f"Unsupported resource_type '{resource_type}'. "
-                    f"Supported: {', '.join(_SUPPORTED_RESOURCE_TYPES)}. "
-                    "Use the full restore for project-level recovery."
-                )
+                raise UnsupportedResourceTypeError(UNSUPPORTED_RESOURCE_TYPE_MESSAGE)
 
+            # Before the schema upgrade and before RESTORE_STARTED: work
+            # somebody started refuses the restore at no cost. The drain
+            # looks again as it pauses.
+            self._refuse_while_somebody_started_work()
             started_payload = {
                 "snapshot_id": snapshot_id,
                 "resource_type": resource_type,
@@ -133,14 +165,30 @@ class ResourceRestoreMixin:
                     raise RuntimeError("Schema upgrade failed; aborting restore.")
 
                 try:
-                    report = self._restore_resource_from_snapshot(
+                    rows = self._read_resource_from_snapshot(
                         upgraded_snapshot,
                         snapshot_id,
                         resource_type,
                         resource_id,
                         vault_root,
-                        confirm_restore_dependencies=confirm_restore_dependencies,
                     )
+                    # The dependency check only reads, so it comes before the
+                    # drain: a refusal leaves background work alone. The
+                    # write checks again, in its own transaction.
+                    if not confirm_restore_dependencies:
+                        missing = self._vault.db.run_immediate_read_task(
+                            lambda session: self._find_missing_parent_ids(
+                                session, rows.candidate_parents
+                            )
+                        )
+                        if missing:
+                            raise MissingDependenciesError(missing)
+                    # Rows are rewritten only with background work drained, so
+                    # no running task writes over the restored rows.
+                    with self._background_work_paused():
+                        report = self._write_resource_rows(
+                            rows, confirm_restore_dependencies
+                        )
                 finally:
                     # Remove the whole mkdtemp dir, not just the file, so the
                     # empty scratch directory isn't leaked.
@@ -158,9 +206,8 @@ class ResourceRestoreMixin:
                 )
                 return report
             except Exception as exc:
-                self._emit_lifecycle(
-                    EventType.RESTORE_FAILED,
-                    {**started_payload, "error": str(exc)},
+                self._emit_restore_failed(
+                    started_payload, exc, RESOURCE_RESTORE_FAILED_MESSAGE
                 )
                 raise
         finally:
@@ -190,11 +237,17 @@ class ResourceRestoreMixin:
             A ``RestoreReport`` with aggregate counts.
 
         Raises:
-            ValueError: If the snapshot/snapshot is not found.
+            SnapshotNotFoundError: If the snapshot or its file is not found.
             RestoreInProgressError: If another restore is already running.
+            WorkInProgressError: If work somebody started was queued or
+                running; nothing was paused or written.
+            BackgroundWorkStillRunningError: If a background task was still
+                running when the drain timed out; nothing was written.
             MissingDependenciesError: If any batch item has parents
                 missing in live and ``confirm_restore_dependencies`` is
-                False. ``missing`` carries the union across the batch.
+                False. ``missing`` carries the union across the batch. An
+                item whose parent was deleted while the drain waited is not
+                raised but skipped, with a line in the report's ``errors``.
         """
         if not self._restore_lock.acquire(blocking=False):
             raise RestoreInProgressError(
@@ -206,7 +259,7 @@ class ResourceRestoreMixin:
             cp = self._get_snapshot_or_raise(snapshot_id)
             abs_snapshot = resolve_path_within(vault_root, cp.relative_path)
             if not os.path.exists(abs_snapshot):
-                raise ValueError(f"Snapshot file not found on disk: {abs_snapshot}")
+                raise self._snapshot_file_missing(snapshot_id, abs_snapshot)
 
             if not resources:
                 return RestoreReport(
@@ -214,6 +267,9 @@ class ResourceRestoreMixin:
                     resource_type="batch",
                 )
 
+            # Before the schema upgrade and before RESTORE_STARTED, as for a
+            # single resource.
+            self._refuse_while_somebody_started_work()
             started_payload = {"snapshot_id": snapshot_id, "resource_type": "batch"}
             self._emit_lifecycle(EventType.RESTORE_STARTED, started_payload)
             try:
@@ -222,76 +278,20 @@ class ResourceRestoreMixin:
                 if upgraded_snapshot is None:
                     raise RuntimeError("Schema upgrade failed; aborting batch restore.")
 
-                # Pre-flight: compute the union of parents referenced by
-                # any item in the batch but missing from live. Raise once
-                # for the whole batch if the caller hasn't confirmed -
-                # avoids the "restore item 1, fail on item 2, leave
-                # partial state" trap.
-                union_candidates = self._collect_batch_candidate_parents(
-                    upgraded_snapshot, resources, vault_root
-                )
-                batch_missing = self._vault.db.run_immediate_read_task(
-                    lambda session: self._find_missing_parent_ids(
-                        session, union_candidates
-                    )
-                )
-                if batch_missing and not confirm_restore_dependencies:
-                    raise MissingDependenciesError(batch_missing)
-                if batch_missing:
-                    # Confirmed - restore parents once for the whole batch.
-                    self._vault.db.run_task(
-                        lambda session: self._restore_parent_rows(
-                            session, union_candidates, batch_missing
-                        ),
-                        priority=0,
-                    )
-
-                total = RestoreReport(snapshot_id=snapshot_id, resource_type="batch")
                 try:
-                    for item in resources:
-                        rtype = item.get("type", "")
-                        rid = int(item.get("id", 0))
-                        if rtype not in _SUPPORTED_RESOURCE_TYPES:
-                            total.errors.append(
-                                f"Skipped unsupported resource type '{rtype}' "
-                                f"(supported: {', '.join(_SUPPORTED_RESOURCE_TYPES)})."
-                            )
-                            continue
-                        try:
-                            # Pass confirm=True down because the pre-flight
-                            # already restored any missing parents - the
-                            # per-item dep check is now a no-op.
-                            sub = self._restore_resource_from_snapshot(
-                                upgraded_snapshot,
-                                snapshot_id,
-                                rtype,
-                                rid,
-                                vault_root,
-                                confirm_restore_dependencies=True,
-                            )
-                            total.missing_files_count += sub.missing_files_count
-                            total.upserted_count += sub.upserted_count
-                            total.skipped_excluded += sub.skipped_excluded
-                            total.errors.extend(sub.errors)
-                        except Exception as exc:
-                            msg = f"{rtype}/{rid}: {exc}"
-                            logger.error(
-                                "RestoreService: batch item restore failed: %s",
-                                msg,
-                                exc_info=True,
-                            )
-                            total.errors.append(msg)
+                    total = self._restore_batch_items(
+                        upgraded_snapshot,
+                        snapshot_id,
+                        resources,
+                        vault_root,
+                        confirm_restore_dependencies,
+                    )
                 finally:
-                    try:
-                        os.remove(upgraded_snapshot)
-                        shutil.rmtree(
-                            os.path.dirname(upgraded_snapshot), ignore_errors=True
-                        )
-                    except Exception:
-                        logger.warning(
-                            "RestoreService: failed to remove temp upgraded snapshot and dir: %s",
-                            upgraded_snapshot,
-                        )
+                    # Covers the dependency refusal and the drain's refusal
+                    # too, which used to leave the scratch copy behind.
+                    shutil.rmtree(
+                        os.path.dirname(upgraded_snapshot), ignore_errors=True
+                    )
 
                 self._emit_lifecycle(
                     EventType.RESTORE_COMPLETED,
@@ -303,24 +303,148 @@ class ResourceRestoreMixin:
                 )
                 return total
             except Exception as exc:
-                self._emit_lifecycle(
-                    EventType.RESTORE_FAILED,
-                    {**started_payload, "error": str(exc)},
+                self._emit_restore_failed(
+                    started_payload, exc, RESOURCE_RESTORE_FAILED_MESSAGE
                 )
                 raise
         finally:
             self._restore_lock.release()
 
-    def _restore_resource_from_snapshot(
+    def _restore_batch_items(
+        self,
+        upgraded_snapshot: str,
+        snapshot_id: int,
+        resources: list[dict],
+        vault_root: str,
+        confirm_restore_dependencies: bool,
+    ) -> RestoreReport:
+        """Check the batch's parents, then restore every item.
+
+        The dependency check only reads, so it runs before background work is
+        drained and a refusal leaves running tasks alone. The writes (the
+        parent rows and every item) run with background work held off, and
+        each checks the parents again in its own transaction: an item whose
+        parent was deleted meanwhile, without the caller's consent, is
+        skipped and reported, not given the parent back.
+
+        Raises:
+            MissingDependenciesError: If parents are missing in live and
+                ``confirm_restore_dependencies`` is False.
+            BackgroundWorkStillRunningError: If a task was still running when
+                the drain timed out; nothing was written.
+        """
+        # Pre-flight: compute the union of parents referenced by any item in
+        # the batch but missing from live. Raise once for the whole batch if
+        # the caller hasn't confirmed - avoids the "restore item 1, fail on
+        # item 2, leave partial state" trap.
+        union_candidates = self._collect_batch_candidate_parents(
+            upgraded_snapshot, resources, vault_root
+        )
+        batch_missing = self._vault.db.run_immediate_read_task(
+            lambda session: self._find_missing_parent_ids(session, union_candidates)
+        )
+        if batch_missing and not confirm_restore_dependencies:
+            raise MissingDependenciesError(batch_missing)
+
+        total = RestoreReport(snapshot_id=snapshot_id, resource_type="batch")
+        with self._background_work_paused():
+            if batch_missing:
+                # Confirmed - restore parents once for the whole batch, as they
+                # are missing now: one may have been deleted, or brought back,
+                # while the drain waited.
+                def _restore_missing_parents(session) -> int:
+                    missing_now = self._find_missing_parent_ids(
+                        session, union_candidates
+                    )
+                    return self._restore_parent_rows(
+                        session, union_candidates, missing_now
+                    )
+
+                self._vault.db.run_task(_restore_missing_parents, priority=0)
+            for item in resources:
+                rtype = item.get("type", "")
+                rid = int(item.get("id", 0))
+                if rtype not in _SUPPORTED_RESOURCE_TYPES:
+                    # Name the type only when it is a known one, so the report
+                    # never echoes an arbitrary string from the request.
+                    if rtype == "project":
+                        total.errors.append(
+                            f"Skipped project/{rid}: a project is restored "
+                            "with the full restore."
+                        )
+                    else:
+                        total.errors.append(
+                            f"Skipped item {rid}: its type is not supported "
+                            f"(supported: {', '.join(_SUPPORTED_RESOURCE_TYPES)})."
+                        )
+                    continue
+                try:
+                    # The caller's consent, not True: a parent deleted after
+                    # the pre-flight found none missing was never confirmed,
+                    # so the item's write refuses rather than recreate it.
+                    sub = self._write_resource_rows(
+                        self._read_resource_from_snapshot(
+                            upgraded_snapshot,
+                            snapshot_id,
+                            rtype,
+                            rid,
+                            vault_root,
+                        ),
+                        confirm_restore_dependencies,
+                    )
+                    total.missing_files_count += sub.missing_files_count
+                    total.upserted_count += sub.upserted_count
+                    total.skipped_excluded += sub.skipped_excluded
+                    total.errors.extend(sub.errors)
+                except MissingDependenciesError as exc:
+                    logger.warning(
+                        "RestoreService: batch item %s/%d of snapshot %d not "
+                        "restored; parents deleted during the restore: %s",
+                        rtype,
+                        rid,
+                        snapshot_id,
+                        exc.missing,
+                    )
+                    total.errors.append(
+                        f"{rtype}/{rid}: not restored, because a character, "
+                        "picture set or project it needs was deleted while the "
+                        "restore ran. Restore it again to bring that back too."
+                    )
+                except RestoreRefusedError as exc:
+                    # A refusal composed its own sentence for the owner (a face
+                    # box the model cannot read); the item's write rolled back.
+                    logger.warning(
+                        "RestoreService: batch item %s/%d of snapshot %d refused: %s",
+                        rtype,
+                        rid,
+                        snapshot_id,
+                        exc,
+                    )
+                    total.errors.append(f"{rtype}/{rid}: {exc}")
+                except Exception:
+                    logger.error(
+                        "RestoreService: batch item restore failed for "
+                        "snapshot %d (%s/%d)",
+                        snapshot_id,
+                        rtype,
+                        rid,
+                        exc_info=True,
+                    )
+                    total.errors.append(
+                        f"{rtype}/{rid}: could not be restored; the server log "
+                        "has the details."
+                    )
+        return total
+
+    def _read_resource_from_snapshot(
         self,
         abs_snapshot: str,
         snapshot_id: int,
         resource_type: str,
         resource_id: int,
         vault_root: str,
-        confirm_restore_dependencies: bool = False,
-    ) -> RestoreReport:
-        """Upsert resource rows from the snapshot into the live database.
+    ) -> _ResourceRows:
+        """Read what restoring one resource would write, changing nothing.
 
         Args:
             abs_snapshot: Absolute path to the upgraded snapshot.
@@ -330,7 +454,9 @@ class ResourceRestoreMixin:
             vault_root: Vault root directory for file existence checks.
 
         Returns:
-            RestoreReport with counts.
+            The rows, the pictures and the parents they reference, with a
+            report holding the skip counts. ``_write_resource_rows`` writes
+            them.
         """
         from pixlstash.utils.image_processing.image_utils import ImageUtils
 
@@ -435,22 +561,41 @@ class ResourceRestoreMixin:
                 )
         finally:
             snap_engine.dispose()
+        return _ResourceRows(report, snap_rows, valid_picture_ids, candidate_parents)
 
-        # Upsert in the live DB.
-        # Inside the writer task we first check for parents missing in live
-        # and either short-circuit with ``MissingDependenciesError`` (the
-        # caller has not opted in) or restore them from the snapshot first.
-        # The whole sequence runs in one writer-session transaction so a
-        # mid-flight failure rolls back both the parent inserts and the
-        # subsequent upsert.
+    def _write_resource_rows(
+        self, rows: _ResourceRows, confirm_restore_dependencies: bool
+    ) -> RestoreReport:
+        """Upsert what ``_read_resource_from_snapshot`` read into the live DB.
+
+        The parents are checked again inside the writer transaction, so the
+        check and the write see the same database: a parent missing now
+        refuses the write (``MissingDependenciesError``) unless the caller
+        confirmed, in which case it is restored from the snapshot first. A
+        failure rolls back the parent inserts and the upsert together.
+
+        Args:
+            rows: Output of ``_read_resource_from_snapshot``.
+            confirm_restore_dependencies: Whether the caller agreed to restore
+                missing parents.
+
+        Returns:
+            ``rows.report`` with the upsert counts.
+
+        Raises:
+            MissingDependenciesError: A parent is missing in live and the
+                caller did not confirm; nothing was written.
+        """
+
         def _check_deps_and_upsert(session):
-            missing = self._find_missing_parent_ids(session, candidate_parents)
+            missing = self._find_missing_parent_ids(session, rows.candidate_parents)
             if missing:
                 if not confirm_restore_dependencies:
                     raise MissingDependenciesError(missing)
-                self._restore_parent_rows(session, candidate_parents, missing)
-            return self._upsert_rows(session, snap_rows, valid_picture_ids)
+                self._restore_parent_rows(session, rows.candidate_parents, missing)
+            return self._upsert_rows(session, rows.snap_rows, rows.valid_picture_ids)
 
+        report = rows.report
         report.upserted_count, report.skipped_excluded = self._vault.db.run_task(
             _check_deps_and_upsert, priority=0
         )
@@ -667,7 +812,9 @@ class ResourceRestoreMixin:
             if not wanted:
                 continue
             live_ids = set(
-                live_session.execute(sa_select(model.id).where(model.id.in_(wanted)))
+                live_session.execute(
+                    sa_select(model.id).where(in_json(model.id, wanted))
+                )
                 .scalars()
                 .all()
             )
@@ -749,7 +896,7 @@ class ResourceRestoreMixin:
             }
             live_project_ids = set(
                 live_session.execute(
-                    sa_select(Project.id).where(Project.id.in_(wanted_projects))
+                    sa_select(Project.id).where(in_json(Project.id, wanted_projects))
                 )
                 .scalars()
                 .all()
@@ -958,25 +1105,48 @@ class ResourceRestoreMixin:
         #      can violate (the original reason this branch existed for tags).
         # Bulk-delete by picture_id, then insert fresh rows. Faces/PSMs/PPMs
         # are constructed without a PK so the DB assigns one.
+        # Chunked: a set or project restores every member, more than one
+        # statement may bind.
         if valid_picture_ids:
-            for child_model in (Face, Tag, PictureSetMember, PictureProjectMember):
-                session.execute(
-                    sa_delete(child_model).where(
-                        child_model.picture_id.in_(valid_picture_ids)
+            for chunk in chunked(valid_picture_ids):
+                for child_model in (Face, Tag, PictureSetMember, PictureProjectMember):
+                    session.execute(
+                        sa_delete(child_model).where(child_model.picture_id.in_(chunk))
                     )
-                )
             session.flush()
+        # The box is copied as the snapshot stored it. Re-encoding it through
+        # ``face.bbox`` turned a stored ``"null"`` into NULL, which the
+        # ``bbox_ IS NOT NULL`` readers count differently, and raised a bare
+        # JSONDecodeError on a box that is not JSON. A box the model refuses
+        # (not JSON, or not ``null`` or four finite numbers) refuses the whole
+        # restore rather than being dropped or rewritten; raising here rolls
+        # back this transaction, the deletes above included.
         for face in snap_rows.get("faces", []):
-            session.add(
-                Face(
+            try:
+                restored = Face(
                     picture_id=face.picture_id,
                     frame_index=face.frame_index,
                     face_index=face.face_index,
                     character_id=face.character_id,
-                    bbox=face.bbox,
+                    bbox_=face.bbox_,
                     features=face.features,
                 )
-            )
+            except ValueError as exc:
+                # The model's message is fixed; check_bbox_text has already
+                # logged the refused text, cut short.
+                logger.warning(
+                    "RestoreService: snapshot face %s on picture %s has a bbox "
+                    "the model refuses (%s); refusing the restore",
+                    face.id,
+                    face.picture_id,
+                    exc,
+                )
+                raise RestoreRefusedError(
+                    f"Face {face.id} on picture {face.picture_id} in the "
+                    "snapshot has a box that cannot be read, so the restore "
+                    "was refused. Nothing was changed."
+                ) from exc
+            session.add(restored)
             count += 1
         exclusions = session_tag_exclusions(session)
         skipped_excluded = 0

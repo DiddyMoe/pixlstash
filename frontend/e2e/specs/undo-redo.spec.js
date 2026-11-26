@@ -1,3 +1,4 @@
+import { clearDedupState } from '../fixtures/dedupSeed.js'
 import { test, expect, readClientId } from '../fixtures/test.js'
 
 // Undo and redo driven from the UI: the Ctrl+Z / Ctrl+Y chord
@@ -202,6 +203,12 @@ const CHANGE_KINDS = [
       }),
   },
 ]
+
+// Opening /duplicates asks for a scan this backend never runs, and a pending
+// scan refuses a snapshot restore, so the file clears it for the next specs.
+test.afterAll(() => {
+  clearDedupState()
+})
 
 test.describe('undo and redo from the keyboard', () => {
   for (const kind of CHANGE_KINDS) {

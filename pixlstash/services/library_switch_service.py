@@ -27,9 +27,9 @@ import os
 import shutil
 import threading
 from contextlib import contextmanager
-from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
+from pixlstash.db_models.face import clear_refused_bboxes
 from pixlstash.hub.registry import (
     SCRATCH_LIBRARY_NAME as _SCRATCH_LIBRARY_NAME,
     VAULT_FILENAME,
@@ -41,7 +41,18 @@ from pixlstash.hub.registry import (
     validate_vault_folder,
 )
 from pixlstash.pixl_logging import get_logger
+
+# The admission states live with the coordinator that holds them, a module
+# with no imports of its own, so the restore service can import its errors
+# without pulling in the routes this module needs.
+from pixlstash.services.library_generation_coordinator import (
+    LibraryNotReadyError,
+    LibrarySwitchTimeoutError,
+    SwitchState,
+)
 from pixlstash.hub.bootstrap import (
+    LibraryFingerprintConflictError,
+    NewerLibraryError,
     known_vault_revisions,
     newer_library_message,
     registered_vault_path,
@@ -49,6 +60,7 @@ from pixlstash.hub.bootstrap import (
 from pixlstash.routes.pictures import clear_stats_cache
 from pixlstash.routes.pictures._anomaly import clear_anomaly_region_cache
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.sqlite_uri import sqlite_file_uri
 
 if TYPE_CHECKING:
@@ -62,21 +74,28 @@ _BUSY_MESSAGE = (
 )
 
 
-class SwitchState(str, Enum):
-    """What the server is currently able to serve."""
-
-    READY = "ready"
-    """A vault is open and requests are served normally."""
-
-    SWITCHING = "switching"
-    """Mid-swap. Data requests are refused with 503 until this clears."""
-
-    UNAVAILABLE = "unavailable"
-    """No verified coherent open vault exists; restart is required."""
-
-
 class LibrarySwitchError(LibraryError):
     """A switch was refused or failed, with the session left on its old library."""
+
+
+def _open_failure_message(target: Library, exc: BaseException, outcome: str) -> str:
+    """Say why *target* did not open, naming no path and quoting no exception.
+
+    The answer goes back over HTTP, and the exceptions a vault open raises
+    carry the folder, the database path and SQLite's own words. The caller
+    logs *exc* with its traceback. Two causes are the owner's to act on and
+    are worded here from their type: a library a newer build last opened, and
+    a folder that now holds a different library. Anything else is "could not
+    open", and the log says why.
+    """
+    if isinstance(exc, NewerLibraryError):
+        return newer_library_message(exc.unknown, library=f'"{target.name}"')
+    if isinstance(exc, LibraryFingerprintConflictError):
+        return (
+            f'"{target.name}" was not opened: its folder now holds a different '
+            f"library (a fingerprint conflict). {outcome}"
+        )
+    return f'Could not open "{target.name}". {outcome}'
 
 
 def _bring_up(vault, label: str) -> None:
@@ -125,7 +144,10 @@ def assert_vault_not_newer(vault_path: str) -> None:
             sqlite_file_uri(vault_path, read_only=True), uri=True, timeout=5
         )
     except sqlite3.Error as exc:
-        raise LibrarySwitchError(f"{vault_path} could not be opened: {exc}") from exc
+        logger.error("Could not open vault %s read-only", vault_path, exc_info=True)
+        raise LibrarySwitchError(
+            "That library's database could not be opened."
+        ) from exc
 
     try:
         rows = conn.execute("SELECT version_num FROM alembic_version").fetchall()
@@ -138,9 +160,7 @@ def assert_vault_not_newer(vault_path: str) -> None:
     known = known_vault_revisions()
     unknown = [row[0] for row in rows if row[0] and row[0] not in known]
     if unknown:
-        raise LibrarySwitchError(
-            newer_library_message(unknown, library=f"The library at {vault_path}")
-        )
+        raise LibrarySwitchError(newer_library_message(unknown, library="That library"))
 
 
 class LibrarySwitchService:
@@ -178,7 +198,7 @@ class LibrarySwitchService:
                     )
                     continue
                 try:
-                    if os.path.islink(private_dir):
+                    if is_link_or_missing(private_dir):
                         os.unlink(private_dir)
                     elif os.path.isdir(private_dir):
                         shutil.rmtree(private_dir)
@@ -195,7 +215,7 @@ class LibrarySwitchService:
         try:
             safe_staging_root = os.path.commonpath(
                 (previous_real, staging_root_real)
-            ) == previous_real and not os.path.islink(staging_root)
+            ) == previous_real and not is_link_or_missing(staging_root)
         except ValueError:
             safe_staging_root = False
         for session in list(self._server.staging_sessions.values()):
@@ -218,7 +238,7 @@ class LibrarySwitchService:
                 )
                 continue
             try:
-                if os.path.islink(candidate):
+                if is_link_or_missing(candidate):
                     os.unlink(candidate)
                 elif os.path.isdir(candidate):
                     shutil.rmtree(candidate)
@@ -229,6 +249,10 @@ class LibrarySwitchService:
         self._server.staging_sessions.clear()
         self._server.auth.clear_guest_session_tracking()
         ImageUtils._extract_embedded_metadata_cached.cache_clear()
+        # Stored boxes already logged as refused, keyed by row id: the next
+        # library reuses those ids, and a bad row it holds under one would
+        # never get its log line. After close, so no old worker adds one back.
+        clear_refused_bboxes()
 
     def switch_to(self, library_uuid: str) -> Library:
         """Make the library with *library_uuid* the active one.
@@ -253,29 +277,47 @@ class LibrarySwitchService:
             registry = self._server.library_registry
             target = registry.by_uuid(library_uuid)
             if target is None or not target.attached:
-                raise LibraryNotFoundError(
-                    f"No attached library with uuid {library_uuid}."
-                )
+                # Not repeated back: the uuid is the caller's text, unchecked.
+                # `routes/libraries.py` answers its own lookup the same way.
+                raise LibraryNotFoundError("No attached library has that uuid.")
             if target.is_active:
                 logger.info("Library %s is already active; nothing to do", target.name)
                 return target
             try:
                 self._server.library_coordinator.begin_switch()
-            except RuntimeError as exc:
+            except (LibrarySwitchTimeoutError, LibraryNotReadyError) as exc:
+                # Only the coordinator's two refusals are answered here: the
+                # readers did not drain in time, or the coordinator is not
+                # READY (a restore, another switch, or no verified library;
+                # the switch route is hub-only, so it reaches here past the
+                # admission fence). Any other RuntimeError is a defect and
+                # propagates as one.
+                #
                 # A refused switch is now a reachable, expected state rather
                 # than a rare one: a folder-mapping commit holds a read lease
                 # for as long as it runs, precisely so it cannot be retargeted
                 # at another library half way through. "Timed out waiting for
                 # active-library readers" is the right mechanism and the wrong
                 # sentence to hand the owner, so name the work instead.
-                busy = self._what_is_holding_the_library()
+                busy = self.describe_library_holders()
                 if busy:
                     raise LibrarySwitchError(
                         f"This library is busy: {busy}. Switching now would "
                         "leave that work writing into the other library, so it "
                         "waits. Let it finish, or stop it, then switch."
                     ) from exc
-                raise LibrarySwitchError(str(exc)) from exc
+                # Nothing recognisable is holding the library. The
+                # coordinator's own exception says why in its own words, and
+                # those go to the log rather than into the answer.
+                logger.warning(
+                    "Switch to %s refused: the library did not become free",
+                    target.name,
+                    exc_info=True,
+                )
+                raise LibrarySwitchError(
+                    "PixlStash is not ready to switch libraries just now. Try "
+                    "again in a moment."
+                ) from exc
             try:
                 return self._swap(target)
             except Exception:
@@ -311,9 +353,9 @@ class LibrarySwitchService:
         try:
             target = self._server.library_registry.by_uuid(library_uuid)
             if target is None or not target.attached:
-                raise LibraryNotFoundError(
-                    f"No attached library with uuid {library_uuid}."
-                )
+                # Not repeated back: the uuid is the caller's text, unchecked.
+                # `routes/libraries.py` answers its own lookup the same way.
+                raise LibraryNotFoundError("No attached library has that uuid.")
             if target.is_active:
                 raise LibrarySwitchError(
                     f'"{target.name}" is the library that is already open.'
@@ -329,7 +371,7 @@ class LibrarySwitchService:
             except Exception as exc:
                 logger.exception("Could not open library %s to move into", target.name)
                 raise LibrarySwitchError(
-                    f'Could not open "{target.name}": {exc}. Nothing was moved.'
+                    _open_failure_message(target, exc, "Nothing was moved.")
                 ) from exc
             try:
                 # The owner's tag exclusions are hub-wide, so the library opened
@@ -345,7 +387,7 @@ class LibrarySwitchService:
         finally:
             self._lock.release()
 
-    def _what_is_holding_the_library(self) -> Optional[str]:
+    def describe_library_holders(self) -> Optional[str]:
         """Name the long-running work a switch is waiting on, when it can be.
 
         The coordinator counts readers; it does not know what they are. A
@@ -354,8 +396,10 @@ class LibrarySwitchService:
         milliseconds, so they are what an owner is actually waiting on when a
         switch refuses. An upload batch still being received is named too: it
         holds its request's lease until the last file is written. Returns
-        ``None`` when nothing recognisable is running, and the caller falls
-        back to the coordinator's own words.
+        ``None`` when nothing recognisable is running, and the caller then
+        says only that it is not ready to switch, inventing no reason. A full
+        restore asks the same question when its ``begin_switch`` times out
+        (``RestoreService``).
         """
         with self._server.folder_structure_commit_lock:
             commit = self._server.folder_structure_commit
@@ -403,8 +447,12 @@ class LibrarySwitchService:
             # Nothing has been closed yet, so the session simply carries on.
             logger.exception("Could not open library %s; staying put", target.name)
             raise LibrarySwitchError(
-                f'Could not open "{target.name}": {exc}. PixlStash is still using '
-                f"the library it was already on, and nothing has been changed."
+                _open_failure_message(
+                    target,
+                    exc,
+                    "PixlStash is still using the library it was already on, and "
+                    "nothing has been changed.",
+                )
             ) from exc
 
         old_retirement_started = False
@@ -413,6 +461,9 @@ class LibrarySwitchService:
             # the old vault is retired.
             incoming.add_event_listener(self._server.handle_vault_event)
             incoming.auth_service = self._server.auth
+            # A vault-owned writer (a finished training run's import) takes its
+            # lease through this; one built here is the one published below.
+            incoming.library_coordinator = self._server.library_coordinator
             self._server.apply_user_settings_to_vault(incoming)
             self._server.reconcile_library_settings(incoming, target)
 
@@ -491,6 +542,7 @@ class LibrarySwitchService:
                     )
                     recovered.add_event_listener(self._server.handle_vault_event)
                     recovered.auth_service = self._server.auth
+                    recovered.library_coordinator = self._server.library_coordinator
                     self._server.apply_user_settings_to_vault(recovered)
                     self._server.reconcile_library_settings(recovered, previous_library)
                     _bring_up(recovered, "recovered previous")
@@ -523,9 +575,10 @@ class LibrarySwitchService:
                     "The switch retired the old library without a recoverable "
                     "registry entry. Restart the server."
                 ) from exc
+            # Logged with its traceback at the top of this handler.
             raise LibrarySwitchError(
-                f'Could not switch to "{target.name}": {exc}. PixlStash is still '
-                "using the previous library."
+                f'Could not switch to "{target.name}". PixlStash is still using '
+                "the previous library."
             ) from exc
         active = self._server.library_registry.by_uuid(target.uuid)
         logger.info("Active library is now %s (%s)", active.name, active.path)
@@ -570,9 +623,14 @@ class LibrarySwitchService:
                 # rename already happened and only the mark is stale - which
                 # the startup sweep settles - or this folder gained a vault
                 # from somewhere else while the import ran.
+                logger.warning(
+                    "Not promoting the import into %s: %s already exists",
+                    library.name,
+                    permanent,
+                )
                 raise LibrarySwitchError(
-                    f"{permanent} already exists, so the import cannot be "
-                    "promoted onto it."
+                    f'The folder of "{library.name}" already has a '
+                    f"{VAULT_FILENAME}, so the import cannot be promoted onto it."
                 )
 
             self._server.library_coordinator.begin_switch()
@@ -612,6 +670,11 @@ class LibrarySwitchService:
                 # would point every reader at a vault.db that is not there yet.
                 promoted = registry.finish_pending_import(library.id)
             except Exception as exc:
+                logger.exception(
+                    "Could not promote the import into %s (renamed=%s)",
+                    library.name,
+                    renamed,
+                )
                 # Reopen whichever name the database has now. The rename is the
                 # only step between the two, so this is a two-case recovery.
                 self._reopen_after_promotion(
@@ -620,7 +683,7 @@ class LibrarySwitchService:
                 if isinstance(exc, LibrarySwitchError):
                     raise
                 raise LibrarySwitchError(
-                    f'Could not finish the import into "{library.name}": {exc}. '
+                    f'Could not finish the import into "{library.name}". '
                     "Nothing was indexed twice and no picture was touched; the "
                     "import can be finished again."
                 ) from exc
@@ -750,6 +813,7 @@ class LibrarySwitchService:
             )
             incoming.add_event_listener(self._server.handle_vault_event)
             incoming.auth_service = self._server.auth
+            incoming.library_coordinator = self._server.library_coordinator
             self._server.apply_user_settings_to_vault(incoming)
             self._server.reconcile_library_settings(incoming, library)
             _bring_up(incoming, "promoted" if renamed else "unpromoted")
@@ -791,10 +855,14 @@ class LibrarySwitchService:
         """
         resolved = resolve_path(target.path)
         if not os.path.isdir(resolved):
+            logger.warning(
+                "Library %s is not where PixlStash left it: %s is not a folder",
+                target.name,
+                resolved,
+            )
             raise LibrarySwitchError(
-                f'"{target.name}" is not where PixlStash left it ({resolved}). '
-                "Reconnect the drive, or point the library at its new location, "
-                "then try again."
+                f'"{target.name}" is not where PixlStash left it. Reconnect the '
+                "drive, or point the library at its new location, then try again."
             )
         # A library still on its first import is validated under the temporary
         # name, because that is where its database is. It must stay openable:
@@ -804,6 +872,9 @@ class LibrarySwitchService:
         try:
             vault_path = validate_vault_folder(resolved, filename=target.vault_filename)
         except LibraryError as exc:
+            # A LibraryError's message is itself a sentence the registry
+            # composed (no path, no exception text), so it is quoted as the
+            # reason. Its cause, when it has one, was logged where it was raised.
             raise LibrarySwitchError(
                 f'"{target.name}" no longer looks like a library: {exc}'
             ) from exc

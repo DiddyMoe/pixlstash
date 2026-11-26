@@ -66,6 +66,7 @@ from pixlstash.services.workflow_identity import (
     unswapped,
 )
 from pixlstash.task_runner import TaskCancelledError
+from pixlstash.tasks.base_task import TaskStatus
 from pixlstash.tasks.workflow_card_backfill_finder import WorkflowCardBackfillFinder
 from pixlstash.tasks.workflow_card_backfill_task import (
     FamilyReidentifyTask,
@@ -2482,6 +2483,33 @@ def test_a_start_with_an_unchanged_shelf_runs_no_family_pass(hub):
     assert isinstance(
         _family_pass(WorkflowCardBackfillFinder(hub=hub)), FamilyReidentifyTask
     ), "a shelf changed since the last pass arms one at start"
+
+
+def test_a_family_pass_cancelled_before_it_starts_is_asked_for_again(hub):
+    """A restore's drain or a stop can cancel the pass after the runner took it
+    and before its body ran. The runner reports that as a cancellation, like
+    any other. Nothing was learned, so no shelf signature is stored and the
+    pass comes round again on the next sweep."""
+    _workflow(hub, _graph(ckpt="house-finetune-v11.safetensors"))
+    finder = WorkflowCardBackfillFinder(hub=hub)
+    task = finder.find_task()
+    while task is not None and not isinstance(task, FamilyReidentifyTask):
+        task.result = task._run_task()
+        finder.on_task_complete(task, None)
+        task = finder.find_task()
+    assert isinstance(task, FamilyReidentifyTask)
+    task.on_cancel()
+    assert task.run() is None
+    assert task.status == TaskStatus.CANCELLED
+    finder.on_task_complete(
+        task, TaskCancelledError("test-cancelled before it started")
+    )
+    assert hub.fetchone("SELECT 1 FROM workflow_family_pass") is None
+    again = _family_pass(finder)
+    assert isinstance(again, FamilyReidentifyTask)
+    assert again is not task
+    stored = hub.fetchone("SELECT signature FROM workflow_family_pass")[0]
+    assert stored == task.params["signature"], "the pass that ran stores its shelf"
 
 
 def test_a_default_on_a_node_the_core_does_not_have_is_left_out(hub, monkeypatch):

@@ -10,6 +10,7 @@
 // a stubbed /insights payload: what is under test there is that each button
 // lands where its label says, which is the frontend's half of the contract.
 
+import { clearDedupState } from '../fixtures/dedupSeed.js'
 import { test, expect } from '../fixtures/test.js'
 
 /** A finding in the backend's shape (library_insights_service._finding). */
@@ -156,6 +157,13 @@ test.describe('About your library: every kind of action button', () => {
     )
     await page.goto('/insights')
     await expect(page.locator('.ins-find')).toHaveCount(STUB.findings.length)
+  })
+
+  // The Duplicates queue asks for a scan of the scope it opens on, and this
+  // backend never runs one: left pending, it would refuse every snapshot
+  // restore after this file.
+  test.afterAll(() => {
+    clearDedupState()
   })
 
   test('a folder\'s unsorted pile opens Unassigned on that folder', async ({ page }) => {

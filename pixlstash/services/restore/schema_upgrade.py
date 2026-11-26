@@ -29,6 +29,8 @@ from pixlstash.utils.snapshot_compression import (
     snapshot_scratch_dir,
 )
 
+from ._models import SnapshotNotFoundError
+
 logger = get_logger(__name__)
 
 
@@ -240,8 +242,26 @@ class SchemaUpgradeMixin:
     def _get_snapshot_or_raise(self, snapshot_id: int) -> Snapshot:
         cp = self._vault.snapshot_service.get_snapshot(snapshot_id)
         if cp is None:
-            raise ValueError(f"Snapshot id={snapshot_id} not found.")
+            raise SnapshotNotFoundError(f"Snapshot {snapshot_id} was not found.")
         return cp
+
+    @staticmethod
+    def _snapshot_file_missing(
+        snapshot_id: int, abs_snapshot: str
+    ) -> SnapshotNotFoundError:
+        """Log a snapshot row whose file is gone and return the error to raise.
+
+        The path goes to the log only; the message names the snapshot id, so a
+        route can show it without disclosing where the library lives.
+        """
+        logger.error(
+            "Snapshot %s has a row but its file is missing on disk: %s",
+            snapshot_id,
+            abs_snapshot,
+        )
+        return SnapshotNotFoundError(
+            f"The file for snapshot {snapshot_id} is missing on disk."
+        )
 
     def _upgrade_snapshot_schema(self, abs_snapshot: str) -> Optional[str]:
         """Materialize the snapshot to a temp file and alembic-upgrade it.

@@ -57,6 +57,7 @@ from pixlstash.hub.registry import (
     resolve_path,
     validate_vault_folder,
 )
+from pixlstash.middleware.library_admission import BUSY_RETRY_AFTER
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.library_switch_service import LibrarySwitchError
 from pixlstash.utils.media_files import count_media_files, has_media_files
@@ -603,9 +604,10 @@ def create_router(server) -> APIRouter:
         """
         # "uuid", not "id": these routes accept nothing else, so a caller who
         # sends a row id or a name gets a 404 whose wording should not suggest
-        # the value was looked up and missing (#1096 review). The identical
-        # message in library_switch_service.py says the same for the same
-        # reason and is corrected with it.
+        # the value was looked up and missing (#1096 review). Nor does it echo
+        # the value back: an answer is a sentence the server composed. The
+        # switch service's LibraryNotFoundError and the move route's 404 say
+        # the identical words, so every "no such library" reads the same.
         library = server.library_registry.by_uuid(library_uuid)
         # `by_uuid` deliberately returns detached rows - that is how a uuid stays
         # meaningful across a detach for the tokens stamped with it. These routes
@@ -615,7 +617,7 @@ def create_router(server) -> APIRouter:
         # duplicate check only inspects attached rows).
         if library is None or not library.attached:
             raise HTTPException(
-                status_code=404, detail=f"No attached library with uuid {library_uuid}."
+                status_code=404, detail="No attached library has that uuid."
             )
         return library
 
@@ -638,7 +640,8 @@ def create_router(server) -> APIRouter:
         server.auth.ensure_secure_when_required(request)
         folder = _safe_folder(path)
         if not os.path.isdir(folder):
-            raise HTTPException(status_code=404, detail=f"{folder} is not a folder.")
+            # Not named: resolved from what the caller sent, and not there.
+            raise HTTPException(status_code=404, detail="That path is not a folder.")
         return _inspect(folder, _caller_is_local(request))
 
     @router.post(
@@ -665,7 +668,7 @@ def create_router(server) -> APIRouter:
         name = (payload.name or "").strip() or None
 
         if not os.path.isdir(folder):
-            raise HTTPException(status_code=404, detail=f"{folder} is not a folder.")
+            raise HTTPException(status_code=404, detail="That path is not a folder.")
 
         verdict = _inspect(folder, include_path=False, count=False)
         if not verdict.can_add:
@@ -700,15 +703,17 @@ def create_router(server) -> APIRouter:
         except NotAVaultError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except PermissionError as exc:
-            logger.error("Could not add a library at %s: %s", folder, exc)
+            logger.error("Could not add a library at %s.", folder, exc_info=True)
             raise HTTPException(
                 status_code=403,
-                detail=f"PixlStash is not allowed to write to {folder}.",
+                detail="PixlStash is not allowed to write to that folder.",
             ) from exc
         except OSError as exc:
-            logger.error("Could not add a library at %s: %s", folder, exc)
+            logger.error(
+                "Could not add a library at %s: %s", folder, exc, exc_info=True
+            )
             raise HTTPException(
-                status_code=500, detail=f"Could not add a library at {folder}: {exc}"
+                status_code=500, detail="Could not add a library at that folder."
             ) from exc
         except LibraryError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -770,8 +775,15 @@ def create_router(server) -> APIRouter:
         if server.library_switch.is_switching:
             raise HTTPException(
                 status_code=503,
-                detail="PixlStash is switching library. Try again in a moment.",
-                headers={"Retry-After": "2"},
+                # The caller is authenticated, so the refusal names the work,
+                # as the gate's own 503 does. The middleware answers before
+                # authentication and says only that PixlStash is busy.
+                detail=(
+                    "PixlStash is restoring the library. Try again in a moment."
+                    if server.library_coordinator.restoring
+                    else "PixlStash is switching library. Try again in a moment."
+                ),
+                headers={"Retry-After": BUSY_RETRY_AFTER},
             )
         target = _by_uuid_or_404(library_uuid)
         share_links = _count_share_links(target.uuid)

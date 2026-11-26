@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image
 
 from pixlstash.services.training_service import handle_for_run
+from pixlstash.task_runner import TaskCancelledError
 from pixlstash.tasks.face_extraction_task import FaceExtractionTask
 from pixlstash.tasks.training_preview_faces_finder import TrainingPreviewFacesFinder
 from pixlstash.tasks.training_preview_faces_task import TrainingPreviewFacesTask
@@ -186,6 +187,26 @@ def test_the_finder_hands_out_settled_previews_of_character_runs(tmp_path):
     assert finder.find_task() is None
     finder.on_task_complete(task, None)
     assert finder.find_task() is not None
+
+
+def test_a_cancelled_preview_task_leaves_its_run_to_be_asked_again(tmp_path):
+    """A restore's drain or a stop is no verdict on the previews, whether it
+    lands before the body starts or while it runs (the runner reports both as
+    a cancellation): the next sweep hands the run out again. A real failure
+    still settles it until a restart."""
+    run, handle = _run(tmp_path)
+    preview = _sample(handle, 0, 0)
+    finder = _finder(tmp_path, [run])
+
+    task = finder.find_task()
+    finder.on_task_complete(task, TaskCancelledError("library restore"))
+    assert run["uuid"] not in finder._settled
+
+    task = finder.find_task()
+    assert [name for name, _ in task._previews] == [preview]
+    finder.on_task_complete(task, RuntimeError("test-detector-failure"))
+    assert run["uuid"] in finder._settled
+    assert finder.find_task() is None
 
 
 def test_a_clip_preview_is_scored_from_its_frames(tmp_path, monkeypatch):
