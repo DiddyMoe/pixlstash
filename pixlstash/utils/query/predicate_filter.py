@@ -48,6 +48,7 @@ from pixlstash.utils.service.person_tags import (
     OBJECT_META_TAGS,
     PERSON_TAGS,
 )
+from pixlstash.utils.service.filter_helpers import is_truthy_flag
 
 _WORKFLOW_ID_PREFIXES = (AUTO_PREFIX, MANUAL_PREFIX)
 
@@ -201,18 +202,6 @@ _NO_REAL_FACE_SQL = (
     "NOT EXISTS (SELECT 1 FROM face WHERE face.picture_id = picture.id "
     "AND face.face_index != -1)"
 )
-
-
-def is_truthy_flag(raw) -> bool:
-    """Return ``True`` for the boolean query-param spellings the frontend sends.
-
-    ``unscored=1`` is the contract, but ``true``/``yes``/``on`` are accepted too so
-    a hand-written URL behaves the same. Anything else (including an absent param
-    and the explicit ``unscored=0``) is False.
-    """
-    if isinstance(raw, bool):
-        return raw
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 # Tag-group terms travel inside the ordinary ``tag`` / ``rejected_tag`` params:

@@ -1,6 +1,6 @@
 """Shared filter helpers for picture query construction."""
 
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from fastapi import HTTPException
 from sqlalchemy import exists, select
@@ -20,6 +20,24 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.service.scope_table import scope_id_subquery
 
 logger = get_logger(__name__)
+
+
+# Defined here and imported by ``predicate_filter``: that module imports the
+# ``utils.service`` package, whose init imports this one, so the reverse import
+# is a cycle.
+def is_truthy_flag(raw) -> bool:
+    """Return ``True`` for the boolean query-param spellings the frontend sends.
+
+    ``unscored=1`` is the contract, but ``true``/``yes``/``on`` are accepted too so
+    a hand-written URL behaves the same. Anything else (including an absent param
+    and the explicit ``unscored=0``) is False.
+    """
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+SCRAPHEAP_VIEW_ID = "SCRAPHEAP"
 
 VALID_COMBINE_MODES: frozenset[str] = frozenset(
     {"mean", "max", "min", "harmonic_mean", "geometric_mean"}
@@ -77,6 +95,37 @@ def normalize_set_mode(value: str | None) -> str:
     if mode not in {"union", "intersection", "difference", "xor"}:
         raise HTTPException(status_code=400, detail="Invalid set_mode")
     return mode
+
+
+def is_scrapheap_view_id(value: object) -> bool:
+    """Return True when ``value`` is the Scrapheap's pseudo character id.
+
+    ``SCRAPHEAP`` is the sidebar's id for the Scrapheap view and the legacy
+    ``character_id`` value of the picture queries. It names no real character.
+    """
+    return value == SCRAPHEAP_VIEW_ID
+
+
+def request_targets_scrapheap(query_params: Mapping[str, object]) -> bool:
+    """Return True when a picture query is scoped to the Scrapheap.
+
+    ``only_deleted=true`` is the contract the frontend sends; the legacy
+    ``character_id=SCRAPHEAP`` is still honoured and logs a deprecation warning.
+
+    Args:
+        query_params: The request's query params, or a dict copy of them.
+
+    Returns:
+        Whether only soft-deleted pictures are in scope.
+    """
+    if is_truthy_flag(query_params.get("only_deleted")):
+        return True
+    if is_scrapheap_view_id(query_params.get("character_id")):
+        logger.warning(
+            "character_id=SCRAPHEAP is deprecated; use only_deleted=true instead"
+        )
+        return True
+    return False
 
 
 def collect_set_filter_ids(

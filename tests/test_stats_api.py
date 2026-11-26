@@ -299,3 +299,60 @@ def test_stats_cache_expires_after_ttl(monkeypatch):
         server.close()
         temp_dir.cleanup()
         gc.collect()
+
+
+def test_stats_scrapheap_view_reads_deleted_only():
+    """``only_deleted=true`` (what the Scrapheap panel sends) counts the heap."""
+    temp_dir, client, server = _setup()
+    clear_stats_cache()
+    try:
+        live = _upload_picture(client, "Bad1.png")
+        gone = _upload_picture(client, "Bad2.png")
+        assert (
+            client.post(f"/pictures/{live}/tags", json={"tag": "live_tag"}).status_code
+            == 200
+        )
+        assert (
+            client.post(f"/pictures/{gone}/tags", json={"tag": "gone_tag"}).status_code
+            == 200
+        )
+        assert client.delete(f"/pictures/{gone}").status_code == 200
+
+        for params in ({"only_deleted": "true"}, {"character_id": "SCRAPHEAP"}):
+            clear_stats_cache()
+            data = client.get("/pictures/stats", params=params).json()
+            assert data["total"] == 1, params
+            assert data["tagged"] == 1, params
+            assert [t["tag"] for t in data["top_tags"]] == ["gone_tag"], params
+
+        # The live view is untouched: the heap picture is not in it.
+        clear_stats_cache()
+        data = client.get("/pictures/stats").json()
+        assert data["total"] == 1
+        assert [t["tag"] for t in data["top_tags"]] == ["live_tag"]
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_stats_empty_scrapheap_is_zero():
+    """An empty heap reports zero, not the live library."""
+    temp_dir, client, server = _setup()
+    clear_stats_cache()
+    try:
+        _upload_picture(client, "Bad1.png")
+
+        clear_stats_cache()
+        data = client.get("/pictures/stats", params={"only_deleted": "true"}).json()
+        assert data["total"] == 0
+        assert data["tagged"] == 0
+        assert data["untagged"] == 0
+        assert data["top_tags"] == []
+
+        clear_stats_cache()
+        assert client.get("/pictures/stats").json()["total"] == 1
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()

@@ -55,10 +55,12 @@ from pixlstash.utils.service.filter_helpers import (
     collect_set_filter_ids,
     fetch_scope_allowed_picture_ids,
     fetch_set_candidate_ids,
+    is_scrapheap_view_id,
     narrow_picture_project_ids,
     normalize_set_mode,
     project_membership_exists_clause,
     project_unassigned_clause,
+    request_targets_scrapheap,
 )
 from pixlstash.utils.query.predicate_filter import PredicateFilter
 
@@ -543,7 +545,9 @@ def register_routes(router, server):
         favourite: bool = Query(False),
     ):
         candidate_ids = None
-        only_deleted = character_id == "SCRAPHEAP"
+        only_deleted = request_targets_scrapheap(request.query_params)
+        if is_scrapheap_view_id(character_id):
+            character_id = None
         set_filter_ids = collect_set_filter_ids(
             set_id_value=set_id,
             set_ids_values=set_ids,
@@ -591,19 +595,6 @@ def register_routes(router, server):
                 )
             elif character_id == "ALL" or character_id == "":
                 candidate_ids = None
-            elif character_id == "SCRAPHEAP":
-
-                def fetch_deleted_ids(session):
-                    rows = session.exec(
-                        select(Picture.id).where(
-                            Picture.deleted.is_(True),
-                        )
-                    ).all()
-                    return list(rows)
-
-                candidate_ids = set(
-                    server.vault.db.run_immediate_read_task(fetch_deleted_ids)
-                )
             elif character_id.isdigit():
 
                 def fetch_character_ids(session, character_id):
@@ -1259,8 +1250,8 @@ def register_routes(router, server):
         confidence_below = _predicate_filter.tags_confidence_below_filter or []
         include = set(request.query_params.getlist("include"))
 
-        only_deleted = character_id_raw == "SCRAPHEAP"
-        if only_deleted:
+        only_deleted = request_targets_scrapheap(request.query_params)
+        if is_scrapheap_view_id(character_id_raw):
             character_id_raw = None
         # The Inbox is the unassigned view narrowed to its period, as the
         # listing reads it (`select_pictures_for_listing`).

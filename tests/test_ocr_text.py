@@ -228,6 +228,27 @@ def test_search_does_not_return_text_heavy_pictures_for_unrelated_queries(
     assert not any(row["text_match"] for row in rows.values())
 
 
+def test_search_in_the_scrapheap_returns_only_the_heap(server, client, pictures):
+    """``only_deleted=true`` (what the Scrapheap view sends) searches the heap."""
+
+    def bin_receipt(session: Session):
+        session.get(Picture, pictures["receipt"]).deleted = True
+        session.commit()
+
+    server.vault.db.run_task(bin_receipt)
+
+    response = client.get(
+        "/pictures/search",
+        params={"query": "coffee", "threshold": 0.01, "only_deleted": "true"},
+    )
+    assert response.status_code == 200, response.text
+    assert [row["id"] for row in response.json()] == [pictures["receipt"]]
+
+    rows = _search(client, "coffee")
+    assert pictures["receipt"] not in rows
+    assert pictures["menu"] in rows
+
+
 def test_search_and_metadata_rows_do_not_carry_the_text(server, client, pictures):
     row = _search(client, "coffee")[pictures["receipt"]]
     assert "ocr_text" not in row and "ocr_words" not in row
