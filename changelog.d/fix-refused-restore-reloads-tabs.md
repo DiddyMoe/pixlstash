@@ -1,0 +1,1 @@
+- Fixed: a restore that is refused no longer reloads other open tabs.

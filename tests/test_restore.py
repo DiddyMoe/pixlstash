@@ -2188,6 +2188,27 @@ def test_restore_nonexistent_snapshot_emits_no_started(server):
     )
 
 
+def test_a_refused_restore_and_a_dry_run_tell_no_other_tab(server):
+    """A restore the missing-file check refuses, and a dry run, change
+    nothing, so they broadcast no lifecycle event: every other open tab
+    resets its session on RESTORE_STARTED and reloads on RESTORE_FAILED."""
+    for i in range(10):
+        name = f"quiet_{i}.jpg"
+        if i < 3:
+            _create_file(server, name)
+        _add_picture(server, filename=name)
+    cp = server.vault.snapshot_service.create_snapshot("MANUAL")
+
+    events = _capture_restore_events(server)
+    with pytest.raises(RuntimeError, match="mount"):
+        server.vault.restore_service.restore_full(cp.id)
+    server.vault.restore_service.restore_full(
+        cp.id, dry_run=True, allow_without_safety=True
+    )
+
+    assert [e.name for e in events] == []
+
+
 def test_missing_deps_refusal_emits_started_then_failed(server):
     """A dependency-refusal restore emits STARTED then a terminal FAILED
     (so the client clears activeJob), never COMPLETED."""

@@ -77,7 +77,9 @@ class FullRestoreMixin:
         """Replace the live database with a snapshot snapshot.
 
         Before step 1 (not on a dry run), stop the planner and drain the
-        TaskRunner (see ``_background_work_paused``).
+        TaskRunner (see ``_background_work_paused``). ``RESTORE_STARTED`` is
+        emitted only after step 3, so a refused restore or a dry run
+        broadcasts no lifecycle event.
 
         Steps:
         1. Take an OPPORTUNISTIC safety snapshot of the current state.
@@ -191,21 +193,28 @@ class FullRestoreMixin:
             # taken below runs on this thread and re-enters the lock.
             self._vault.snapshot_service.hold_registrations(),
         ):
-            # Emit STARTED only AFTER the snapshot is known to exist (and the
-            # lock was already acquired in the outer ``restore_full``) - a 404
-            # or 409 must not leave the UI with ``activeJob`` set forever.
-            # Anything that throws or early-returns from here on emits FAILED
-            # so the frontend can clear ``activeJob``.
+            # Every check that can refuse runs before STARTED, and a dry run
+            # returns before it: on STARTED every other open tab drops its
+            # session, and on FAILED it reloads.
+            upgraded_snapshot, missing_ids, deleted_ids = self._restore_full_checks(
+                vault_root, report, allow_without_safety, abs_snapshot
+            )
+            if dry_run:
+                logger.info("RestoreService: dry_run=True - skipping DB swap.")
+                shutil.rmtree(os.path.dirname(upgraded_snapshot), ignore_errors=True)
+                return report
+            # Anything that throws from here on emits FAILED so the frontend
+            # can clear ``activeJob``.
             started_payload = {"snapshot_id": snapshot_id, "resource_type": "full"}
             self._emit_lifecycle(EventType.RESTORE_STARTED, started_payload)
             try:
                 return self._restore_full_steps(
                     snapshot_id,
-                    dry_run,
                     vault_root,
                     report,
-                    allow_without_safety,
-                    abs_snapshot,
+                    upgraded_snapshot,
+                    missing_ids,
+                    deleted_ids,
                     restore_request_lease,
                 )
             except Exception as exc:
@@ -257,20 +266,20 @@ class FullRestoreMixin:
                 planner.start()
                 logger.info("RestoreService: WorkPlanner restarted after full restore.")
 
-    def _restore_full_steps(
+    def _restore_full_checks(
         self,
-        snapshot_id: int,
-        dry_run: bool,
         vault_root: str,
         report: "RestoreReport",
         allow_without_safety: bool,
         abs_snapshot: str,
-        restore_request_lease: int | None,
-    ) -> "RestoreReport":
-        """The body of full restore steps 1-9 (separated so the lifecycle
-        wrapper in ``_restore_full_inner`` stays narrow)."""
-        db = self._vault.db
+    ) -> tuple[str, list[int], set[int]]:
+        """Full restore steps 1-3: everything before the first change that
+        can refuse the restore.
 
+        Returns:
+            The upgraded snapshot copy's path, the snapshot picture ids whose
+            files are missing, and those the permanent-deletion ledger holds.
+        """
         # 1. Safety snapshot of current state.
         # The safety snapshot is the user's ONLY rollback if the restore
         # breaks something. Failing silently here trades a working DB for
@@ -356,11 +365,21 @@ class FullRestoreMixin:
                 "really did delete that many files, pass "
                 "allow_without_safety=True."
             )
+        return upgraded_snapshot, missing_ids, deleted_ids
 
-        if dry_run:
-            logger.info("RestoreService: dry_run=True - skipping DB swap.")
-            shutil.rmtree(os.path.dirname(upgraded_snapshot), ignore_errors=True)
-            return report
+    def _restore_full_steps(
+        self,
+        snapshot_id: int,
+        vault_root: str,
+        report: "RestoreReport",
+        upgraded_snapshot: str,
+        missing_ids: list[int],
+        deleted_ids: set[int],
+        restore_request_lease: int | None,
+    ) -> "RestoreReport":
+        """Full restore steps 3b-9, after ``RESTORE_STARTED`` (separated so
+        the lifecycle wrapper in ``_restore_full_inner`` stays narrow)."""
+        db = self._vault.db
 
         # 3b. Capture the live likeness pipeline state BEFORE the swap so
         #     the file swap doesn't reset progress-tracking to whatever
