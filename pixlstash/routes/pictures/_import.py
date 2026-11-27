@@ -805,7 +805,7 @@ def register_routes(router, server):
         # the pictures are in fact already in the vault. Ids go stale for real:
         # a ComfyUI graph stores the project as "<name> #<id>", so a replayed
         # workflow carries whatever id was current when it was authored.
-        _validate_association_targets(None, None, project_id)
+        project_created_at = _validate_association_targets(None, None, project_id)
 
         dest_folder = server.vault.image_root
         logger.debug("Importing pictures to folder: " + str(dest_folder))
@@ -1373,6 +1373,23 @@ def register_routes(router, server):
                     ):
                         if not ids:
                             return []
+                        if project_id_value is not None:
+                            # Ids are reused, so the project can be deleted
+                            # during the import and a new one created under
+                            # the same id: only the creation time tells them
+                            # apart.
+                            project = session.get(Project, project_id_value)
+                            if (
+                                project is None
+                                or project.created_at != project_created_at
+                            ):
+                                logger.error(
+                                    "Import task %s: project %s vanished before "
+                                    "association",
+                                    task_id,
+                                    project_id_value,
+                                )
+                                project_id_value = None
                         now = datetime.now(timezone.utc)
                         pics = session.exec(
                             select(Picture).where(Picture.id.in_(ids))
@@ -1588,13 +1605,20 @@ def register_routes(router, server):
             raise HTTPException(status_code=404, detail="Staging session not found")
         return session
 
-    def _validate_association_targets(set_id, character_id, project_id) -> None:
+    def _validate_association_targets(
+        set_id, character_id, project_id
+    ) -> datetime | None:
         """Fail fast if a drop-to-set / -character / -project target is invalid.
 
         A nonexistent set/character/project must error rather than silently
         no-op (or fail downstream after pictures are already imported), and a
         locked set must refuse new members (the same lock rule the add-to-set
         route enforces). Runs at open (on the drop) and again at commit.
+
+        Returns:
+            The project's ``created_at``, or ``None`` without a project. The
+            import files its pictures only on a project with this creation
+            time, since a deleted project's id can be given to a new one.
         """
 
         def _check(session: Session):
@@ -1608,14 +1632,15 @@ def register_routes(router, server):
                 if session.get(Character, character_id) is None:
                     return ("character_missing", None)
             if project_id is not None:
-                if session.get(Project, project_id) is None:
+                project = session.get(Project, project_id)
+                if project is None:
                     return ("project_missing", None)
-            return None
+                return ("ok", project.created_at)
+            return ("ok", None)
 
-        outcome = server.vault.db.run_task(_check, priority=DBPriority.IMMEDIATE)
-        if outcome is None:
-            return
-        kind, name = outcome
+        kind, name = server.vault.db.run_task(_check, priority=DBPriority.IMMEDIATE)
+        if kind == "ok":
+            return name
         if kind == "set_missing":
             raise HTTPException(
                 status_code=404, detail=f"Picture set {set_id} not found"
@@ -1658,7 +1683,7 @@ def register_routes(router, server):
         # Reject an invalid drop target up front (on the drop), before any files
         # are streamed - a nonexistent set/character/project must not silently
         # no-op or fail downstream after import.
-        _validate_association_targets(
+        project_created_at = _validate_association_targets(
             payload.set_id, payload.character_id, payload.project_id
         )
 
@@ -1679,6 +1704,7 @@ def register_routes(router, server):
             "stage": "staging",
             "staging_dir": staging_dir,
             "project_id": payload.project_id,
+            "project_created_at": project_created_at,
             "set_id": payload.set_id,
             "character_id": payload.character_id,
             "declared_total": declared_total,
@@ -2338,6 +2364,7 @@ def register_routes(router, server):
                 server.vault,
                 staged_files,
                 project_id=session["project_id"],
+                project_created_at=session["project_created_at"],
                 set_id=session["set_id"],
                 character_id=session["character_id"],
                 sidecar_tags_by_key=sidecar_tags_by_key,

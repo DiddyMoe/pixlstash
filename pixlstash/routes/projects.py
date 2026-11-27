@@ -1067,10 +1067,12 @@ def create_router(server) -> APIRouter:
             )
 
         def check_project(session: Session, pid: int):
-            if session.get(Project, pid) is None:
+            project = session.get(Project, pid)
+            if project is None:
                 raise HTTPException(status_code=404, detail="Project not found")
+            return project.created_at
 
-        server.vault.db.run_task(
+        checked_created_at = server.vault.db.run_task(
             check_project, project_id, priority=DBPriority.IMMEDIATE
         )
 
@@ -1090,6 +1092,12 @@ def create_router(server) -> APIRouter:
 
         def insert_record(session: Session):
             nonlocal committed
+            # Ids are reused, so the project can be deleted while the file is
+            # written and a new one created under the same id: only the
+            # creation time tells them apart.
+            project = session.get(Project, project_id)
+            if project is None or project.created_at != checked_created_at:
+                raise HTTPException(status_code=404, detail="Project not found")
             attachment = ProjectAttachment(
                 project_id=project_id,
                 original_filename=original_filename,

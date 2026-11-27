@@ -12,6 +12,7 @@ from pixlstash.db_models.character import Character
 from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.picture_project import PictureProjectMember
 from pixlstash.db_models.picture_set import PictureSet, PictureSetMember
+from pixlstash.db_models.project import Project
 from pixlstash.db_models.tag import Tag, TAG_PENDING_SENTINEL
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
@@ -120,6 +121,9 @@ class PictureImportTask(BaseTask):
             entries to ingest. An entry may also carry ``client_key`` and
             ``sidecar_folder``, the folder label its captions are matched in.
         _project_id: Optional project the imported pictures are added to.
+        _project_created_at: That project's ``created_at`` when the drop was
+            made; a project under the same id with another creation time is a
+            new one, and the pictures are not added to it.
         _staging_id: The staging-session id (carried into the result/logs).
         _staging_dir: Absolute path of the staging directory to remove when done.
         _phase: What ``_run_task`` is doing, read through ``phase``.
@@ -140,6 +144,7 @@ class PictureImportTask(BaseTask):
         staged_files: list[dict],
         *,
         project_id: Optional[int] = None,
+        project_created_at: Optional[datetime] = None,
         set_id: Optional[int] = None,
         character_id: Optional[int] = None,
         sidecar_tags_by_key: Optional[dict[tuple[str, str], list[str]]] = None,
@@ -156,6 +161,8 @@ class PictureImportTask(BaseTask):
             staged_files: Sequence of ``{"file_path", "original_file_name"}``
                 dicts for each staged media file on disk.
             project_id: Optional project id to add every imported picture to.
+            project_created_at: The ``created_at`` of ``project_id``'s project
+                when the drop was made.
             set_id: Optional picture-set id every imported picture is added to
                 (a drop-to-set target).
             character_id: Optional character id every imported picture is
@@ -192,6 +199,7 @@ class PictureImportTask(BaseTask):
         self._db = vault.db
         self._staged_files = staged_files
         self._project_id = project_id
+        self._project_created_at = project_created_at
         self._set_id = set_id
         self._character_id = character_id
         self._sidecar_tags_by_key = sidecar_tags_by_key or {}
@@ -667,6 +675,18 @@ class PictureImportTask(BaseTask):
             return
 
         def apply_project(session: Session, ids: list[int], project_id_value: int):
+            # Ids are reused, so the project can be deleted during the import
+            # and a new one created under the same id: only the creation time
+            # tells them apart.
+            project = session.get(Project, project_id_value)
+            if project is None or project.created_at != self._project_created_at:
+                logger.error(
+                    "PictureImportTask: project %s vanished before association "
+                    "(staging_id=%s)",
+                    project_id_value,
+                    self._staging_id,
+                )
+                return
             for pic in session.exec(select(Picture).where(Picture.id.in_(ids))).all():
                 member = session.exec(
                     select(PictureProjectMember).where(
