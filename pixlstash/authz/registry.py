@@ -1061,6 +1061,10 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
     ): _LIST_AWARE,  # generate_zip scope-filters via fetch_scope_allowed
     (
         "POST",
+        "/api/v1/pictures/export",
+    ): _LIST_AWARE,  # READ_SAFE; the GET's export with the ids in the body
+    (
+        "POST",
         "/api/v1/pictures/thumbnails",
     ): _LIST_AWARE,  # READ_SAFE; scope-filters ids
     (
@@ -1137,6 +1141,10 @@ ROUTE_POLICIES: dict[tuple[str, str], RoutePolicy] = {
     ("POST", "/api/v1/pictures/export/folder"): RoutePolicy(
         _LOOPBACK,
         justification="§16.3 RED LINE (#291): writes exported pictures straight onto the host disk and, once done, opens the destination in the host file manager (same host-GUI spawn as pictures/open-location, via pixlstash/utils/host_open.py); loopback-only, allow_remote_host_ops can NOT loosen it",
+    ),
+    ("POST", "/api/v1/pictures/export/folder/selection"): RoutePolicy(
+        _LOOPBACK,
+        justification="§16.3 RED LINE (#291): POST /pictures/export/folder with the selection and the destination in a JSON body; the same host write and file-manager spawn, so the same tier: loopback-only, allow_remote_host_ops can NOT loosen it",
     ),
     ("POST", "/api/v1/pictures/share-copies"): RoutePolicy(
         _LOOPBACK,

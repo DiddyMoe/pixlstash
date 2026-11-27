@@ -1,0 +1,1 @@
+- Fixed: exporting a large selection failed with "URI too long".

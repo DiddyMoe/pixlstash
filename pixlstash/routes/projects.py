@@ -3,7 +3,6 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -678,19 +677,18 @@ def create_router(server) -> APIRouter:
                     "Could not remove attachment file %s: %s", full_path, exc
                 )
 
-        # Remove the project attachments directory if it is now empty.
+        # Only the folders left empty: ids are reused, so a new project with
+        # this id may already have uploaded into them.
         project_dir = resolve_path_within(
             server.vault.image_root,
             "projects",
             str(project_id),
         )
-        try:
-            if os.path.isdir(project_dir):
-                shutil.rmtree(project_dir, ignore_errors=True)
-        except OSError as exc:
-            logger.warning(
-                "Could not remove project directory %s: %s", project_dir, exc
-            )
+        for folder in (os.path.join(project_dir, "attachments"), project_dir):
+            try:
+                os.rmdir(folder)
+            except OSError as exc:
+                logger.debug("Left project folder %s in place: %s", folder, exc)
 
         return {"status": "deleted", "id": project_id}
 
@@ -1069,10 +1067,12 @@ def create_router(server) -> APIRouter:
             )
 
         def check_project(session: Session, pid: int):
-            if session.get(Project, pid) is None:
+            project = session.get(Project, pid)
+            if project is None:
                 raise HTTPException(status_code=404, detail="Project not found")
+            return project.created_at
 
-        server.vault.db.run_task(
+        checked_created_at = server.vault.db.run_task(
             check_project, project_id, priority=DBPriority.IMMEDIATE
         )
 
@@ -1083,16 +1083,21 @@ def create_router(server) -> APIRouter:
         ext = re.sub(r"[^a-zA-Z0-9.]", "", raw_ext)[:16]
         stored_filename = safe_stem + ext
         full_path = resolve_path_within(att_dir, stored_filename)
-
-        with open(full_path, "wb") as f:
-            f.write(contents)
-
         mime_type = file.content_type or mimetypes.guess_type(original_filename)[0]
         # Derive rel_path from the already-validated full_path so the stored
         # value is guaranteed to be within image_root (CodeQL sanitizer path).
         rel_path = os.path.relpath(full_path, server.vault.image_root)
 
+        committed = False
+
         def insert_record(session: Session):
+            nonlocal committed
+            # Ids are reused, so the project can be deleted while the file is
+            # written and a new one created under the same id: only the
+            # creation time tells them apart.
+            project = session.get(Project, project_id)
+            if project is None or project.created_at != checked_created_at:
+                raise HTTPException(status_code=404, detail="Project not found")
             attachment = ProjectAttachment(
                 project_id=project_id,
                 original_filename=original_filename,
@@ -1103,10 +1108,22 @@ def create_router(server) -> APIRouter:
             )
             session.add(attachment)
             session.commit()
+            committed = True
             session.refresh(attachment)
             return attachment
 
-        return server.vault.db.run_task(insert_record, priority=DBPriority.IMMEDIATE)
+        try:
+            with open(full_path, "wb") as f:
+                f.write(contents)
+            return server.vault.db.run_task(
+                insert_record, priority=DBPriority.IMMEDIATE
+            )
+        except Exception:
+            # Until the row commits nothing points at the file, so nothing
+            # else would remove it.
+            if not committed and os.path.isfile(full_path):
+                os.remove(full_path)
+            raise
 
     @router.post(
         "/projects/{project_id}/attachments/url",

@@ -59,6 +59,489 @@ class PictureMetadataResponse(BaseModel):
     text_match: bool = False
 
 
+def search_results(
+    server,
+    request,
+    query: str,
+    *,
+    offset: int,
+    limit: int,
+    threshold: float,
+) -> list[tuple[Picture, float]]:
+    """The pictures a text search shows, in the order it shows them.
+
+    ``GET /pictures/search`` serializes what this returns, and an export of
+    a search view packages it, so the two cannot disagree. Every filter,
+    the Scrapheap flag, the token's scope and the hidden tags are read from
+    *request* as the search route reads them.
+
+    Returns:
+        ``(picture, relevance)`` pairs, best first unless the request sorts.
+
+    Raises:
+        HTTPException: 400 for an empty query or a bad sort or id; 503 when
+            the query encoders failed to load.
+    """
+    unassigned_by = request.query_params.get("unassigned_by")
+    query_params = {}
+    format = None
+    character_id = None
+    set_id = None
+    set_ids = None
+    set_mode = "union"
+    project_id = None
+    sort = None
+    descending = True
+    min_score_raw = None
+    unscored = False
+    favourite_only = False
+    comfyui_models = []
+    comfyui_loras = []
+    tags_filter = []
+    stack_state = None
+    imported_since = None
+    if request.query_params:
+        query_params = dict(request.query_params)
+        query = query_params.pop("query", query)
+        offset = int(query_params.pop("offset", offset))
+        limit = int(query_params.pop("limit", limit))
+        character_id = query_params.pop("character_id", None)
+        query_params.pop("unassigned_by", None)
+        set_id = query_params.pop("set_id", None)
+        set_ids = request.query_params.getlist("set_ids")
+        set_mode = query_params.pop("set_mode", "union")
+        base_set_id_raw = query_params.pop("base_set_id", None)
+        project_id = query_params.pop("project_id", None)
+        sort = query_params.pop("sort", None)
+        desc_val = query_params.pop("descending", descending)
+        descending = (
+            desc_val.lower() == "true" if isinstance(desc_val, str) else bool(desc_val)
+        )
+        # Intrinsic list params are parsed by the shared parser; the membership
+        # and pagination params keep their bespoke ``query_params`` pop handling.
+        _predicate_filter = PredicateFilter.from_query_params(request)
+        format = _predicate_filter.format or []
+        min_score_raw = query_params.pop("min_score", None)
+        unscored = _predicate_filter.unscored
+        favourite_only = _predicate_filter.favourite_only
+        comfyui_models = _predicate_filter.comfyui_models_filter or []
+        comfyui_loras = _predicate_filter.comfyui_loras_filter or []
+        tags_filter = _predicate_filter.tags_filter or []
+        tags_rejected_filter = _predicate_filter.tags_rejected_filter or []
+        stack_state = _predicate_filter.stack_state
+        # A search in the Inbox searches the Inbox: the unassigned view
+        # (both halves) added within its period, as the listing reads it.
+        if request.query_params.get("inbox") is not None:
+            character_id = "UNASSIGNED"
+            unassigned_by = None
+            imported_since = _predicate_filter.imported_since
+    min_score = int(min_score_raw) if min_score_raw is not None else None
+    if not query:
+        raise HTTPException(
+            status_code=400, detail="Query parameter is required for search"
+        )
+
+    only_deleted = request_targets_scrapheap(request.query_params)
+    if is_scrapheap_view_id(character_id):
+        character_id = None
+    candidate_ids = None
+    sort_mech = None
+    normalized_set_mode = normalize_set_mode(set_mode)
+    set_filter_ids = collect_set_filter_ids(
+        set_id_value=set_id,
+        set_ids_values=set_ids,
+    )
+    if normalized_set_mode == "difference" and base_set_id_raw is not None:
+        try:
+            _base_id = parse_sqlite_int(base_set_id_raw)
+            if _base_id in set_filter_ids:
+                set_filter_ids = [_base_id] + [
+                    s for s in set_filter_ids if s != _base_id
+                ]
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring invalid base_set_id value %r in /pictures/search request",
+                base_set_id_raw,
+            )
+
+    if sort:
+        try:
+            sort_mech = SortMechanism.from_string(sort, descending=descending)
+        except ValueError as ve:
+            logger.error("Invalid sort mechanism for search: %s", ve)
+            raise HTTPException(status_code=400, detail=str(ve))
+
+    if set_filter_ids:
+        candidate_ids = server.vault.db.run_immediate_read_task(
+            fetch_set_candidate_ids,
+            set_ids=set_filter_ids,
+            set_mode=normalized_set_mode,
+            deleted_only=only_deleted,
+        )
+    elif character_id is not None:
+        if character_id == "UNASSIGNED":
+
+            def fetch_unassigned_ids(session):
+                assignment_project_id = None
+                assignment_unassigned_project = False
+                if project_id == "UNASSIGNED":
+                    assignment_unassigned_project = True
+                elif project_id is not None:
+                    try:
+                        assignment_project_id = parse_sqlite_int(project_id)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Invalid project_id %r for UNASSIGNED search assignment scope; treating as global scope",
+                            project_id,
+                        )
+                unassigned_conditions = Picture.build_unassigned_conditions(
+                    enforce_stack_assignment=True,
+                    assignment_project_id=assignment_project_id,
+                    assignment_unassigned_project=assignment_unassigned_project,
+                    unassigned_by=unassigned_by,
+                )
+                query_stmt = select(Picture.id).where(
+                    *unassigned_conditions,
+                    Picture.deleted.is_(False),
+                )
+                if imported_since is not None:
+                    query_stmt = query_stmt.where(Picture.imported_at >= imported_since)
+                return list(session.exec(query_stmt).all())
+
+            candidate_ids = set(
+                server.vault.db.run_immediate_read_task(fetch_unassigned_ids)
+            )
+        elif character_id in ("ALL", ""):
+            candidate_ids = None
+        elif str(character_id).isdigit():
+
+            def fetch_character_ids(session, character_id_value):
+                # A subquery, not a fetched id list: a person can be in
+                # more pictures than SQLite binds in one statement.
+                character_picture_ids = select(Face.picture_id).where(
+                    Face.character_id == character_id_value
+                )
+                rows = session.exec(
+                    select(Picture.id).where(
+                        Picture.id.in_(character_picture_ids),
+                        Picture.deleted.is_(False),
+                    )
+                ).all()
+                return list(rows)
+
+            try:
+                character_id_value = parse_sqlite_int(character_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail="Invalid character_id"
+                ) from None
+            candidate_ids = set(
+                server.vault.db.run_immediate_read_task(
+                    fetch_character_ids, character_id_value
+                )
+            )
+    else:
+        search_character_ids_raw = request.query_params.getlist("character_ids")
+        search_character_id_list = []
+        for _v in search_character_ids_raw:
+            try:
+                _cid = parse_sqlite_int(_v)
+                if _cid > 0:
+                    search_character_id_list.append(_cid)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid character_ids value %r in /pictures/search request",
+                    _v,
+                )
+        if search_character_id_list:
+            search_character_mode_raw = query_params.get("character_mode", "union")
+            search_character_mode = (
+                (search_character_mode_raw or "union").strip().lower()
+            )
+            if search_character_mode not in {
+                "union",
+                "intersection",
+                "difference",
+                "xor",
+            }:
+                search_character_mode = "union"
+
+            def fetch_character_ids_by_mode(session, ids, mode):
+                # The caller's list has no cap: read it in chunks. Each row
+                # names its person, so the modes below combine the merged rows.
+                rows = [
+                    row
+                    for id_chunk in chunked(ids)
+                    for row in session.exec(
+                        select(Face.character_id, Face.picture_id).where(
+                            Face.character_id.in_(id_chunk)
+                        )
+                    ).all()
+                ]
+                members_by_char: dict[int, set[int]] = {cid: set() for cid in ids}
+                for cid, pid in rows:
+                    members_by_char.setdefault(int(cid), set()).add(int(pid))
+                if mode == "intersection":
+                    result: set[int] | None = None
+                    for cid in ids:
+                        current = members_by_char.get(cid, set())
+                        result = set(current) if result is None else result & current
+                    candidate_pids = list(result or set())
+                elif mode == "difference":
+                    first = members_by_char.get(ids[0], set())
+                    rest_set: set[int] = set()
+                    for cid in ids[1:]:
+                        rest_set |= members_by_char.get(cid, set())
+                    candidate_pids = list(first - rest_set)
+                elif mode == "xor":
+                    xor_u: set[int] = set()
+                    for cid in ids:
+                        xor_u |= members_by_char.get(cid, set())
+                    xor_i: set[int] | None = None
+                    for cid in ids:
+                        cur = members_by_char.get(cid, set())
+                        xor_i = set(cur) if xor_i is None else xor_i & cur
+                    candidate_pids = list(xor_u - (xor_i or set()))
+                else:
+                    union_pids: set[int] = set()
+                    for cid in ids:
+                        union_pids |= members_by_char.get(cid, set())
+                    candidate_pids = list(union_pids)
+                if not candidate_pids:
+                    return []
+                candidate_scope = scope_id_subquery(
+                    session, candidate_pids, name="_pixlstash_search_people_ids"
+                )
+                rows2 = session.exec(
+                    select(Picture.id).where(
+                        Picture.id.in_(candidate_scope),
+                        Picture.deleted.is_(False),
+                    )
+                ).all()
+                return list(rows2)
+
+            candidate_ids = set(
+                server.vault.db.run_immediate_read_task(
+                    fetch_character_ids_by_mode,
+                    search_character_id_list,
+                    search_character_mode,
+                )
+            )
+
+    # One of the person's face clusters (``face_cluster``), as the listing
+    # takes it.
+    face_cluster_ids = _face_cluster_ids(
+        server,
+        request,
+        character_id,
+        request.query_params.get("face_cluster"),
+        request.query_params.get("face_cluster_threshold"),
+    )
+    if face_cluster_ids is not None:
+        candidate_ids = (
+            face_cluster_ids
+            if candidate_ids is None
+            else set(candidate_ids) & face_cluster_ids
+        )
+
+    if project_id is not None:
+
+        def fetch_project_ids(
+            session,
+            project_id_value: str,
+            deleted_only: bool,
+        ):
+            query_stmt = select(Picture.id)
+            if project_id_value == "UNASSIGNED":
+                query_stmt = query_stmt.where(project_unassigned_clause(Picture))
+            else:
+                try:
+                    parsed_project_id = parse_sqlite_int(project_id_value)
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid project_id",
+                    )
+                query_stmt = query_stmt.where(
+                    project_membership_exists_clause(parsed_project_id, Picture)
+                )
+            if deleted_only:
+                query_stmt = query_stmt.where(Picture.deleted.is_(True))
+            else:
+                query_stmt = query_stmt.where(Picture.deleted.is_(False))
+            return list(session.exec(query_stmt).all())
+
+        project_candidate_ids = set(
+            server.vault.db.run_immediate_read_task(
+                fetch_project_ids,
+                project_id,
+                only_deleted,
+            )
+        )
+        candidate_ids = (
+            project_candidate_ids
+            if candidate_ids is None
+            else candidate_ids & project_candidate_ids
+        )
+
+    # Token scope enforcement: restrict candidate_ids to the pictures
+    # allowed by the token's resource scope.  This prevents a scoped
+    # token (e.g. picture_set, project, character) from seeing pictures
+    # outside its authorised scope by passing arbitrary filter params.
+    scope_allowed = fetch_scope_allowed_picture_ids(server, request)
+    if scope_allowed is not None:
+        candidate_ids = (
+            scope_allowed if candidate_ids is None else candidate_ids & scope_allowed
+        )
+
+    if candidate_ids is not None and not candidate_ids:
+        return []
+
+    # Encoded here, never inside the database task: the DB writer is one
+    # thread, and an encode there holds every write for a model call.
+    try:
+        query_embedding = server.vault.generate_text_embedding(query)
+        clip_query_embedding = server.vault.generate_clip_text_embedding(query)
+    except CpuQueryEncodersNotReadyError as exc:
+        # 503 rather than a 500: nothing is wrong with the request; the
+        # CPU query encoders failed to load at start-up.
+        logger.warning("Text search cannot encode its query: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        ) from exc
+
+    def find_by_text(session, query, offset, limit):
+        words = re.findall(r"\b\w+\b", query.lower())
+        semantic_offset = 0 if sort_mech else offset
+        semantic_limit = sys.maxsize if sort_mech else limit
+        candidate_size = len(candidate_ids) if candidate_ids else None
+
+        def log_semantic_results(label: str, rows):
+            if rows is None:
+                return
+            if not rows:
+                logger.debug(
+                    "Semantic search %s: no results (query=%r, words=%s, threshold=%s, format=%s, only_deleted=%s, candidate_ids=%s)",
+                    label,
+                    query,
+                    words,
+                    threshold,
+                    format,
+                    only_deleted,
+                    candidate_size,
+                )
+                return
+            preview = [
+                {
+                    "id": getattr(pic, "id", None),
+                    "score": round(float(score), 4),
+                }
+                for pic, score in rows[:10]
+            ]
+            logger.debug(
+                "Semantic search %s: results=%d (query=%r, words=%s, threshold=%s, format=%s, only_deleted=%s, candidate_ids=%s) top=%s",
+                label,
+                len(rows),
+                query,
+                words,
+                threshold,
+                format,
+                only_deleted,
+                candidate_size,
+                preview,
+            )
+
+        results = Picture.semantic_search(
+            session,
+            query,
+            words,
+            query_embedding=query_embedding,
+            clip_query_embedding=clip_query_embedding,
+            text_match_weight=OCR_TEXT_MATCH_WEIGHT,
+            offset=semantic_offset,
+            limit=semantic_limit,
+            threshold=threshold,
+            format=format,
+            select_fields=Picture.metadata_fields(),
+            only_deleted=only_deleted,
+            candidate_ids=list(candidate_ids) if candidate_ids else None,
+            min_score=min_score,
+            unscored=unscored,
+            favourite_only=favourite_only,
+            comfyui_models_filter=comfyui_models or None,
+            comfyui_loras_filter=comfyui_loras or None,
+            tags_filter=tags_filter or None,
+            tags_rejected_filter=tags_rejected_filter or None,
+            stack_state=stack_state,
+        )
+
+        log_semantic_results("base", results)
+
+        if not sort_mech:
+            return results
+
+        if not results:
+            return []
+
+        score_map = {
+            pic.id: score
+            for pic, score in results
+            if pic is not None and getattr(pic, "id", None) is not None
+        }
+        if not score_map:
+            return []
+
+        # Every picture the search matched, so possibly more ids than
+        # SQLite binds in one statement: passed as a temp-table scope.
+        result_scope = scope_id_subquery(
+            session, score_map.keys(), name="_pixlstash_search_result_ids"
+        )
+        sorted_pics = Picture.find(
+            session,
+            sort_mech=sort_mech,
+            offset=offset,
+            limit=limit,
+            select_fields=Picture.metadata_fields(),
+            format=format,
+            only_deleted=only_deleted,
+            id=result_scope,
+            min_score=min_score,
+            unscored=unscored,
+            favourite_only=favourite_only,
+            comfyui_models_filter=comfyui_models or None,
+            comfyui_loras_filter=comfyui_loras or None,
+            tags_filter=tags_filter or None,
+            tags_rejected_filter=tags_rejected_filter or None,
+            stack_state=stack_state,
+        )
+        sorted_results = [(pic, score_map.get(pic.id, 0.0)) for pic in sorted_pics]
+        log_semantic_results(f"sorted_{sort_mech.key.name}", sorted_results)
+        return sorted_results
+
+    results = server.vault.db.run_immediate_read_task(
+        find_by_text, query, offset, limit
+    )
+    if results:
+        hidden_ids = _fetch_hidden_picture_ids(
+            server,
+            request,
+            [
+                getattr(pic, "id", None)
+                for pic, _score in results
+                if pic is not None and getattr(pic, "id", None) is not None
+            ],
+        )
+        if hidden_ids:
+            results = [
+                result
+                for result in results
+                if result[0] is not None
+                and getattr(result[0], "id", None) not in hidden_ids
+            ]
+    return results
+
+
 def register_routes(router, server):
     @router.get(
         "/pictures/search",
@@ -72,472 +555,17 @@ def register_routes(router, server):
         offset: SqliteInt = 0,
         limit: SqliteInt = sys.maxsize,
         threshold: float = Query(0.5),
+        # Declared to validate it; search_results reads it from the query string.
         unassigned_by: Literal["character", "set"] | None = Query(None),
     ):
-        query_params = {}
-        format = None
-        character_id = None
-        set_id = None
-        set_ids = None
-        set_mode = "union"
-        project_id = None
-        sort = None
-        descending = True
-        min_score_raw = None
-        unscored = False
-        favourite_only = False
-        comfyui_models = []
-        comfyui_loras = []
-        tags_filter = []
-        stack_state = None
-        imported_since = None
-        if request.query_params:
-            query_params = dict(request.query_params)
-            query = query_params.pop("query", query)
-            offset = int(query_params.pop("offset", offset))
-            limit = int(query_params.pop("limit", limit))
-            character_id = query_params.pop("character_id", None)
-            query_params.pop("unassigned_by", None)
-            set_id = query_params.pop("set_id", None)
-            set_ids = request.query_params.getlist("set_ids")
-            set_mode = query_params.pop("set_mode", "union")
-            base_set_id_raw = query_params.pop("base_set_id", None)
-            project_id = query_params.pop("project_id", None)
-            sort = query_params.pop("sort", None)
-            desc_val = query_params.pop("descending", descending)
-            descending = (
-                desc_val.lower() == "true"
-                if isinstance(desc_val, str)
-                else bool(desc_val)
-            )
-            # Intrinsic list params are parsed by the shared parser; the membership
-            # and pagination params keep their bespoke ``query_params`` pop handling.
-            _predicate_filter = PredicateFilter.from_query_params(request)
-            format = _predicate_filter.format or []
-            min_score_raw = query_params.pop("min_score", None)
-            unscored = _predicate_filter.unscored
-            favourite_only = _predicate_filter.favourite_only
-            comfyui_models = _predicate_filter.comfyui_models_filter or []
-            comfyui_loras = _predicate_filter.comfyui_loras_filter or []
-            tags_filter = _predicate_filter.tags_filter or []
-            tags_rejected_filter = _predicate_filter.tags_rejected_filter or []
-            stack_state = _predicate_filter.stack_state
-            # A search in the Inbox searches the Inbox: the unassigned view
-            # (both halves) added within its period, as the listing reads it.
-            if request.query_params.get("inbox") is not None:
-                character_id = "UNASSIGNED"
-                unassigned_by = None
-                imported_since = _predicate_filter.imported_since
-        min_score = int(min_score_raw) if min_score_raw is not None else None
-        if not query:
-            raise HTTPException(
-                status_code=400, detail="Query parameter is required for search"
-            )
-
-        only_deleted = request_targets_scrapheap(request.query_params)
-        if is_scrapheap_view_id(character_id):
-            character_id = None
-        candidate_ids = None
-        sort_mech = None
-        normalized_set_mode = normalize_set_mode(set_mode)
-        set_filter_ids = collect_set_filter_ids(
-            set_id_value=set_id,
-            set_ids_values=set_ids,
-        )
-        if normalized_set_mode == "difference" and base_set_id_raw is not None:
-            try:
-                _base_id = parse_sqlite_int(base_set_id_raw)
-                if _base_id in set_filter_ids:
-                    set_filter_ids = [_base_id] + [
-                        s for s in set_filter_ids if s != _base_id
-                    ]
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Ignoring invalid base_set_id value %r in /pictures/search request",
-                    base_set_id_raw,
-                )
-
-        if sort:
-            try:
-                sort_mech = SortMechanism.from_string(sort, descending=descending)
-            except ValueError as ve:
-                logger.error("Invalid sort mechanism for search: %s", ve)
-                raise HTTPException(status_code=400, detail=str(ve))
-
-        if set_filter_ids:
-            candidate_ids = server.vault.db.run_immediate_read_task(
-                fetch_set_candidate_ids,
-                set_ids=set_filter_ids,
-                set_mode=normalized_set_mode,
-                deleted_only=only_deleted,
-            )
-        elif character_id is not None:
-            if character_id == "UNASSIGNED":
-
-                def fetch_unassigned_ids(session):
-                    assignment_project_id = None
-                    assignment_unassigned_project = False
-                    if project_id == "UNASSIGNED":
-                        assignment_unassigned_project = True
-                    elif project_id is not None:
-                        try:
-                            assignment_project_id = parse_sqlite_int(project_id)
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Invalid project_id %r for UNASSIGNED search assignment scope; treating as global scope",
-                                project_id,
-                            )
-                    unassigned_conditions = Picture.build_unassigned_conditions(
-                        enforce_stack_assignment=True,
-                        assignment_project_id=assignment_project_id,
-                        assignment_unassigned_project=assignment_unassigned_project,
-                        unassigned_by=unassigned_by,
-                    )
-                    query_stmt = select(Picture.id).where(
-                        *unassigned_conditions,
-                        Picture.deleted.is_(False),
-                    )
-                    if imported_since is not None:
-                        query_stmt = query_stmt.where(
-                            Picture.imported_at >= imported_since
-                        )
-                    return list(session.exec(query_stmt).all())
-
-                candidate_ids = set(
-                    server.vault.db.run_immediate_read_task(fetch_unassigned_ids)
-                )
-            elif character_id in ("ALL", ""):
-                candidate_ids = None
-            elif str(character_id).isdigit():
-
-                def fetch_character_ids(session, character_id_value):
-                    # A subquery, not a fetched id list: a person can be in
-                    # more pictures than SQLite binds in one statement.
-                    character_picture_ids = select(Face.picture_id).where(
-                        Face.character_id == character_id_value
-                    )
-                    rows = session.exec(
-                        select(Picture.id).where(
-                            Picture.id.in_(character_picture_ids),
-                            Picture.deleted.is_(False),
-                        )
-                    ).all()
-                    return list(rows)
-
-                try:
-                    character_id_value = parse_sqlite_int(character_id)
-                except ValueError:
-                    raise HTTPException(
-                        status_code=400, detail="Invalid character_id"
-                    ) from None
-                candidate_ids = set(
-                    server.vault.db.run_immediate_read_task(
-                        fetch_character_ids, character_id_value
-                    )
-                )
-        else:
-            search_character_ids_raw = request.query_params.getlist("character_ids")
-            search_character_id_list = []
-            for _v in search_character_ids_raw:
-                try:
-                    _cid = parse_sqlite_int(_v)
-                    if _cid > 0:
-                        search_character_id_list.append(_cid)
-                except (TypeError, ValueError):
-                    logger.warning(
-                        "Ignoring invalid character_ids value %r in /pictures/search request",
-                        _v,
-                    )
-            if search_character_id_list:
-                search_character_mode_raw = query_params.get("character_mode", "union")
-                search_character_mode = (
-                    (search_character_mode_raw or "union").strip().lower()
-                )
-                if search_character_mode not in {
-                    "union",
-                    "intersection",
-                    "difference",
-                    "xor",
-                }:
-                    search_character_mode = "union"
-
-                def fetch_character_ids_by_mode(session, ids, mode):
-                    # The caller's list has no cap: read it in chunks. Each row
-                    # names its person, so the modes below combine the merged rows.
-                    rows = [
-                        row
-                        for id_chunk in chunked(ids)
-                        for row in session.exec(
-                            select(Face.character_id, Face.picture_id).where(
-                                Face.character_id.in_(id_chunk)
-                            )
-                        ).all()
-                    ]
-                    members_by_char: dict[int, set[int]] = {cid: set() for cid in ids}
-                    for cid, pid in rows:
-                        members_by_char.setdefault(int(cid), set()).add(int(pid))
-                    if mode == "intersection":
-                        result: set[int] | None = None
-                        for cid in ids:
-                            current = members_by_char.get(cid, set())
-                            result = (
-                                set(current) if result is None else result & current
-                            )
-                        candidate_pids = list(result or set())
-                    elif mode == "difference":
-                        first = members_by_char.get(ids[0], set())
-                        rest_set: set[int] = set()
-                        for cid in ids[1:]:
-                            rest_set |= members_by_char.get(cid, set())
-                        candidate_pids = list(first - rest_set)
-                    elif mode == "xor":
-                        xor_u: set[int] = set()
-                        for cid in ids:
-                            xor_u |= members_by_char.get(cid, set())
-                        xor_i: set[int] | None = None
-                        for cid in ids:
-                            cur = members_by_char.get(cid, set())
-                            xor_i = set(cur) if xor_i is None else xor_i & cur
-                        candidate_pids = list(xor_u - (xor_i or set()))
-                    else:
-                        union_pids: set[int] = set()
-                        for cid in ids:
-                            union_pids |= members_by_char.get(cid, set())
-                        candidate_pids = list(union_pids)
-                    if not candidate_pids:
-                        return []
-                    candidate_scope = scope_id_subquery(
-                        session, candidate_pids, name="_pixlstash_search_people_ids"
-                    )
-                    rows2 = session.exec(
-                        select(Picture.id).where(
-                            Picture.id.in_(candidate_scope),
-                            Picture.deleted.is_(False),
-                        )
-                    ).all()
-                    return list(rows2)
-
-                candidate_ids = set(
-                    server.vault.db.run_immediate_read_task(
-                        fetch_character_ids_by_mode,
-                        search_character_id_list,
-                        search_character_mode,
-                    )
-                )
-
-        # One of the person's face clusters (``face_cluster``), as the listing
-        # takes it.
-        face_cluster_ids = _face_cluster_ids(
+        results = search_results(
             server,
             request,
-            character_id,
-            request.query_params.get("face_cluster"),
-            request.query_params.get("face_cluster_threshold"),
+            query,
+            offset=offset,
+            limit=limit,
+            threshold=threshold,
         )
-        if face_cluster_ids is not None:
-            candidate_ids = (
-                face_cluster_ids
-                if candidate_ids is None
-                else set(candidate_ids) & face_cluster_ids
-            )
-
-        if project_id is not None:
-
-            def fetch_project_ids(
-                session,
-                project_id_value: str,
-                deleted_only: bool,
-            ):
-                query_stmt = select(Picture.id)
-                if project_id_value == "UNASSIGNED":
-                    query_stmt = query_stmt.where(project_unassigned_clause(Picture))
-                else:
-                    try:
-                        parsed_project_id = parse_sqlite_int(project_id_value)
-                    except (TypeError, ValueError):
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Invalid project_id",
-                        )
-                    query_stmt = query_stmt.where(
-                        project_membership_exists_clause(parsed_project_id, Picture)
-                    )
-                if deleted_only:
-                    query_stmt = query_stmt.where(Picture.deleted.is_(True))
-                else:
-                    query_stmt = query_stmt.where(Picture.deleted.is_(False))
-                return list(session.exec(query_stmt).all())
-
-            project_candidate_ids = set(
-                server.vault.db.run_immediate_read_task(
-                    fetch_project_ids,
-                    project_id,
-                    only_deleted,
-                )
-            )
-            candidate_ids = (
-                project_candidate_ids
-                if candidate_ids is None
-                else candidate_ids & project_candidate_ids
-            )
-
-        # Token scope enforcement: restrict candidate_ids to the pictures
-        # allowed by the token's resource scope.  This prevents a scoped
-        # token (e.g. picture_set, project, character) from seeing pictures
-        # outside its authorised scope by passing arbitrary filter params.
-        scope_allowed = fetch_scope_allowed_picture_ids(server, request)
-        if scope_allowed is not None:
-            candidate_ids = (
-                scope_allowed
-                if candidate_ids is None
-                else candidate_ids & scope_allowed
-            )
-
-        if candidate_ids is not None and not candidate_ids:
-            return []
-
-        # Encoded here, never inside the database task: the DB writer is one
-        # thread, and an encode there holds every write for a model call.
-        try:
-            query_embedding = server.vault.generate_text_embedding(query)
-            clip_query_embedding = server.vault.generate_clip_text_embedding(query)
-        except CpuQueryEncodersNotReadyError as exc:
-            # 503 rather than a 500: nothing is wrong with the request; the
-            # CPU query encoders failed to load at start-up.
-            logger.warning("Text search cannot encode its query: %s", exc)
-            raise HTTPException(
-                status_code=503,
-                detail=str(exc),
-            ) from exc
-
-        def find_by_text(session, query, offset, limit):
-            words = re.findall(r"\b\w+\b", query.lower())
-            semantic_offset = 0 if sort_mech else offset
-            semantic_limit = sys.maxsize if sort_mech else limit
-            candidate_size = len(candidate_ids) if candidate_ids else None
-
-            def log_semantic_results(label: str, rows):
-                if rows is None:
-                    return
-                if not rows:
-                    logger.debug(
-                        "Semantic search %s: no results (query=%r, words=%s, threshold=%s, format=%s, only_deleted=%s, candidate_ids=%s)",
-                        label,
-                        query,
-                        words,
-                        threshold,
-                        format,
-                        only_deleted,
-                        candidate_size,
-                    )
-                    return
-                preview = [
-                    {
-                        "id": getattr(pic, "id", None),
-                        "score": round(float(score), 4),
-                    }
-                    for pic, score in rows[:10]
-                ]
-                logger.debug(
-                    "Semantic search %s: results=%d (query=%r, words=%s, threshold=%s, format=%s, only_deleted=%s, candidate_ids=%s) top=%s",
-                    label,
-                    len(rows),
-                    query,
-                    words,
-                    threshold,
-                    format,
-                    only_deleted,
-                    candidate_size,
-                    preview,
-                )
-
-            results = Picture.semantic_search(
-                session,
-                query,
-                words,
-                query_embedding=query_embedding,
-                clip_query_embedding=clip_query_embedding,
-                text_match_weight=OCR_TEXT_MATCH_WEIGHT,
-                offset=semantic_offset,
-                limit=semantic_limit,
-                threshold=threshold,
-                format=format,
-                select_fields=Picture.metadata_fields(),
-                only_deleted=only_deleted,
-                candidate_ids=list(candidate_ids) if candidate_ids else None,
-                min_score=min_score,
-                unscored=unscored,
-                favourite_only=favourite_only,
-                comfyui_models_filter=comfyui_models or None,
-                comfyui_loras_filter=comfyui_loras or None,
-                tags_filter=tags_filter or None,
-                tags_rejected_filter=tags_rejected_filter or None,
-                stack_state=stack_state,
-            )
-
-            log_semantic_results("base", results)
-
-            if not sort_mech:
-                return results
-
-            if not results:
-                return []
-
-            score_map = {
-                pic.id: score
-                for pic, score in results
-                if pic is not None and getattr(pic, "id", None) is not None
-            }
-            if not score_map:
-                return []
-
-            # Every picture the search matched, so possibly more ids than
-            # SQLite binds in one statement: passed as a temp-table scope.
-            result_scope = scope_id_subquery(
-                session, score_map.keys(), name="_pixlstash_search_result_ids"
-            )
-            sorted_pics = Picture.find(
-                session,
-                sort_mech=sort_mech,
-                offset=offset,
-                limit=limit,
-                select_fields=Picture.metadata_fields(),
-                format=format,
-                only_deleted=only_deleted,
-                id=result_scope,
-                min_score=min_score,
-                unscored=unscored,
-                favourite_only=favourite_only,
-                comfyui_models_filter=comfyui_models or None,
-                comfyui_loras_filter=comfyui_loras or None,
-                tags_filter=tags_filter or None,
-                tags_rejected_filter=tags_rejected_filter or None,
-                stack_state=stack_state,
-            )
-            sorted_results = [(pic, score_map.get(pic.id, 0.0)) for pic in sorted_pics]
-            log_semantic_results(f"sorted_{sort_mech.key.name}", sorted_results)
-            return sorted_results
-
-        results = server.vault.db.run_immediate_read_task(
-            find_by_text, query, offset, limit
-        )
-        if results:
-            hidden_ids = _fetch_hidden_picture_ids(
-                server,
-                request,
-                [
-                    getattr(pic, "id", None)
-                    for pic, _score in results
-                    if pic is not None and getattr(pic, "id", None) is not None
-                ],
-            )
-            if hidden_ids:
-                results = [
-                    result
-                    for result in results
-                    if result[0] is not None
-                    and getattr(result[0], "id", None) not in hidden_ids
-                ]
         rows = [Picture.serialize_with_likeness(r) for r in results]
         # Per row, whether the picture's own text matched: the result pill counts
         # and narrows on this without a second search (#1197).

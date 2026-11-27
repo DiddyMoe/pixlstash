@@ -1,0 +1,1 @@
+- Fixed: a file dropped on Project Files was also imported into the library.

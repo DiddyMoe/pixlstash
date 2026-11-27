@@ -142,6 +142,17 @@ def test_line_regions_split_into_word_boxes_by_character_share():
 def server():
     with tempfile.TemporaryDirectory() as temp_dir:
         with Server(f"{temp_dir}/server-config.json") as srv:
+            # These sweeps hold a picture whose folder is missing (the paths
+            # below) out of every finder, by id. Each test's pictures reuse the
+            # last test's ids, so a hold from one test hid the next one's.
+            srv.vault._work_planner.detach_finders(
+                [
+                    TaskType.QUALITY,
+                    TaskType.IMAGE_EMBEDDING,
+                    TaskType.TAGGER,
+                    TaskType.DESCRIPTION,
+                ]
+            )
             yield srv
 
 

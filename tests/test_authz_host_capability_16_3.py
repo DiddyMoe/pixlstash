@@ -90,6 +90,7 @@ _LOOPBACK_ROUTE_KEYS = {
     ("POST", "/api/v1/model-folders/{folder_id}/open"),
     ("POST", "/api/v1/server-config/open"),
     ("POST", "/api/v1/pictures/export/folder"),
+    ("POST", "/api/v1/pictures/export/folder/selection"),
     ("POST", "/api/v1/pictures/share-copies"),
     ("GET", "/api/v1/open-with"),
     ("POST", "/api/v1/open-with"),
@@ -582,6 +583,9 @@ def test_host_capability_tier_split_is_49_local_7_loopback():
     run on it again, ``POST /training/jobs``' class. It takes no path. Its
     ``GET`` reads the run's checkpoint headers and returns no path, so it is
     ``owner_only``.
+    94 = 75 + 19 with ``POST /pictures/export/folder/selection``, the folder
+    export with its selection and destination in a JSON body: ``POST
+    /pictures/export/folder``'s write and file-manager spawn, so its tier.
 
     Arithmetic, not judgement."""
     loopback = {
@@ -595,7 +599,7 @@ def test_host_capability_tier_split_is_49_local_7_loopback():
         if rp.policy is AccessPolicy.LOCAL_OWNER_ONLY
     }
     assert loopback == _LOOPBACK_ROUTE_KEYS, loopback
-    assert len(loopback) == 18, sorted(loopback)
+    assert len(loopback) == 19, sorted(loopback)
     assert len(local) == 75, sorted(local)
 
 
@@ -1386,6 +1390,34 @@ def test_export_folder_loopback_owner_only_public_403():
             assert _is_loopback_403(r), (
                 f"public owner must be 403'd on the red line; got {r.status_code}: {r.text}"
             )
+
+
+_EXPORT_FOLDER_SELECTION = f"{API}/pictures/export/folder/selection"
+
+
+def test_export_folder_selection_is_loopback_only_even_with_the_flag_on():
+    """The folder export with its selection in the body is the red line of
+    ``pictures/export/folder``: a loopback owner passes the gate, and RFC1918,
+    Tailscale and public stay 403 with ``allow_remote_host_ops`` on. The
+    destination cannot exist, so the owner gets the handler's 404 and nothing
+    is written."""
+    body = {
+        "picture_ids": [999999],
+        "destination": "/nonexistent-291-export-destination",
+    }
+    with _owner_env() as env:
+        server, owner = env["server"], env["owner"]
+        with _enforcing(server):
+            r = owner.post(_EXPORT_FOLDER_SELECTION, json=body)
+            assert r.status_code == 404, r.text
+            assert r.json()["detail"] == "Destination folder not found."
+        with _enforcing(server), _remote_host_ops(server, True):
+            for ip in (LAN_IPV4, "100.64.0.5", "8.8.8.8"):
+                r = owner.post(_EXPORT_FOLDER_SELECTION, json=body, headers=_xff(ip))
+                assert _is_loopback_403(r), (
+                    f"{ip} must be 403'd on the selection folder export; got "
+                    f"{r.status_code}: {r.text}"
+                )
 
 
 _SHARE_COPIES = f"{API}/pictures/share-copies"  # #2417

@@ -28,10 +28,11 @@
     "local run (2026-11-01): tests/test_tag_groups.py, which this branch newly gates, --force-cpu --fast-captions to match CI",
     "local run (2026-11-01): tests/test_tag_groups.py and tests/test_default_tag_groups.py, which this branch newly gates, --force-cpu --fast-captions to match CI",
     "local run (2026-11-01): tests/test_tag_groups.py and tests/test_default_tag_groups.py, the eleven tests the #2469 review added, --force-cpu --fast-captions to match CI",
-    "local run (2026-11-01): tests/test_tag_groups.py and tests/test_default_tag_groups.py after the Character, Copyright, Artist and Adult extension, --force-cpu --fast-captions to match CI"
+    "local run (2026-11-01): tests/test_tag_groups.py and tests/test_default_tag_groups.py after the Character, Copyright, Artist and Adult extension, --force-cpu --fast-captions to match CI",
+    "local run (2026-11-27): tests/test_search_export_parity.py, which this branch newly gates, CUDA hidden, --fast-captions to match CI"
   ],
-  "test_count": 6360,
-  "total_seconds": 8361.48,
+  "test_count": 6363,
+  "total_seconds": 8391.97,
   "durations": {
     "tests/db_models/test_training_models.py::test_config_ai_toolkit_keys_clearable": 0.0,
     "tests/db_models/test_training_models.py::test_config_ai_toolkit_keys_trimmed": 0.0,
@@ -4373,6 +4374,9 @@
     "tests/test_scrapheap_retention.py::test_turning_auto_purge_on_deliberately_still_purges": 0.3,
     "tests/test_scrapheap_retention.py::test_turning_auto_purge_on_reports_its_blast_radius": 0.31,
     "tests/test_scrapheap_retention.py::test_unreachable_location_corrects_the_ledger_to_file_kept": 0.3,
+    "tests/test_search_export_parity.py::test_a_search_export_packages_the_search_views_pictures_in_its_order[min_score]": 22.29,
+    "tests/test_search_export_parity.py::test_a_search_export_packages_the_search_views_pictures_in_its_order[scrapheap-min_score]": 1.86,
+    "tests/test_search_export_parity.py::test_a_search_export_packages_the_search_views_pictures_in_its_order[set-min_score]": 6.34,
     "tests/test_security_supported_versions.py::test_a_fourth_row_raises_rather_than_leaving_an_orphan": 0.0,
     "tests/test_security_supported_versions.py::test_a_wider_version_widens_the_whole_column": 0.0,
     "tests/test_security_supported_versions.py::test_main_exits_nonzero_and_leaves_the_file_alone_on_a_bad_table": 0.04,

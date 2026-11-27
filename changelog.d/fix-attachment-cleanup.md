@@ -1,0 +1,1 @@
+- Fixed: an attachment that failed to save left its file on disk.

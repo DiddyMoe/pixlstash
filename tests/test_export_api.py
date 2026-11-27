@@ -124,6 +124,94 @@ def test_pictures_export_of_the_scrapheap_view_packs_the_heap():
         gc.collect()
 
 
+def test_a_selection_of_thousands_of_ids_in_the_body_exports_those_pictures():
+    """A selection travels in the body, where its size is no request line."""
+    temp_dir, client, server = _setup()
+    try:
+        _upload_picture(client, "Bad1.png")
+        chosen = _upload_picture(client, "Bad2.png")
+        missing = list(range(1_000_000, 1_000_000 + 4_999))
+
+        resp = client.post(
+            "/pictures/export",
+            json={
+                "picture_ids": [chosen, *missing],
+                "caption_mode": "none",
+                "use_original_file_names": True,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task_id = resp.json()["task_id"]
+        _wait_for_export(client, task_id)
+
+        resp = client.get(f"{API_PREFIX}/pictures/export/download/{task_id}")
+        assert resp.status_code == 200, resp.text
+        with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+            assert zf.namelist() == ["Bad2.png"]
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def _export_zip_names(client, picture_ids):
+    """The member names of a ZIP export of *picture_ids*, in archive order."""
+    resp = client.post(
+        "/pictures/export",
+        json={
+            "picture_ids": picture_ids,
+            "caption_mode": "none",
+            "use_original_file_names": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["task_id"]
+    _wait_for_export(client, task_id)
+    resp = client.get(f"{API_PREFIX}/pictures/export/download/{task_id}")
+    assert resp.status_code == 200, resp.text
+    with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+        return zf.namelist()
+
+
+def test_an_export_keeps_the_order_the_pictures_are_named_in():
+    """A selection is packaged in the order named, a repeated id once, at its
+    first place."""
+    temp_dir, client, server = _setup()
+    try:
+        first = _upload_picture(client, "Bad1.png")
+        second = _upload_picture(client, "Bad2.png")
+        third = _upload_picture(client, "Reference1.png")
+
+        names = _export_zip_names(client, [third, first, third, second])
+        assert names == ["Reference1.png", "Bad1.png", "Bad2.png"]
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_an_exported_stack_keeps_its_place_in_the_selection():
+    """A stack is packaged as its cover, where its first picture was named."""
+    temp_dir, client, server = _setup()
+    try:
+        stacked = [
+            _upload_picture(client, "Bad2.png"),
+            _upload_picture(client, "Reference1.png"),
+        ]
+        loose = _upload_picture(client, "Bad1.png")
+        resp = client.post("/stacks", json={"picture_ids": stacked})
+        assert resp.status_code == 200, resp.text
+
+        names = _export_zip_names(client, [stacked[0], loose, stacked[1]])
+        assert len(names) == 2, names
+        assert names[0] in {"Bad2.png", "Reference1.png"}, names
+        assert names[1] == "Bad1.png", names
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
 def test_project_export_produces_valid_zip():
     temp_dir, client, server = _setup()
     try:
@@ -482,6 +570,48 @@ def test_pictures_export_folder_rejects_a_destination_inside_the_library():
             )
             assert accepted.status_code == 200, accepted.text
             _wait_for_export(client, accepted.json()["task_id"])
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_a_folder_export_of_a_selection_in_the_body_writes_those_pictures():
+    from unittest import mock
+
+    temp_dir, client, server = _setup()
+    try:
+        _upload_picture(client, "Bad1.png")
+        chosen = _upload_picture(client, "Bad2.png")
+        body = {
+            "picture_ids": [chosen],
+            "caption_mode": "none",
+            "use_original_file_names": True,
+        }
+
+        inside = os.path.join(server.vault.image_root, "exported")
+        os.makedirs(inside, exist_ok=True)
+        resp = client.post(
+            "/pictures/export/folder/selection",
+            json={**body, "destination": inside},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "part of your library" in resp.json().get("detail", "")
+
+        destination = os.path.join(temp_dir.name, "destination")
+        os.makedirs(destination, exist_ok=True)
+        with mock.patch(
+            "pixlstash.utils.service.export_utils.open_in_file_manager",
+            return_value=True,
+        ):
+            resp = client.post(
+                "/pictures/export/folder/selection",
+                json={**body, "destination": destination},
+            )
+            assert resp.status_code == 200, resp.text
+            _wait_for_export(client, resp.json()["task_id"])
+
+        assert os.listdir(destination) == ["Bad2.png"]
     finally:
         server.close()
         temp_dir.cleanup()
