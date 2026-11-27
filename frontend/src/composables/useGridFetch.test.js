@@ -298,7 +298,9 @@ describe("useGridFetch streaming path", () => {
     // Count says 5, stream only ever delivers 3 - the last 2 cells would
     // otherwise remain permanent id-less spinners.
     getPictureCount.mockResolvedValue({ count: 5 });
-    streamPictures.mockResolvedValue({ pictures: pics });
+    streamPictures.mockImplementation((_query, { offset, batchLimit }) =>
+      Promise.resolve({ pictures: pics.slice(offset, offset + batchLimit) }),
+    );
 
     const { grid, refs } = makeHarness({
       selectedSort: "CHARACTER_LIKENESS",
@@ -1341,11 +1343,14 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
   // background batches of 5,000, 5,000 and 1,600 rows between them.
   const TOTAL = 12_000;
   const TAIL_START = TOTAL - 200;
+  // Pictures the server has deleted, so later answers leave them out.
+  const serverDeleted = new Set();
 
   beforeEach(() => {
     getPictureCount.mockReset();
     streamPictures.mockReset();
     getPictureCount.mockResolvedValue({ count: TOTAL });
+    serverDeleted.clear();
   });
 
   // Both lists as plain rows, so a comparison sees each row's fields.
@@ -1367,7 +1372,12 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
         reads.push({ offset, ...readLists(refs) });
         if (offset === 5200) refsWrite(refs);
       }
-      return Promise.resolve({ pictures: streamedRows(offset, batchLimit) });
+      const rows = streamedRows(0, TOTAL).filter(
+        (row) => !serverDeleted.has(row.id),
+      );
+      return Promise.resolve({
+        pictures: rows.slice(offset, offset + batchLimit),
+      });
     });
     const harness = makeHarness();
     refs = harness.refs;
@@ -1398,11 +1408,14 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
     [
       "a delete takes a picture out of both lists",
       (refs) => {
+        serverDeleted.add(3);
         const kept = (row) => row.id !== 3;
         refs.allGridImages.value = refs.allGridImages.value.filter(kept);
         refs.lastFetchedGridImages.value =
           refs.lastFetchedGridImages.value.filter(kept);
       },
+      // The batch out during the delete is asked again, a slot earlier.
+      [5200, 5199, 10199, null],
     ],
     [
       "a re-score rewrites a card in the grid alone",
@@ -1411,13 +1424,14 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
         next[1] = { ...next[1], score: 5 };
         refs.allGridImages.value = next;
       },
+      [5200, 10200, null],
     ],
   ])(
     "keeps the fetched rows the grid's loaded rows after %s mid-stream",
-    async (_case, write) => {
+    async (_case, write, offsets) => {
       const reads = await streamReading(write);
 
-      expect(reads.map((read) => read.offset)).toEqual([5200, 10200, null]);
+      expect(reads.map((read) => read.offset)).toEqual(offsets);
       for (const { gridRows, fetchedRows } of reads) {
         expect(fetchedRows).toEqual(loaded(gridRows));
       }

@@ -1247,11 +1247,6 @@ export function useGridFetch(
         const TAIL_THRESHOLD = 1000;
         const shouldFetchTailEarly =
           total > FIRST_BATCH && backgroundGap > TAIL_THRESHOLD;
-        // Effective end of the background region: extends to `total` when we
-        // skip the early tail so every item is eventually fetched.
-        const lastBatchStart = shouldFetchTailEarly
-          ? potentialLastBatchStart
-          : total;
 
         // Kick off the first batch and the optional tail batch concurrently, but
         // do NOT block visible-thumbnail loading on the tail (which fills
@@ -1349,24 +1344,55 @@ export function useGridFetch(
         // 4. Background stream: fill remaining items sequentially after first
         // batch is rendered.  Sequential (not parallel) to avoid DB contention
         // that would slow the already-visible first-batch response.
-        let bgOff = FIRST_BATCH;
-        while (bgOff < lastBatchStart) {
+        //
+        // Each batch asks for the next run of cells with no picture yet, read
+        // from the grid as it stands: a removal mid-stream (removeImagesById)
+        // moves the unfilled cells up, and the server's offsets move with it.
+        let fillFrom = 0;
+        while (true) {
           if (!isCurrent()) return;
-          const limit = Math.min(BG_BATCH, lastBatchStart - bgOff);
+          const askGrid = allGridImages.value;
+          let bgOffset = fillFrom;
+          while (bgOffset < askGrid.length && askGrid[bgOffset]?.id != null) {
+            bgOffset += 1;
+          }
+          let runEnd = bgOffset;
+          while (
+            runEnd < askGrid.length &&
+            runEnd - bgOffset < BG_BATCH &&
+            askGrid[runEnd]?.id == null
+          ) {
+            runEnd += 1;
+          }
+          if (bgOffset >= runEnd) break;
+          // The loaded picture after the run. A picture removed before it was
+          // loaded leaves the grid one cell longer than the server's list, so
+          // the server's answer runs into this picture early.
+          const nextLoadedId = askGrid[runEnd]?.id ?? null;
           const bgResTimed = await timeRequest(
             streamPictures(streamQuery, {
-              offset: bgOff,
-              batchLimit: limit,
+              offset: bgOffset,
+              batchLimit: runEnd - bgOffset,
               signal,
             }),
           );
           if (!isCurrent()) return;
-          const bgOffset = bgOff;
-          bgOff += limit;
+          // A removal while the batch was out shifted the cells it was asked
+          // for; ask again from the grid as it is now.
+          if (allGridImages.value.length !== askGrid.length) {
+            fillFrom = 0;
+            continue;
+          }
           const bgNetworkElapsedMs = bgResTimed.elapsedMs;
           const bgUiStartedAt = getNowMs();
           const bgPics = bgResTimed?.body?.pictures ?? [];
-          const bgRows = splicePictures(bgPics, bgOffset);
+          const stopAt = bgPics.findIndex((pic) => pic.id === nextLoadedId);
+          const bgRows = splicePictures(
+            stopAt < 0 ? bgPics : bgPics.slice(0, stopAt),
+            bgOffset,
+          );
+          if (!bgRows.length) break;
+          fillFrom = bgOffset + bgRows.length;
           updateVisibleThumbnails();
           // Keep lastFetchedGridImages current so deletes during streaming work.
           // While both lists are still the ones this load wrote, the batch's
@@ -1416,25 +1442,24 @@ export function useGridFetch(
         lastFetchedGridImages.value = allGridImages.value.filter(
           (img) => img && img.id != null,
         );
-        // Safety net: trim trailing placeholders the stream never filled.  If the
-        // count and stream queries ever drift again (stream yields fewer rows than
-        // COUNT(*)), the surplus tail cells would sit as permanent spinners.  Only
-        // the contiguous trailing run of id-less cells is dropped - mid-grid holes
-        // are left alone.
+        // Safety net: drop the placeholders the stream never filled, so they do
+        // not sit as permanent spinners. They are left when the count and
+        // stream queries drift (stream yields fewer rows than COUNT(*)), and
+        // one is left before the next loaded picture for each picture removed
+        // before it was loaded.
         const _finalGrid = allGridImages.value;
-        let _filledEnd = _finalGrid.length;
-        while (_filledEnd > 0 && _finalGrid[_filledEnd - 1]?.id == null) {
-          _filledEnd -= 1;
-        }
-        if (_filledEnd < _finalGrid.length) {
+        const _filled = _finalGrid.filter((img) => img?.id != null);
+        if (_filled.length < _finalGrid.length) {
           console.warn(
             "[ImageGrid.vue] Stream returned fewer rows than the count; trimming",
-            _finalGrid.length - _filledEnd,
-            "trailing placeholder cells.",
+            _finalGrid.length - _filled.length,
+            "placeholder cells.",
           );
-          allGridImages.value = _finalGrid.slice(0, _filledEnd);
-          if (visibleEnd.value > _filledEnd) {
-            visibleEnd.value = _filledEnd;
+          allGridImages.value = _filled.map((img, i) =>
+            img.idx === i ? img : { ...img, idx: i },
+          );
+          if (visibleEnd.value > _filled.length) {
+            visibleEnd.value = _filled.length;
           }
         }
         fetchPhaseTimings.postProcessMs = Math.max(

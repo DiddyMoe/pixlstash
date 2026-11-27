@@ -238,18 +238,29 @@ describe("useVirtualScroll square row pitch", () => {
     store.thumbnailMode = "square";
     store.thumbnailSize = 256;
     store.compactMode = false;
-    const geom = squareGeometry(store.columns);
-    const card = { getBoundingClientRect: () => ({ height: geom.track }) };
+    // The page's geometry, which a test changes to stand for Vue's patch.
+    const page = { geom: squareGeometry(store.columns) };
+    const card = {
+      getBoundingClientRect: () => ({ height: page.geom.track }),
+    };
     const grid = {
       clientWidth: GRID_W,
       getBoundingClientRect: () => ({ width: GRID_W }),
       querySelector: (selector) =>
         selector === ":scope > .image-card" ? card : null,
-      computedStyle: () => ({ display: "grid", rowGap: `${geom.gap}px` }),
+      computedStyle: () => ({
+        display: "grid",
+        rowGap: `${page.geom.gap}px`,
+      }),
     };
     vi.stubGlobal("getComputedStyle", (el) => el.computedStyle());
+    const scrollWrapper = ref({
+      scrollTop: 0,
+      clientHeight: VIEWPORT_H,
+      clientWidth: GRID_W,
+    });
     const vs = useVirtualScroll(
-      ref({ scrollTop: 0, clientHeight: VIEWPORT_H, clientWidth: GRID_W }),
+      scrollWrapper,
       ref(grid),
       reactive({}),
       computed(() => N),
@@ -261,7 +272,7 @@ describe("useVirtualScroll square row pitch", () => {
     );
     vs.initialRender.value = false;
     vs.updateRowHeightFromGrid();
-    return { vs, geom };
+    return { vs, geom: page.geom, page, store, scrollWrapper };
   }
 
   afterEach(() => {
@@ -302,5 +313,35 @@ describe("useVirtualScroll square row pitch", () => {
       expect(Math.abs(laid.firstRowTop - rowTop)).toBeLessThan(1 / 64);
       expect(Math.abs(laid.total - total)).toBeLessThan(1 / 64);
     }
+  });
+
+  it("re-measures after a column change and keeps the top picture in place", async () => {
+    const { vs, store, page, scrollWrapper } = harness();
+    const before = page.geom;
+    // A quarter of the way into row 200.
+    scrollWrapper.value.scrollTop = vs.squareRowTop(200) + 0.25 * before.pitch;
+    vs.recalculateVisibleRange();
+    const topItem = 200 * before.cols;
+
+    store.sizeLevel = 4;
+    expect(store.columns).not.toBe(before.cols);
+    // ImageGrid's columns watcher runs before the patch: the page still has
+    // the old layout when it asks for a re-measure.
+    vs.updateRowHeightFromGrid();
+    // Vue patches the DOM to the new column count.
+    const after = squareGeometry(store.columns);
+    page.geom = after;
+    await nextTick();
+    await nextTick();
+    await nextTick();
+
+    expect(vs.rowHeight.value).toBe(after.pitch);
+    const into =
+      (scrollWrapper.value.scrollTop - vs.squareRowTop(0)) / after.pitch;
+    const topRow = Math.floor(topItem / after.cols);
+    expect(Math.floor(into)).toBe(topRow);
+    expect(into - topRow).toBeCloseTo(0.25, 6);
+    // The render window was recomputed for the restored position.
+    expect(vs.visibleStart.value).toBe(topRow * after.cols);
   });
 });

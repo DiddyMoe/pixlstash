@@ -1526,6 +1526,7 @@ import {
 } from "../../utils/stack.js";
 import { useVirtualScroll } from "../../composables/useVirtualScroll.js";
 import {
+  rowAtOffset,
   rowOfIndex,
   JUSTIFIED_ROW_GAP,
 } from "../../composables/useJustifiedLayout.js";
@@ -9139,13 +9140,16 @@ watch(allGridImages, () => {
   if (anyGone) operationStore.dropGhosts();
 });
 
-// The store hands back the ids whose window has closed.
+// The store hands back the ids whose window has closed. The collapse is on a
+// timer, which the grid's own rules never otherwise do (the pills exist so
+// nothing reshuffles unprompted); it is acceptable because removeImagesById
+// does not move the cards on screen.
 watch(
   () => operationStore.collapsingPictureIds,
   (ids) => {
     if (!ids || !ids.length) return;
     const doomed = operationStore.takeCollapsingGhosts();
-    if (doomed.length) void collapseGhostedImages(doomed);
+    if (doomed.length) removeImagesById(doomed);
   },
 );
 
@@ -9165,58 +9169,112 @@ function gridItemTopOffset(index) {
 }
 
 /**
- * Drop the ghosted tiles and close the gap, without yanking the viewport.
+ * Where the view stands before cells leave the grid, for restoreScrollAnchor to
+ * hold it after. `isLeaving(img, index)` names the cells that go; every other
+ * cell keeps its order.
  *
- * The collapse is on a timer, which is the one thing the grid's own rules never
- * do (the pills exist so nothing reshuffles under the user unprompted). What
- * makes it acceptable is that content the user is actually looking at does not
- * move: anchor on the topmost item still on screen, remove, then put that item
- * back under the same pixel. Ghosts below the fold move nothing; ghosts on
- * screen close their gap in plain sight, which is the expected consequence of
- * the sentence the receipt just read out; ghosts scrolled off the top would
- * otherwise drag the whole view up under someone who has moved on.
+ * Null when there is nothing to hold: the view is at the top, nothing leaves
+ * above the top row on screen (the cards on screen then move only to close
+ * gaps on screen, in plain sight), or no cell from that row on stays. In
+ * justified mode also when no card on screen stays, since the pixel hold needs
+ * one to measure by.
  */
-async function collapseGhostedImages(ids) {
+function captureScrollAnchor(isLeaving) {
   const wrapper = scrollWrapper.value;
-  const scrollTop = wrapper ? wrapper.scrollTop : 0;
-  let anchorId = null;
-  let anchorOffset = 0;
-  if (wrapper && scrollTop > 0) {
-    const doomed = new Set(
-      ids.map((id) => String(getPictureId(id))).filter((id) => id !== "null"),
+  if (!wrapper || !(wrapper.scrollTop > 0)) return null;
+  const list = allGridImages.value || [];
+  const scrollTop = wrapper.scrollTop;
+  const justified = isJustifiedMode.value;
+  const cols = Math.max(1, gridStore.columns || 1);
+  // The first slot of the top row on screen, partly scrolled off or not.
+  let firstSlot;
+  if (justified) {
+    const layout = justifiedLayout.value;
+    if (!layout?.rowHeights?.length) return null;
+    let row = rowAtOffset(layout.rowOffsets, scrollTop);
+    if (layout.rowOffsets[row] + layout.rowHeights[row] <= scrollTop) row += 1;
+    if (row >= layout.rowHeights.length) return null;
+    firstSlot = layout.rowStarts[row];
+  } else {
+    const topRow = Math.max(
+      0,
+      Math.floor((scrollTop - squareRowTop(0)) / rowHeight.value),
     );
-    const list = allGridImages.value || [];
-    for (let i = 0; i < list.length; i += 1) {
-      const pictureId = getPictureId(list[i]?.id);
-      if (pictureId === null || doomed.has(String(pictureId))) continue;
-      const top = gridItemTopOffset(i);
-      if (top === null) break;
-      if (top >= scrollTop) {
-        anchorId = pictureId;
-        anchorOffset = top - scrollTop;
-        break;
-      }
-    }
+    firstSlot = Math.min(topRow * cols, list.length);
   }
-
-  removeImagesById(ids);
-
-  if (anchorId === null || !wrapper) return;
-  await nextTick();
-  const newIndex = (allGridImages.value || []).findIndex(
-    (img) => getPictureId(img?.id) === anchorId,
-  );
-  if (newIndex < 0) return;
-  const newTop = gridItemTopOffset(newIndex);
-  if (newTop === null) return;
-  const target = Math.max(0, newTop - anchorOffset);
-  // Sub-pixel churn is not worth a scroll write (and would fight momentum).
-  if (Math.abs(target - wrapper.scrollTop) > 1) {
-    wrapper.scrollTop = target;
+  let leavingAbove = 0;
+  for (let i = 0; i < firstSlot; i += 1) {
+    if (isLeaving(list[i], i)) leavingAbove += 1;
   }
+  if (leavingAbove === 0) return null;
+  let stay = firstSlot;
+  while (stay < list.length && isLeaving(list[stay], stay)) stay += 1;
+  if (stay >= list.length) return null;
+  const anchor = {
+    justified,
+    firstSlot,
+    // A cell with no picture yet has nothing to find it by afterwards; its
+    // new slot is its old one less the cells that left before it.
+    stay,
+    pictureId: getPictureId(list[stay]?.id),
+    leavingBeforeStay: leavingAbove + (stay - firstSlot),
+    cols,
+    pitch: rowHeight.value,
+    offset: null,
+  };
+  if (justified) {
+    const top = gridItemTopOffset(stay);
+    if (top === null || top >= scrollTop + wrapper.clientHeight) return null;
+    anchor.offset = top - scrollTop;
+  }
+  return anchor;
 }
 
-// Remove images by ID (for event-driven removal)
+/**
+ * Hold the view captureScrollAnchor described, under the grid the change left.
+ *
+ * Square mode keeps whole rows. When n cells leave above the top row on
+ * screen, the cards below them move n slots back; scrolling up round(n / cols)
+ * rows leaves every card on screen fewer than half a row of slots from where
+ * it was, so only the ones that wrap change row.
+ *
+ * Justified mode re-packs every row after the first cell that left, so no
+ * slot arithmetic holds; the topmost staying card on screen is put back under
+ * the same pixel instead.
+ */
+function restoreScrollAnchor(anchor) {
+  const wrapper = scrollWrapper.value;
+  if (!anchor || !wrapper) return;
+  const newIndex =
+    anchor.pictureId === null
+      ? anchor.stay - anchor.leavingBeforeStay
+      : (allGridImages.value || []).findIndex(
+          (img) => getPictureId(img?.id) === anchor.pictureId,
+        );
+  // The rebuild dropped the picture (an expanded stack's member whose stack
+  // collapsed with its leader): nothing is left to measure the change by.
+  if (newIndex < 0) return;
+  if (anchor.justified) {
+    const newTop = gridItemTopOffset(newIndex);
+    if (newTop === null) return;
+    const target = Math.max(0, newTop - anchor.offset);
+    // Sub-pixel churn is not worth a scroll write (and would fight momentum).
+    if (Math.abs(target - wrapper.scrollTop) > 1) wrapper.scrollTop = target;
+    return;
+  }
+  const rows = Math.round((anchor.firstSlot - newIndex) / anchor.cols);
+  if (rows !== 0) wrapper.scrollTop -= rows * anchor.pitch;
+}
+
+/**
+ * Remove pictures from the grid without moving what is on screen.
+ *
+ * The grid turns the browser's scroll anchoring off (`overflow-anchor: none`
+ * on the scroll wrapper), so it anchors by hand: removals above the top row on
+ * screen scroll the view up by the whole rows they took (in justified mode,
+ * the topmost card on screen keeps its pixel). The scroll is written before
+ * Vue renders, so the window the render draws is already the anchored one.
+ */
 function removeImagesById(imageIds) {
   if (!Array.isArray(imageIds) || !imageIds.length) {
     return;
@@ -9225,7 +9283,9 @@ function removeImagesById(imageIds) {
     imageIds.map((id) => getPictureId(id)).filter((id) => id !== null),
   );
   const removeId = (img) => dIds.has(getPictureId(img?.id));
-  allGridImages.value = allGridImages.value.filter((img) => !removeId(img));
+  const anchor = captureScrollAnchor(removeId);
+  const remaining = allGridImages.value.filter((img) => !removeId(img));
+  allGridImages.value = remaining;
   if (Array.isArray(lastFetchedGridImages.value)) {
     lastFetchedGridImages.value = lastFetchedGridImages.value.filter(
       (img) => !removeId(img),
@@ -9246,8 +9306,32 @@ function removeImagesById(imageIds) {
     (id) => !dIds.has(getPictureId(id)),
   );
   resetThumbnailState();
-  rebuildGridImagesFromLastFetch();
-  void refreshExpandedStacksAfterFetch();
+  // A stream still filling the grid writes its batches into the cells with no
+  // picture yet (useGridFetch). The rebuild lays the grid out from the rows
+  // loaded so far, which drops those cells, so mid-stream the removed rows
+  // leave in place instead and every cell after them moves up a slot.
+  if (remaining.some((img) => img?.id == null)) {
+    allGridImages.value = remaining.map((img, i) =>
+      img.idx === i ? img : { ...img, idx: i },
+    );
+    if (visibleStart.value >= remaining.length) {
+      const cols = Math.max(1, gridStore.columns || 1);
+      const windowCount = Math.max(cols, divisibleViewWindow.value || cols);
+      visibleStart.value = 0;
+      visibleEnd.value = Math.min(remaining.length, windowCount);
+    } else if (visibleEnd.value > remaining.length) {
+      visibleEnd.value = remaining.length;
+    }
+    updateVisibleThumbnails();
+  } else {
+    rebuildGridImagesFromLastFetch();
+    void refreshExpandedStacksAfterFetch();
+  }
+  restoreScrollAnchor(anchor);
+  // The window follows the restored scroll, so it holds the pictures that were
+  // on screen rather than their old slots. A viewport with no height has
+  // nothing on screen to hold.
+  if (scrollWrapper.value?.clientHeight > 0) recalculateVisibleRange();
 }
 
 function getExportCount() {
