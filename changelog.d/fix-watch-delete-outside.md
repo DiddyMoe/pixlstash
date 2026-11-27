@@ -1,0 +1,1 @@
+- Fixed: Delete after import no longer removes a file outside the watch folder.

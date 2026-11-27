@@ -1,4 +1,6 @@
 import errno
+import io
+import itertools
 import logging
 import os
 import shutil
@@ -15,7 +17,7 @@ from PIL import Image
 from pixlstash.server import Server
 from pixlstash.db_models.import_folder import ImportFolder
 from pixlstash.db_models.picture import Picture
-from pixlstash.tasks import missing_watch_folder_import_finder
+from pixlstash.tasks import missing_watch_folder_import_finder, watch_folder_import_task
 from pixlstash.utils import reference_folder_validator
 
 API_PREFIX = "/api/v1"
@@ -922,3 +924,113 @@ def test_import_folder_listing_tells_an_unreadable_folder_from_a_missing_one():
         finally:
             os.chmod(locked, 0o700)
             os.chmod(gate, 0o700)
+
+
+# ---------------------------------------------------------------------------
+# Delete-after-import removes only the file it imported
+# ---------------------------------------------------------------------------
+
+# Each picture below has its own colour, so none is a duplicate of another on
+# the shared server.
+_watch_colours = itertools.count(1)
+
+
+@pytest.fixture(scope="module")
+def watch_server():
+    """One server for the tests below. They run the task on candidates they
+    build; no watch folder is registered, so the finder offers nothing."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with Server(os.path.join(temp_dir, "server-config.json")) as server:
+            yield server
+
+
+def _write_picture(path) -> bytes:
+    colour = next(_watch_colours)
+    buffer = io.BytesIO()
+    Image.new("RGB", (6, 6), (colour % 256, colour // 256, 77)).save(
+        buffer, format="PNG"
+    )
+    data = buffer.getvalue()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return data
+
+
+def _link_folder(target, link) -> None:
+    """A folder link: on Windows a junction, which needs no privilege."""
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def _import_and_delete(monkeypatch, server, file_path, root, after_insert=None):
+    """One delete-after-import pass over *file_path*. *after_insert* runs once
+    the picture's row is committed, before the delete."""
+    database = server.vault.db
+    real_run_task = database.run_task
+
+    def run_task(func, *args, **kwargs):
+        result = real_run_task(func, *args, **kwargs)
+        if after_insert and getattr(func, "__name__", "") == "insert_pictures":
+            after_insert()
+        return result
+
+    monkeypatch.setattr(database, "run_task", run_task)
+    candidate = {
+        "file_path": str(file_path),
+        "delete_after_import": True,
+        "import_source_folder": str(root),
+    }
+    task = watch_folder_import_task.WatchFolderImportTask(database, [candidate], 1)
+    return task._run_task()
+
+
+def test_delete_after_import_keeps_a_file_replaced_since_the_read(
+    watch_server, tmp_path, monkeypatch
+):
+    """The name now leads to other bytes than the library holds a copy of."""
+    root = tmp_path / "watch"
+    file_path = root / "picture.png"
+    _write_picture(file_path)
+    newer = _write_picture(tmp_path / "newer.png")
+
+    result = _import_and_delete(
+        monkeypatch,
+        watch_server,
+        file_path,
+        root,
+        lambda: os.replace(tmp_path / "newer.png", file_path),
+    )
+
+    assert len(result["imported_picture_ids"]) == 1
+    assert file_path.read_bytes() == newer
+
+
+def test_delete_after_import_never_goes_through_a_link(
+    watch_server, tmp_path, monkeypatch
+):
+    """A folder on the path that is a link can lead outside the watch folder,
+    however it got there: the file it leads to stays. The folder is moved out
+    and linked back after the read, so only the delete can refuse it."""
+    root = tmp_path / "watch"
+    outside = tmp_path / "outside"
+    kept = _write_picture(root / "sub" / "picture.png")
+
+    def move_out_and_link_back():
+        os.replace(root / "sub", outside)
+        _link_folder(outside, root / "sub")
+
+    result = _import_and_delete(
+        monkeypatch,
+        watch_server,
+        root / "sub" / "picture.png",
+        root,
+        move_out_and_link_back,
+    )
+
+    assert len(result["imported_picture_ids"]) == 1
+    assert (outside / "picture.png").read_bytes() == kept

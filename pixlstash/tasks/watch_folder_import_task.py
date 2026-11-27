@@ -1,4 +1,5 @@
 import os
+import stat
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -11,6 +12,7 @@ from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.tag import Tag, TAG_PENDING_SENTINEL
 from pixlstash.utils.caption_file_utils import attach_sidecars
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
     session_tag_exclusions,
@@ -28,6 +30,89 @@ from pixlstash.tasks.base_task import BaseTask
 
 
 logger = get_logger(__name__)
+
+# Delete-after-import reaches the file through directory descriptors where the
+# platform has them: every folder from "/" down is opened with O_NOFOLLOW, so a
+# link anywhere on the path fails the walk instead of steering the unlink
+# elsewhere. Windows has no dir_fd; there each folder on the path is checked
+# for a link, a junction included, before the remove.
+_UNLINK_BY_DIR_FD = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+
+
+def _is_file_read(read: os.stat_result, now: os.stat_result) -> bool:
+    """Whether *now* is the regular file *read* was taken from, unchanged."""
+    return (
+        stat.S_ISREG(now.st_mode)
+        and now.st_dev == read.st_dev
+        and now.st_ino == read.st_ino
+        and now.st_size == read.st_size
+        and now.st_mtime_ns == read.st_mtime_ns
+    )
+
+
+def _open_parent_by_dir_fd(path: str) -> tuple[int, str]:
+    """Open the folder holding absolute *path* without following any link.
+
+    Returns its descriptor, which the caller closes, and *path*'s last name.
+    O_NOFOLLOW checks only the last component of a path, so each folder is
+    opened in turn from "/"; one that is a link fails with ELOOP or ENOTDIR.
+    """
+    parent, name = os.path.split(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parent.split(os.sep):
+            if part:
+                next_fd = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, name
+
+
+def _delete_imported_source(file_path: str, read: os.stat_result) -> str | None:
+    """Remove a watched file the library now holds a copy of.
+
+    Returns why the file was kept, or ``None`` once it is removed. It goes
+    only when its path still leads, through no link, to the file the import
+    read: a link on the way can lead outside the watch folder, and a file
+    replaced or rewritten since the read is not the one the library holds.
+
+    Raises:
+        OSError: the path could not be walked, checked or removed.
+    """
+    path = os.path.abspath(file_path)
+    if _UNLINK_BY_DIR_FD:
+        fd, name = _open_parent_by_dir_fd(path)
+        try:
+            if not _is_file_read(read, os.stat(name, dir_fd=fd, follow_symlinks=False)):
+                return "it is no longer the file that was imported"
+            os.unlink(name, dir_fd=fd)
+        finally:
+            os.close(fd)
+        return None
+    # A folder swapped for a link between this walk and the remove is not
+    # ruled out here.
+    folder = os.path.dirname(path)
+    while True:
+        if is_link_or_missing(folder):
+            return f"the folder {folder} on its path is a link"
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    if not _is_file_read(read, os.lstat(path)):
+        return "it is no longer the file that was imported"
+    os.remove(path)
+    return None
 
 
 class WatchFolderImportTask(BaseTask):
@@ -87,6 +172,9 @@ class WatchFolderImportTask(BaseTask):
                 continue
 
             try:
+                # Taken before the reads, so a change while they run keeps
+                # the file from delete-after-import.
+                read_stat = os.lstat(file_path)
                 pixel_sha = ImageUtils.calculate_hash_from_file_path(file_path)
                 size_bytes = os.path.getsize(file_path)
             except Exception as exc:
@@ -168,7 +256,7 @@ class WatchFolderImportTask(BaseTask):
                 if stack_id or source_id:
                     stack_assignments.append((pic, stack_id, source_id))
                 if bool(candidate.get("delete_after_import", False)):
-                    delete_paths.append(file_path)
+                    delete_paths.append((file_path, read_stat))
             except Exception as exc:
                 logger.warning(
                     "Failed to import watched file %s: %s (will retry on next scan)",
@@ -261,16 +349,17 @@ class WatchFolderImportTask(BaseTask):
 
             logger.info("Added %d new pictures from watch folders.", len(imported_ids))
 
-            if delete_paths:
-                for file_path in delete_paths:
-                    try:
-                        os.remove(file_path)
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to delete watched file %s: %s",
-                            file_path,
-                            exc,
-                        )
+            for file_path, read_stat in delete_paths:
+                try:
+                    kept = _delete_imported_source(file_path, read_stat)
+                except OSError as exc:
+                    kept = str(exc)
+                if kept is not None:
+                    logger.warning(
+                        "Kept watched file %s after importing it, not deleting it: %s",
+                        file_path,
+                        kept,
+                    )
 
         if self._last_checked_updates:
 
