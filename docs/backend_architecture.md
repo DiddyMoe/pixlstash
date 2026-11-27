@@ -628,7 +628,7 @@ Public guest scoring and shared-link endpoints.
 | GET | `/api/v1/protected` | Auth probe |
 | WS  | `/api/v1/ws/updates` | Real-time event stream (broadcast) |
 | GET | `/share/{token_slug}` | Public token-embedded picture serving |
-| GET | `/{full_path:path}` | SPA fallback (serves `index.html`) |
+| GET | `/{full_path:path}` | SPA fallback (serves `index.html`); a path under `/api/v1` answers 404 JSON |
 
 ### Complete route index
 

@@ -2491,6 +2491,11 @@ class Server(
 
         @self.api.get("/{full_path:path}", include_in_schema=False)
         async def frontend_fallback(full_path: str):
+            # This route matches every path: one under the API prefix that no
+            # API route matched is an API 404, not the page.
+            path = f"/{full_path}"
+            if path == API_V1_PREFIX or path.startswith(f"{API_V1_PREFIX}/"):
+                raise HTTPException(status_code=404, detail="Not Found")
             dist_dir = self._get_frontend_dist_dir()
             if not dist_dir:
                 raise HTTPException(status_code=404, detail="Not Found")

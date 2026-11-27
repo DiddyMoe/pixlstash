@@ -1,10 +1,11 @@
 """Anti-vacuity guard for the authorization/scope test suites.
 
 ``server.py`` registers a catch-all ``@self.api.get("/{full_path:path}")`` that
-serves the built frontend's ``index.html`` for any unmatched GET. The consequence
-is easy to miss and hard to notice: **a GET to a nonexistent API path returns
-200**, so a bare ``assert resp.status_code == 200`` is fully satisfied by a
-typo'd, renamed, or never-existing URL, and proves nothing at all.
+serves the built frontend's ``index.html`` for any unmatched GET outside the
+``/api/v1`` prefix (under it, the catch-all answers 404). The consequence is easy
+to miss and hard to notice: **a GET to a nonexistent path without the prefix
+returns 200**, so a bare ``assert resp.status_code == 200`` is fully satisfied by
+a typo'd, renamed, or never-existing URL, and proves nothing at all.
 
 That is not hypothetical. ``test_integration_scoped_list_pass_through_not_over
 blocked`` asserted 200 against ``/stacks/{id}/stack`` - a route that has never

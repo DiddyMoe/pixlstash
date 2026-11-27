@@ -1958,6 +1958,23 @@ def test_pictures_likeness_groups_supports_set_intersection_filter(server, clien
     assert pic_a not in intersection_ids
 
 
+def test_an_unknown_api_path_answers_404_and_a_page_path_the_page(
+    server, client, tmp_path, monkeypatch
+):
+    """The SPA fallback serves the page for page paths only, never for /api/v1."""
+    (tmp_path / "index.html").write_text("<html>example-spa-page</html>")
+    monkeypatch.setattr(server, "_get_frontend_dist_dir", lambda: str(tmp_path))
+
+    resp = client.get("/api/v1/no-such-route")
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Not Found"}
+
+    # request(), not get(): the suite's get() prefixes bare paths with /api/v1.
+    resp = client.request("GET", "/some/page")
+    assert resp.status_code == 200
+    assert "example-spa-page" in resp.text
+
+
 def test_post_logo_identical_upload(server, client):
     server.vault.import_default_data()
 
