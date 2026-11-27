@@ -554,7 +554,6 @@ def create_router(server) -> APIRouter:
                         face.character_id = None
                         session.add(face)
             session.flush()
-            session.refresh(face)
             return faces
 
         # Unlike the assign above, this handler does not expand to stacks, so the
