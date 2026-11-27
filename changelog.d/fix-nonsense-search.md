@@ -1,0 +1,1 @@
+- Fixed: a search for words no picture matched showed every picture.

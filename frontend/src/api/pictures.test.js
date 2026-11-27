@@ -142,11 +142,21 @@ describe("api/pictures", () => {
     );
   });
 
-  it("searchPictures encodes the text and appends the scope filter", async () => {
+  // Every picture with an embedding scores above 0.1 by chance, so a lower
+  // default would keep the whole library for words that match nothing.
+  it("searchPictures encodes the text, keeps scores above chance and appends the scope filter", async () => {
     apiClient.get.mockResolvedValue({ data: [] });
     await searchPictures("red car", { query: "character_id=2" });
     expect(apiClient.get).toHaveBeenCalledWith(
-      "/pictures/search?query=red%20car&threshold=0.1&top_n=10000&character_id=2",
+      "/pictures/search?query=red%20car&threshold=0.3&top_n=10000&character_id=2",
+    );
+  });
+
+  it("searchPictures sends an explicit threshold as given", async () => {
+    apiClient.get.mockResolvedValue({ data: [] });
+    await searchPictures("zzqx", { threshold: 0.05 });
+    expect(apiClient.get).toHaveBeenCalledWith(
+      "/pictures/search?query=zzqx&threshold=0.05&top_n=10000",
     );
   });
 

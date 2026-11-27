@@ -310,12 +310,16 @@ export async function likenessSearch(
   ));
 }
 
+// The lowest score a text search keeps: the server's score reaches about 0.3
+// for a picture and words unrelated to it, so a lower floor keeps everything.
+export const SEARCH_CHANCE_CEILING = 0.3;
+
 /**
  * Text-search the library.
  *
  * @param {string} text
  * @param {Object} [options]
- * @param {number} [options.threshold=0.1]
+ * @param {number} [options.threshold=SEARCH_CHANCE_CEILING]
  * @param {number} [options.topN=10000]
  * @param {string} [options.query=""] - pre-encoded filter query string to
  *   narrow the search to the current scope.
@@ -324,7 +328,7 @@ export async function likenessSearch(
  */
 export async function searchPictures(
   text,
-  { threshold = 0.1, topN = 10000, query = "", signal } = {},
+  { threshold = SEARCH_CHANCE_CEILING, topN = 10000, query = "", signal } = {},
 ) {
   return unwrap(getCancellable(
     `/pictures/search?query=${encodeURIComponent(text)}&threshold=${threshold}&top_n=${topN}${query ? `&${query}` : ""}`,
