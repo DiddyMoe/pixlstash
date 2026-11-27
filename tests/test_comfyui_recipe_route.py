@@ -55,7 +55,7 @@ from pixlstash.server import Server
 from pixlstash.services.model_shelf_service import shelf_uuid
 from pixlstash.services.workflow_identity import WORKFLOW_KEY_VERSION
 from tests.authz_guard import no_spa_fallback  # noqa: F401
-from tests.utils import upload_pictures_and_wait
+from tests.utils import bearer_client, mint_read_token, upload_pictures_and_wait
 
 API = "/api/v1"
 
@@ -1166,6 +1166,29 @@ def test_a_scoped_token_is_served_the_graph_but_never_the_library(env):
     ).json()
     assert owner_body["model_slots"][0]["model_id"] == _shelf_model_id(server)
     assert owner_body["inputs"][0]["input_picture_id"] == input_id
+
+
+def test_a_scoped_token_is_not_told_where_the_owners_comfyui_is(env, monkeypatch):
+    """The reason a pre-flight went unchecked names the owner's ComfyUI address."""
+    server, client, pic_id = env
+    _comfyui_unreachable(monkeypatch)
+    address = comfyui_module._comfyui_url(None)
+    scoped = bearer_client(
+        server,
+        mint_read_token(
+            client, "recipe address probe", resource_type="picture", resource_id=pic_id
+        ),
+    )
+
+    r = scoped.get(f"{API}/comfyui/pictures/{pic_id}/recipe")
+    assert r.status_code == 200, r.text
+    assert r.json()["preflight"]["checked"] is False
+    # The whole body: the pre-flight, the LoRA chain and the loader plan each
+    # carry the reason.
+    assert address not in r.text, "a share link was told the address"
+
+    owner = client.get(f"{API}/comfyui/pictures/{pic_id}/recipe").json()
+    assert address in owner["preflight"]["error"]
 
 
 def test_the_lightbox_read_asks_comfyui_nothing(env, monkeypatch):
