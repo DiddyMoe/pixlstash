@@ -770,8 +770,10 @@ def test_undecodable_pictures_do_not_crowd_the_tag_candidate_window(tmp_path):
 
         # Every picture but the last is undecodable. The window is
         # suggested_task_size * (TAGGER_MAX_INFLIGHT + 1) = 4 rows, so the
-        # five suppressed ones fill it completely.
+        # five suppressed ones fill it completely. The registry marks only
+        # bytes that do not decode.
         for pid, name in zip(ids[:-1], names[:-1]):
+            (tmp_path / name).write_bytes(b"test-not-a-png")
             assert vault.db.unprocessable_images.mark_unprocessable(
                 pid, str(tmp_path / name), reason="test-corrupt fixture"
             )
@@ -803,6 +805,7 @@ def test_the_tagger_count_leaves_out_pictures_it_will_not_take_up(tmp_path):
             session.commit()
 
         vault.db.run_task(add_face_rows)
+        (tmp_path / "bad.png").write_bytes(b"test-not-a-png")
         assert vault.db.unprocessable_images.mark_unprocessable(
             unreadable, str(tmp_path / "bad.png"), reason="test-corrupt fixture"
         )

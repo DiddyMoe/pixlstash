@@ -86,20 +86,22 @@ class ThumbnailGenerationTask(BaseTask):
         if img is None:
             # The file exists but cannot be loaded. Returning None leaves
             # thumbnail_width NULL, which is exactly what MissingThumbnailFinder
-            # selects on - without marking, the same picture is re-selected on
-            # every sweep forever (#585). The registry logs one warning per
-            # file version and _filter_and_claim skips it. A file that cannot
-            # be read is marked too: MissingThumbnailFinder has no retry hold,
-            # so a read failure that persists (no permission, a bad sector)
-            # would be re-selected on every sweep. The mark lifts when the file
-            # changes, and on restart.
+            # selects on - without a hold, the same picture is re-selected on
+            # every sweep forever (#585). The registry marks only bytes that do
+            # not decode, pinned until the file changes. MissingThumbnailFinder
+            # has no retry hold, so a file that cannot be read (no permission,
+            # a bad sector) is held instead, until it reads again.
             registry = getattr(self._db, "unprocessable_images", None)
             if registry is not None:
-                registry.mark_unprocessable(
-                    getattr(pic, "id", None),
-                    str(resolved),
-                    reason="thumbnail source could not be loaded",
-                )
+                pic_id = getattr(pic, "id", None)
+                if not registry.mark_unprocessable(
+                    pic_id, str(resolved), reason="thumbnail source could not be loaded"
+                ):
+                    registry.hold_unreadable(
+                        pic_id,
+                        str(resolved),
+                        reason="thumbnail source could not be read",
+                    )
             else:
                 logger.warning(
                     "ThumbnailGenerationTask: failed to load source for picture %s (%s)",

@@ -114,10 +114,14 @@ def test_untagged_breakdown_says_why_and_each_part_filters_the_grid():
             return session.get(Picture, unreadable).file_path
 
         unreadable_path = db.run_task(seed)
+        unreadable_file = ImageUtils.resolve_picture_path(
+            db.image_root, unreadable_path
+        )
+        # The registry marks only bytes that do not decode.
+        with open(unreadable_file, "wb") as handle:
+            handle.write(b"test-not-a-png")
         assert db.unprocessable_images.mark_unprocessable(
-            unreadable,
-            ImageUtils.resolve_picture_path(db.image_root, unreadable_path),
-            reason="test-corrupt fixture",
+            unreadable, unreadable_file, reason="test-corrupt fixture"
         )
 
         clear_stats_cache()
