@@ -58,6 +58,33 @@ def _unloaded_first_resize():
     return image_transform_v2(PreprocessCfg(**cfg), is_train=False).transforms[0]
 
 
+# The names open_clip downloads a tag's checkpoint under, in the order it
+# tries them.
+_HF_WEIGHT_FILES = ("open_clip_model.safetensors", "open_clip_pytorch_model.bin")
+
+
+def _cached_weights(hf_hub: str) -> Optional[str]:
+    """The tag's checkpoint from the Hugging Face cache, or None if not there.
+
+    Looked up with ``local_files_only=True``: given the tag, open_clip asks
+    the hub for the checkpoint's metadata on every load, cached or not.
+
+    Args:
+        hf_hub: The tag's ``hf_hub`` entry, ``"org/repo/"``.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    for filename in _HF_WEIGHT_FILES:
+        try:
+            return hf_hub_download(
+                repo_id=hf_hub.rstrip("/"), filename=filename, local_files_only=True
+            )
+        except LocalEntryNotFoundError:
+            continue
+    return None
+
+
 class ClipService:
     """Manages the OpenCLIP model for text and image embeddings.
 
@@ -107,8 +134,19 @@ class ClipService:
         with MODEL_CONSTRUCTION_LOCK:
             import open_clip
 
+            tag = open_clip.get_pretrained_cfg(CLIP_MODEL_NAME, CLIP_MODEL_WEIGHTS)
+            # Given a path, open_clip takes nothing from the tag; this tag's
+            # preprocessing is open_clip's default, so both loads match
+            # (tests/test_image_embedding_worker.py holds them equal).
+            pretrained = _cached_weights(tag["hf_hub"])
+            if pretrained is None:
+                logger.info(
+                    "Downloading the CLIP weights (%s) for the first time...",
+                    CLIP_MODEL_WEIGHTS,
+                )
+                pretrained = CLIP_MODEL_WEIGHTS
             model, _, preprocess = open_clip.create_model_and_transforms(
-                CLIP_MODEL_NAME, pretrained=CLIP_MODEL_WEIGHTS
+                CLIP_MODEL_NAME, pretrained=pretrained
             )
         model = model.to(self._device)
         if supports_fp16(self._device):

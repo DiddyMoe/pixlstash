@@ -87,6 +87,10 @@ _FAKE_PACKAGES = {
             return {"vision_cfg": {"image_size": 224}}
 
 
+        def get_pretrained_cfg(name, tag):
+            return {"hf_hub": "example-org/example-clip/"}
+
+
         def create_model_and_transforms(name, pretrained=None):
             return _Model(), None, transform.image_transform_v2(None, False)
 

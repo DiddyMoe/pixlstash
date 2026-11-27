@@ -10,10 +10,16 @@ import logging
 import numpy as np
 import pytest
 import torch
+from huggingface_hub.errors import LocalEntryNotFoundError
 from PIL import Image as PILImage
 from sqlmodel import Session, select, text
 
 from pixlstash.db_models import Picture
+from pixlstash.tagger_plugins.clip_service import (
+    CLIP_MODEL_NAME,
+    CLIP_MODEL_WEIGHTS,
+    ClipService,
+)
 from pixlstash.tasks import image_embedding_task as embedding_module
 from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
 from pixlstash.tasks.task_outcome import Outcome, Reason
@@ -306,6 +312,84 @@ def test_the_embedding_preload_keeps_only_what_clip_reads(tmp_path, clip_loaded)
             assert torch.equal(tensor, preprocess(original)), name
         else:
             assert tensor is None
+
+
+_CLIP_REPO = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
+
+
+@pytest.fixture
+def clip_hub(tmp_path, monkeypatch):
+    """Hugging Face as a CLIP load sees it, with every model built unweighted.
+
+    Records each ``hf_hub_download`` as ``(repo, file, local_files_only)``. A
+    local lookup raises ``lookup_error`` when one is set; anything else
+    answers with a checkpoint file that is never read.
+    """
+    import functools
+    from types import SimpleNamespace
+
+    import huggingface_hub
+    import open_clip
+
+    weights = tmp_path / "open_clip_model.safetensors"
+    weights.write_bytes(b"")
+    hub = SimpleNamespace(asked=[], lookup_error=None)
+
+    def _download(*, repo_id, filename, local_files_only=False, **_kwargs):
+        hub.asked.append((repo_id, filename, local_files_only))
+        if local_files_only and hub.lookup_error is not None:
+            raise hub.lookup_error
+        return str(weights)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _download)
+    monkeypatch.setattr(open_clip.pretrained, "hf_hub_download", _download)
+    monkeypatch.setattr(
+        open_clip,
+        "create_model_and_transforms",
+        functools.partial(open_clip.create_model_and_transforms, load_weights=False),
+    )
+    return hub
+
+
+def test_a_cached_clip_checkpoint_loads_without_asking_the_hub(clip_hub):
+    """Given the tag, open_clip asks the hub on every load, cached or not.
+
+    A cached checkpoint is loaded by its path instead, and must still be
+    preprocessed exactly as a load by the tag is.
+    """
+    import open_clip
+
+    service = ClipService(device="cpu")
+    service._load()
+
+    assert clip_hub.asked == [(_CLIP_REPO, "open_clip_model.safetensors", True)]
+    _model, _, by_tag = open_clip.create_model_and_transforms(
+        CLIP_MODEL_NAME, pretrained=CLIP_MODEL_WEIGHTS
+    )
+    assert repr(service._preprocess) == repr(by_tag)
+
+
+def test_a_clip_checkpoint_not_yet_cached_is_downloaded(clip_hub):
+    clip_hub.lookup_error = LocalEntryNotFoundError("example: not cached")
+
+    ClipService(device="cpu")._load()
+
+    assert clip_hub.asked == [
+        (_CLIP_REPO, "open_clip_model.safetensors", True),
+        (_CLIP_REPO, "open_clip_pytorch_model.bin", True),
+        (_CLIP_REPO, "open_clip_model.safetensors", False),
+    ]
+
+
+def test_a_clip_cache_that_cannot_be_read_fails_the_load_without_a_download(
+    clip_hub,
+):
+    clip_hub.lookup_error = PermissionError("example: the cache is not readable")
+
+    with pytest.raises(PermissionError):
+        ClipService(device="cpu")._load()
+
+    assert clip_hub.asked == [(_CLIP_REPO, "open_clip_model.safetensors", True)]
 
 
 def test_an_animated_gif_preloads_three_frames_and_a_still_gif_one(tmp_path):
