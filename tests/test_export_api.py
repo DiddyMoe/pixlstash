@@ -154,6 +154,64 @@ def test_a_selection_of_thousands_of_ids_in_the_body_exports_those_pictures():
         gc.collect()
 
 
+def _export_zip_names(client, picture_ids):
+    """The member names of a ZIP export of *picture_ids*, in archive order."""
+    resp = client.post(
+        "/pictures/export",
+        json={
+            "picture_ids": picture_ids,
+            "caption_mode": "none",
+            "use_original_file_names": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["task_id"]
+    _wait_for_export(client, task_id)
+    resp = client.get(f"{API_PREFIX}/pictures/export/download/{task_id}")
+    assert resp.status_code == 200, resp.text
+    with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+        return zf.namelist()
+
+
+def test_an_export_keeps_the_order_the_pictures_are_named_in():
+    """A selection is packaged in the order named, a repeated id once, at its
+    first place."""
+    temp_dir, client, server = _setup()
+    try:
+        first = _upload_picture(client, "Bad1.png")
+        second = _upload_picture(client, "Bad2.png")
+        third = _upload_picture(client, "Reference1.png")
+
+        names = _export_zip_names(client, [third, first, third, second])
+        assert names == ["Reference1.png", "Bad1.png", "Bad2.png"]
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_an_exported_stack_keeps_its_place_in_the_selection():
+    """A stack is packaged as its cover, where its first picture was named."""
+    temp_dir, client, server = _setup()
+    try:
+        stacked = [
+            _upload_picture(client, "Bad2.png"),
+            _upload_picture(client, "Reference1.png"),
+        ]
+        loose = _upload_picture(client, "Bad1.png")
+        resp = client.post("/stacks", json={"picture_ids": stacked})
+        assert resp.status_code == 200, resp.text
+
+        names = _export_zip_names(client, [stacked[0], loose, stacked[1]])
+        assert len(names) == 2, names
+        assert names[0] in {"Bad2.png", "Reference1.png"}, names
+        assert names[1] == "Bad1.png", names
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
 def test_project_export_produces_valid_zip():
     temp_dir, client, server = _setup()
     try:

@@ -347,7 +347,7 @@ Key endpoints (see the auto-generated index below for the full set):
 | POST | `/pictures/import/staging/{staging_id}/commit` | Safe handoff → background `PictureImportTask`; idempotent per session |
 | DELETE | `/pictures/import/staging/{staging_id}` | Cancel an uncommitted staging session |
 | GET | `/pictures/import/staging/{staging_id}/status` | Staging + background-import progress |
-| GET | `/pictures/export` | Start async ZIP export |
+| GET | `/pictures/export` | Start async ZIP export. Named pictures (`id=`, or the POST's `picture_ids`) are packaged in the order named, a repeated id once and a stack as its cover in its first picture's place |
 | GET | `/pictures/export/status?task_id=…` | Export progress |
 | GET | `/pictures/export/download/{task_id}` | Download finished ZIP |
 | POST | `/pictures/export` | Start async ZIP export of the pictures named in the JSON body (`picture_ids`), for a selection too large for the GET's query string; same scope filter as the GET |

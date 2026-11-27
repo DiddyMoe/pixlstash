@@ -587,20 +587,28 @@ class ExportUtils:
         The leader is the cover the grid shows, the lowest ``stack_position``;
         a stack without positions falls back to the newest picture by
         ``created_at`` (ties broken by highest ``id``). Pictures not in any
-        stack are passed through unchanged.
+        stack are passed through unchanged. The order is kept: a leader takes
+        the place of its stack's first picture in *pics*.
         """
         by_stack: dict = {}
-        result = []
+        slots = []
         for pic in pics:
             stack_id = getattr(pic, "stack_id", None)
             if stack_id is None:
-                result.append(pic)
+                slots.append(pic)
+            elif stack_id in by_stack:
+                by_stack[stack_id].append(pic)
             else:
-                by_stack.setdefault(stack_id, []).append(pic)
+                by_stack[stack_id] = [pic]
+                slots.append(by_stack[stack_id])
 
-        for stack_id, members in by_stack.items():
+        result = []
+        for slot in slots:
+            if not isinstance(slot, list):
+                result.append(slot)
+                continue
             newest = sorted(
-                members,
+                slot,
                 key=lambda p: (
                     getattr(p, "created_at", None) or "",
                     getattr(p, "id", 0) or 0,
@@ -617,6 +625,25 @@ class ExportUtils:
             result.append(leader)
 
         return result
+
+    @staticmethod
+    def _find_pictures_in_order(server, picture_ids, *, select_fields, include_deleted):
+        """Read the named pictures, in the order named, a repeated id once."""
+        ordered = list(dict.fromkeys(int(pid) for pid in picture_ids))
+
+        def fetch(session):
+            found = {
+                pic.id: pic
+                for pic in Picture.find(
+                    session,
+                    id=ordered,
+                    select_fields=select_fields,
+                    include_deleted=include_deleted,
+                )
+            }
+            return [found[pid] for pid in ordered if pid in found]
+
+        return server.vault.db.run_task(fetch)
 
     @staticmethod
     def _fetch_character_picture_ids(server, character_id: int, only_deleted: bool):
@@ -672,9 +699,9 @@ class ExportUtils:
         threshold = background_data.get("threshold", 0.0)
 
         if picture_ids:
-            pics = server.vault.db.run_task(
-                Picture.find,
-                id=picture_ids,
+            pics = ExportUtils._find_pictures_in_order(
+                server,
+                picture_ids,
                 select_fields=select_fields,
                 include_deleted=only_deleted,
             )
