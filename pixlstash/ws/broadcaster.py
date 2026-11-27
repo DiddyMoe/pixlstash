@@ -512,12 +512,14 @@ class WsBroadcasterMixin:
                 # acceptance and tracked registration.  Every exit (including
                 # injected accept/lock failures) releases exactly once.
                 self.library_coordinator.release_read(lease)
-            if client is None:
-                # Admission can be granted before a later step in the leased
-                # block fails. The receive loop's ``finally`` never runs on this
-                # path, so release the admission lease here instead.
-                if admission_lease is not None:
+                if client is None:
+                    # Admission can be granted before a later step in the
+                    # leased block returns or raises - ``accept`` raises when
+                    # the peer has already gone. The receive loop's ``finally``
+                    # never runs on either path, so release the admission lease
+                    # here. Left held, it fails every later restore's drain.
                     self.auth.unregister_authenticated_websocket(admission_lease)
+            if client is None:
                 return
             try:
                 while True:
