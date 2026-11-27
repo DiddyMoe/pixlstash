@@ -705,9 +705,20 @@ class TrainingService:
         # terminal status; writing 'stopping' after that would clobber the
         # terminal state. Marking it first lets the worker's _finalize win. Under
         # the lock _persist_progress reads and writes under, so a poll cannot
-        # read "running" and then write it over this flag.
+        # read "running" and then write it over this flag. Written only while
+        # unfinished: _finalize writes the end state outside this lock, so a
+        # run that ended since the read keeps it. A flag lost to a busy hub
+        # still stops the trainer.
         with self._active_lock:
-            self._update_job(info["uuid"], status="stopping")
+            marked = self._update_job(
+                info["uuid"],
+                status="stopping",
+                only_if_status=training_runs.UNFINISHED_STATUSES,
+            )
+        if not marked and (
+            self._job_status(info["uuid"]) not in training_runs.UNFINISHED_STATUSES
+        ):
+            return False
         logger.info("cancel: job %s asked to stop (status=stopping).", info["uuid"])
 
         with self._active_lock:
@@ -2115,7 +2126,12 @@ class TrainingService:
         return training_runs.get_run_status(self._hub, job_uuid)
 
     def _update_job(
-        self, job_uuid: str, *, attempts: int | None = None, **fields
+        self,
+        job_uuid: str,
+        *,
+        attempts: int | None = None,
+        only_if_status: tuple[str, ...] | None = None,
+        **fields,
     ) -> bool:
         """Update columns on a training run by uuid.
 
@@ -2126,11 +2142,14 @@ class TrainingService:
             attempts: How many times to try. Defaults to
                 ``_RETRIED_WRITE_ATTEMPTS`` for a write of an end state, which
                 nothing writes again once the run is over, else to once.
+            only_if_status: Write only while the run's status is one of
+                these (see ``training_runs.update_run``).
             **fields: Column names → values to set.
 
         Returns:
             True when the row was written. False, after logging why, when no
-            run has that uuid or the write failed.
+            run has that uuid, its status is not in *only_if_status*, or the
+            write failed.
         """
         if attempts is None:
             attempts = (
@@ -2142,9 +2161,19 @@ class TrainingService:
         while True:
             attempt += 1
             try:
-                if training_runs.update_run(self._hub, job_uuid, **fields):
+                if training_runs.update_run(
+                    self._hub, job_uuid, only_if_status=only_if_status, **fields
+                ):
                     return True
-                logger.warning("_update_job: no job with uuid=%s", job_uuid)
+                if only_if_status is None:
+                    logger.warning("_update_job: no job with uuid=%s", job_uuid)
+                else:
+                    logger.info(
+                        "_update_job: job %s is gone or no longer %s; %s not written",
+                        job_uuid,
+                        "/".join(only_if_status),
+                        list(fields),
+                    )
                 return False
             except sqlite3.OperationalError:
                 if attempt >= attempts:

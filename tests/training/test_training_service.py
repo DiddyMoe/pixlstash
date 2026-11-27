@@ -761,6 +761,53 @@ def test_a_cancel_that_read_queued_stops_a_run_launched_meanwhile(
     assert cancelled == [4242]
 
 
+def test_a_cancel_that_read_running_leaves_a_run_that_ended_meanwhile(
+    hub, repo_dir, monkeypatch
+):
+    """cancel() reads the run before taking the lock; if the run ended in
+    between, nothing is left to stop, and ``stopping`` must not be written
+    over its end state, where no poll would ever clear it."""
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    job = service.enqueue(
+        set_id=_SET_ID,
+        name="ended",
+        base_model="m",
+        trigger_word="t",
+        template_path=_write_template(repo_dir, steps=4, save_every=2),
+    )
+    training_runs.update_run(hub, job["uuid"], status="running", pid=4242)
+    stale = training_runs.get_run(hub, _LIBRARY_UUID, job["id"])
+    training_runs.update_run(
+        hub, job["uuid"], status="completed", completed_at=now_iso()
+    )
+    cancelled = []
+
+    class _Backend:
+        def cancel(self, handle):
+            cancelled.append(handle.pid)
+
+    service._active_backend = _Backend()
+    service._active_job_uuid = job["uuid"]
+    reads = iter([stale])
+    real_get_run = training_runs.get_run
+    monkeypatch.setattr(
+        training_service_module.training_runs,
+        "get_run",
+        lambda *args: next(reads, None) or real_get_run(*args),
+    )
+
+    assert service.cancel(job["id"]) is False
+
+    assert _job_status(hub, job["uuid"]).status == "completed"
+    assert cancelled == []
+
+
 def test_shutdown_mid_run_leaves_the_live_job_running(hub, repo_dir, monkeypatch):
     """Stopping the service while a trainer runs must not mark it errored.
 
@@ -1749,13 +1796,13 @@ def _polled_run(hub, repo_dir, monkeypatch, job_uuid, fail_first=False):
     writes = []
     real_update = training_runs.update_run
 
-    def update_run(hub_, run_uuid, **fields):
+    def update_run(hub_, run_uuid, *, only_if_status=None, **fields):
         # A new phase is written on its own; it is not a progress write.
         if set(fields) != {"phase_log"}:
             writes.append(set(fields))
             if fail_first and len(writes) == 1:
                 raise sqlite3.OperationalError("database is locked")
-        return real_update(hub_, run_uuid, **fields)
+        return real_update(hub_, run_uuid, only_if_status=only_if_status, **fields)
 
     monkeypatch.setattr(training_runs, "update_run", update_run)
     return service, writes
@@ -3153,6 +3200,26 @@ def test_a_progress_write_is_not_retried(hub, repo_dir, monkeypatch, tmp_path):
     )
 
     assert len(tried) == 1
+
+
+def test_a_stop_whose_flag_meets_a_busy_hub_still_stops_the_trainer(
+    hub, repo_dir, monkeypatch
+):
+    service, _, job = _queued(hub, repo_dir)
+    training_runs.update_run(hub, job["uuid"], status="running", pid=4242)
+    cancelled = []
+
+    class _Backend:
+        def cancel(self, handle):
+            cancelled.append(handle.pid)
+
+    service._active_backend = _Backend()
+    service._active_job_uuid = job["uuid"]
+    _busy_hub_for(monkeypatch, lambda fields: fields.get("status") == "stopping")
+
+    assert service.cancel(job["id"]) is True
+
+    assert cancelled == [4242]
 
 
 def test_a_launch_that_cannot_be_recorded_stops_its_trainer(hub, repo_dir, monkeypatch):
