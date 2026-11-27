@@ -162,8 +162,13 @@ async function load() {
   error.value = "";
   loadError.value = "";
   refused.value = false;
+  // An edit the server does not hold yet (its save is debounced or in flight)
+  // outranks this read: applying it would snap the builder back to the stored
+  // layout.
+  const seq = editSeq;
   try {
-    applySettings(await getLayoutSettings());
+    const body = await getLayoutSettings();
+    if (seq === editSeq && storedEditSeq === editSeq) applySettings(body);
     loaded.value = true;
     // A library with no layout opens on an empty slot, and the dialog writes
     // NOTHING until the owner picks a level.
@@ -186,19 +191,6 @@ async function load() {
     loading.value = false;
   }
 }
-
-// Vuetify dialogs stay mounted after the first open, so onMounted fires only
-// once - fetch on the open transition instead (the house pattern). `blocked` is
-// watched alongside it because the registry read that answers it is still in
-// flight when the dialog opens.
-watch(
-  [() => props.open, blocked],
-  ([isOpen, cannot]) => {
-    if (!isOpen || cannot || loaded.value) return;
-    load();
-  },
-  { immediate: true },
-);
 
 /**
  * Coalesce a burst of edits into one PATCH.
@@ -519,6 +511,31 @@ async function refreshPreview() {
     if (seq === previewSeq) previewing.value = false;
   }
 }
+
+// Vuetify dialogs stay mounted after the first open, so onMounted fires only
+// once - fetch on the open transition instead (the house pattern). `blocked` is
+// watched alongside it because the registry read that answers it is still in
+// flight when the dialog opens.
+//
+// Every open reads again: pictures are imported and moved while the dialog is
+// closed, so the last visit's count is not the plan any more. A move or undo
+// still going owns the bar until it ends. Declared below the state it reads,
+// since `immediate` runs it during setup.
+watch(
+  [() => props.open, blocked],
+  ([isOpen, cannot], previous) => {
+    if (!isOpen || cannot) return;
+    if (!loaded.value) {
+      load();
+      return;
+    }
+    // Already open: `blocked` settled again, nothing was reopened.
+    if (previous?.[0]) return;
+    if (migrating.value || undoing.value) return;
+    load();
+  },
+  { immediate: true },
+);
 
 // The sweep changes the count, so toggling it is an edit as far as the bar is
 // concerned: stale until the new count lands.

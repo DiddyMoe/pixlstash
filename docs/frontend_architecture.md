@@ -974,6 +974,9 @@ is spent on the one thing that needs it. One pane, no steps:
   a second yes for one gesture. Every edit marks the count stale, the bar reads
   `counting…` *instead of* the old number, and the primary is inert until a
   fresh count lands. A number that lags the tree is worse than no number.
+  Every open re-reads the layout and counts again, since pictures move while
+  the dialog is closed; a move or undo still running keeps the bar, and an edit
+  whose save has not landed stays on screen over the reopen's read.
 - **Saves are debounced 500 ms.** `v-select multiple` emits per item toggle and
   every save re-counts.
 - **The migration runs in passes and echoes one `batch_id`**, which is what makes
