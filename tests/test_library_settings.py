@@ -678,6 +678,19 @@ class TestValueTypes:
         assert (body["columns"], body["stack_strictness"]) == (5, 0.5)
 
 
+class TestRequestBody:
+    """A config PATCH body that is not a JSON object answers 422."""
+
+    @pytest.mark.parametrize("body", [b"[1]", b"example-not-json"])
+    def test_a_body_that_is_not_a_json_object_answers_422(self, server, body):
+        response = _owner(server).patch(
+            f"{API}/users/me/config",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422, response.text
+
+
 class TestTagChipSize:
     """The tag chip size is the owner's, kept in its own hub table."""
 

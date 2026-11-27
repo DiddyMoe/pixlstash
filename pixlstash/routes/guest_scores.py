@@ -23,6 +23,7 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models.guest_score import GuestScore
 from pixlstash.db_models.guest_session import GuestSession
 from pixlstash.pixl_logging import get_logger
+from pixlstash.routes._helpers import read_json_object
 from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
 from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
@@ -143,6 +144,7 @@ def create_router(server) -> APIRouter:
 
         Raises:
             400: Validation error (bad session_id, bad score value, too many entries).
+            422: The body is not a JSON object.
             503: Too many concurrent active guest sessions (new session refused).
         """
         token_scope = getattr(request.state, "token_scope", None)
@@ -155,7 +157,7 @@ def create_router(server) -> APIRouter:
                 status_code=403, detail="No token_public_id on request state"
             )
 
-        body: dict[str, Any] = await request.json()
+        body = await read_json_object(request)
 
         # Validate session_id - rebind from the match group so the value used
         # downstream is the regex-validated string, not raw user input.

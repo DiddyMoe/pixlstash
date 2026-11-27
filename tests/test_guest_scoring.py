@@ -267,6 +267,22 @@ def test_post_too_many_scores():
 
 
 # ---------------------------------------------------------------------------
+# 6b. POST - a body that is not a JSON object → 422
+# ---------------------------------------------------------------------------
+
+
+def test_post_body_that_is_not_an_object():
+    with tempfile.TemporaryDirectory() as tmp:
+        server, _, read_token = _setup(tmp)
+        try:
+            rc = _read_client(server, read_token)
+            r = rc.post(f"{API}/pictures/guest-scores", json=[1])
+            assert r.status_code == 422, r.text
+        finally:
+            server.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
 # 7. Successful POST - score persisted, in-memory tracker updated
 # ---------------------------------------------------------------------------
 

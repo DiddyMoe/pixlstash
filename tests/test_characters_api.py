@@ -90,6 +90,20 @@ def test_patch_character_name_and_description():
         gc.collect()
 
 
+def test_patch_character_with_a_body_that_is_not_an_object_answers_422():
+    temp_dir, client, server = _setup()
+    try:
+        resp = client.post("/characters", json={"name": "Dana"})
+        char_id = resp.json()["character"]["id"]
+
+        resp = client.patch(f"/characters/{char_id}", json=[1])
+        assert resp.status_code == 422, resp.text
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
 def test_delete_character_returns_success():
     temp_dir, client, server = _setup()
     try:

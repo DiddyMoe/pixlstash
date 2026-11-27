@@ -22,7 +22,7 @@ from pixlstash.hub.workflows import (
     picture_ghost_count,
 )
 from pixlstash.pixl_logging import get_logger
-from pixlstash.routes._helpers import require_hub
+from pixlstash.routes._helpers import read_json_object, require_hub
 from pixlstash.routes.model_folders import register_comfyui_model_folders
 from pixlstash.utils.path_utils import LibraryRootsUnavailable
 from pixlstash.utils.sql_chunking import chunked
@@ -812,12 +812,8 @@ def create_router(server) -> APIRouter:
 
         start_time = time.time()
         logger.debug(f"[TIMING] PATCH /users/me/config called at {start_time:.3f}")
-        patch_data = await request.json()
-        refused = [
-            key
-            for key in AI_TOOLKIT_CONFIG_KEYS
-            if isinstance(patch_data, dict) and key in patch_data
-        ]
+        patch_data = await read_json_object(request)
+        refused = [key for key in AI_TOOLKIT_CONFIG_KEYS if key in patch_data]
         if refused:
             raise HTTPException(
                 status_code=422,
@@ -826,17 +822,13 @@ def create_router(server) -> APIRouter:
                     "checkout and its Python with PUT /api/v1/training/ai-toolkit/config."
                 ),
             )
-        auto_exclusive = (
-            patch_data.pop("auto_exclusive_after_oom", None)
-            if isinstance(patch_data, dict)
-            else None
-        )
+        auto_exclusive = patch_data.pop("auto_exclusive_after_oom", None)
         if auto_exclusive is not None and not isinstance(auto_exclusive, bool):
             raise HTTPException(
                 status_code=400, detail="auto_exclusive_after_oom must be true or false"
             )
         chip_size = None
-        if isinstance(patch_data, dict) and tag_preferences.CONFIG_KEY in patch_data:
+        if tag_preferences.CONFIG_KEY in patch_data:
             # Its own hub table, not the user row. Checked here, before any
             # write, and stored only once the user row has been saved, so a
             # PATCH refused for any value saves none of them.
@@ -920,7 +912,7 @@ def create_router(server) -> APIRouter:
             if user is None:
                 raise HTTPException(status_code=404, detail="User not found")
 
-            if isinstance(patch_data, dict) and "comfyui_url" in patch_data:
+            if "comfyui_url" in patch_data:
                 _refuse_orphaning_a_link(user, patch_data["comfyui_url"])
             old_penalised_tags = resolve_owner_penalised_tags(
                 user.smart_score_penalised_tags

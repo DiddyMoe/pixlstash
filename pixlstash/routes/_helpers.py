@@ -1,6 +1,8 @@
 """Shared route helpers. Import these instead of duplicating an inline guard."""
 
-from fastapi import HTTPException
+import json
+
+from fastapi import HTTPException, Request
 from sqlmodel import Session, select
 
 from pixlstash.db_models import (
@@ -87,3 +89,22 @@ def require_hub(
     if hub is None:
         raise HTTPException(status_code=503, detail=detail)
     return hub
+
+
+async def read_json_object(request: Request) -> dict:
+    """The request body as a JSON object, or a 422 saying why it is not one.
+
+    For a handler that reads its body itself instead of declaring a model; a
+    route whose body FastAPI parses answers the same two mistakes with 422.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=422, detail="The request body is not valid JSON."
+        ) from exc
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=422, detail="The request body must be a JSON object."
+        )
+    return body

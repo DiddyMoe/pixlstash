@@ -56,6 +56,7 @@ from pixlstash.services.layout_move_service import rename_entity_folders
 from pixlstash.services.set_lock_service import locked_picture_ids
 from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
 from pixlstash.tasks.face_extraction_task import CROP_EXPAND_SCALE
+from pixlstash.routes._helpers import read_json_object
 from pixlstash.routes.pictures import FaceListResponse
 from pixlstash.utils.library_layout import Facet
 from pixlstash.utils.field_allowlist import (
@@ -970,7 +971,7 @@ def create_router(server) -> APIRouter:
     )
     async def patch_character(id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
-        data = await request.json()
+        data = await read_json_object(request)
         name = data.get("name")
         description = data.get("description")
         # Sentinel, because ``null`` is a meaningful value here: it clears the
