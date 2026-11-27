@@ -550,9 +550,19 @@ class ModelFolderDirResponse(BaseModel):
     has_dirs: bool = Field(
         description=(
             "Whether this directory holds at least one subdirectory the tree "
-            "would show, so the client knows to draw an expand arrow before it "
-            "asks."
+            "would show, a link node included, so the client knows to draw an "
+            "expand arrow before it asks. Always false on a link node."
         )
+    )
+    link: bool = Field(
+        default=False,
+        description=(
+            "Whether this entry is a symlink or junction to a directory. The scan "
+            "follows it, and the counts are the models registered under this "
+            "name, zero when the scan skipped it. It is read-only: nothing is "
+            "moved, renamed, removed or created through it, and the tree does "
+            "not expand it."
+        ),
     )
 
 
@@ -779,7 +789,8 @@ def _is_samples_dir_of(name: str, sample_stems: set[str]) -> bool:
 def _offered_dir(entry: os.DirEntry, sample_stems: set[str]) -> bool:
     """Whether the tree shows *entry* as a subdirectory.
 
-    Dot-names, symlinks and Windows junctions are never offered. A bind
+    Dot-names, symlinks and Windows junctions are never offered here; a link
+    to a directory is offered as a link node by :func:`_offered_link`. A bind
     mount is a directory to every API here and is offered, as the scanner walks
     it. A ``<stem>_samples`` directory is
     hidden beside a model whose filename stem is ``<stem>``: its previews belong
@@ -800,15 +811,33 @@ def _offered_dir(entry: os.DirEntry, sample_stems: set[str]) -> bool:
     return not _is_samples_dir_of(entry.name, sample_stems)
 
 
+def _offered_link(entry: os.DirEntry, sample_stems: set[str]) -> bool:
+    """Whether the tree shows *entry* as a link node: a link to a directory.
+
+    Dot-names and a ``<stem>_samples`` link beside its model are not offered,
+    as for a directory; nor are a broken link and a link to a file.
+    """
+    if entry.name.startswith(".") or _is_samples_dir_of(entry.name, sample_stems):
+        return False
+    try:
+        return is_link_entry(entry) and entry.is_dir()
+    except OSError as exc:
+        logger.warning("Left %s out of the folder tree: %s", entry.path, exc)
+        return False
+
+
 def _has_offered_dir(directory: str, sample_stems: set[str]) -> bool:
-    """Whether *directory* holds at least one offered subdirectory.
+    """Whether *directory* holds at least one offered subdirectory or link node.
 
     Raises:
         OSError: When the directory cannot be listed. The caller decides what
             that means for its answer.
     """
     with os.scandir(directory) as entries:
-        return any(_offered_dir(entry, sample_stems) for entry in entries)
+        return any(
+            _offered_dir(entry, sample_stems) or _offered_link(entry, sample_stems)
+            for entry in entries
+        )
 
 
 class ModelFolderDeleteResponse(BaseModel):
@@ -983,8 +1012,7 @@ def register_model_folder(
         raise HTTPException(status_code=400, detail=error)
     # That check compares strings, so one symlink defeats it:
     # ``/home/u/models-link -> /etc`` passes, and the scan then walks /etc
-    # because os.walk follows the top-level link (followlinks=False only
-    # governs links found inside the tree). The example is spelled absolute
+    # because it follows links. The example is spelled absolute
     # because the lexical check above has already refused anything else, and
     # nothing here expands ``~``. Resolve, re-run the blocklist on what the
     # link actually points
@@ -1420,8 +1448,10 @@ def create_router(server) -> APIRouter:
             "level per call, so the models tree opens lazily.\n\n"
             "`path` is POSIX and relative to the folder; leave it empty for the "
             "root. Every directory carries the `present` models under it, "
-            "recursively, and those directly in it. Empty directories are listed. Dot-names, symlinks and a "
-            "`<stem>_samples` directory beside its model are not.\n\n"
+            "recursively, and those directly in it. Empty directories are listed. Dot-names, broken links, "
+            "links to files and a `<stem>_samples` directory beside its model are not.\n\n"
+            "A link to a directory is listed with `link: true` and `has_dirs: false`: "
+            "the scan follows it, and the tree shows it read-only without expanding it.\n\n"
             "A locked folder answers `locked: true` with no `dirs`, and its disk "
             "is not read; the counts still come from the database."
         ),
@@ -1489,12 +1519,14 @@ def create_router(server) -> APIRouter:
 
         dirs: list[ModelFolderDirResponse] = []
         if not locked:
+            offered: list[tuple[os.DirEntry, bool]] = []
             try:
                 with os.scandir(directory) as entries:
-                    offered = sorted(
-                        (e for e in entries if _offered_dir(e, here_stems)),
-                        key=lambda e: (e.name.casefold(), e.name),
-                    )
+                    for e in entries:
+                        if _offered_dir(e, here_stems):
+                            offered.append((e, False))
+                        elif _offered_link(e, here_stems):
+                            offered.append((e, True))
             except OSError as exc:
                 logger.warning(
                     "Could not list model folder %s at %r (%s): %s",
@@ -1507,10 +1539,11 @@ def create_router(server) -> APIRouter:
                     status_code=409,
                     detail="Could not read this directory.",
                 ) from exc
-            for entry in offered:
+            offered.sort(key=lambda pair: (pair[0].name.casefold(), pair[0].name))
+            for entry, link in offered:
                 child = children.get(entry.name, _Subtree())
                 try:
-                    has_dirs = _has_offered_dir(
+                    has_dirs = not link and _has_offered_dir(
                         entry.path, child_stems.get(entry.name, set())
                     )
                 except OSError as exc:
@@ -1530,6 +1563,7 @@ def create_router(server) -> APIRouter:
                         direct_model_count=len(child.direct_ids),
                         bytes=child.bytes,
                         has_dirs=has_dirs,
+                        link=link,
                     )
                 )
 

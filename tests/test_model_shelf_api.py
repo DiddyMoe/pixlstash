@@ -10265,6 +10265,26 @@ def test_a_relpath_that_escapes_its_folder_is_refused_not_unlinked(
     assert list(fake_trash.iterdir()) == []
 
 
+def test_a_model_behind_a_directory_link_is_refused_not_unlinked(
+    shelf_env, real_files, fake_trash, tmp_path
+):
+    """The scan lists a model through a link to a directory elsewhere; the
+    shelf does not delete inside the place the link names."""
+    outside = tmp_path / "other-drive"
+    outside.mkdir()
+    behind = outside / "alice.safetensors"
+    write_adapter(behind)
+    os.symlink(outside, real_files / "linked", target_is_directory=True)
+    alice = shelf_env.model_ids["alice.safetensors"]
+    _relpath_of(shelf_env.server, "alice.safetensors", "linked/alice.safetensors")
+
+    r = _delete(shelf_env, [alice])
+    assert r.status_code == 200, r.text
+    assert r.json()["refused"] == [{"id": alice, "reason": "escapes_its_folder"}]
+    assert behind.exists(), "the file behind the link was deleted"
+    assert list(fake_trash.iterdir()) == []
+
+
 def test_delete_takes_the_same_job_slot_as_a_move_and_an_import(
     shelf_env, real_files, fake_trash
 ):
@@ -11800,20 +11820,33 @@ def test_dirs_count_every_copy_beneath_each_entry(shelf_env, tmp_path):
     assert (dirs["empty"]["model_count"], dirs["empty"]["bytes"]) == (0, 0)
 
 
-def test_dot_dirs_symlinks_and_files_are_not_offered(shelf_env, tmp_path):
+def test_dot_dirs_and_files_are_not_offered_and_a_dir_link_is_a_link_node(
+    shelf_env, tmp_path
+):
     root = tmp_path / "loras"
     (root / "real").mkdir(parents=True)
     (root / ".cache").mkdir()
     (root / "style").mkdir()
-    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "deeper").mkdir(parents=True)
     (root / "linked").symlink_to(tmp_path / "outside", target_is_directory=True)
     (root / "alias").symlink_to(root / "style", target_is_directory=True)
+    (root / "real" / "away").symlink_to(tmp_path / "outside", target_is_directory=True)
+    (root / "broken").symlink_to(tmp_path / "gone", target_is_directory=True)
     (root / "notes.txt").write_text("not a folder")
+    (root / "notes-link").symlink_to(root / "notes.txt")
     _seeded_folder_at(shelf_env.server, str(root))
-    _set_copies(shelf_env, 1, [("real/a.safetensors", 4)])
+    _set_copies(shelf_env, 1, [("real/a.safetensors", 4), ("linked/b.safetensors", 2)])
 
     body = _listing(shelf_env).json()
-    assert [entry["name"] for entry in body["dirs"]] == ["real", "style"]
+    assert [
+        (entry["name"], entry["link"], entry["has_dirs"], entry["model_count"])
+        for entry in body["dirs"]
+    ] == [
+        ("alias", True, False, 0),
+        ("linked", True, False, 1),
+        ("real", False, True, 1),
+        ("style", False, False, 0),
+    ]
 
 
 def test_a_samples_directory_is_hidden_beside_its_model_and_shown_without_one(

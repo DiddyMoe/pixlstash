@@ -12640,6 +12640,20 @@ mounted over it is not (`_emptied_since_seen`). A mount point re-created on
 every boot does read as emptied, and a share whose clock runs behind this
 machine's can keep an emptied folder `unreachable`.
 
+**A scan follows links, as ComfyUI does.** A directory in a model folder that is
+a symlink, or a junction on Windows, to another drive is where the owner's models
+are, and ComfyUI loads them from there. `ModelFolderScanner._walk` follows it and
+registers each file under its path through the link, the name ComfyUI loads it
+by. Each directory's real path is tracked, and a directory is skipped, with an
+info line naming it and its target, when its real path was already walked in this
+scan (two links to one place); when it is a link into this folder, or to this
+folder, the link's own directory or anything above them (the plain walk lists
+the first; the rest are loops); or when it lies outside this folder and inside
+another registered folder, which lists it under its own row. Directories are
+walked in name order, so the spelling that wins is the same on every scan. The
+watch does not descend into a link, so a change behind one waits for the
+10-minute rescan.
+
 **The shelf hears about it.** A scan that found copies the folder had no
 `present` row for announces their ids as `models_arrived`, the event a download
 announces, so the open shelf re-reads and badges them as new. A scan that only
@@ -13477,9 +13491,14 @@ arrow before it is asked.
   what the scanner recorded" would have hidden it. A missing path or a file is
   404. A directory that cannot be listed is logged with the folder id, the path
   and the error, and answers 409.
-- **What the tree offers.** Dot-names, symlinks and Windows junctions
-  (`utils.links.is_link_entry`, §11) are skipped, and non-directories too; an
-  entry removed since the listing is left out with a warning.
+- **What the tree offers.** Dot-names, broken links, links to files and other
+  non-directories are skipped; an entry removed since the listing is left out
+  with a warning. A symlink or Windows junction to a directory
+  (`utils.links.is_link_entry`, §11) is listed with `link: true` and
+  `has_dirs: false`: the scan follows it (25.13), so its counts are the models
+  registered under its name, zero when the scan skipped it. The tree shows it
+  read-only and does not expand it, and the move and folder verbs refuse it
+  (25.24). Listing through a link that leaves the folder is the 400 above.
   A bind mount is a plain directory to every API here and is offered, as the
   scanner walks it: it is the owner's own mount inside their own folder. Names sort case-insensitively. A `<stem>_samples` directory is
   hidden when a `present` model file directly in the same directory has the stem
@@ -13502,8 +13521,9 @@ arrow before it is asked.
   directory still counts toward its ancestors' totals, because the totals describe
   what the database holds beneath the path, not what the tree shows.
 - **`has_dirs`.** One `os.scandir` peek per visible child, applying the same
-  filters with that child's direct-file stems from the rows already read. A child
-  that cannot be peeked answers `has_dirs: false` and is logged as a warning.
+  filters with that child's direct-file stems from the rows already read, so a
+  link inside counts. A child that cannot be peeked answers `has_dirs: false`
+  and is logged as a warning; a link node is never peeked.
 - **Authority.** `LOCAL_OWNER_ONLY` (§16.3), not `owner_only`: the route reports
   directory names PixlStash never registered, the authority
   `GET /api/v1/models/{model_id}/samples` already exercises. The templated path is
@@ -13527,9 +13547,11 @@ anything is written:
   One removed between the plan and the write fails that file rather than being
   recreated: only a relocation, which keeps its tree, makes directories.
 - **A link, a junction or a dot-name on the way is a 400**, even one that stays
-  inside the folder. The listing never offers them, and the scanner does not
-  walk through a link, so a file moved through one would sit at a path no
-  rescan finds.
+  inside the folder. The listing never offers a dot-name and shows a link only
+  as a read-only node: the scan lists the models behind one (25.13), but its
+  target is another place on disk, which the shelf moves nothing into. A model
+  registered through a link resolves outside its folder, so
+  `resolve_path_within` refuses it as a move source too.
 - **A locked destination is a 409.** A folder whose `movable` is not `per_item`
   (the managed store, the HuggingFace cache, the InsightFace packs) takes no
   move in, as it already gave none out. Before #2204 the managed store was a

@@ -1398,6 +1398,107 @@ describe("the folder verbs (#2206)", () => {
   });
 });
 
+describe("ModelFolderTree and a linked directory", () => {
+  // A symlink or junction to a directory: the server lists the models behind
+  // it and refuses every move, rename and new folder through it.
+  const SHARED = {
+    name: "Shared",
+    path: "Shared",
+    model_count: 7,
+    direct_model_count: 5,
+    bytes: 1,
+    has_dirs: false,
+    link: true,
+  };
+  const ROOT_LISTING = LISTINGS["1:"];
+
+  beforeEach(() => {
+    LISTINGS["1:"] = [...ROOT_LISTING, SHARED];
+    LISTINGS["1:Shared"] = [
+      { name: "inner", path: "Shared/inner", model_count: 2, direct_model_count: 2, bytes: 1, has_dirs: false },
+    ];
+    useLibrariesStore().canManage = true;
+  });
+
+  afterEach(() => {
+    LISTINGS["1:"] = ROOT_LISTING;
+    delete LISTINGS["1:Shared"];
+    useModelShelfStore().dragCopies = null;
+    useModelShelfStore().cutCopies = null;
+  });
+
+  async function openFolder(props = {}) {
+    const wrapper = mountTree(props);
+    await flushPromises();
+    await item(wrapper, 1).find(".mft-twist").trigger("click");
+    await flushPromises();
+    return wrapper;
+  }
+
+  it("draws a link read-only: its arrow, nothing to expand, no menu, no drag and no drop", async () => {
+    const shelf = useModelShelfStore();
+    const wrapper = await openFolder();
+    // The shelf reads the place it opens, a link included.
+    await useModelFoldersStore().loadDirs(1, "Shared");
+    await flushPromises();
+    const link = item(wrapper, 1, "Shared");
+    expect(link.find('[data-testid="model-folder-link"]').exists()).toBe(true);
+    expect(link.find(".mft-count").text()).toBe("5");
+    expect(link.attributes("aria-label")).toContain("link");
+    expect(link.attributes("aria-expanded")).toBe(undefined);
+    expect(link.find('[data-testid="model-folder-more"]').exists()).toBe(false);
+    expect(link.attributes("draggable")).toBe(undefined);
+    expect(item(wrapper, 1, "VAE").attributes("draggable")).toBe("true");
+
+    shelf.dragCopies = {
+      items: [{ folder_id: 1, relpath: "alice.safetensors" }],
+      totalBytes: 10,
+      bytesByFolderId: new Map([[1, 10]]),
+    };
+    const over = new CustomEvent("model-copies-over", {
+      cancelable: true,
+      detail: { x: 5, y: 6 },
+    });
+    link.element.dispatchEvent(over);
+    await flushPromises();
+    expect(over.defaultPrevented).toBe(false);
+    expect(link.classes()).toContain("not-droppable");
+
+    await link.trigger("click");
+    expect(wrapper.emitted("select")).toEqual([
+      [{ folderId: 1, path: "Shared", locked: false }],
+    ]);
+    wrapper.unmount();
+  });
+
+  it("answers Ctrl V on a link with why, and pastes nothing", async () => {
+    const shelf = useModelShelfStore();
+    const paste = vi.spyOn(shelf, "pasteCut").mockReturnValue(true);
+    shelf.cutCopies = {
+      items: [{ folder_id: 1, relpath: "Lora/alice.safetensors" }],
+      ids: new Set([1]),
+    };
+    const wrapper = await openFolder();
+    const link = item(wrapper, 1, "Shared");
+    link.element.focus();
+    await link.trigger("keydown", { key: "v", ctrlKey: true });
+    expect(paste).not.toHaveBeenCalled();
+    expect(useNoticeStore().notices.at(-1).text).toBe(
+      "That folder is a link to another place, so nothing can be moved into it.",
+    );
+    wrapper.unmount();
+  });
+
+  it("refuses a link in pick mode", async () => {
+    const wrapper = await openFolder({ mode: "pick" });
+    const link = item(wrapper, 1, "Shared");
+    expect(link.attributes("aria-disabled")).toBe("true");
+    await link.trigger("click");
+    expect(wrapper.emitted("select")).toBe(undefined);
+    wrapper.unmount();
+  });
+});
+
 describe("ModelFolderTree welcomes the dragged model", () => {
   const SM = {
     id: 1,

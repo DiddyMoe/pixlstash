@@ -5586,7 +5586,12 @@ neither edge moves on a workspace switch.
   `useModelFoldersStore().labelByFolderId`, which tells namesakes apart in the
   name itself: `Lora (StabilityMatrix)`. A **locked** folder (`movable !==
   "per_item"`: the managed store, the HuggingFace cache, the InsightFace packs)
-  draws `mdi-folder-lock-outline` as its glyph and never expands. **The counts
+  draws `mdi-folder-lock-outline` as its glyph and never expands. A **link**
+  (a subfolder the listing marks `link: true`: a symlink or junction to a
+  directory) draws `mdi-folder-arrow-right-outline`, says "link" in its label
+  and never expands either: the scan lists the models behind it, so it shows
+  their count and opens on the shelf like any folder, but nothing moves into,
+  out of or through it, so it has no menu, no drag and takes no drop. **The counts
   are one column**: nothing trails them, the ComfyUI marks sit in a slot one
   mark wide whether or not it holds one, and in browse mode every row keeps a
   column after its count for the ⋯ (locked rows too), so the ⋯ shown on
@@ -5598,8 +5603,8 @@ neither edge moves on a workspace switch.
   the data, not the component. A listing that is refused (a remote owner: the
   route is §16.3 `local_owner_only`) offers no subfolders rather than an error
   per row. **Two modes**: `browse` (the sidebar) opens what is clicked, a
-  locked folder included; `pick` (the move work, #2204) refuses a locked folder
-  and anything its `disabled(node)` refuses. Both emit `select` with
+  locked folder included; `pick` (the move work, #2204) refuses a locked folder,
+  a link and anything its `disabled(node)` refuses. Both emit `select` with
   `{folderId, path, locked}` and read `selected` back. **The sidebar's open
   rows outlive it**: in `browse` the expanded folder keys and closed drives are
   `useModelFoldersStore().treeExpanded` / `treeClosedDrives`, so a trip to
@@ -5694,7 +5699,9 @@ posts `POST /model-folders/{folder_id}/open` with the row's path. It is
 loopback-only at the gate, takes no gate reason here (it only looks), and a
 refusal is a notice saying which one. The route itself does not refuse a
 locked folder: opening one changes nothing, so the lock rule is the menu's. A locked folder has
-no menu at all: its lock is what it shows. Pick mode has no menus; it chooses.
+no menu at all: its lock is what it shows. A link has none either, and `Ctrl V`
+on it says that nothing can be moved into a link. Pick mode has no menus; it
+chooses.
 
 **Every verb goes through `useModelFolderGates`.** `folderVerbReason(folder)`
 gives the remote tier, a running move (`moves.busy`), then a scan of the
@@ -5716,12 +5723,12 @@ newPath)`, which opens the way down, lists it and takes the focus. A subfolder
 rename is a move with `newName`, through the one job slot; a root rename is the
 synchronous route above.
 
-**A folder drag has a type of its own.** Subfolder rows are `draggable` and
+**A folder drag has a type of its own.** Subfolder rows other than links are `draggable` and
 carry `application/x-pixlstash-model-folder` (`FOLDER_TYPE`), not the model
 copies' type. The source is also held in `useModelShelfStore.dragFolder`,
 because a drop target cannot read `dataTransfer` during `dragover`. `useFolderDrop`
-refuses, with the shared `.not-droppable` hatch, a drive, a locked folder, the
-folder itself, its descendants, the folder it is already in, and any drop while
+refuses, with the shared `.not-droppable` hatch, a drive, a locked folder, a
+link, the folder itself, its descendants, the folder it is already in, and any drop while
 a move runs. Its tip names the mechanism from `device_id`, as the file tip does.
 
 **The drop asks only when there is something to ask.** A drop calls
@@ -6623,8 +6630,8 @@ dialog, which says so on its button.
   with `elementFromPoint` and sends it `model-copies-over` (the pointer in
   `detail`), `model-copies-leave` and `model-copies-drop`, and a row takes the
   drop by `preventDefault` on the first, as a `dragover` would. The rules are
-  `useModelCopyDrop`: a drive row, a locked folder and the folder every dragged
-  copy is already in refuse with the shared `.not-droppable` hatch; a folder
+  `useModelCopyDrop`: a drive row, a locked folder, a link and the folder every
+  dragged copy is already in refuse with the shared `.not-droppable` hatch; a folder
   that takes it draws `.drop-ring`, the focus stroke inset (without the glow)
   over the hover wash (not olive, the selection, nor amber, an action). `ModelDropTip` is the
   drag's only preview: it follows the pointer with the file's name (or how
@@ -6674,7 +6681,8 @@ dialog, which says so on its button.
   view; the menu entry shows only while something is cut and says why it is
   disabled elsewhere), and `Ctrl V` on a
   focused Folders tree row or **Paste here** at the top of its menu (that
-  folder; a locked one, which has no menu, says why it refuses). `Esc` puts the
+  folder; a locked one, which has no menu, says why it refuses, and so does a
+  link, which takes nothing). `Esc` puts the
   cut back before it clears a selection, one undo per press. The cut is spent
   when the pasted move starts. All three keys are in the shortcuts dialog, and
   inside a text field the guard hands them back, so cutting text still cuts

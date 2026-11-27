@@ -66,6 +66,7 @@ from pixlstash.utils.adapter_header import (
     describe_adapter,
 )
 from pixlstash.utils.known_base_models import SOURCE_RANK, identify, rank
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.model_utils import quant_from_filename
 
 logger = get_logger(__name__)
@@ -316,6 +317,20 @@ def _still_arriving(path: str) -> bool:
     return not safetensors_complete(path) and describe_adapter(path) is not None
 
 
+def _real(path: str) -> str:
+    """*path* with every link resolved, case-folded where the OS folds case."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _is_within(path: str, base: str) -> bool:
+    """Whether real path *path* is *base* or lies under it (both from ``_real``)."""
+    try:
+        return os.path.commonpath([path, base]) == base
+    except ValueError:
+        # Two Windows drives: ``commonpath`` raises, and they cannot overlap.
+        return False
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -479,7 +494,7 @@ class ModelFolderScanner:
             if not self._is_readable(path):
                 continue
             known = self._known_files(folder_id)
-            for abs_path, relpath in self._walk(path, set()):
+            for abs_path, relpath in self._walk(folder_id, path, set()):
                 if os.path.basename(relpath).lower() in names and relpath not in known:
                     found.append((folder_id, abs_path, relpath))
         return found
@@ -516,7 +531,7 @@ class ModelFolderScanner:
         # and a caller with no denominator has nothing to show for the expensive
         # one. Only ``.safetensors`` files are yielded, so the list is small even
         # for a folder of 1,800 adapters.
-        files = list(self._walk(path, blocked))
+        files = list(self._walk(folder_id, path, blocked))
         if not files and not blocked and self._is_empty_dir(path):
             # An unmounted drive often leaves its mount point behind, empty and
             # readable. Sweeping that would mark every model missing and hash
@@ -599,18 +614,41 @@ class ModelFolderScanner:
             logger.info("Cannot list %s to see whether it is empty: %s", path, exc)
             return False
 
-    @staticmethod
-    def _walk(root: str, blocked: set[str]):
+    def _walk(self, folder_id: int, root: str, blocked: set[str]):
         """Yield ``(abs_path, relpath)`` for every model file under *root*.
 
-        Symlinks are not followed (``os.walk`` default), so a folder that links
-        back into itself or into another registered folder cannot make the scan
-        loop or double-count.
+        Directory links, symlinks and Windows junctions alike, are followed as
+        ComfyUI follows them: a ``loras`` folder linked to another drive is
+        where the owner's LoRAs are, and ComfyUI loads them from there.
+        *relpath* is spelled through the link, because that is the name ComfyUI
+        loads the file by.
+
+        Each directory's real path is computed (by ``realpath`` for a link, by
+        joining the parent's real path for anything else), and a directory is
+        skipped, with an info line naming it and its target, when:
+
+        * its real path was already walked in this pass: two links to one
+          place, or a link back into a tree already listed;
+        * it is a link whose target is inside this folder, or is this folder,
+          the directory holding the link or a directory above them: the plain
+          walk lists that tree under its own name, and an ancestor is a loop;
+        * it lies outside this folder and inside another registered model
+          folder, which lists it under its own row and its own scan.
+
+        Directories are walked in name order, so which spelling wins when two
+        reach one place is the same on every scan.
 
         A directory that cannot be listed is collected into *blocked* rather
         than discarded. ``os.walk`` swallows those errors by default, which
         would make an unplugged mount under a registered folder indistinguishable
         from a deletion - the one thing this module promises never to do.
+
+        Args:
+            folder_id: The registered folder being walked, so the others can
+                be told apart from it.
+            root: Its path.
+            blocked: Collects the relpath of every directory that could not be
+                listed.
         """
 
         def on_error(exc: OSError) -> None:
@@ -623,7 +661,54 @@ class ModelFolderScanner:
             )
             blocked.add(os.path.relpath(failed, root))
 
-        for directory, _dirs, files in os.walk(root, onerror=on_error):
+        real_root = _real(root)
+        others = [
+            _real(row["path"])
+            for row in self._hub.fetchall(
+                "SELECT path FROM model_folder WHERE id != ?", (folder_id,)
+            )
+            if row["path"]
+        ]
+        visited = {real_root}
+        real_of = {root: real_root}
+
+        for directory, dirs, files in os.walk(root, onerror=on_error, followlinks=True):
+            real_parent = real_of.pop(directory)
+            kept = []
+            for name in sorted(dirs):
+                child = os.path.join(directory, name)
+                linked = is_link_or_missing(child)
+                real = (
+                    _real(child)
+                    if linked
+                    else os.path.normcase(os.path.join(real_parent, name))
+                )
+                reason = None
+                if real in visited:
+                    reason = "was already walked in this scan"
+                elif linked and (
+                    _is_within(real, real_root)
+                    or _is_within(real_root, real)
+                    or _is_within(real_parent, real)
+                ):
+                    reason = "is inside this folder or above the link"
+                elif not _is_within(real, real_root) and any(
+                    _is_within(real, other) for other in others
+                ):
+                    reason = "is inside another registered model folder"
+                if reason is not None:
+                    logger.info(
+                        "Model scan of %s skips %s: its target %s %s.",
+                        root,
+                        child,
+                        real,
+                        reason,
+                    )
+                    continue
+                visited.add(real)
+                real_of[child] = real
+                kept.append(name)
+            dirs[:] = kept
             for name in sorted(files):
                 if not name.lower().endswith(SHELF_MODEL_SUFFIXES):
                     continue
