@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -61,6 +63,14 @@ _TERMINAL_JOB_STATUSES = frozenset({"completed", "stopped", "error"})
 _TERMINAL_PROGRESS_STATUSES = frozenset({"completed", "stopped", "error"})
 # Cap on the trainer log tail we persist onto the job row.
 _LOG_TAIL_BYTES = 8192
+# A write that ends a run, or that the run cannot do without (its launch, a
+# Train longer requeue), is tried this many times when the hub is busy. Each
+# try already waits out HUB_BUSY_TIMEOUT_S, so more tries would not cure a
+# hub that stays locked.
+_RETRIED_WRITE_ATTEMPTS = 3
+# The ceiling of the first wait between those tries, doubling each time and
+# drawn at random so writers that failed together do not try again together.
+_RETRIED_WRITE_BACKOFF_S = 0.5
 
 #: How long a run adopted at start-up keeps its lease exclusive and unshrunk:
 #: PixlStash has not watched it reach its peak since the restart.
@@ -412,10 +422,10 @@ class TrainingService:
             preset=(resolution or {}).get("preset"),
             resolved_profile=json.dumps(resolution) if resolution else None,
             advanced_pins=json.dumps(pins or {}),
+            # With the insert, before the worker can claim the run: its lease
+            # reads the answer.
+            comfyui_quit="allowed" if quit_comfyui else None,
         )
-        if quit_comfyui:
-            # Before the worker can claim it: its lease reads the answer.
-            self._update_job(job_uuid, comfyui_quit="allowed")
         self._note_phase(job_uuid, "waiting_gpu")
         job = training_runs.get_run(hub, library_uuid, run_id)
         # The template path and the config patches have no column. Keep them
@@ -578,8 +588,11 @@ class TrainingService:
                         "WHERE training_run_id = ? AND training_step IS NULL",
                         (final_step, run["id"]),
                     )
+            # The folder is carried on already, so a busy hub must not leave
+            # the row finished.
             self._update_job(
                 run["uuid"],
+                attempts=_RETRIED_WRITE_ATTEMPTS,
                 status="queued",
                 step=from_step,
                 total_steps=total,
@@ -1095,7 +1108,7 @@ class TrainingService:
         Returns:
             A ``(handle, progress)`` tuple: the launched handle and the terminal
             :class:`TrainingProgress` snapshot. None when the run was cancelled
-            before it could launch.
+            before it could launch, or its launch could not be written.
         """
         job_uuid = info["uuid"]
         pending = self._load_pending_spec(job_uuid)
@@ -1130,8 +1143,9 @@ class TrainingService:
             self._active_job_uuid = job_uuid
             config = self._read_rendered_config(handle.config_path)
             total_steps = self._total_steps_from_config(config)
-            self._update_job(
+            launched = self._update_job(
                 job_uuid,
+                attempts=_RETRIED_WRITE_ATTEMPTS,
                 status="running",
                 pid=handle.pid,
                 training_folder=handle.training_folder,
@@ -1140,6 +1154,9 @@ class TrainingService:
                 total_steps=total_steps,
                 started_at=now_iso(),
             )
+        if not launched:
+            self._abandon_launch(backend, handle, job_uuid)
+            return None
         self._note_phase(job_uuid, "loading")
         self._emit_progress(
             job_uuid, status="running", current=0, total=total_steps, message="Started"
@@ -1147,6 +1164,19 @@ class TrainingService:
 
         progress = self._poll_until_done(backend, handle, job_uuid, lease, watch)
         return handle, progress
+
+    def _abandon_launch(self, backend: TrainerBackend, handle, job_uuid: str) -> None:
+        """Stop a trainer whose launch could not be written to its row.
+
+        The row names neither the trainer's pid nor its folder, so nothing
+        would re-attach to it after a restart, and its lease is released when
+        the run returns. Should the error write fail too, the row stays queued
+        and the worker starts the run again.
+        """
+        backend.cancel(handle)
+        self._fail(
+            job_uuid, "The run could not be recorded as started, so it was stopped."
+        )
 
     def _poll_until_done(
         self,
@@ -2084,24 +2114,64 @@ class TrainingService:
         """A job's persisted status, or None when it is gone."""
         return training_runs.get_run_status(self._hub, job_uuid)
 
-    def _update_job(self, job_uuid: str, **fields) -> bool:
+    def _update_job(
+        self, job_uuid: str, *, attempts: int | None = None, **fields
+    ) -> bool:
         """Update columns on a training run by uuid.
+
+        A write that meets a busy hub is tried again, *attempts* times in all.
 
         Args:
             job_uuid: The job uuid.
+            attempts: How many times to try. Defaults to
+                ``_RETRIED_WRITE_ATTEMPTS`` for a write of an end state, which
+                nothing writes again once the run is over, else to once.
             **fields: Column names → values to set.
 
         Returns:
             True when the row was written. False, after logging why, when no
             run has that uuid or the write failed.
         """
-        try:
-            if training_runs.update_run(self._hub, job_uuid, **fields):
-                return True
-            logger.warning("_update_job: no job with uuid=%s", job_uuid)
-        except Exception:
-            logger.exception("Failed to update job %s with %s", job_uuid, list(fields))
-        return False
+        if attempts is None:
+            attempts = (
+                _RETRIED_WRITE_ATTEMPTS
+                if fields.get("status") in _TERMINAL_JOB_STATUSES
+                else 1
+            )
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if training_runs.update_run(self._hub, job_uuid, **fields):
+                    return True
+                logger.warning("_update_job: no job with uuid=%s", job_uuid)
+                return False
+            except sqlite3.OperationalError:
+                if attempt >= attempts:
+                    logger.exception(
+                        "Failed to update job %s with %s after %d tries",
+                        job_uuid,
+                        list(fields),
+                        attempt,
+                    )
+                    return False
+                wait = random.uniform(0, _RETRIED_WRITE_BACKOFF_S * 2 ** (attempt - 1))
+                logger.warning(
+                    "Job %s: the hub was busy writing %s (try %d of %d); "
+                    "trying again in %.2fs",
+                    job_uuid,
+                    list(fields),
+                    attempt,
+                    attempts,
+                    wait,
+                    exc_info=True,
+                )
+                time.sleep(wait)
+            except Exception:
+                logger.exception(
+                    "Failed to update job %s with %s", job_uuid, list(fields)
+                )
+                return False
 
     def _persist_progress(
         self, job_uuid: str, progress: TrainingProgress, handle
@@ -2150,8 +2220,10 @@ class TrainingService:
                     if fields.get(column) is not None:
                         fields[column] = json.dumps(fields[column])
                 # A failed write leaves the snapshot as it was, so the next
-                # poll writes these columns again.
-                if self._update_job(job_uuid, status=status, **fields):
+                # poll writes these columns again, and `_finalize` writes the
+                # end state with retries. Tried once: a retry here would hold
+                # the lock a cancel waits on.
+                if self._update_job(job_uuid, status=status, attempts=1, **fields):
                     self._persisted[job_uuid] = {**written, **changed}
         # A completed trainer is imported next: `_finalize` writes completed_at.
         self._note_phase(

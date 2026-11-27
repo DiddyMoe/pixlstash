@@ -12662,6 +12662,15 @@ only (no curve, log tail, config or sample paths), and
 SQL rather than loading it; a stored curve that is not valid JSON answers no
 latest loss and is logged.
 
+**A busy hub.** A run write that meets a locked `hub.db` is tried again only
+where nothing would write it later: an end state, the launch and a Train longer
+requeue are tried three times (`_RETRIED_WRITE_ATTEMPTS`), with a random wait
+that doubles between tries; a poll's write is tried once, since the next poll
+or `_finalize` writes it again. A launch that cannot be written stops its
+trainer and ends the run `error`, because a row that names no pid or folder is
+one nothing re-attaches to. The owner's yes to quitting ComfyUI is written in
+the run's insert.
+
 `/training/jobs*` lists and addresses only the open library's runs; another
 library's run answers as one that does not exist. The worker claims and
 reconciles only its own library's runs, so a queued or unfinished run of another
@@ -12836,7 +12845,7 @@ would wait with ComfyUI unseen, never cleared and never offered to quit. `POST /
 (`{kept_mb, short_mb, can_quit, busy, beside}`) when the resolved profile fits
 only with ComfyUI quit, `beside` being Save memory resolved beside it.
 `POST /training/jobs` takes the owner's answer as `comfyui` (`quit` or `queue`,
-the default); quit is kept on the row as `comfyui_quit = 'allowed'`, the worker
+the default); quit is written with the row as `comfyui_quit = 'allowed'`, the worker
 hands it to the run's lease, and a lease that quit ComfyUI leaves `quit` there,
 which `GET /training/jobs/{id}/live` reports as `comfyui_quit {at}` once the run
 has ended. `POST /training/jobs/{id}/quit-comfyui` is the same yes from the run

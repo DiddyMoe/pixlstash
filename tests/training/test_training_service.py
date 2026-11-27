@@ -3063,3 +3063,153 @@ def test_a_set_aside_that_fails_midway_leaves_the_folder_as_it_was(
     monkeypatch.setattr(os, "rename", real_rename)
 
     assert sorted(os.listdir(handle.save_root)) == before
+
+
+# ---------------------------------------------------------------------------
+# Run writes against a busy hub
+# ---------------------------------------------------------------------------
+
+
+def _busy_hub_for(monkeypatch, busy, failures=99):
+    """Make the run writes *busy* picks fail as on a locked hub, *failures* times.
+
+    Returns every picked write tried, in order.
+    """
+    real_update_run = training_runs.update_run
+    tried = []
+
+    def update_run(hub, run_uuid, **fields):
+        if not busy(fields):
+            return real_update_run(hub, run_uuid, **fields)
+        tried.append(fields)
+        if len(tried) <= failures:
+            raise sqlite3.OperationalError("database is locked")
+        return real_update_run(hub, run_uuid, **fields)
+
+    monkeypatch.setattr(training_service_module.training_runs, "update_run", update_run)
+    monkeypatch.setattr(training_service_module, "_RETRIED_WRITE_BACKOFF_S", 0.0)
+    return tried
+
+
+def _queued(hub, repo_dir, *, importer=None, quit_comfyui=False):
+    """A service, its lease and one run it has queued (not started)."""
+    lease = _StubLease(grant=True)
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=lease,
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+        importer=importer,
+    )
+    job = service.enqueue(
+        set_id=_SET_ID,
+        name="busy",
+        base_model="m",
+        trigger_word="t",
+        template_path=_write_template(repo_dir, steps=4, save_every=2),
+        resolution=_RESOLUTION,
+        quit_comfyui=quit_comfyui,
+    )
+    return service, lease, job
+
+
+def test_an_end_state_write_that_meets_a_busy_hub_is_tried_again(
+    hub, repo_dir, monkeypatch
+):
+    service, _, job = _queued(hub, repo_dir)
+    training_runs.update_run(hub, job["uuid"], status="running")
+    tried = _busy_hub_for(
+        monkeypatch, lambda fields: fields.get("status") == "stopped", failures=2
+    )
+
+    service._finalize(
+        None,
+        None,
+        {"uuid": job["uuid"]},
+        TrainingProgress(
+            status="stopped", info="Job stopped", step=3, total_steps=4, speed=""
+        ),
+    )
+
+    assert len(tried) == 3
+    final = _job_status(hub, job["uuid"])
+    assert final.status == "stopped" and final.completed_at
+
+
+def test_a_progress_write_is_not_retried(hub, repo_dir, monkeypatch, tmp_path):
+    # A poll's write is tried once, even of an end state: the next poll writes
+    # the progress again, and _finalize the end state, outside the lock a
+    # cancel waits on.
+    service, _, job = _queued(hub, repo_dir)
+    tried = _busy_hub_for(monkeypatch, lambda fields: "status" in fields)
+
+    service._persist_progress(
+        job["uuid"],
+        TrainingProgress(
+            status="completed", info="done", step=4, total_steps=4, speed=""
+        ),
+        SimpleNamespace(log_path=str(tmp_path / "no.log")),
+    )
+
+    assert len(tried) == 1
+
+
+def test_a_launch_that_cannot_be_recorded_stops_its_trainer(hub, repo_dir, monkeypatch):
+    # Unrecorded, the row names neither the trainer's pid nor its folder, so
+    # nothing re-attaches to it after a restart and it trains under no lease.
+    monkeypatch.setenv("FAKE_RUN_LOAD_SECONDS", "30")
+    monkeypatch.setattr(
+        "pixlstash.training.local_ai_toolkit._CANCEL_GRACE_SECONDS", 0.2
+    )
+    importer = _RecordingImport()
+    service, lease, job = _queued(hub, repo_dir, importer=importer)
+    tried = _busy_hub_for(
+        monkeypatch,
+        lambda fields: fields.get("status") == "running" and "pid" in fields,
+    )
+
+    started = time.monotonic()
+    service._run_job(training_runs.get_run(hub, _LIBRARY_UUID, job["id"]))
+
+    assert time.monotonic() - started < 20, "the trainer was left to run"
+    assert len(tried) == 3
+    pid = tried[0]["pid"]
+    assert _poll_until(lambda: not LocalAiToolkit._pid_alive(pid), timeout=10)
+    final = _job_status(hub, job["uuid"])
+    assert (final.status, final.pid) == ("error", None)
+    assert importer.calls == []
+    assert lease.acquire_count == lease.release_count == 1
+
+
+def test_leave_to_quit_comfyui_is_written_with_the_run_itself(
+    hub, repo_dir, monkeypatch
+):
+    # Written after the insert, a busy hub could lose the owner's yes, and the
+    # run would wait for the GPU as though they had said no.
+    _busy_hub_for(monkeypatch, lambda fields: "comfyui_quit" in fields)
+
+    _, _, job = _queued(hub, repo_dir, quit_comfyui=True)
+
+    assert _job_status(hub, job["uuid"]).comfyui_quit == "allowed"
+
+
+def test_a_train_longer_whose_requeue_meets_a_busy_hub_is_queued(
+    hub, repo_dir, monkeypatch
+):
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    run = _finished_run(hub, repo_dir, service)
+    tried = _busy_hub_for(
+        monkeypatch, lambda fields: fields.get("status") == "queued", failures=1
+    )
+
+    service.train_longer(run["id"], from_step=4, more_steps=2)
+
+    assert len(tried) == 2
+    assert _job_status(hub, run["uuid"]).status == "queued"

@@ -101,6 +101,7 @@ def create_run(
     preset: Optional[str] = None,
     resolved_profile: Optional[str] = None,
     advanced_pins: Optional[str] = None,
+    comfyui_quit: Optional[str] = None,
 ) -> int:
     """Insert a queued run and return its id.
 
@@ -116,6 +117,8 @@ def create_run(
         preset: The recipe as ``id@version``.
         resolved_profile: The resolver's result, as JSON.
         advanced_pins: The owner's Advanced values, as JSON.
+        comfyui_quit: ``"allowed"`` when the owner said ComfyUI may be quit
+            for the run, else None.
 
     Returns:
         The new ``training_run.id``.
@@ -124,8 +127,8 @@ def create_run(
         cursor = conn.execute(
             "INSERT INTO training_run (uuid, library_uuid, name, status, set_id, "
             "character_id, base_model, trigger_word, preset, resolved_profile, "
-            "advanced_pins, created_at) "
-            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
+            "advanced_pins, comfyui_quit, created_at) "
+            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 uuid,
                 library_uuid,
@@ -137,6 +140,7 @@ def create_run(
                 preset,
                 resolved_profile,
                 advanced_pins,
+                comfyui_quit,
                 now_iso(),
             ),
         )
