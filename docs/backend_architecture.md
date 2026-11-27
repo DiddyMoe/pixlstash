@@ -6984,6 +6984,10 @@ worth knowing:
   This response is what "Save image as" hands the user, and a saved copy of a
   rotated picture that had quietly lost its `workflow` / `prompt` would be a
   worse bug than the unturned view. The stored file is untouched regardless.
+  They are taken from the turned image, which `apply_exif_orientation` clears
+  of the orientation an XMP `tiff:Orientation` or a `Raw profile type exif`
+  carried, so the saved copy is not turned twice; share copies keep their text
+  and XMP the same way.
 - Anything already on the re-encode path — the HEIC→JPEG transcode, watermark
   compositing — is transposed too, JPEG included, because PIL drops the EXIF
   block on save and the tag would not survive to be applied.

@@ -7,6 +7,7 @@ import hashlib
 import os
 import piexif
 import piexif.helper
+import re
 import shutil
 import struct
 import tempfile
@@ -63,6 +64,12 @@ _ORIENTATION_TRANSPOSE = {
     7: Image.Transpose.TRANSVERSE,
     8: Image.Transpose.ROTATE_90,
 }
+# The XMP spellings of the orientation, which ``getexif()`` reads when the
+# EXIF has none.
+_XMP_ORIENTATION_PATTERNS = (
+    r'tiff:Orientation="([0-9])"',
+    r"<tiff:Orientation>([0-9])</tiff:Orientation>",
+)
 
 #: What Pillow's ``getexif()`` raises for an EXIF block too damaged to read:
 #: ``SyntaxError`` for a TIFF header that does not parse, ``struct.error`` for
@@ -467,7 +474,9 @@ class ImageUtils:
         ``ImageOps.exif_transpose`` writes the EXIF block back after turning,
         and Pillow raises ``struct.error`` writing some tags it reads (a LONG8
         value). This turns the pixels without writing EXIF back. The turned
-        image carries no EXIF block, so nothing can turn it a second time.
+        image carries no EXIF block and its XMP has no orientation, so
+        nothing can turn it a second time; a writer that keeps the picture's
+        text or XMP takes it from the image returned here.
         EXIF too damaged to read (:data:`EXIF_PARSE_ERRORS`) leaves *img* as
         stored.
         """
@@ -488,6 +497,17 @@ class ImageUtils:
         upright = img.transpose(method)
         upright.info.pop("exif", None)
         upright.info.pop("Raw profile type exif", None)
+        for key in ("XML:com.adobe.xmp", "xmp"):
+            value = upright.info.get(key)
+            if value is None:
+                continue
+            for pattern in _XMP_ORIENTATION_PATTERNS:
+                value = (
+                    re.sub(pattern, "", value)
+                    if isinstance(value, str)
+                    else re.sub(pattern.encode(), b"", value)
+                )
+            upright.info[key] = value
         return upright
 
     @staticmethod

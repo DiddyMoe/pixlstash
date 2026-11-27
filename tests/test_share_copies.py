@@ -430,6 +430,59 @@ def test_a_resized_copy_is_turned_upright_rather_than_tagged(library):
         assert img.getexif().get(0x0112) is None
 
 
+ORIENTED_XMP = XMP.replace(
+    b"<rdf:Description>",
+    b'<rdf:Description xmlns:tiff="http://ns.adobe.com/tiff/1.0/" '
+    b'tiff:Orientation="6">',
+)
+
+
+def _xmp_oriented_jpeg() -> bytes:
+    buf = BytesIO()
+    _pattern().save(buf, format="JPEG", quality=90, xmp=ORIENTED_XMP)
+    return buf.getvalue()
+
+
+def _xmp_oriented_png() -> bytes:
+    info = PngImagePlugin.PngInfo()
+    info.add_itxt("XML:com.adobe.xmp", ORIENTED_XMP.decode())
+    buf = BytesIO()
+    _pattern().save(buf, format="PNG", pnginfo=info)
+    return buf.getvalue()
+
+
+def _raw_profile_oriented_png() -> bytes:
+    data = _exif(orientation=6).tobytes()
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Raw profile type exif", f"\nexif\n{len(data):8}\n{data.hex()}\n")
+    info.add_itxt("XML:com.adobe.xmp", XMP.decode())
+    buf = BytesIO()
+    _pattern().save(buf, format="PNG", pnginfo=info)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    "make",
+    [_xmp_oriented_jpeg, _xmp_oriented_png, _raw_profile_oriented_png],
+    ids=lambda f: f.__name__,
+)
+def test_a_resized_copy_of_a_picture_turned_by_xmp_or_raw_exif_is_not_turned_again(
+    library, make
+):
+    library["add"](make(), "turned.img")
+
+    (entry,) = _copy(library, max_long_edge=24, keep_generation_data=True)["files"]
+
+    with open(entry["path"], "rb") as fh:
+        copy = fh.read()
+    # The rest of the XMP is kept.
+    assert b"a cat" in copy
+    with Image.open(BytesIO(copy)) as img:
+        img.load()
+        assert img.size == (16, 24)
+        assert img.getexif().get(0x0112) is None
+
+
 def test_max_long_edge_never_enlarges_and_keeps_a_small_picture_untouched(library):
     original = _a1111_png()
     library["add"](original, "small.png")

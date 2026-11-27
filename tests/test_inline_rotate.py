@@ -959,6 +959,35 @@ def test_a_served_rotated_png_keeps_its_comfyui_provenance(client, server):
         )
 
 
+def test_a_served_png_turned_by_its_xmp_carries_the_xmp_without_the_turn(
+    client, server
+):
+    _counter[0] += 1
+    image = Image.new("RGB", (64, 48), color=(_counter[0] * 7 % 256, 99, 21))
+    info = PngInfo()
+    info.add_itxt(
+        "XML:com.adobe.xmp",
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description '
+        'xmlns:tiff="http://ns.adobe.com/tiff/1.0/" tiff:Orientation="6">'
+        "<dc:description>a cat</dc:description></rdf:Description></rdf:RDF>"
+        "</x:xmpmeta>",
+    )
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", pnginfo=info)
+    result = upload_pictures_and_wait(
+        client, [("file", ("xmp-turned.png", buf.getvalue(), "image/png"))]
+    )
+    picture_id = result["results"][0]["picture_id"]
+
+    resp = client.get(f"{API}/pictures/{picture_id}.png")
+    assert resp.status_code == 200, resp.text
+    with Image.open(io.BytesIO(resp.content)) as served:
+        served.load()
+        assert served.size == (48, 64), "expected the turned render"
+        assert served.getexif().get(0x0112) is None
+        assert "a cat" in served.info["XML:com.adobe.xmp"]
+
+
 def test_the_grid_projection_carries_the_orientation(client, server):
     """The lightbox's cache-buster is built from a grid row, so it has to be in one.
 

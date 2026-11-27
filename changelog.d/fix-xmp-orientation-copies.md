@@ -1,0 +1,1 @@
+- Fixed: share copies of photos turned by XMP are no longer turned twice.

@@ -350,7 +350,6 @@ def _reencode(source, max_long_edge, watermark_bytes, keep_generation_data):
         if not resized and not watermark_bytes:
             return None
         fmt = img.format if img.format in _REENCODE_FORMATS else "PNG"
-        info = dict(img.info)
         try:
             exif = img.getexif()
         except EXIF_PARSE_ERRORS as exc:
@@ -362,6 +361,8 @@ def _reencode(source, max_long_edge, watermark_bytes, keep_generation_data):
             )
             exif = Image.Exif()
         out = ImageUtils.apply_exif_orientation(img)
+        # The turned image's: its XMP and text carry no orientation.
+        info = dict(out.info)
     if resized:
         out.thumbnail((max_long_edge, max_long_edge), Image.LANCZOS)
     if watermark_bytes:
