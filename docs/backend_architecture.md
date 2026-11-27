@@ -1866,10 +1866,10 @@ carried in the 4-tuples `_load_input_images` returns and threaded into the save.
 would then be false:
 
 - **Orientation (`0x0112`) — the highest-risk one.** `ImageUtils.load_image_or_video`
-  applies `ImageOps.exif_transpose` on load, so the pixels a plugin returns are
-  *already upright*. Re-stamping the source's orientation would turn the output
-  a second time on display, and its displayed size would disagree with its
-  stored size.
+  applies `ImageUtils.apply_exif_orientation` on load, so the pixels a plugin
+  returns are *already upright*. Re-stamping the source's orientation would
+  turn the output a second time on display, and its displayed size would
+  disagree with its stored size.
 - `ImageWidth` (`0x0100`) / `ImageLength` (`0x0101`), and `PixelXDimension`
   (`0xA002`) / `PixelYDimension` (`0xA003`) in the Exif sub-IFD.
 - The IFD1 thumbnail, which `Exif.tobytes()` does not write — it would show the
@@ -7035,11 +7035,11 @@ re-derives, per picture:
 
 - `Face.bbox` **and** `Detection.bbox`. Both are stored in **EXIF-corrected**
   space (the extraction tasks load through `load_image_bgr_reduced`, which runs
-  `ImageOps.exif_transpose`), so they move even though no pixel did. The corner
-  maths is *reused* from the `rotate` image plugin's `get_bbox_transform` rather
-  than copied. `Picture.width` / `height` are RAW and stay put; the display size
-  the transform needs is those two swapped iff the *current* orientation is one
-  of 5–8.
+  `ImageUtils.apply_exif_orientation`), so they move even though no pixel did.
+  The corner maths is *reused* from the `rotate` image plugin's
+  `get_bbox_transform` rather than copied. `Picture.width` / `height` are RAW
+  and stay put; the display size the transform needs is those two swapped iff
+  the *current* orientation is one of 5–8.
 - `pixel_sha` and `size_bytes` — the container changed even though the pixels
   did not, so the tier-1 duplicate key must be recomputed (§22.6).
 - `thumbnail_width` / `thumbnail_height`, NULLed so `MissingThumbnailFinder`

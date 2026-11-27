@@ -142,9 +142,9 @@ def run(self, images, parameters=None, progress_callback=None,
         error_callback=None, captions=None) -> list[Image.Image]:
 ```
 
-- `images` are PIL images, already EXIF-oriented (`ImageOps.exif_transpose`) and
-  **converted to RGB** — there is no alpha channel on the way in, whatever the source
-  file had.
+- `images` are PIL images, already EXIF-oriented
+  (`ImageUtils.apply_exif_orientation`) and **converted to RGB** — there is no
+  alpha channel on the way in, whatever the source file had.
 - **The returned list must be the same length as `images`, in the same order.** A
   mismatch raises and the whole run fails, so on a per-image failure append a fallback
   (usually `image.copy()`) and report the error rather than dropping the entry.

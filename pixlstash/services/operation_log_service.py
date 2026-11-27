@@ -1349,7 +1349,7 @@ def _rotate_picture_boxes(
     """Turn every stored face/detection box with the picture's display.
 
     Both box tables are stored in **EXIF-corrected** space - the extraction tasks
-    load through ``load_image_bgr_reduced``, which runs ``ImageOps.exif_transpose``
+    load through ``load_image_bgr_reduced``, which runs ``apply_exif_orientation``
     - so a change of orientation moves them even though not one pixel moved.
     ``Picture.width`` / ``height`` are RAW and stay as they are; the display size
     the transform needs is those two swapped when the *current* orientation is a
@@ -1571,7 +1571,7 @@ def apply_orientation(
     # NULLing the dimensions is what MissingThumbnailFinder selects on.
     picture.thumbnail_width = None
     picture.thumbnail_height = None
-    # Both are computed from the DECODED image, which exif_transpose has just
+    # Both are computed from the DECODED image, which the loaders have just
     # started producing at a different rotation, so both are now describing a
     # picture that no longer exists. Left stale they are worse than absent: the
     # near-duplicate tiers compare a turned picture against its own pre-turn

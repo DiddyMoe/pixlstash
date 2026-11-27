@@ -17,7 +17,7 @@ from io import BytesIO
 
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import FileResponse
-from PIL import Image, ImageOps
+from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 from pixlstash.db_models import Picture
@@ -120,7 +120,7 @@ def register_routes(router, server):
         #
         # An in-place rotate writes the file's EXIF orientation tag and leaves
         # the pixels alone, which is correct only where the renderer applies the
-        # tag. The backend always does (`exif_transpose` on every decode, which
+        # tag. The backend always does (`apply_exif_orientation` on every decode, which
         # is what the thumbnail is built from); the browser applies it for JPEG
         # and ONLY for JPEG. Measured 2026-08-18 against a real library file:
         #
@@ -191,10 +191,10 @@ def register_routes(router, server):
                     pil_img.load()
                     png_text = dict(getattr(pil_img, "text", {}) or {})
                     # Turned FIRST, so anything composited below lands the right
-                    # way up. `exif_transpose` also drops the orientation tag it
-                    # has just applied, so the result cannot be turned twice.
+                    # way up. `apply_exif_orientation` also drops the EXIF that
+                    # carried the turn, so the result cannot be turned twice.
                     if needs_transpose:
-                        pil_img = ImageOps.exif_transpose(pil_img)
+                        pil_img = ImageUtils.apply_exif_orientation(pil_img)
                     if apply_wm:
                         wm_bytes = _get_user_watermark_bytes()
                         if wm_bytes:

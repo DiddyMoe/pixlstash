@@ -3,7 +3,8 @@
 Rotating a photo is a *correction*, not a new picture, and the whole decoding
 stack already honours the orientation tag: every read path in
 :mod:`~pixlstash.utils.image_processing.image_utils` runs
-``ImageOps.exif_transpose`` (thumbnails, the ML loaders, the plugin pipeline),
+``ImageUtils.apply_exif_orientation`` (thumbnails, the ML loaders, the plugin
+pipeline),
 and browsers apply it to the full-size original they are served. So the
 cheapest correct rotate is to change the tag and leave the bitmap alone.
 

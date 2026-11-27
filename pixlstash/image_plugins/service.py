@@ -110,9 +110,9 @@ def _source_exif_bytes(source_path: str | None) -> bytes | None:
     """Return the source's EXIF minus orientation and geometry, or ``None``.
 
     Orientation must go: :meth:`ImageUtils.load_image_or_video` runs
-    ``ImageOps.exif_transpose`` on load, so the pixels a plugin hands back are
-    already upright and re-stamping the source's orientation would rotate the
-    output a second time on display.
+    ``ImageUtils.apply_exif_orientation`` on load, so the pixels a plugin hands
+    back are already upright and re-stamping the source's orientation would
+    rotate the output a second time on display.
     """
     if not source_path:
         return None

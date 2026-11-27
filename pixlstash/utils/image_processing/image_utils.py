@@ -19,7 +19,7 @@ from io import BytesIO
 from typing import Callable, Optional
 
 import numpy as np
-from PIL import ExifTags, Image, ImageOps
+from PIL import ExifTags, Image
 
 try:
     from PIL.TiffImagePlugin import IFDRational
@@ -51,6 +51,17 @@ THUMBNAIL_WEBP_METHOD = 2
 # cap (extreme panoramas). The bitmap is never upscaled beyond the source.
 THUMBNAIL_SHORT_EDGE = 384
 THUMBNAIL_LONG_EDGE_CAP = 1024
+
+# The transpose that shows a picture stored with each EXIF orientation upright.
+_ORIENTATION_TRANSPOSE = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
 
 
 class ImageUtils:
@@ -400,6 +411,24 @@ class ImageUtils:
             return None
 
     @staticmethod
+    def apply_exif_orientation(img: Image.Image) -> Image.Image:
+        """Return *img* turned upright by its EXIF orientation, or *img* itself.
+
+        ``ImageOps.exif_transpose`` writes the EXIF block back after turning,
+        and Pillow raises ``struct.error`` writing some tags it reads (a LONG8
+        value). This turns the pixels without writing EXIF back. The turned
+        image carries no EXIF block, so nothing can turn it a second time.
+        """
+        img.load()
+        method = _ORIENTATION_TRANSPOSE.get(img.getexif().get(ORIENTATION_TAG, 1))
+        if method is None:
+            return img
+        upright = img.transpose(method)
+        upright.info.pop("exif", None)
+        upright.info.pop("Raw profile type exif", None)
+        return upright
+
+    @staticmethod
     def load_image_or_video_bgr(file_path: str) -> Optional[np.ndarray]:
         """Load an image or the first video frame as a BGR numpy array."""
         if not file_path or not os.path.exists(file_path):
@@ -412,7 +441,7 @@ class ImageUtils:
             return img
         try:
             with Image.open(file_path) as pil_img:
-                pil_img = ImageOps.exif_transpose(pil_img)
+                pil_img = ImageUtils.apply_exif_orientation(pil_img)
                 if pil_img.mode not in ("RGB", "L"):
                     pil_img = pil_img.convert("RGB")
                 rgb = np.array(pil_img)
@@ -616,7 +645,7 @@ class ImageUtils:
         try:
             try:
                 with Image.open(file_path) as img:
-                    img = ImageOps.exif_transpose(img)
+                    img = ImageUtils.apply_exif_orientation(img)
                     return np.array(img.convert("RGB"))
             except Exception as exc:
                 logger.debug(
@@ -649,7 +678,7 @@ class ImageUtils:
                 with Image.open(file_path) as img:
                     # Must be called before load()/convert(); no-op for non-JPEG.
                     img.draft("RGB", (max_side, max_side))
-                    img = ImageOps.exif_transpose(img)
+                    img = ImageUtils.apply_exif_orientation(img)
                     arr = np.array(img.convert("RGB"))
             except Exception as exc:
                 logger.debug(
@@ -729,7 +758,7 @@ class ImageUtils:
         try:
             if isinstance(img, Image.Image):
                 pil_img = img.copy()
-                pil_img = ImageOps.exif_transpose(pil_img)
+                pil_img = ImageUtils.apply_exif_orientation(pil_img)
             else:
                 pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
             if pil_img.mode not in ("RGB", "L"):
@@ -1387,7 +1416,7 @@ class ImageUtils:
                 # draft() tells the JPEG decoder to use DCT subsampling - a no-op
                 # for other formats.  Must be called before load()/convert().
                 img.draft("RGB", (max_side, max_side))
-                img = ImageOps.exif_transpose(img)
+                img = ImageUtils.apply_exif_orientation(img)
                 arr = np.array(img.convert("RGB"))
 
             h, w = arr.shape[:2]

@@ -1839,7 +1839,8 @@ says so, so the dialog can tell the owner instead of promising a clean file.
 An animated image and a video are never resized or watermarked, and report
 `resized`/`watermarked` false, so a dialog that asked for either can say it
 was not applied. A re-encode with `keep_generation_data` keeps the PNG text,
-EXIF, XMP and JPEG comment, and transparency always.
+EXIF, XMP and JPEG comment, and transparency always. EXIF that Pillow cannot
+write back (a LONG8 tag) is left out and logged.
 
 **Staging root, and why main can trust it.** The copies land in
 `<dir of server-config.json>/share-copies/<batch>/`. The Electron main process
