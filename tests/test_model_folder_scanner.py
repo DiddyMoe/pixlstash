@@ -565,7 +565,7 @@ class TestStates:
         """The subtree sweep's other branch, driven directly.
 
         `_mark_unreachable_subtrees` has two UPDATEs: one keyed on
-        `relpath LIKE prefix` (above) and one with no path predicate at all, for
+        the relpath prefix (above) and one with no path predicate at all, for
         `blocked = {"."}` - the root became unlistable *after* `scan_folder`'s
         readability check passed, which is a race no test can force and
         `on_error` genuinely produces (`os.path.relpath(root, root)` is `"."`).
@@ -682,6 +682,33 @@ class TestStates:
         )
         assert rows["local.safetensors"]["state"] == STATE_PRESENT
         assert result.missing == 0
+        assert result.unreachable == 1
+
+    @SKIP_AS_ROOT
+    def test_an_unreadable_subdirectory_leaves_its_sibling_in_another_case(
+        self, hub, scanner, tmp_path
+    ):
+        folder = tmp_path / "models"
+        (folder / "Flux").mkdir(parents=True)
+        if (folder / "flux").exists():
+            pytest.skip("this filesystem folds case, so Flux and flux are one")
+        (folder / "flux").mkdir()
+        write_adapter(folder / "Flux" / "a.safetensors")
+        write_adapter(folder / "flux" / "b.safetensors", pad=1)
+        folder_id = register_folder(hub, folder)
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        os.chmod(folder / "Flux", 0o000)
+        try:
+            result = scanner.scan_folder(folder_id, str(folder), "user")
+        finally:
+            os.chmod(folder / "Flux", 0o755)
+
+        rows = located(hub)
+        assert rows[os.path.join("Flux", "a.safetensors")]["state"] == (
+            STATE_UNREACHABLE
+        )
+        assert rows[os.path.join("flux", "b.safetensors")]["state"] == STATE_PRESENT
         assert result.unreachable == 1
 
     def test_last_checked_is_stamped_on_both_paths(self, hub, scanner, tmp_path):

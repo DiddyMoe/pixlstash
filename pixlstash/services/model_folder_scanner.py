@@ -170,8 +170,7 @@ _WRITE_BATCH = 200
 _WRITE_INTERVAL_S = 2.0
 
 # SQLite LIKE wildcards. Escaped before a relpath prefix is used in a LIKE, or a
-# folder named ``sd_xl`` would match ``sdaxl`` and quietly protect the wrong
-# subtree from the missing sweep.
+# folder named ``sd_xl`` would match ``sdaxl``.
 _LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": "\\%", "_": "\\_"})
 
 
@@ -1184,16 +1183,20 @@ class ModelFolderScanner:
                         (STATE_UNREACHABLE, scanned_at, folder_id, STATE_REMOVED),
                     )
                 else:
-                    prefix = (relative_dir + os.sep).translate(_LIKE_ESCAPE)
+                    # Compared exactly, not with LIKE: LIKE folds ASCII case,
+                    # so blocking ``Flux`` would mark a readable ``flux``
+                    # beside it.
+                    prefix = relative_dir + os.sep
                     cursor = conn.execute(
                         "UPDATE model_file SET state = ?, seen_at = ? "
-                        "WHERE model_folder_id = ? AND relpath LIKE ? ESCAPE '\\' "
+                        "WHERE model_folder_id = ? AND substr(relpath, 1, ?) = ? "
                         "AND state != ?",
                         (
                             STATE_UNREACHABLE,
                             scanned_at,
                             folder_id,
-                            prefix + "%",
+                            len(prefix),
+                            prefix,
                             STATE_REMOVED,
                         ),
                     )
