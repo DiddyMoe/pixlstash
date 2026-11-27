@@ -197,6 +197,10 @@ READ_SAFE_POST_PATHS: frozenset[str] = frozenset(
         "/api/v1/pictures/likeness-search",
         "/api/v1/pictures/face-search",
         "/api/v1/characters/likeness-search",
+        # ZIP export of named pictures - POST only because a large selection is
+        # too long for the GET's ?id= list. It starts the same export the GET
+        # does (a temporary ZIP, no library write) and scope-filters its ids.
+        "/api/v1/pictures/export",
         # Do NOT add /api/v1/pictures/{id}/text/read: it queues GPU work with no
         # dedupe, and it is safe only because no resource-scoped token can POST.
     }

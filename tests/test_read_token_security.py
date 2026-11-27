@@ -82,6 +82,7 @@ from pixlstash.db_models import (
     Tag,
     UserToken,
 )
+from pixlstash.auth import COMFYUI_SCOPE, COMFYUI_SCOPE_REFUSAL
 from pixlstash.hub.workflow_group_writes import create_manual_workflow
 from pixlstash.hub.workflows import record_api_graph
 from pixlstash.server import Server
@@ -967,6 +968,53 @@ class TestReadTokenBlocksWrites(_SharedPictureLibrary):
             f"READ token should not restore pictures, got {r.status_code}: {r.text}"
         )
 
+    def test_cannot_export_a_selection_to_a_host_folder(self, library_env, tmp_path):
+        (tmp_path / "already-here.txt").write_text("not part of an export")
+        body = {
+            "picture_ids": library_env.picture_ids[:1],
+            "destination": str(tmp_path),
+        }
+        path = f"{API}/pictures/export/folder/selection"
+
+        # Positive control: the owner reaches the destination checks.
+        owner = library_env.owner_client.post(path, json=body)
+        assert owner.status_code == 409, owner.text
+
+        r = TestClient(library_env.server.api).post(
+            path,
+            json=body,
+            headers={"Authorization": f"Bearer {library_env.read_token}"},
+        )
+        assert r.status_code == 403, (
+            f"READ token should not export to a host folder, got {r.status_code}: {r.text}"
+        )
+
+    def test_a_comfyui_key_cannot_start_a_selection_export(self, library_env, tmp_path):
+        token = _rescope(library_env.server, library_env.read_token, COMFYUI_SCOPE)
+        (tmp_path / "already-here.txt").write_text("not part of an export")
+        ids = library_env.picture_ids[:1]
+        requests = (
+            # An empty selection is refused before any export starts.
+            (f"{API}/pictures/export", {"picture_ids": []}, 422),
+            (
+                f"{API}/pictures/export/folder/selection",
+                {"picture_ids": ids, "destination": str(tmp_path)},
+                409,
+            ),
+        )
+        for path, body, owner_status in requests:
+            # Positive control: the owner reaches the route's own checks.
+            owner = library_env.owner_client.post(path, json=body)
+            assert owner.status_code == owner_status, owner.text
+
+            r = TestClient(library_env.server.api).post(
+                path, json=body, headers={"Authorization": f"Bearer {token}"}
+            )
+            assert r.status_code == 403, (
+                f"a ComfyUI key reached {path}: {r.status_code}: {r.text}"
+            )
+            assert r.json()["detail"] == COMFYUI_SCOPE_REFUSAL
+
 
 # ---------------------------------------------------------------------------
 # 2. READ token must not access owner-restricted endpoints
@@ -1586,6 +1634,38 @@ class TestResourceScopedReadTokenIsolation:
         assert status["total"] == 1, (
             f"Export for set A (1 picture) reported total={status['total']}; "
             "out-of-scope pictures from set B may have been included"
+        )
+
+    def test_a_selection_export_keeps_only_the_tokens_pictures(self, env):
+        """A READ share token may POST an export; it packages only its scope."""
+        scoped = TestClient(env.server.api)
+        headers = {"Authorization": f"Bearer {env.token_a}"}
+        r = scoped.post(
+            f"{API}/pictures/export",
+            json={"picture_ids": [env.pic_a, env.pic_b]},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        task_id = r.json()["task_id"]
+
+        deadline = time.monotonic() + 30
+        status = None
+        while time.monotonic() < deadline:
+            sr = scoped.get(
+                f"{API}/pictures/export/status",
+                params={"task_id": task_id},
+                headers=headers,
+            )
+            assert sr.status_code == 200, sr.text
+            status = sr.json()
+            if status["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert status and status["status"] == "completed", status
+        assert status["total"] == 1, (
+            f"an export naming set A's and set B's pictures reported "
+            f"total={status['total']} for a set-A token"
         )
 
     # -- Batch POST endpoints (READ_SAFE_POST_PATHS) must scope-filter -------

@@ -931,6 +931,28 @@ export async function startExport(query = "") {
 }
 
 /**
+ * Start a ZIP export of named pictures, the selection in a JSON body.
+ *
+ * {@link startExport} names a selection as one `?id=` per picture, and a
+ * large selection makes a request line the server refuses (414). This sends
+ * the selection as `picture_ids`; the server exports those pictures and
+ * nothing else. Poll and download as for {@link startExport}.
+ *
+ * @param {Array<number|string>} pictureIds
+ * @param {Object} [options] - the export's options, as the server names them:
+ *   `export_type`, `caption_mode`, `tag_format`, `include_character_name`,
+ *   `use_original_file_names`, `resolution`, `bbox_mode`,
+ *   `keep_generation_data`.
+ * @returns {Promise<Object>} the response body, whose `task_id` drives polling.
+ */
+export async function startExportByIds(pictureIds, options = {}) {
+  return unwrap(apiClient.post(`/pictures/export`, {
+    picture_ids: pictureIds.map(Number),
+    ...options,
+  }));
+}
+
+/**
  * Start a folder export of a picture selection or filter scope (#291).
  *
  * The local-owner counterpart to {@link startExport}: instead of packaging a
@@ -945,6 +967,26 @@ export async function startExport(query = "") {
  */
 export async function startFolderExport(query) {
   return unwrap(apiClient.post(`/pictures/export/folder?${query}`));
+}
+
+/**
+ * Start a folder export of named pictures, the selection in a JSON body.
+ *
+ * The body counterpart of {@link startFolderExport}, for the reason
+ * {@link startExportByIds} is the body counterpart of {@link startExport}.
+ * The server checks the destination as for {@link startFolderExport}.
+ *
+ * @param {string} destination - an empty folder on the server's machine.
+ * @param {Array<number|string>} pictureIds
+ * @param {Object} [options] - the options {@link startExportByIds} takes.
+ * @returns {Promise<Object>} the response body, whose `task_id` drives polling.
+ */
+export async function startFolderExportByIds(destination, pictureIds, options = {}) {
+  return unwrap(apiClient.post(`/pictures/export/folder/selection`, {
+    destination,
+    picture_ids: pictureIds.map(Number),
+    ...options,
+  }));
 }
 
 /**

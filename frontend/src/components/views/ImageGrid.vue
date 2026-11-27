@@ -1445,7 +1445,9 @@ import {
   clearImpossibleTags,
   restoreImpossibleTags,
   startExport,
+  startExportByIds,
   startFolderExport,
+  startFolderExportByIds,
   getExportStatus,
   downloadExport,
   listPicturesByIds,
@@ -9420,18 +9422,27 @@ function selectionCoversView() {
 }
 
 /**
- * The pictures an export sends: the selected ids, or the view's own query when
- * nothing is selected or the selection is the whole view - which is what the
- * toolbar's whole-grid export sent, collapsed stack members and the unloaded
- * tail included.
+ * The selected pictures an export names, in selection order; null when the
+ * export is the view's instead, because nothing is selected or the selection
+ * is the whole view - which is what the toolbar's whole-grid export sent,
+ * collapsed stack members and the unloaded tail included.
  */
-function exportPictureParams() {
+function exportSelectedPictureIds() {
   const selectedIds = selectedImageIds.value;
-  if (!selectedIds?.length || selectionCoversView()) {
-    return buildPictureIdsQueryParams();
+  if (!selectedIds?.length || selectionCoversView()) return null;
+  return selectedIds.map((id) => getPictureId(id));
+}
+
+/**
+ * The query of an export of the whole view, ZIP or folder: the view's own
+ * query, then the export's options, a false flag left out.
+ */
+function viewExportQuery(exportOptions) {
+  const params = new URLSearchParams(buildPictureIdsQueryParams());
+  for (const [name, value] of Object.entries(exportOptions)) {
+    if (value === false) continue;
+    params.append(name, String(value));
   }
-  const params = new URLSearchParams();
-  for (const id of selectedIds) params.append("id", getPictureId(id));
   return params.toString();
 }
 
@@ -9535,35 +9546,28 @@ async function exportCurrentViewToZip(options = {}) {
   const resolution = options.resolution || "original";
   const bboxMode = options.bboxMode || "none";
   const keepGenerationData = options.keepGenerationData === true;
-  const params = exportPictureParams();
-  const extraParams = new URLSearchParams();
-  if (exportType) {
-    extraParams.append("export_type", exportType);
-  }
-  if (captionMode) {
-    extraParams.append("caption_mode", captionMode);
-  }
+  // The options as the server names them, for the body and the query alike.
+  const exportOptions = {
+    export_type: exportType,
+    caption_mode: captionMode,
+    include_character_name: includeCharacterName,
+    use_original_file_names: useOriginalFileNames,
+    resolution,
+    // Stripped unless the Share panel and Export row says keep (#2417).
+    keep_generation_data: keepGenerationData,
+  };
   if (captionMode === "tags" && tagFormat === "underscores") {
-    extraParams.append("tag_format", "underscores");
-  }
-  if (includeCharacterName) {
-    extraParams.append("include_character_name", "true");
-  }
-  if (useOriginalFileNames) {
-    extraParams.append("use_original_file_names", "true");
-  }
-  if (resolution) {
-    extraParams.append("resolution", resolution);
+    exportOptions.tag_format = "underscores";
   }
   if (bboxMode && bboxMode !== "none") {
-    extraParams.append("bbox_mode", bboxMode);
+    exportOptions.bbox_mode = bboxMode;
   }
-  // Stripped unless the Share panel and Export row says keep (#2417).
-  if (keepGenerationData) {
-    extraParams.append("keep_generation_data", "true");
-  }
-  const extraParamString = extraParams.toString();
-  const exportQuery = [params, extraParamString].filter(Boolean).join("&");
+  // A selection goes in the request body: as `?id=` parameters a large one is
+  // a URL the server or a proxy in front of it refuses.
+  const pictureIds = exportSelectedPictureIds();
+  const startRequest = pictureIds
+    ? () => startExportByIds(pictureIds, exportOptions)
+    : () => startExport(viewExportQuery(exportOptions));
 
   const texts = {
     left:
@@ -9591,7 +9595,7 @@ async function exportCurrentViewToZip(options = {}) {
     exportProgress.message = "Preparing export...";
     exportProgress.cancelRequested = false;
 
-    const startBody = await startExport(exportQuery);
+    const startBody = await startRequest();
     const taskId = startBody?.task_id;
     if (!taskId) {
       throw new Error("Missing task_id from export response.");
@@ -9674,36 +9678,31 @@ async function exportCurrentViewToFolder(options = {}) {
   const resolution = options.resolution || "original";
   const bboxMode = options.bboxMode || "none";
   const keepGenerationData = options.keepGenerationData === true;
-  const params = exportPictureParams();
-  const extraParams = new URLSearchParams();
-  extraParams.append("destination", destination);
-  if (exportType) {
-    extraParams.append("export_type", exportType);
-  }
-  if (captionMode) {
-    extraParams.append("caption_mode", captionMode);
-  }
+  // The options as the server names them, for the body and the query alike.
+  const exportOptions = {
+    export_type: exportType,
+    caption_mode: captionMode,
+    include_character_name: includeCharacterName,
+    use_original_file_names: useOriginalFileNames,
+    resolution,
+    // Stripped unless the Share panel and Export row says keep (#2417).
+    keep_generation_data: keepGenerationData,
+  };
   if (captionMode === "tags" && tagFormat === "underscores") {
-    extraParams.append("tag_format", "underscores");
-  }
-  if (includeCharacterName) {
-    extraParams.append("include_character_name", "true");
-  }
-  if (useOriginalFileNames) {
-    extraParams.append("use_original_file_names", "true");
-  }
-  if (resolution) {
-    extraParams.append("resolution", resolution);
+    exportOptions.tag_format = "underscores";
   }
   if (bboxMode && bboxMode !== "none") {
-    extraParams.append("bbox_mode", bboxMode);
+    exportOptions.bbox_mode = bboxMode;
   }
-  // Stripped unless the Share panel and Export row says keep (#2417).
-  if (keepGenerationData) {
-    extraParams.append("keep_generation_data", "true");
-  }
-  const extraParamString = extraParams.toString();
-  const exportQuery = [params, extraParamString].filter(Boolean).join("&");
+  // A selection goes in the request body: as `?id=` parameters a large one is
+  // a URL the server or a proxy in front of it refuses.
+  const pictureIds = exportSelectedPictureIds();
+  const startRequest = pictureIds
+    ? () => startFolderExportByIds(destination, pictureIds, exportOptions)
+    : () =>
+        startFolderExport(
+          viewExportQuery({ destination, ...exportOptions }),
+        );
 
   const texts = {
     left:
@@ -9734,7 +9733,7 @@ async function exportCurrentViewToFolder(options = {}) {
     exportProgress.message = "Preparing export...";
     exportProgress.cancelRequested = false;
 
-    const startBody = await startFolderExport(exportQuery);
+    const startBody = await startRequest();
     const taskId = startBody?.task_id;
     if (!taskId) {
       throw new Error("Missing task_id from export response.");
