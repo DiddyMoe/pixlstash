@@ -22,7 +22,7 @@ from pixlstash.tagger_plugins.clip_service import (
 )
 from pixlstash.tasks import image_embedding_task as embedding_module
 from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
-from pixlstash.tasks.task_outcome import Outcome, Reason
+from pixlstash.tasks.task_outcome import Outcome, Reason, RetryHold
 from pixlstash.utils.image_processing.media_load import LoadFailure
 from pixlstash.vault import Vault
 from tests.test_model_downloads import serve_bytes
@@ -731,6 +731,7 @@ def _point_the_scorer_at(monkeypatch, url, path):
     """The aesthetic scorer is looked for at *path* and downloaded from *url*."""
     monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_model", None)
     monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_disabled", False)
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_hold", RetryHold())
     monkeypatch.setattr(
         ImageEmbeddingTask,
         "AESTHETIC_SUPPORTED_CLIP",
@@ -765,6 +766,85 @@ def test_the_scorer_download_follows_no_redirect_off_https(monkeypatch, tmp_path
             )._ensure_model()
     assert asked == []
     assert not path.exists()
+
+
+class _ScoringWorkflow(_RecordingWorkflow):
+    """Embeds at the scorer's width, on the CPU."""
+
+    device = "cpu"
+
+    def __init__(self, dim):
+        super().__init__()
+        self._dim = dim
+
+    def encode_images(self, images, tensors=None):
+        return np.ones((len(images), self._dim), dtype=np.float32)
+
+
+@pytest.fixture
+def scorer_on_disk(tmp_path, monkeypatch):
+    """The scorer's config, under *tmp_path*, and the clock its hold reads.
+
+    The jitter is pinned to the top of the range, so the first wait is 4 s.
+    """
+    monkeypatch.setattr(embedding_module, "builtin_model_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_model", None)
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_disabled", None)
+    clock = [0.0]
+    monkeypatch.setattr(
+        ImageEmbeddingTask,
+        "_aesthetic_hold",
+        RetryHold(clock=lambda: clock[0], rng=lambda: 1.0),
+    )
+    return ImageEmbeddingTask._aesthetic_config(), clock
+
+
+def _write_scorer(config):
+    torch.save(torch.nn.Linear(config["dim"], 1).state_dict(), config["path"])
+
+
+def _score_after_one_pass(vault, config, name):
+    """The score one pass stores for a new picture called *name*."""
+    pid, path = _png(vault, name)
+    task = ImageEmbeddingTask(
+        database=vault.db,
+        clip_workflow=_ScoringWorkflow(config["dim"]),
+        batch=[(pid, path)],
+    )
+    task.on_queued()
+    task._run_task()
+    return _stored(vault, pid)[1]
+
+
+def test_a_scorer_that_failed_to_load_is_loaded_again_after_a_wait(
+    shared_vault, scorer_on_disk
+):
+    config, clock = scorer_on_disk
+    with open(config["path"], "wb") as handle:
+        handle.write(b"not a checkpoint")
+    _score_after_one_pass(shared_vault, config, "test-scorer-unreadable.png")
+    _write_scorer(config)
+
+    held = _score_after_one_pass(shared_vault, config, "test-scorer-held.png")
+    assert held is None, "inside the wait the load is not tried again"
+    clock[0] += 4.0
+    retried = _score_after_one_pass(shared_vault, config, "test-scorer-retried.png")
+    assert retried is not None, "after the wait the scorer loads and scores"
+
+
+def test_a_scorer_that_loads_is_never_held(shared_vault, scorer_on_disk):
+    config, _ = scorer_on_disk
+    _write_scorer(config)
+
+    scored = _score_after_one_pass(shared_vault, config, "test-scorer-loads.png")
+    assert scored is not None
+    score_only = _add_picture(
+        shared_vault, "test-scorer-score-only.png", image_embedding=_EMBEDDED
+    )
+    work = shared_vault.db.run_task(
+        lambda session: ImageEmbeddingTask.fetch_work(session, limit=10**6)
+    )
+    assert score_only in {row.id for row in work}, "a score is still work"
 
 
 def test_a_picture_whose_row_is_gone_is_not_reported_done(shared_vault, no_scorer):
