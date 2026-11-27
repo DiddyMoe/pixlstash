@@ -2677,3 +2677,110 @@ def test_the_driver_suspends_and_restores_a_real_context():
     if done.returncode == 0 and done.stdout.strip() == "not supported":
         pytest.skip("this driver exports the CUDA checkpoint API but refuses it")
     assert done.returncode == 0 and done.stdout.strip() == "ok", done.stderr[-2000:]
+
+
+# ── a hung ComfyUI does not hold up the snapshot ───────────────────────────
+# ``GET /workers/progress`` and the Run anyway dialog read ``snapshot()`` and
+# ``training_room()``. A ComfyUI that accepts connections and never answers
+# must not hold them for its HTTP timeouts.
+
+
+class HungComfy(FakeComfy):
+    """Answers its first read, then hangs on every read until released."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.hang = threading.Event()
+        self.release = threading.Event()
+        self.reads = 0
+
+    def usage_mb(self):
+        self.reads += 1
+        if self.hang.is_set():
+            self.release.wait(10)
+        return self.usage
+
+
+def _wait_for(condition, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return condition()
+
+
+@pytest.mark.parametrize("read", ["snapshot", "training_room"])
+def test_a_hung_comfyui_does_not_hold_up_the_snapshot(read):
+    arb, _fake, _ = make(used_mb=12000, thread=False)
+    comfy = HungComfy(usage=7000)
+    arb.register_probe(Tenant.COMFYUI, comfy)
+
+    def take():
+        return arb.snapshot() if read == "snapshot" else arb.training_room(CARD)
+
+    take()
+    comfy.hang.set()
+    try:
+        started = time.monotonic()
+        take()
+        take()
+        took = time.monotonic() - started
+        assert took < 2 * arbiter_module.SNAPSHOT_PROBE_WAIT_S + 0.5, took
+        # One read outstanding, not one more per poll.
+        assert comfy.reads == 2
+    finally:
+        comfy.release.set()
+    comfy.hang.clear()
+    comfy.usage = 5000
+    assert _wait_for(
+        lambda: (arb.snapshot()["comfyui"] or {}).get("held_mb") == 5000
+    ), "a ComfyUI that answers again is read again"
+
+
+def test_a_snapshot_from_the_last_reading_is_marked_stale():
+    arb, _fake, _ = make(used_mb=12000, thread=False)
+    comfy = HungComfy(usage=7000)
+    arb.register_probe(Tenant.COMFYUI, comfy)
+    assert arb.snapshot()["stale"] is False
+
+    comfy.hang.set()
+    try:
+        timed_out = arb.snapshot()
+        outstanding = arb.snapshot()
+        assert timed_out["stale"] is True
+        assert outstanding["stale"] is True
+        assert timed_out["comfyui"]["held_mb"] == 7000
+        assert timed_out["devices"][0]["used_mb"] == 12000
+    finally:
+        comfy.release.set()
+    comfy.hang.clear()
+    assert _wait_for(lambda: arb.snapshot()["stale"] is False)
+
+
+def test_a_second_poller_shares_the_read_in_flight():
+    arb, _fake, _ = make(used_mb=12000, thread=False)
+    comfy = HungComfy(usage=7000)
+    arb.register_probe(Tenant.COMFYUI, comfy)
+    arb.snapshot()
+
+    comfy.hang.set()
+    answer = {}
+    first = threading.Thread(
+        target=lambda: answer.update(snapshot=arb.snapshot()),
+        name="test-first-poller",
+    )
+    first.start()
+    try:
+        assert _wait_for(lambda: comfy.reads == 2), "the first read never started"
+        # The read answers inside its deadline, after the second poller joined.
+        timer = threading.Timer(
+            arbiter_module.SNAPSHOT_PROBE_WAIT_S * 0.4, comfy.release.set
+        )
+        timer.start()
+        second = arb.snapshot()
+        first.join(5)
+        timer.join(5)
+    finally:
+        comfy.release.set()
+    assert answer["snapshot"]["stale"] is False
+    assert second["stale"] is False, "the second poller answered stale at once"
+    assert comfy.reads == 2, "the second poller started a read of its own"

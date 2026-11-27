@@ -2912,7 +2912,7 @@ PixlStash admits the GPU work it starts against the card's measured free memory 
 **The snapshot** (`resources` on `GET /workers/progress`, owner only, `null` for any other token):
 
 ```
-{enforcing, devices: [{uuid, name, total_mb, used_mb, free_mb, reserved_mb, reserved_by: {tenant: mb}, budget_mb, measurable, pixlstash}],
+{enforcing, stale, devices: [{uuid, name, total_mb, used_mb, free_mb, reserved_mb, reserved_by: {tenant: mb}, budget_mb, measurable, pixlstash}],
  ram: {total_mb, available_mb},
  holders: [{device, tenant, label, used_mb, measured_by, lease_id, outside_pixlstash}],
  leases: [{id, tenant, label, kind, state, device, need_mb, ram_mb, reserved_mb, held_mb, peak_mb, since,
@@ -2922,6 +2922,8 @@ PixlStash admits the GPU work it starts against the card's measured free memory 
  preempted: [{worker_type, caused_by, since, text}],
  summary: {state: idle | running | waiting, headline}}
 ```
+
+`stale` is true when the cards and tenants did not answer within `SNAPSHOT_PROBE_WAIT_S` (0.25 s): every figure is then the last reading, and the Tasks tab's GPU block and the Run anyway dialog say the figures may be out of date. A ComfyUI that accepts connections and never answers costs the poll that bound, not its HTTP timeouts; the read goes on and is stored when it answers, and polls that arrive meanwhile share it rather than starting another.
 
 `reserved_by` splits `reserved_mb` by tenant (reservations not yet grown into); the GPU bars (Tasks tab, Run anyway dialog) draw each in its tenant's colour, paler, and only the rest as spare.
 

@@ -1300,6 +1300,23 @@ describe("the GPU queue in the task manager", () => {
     expect(bar.find(".tm-vram-seg--spare").exists()).toBe(true);
   });
 
+  it("says the figures may be out of date while the reading is stale", () => {
+    setGpu(gpuAnswer({ stale: true }));
+    const wrapper = mount(TasksPanel, globalOpts);
+    const bar = wrapper.find('[data-testid="tm-gpu"]');
+    expect(bar.find('[data-testid="tm-gpu-stale"]').text()).toBe(
+      "These figures may be out of date: the GPU did not answer in time.",
+    );
+    expect(bar.find(".tm-gpu-figs").text()).toContain("11.3 GB free");
+  });
+
+  it("says nothing about the figures on a fresh reading", () => {
+    setGpu(gpuAnswer({ stale: false }));
+    const wrapper = mount(TasksPanel, globalOpts);
+    expect(wrapper.find('[data-testid="tm-gpu"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="tm-gpu-stale"]').exists()).toBe(false);
+  });
+
   it("draws no bar and no fold on a server that sends no resources", () => {
     setGpu(null);
     const wrapper = mount(TasksPanel, globalOpts);
@@ -1596,6 +1613,7 @@ describe("the GPU queue in the task manager", () => {
   it("asks before Run anyway, and starts the lease only when the dialog is confirmed", async () => {
     setGpu(
       gpuAnswer({
+        stale: true,
         leases: [
           gpuLease({
             id: "lease-b",
@@ -1624,6 +1642,7 @@ describe("the GPU queue in the task manager", () => {
     const dialog = wrapper.findComponent(RunAnywayDialog);
     expect(dialog.props("open")).toBe(true);
     expect(dialog.props("needMb")).toBe(14600);
+    expect(dialog.props("stale")).toBe(true);
     expect(runLeaseAnyway).not.toHaveBeenCalled();
 
     dialog.vm.$emit("confirm");

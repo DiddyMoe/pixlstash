@@ -72,4 +72,17 @@ describe("the Run anyway dialog", () => {
     expect(wrapper.emitted("close")).toHaveLength(1);
     expect(wrapper.emitted("confirm")).toHaveLength(1);
   });
+
+  it("says the figures may be out of date when the reading is stale", () => {
+    const wrapper = mountDialog({ needMb: 4096, stale: true });
+    expect(wrapper.find('[data-testid="ra-stale"]').text()).toBe(
+      "These figures may be out of date: the GPU did not answer in time.",
+    );
+    expect(wrapper.find('[data-testid="ra-bar"]').exists()).toBe(true);
+  });
+
+  it("says nothing about the figures when the reading is fresh", () => {
+    const wrapper = mountDialog({ needMb: 4096 });
+    expect(wrapper.find('[data-testid="ra-stale"]').exists()).toBe(false);
+  });
 });

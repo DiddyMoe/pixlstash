@@ -33,6 +33,13 @@
          with the free part and the spare margin. Drawn only when the backend
          reports `resources`. -->
     <div v-if="tasksStore.vramBars.length" class="tm-gpu" data-testid="tm-gpu">
+      <p
+        v-if="tasksStore.resources?.stale"
+        class="tm-gpu-stale"
+        data-testid="tm-gpu-stale"
+      >
+        These figures may be out of date: the GPU did not answer in time.
+      </p>
       <div
         v-for="bar in tasksStore.vramBars"
         :key="bar.device.uuid"
@@ -527,6 +534,7 @@
       :need-mb="runAnyway?.needMb || 0"
       :device="runAnyway?.device || null"
       :holders="tasksStore.resources?.holders || []"
+      :stale="tasksStore.resources?.stale === true"
       :busy="busyLease !== ''"
       @close="closeRunAnyway"
       @confirm="confirmRunAnyway"
@@ -2232,6 +2240,12 @@ const tmSystemItems = computed(() => {
   flex-direction: column;
   gap: var(--space-4);
   min-width: 0;
+}
+
+.tm-gpu-stale {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
 }
 
 .tm-gpu-dev {
