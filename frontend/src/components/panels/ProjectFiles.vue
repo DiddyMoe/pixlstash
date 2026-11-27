@@ -1,8 +1,11 @@
 <template>
   <div class="pf-wrapper">
-    <!-- Header bar: always visible, also acts as drop target when collapsed -->
+    <!-- Header bar: always visible, also acts as drop target when collapsed.
+         Both drop targets attach what is dropped, so they carry
+         data-owns-file-drop for the window's importer to leave it alone. -->
     <div
       class="pf-header"
+      data-owns-file-drop
       :class="{ 'pf-drag-active': dragOver && !expanded }"
       @click="toggleExpanded"
       @dragover.prevent="onDragOver"
@@ -22,6 +25,7 @@
     <div
       v-if="expanded"
       class="pf-panel"
+      data-owns-file-drop
       :class="{ 'pf-drag-active': dragOver }"
       @dragover.prevent="onDragOver"
       @dragleave="onDragLeave"

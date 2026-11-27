@@ -43,9 +43,9 @@ let modelDropSeq = 0;
 /**
  * Import what is dropped or pasted anywhere in the window.
  *
- * The grid has its own drop target, so picture drops that land inside it are
- * left alone; this is the catch-all for everywhere else. Listeners are
- * registered in the capture phase so a drop is claimed before the browser
+ * The grid and Project Files take their own drops, so picture drops that land
+ * on them are left alone; this is the catch-all for everywhere else. Listeners
+ * are registered in the capture phase so a drop is claimed before the browser
  * navigates to the file.
  *
  * A `.safetensors` is the exception that IS claimed here wherever it lands,
@@ -61,12 +61,18 @@ export function useWindowFileImport({ sidebarRef }) {
   const noticeStore = useNoticeStore();
   const selectionStore = useSelectionStore();
 
-  function isInsideImageGrid(event) {
+  /**
+   * Whether the drop landed on an element that takes the files itself: the
+   * grid (the arriving tiles above it included), or one marked
+   * `data-owns-file-drop`, such as Project Files, which attaches them.
+   */
+  function isOnOwnDropTarget(event) {
     const target = event?.target;
     if (!(target instanceof Element)) return false;
-    // The arriving tiles above the grid are the grid's drop target too.
     return Boolean(
-      target.closest(".image-grid, .grid-scroll-wrapper, .grid-arriving"),
+      target.closest(
+        ".image-grid, .grid-scroll-wrapper, .grid-arriving, [data-owns-file-drop]",
+      ),
     );
   }
 
@@ -333,7 +339,7 @@ export function useWindowFileImport({ sidebarRef }) {
     const dropped = Array.from(event.dataTransfer?.files || []);
     const allModels = dropped.length > 0 && dropped.every(isModelFile);
     if (allModels) event.stopPropagation();
-    const insideGrid = isInsideImageGrid(event);
+    const onOwnTarget = isOnOwnDropTarget(event);
     // Read now: the walk below awaits, and the target is the drop's to name.
     const modelDropTarget = modelDropTargetOf(event.target);
 
@@ -346,9 +352,9 @@ export function useWindowFileImport({ sidebarRef }) {
 
     // Started BEFORE the shelf work and never awaited with it: a model copy
     // runs for minutes, and the pictures of a mixed drop must not queue behind
-    // it. Inside the grid there is nothing to start - its own handler has the
-    // pictures already, with the character context this one lacks.
-    if (!insideGrid && pictureFiles.length) {
+    // it. On a target of its own there is nothing to start - its handler has
+    // the files already (the grid's with the character context this one lacks).
+    if (!onOwnTarget && pictureFiles.length) {
       const projectId = sidebarRef.value?.currentProjectId ?? null;
       sidebarRef.value?.startLocalImport?.(pictureFiles, projectId);
     }
@@ -357,7 +363,7 @@ export function useWindowFileImport({ sidebarRef }) {
       await addDroppedModelFiles(modelFiles, modelDropTarget);
       return;
     }
-    if (insideGrid || pictureFiles.length) return;
+    if (onOwnTarget || pictureFiles.length) return;
     noticeStore.warning(
       "None of those files are a supported image, video or archive.",
       { key: "import-unsupported-files" },
