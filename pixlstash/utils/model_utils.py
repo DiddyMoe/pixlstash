@@ -26,6 +26,10 @@ logger = get_logger(__name__)
 #: tensors". Reproduced 8/8 with the two loads overlapping, 0/3 without. Loads
 #: are rare and already seconds long, so serialising them costs little.
 #: Reentrant because a loader may nest helpers.
+#:
+#: Also held for the first import of the ML stack at the model entry points
+#: and the plugin loaders: ``accelerate``'s modules import each other, and two
+#: threads importing them at once hand one of them a half-initialised module.
 MODEL_CONSTRUCTION_LOCK = threading.RLock()
 
 
@@ -117,11 +121,11 @@ def quiet_transformers_load_report():
 
 def load_sentence_transformer(*args, **kwargs) -> SentenceTransformer:
     """Load a SentenceTransformer model, suppressing benign load warnings."""
-    # Local import: see _transformers_logging() for why the ML stack is not
-    # imported at module scope.
-    from sentence_transformers import SentenceTransformer
-
     with MODEL_CONSTRUCTION_LOCK, quiet_transformers_load_report():
+        # Local import: see _transformers_logging() for why the ML stack is not
+        # imported at module scope.
+        from sentence_transformers import SentenceTransformer
+
         return SentenceTransformer(*args, **kwargs)
 
 

@@ -39,13 +39,14 @@ def _unloaded_first_resize():
     image size. ``tests/test_image_embedding_worker.py`` holds it to the
     transform a real load returns.
     """
-    import open_clip
-    from open_clip.pretrained import get_pretrained_cfg
-    from open_clip.transform import (
-        PreprocessCfg,
-        image_transform_v2,
-        merge_preprocess_dict,
-    )
+    with MODEL_CONSTRUCTION_LOCK:
+        import open_clip
+        from open_clip.pretrained import get_pretrained_cfg
+        from open_clip.transform import (
+            PreprocessCfg,
+            image_transform_v2,
+            merge_preprocess_dict,
+        )
 
     cfg = merge_preprocess_dict(
         asdict(PreprocessCfg()),
@@ -101,10 +102,11 @@ class ClipService:
             self._tokenizer = None
 
     def _load(self) -> None:
-        import open_clip
-
-        # Built under the process-wide lock; see MODEL_CONSTRUCTION_LOCK.
+        # Imported and built under the process-wide lock; see
+        # MODEL_CONSTRUCTION_LOCK.
         with MODEL_CONSTRUCTION_LOCK:
+            import open_clip
+
             model, _, preprocess = open_clip.create_model_and_transforms(
                 CLIP_MODEL_NAME, pretrained=CLIP_MODEL_WEIGHTS
             )
