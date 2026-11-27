@@ -31,9 +31,12 @@ from pixlstash.db_models import (
     Tag,
     UserToken,
 )
+from pixlstash.routes.pictures import _library_move
+from pixlstash.routes.pictures._crud import BULK_DELETE_MAX_IDS
 from pixlstash.server import Server
 from pixlstash.services.library_switch_service import LibrarySwitchError
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from tests.test_keep_cover_only import _sqlite_variable_ceiling
 from tests.utils import reset_owner_auth
 
 API = "/api/v1"
@@ -337,6 +340,62 @@ class TestWhatTheOtherLibraryAlreadyHolds:
         assert _here(server, again).deleted is False
         (only,) = _there(server, other, sha)
         assert only["deleted"] is True
+
+
+class TestALongSelection:
+    def test_more_ids_than_sqlite_binds_at_once_are_read_and_read_again(
+        self, server, owner, other, monkeypatch
+    ):
+        """A request carries up to BULK_DELETE_MAX_IDS ids, past the 999
+        parameters SQLite binds before 3.32. Every id is read with its tag, and
+        the read after a failed Scrapheap step finds every one of them moved."""
+
+        def seed(session: Session) -> list[int]:
+            now = datetime.now(timezone.utc)
+            pictures = [
+                Picture(
+                    file_path=f"/nonexistent/libmove-long-{n}.png",
+                    format="png",
+                    width=8,
+                    height=8,
+                    pixel_sha=f"libmove-long-{n}",
+                    imported_at=now,
+                )
+                for n in range(BULK_DELETE_MAX_IDS)
+            ]
+            session.add_all(pictures)
+            session.flush()
+            for n, pic in enumerate(pictures):
+                session.add(Tag(tag=f"libmove-long-{n}", picture_id=pic.id))
+            session.commit()
+            return [int(pic.id) for pic in pictures]
+
+        ids = server.vault.db.run_task(seed)
+        read = []
+        real_scrapheap = _library_move.scrapheap_pictures
+
+        def copy(target, source_root, row):
+            read.append((row.id, row.tags))
+            return "new"
+
+        def scrapheap_then_fail(*args):
+            # The soft delete commits, then a later step fails: the route reads
+            # the source again to say what happened.
+            real_scrapheap(*args)
+            raise RuntimeError("example-post-commit-failure")
+
+        monkeypatch.setattr(_library_move, "_copy_into", copy)
+        monkeypatch.setattr(_library_move, "scrapheap_pictures", scrapheap_then_fail)
+
+        with _sqlite_variable_ceiling(server):
+            response = _move(owner, other, ids)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert read == [(pid, [f"libmove-long-{n}"]) for n, pid in enumerate(ids)]
+        assert body["moved"] == ids
+        assert body["copied_source_unknown"] == []
+        assert body["copied_but_not_moved"] == []
 
 
 class TestWhatIsLeftBehind:

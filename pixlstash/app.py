@@ -672,6 +672,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_logging(server_config: dict) -> None:
+    """Send the log to the console and, when one is configured, to ``log_file``.
+
+    The file receives the log at every ``log_level``, the default ``info``
+    included; ``docker-entrypoint.sh`` sets ``log_file`` to null to keep a
+    container's log on stdout only.
+    """
+    log_level = _resolve_log_level(server_config.get("log_level"))
+    log_file = server_config.get("log_file") or None
+    if log_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+    setup_logging(log_file=log_file, log_level=log_level)
+
+
 def main():
     _boot_t0 = time.perf_counter()
     _force_utf8_streams()
@@ -695,15 +711,7 @@ def main():
     server_config = Server.init_server_config(args.server_config)
     _prepare_startup_permissions(args.server_config, server_config)
 
-    log_level = _resolve_log_level(server_config.get("log_level"))
-    log_file = server_config.get("log_file")
-    if log_file and log_level != logging.INFO:
-        log_dir = os.path.dirname(log_file)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        setup_logging(log_file=log_file, log_level=log_level)
-    else:
-        setup_logging(log_level=log_level)
+    _configure_logging(server_config)
     if gpu_select.NOTE is not None:
         logger.log(*gpu_select.NOTE)
 

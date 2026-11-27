@@ -35,6 +35,7 @@ from pixlstash.services.folder_structure_service import (
 )
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.reference_folder_validator import validate_reference_folder_path
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -104,7 +105,7 @@ class FolderStructureAssignmentPayload(BaseModel):
 
     relative_path: str
     kind: str
-    match_id: Optional[int] = None
+    match_id: Optional[SqliteInt] = None
 
 
 class FolderStructureCaptionPayload(BaseModel):

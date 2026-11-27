@@ -31,6 +31,8 @@ from pixlstash.utils.service.filter_helpers import (
 )
 from pixlstash.utils.query.predicate_filter import PredicateFilter
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 from ._helpers import (
     _face_cluster_ids,
@@ -67,8 +69,8 @@ def register_routes(router, server):
     def search_pictures(
         request: Request,
         query: str,
-        offset: int = Query(0),
-        limit: int = Query(sys.maxsize),
+        offset: SqliteInt = 0,
+        limit: SqliteInt = sys.maxsize,
         threshold: float = Query(0.5),
         unassigned_by: Literal["character", "set"] | None = Query(None),
     ):
@@ -144,7 +146,7 @@ def register_routes(router, server):
         )
         if normalized_set_mode == "difference" and base_set_id_raw is not None:
             try:
-                _base_id = int(base_set_id_raw)
+                _base_id = parse_sqlite_int(base_set_id_raw)
                 if _base_id in set_filter_ids:
                     set_filter_ids = [_base_id] + [
                         s for s in set_filter_ids if s != _base_id
@@ -179,7 +181,7 @@ def register_routes(router, server):
                         assignment_unassigned_project = True
                     elif project_id is not None:
                         try:
-                            assignment_project_id = int(project_id)
+                            assignment_project_id = parse_sqlite_int(project_id)
                         except (TypeError, ValueError):
                             logger.warning(
                                 "Invalid project_id %r for UNASSIGNED search assignment scope; treating as global scope",
@@ -222,9 +224,15 @@ def register_routes(router, server):
                     ).all()
                     return list(rows)
 
+                try:
+                    character_id_value = parse_sqlite_int(character_id)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid character_id"
+                    ) from None
                 candidate_ids = set(
                     server.vault.db.run_immediate_read_task(
-                        fetch_character_ids, int(character_id)
+                        fetch_character_ids, character_id_value
                     )
                 )
         else:
@@ -232,7 +240,7 @@ def register_routes(router, server):
             search_character_id_list = []
             for _v in search_character_ids_raw:
                 try:
-                    _cid = int(_v)
+                    _cid = parse_sqlite_int(_v)
                     if _cid > 0:
                         search_character_id_list.append(_cid)
                 except (TypeError, ValueError):
@@ -254,11 +262,17 @@ def register_routes(router, server):
                     search_character_mode = "union"
 
                 def fetch_character_ids_by_mode(session, ids, mode):
-                    rows = session.exec(
-                        select(Face.character_id, Face.picture_id).where(
-                            Face.character_id.in_(ids)
-                        )
-                    ).all()
+                    # The caller's list has no cap: read it in chunks. Each row
+                    # names its person, so the modes below combine the merged rows.
+                    rows = [
+                        row
+                        for id_chunk in chunked(ids)
+                        for row in session.exec(
+                            select(Face.character_id, Face.picture_id).where(
+                                Face.character_id.in_(id_chunk)
+                            )
+                        ).all()
+                    ]
                     members_by_char: dict[int, set[int]] = {cid: set() for cid in ids}
                     for cid, pid in rows:
                         members_by_char.setdefault(int(cid), set()).add(int(pid))
@@ -339,7 +353,7 @@ def register_routes(router, server):
                     query_stmt = query_stmt.where(project_unassigned_clause(Picture))
                 else:
                     try:
-                        parsed_project_id = int(project_id_value)
+                        parsed_project_id = parse_sqlite_int(project_id_value)
                     except (TypeError, ValueError):
                         raise HTTPException(
                             status_code=400,

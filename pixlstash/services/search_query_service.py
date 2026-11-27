@@ -23,11 +23,14 @@ from pixlstash.db_models import (
 )
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.likeness.likeness_utils import LikenessUtils
+from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import in_json
 from pixlstash.utils.service.filter_helpers import (
     fetch_set_candidate_ids,
     project_membership_exists_clause,
     project_unassigned_clause,
 )
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -80,7 +83,7 @@ def fetch_project_candidate_ids(db, project_id_str: str) -> set[int]:
             )
         else:
             try:
-                parsed_project_id = int(project_id_value)
+                parsed_project_id = parse_sqlite_int(project_id_value)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Invalid project_id")
             stmt = select(Picture.id).where(
@@ -162,7 +165,13 @@ def fetch_signature_tags(
     def _fetch(session) -> list[str]:
         rows = session.exec(
             select(Tag.tag)
-            .where(Tag.picture_id.in_(member_ids))
+            .where(
+                Tag.picture_id.in_(
+                    scope_id_subquery(
+                        session, member_ids, name="_pixlstash_signature_member_ids"
+                    )
+                )
+            )
             .where(Tag.tag.is_not(None))
             .where(
                 ~Tag.tag.like(
@@ -182,7 +191,9 @@ def fetch_tag_counts_for_pictures(
 ) -> dict[int, int]:
     """Return how many of *tags* each of *picture_ids* carries.
 
-    Pictures carrying none of them are absent from the result.
+    Pictures carrying none of them are absent from the result. *tags* is a
+    set's signature, as long as the tags its members share, so it is bound as
+    one JSON array; *picture_ids* is at most one page of matches.
 
     Args:
         db: The ``vault.db`` Database instance.
@@ -199,7 +210,7 @@ def fetch_tag_counts_for_pictures(
         rows = session.exec(
             select(Tag.picture_id, func.count(Tag.tag))
             .where(Tag.picture_id.in_(picture_ids))
-            .where(Tag.tag.in_(tags))
+            .where(in_json(Tag.tag, tags))
             .group_by(Tag.picture_id)
         ).all()
         return {int(pid): int(n) for pid, n in rows}
@@ -245,7 +256,13 @@ def fetch_face_candidates(
         if candidate_ids is not None:
             if not candidate_ids:
                 return []
-            query = query.where(Face.picture_id.in_(candidate_ids))
+            query = query.where(
+                Face.picture_id.in_(
+                    scope_id_subquery(
+                        session, candidate_ids, name="_pixlstash_face_candidate_ids"
+                    )
+                )
+            )
 
         rows = session.execute(query).all()
         if model_pack:
@@ -425,7 +442,13 @@ def fetch_candidate_clip_embeddings(
             .where(Picture.image_embedding.is_not(None))
         )
         if candidate_ids is not None:
-            stmt = stmt.where(Picture.id.in_(candidate_ids))
+            stmt = stmt.where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, candidate_ids, name="_pixlstash_clip_candidate_ids"
+                    )
+                )
+            )
         return session.exec(stmt).all()
 
     rows = db.run_immediate_read_task(_query)
@@ -460,7 +483,13 @@ def fetch_source_clip_embeddings(
     def _fetch(session) -> list[tuple[int, bytes]]:
         rows = session.exec(
             select(Picture.id, Picture.image_embedding)
-            .where(Picture.id.in_(source_picture_ids))
+            .where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, source_picture_ids, name="_pixlstash_clip_source_ids"
+                    )
+                )
+            )
             .where(Picture.deleted.is_(False))
             .where(Picture.image_embedding.is_not(None))
         ).all()

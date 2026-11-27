@@ -65,6 +65,7 @@ from pixlstash.db_models import (
 from pixlstash.pixl_logging import get_logger
 from pixlstash.routes._helpers import picture_referenced_by_project
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import in_json
 
 logger = get_logger(__name__)
 
@@ -374,7 +375,9 @@ def _require_projects_exist(session: Session, project_ids: Iterable[int]) -> Non
         return
     found = {
         int(row)
-        for row in session.exec(select(Project.id).where(Project.id.in_(wanted))).all()
+        for row in session.exec(
+            select(Project.id).where(in_json(Project.id, wanted))
+        ).all()
         if row is not None
     }
     missing = [pid for pid in wanted if pid not in found]

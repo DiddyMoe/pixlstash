@@ -313,7 +313,7 @@ Modules **off** the server import path (`tagger_plugins/wd14.py`, `tagger_plugin
 | [pixlstash/worker_config.py](../pixlstash/worker_config.py) | Global constants — `NUM_WORKERS`, per-task `*_MAX_INFLIGHT`, batch sizes. |
 | [pixlstash/startup_checks.py](../pixlstash/startup_checks.py) | Preflight: disk space, VRAM, CUDA, SSL. May force CPU mode. |
 | [pixlstash/event_types.py](../pixlstash/event_types.py) | `EventType` enum used by WebSocket event bus. |
-| [pixlstash/pixl_logging.py](../pixlstash/pixl_logging.py) | Uvicorn log config + coloured formatter. |
+| [pixlstash/pixl_logging.py](../pixlstash/pixl_logging.py) | Uvicorn log config + coloured formatter. The log always goes to stdout; a configured `log_file` gets the same records too, at every level. |
 | [pixlstash/stacking.py](../pixlstash/stacking.py) | Picture stacking (duplicates / variants). |
 | [pixlstash/image_loading_dataset_prepper.py](../pixlstash/image_loading_dataset_prepper.py) | Dataset preparation utilities for offline training scripts. |
 | [pixlstash/cli.py](../pixlstash/cli.py) | CLI entry point (`pixlstash-cli`). Two verb groups: `libraries` (list/create/attach/detach/relocate/activate/backup/restore/prepare-legacy-identity/rename) and `plugins` (install/test/list/remove). Only the `libraries` group opens the hub — see §8.1. |
@@ -628,7 +628,7 @@ Public guest scoring and shared-link endpoints.
 | GET | `/api/v1/protected` | Auth probe |
 | WS  | `/api/v1/ws/updates` | Real-time event stream (broadcast) |
 | GET | `/share/{token_slug}` | Public token-embedded picture serving |
-| GET | `/{full_path:path}` | SPA fallback (serves `index.html`) |
+| GET | `/{full_path:path}` | SPA fallback (serves `index.html`); a path under `/api/v1` answers 404 JSON. A file is served only when its resolved path is inside the resolved build folder (`path_is_within`) |
 
 ### Complete route index
 
@@ -2401,6 +2401,24 @@ The canonical shape (copy a sibling such as [`snapshot_service.py`](../pixlstash
 - A thin **vault wrapper** (`def do_x(vault, ...)`) does nothing but `vault.db.run_task(x_in_session, ...)` and shape the return.
 
 This rule is enforced by **`tests/test_architecture_guardrails.py::test_services_no_direct_db_calls`**, which fails CI on any `vault.db.run_*` call in `pixlstash/services/`. The test carries a small **allowlist** of transitional files that still keep the `vault.db.run_task` call inside their wrapper. **If you add or move a service file that contains such a wrapper, you must add it to that allowlist in the same change, with a one-line justification** — otherwise the guardrail fails (this is exactly how the impossible-tags clear service first broke CI). The allowlist is meant to shrink as files migrate fully behind `Vault` methods; do not grow it without cause.
+
+### 10.2 Id lists
+
+An `IN` list binds one parameter per id, and SQLite refuses a statement past its
+variable limit (999 before 3.32, 32,766 since, lower if a build sets it). A list
+whose length the caller or the library decides (a selection, a set, a person, a
+flush) goes through one of three helpers instead:
+
+- **`chunked(ids)`** (`pixlstash/utils/sql_chunking.py`, 900 a chunk) for reads
+  and writes keyed per id, where each chunk's result is a slice of the whole.
+- **`scope_id_subquery(session, ids, name=...)`**
+  (`pixlstash/utils/service/scope_table.py`) when the statement orders, limits,
+  groups or counts across the list; give each site its own `name`.
+- **`in_json(column, values)`** / **`not_in_json(column, values)`** to keep a
+  membership or an exclusion in one statement: the list binds as one JSON array.
+  Text compares case-sensitively; an exclusion cannot be chunked.
+
+`tests/test_id_lists_routes.py` pins the limit to 999 and sends one id more.
 
 ---
 
@@ -6331,6 +6349,8 @@ Clearing `usertoken` in the swapped-in database is only half of it. `AuthService
 | `POST` | `/api/v1/snapshots/{id}/hash-compare` | Hash-compare for the per-picture preview. |
 
 All snapshot routes require `auth.require_unscoped_owner` — scoped tokens are rejected.
+
+Every id in a path or body (`snapshot_id`, `resource_id`, `picture_ids[]`) is a `SqliteInt` (`utils/sqlite_ints.py`), so a value outside SQLite's signed 64-bit range is a 422 before the handler runs.
 
 ### 18.7 Permanent-deletion ledger (`deleted_file_log`)
 

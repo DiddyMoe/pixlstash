@@ -3057,6 +3057,8 @@ clients.
 
 Backend rule: errors must use FastAPI's `HTTPException(status_code, detail=...)` with a human-readable `detail`. Never return a `500` for an expected validation failure.
 
+An integer outside SQLite's signed 64-bit range is a `422` where the route declares it as a `SqliteInt` (`pixlstash/utils/sqlite_ints.py`); an id the handler parses from text goes through `parse_sqlite_int` and gets that route's existing invalid-id answer (`400`), and the authz gate refuses such an id from a resource-scoped token with `403`.
+
 A request refused before its route runs (a body, query, path or header value of the wrong type or shape, or a validator's `ValueError`) is answered by `validation_exception_handler` in `pixlstash/server.py` as `422 {"detail": [{type, loc, msg}]}`. Pydantic's `input`, `ctx` and `url` are never sent, and each text value of the refused input is written as `*` in `msg` where it appears as sent or in a `repr` spelling (`Value error, '*' is not a model file`). That starring is a backstop, not a guarantee: a value a validator reshaped first (its case changed, a slice of it, two values joined with nothing between them) is not recognised, so a validator never reshapes a submitted value it puts in its message. `loc` is the field's address and keeps a mapping entry's key, which the caller chose. A password shorter than 8 characters is the one string `detail`. `errorDetail` (`frontend/src/utils/apiError.js`) shows nothing for a list `detail`, so the toast carries the caller's own copy; the ComfyUI pack shows the `msg` texts.
 
 ---

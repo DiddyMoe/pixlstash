@@ -39,6 +39,7 @@ from pixlstash.utils.tag_reset_registry import TagResetRegistry
 from pixlstash.utils.quality.tag_exclusion import (
     SESSION_INFO_KEY as TAG_EXCLUSIONS_INFO_KEY,
 )
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.sqlite_uri import sqlite_url
 from pixlstash.utils.unprocessable_image_registry import UnprocessableImageRegistry
 
@@ -517,12 +518,14 @@ def _after_flush_layout_marker(session, flush_context) -> None:
     due_at = time.time() + CHECK_DEBOUNCE_S
     with session.no_autoflush:
         # Core UPDATE against the Table for the same reason the hash hook uses
-        # one: it must not re-enter the ORM flush cycle that called it.
-        session.execute(
-            sa_update(Picture.__table__)
-            .where(Picture.__table__.c.id.in_(sorted(dirty_pids)))
-            .values(layout_check_due_at=due_at)
-        )
+        # one: it must not re-enter the ORM flush cycle that called it. A bulk
+        # move or import can dirty more pictures than one statement binds.
+        for chunk in chunked(sorted(dirty_pids)):
+            session.execute(
+                sa_update(Picture.__table__)
+                .where(Picture.__table__.c.id.in_(chunk))
+                .values(layout_check_due_at=due_at)
+            )
         for pid in dirty_pids:
             # Expire it, or a picture already loaded keeps reading the old
             # value and setting that value again writes nothing.
@@ -560,12 +563,13 @@ def _after_flush_smart_score_reset(session, flush_context) -> None:
     with session.no_autoflush:
         # Core UPDATE, as in the hooks above, so the flush cycle is not re-entered.
         table = Picture.__table__
-        session.execute(
-            sa_update(table)
-            .where(table.c.id.in_(sorted(dirty_pids)))
-            .where(table.c.smart_score.is_not(None))
-            .values(smart_score=None)
-        )
+        for chunk in chunked(sorted(dirty_pids)):
+            session.execute(
+                sa_update(table)
+                .where(table.c.id.in_(chunk))
+                .where(table.c.smart_score.is_not(None))
+                .values(smart_score=None)
+            )
         for pid in dirty_pids:
             cached = session.identity_map.get(identity_key(Picture, pid))
             if cached is not None:

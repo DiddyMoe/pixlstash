@@ -498,6 +498,7 @@ jobs:
           tests/test_adapter_header.py
           tests/test_aitoolkit_run.py
           tests/test_anomaly_region_scope.py
+          tests/test_app_logging_setup.py
           tests/test_app_permission_repair.py
           tests/test_architecture_guardrails.py
           tests/test_async_import_staging.py
@@ -564,6 +565,7 @@ jobs:
           tests/test_hub_engine.py
           tests/test_hub_model_shelf_schema.py
           tests/test_hub_registry.py
+          tests/test_id_lists_routes.py
           tests/test_identity_storage_guardrail.py
           tests/test_image_embedding_worker.py
           tests/test_import_scrapheap_match.py

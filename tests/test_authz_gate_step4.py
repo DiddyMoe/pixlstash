@@ -852,3 +852,153 @@ def test_integration_stack_detail_does_not_leak_out_of_scope_members(env, stacke
             f"a token granting no stack member must not see the stack; "
             f"got {r.status_code}: {r.text}"
         )
+
+
+def _no_raise_client(env, owner: bool = False) -> TestClient:
+    """A client that turns a server exception into its 500 response."""
+    client = TestClient(env["server"].api, raise_server_exceptions=False)
+    if owner:
+        client.cookies = env["owner"].cookies
+    return client
+
+
+def test_integration_id_past_sqlite_range_is_refused_for_a_share_token(env):
+    """A share token sending an id SQLite cannot store is refused like any id
+    outside its grant, instead of reaching the membership query and answering 500;
+    an in-range id in the grant is still served."""
+    client, tok = _no_raise_client(env), env["tokens"]["set"]
+    with _enforcing(env["server"]):
+        r = client.get(f"{API}/pictures/{2**63}/metadata", headers=_bearer(tok))
+        assert r.status_code == 403, r.text
+        r = client.get(f"{API}/pictures/{env['pic_a']}/metadata", headers=_bearer(tok))
+        assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize("value", [2**63, -(2**63) - 1])
+@pytest.mark.parametrize(
+    "method, path, body",
+    [
+        ("POST", "/pictures/face-search?source_picture_id={v}", None),
+        ("GET", "/picture_sets/{v}", None),
+        ("GET", "/characters/{v}", None),
+        ("GET", "/dedup/auto-stack/runs/{v}", None),
+        ("POST", "/recipes/{v}/extract-workflow", None),
+        (
+            "POST",
+            "/users/me/token",
+            lambda v: {"scope": "READ", "resource_type": "picture", "resource_id": v},
+        ),
+        ("POST", "/users/me/shared-picture-ids/batch", lambda v: {"picture_ids": [v]}),
+        ("POST", "/pictures/reset_tags", lambda v: {"picture_ids": [v]}),
+        ("POST", "/pictures/reset_description", lambda v: {"picture_ids": [v]}),
+        ("POST", "/open-with", lambda v: {"picture_id": v}),
+        (
+            "POST",
+            "/folder-structure/commit",
+            lambda v: {
+                "assignments": [{"relative_path": "a", "kind": "set", "match_id": v}]
+            },
+        ),
+        ("POST", "/server-config/layout/migration", lambda v: {"after_id": v}),
+    ],
+    ids=[
+        "search",
+        "sets",
+        "characters",
+        "dedup",
+        "workflows",
+        "token",
+        "shared",
+        "reset-tags",
+        "reset-description",
+        "open-with",
+        "folder-structure",
+        "layout-migration",
+    ],
+)
+def test_id_past_sqlite_range_answers_422(env, method, path, body, value):
+    """An integer id SQLite cannot store is a validation error, not a 500."""
+    r = _no_raise_client(env, owner=True).request(
+        method, API + path.format(v=value), json=body(value) if body else None
+    )
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize(
+    "method, path, body, status",
+    [
+        ("POST", "/pictures/face-search?set_id={v}", None, 400),
+        ("POST", "/pictures/likeness-search?project_id={v}", None, 400),
+        ("GET", "/pictures/likeness-groups?character_id={v}", None, 400),
+        ("GET", "/pictures?character_ids={v}", None, 200),
+        ("GET", "/tag_suggestions?character_id={v}", None, 400),
+        ("DELETE", "/pictures/{pic}/tags/{v}", None, 400),
+        ("PATCH", "/users/me/config", {"similarity_character": 2**63}, 400),
+        ("POST", "/characters/{char}/faces", {"face_ids": [2**63]}, 400),
+        ("POST", "/characters/{char}/faces", {"picture_ids": [2**63]}, 400),
+        (
+            "POST",
+            "/characters/{char}/faces",
+            {"face_assignments": [{"picture_id": 2**63, "face_id": 1}]},
+            400,
+        ),
+        ("DELETE", "/characters/{char}/faces", {"face_ids": [2**63]}, 400),
+        ("DELETE", "/characters/{char}/faces", {"picture_ids": [2**63]}, 400),
+        ("PATCH", "/pictures/project", {"picture_ids": [2**63]}, 400),
+        (
+            "POST",
+            "/pictures/favourite",
+            {"picture_ids": [2**63], "favourite": True},
+            400,
+        ),
+        ("POST", "/pictures/scrapheap/restore", {"picture_ids": [2**63]}, 400),
+        ("POST", "/picture_sets", {"name": "S2", "parent_set_id": 2**63}, 400),
+        ("PATCH", "/picture_sets/{set}", {"parent_character_id": 2**63}, 400),
+        ("POST", "/picture_sets/{set}/members", {"picture_ids": [2**63]}, 400),
+        ("PUT", "/picture_sets/{set}/members", {"picture_ids": [2**63]}, 400),
+        ("GET", "/pictures?character_id=UNASSIGNED&id={v}", None, 200),
+        ("GET", "/pictures/count?character_id=UNASSIGNED&id={v}", None, 200),
+    ],
+    ids=[
+        "set",
+        "project",
+        "character",
+        "people",
+        "review",
+        "tag",
+        "config",
+        "assign-faces",
+        "assign-pictures",
+        "assign-pairs",
+        "unassign-faces",
+        "unassign-pictures",
+        "picture-project",
+        "favourite",
+        "restore",
+        "set-create-parent",
+        "set-update-parent",
+        "set-members-add",
+        "set-members-replace",
+        "unassigned",
+        "unassigned-count",
+    ],
+)
+def test_parsed_id_past_sqlite_range_is_not_a_500(env, method, path, body, status):
+    """An id a handler parses from text takes that route's invalid-id answer, or
+    is skipped where invalid values are skipped, instead of answering 500."""
+    url = API + path.format(
+        v=2**63, pic=env["pic_a"], char=env["char_id"], set=env["set_id"]
+    )
+    r = _no_raise_client(env, owner=True).request(method, url, json=body)
+    assert r.status_code == status, r.text
+
+
+def test_id_past_float_range_is_not_a_500(env):
+    """JSON reads ``1e999`` as infinity, which ``int()`` cannot convert, so a
+    handler-parsed id that large takes the route's invalid-id answer too."""
+    r = _no_raise_client(env, owner=True).post(
+        API + f"/characters/{env['char_id']}/faces",
+        content=b'{"face_ids": [1e999]}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 400, r.text

@@ -57,6 +57,7 @@ from pixlstash.utils.quality.tag_exclusion import (
     is_excluded,
     session_tag_exclusions,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 from sqlmodel import Session, delete, select
 
 logger = get_logger(__name__)
@@ -200,7 +201,7 @@ class ReferenceFolderResponse(BaseModel):
 
 
 class MoveReferencePicturesRequest(BaseModel):
-    picture_ids: list[int]
+    picture_ids: list[SqliteInt]
     destination_subpath: Optional[str] = None
 
 
@@ -780,7 +781,7 @@ def create_router(server) -> APIRouter:
     )
     @holding_folder_overlap_lock
     def update_reference_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ReferenceFolderUpdateRequest = Body(...),
     ):
@@ -1038,7 +1039,7 @@ def create_router(server) -> APIRouter:
     )
     @holding_folder_overlap_lock
     def relocate_reference_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: RelocateReferenceFolderRequest = Body(...),
     ):
@@ -1202,7 +1203,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
     )
     def move_reference_folder_pictures(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: MoveReferencePicturesRequest = Body(...),
     ):
@@ -1460,7 +1461,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
     )
     def export_reference_folder_metadata(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ReferenceFolderMetadataRequest = Body(...),
     ):
@@ -1564,7 +1565,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
     )
     def import_reference_folder_metadata(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ReferenceFolderMetadataRequest = Body(...),
     ):
@@ -1707,7 +1708,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
         response_model=ReferenceFolderDeleteResponse,
     )
-    def delete_reference_folder(folder_id: int, request: Request):
+    def delete_reference_folder(folder_id: SqliteInt, request: Request):
 
         def remove(session: Session):
             rf = session.get(ReferenceFolder, folder_id)
@@ -1793,7 +1794,7 @@ def create_router(server) -> APIRouter:
         response_model=ReferenceFolderOpenResponse,
     )
     def open_reference_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         subpath: Optional[str] = None,
     ):

@@ -642,6 +642,55 @@ class TestAChangeMadeWhileOpen:
         assert _stored_fingerprint(server) == recorded
 
 
+class TestValueTypes:
+    """A value a setting cannot hold is refused with a fixed sentence, unsaved."""
+
+    @pytest.mark.parametrize(
+        "key, value, detail",
+        [
+            ("columns", {}, "columns must be an integer"),
+            ("columns", "example-big", "columns must be an integer"),
+            ("columns", 2**70, "columns must be an integer"),
+            ("stack_strictness", "nan", "stack_strictness must be a number"),
+            ("max_vram_gb", [1], "max_vram_gb must be a number"),
+            (
+                "similarity_character",
+                "example-word",
+                "similarity_character must be an integer",
+            ),
+        ],
+    )
+    def test_a_value_of_the_wrong_type_is_refused(self, server, key, value, detail):
+        client = _owner(server)
+        before = client.get(f"{API}/users/me/config").json()[key]
+        response = client.patch(f"{API}/users/me/config", json={key: value})
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == detail
+        assert client.get(f"{API}/users/me/config").json()[key] == before
+
+    def test_a_number_sent_as_text_or_a_float_is_stored(self, server):
+        client = _owner(server)
+        response = client.patch(
+            f"{API}/users/me/config", json={"columns": "5", "stack_strictness": 0.5}
+        )
+        assert response.status_code == 200, response.text
+        body = client.get(f"{API}/users/me/config").json()
+        assert (body["columns"], body["stack_strictness"]) == (5, 0.5)
+
+
+class TestRequestBody:
+    """A config PATCH body that is not a JSON object answers 422."""
+
+    @pytest.mark.parametrize("body", [b"[1]", b"example-not-json"])
+    def test_a_body_that_is_not_a_json_object_answers_422(self, server, body):
+        response = _owner(server).patch(
+            f"{API}/users/me/config",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422, response.text
+
+
 class TestTagChipSize:
     """The tag chip size is the owner's, kept in its own hub table."""
 

@@ -45,7 +45,7 @@ def test_workers_progress_has_expected_keys():
         assert resp.status_code == 200
         data = resp.json()
         assert "status" in data
-        assert "workers" in data
+        assert data["workers"], "the owner was told of no workers"
         assert "process" in data
         process = data["process"]
         assert "ram_used_gb" in process
@@ -88,9 +88,23 @@ def test_workers_progress_has_expected_keys():
         reader = bearer_client(server, mint_read_token(client, "test-read-token"))
         resp = reader.get(path)
         assert resp.status_code == 200, resp.text
-        assert "workers" in resp.json()
+        # A library-wide READ token sees the rows (counts only); a share
+        # token, scoped to one resource, is told of none.
+        assert resp.json()["workers"], "a READ token was told of no workers"
         assert resp.json()["database_writer"] is None
         assert resp.json()["task_labels"] == TASK_LABELS
+        share = bearer_client(
+            server,
+            mint_read_token(
+                client,
+                "test-share-token",
+                resource_type="picture",
+                resource_id=4242,
+            ),
+        )
+        resp = share.get(path)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["workers"] == {}, "a share token was told of the workers"
         # Asserted on a warm server rather than in a file of its own: the GPU
         # out-of-memory retry announces itself through this notifier, and
         # without the wiring the toast never leaves the machine

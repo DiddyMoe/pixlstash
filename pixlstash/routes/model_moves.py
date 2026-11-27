@@ -113,6 +113,7 @@ from pixlstash.utils.insightface_model_utils import set_insightface_root
 from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.reference_folder_validator import validate_reference_folder_path
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -133,7 +134,7 @@ class MoveItem(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    folder_id: int = Field(
+    folder_id: SqliteInt = Field(
         description=(
             "`model_folder.id` the copy currently lives under. Comes straight "
             "from a shelf row's `locations[].folder_id`."
@@ -154,7 +155,7 @@ class MoveRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    destination_folder_id: int = Field(
+    destination_folder_id: SqliteInt = Field(
         description=(
             "A registered folder the shelf catalogues. A `source` folder is "
             "refused: it is an ai-toolkit output root, taken from, never "
@@ -220,7 +221,7 @@ class FolderMoveRequest(BaseModel):
             "(`loras/sdxl`). Empty, the registered folder itself, is a 400."
         )
     )
-    destination_folder_id: int = Field(
+    destination_folder_id: SqliteInt = Field(
         description="The registered folder it moves into; the same one for a rename."
     )
     destination_path: str = Field(
@@ -1066,7 +1067,7 @@ def create_router(server) -> APIRouter:
         response_model=MoveStatusResponse,
     )
     def relocate_model_folder(
-        folder_id: int, request: Request, payload: RelocateRequest = Body(...)
+        folder_id: SqliteInt, request: Request, payload: RelocateRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         folder = server.hub.fetchone(
@@ -1223,7 +1224,7 @@ def create_router(server) -> APIRouter:
         responses={200: {"model": FolderMovePlanResponse}},
     )
     def move_model_folder_dir(
-        folder_id: int, request: Request, payload: FolderMoveRequest = Body(...)
+        folder_id: SqliteInt, request: Request, payload: FolderMoveRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         try:

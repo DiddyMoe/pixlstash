@@ -102,6 +102,9 @@ describe("updates socket close lifecycle", () => {
   });
 });
 
+/** How the full-restore barrier closes an established socket. */
+const RESTORE_CLOSE = { code: 1012, reason: "Database restore in progress" };
+
 /** The last socket the composable opened, so a test can push a frame at it. */
 let socket = null;
 /** The component the composable is mounted in, unmounted after each case. */
@@ -286,6 +289,17 @@ describe("useUpdatesSocket: connection lifecycle", () => {
     vi.useRealTimers();
   });
 
+  it("reconnects without reloading when the server stops", async () => {
+    vi.useFakeTimers();
+    connect();
+    // uvicorn's graceful shutdown closes every socket with a bare 1012.
+    socket.onclose({ code: 1012 });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(reloadAfterFullRestore).not.toHaveBeenCalled();
+    expect(socketCount).toBe(2);
+    vi.useRealTimers();
+  });
+
   it("hard reloads a non-initiating tab from the pre-drain restore event", async () => {
     vi.useFakeTimers();
     connect();
@@ -294,8 +308,8 @@ describe("useUpdatesSocket: connection lifecycle", () => {
     receive({ type: "restore_started", resource_type: "full" });
     expect(prepareForFullRestoreTransition).toHaveBeenCalledTimes(1);
     expect(reloadAfterFullRestore).not.toHaveBeenCalled();
-    drainedSocket.onclose({ code: 1012 });
-    drainedSocket.onclose({ code: 1012 });
+    drainedSocket.onclose(RESTORE_CLOSE);
+    drainedSocket.onclose(RESTORE_CLOSE);
     drainedSocket.onmessage({
       data: JSON.stringify({
         type: "restore_completed",
@@ -313,7 +327,7 @@ describe("useUpdatesSocket: connection lifecycle", () => {
     isReadOnly.value = true;
     connect();
 
-    socket.onclose({ code: 1012 });
+    socket.onclose(RESTORE_CLOSE);
 
     expect(reloadAfterFullRestore).toHaveBeenCalledTimes(1);
   });
@@ -322,7 +336,7 @@ describe("useUpdatesSocket: connection lifecycle", () => {
     vi.useFakeTimers();
     connect();
 
-    socket.onclose({ code: 1012 });
+    socket.onclose(RESTORE_CLOSE);
     await vi.advanceTimersByTimeAsync(2500);
 
     expect(reloadAfterFullRestore).toHaveBeenCalledTimes(1);
@@ -336,7 +350,7 @@ describe("useUpdatesSocket: connection lifecycle", () => {
     connect();
 
     receive({ type: "restore_started", resource_type: "full" });
-    socket.onclose({ code: 1012 });
+    socket.onclose(RESTORE_CLOSE);
     await vi.advanceTimersByTimeAsync(2500);
 
     expect(reloadAfterFullRestore).not.toHaveBeenCalled();

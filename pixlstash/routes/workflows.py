@@ -244,6 +244,7 @@ from pixlstash.services.workflow_card_service import (
 )
 from pixlstash.services import saved_recipe_service
 from pixlstash.services.trash_undo import KIND_WORKFLOW, remember, take
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.utils.trash_restore import NotInTrash
 from pixlstash.services.model_kind_suggestions import (
     OFFERED_KINDS,
@@ -1684,9 +1685,9 @@ class RunInput(ParameterAddress):
 class RunDestination(BaseModel):
     """Where a run with no source picture files its output."""
 
-    set_id: int | None = None
-    project_id: int | None = None
-    character_id: int | None = None
+    set_id: SqliteInt | None = None
+    project_id: SqliteInt | None = None
+    character_id: SqliteInt | None = None
 
 
 class WorkflowChanges(BaseModel):
@@ -1874,10 +1875,10 @@ class RunRequest(BaseModel):
     rewriting it would change the identity of what is being run.
     """
 
-    picture_ids: list[Annotated[int, Field(le=MAX_PICTURE_ID)]] = Field(
+    picture_ids: list[Annotated[SqliteInt, Field(le=MAX_PICTURE_ID)]] = Field(
         default_factory=list, max_length=MAX_RUN_PICTURES
     )
-    saved_recipe_id: int | None = None
+    saved_recipe_id: SqliteInt | None = None
     # A workflow (#1622): `auto:<core and families digest>` or an owner's group. It runs its
     # base topology's graph with its DEFAULT RECIPE applied by the server, and
     # this body's values, models, LoRAs and skipped stages over that. Only this
@@ -2081,7 +2082,7 @@ class RunRequest(BaseModel):
 class UpscaleRequest(BaseModel):
     """``POST /workflows/upscale`` and its pre-flight (#1868)."""
 
-    picture_ids: list[Annotated[int, Field(le=MAX_PICTURE_ID)]] = Field(
+    picture_ids: list[Annotated[SqliteInt, Field(le=MAX_PICTURE_ID)]] = Field(
         min_length=1, max_length=MAX_RUN_PICTURES
     )
     upscale: RunUpscale = Field(default_factory=RunUpscale)
@@ -3458,7 +3459,7 @@ class SetCloneAsk(BaseModel):
     """One workflow set to plan a clone onto: a key of the caller's, its models."""
 
     key: str = Field(min_length=1, max_length=MAX_LABEL_LENGTH)
-    checkpoint_ids: list[int] = Field(
+    checkpoint_ids: list[SqliteInt] = Field(
         default_factory=list,
         max_length=MAX_SET_MODELS,
         description=(
@@ -3466,7 +3467,7 @@ class SetCloneAsk(BaseModel):
             "of a two-model graph, empty when none."
         ),
     )
-    model_ids: list[int] = Field(
+    model_ids: list[SqliteInt] = Field(
         max_length=MAX_SET_MODELS,
         description="Its other models: VAEs and text encoders are used.",
     )
@@ -5426,7 +5427,7 @@ def create_router(server) -> APIRouter:
     def lora_summary(
         request: Request,
         workflow_id: str,
-        cover: int | None = Query(
+        cover: SqliteInt | None = Query(
             None, ge=1, description="The picture on top of the workflow's cover."
         ),
     ):
@@ -11893,7 +11894,7 @@ def create_router(server) -> APIRouter:
     def read_model_swap(
         request: Request,
         workflow_id: str,
-        checkpoint_id: int | None = None,
+        checkpoint_id: SqliteInt | None = None,
         replacing: str | None = Query(None, min_length=1, max_length=MAX_VALUE_LENGTH),
         slot_kind: Literal["checkpoint", "vae", "text_encoder"] | None = None,
         cached: bool = Query(
@@ -14800,7 +14801,7 @@ def create_router(server) -> APIRouter:
             },
         },
     )
-    def extract_workflow(request: Request, recipe_id: int):
+    def extract_workflow(request: Request, recipe_id: SqliteInt):
         server.auth.ensure_secure_when_required(request)
         hub = _hub()
         saved = saved_recipe_service.read_recipe(server.vault, recipe_id)

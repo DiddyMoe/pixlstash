@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import tag_health_service
 from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -134,8 +135,8 @@ def create_router(server) -> APIRouter:
     )
     def get_tag_health(
         request: Request,
-        project_id: Optional[int] = None,
-        set_id: Optional[int] = None,
+        project_id: Optional[SqliteInt] = None,
+        set_id: Optional[SqliteInt] = None,
         character_id: Optional[str] = None,
     ):
         _reject_scoped_tokens(request)

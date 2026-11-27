@@ -36,6 +36,7 @@ from pixlstash.services.project_membership_service import (
 )
 from pixlstash.services.stack_membership import expand_picture_ids_to_stacks
 from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -77,14 +78,14 @@ def _enforce_face_mutation_scope(
     affected: set[int] = set()
     for raw in picture_ids or []:
         try:
-            affected.add(int(raw))
+            affected.add(parse_sqlite_int(raw))
         except (TypeError, ValueError):
             continue
 
     normalized_face_ids: list[int] = []
     for raw in face_ids or []:
         try:
-            normalized_face_ids.append(int(raw))
+            normalized_face_ids.append(parse_sqlite_int(raw))
         except (TypeError, ValueError):
             continue
     if normalized_face_ids:
@@ -146,7 +147,7 @@ def create_router(server) -> APIRouter:
         response_model=CharacterFaceAssignmentResponse,
     )
     def assign_face_to_character(
-        request: Request, character_id: int, payload: dict = Body(...)
+        request: Request, character_id: SqliteInt, payload: dict = Body(...)
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         face_ids = payload.get("face_ids")
@@ -161,6 +162,16 @@ def create_router(server) -> APIRouter:
         ):
             raise HTTPException(
                 status_code=400, detail="face_assignments must be a list"
+            )
+        try:
+            if isinstance(face_ids, list):
+                face_ids = [parse_sqlite_int(face_id) for face_id in face_ids]
+            if isinstance(picture_ids, list):
+                picture_ids = [parse_sqlite_int(pic_id) for pic_id in picture_ids]
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="face_ids and picture_ids must contain integers",
             )
         if face_assignments_raw and (face_ids or picture_ids):
             raise HTTPException(
@@ -181,8 +192,8 @@ def create_router(server) -> APIRouter:
                     detail=f"face_assignments[{index}] must be an object",
                 )
             try:
-                picture_id = int(raw["picture_id"])
-                face_id = int(raw["face_id"])
+                picture_id = parse_sqlite_int(raw["picture_id"])
+                face_id = parse_sqlite_int(raw["face_id"])
             except (KeyError, TypeError, ValueError):
                 raise HTTPException(
                     status_code=400,
@@ -494,7 +505,7 @@ def create_router(server) -> APIRouter:
         response_model=CharacterFaceAssignmentResponse,
     )
     def remove_character_from_faces(
-        request: Request, character_id: int, payload: dict = Body(...)
+        request: Request, character_id: SqliteInt, payload: dict = Body(...)
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         face_ids = payload.get("face_ids", None)
@@ -503,6 +514,16 @@ def create_router(server) -> APIRouter:
             raise HTTPException(
                 status_code=400,
                 detail="Must send a list of picture_ids or face_ids",
+            )
+        try:
+            if isinstance(face_ids, list):
+                face_ids = [parse_sqlite_int(face_id) for face_id in face_ids]
+            if isinstance(picture_ids, list):
+                picture_ids = [parse_sqlite_int(pic_id) for pic_id in picture_ids]
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="face_ids and picture_ids must contain integers",
             )
         # Scope guard (BOLA): a write-capable resource-scoped token may only
         # unassign faces on pictures within its granted resource. Covers both

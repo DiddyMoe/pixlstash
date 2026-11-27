@@ -190,6 +190,7 @@ from pixlstash.utils.known_base_models import (
 )
 from pixlstash.utils.model_utils import canonical_quant, derive_model_name
 from pixlstash.utils.path_utils import path_is_within
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -268,7 +269,7 @@ class ModelAttachment(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     entity_type: str = Field(description="``character`` or ``set``.")
-    entity_id: int = Field(
+    entity_id: SqliteInt = Field(
         description="Row id in this library's vault. Meaningless in another library."
     )
 
@@ -707,7 +708,7 @@ class ModelEditRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description=(
@@ -834,7 +835,7 @@ class ModelForgetRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The models to forget, by hub `model.id`.",
@@ -846,7 +847,7 @@ class ModelsHiddenRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The models to hide or show, by hub `model.id`.",
@@ -908,7 +909,7 @@ class BaseModelLookupRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_LOOKUP,
         description=(
@@ -963,7 +964,7 @@ class ModelCompanionsRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The models about to be deleted, by hub `model.id`.",
@@ -1417,7 +1418,7 @@ class WorkflowSetMemberRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model_id: Optional[int] = Field(default=None, description="Hub `model.id`.")
+    model_id: Optional[SqliteInt] = Field(default=None, description="Hub `model.id`.")
     sha256: Optional[str] = Field(
         default=None, pattern=r"^[0-9a-fA-F]{64}$", description="A full digest."
     )
@@ -1680,7 +1681,7 @@ class WorkflowSetMergeRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    set_ids: list[int] = Field(
+    set_ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The sets merged into this one and then deleted.",
@@ -2375,10 +2376,10 @@ def create_router(server) -> APIRouter:
         kind: Optional[str] = Query(
             None, description="Adapter algorithm, e.g. `lora` or `lokr`."
         ),
-        character_id: Optional[int] = Query(
+        character_id: Optional[SqliteInt] = Query(
             None, description="Only adapters attached to this character."
         ),
-        set_id: Optional[int] = Query(
+        set_id: Optional[SqliteInt] = Query(
             None, description="Only adapters attached to this picture set."
         ),
         q: Optional[str] = Query(
@@ -2590,10 +2591,10 @@ def create_router(server) -> APIRouter:
         kind: Optional[str] = Query(
             None, description="Adapter algorithm, e.g. `lora` or `lokr`."
         ),
-        character_id: Optional[int] = Query(
+        character_id: Optional[SqliteInt] = Query(
             None, description="Only models attached to this character."
         ),
-        set_id: Optional[int] = Query(
+        set_id: Optional[SqliteInt] = Query(
             None, description="Only models attached to this picture set."
         ),
         q: Optional[str] = Query(
@@ -3269,7 +3270,9 @@ def create_router(server) -> APIRouter:
         response_model=HandMadeSet,
     )
     def rename_workflow_set(
-        set_id: int, request: Request, payload: WorkflowSetRenameRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetRenameRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3286,7 +3289,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=WorkflowSetDeleteResponse,
     )
-    def delete_workflow_set(set_id: int, request: Request):
+    def delete_workflow_set(set_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
             snapshot = delete_set(server.hub, set_id)
@@ -3305,7 +3308,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetMembersResponse,
     )
     def add_workflow_set_members(
-        set_id: int, request: Request, payload: WorkflowSetMembersRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetMembersRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3330,7 +3335,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetRemoveResponse,
     )
     def remove_workflow_set_members(
-        set_id: int, request: Request, payload: WorkflowSetRemoveRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetRemoveRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3379,7 +3386,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetDeclinesResponse,
     )
     def put_workflow_set_declines(
-        set_id: int, request: Request, payload: WorkflowSetDeclinesRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetDeclinesRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3402,7 +3411,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetMergeResponse,
     )
     def merge_workflow_sets(
-        set_id: int, request: Request, payload: WorkflowSetMergeRequest = Body(...)
+        set_id: SqliteInt,
+        request: Request,
+        payload: WorkflowSetMergeRequest = Body(...),
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3432,7 +3443,7 @@ def create_router(server) -> APIRouter:
         response_model=WorkflowSetSeenResponse,
     )
     def put_workflow_set_seen(
-        set_id: int, request: Request, payload: WorkflowSetSeenRequest = Body(...)
+        set_id: SqliteInt, request: Request, payload: WorkflowSetSeenRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         with _workflow_set_errors():
@@ -3506,7 +3517,7 @@ def create_router(server) -> APIRouter:
     )
     def put_member_verdict(
         combo_key: str,
-        model_id: int,
+        model_id: SqliteInt,
         request: Request,
         payload: MemberVerdictRequest = Body(...),
     ):
@@ -3529,7 +3540,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=MemberVerdictResponse,
     )
-    def delete_member_verdict(combo_key: str, model_id: int, request: Request):
+    def delete_member_verdict(combo_key: str, model_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         with _verdict_errors():
             previous = write_member_verdict(server.hub, combo_key, model_id, None)
@@ -3559,7 +3570,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=ModelOpenLocationResponse,
     )
-    def open_model_location(model_id: int, request: Request):
+    def open_model_location(model_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         if (
             server.hub.fetchone("SELECT id FROM model WHERE id = ?", (model_id,))

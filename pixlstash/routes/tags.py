@@ -42,6 +42,7 @@ from pixlstash.services.impossible_tag_clear_service import (
     clear_impossible_tags,
     restore_cleared_tags,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -94,14 +95,14 @@ class BulkPictureTagsResponse(BaseModel):
 class ClearedTagPair(BaseModel):
     """One removed ``(picture, tag)``, returned for the undo and echoed back to restore."""
 
-    picture_id: int = Field(..., description="Picture the tag was removed from.")
+    picture_id: SqliteInt = Field(..., description="Picture the tag was removed from.")
     tag: str = Field(..., description="The removed tag value.")
 
 
 class ClearImpossibleTagsRequest(BaseModel):
     """Bulk-clear request: the selected pictures and the active grid filters to apply."""
 
-    picture_ids: list[int] = Field(
+    picture_ids: list[SqliteInt] = Field(
         ..., description="Selected picture ids to clear wrong tags from."
     )
     filters: list[str] = Field(
@@ -176,7 +177,7 @@ def create_router(server) -> APIRouter:
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             try:
-                pic_id = int(id)
+                pic_id = parse_sqlite_int(id)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Invalid picture id")
             tag = payload.get("tag")
@@ -279,7 +280,7 @@ def create_router(server) -> APIRouter:
     def list_picture_tags(request: Request, id: str):
         try:
             try:
-                pic_id = int(id)
+                pic_id = parse_sqlite_int(id)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Invalid picture id")
             pic_list = server.vault.db.run_task(
@@ -316,12 +317,15 @@ def create_router(server) -> APIRouter:
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             try:
-                pic_id = int(id)
+                pic_id = parse_sqlite_int(id)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Invalid picture id")
             if not tag_id.isdigit():
                 raise HTTPException(status_code=400, detail="tag_id must be numeric")
-            tag_id_int = int(tag_id)
+            try:
+                tag_id_int = parse_sqlite_int(tag_id)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid tag_id") from None
 
             def update_picture(session, pic_id, tag_id_value):
                 # A picture frozen by a locked set has read-only label data.
@@ -403,7 +407,7 @@ def create_router(server) -> APIRouter:
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
         tag_value = (payload or {}).get("tag")
@@ -477,7 +481,7 @@ def create_router(server) -> APIRouter:
     def clear_all_tags_on_picture(request: Request, id: str):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -672,7 +676,7 @@ def create_router(server) -> APIRouter:
             raise HTTPException(status_code=500, detail="Failed to list tags")
 
     class BulkFetchTagsRequest(BaseModel):
-        picture_ids: list[int] = []
+        picture_ids: list[SqliteInt] = []
 
     @router.post(
         "/pictures/tags/bulk_fetch",

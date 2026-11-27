@@ -68,25 +68,24 @@ class PixlStashColourisedHandler(logging_.StreamHandler):
 def setup_logging(log_file=None, log_level=LOG_LEVEL):
     """Configure root logging handlers and level.
 
-    If *log_file* is provided, logs are written there with a standard formatter.
-    Otherwise logs are emitted to stdout with Uvicorn's colourised formatter.
+    Logs always go to the console with Uvicorn's colourised formatter: Docker's
+    ``docker logs`` and the desktop app's server log (and its crash tail) read
+    the process's stdout. If *log_file* is provided, the same records are also
+    written there with a plain formatter.
     *log_level* accepts either an int or name understood by logging_._checkLevel.
     """
     root = logging_.getLogger()
-    root.handlers = []  # Remove any default handlers
+    handlers = [PixlStashColourisedHandler()]
     if log_file:
         # Force UTF-8: on Windows FileHandler would otherwise open with the
         # legacy ANSI codepage (cp1252) and raise UnicodeEncodeError on the
         # non-ASCII glyphs we log (arrows, box drawing, etc.).
-        handler = logging_.FileHandler(log_file, encoding="utf-8")
-        # Use standard format for file logging
-        formatter = logging_.Formatter(
-            fmt="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        file_handler = logging_.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(
+            logging_.Formatter(fmt="%(asctime)s %(levelname)s %(name)s: %(message)s")
         )
-        handler.setFormatter(formatter)
-    else:
-        handler = PixlStashColourisedHandler()
-    root.addHandler(handler)
+        handlers.append(file_handler)
+    root.handlers = handlers  # Replaces any default handlers
     root.setLevel(log_level)
     # Suppress noisy alembic plugin/migration INFO messages
     logging_.getLogger("alembic.runtime.plugins").setLevel(logging_.WARNING)

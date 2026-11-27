@@ -35,6 +35,7 @@ from pixlstash.scoring import (
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 
 from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 
 logger = get_logger(__name__)
@@ -127,7 +128,7 @@ def register_routes(router, server):
         response_class=FileResponse,
         responses={200: {"content": {"image/webp": {}}}},
     )
-    async def get_thumbnail(request: Request, id: int):
+    async def get_thumbnail(request: Request, id: SqliteInt):
         started_at = datetime.now(timezone.utc)
         vault = server.vault
         generation = getattr(server, "library_generation", 0)
@@ -318,7 +319,7 @@ def register_routes(router, server):
             filtered_ids = []
             for raw_id in ids:
                 try:
-                    if int(raw_id) in scope_allowed:
+                    if parse_sqlite_int(raw_id) in scope_allowed:
                         filtered_ids.append(raw_id)
                 except (TypeError, ValueError):
                     continue
@@ -338,7 +339,7 @@ def register_routes(router, server):
         ids_int = []
         for raw_id in ids:
             try:
-                ids_int.append(int(raw_id))
+                ids_int.append(parse_sqlite_int(raw_id))
             except (TypeError, ValueError):
                 continue
 

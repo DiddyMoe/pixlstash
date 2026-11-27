@@ -61,6 +61,7 @@ from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
     session_tag_exclusions,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 from ._helpers import (
     _create_picture_imports,
@@ -554,14 +555,14 @@ class StagingOpenRequest(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    project_id: Optional[int] = None
+    project_id: Optional[SqliteInt] = None
     """Optional project every imported picture is added to on commit."""
 
-    set_id: Optional[int] = None
+    set_id: Optional[SqliteInt] = None
     """Optional picture set every imported picture is added to on commit
     (a drop-to-set target). Independent of ``character_id``."""
 
-    character_id: Optional[int] = None
+    character_id: Optional[SqliteInt] = None
     """Optional character every imported picture is associated with on commit
     (a drop-to-character target; deferred via ``pending_character_id`` until face
     extraction runs). Independent of ``set_id``."""
@@ -774,7 +775,7 @@ def register_routes(router, server):
     def import_pictures(
         request: Request,
         file: list[UploadFile] = File(None),
-        project_id: int | None = Form(None),
+        project_id: SqliteInt | None = Form(None),
     ):
         # Capture the originating tab's client id synchronously, at request
         # entry. The import runs on a detached executor thread where the origin

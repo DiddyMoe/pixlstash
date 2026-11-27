@@ -23,6 +23,7 @@ from pixlstash.utils.service.share_copies import (
     share_links_root,
     sweep_share_copies,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.utils.watermark import get_watermark_bytes
 from pixlstash.utils.reference_folder_validator import validate_reference_folder_path
 from pixlstash.utils.sql_chunking import chunked
@@ -66,7 +67,7 @@ class ExportStatusResponse(BaseModel):
 
 class ShareCopiesRequest(BaseModel):
     # No cap: a drag or a copy of a whole view links the originals (#2420).
-    picture_ids: list[int] = Field(min_length=1)
+    picture_ids: list[SqliteInt] = Field(min_length=1)
     keep_generation_data: bool = False
     # The longer side of each image, at most; None keeps the original size.
     max_long_edge: Optional[int] = Field(default=None, ge=64, le=16384)
@@ -129,7 +130,7 @@ def register_routes(router, server):
         request: Request,
         background_tasks: BackgroundTasks,
         query: str = Query(None),
-        set_id: int = Query(None),
+        set_id: SqliteInt | None = Query(None),
         threshold: float = Query(0.0),
         caption_mode: str = Query("description"),
         include_character_name: bool = Query(False),
@@ -205,7 +206,7 @@ def register_routes(router, server):
         background_tasks: BackgroundTasks,
         destination: str = Query(...),
         query: str = Query(None),
-        set_id: int = Query(None),
+        set_id: SqliteInt | None = Query(None),
         threshold: float = Query(0.0),
         caption_mode: str = Query("description"),
         include_character_name: bool = Query(False),

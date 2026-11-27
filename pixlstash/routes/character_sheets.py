@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from pixlstash.event_types import EventType
 from pixlstash.services import character_sheet
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 # A run draws at most a handful of sheets; "Draw more" adds to them.
 MAX_SHEETS = 32
@@ -94,8 +95,8 @@ class SheetPrompt(BaseModel):
 
 
 class SheetRankRequest(BaseModel):
-    picture_ids: list[int] = Field(min_length=1, max_length=MAX_SHEETS)
-    reference_picture_ids: list[int] | None = Field(
+    picture_ids: list[SqliteInt] = Field(min_length=1, max_length=MAX_SHEETS)
+    reference_picture_ids: list[SqliteInt] | None = Field(
         None,
         max_length=4,
         description="The pictures the sheets were drawn from: closeness is "
@@ -191,7 +192,7 @@ class SheetRanking(BaseModel):
 
 
 class SheetIds(BaseModel):
-    picture_ids: list[int] = Field(min_length=1, max_length=MAX_SHEETS)
+    picture_ids: list[SqliteInt] = Field(min_length=1, max_length=MAX_SHEETS)
     boxes: dict[int, list[list[float]]] | None = Field(
         None,
         description="Cuts drawn by hand, keyed by sheet picture id: six "
@@ -242,7 +243,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=SheetRanking,
     )
-    def rank_sheets(character_id: int, payload: SheetRankRequest):
+    def rank_sheets(character_id: SqliteInt, payload: SheetRankRequest):
         try:
             sheets, references = character_sheet.rank_sheets(
                 server.vault,
@@ -269,7 +270,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=UsedSheets,
     )
-    def use_sheets(request: Request, character_id: int, payload: SheetIds):
+    def use_sheets(request: Request, character_id: SqliteInt, payload: SheetIds):
         try:
             panel_ids = character_sheet.use_sheets(
                 server, character_id, payload.picture_ids, payload.boxes

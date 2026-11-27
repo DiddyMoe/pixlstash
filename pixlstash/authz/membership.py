@@ -49,6 +49,7 @@ from pixlstash.db_models import (
 )
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.service.filter_helpers import visible_project_ids
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -533,7 +534,7 @@ def resolve_tag_suggestion_picture_id(server, raw_id) -> int | None:
         token - a suggestion the token cannot resolve is not one it may act on).
     """
     try:
-        suggestion_id = int(raw_id)
+        suggestion_id = parse_sqlite_int(raw_id)
     except (TypeError, ValueError):
         logger.warning(
             "resolve_tag_suggestion_picture_id: non-integer suggestion id %r; "

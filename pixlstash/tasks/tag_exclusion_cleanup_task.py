@@ -57,6 +57,7 @@ from pixlstash.utils.quality.tag_exclusion import (
 from pixlstash.utils.service.tag_prediction_utils import (
     recompute_anomaly_tag_uncertainty,
 )
+from pixlstash.utils.sql_chunking import in_json
 
 logger = get_logger(__name__)
 
@@ -88,7 +89,7 @@ def matching_rows(
     lock = model.picture_id.in_ if locked else model.picture_id.not_in
     spellings = excluded_spellings(session, model.tag, frozenset(names))
     query = select(*(columns or (model,))).where(
-        model.tag.in_(spellings),
+        in_json(model.tag, spellings),
         lock(locked_picture_id_subquery()),
     )
     if model is TagSuggestion:

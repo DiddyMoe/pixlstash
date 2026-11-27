@@ -81,6 +81,7 @@ from pixlstash.authz.policy import (
 )
 from pixlstash.authz.registry import CONDITIONALLY_MOUNTED_ROUTES, ROUTE_POLICIES
 from pixlstash.route_inventory import iter_api_route_contexts
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 if TYPE_CHECKING:
     from pixlstash.auth import AuthService
@@ -681,7 +682,7 @@ class AuthzGate:
             return
 
         try:
-            obj_id = int(raw_id)
+            obj_id = parse_sqlite_int(raw_id)
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=403,

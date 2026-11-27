@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from sqlmodel import Session, select, update
 
 from pixlstash.db_models import Character, PictureSet
+from pixlstash.utils.sqlite_ints import SQLITE_INT_MAX, SQLITE_INT_MIN
 
 # How far below a person or top-level set a set may sit: three levels in all.
 MAX_DEPTH = 2
@@ -37,7 +38,9 @@ def validate_parent(
     """
     for value in (parent_set_id, parent_character_id):
         if value is not None and (
-            isinstance(value, bool) or not isinstance(value, int)
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not SQLITE_INT_MIN <= value <= SQLITE_INT_MAX
         ):
             raise HTTPException(
                 status_code=400, detail=f"A parent id must be a number, not {value!r}."

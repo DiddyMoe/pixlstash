@@ -5,7 +5,8 @@ SQLite limits how many bound parameters a single statement may carry
 Any ``WHERE col IN (:a, :b, ...)`` built from a caller-sized id list can cross
 that cap and fail at execution time. A load is chunked; an exclusion cannot be
 (``NOT IN`` over one chunk says nothing about the others), so it binds the
-whole set as one JSON array instead.
+whole set as one JSON array instead, and so does a membership test that must
+stay in one statement (:func:`in_json`).
 
 The limit and the chunker used to be redeclared in five modules, each with its
 own copy of this rationale and no shared value to change. They live here now.
@@ -63,3 +64,23 @@ def not_in_json(column, values: Collection[int]) -> ColumnElement:
     """
     rows = func.json_each(json.dumps(sorted(values))).table_valued("value")
     return column.not_in(select(rows.c.value))
+
+
+def in_json(column, values: Collection) -> ColumnElement:
+    """``column IN values`` with *values* bound as ONE JSON array.
+
+    The membership twin of :func:`not_in_json`, for a list that has to stay in
+    one statement: under a ``GROUP BY ... LIMIT`` (where :func:`chunked` would
+    change the answer) or a one-line swap at a caller-sized ``.in_()``. The
+    match is SQLite's ``=``, so text compares case-sensitively.
+
+    Args:
+        column: The column or expression to test, e.g. ``Picture.id``.
+        values: Integers or strings to match. Sorted before encoding so equal
+            sets bind byte-identical text.
+
+    Returns:
+        The predicate. An empty *values* matches nothing.
+    """
+    rows = func.json_each(json.dumps(sorted(values))).table_valued("value")
+    return column.in_(select(rows.c.value))

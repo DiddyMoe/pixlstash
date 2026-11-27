@@ -1274,25 +1274,6 @@ def _typed_setting(value: Any, kind: type) -> Any:
     return typed
 
 
-def _parse_metadata_value(value: Any) -> Any:
-    """Recursively parse JSON strings nested within metadata values."""
-    if isinstance(value, str):
-        trimmed = value.strip()
-        if (trimmed.startswith("{") and trimmed.endswith("}")) or (
-            trimmed.startswith("[") and trimmed.endswith("]")
-        ):
-            try:
-                return json.loads(trimmed)
-            except (json.JSONDecodeError, ValueError):
-                return value
-        return value
-    if isinstance(value, list):
-        return [_parse_metadata_value(item) for item in value]
-    if isinstance(value, dict):
-        return {k: _parse_metadata_value(v) for k, v in value.items()}
-    return value
-
-
 def _workflow_candidate(value: Any) -> dict | None:
     """Attempt to interpret a raw metadata value as a ComfyUI workflow dict.
 

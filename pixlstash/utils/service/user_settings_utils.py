@@ -1,12 +1,14 @@
 """User settings serialisation and patching utilities."""
 
 import json
+import math
 import os
 import re
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import comfyui_connections
 from pixlstash.training import ai_toolkit_install
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 from pixlstash.utils.system_utils import (  # noqa: F401
     MAX_VRAM_BUDGET_GB,
@@ -92,18 +94,44 @@ SIDEBAR_WIDTH_MIN = 220
 SIDEBAR_WIDTH_MAX = 300
 
 
-def _thumbnail_size(value):
-    """Parse a raw thumbnail size value into an int, or return None."""
+def _int_setting(key: str, value) -> int:
+    """*value* as an int SQLite can store, or a ValueError naming only *key*.
+
+    *key* is a setting name the caller has already matched, never request text.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{key} must be an integer")
+    try:
+        return parse_sqlite_int(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+
+
+def _float_setting(key: str, value) -> float:
+    """*value* as a finite float, or a ValueError naming only *key*."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{key} must be a number")
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{key} must be a number")
+    return number
+
+
+def _thumbnail_size(value, key):
+    """Parse a raw size setting *key* into an int, or return None."""
     if value is None:
         return None
     if isinstance(value, str):
         if value.lower() == "default":
             return None
-        if value.isdigit():
-            return int(value)
+        if value.isdecimal():
+            return _int_setting(key, value)
         return None
     if isinstance(value, (int, float)):
-        return int(value)
+        return _int_setting(key, value)
     return None
 
 
@@ -187,14 +215,16 @@ def serialize_user_config(user) -> dict:
     )
 
     allowed_sidebar_sizes = tuple(range(24, 65, 8))
-    sidebar_size = _thumbnail_size(config.get("sidebar_thumbnail_size"))
+    sidebar_size = _thumbnail_size(
+        config.get("sidebar_thumbnail_size"), "sidebar_thumbnail_size"
+    )
     if sidebar_size is None:
         sidebar_size = default_user.sidebar_thumbnail_size
     if sidebar_size not in allowed_sidebar_sizes:
         sidebar_size = min(allowed_sidebar_sizes, key=lambda v: abs(v - sidebar_size))
     config["sidebar_thumbnail_size"] = sidebar_size
 
-    sidebar_width = _thumbnail_size(config.get("sidebar_width"))
+    sidebar_width = _thumbnail_size(config.get("sidebar_width"), "sidebar_width")
     if sidebar_width is None:
         sidebar_width = default_user.sidebar_width
     sidebar_width = max(SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, sidebar_width))
@@ -407,10 +437,8 @@ def apply_user_config_patch(user, patch_data) -> bool:
         if key == "similarity_character":
             if value in ("", None, "null"):
                 new_value = None
-            elif isinstance(value, str) and value.isdigit():
-                new_value = int(value)
             else:
-                new_value = value
+                new_value = _int_setting("similarity_character", value)
             if user.similarity_character != new_value:
                 user.similarity_character = new_value
                 updated = True
@@ -503,7 +531,7 @@ def apply_user_config_patch(user, patch_data) -> bool:
             if value in ("", None, "null"):
                 new_value = None
             else:
-                new_value = float(value)
+                new_value = _float_setting("max_vram_gb", value)
                 if new_value <= 0:
                     raise ValueError("max_vram_gb must be greater than 0")
                 ceiling = max_vram_budget_gb()
@@ -562,19 +590,19 @@ def apply_user_config_patch(user, patch_data) -> bool:
             if value in ("", None, "null"):
                 new_value = None
             else:
-                new_value = float(value)
+                new_value = _float_setting("stack_strictness", value)
             if user.stack_strictness != new_value:
                 user.stack_strictness = new_value
                 updated = True
             continue
         if key == "columns":
-            new_value = int(value)
+            new_value = _int_setting("columns", value)
             if user.columns != new_value:
                 user.columns = new_value
                 updated = True
             continue
         if key == "sidebar_thumbnail_size":
-            new_value = _thumbnail_size(value)
+            new_value = _thumbnail_size(value, key)
             if new_value is None:
                 continue
             allowed_sizes = tuple(range(32, 65, 8))
@@ -585,7 +613,7 @@ def apply_user_config_patch(user, patch_data) -> bool:
                 updated = True
             continue
         if key == "sidebar_width":
-            new_value = _thumbnail_size(value)
+            new_value = _thumbnail_size(value, key)
             if new_value is None:
                 continue
             new_value = max(SIDEBAR_WIDTH_MIN, min(SIDEBAR_WIDTH_MAX, new_value))
@@ -623,7 +651,7 @@ def apply_user_config_patch(user, patch_data) -> bool:
                 # persisting an empty size.
                 new_value = 3
             else:
-                new_value = int(value)
+                new_value = _int_setting("thumbnail_size_level", value)
             # Clamp to the supported 0..6 range instead of rejecting, mirroring
             # how the sidebar sizes snap to their allowed set.
             new_value = max(0, min(6, new_value))

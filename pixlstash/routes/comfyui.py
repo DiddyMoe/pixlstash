@@ -117,6 +117,7 @@ from pixlstash.services.workflow_io import (
 )
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.path_utils import resolve_path_within
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 from pixlstash.utils.trash_restore import NotInTrash, restore_from_trash
 from pixlstash.services.model_mover import publish_no_clobber
 from pixlstash.utils.workflow_ids import MANUAL_PREFIX
@@ -3850,7 +3851,7 @@ def create_router(server) -> APIRouter:
     )
     def get_picture_comfyui_workflow(request: Request, picture_id: str):
         try:
-            pic_id = int(picture_id)
+            pic_id = parse_sqlite_int(picture_id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -3932,7 +3933,7 @@ def create_router(server) -> APIRouter:
         ),
     ):
         try:
-            pic_id = int(picture_id)
+            pic_id = parse_sqlite_int(picture_id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -3940,6 +3941,16 @@ def create_router(server) -> APIRouter:
         prompt_graph = find_comfy_api_prompt(embedded_metadata)
         user = server.auth.get_user_for_request(request)
         comfyui_url = _comfyui_url(user)
+        owner = server.auth.is_unscoped_owner_request(request)
+
+        def read_object_info(cached: bool = False) -> tuple[dict | None, str | None]:
+            info, error = _read_object_info(comfyui_url, cached=cached)
+            # The reason names the owner's ComfyUI address, which a share link
+            # reading this route is not told.
+            if error is not None and not owner:
+                error = "ComfyUI unreachable"
+            return info, error
+
         object_info: dict | None = None
         object_info_error: str | None = None
         editor_graph = None
@@ -3958,9 +3969,7 @@ def create_router(server) -> APIRouter:
             # arrow key.
             editor_graph = find_comfy_workflow(embedded_metadata)
             if is_ui_graph(editor_graph):
-                object_info, object_info_error = _read_object_info(
-                    comfyui_url, cached=True
-                )
+                object_info, object_info_error = read_object_info(cached=True)
                 prompt_graph, conversion_problems = convert_ui_graph_to_api(
                     editor_graph, object_info
                 )
@@ -4000,7 +4009,7 @@ def create_router(server) -> APIRouter:
         stats = summarize_comfy_workflow(graph)
         if not from_editor_graph:
             object_info, object_info_error = (
-                _read_object_info(comfyui_url)
+                read_object_info()
                 if preflight
                 else (None, "the pre-flight was not asked for")
             )
@@ -4032,7 +4041,6 @@ def create_router(server) -> APIRouter:
         # scoped reader is told every id is unchecked, and cannot run it anyway.
         as_run = json.loads(json.dumps(graph))
         swap_pixlstash_savers(as_run)
-        owner = server.auth.is_unscoped_owner_request(request)
         refused_nodes = pixlstash_node_refusals(
             as_run,
             library_ids=(

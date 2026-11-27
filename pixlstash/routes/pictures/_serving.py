@@ -24,6 +24,7 @@ from pixlstash.db_models import Picture
 from pixlstash.db_models.user import User
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 from pixlstash.utils.watermark import apply_watermark, get_watermark_bytes
 
 from ._helpers import MEDIA_TYPE_BY_FORMAT
@@ -55,7 +56,10 @@ def register_routes(router, server):
         if not ext or not isinstance(ext, str):
             logger.error(f"Invalid extension type: {type(ext)} value: {ext}")
             raise HTTPException(status_code=400, detail="Invalid picture extension")
-        id = int(id)
+        try:
+            id = parse_sqlite_int(id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid picture id") from None
 
         pics = server.vault.db.run_immediate_read_task(
             lambda session: Picture.find(session, id=id, include_deleted=True)

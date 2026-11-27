@@ -1,0 +1,1 @@
+- Fixed: an unknown API address answered with the web page instead of 404.

@@ -133,6 +133,7 @@ from pixlstash.utils.reference_folder_validator import (
     validate_reference_folder_accessible,
     validate_reference_folder_path,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.utils.system_utils import describe_storage_device
 
 logger = get_logger(__name__)
@@ -1428,7 +1429,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderDirsResponse,
     )
     def list_model_folder_dirs(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         path: str = Query(
             "",
@@ -1557,7 +1558,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderDirCreateResponse,
     )
     def create_model_folder_dir(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ModelFolderDirCreateRequest = Body(...),
     ):
@@ -1625,7 +1626,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderOpenResponse,
     )
     def open_model_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         path: str = Query(
             "",
@@ -1700,7 +1701,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderResponse,
     )
     def update_model_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ModelFolderUpdateRequest = Body(...),
     ):
@@ -1809,7 +1810,7 @@ def create_router(server) -> APIRouter:
         response_model=ModelFolderResponse,
     )
     def rename_model_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ModelFolderRenameRequest = Body(...),
     ):
@@ -1967,7 +1968,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=ModelFolderDeleteResponse,
     )
-    def delete_model_folder(folder_id: int, request: Request):
+    def delete_model_folder(folder_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         folder = _fetch_folder(folder_id)
         if is_declared_root(folder["owner"], folder["kind"]):

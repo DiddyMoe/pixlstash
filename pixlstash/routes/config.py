@@ -22,10 +22,11 @@ from pixlstash.hub.workflows import (
     picture_ghost_count,
 )
 from pixlstash.pixl_logging import get_logger
-from pixlstash.routes._helpers import require_hub
+from pixlstash.routes._helpers import read_json_object, require_hub
 from pixlstash.routes.model_folders import register_comfyui_model_folders
 from pixlstash.utils.path_utils import LibraryRootsUnavailable
 from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.utils.vram_utils import query_total_vram_mb
 from pixlstash.services import (
     comfyui_connections,
@@ -143,7 +144,7 @@ def create_router(server) -> APIRouter:
         description: Optional[str] = None
         scope: str = "ALL"
         resource_type: Optional[str] = None
-        resource_id: Optional[int] = None
+        resource_id: Optional[SqliteInt] = None
         expires_at: Optional[datetime] = None
         include_attachments: bool = False
         watermark: bool = True
@@ -811,12 +812,8 @@ def create_router(server) -> APIRouter:
 
         start_time = time.time()
         logger.debug(f"[TIMING] PATCH /users/me/config called at {start_time:.3f}")
-        patch_data = await request.json()
-        refused = [
-            key
-            for key in AI_TOOLKIT_CONFIG_KEYS
-            if isinstance(patch_data, dict) and key in patch_data
-        ]
+        patch_data = await read_json_object(request)
+        refused = [key for key in AI_TOOLKIT_CONFIG_KEYS if key in patch_data]
         if refused:
             raise HTTPException(
                 status_code=422,
@@ -825,17 +822,13 @@ def create_router(server) -> APIRouter:
                     "checkout and its Python with PUT /api/v1/training/ai-toolkit/config."
                 ),
             )
-        auto_exclusive = (
-            patch_data.pop("auto_exclusive_after_oom", None)
-            if isinstance(patch_data, dict)
-            else None
-        )
+        auto_exclusive = patch_data.pop("auto_exclusive_after_oom", None)
         if auto_exclusive is not None and not isinstance(auto_exclusive, bool):
             raise HTTPException(
                 status_code=400, detail="auto_exclusive_after_oom must be true or false"
             )
         chip_size = None
-        if isinstance(patch_data, dict) and tag_preferences.CONFIG_KEY in patch_data:
+        if tag_preferences.CONFIG_KEY in patch_data:
             # Its own hub table, not the user row. Checked here, before any
             # write, and stored only once the user row has been saved, so a
             # PATCH refused for any value saves none of them.
@@ -919,7 +912,7 @@ def create_router(server) -> APIRouter:
             if user is None:
                 raise HTTPException(status_code=404, detail="User not found")
 
-            if isinstance(patch_data, dict) and "comfyui_url" in patch_data:
+            if "comfyui_url" in patch_data:
                 _refuse_orphaning_a_link(user, patch_data["comfyui_url"])
             old_penalised_tags = resolve_owner_penalised_tags(
                 user.smart_score_penalised_tags
@@ -1011,6 +1004,13 @@ def create_router(server) -> APIRouter:
                 character_id = int(raw_character)
             else:
                 character_id = raw_character
+            if isinstance(character_id, int):
+                try:
+                    character_id = parse_sqlite_int(character_id)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid similarity_character"
+                    ) from None
             library_settings_service.set_similarity_character(
                 server.vault.db, character_id
             )
@@ -1225,7 +1225,7 @@ def create_router(server) -> APIRouter:
         response_model=DeleteTokenResponse,
         description="Deletes one personal access token by id for the authenticated user.",
     )
-    def delete_me_token(token_id: int, request: Request):
+    def delete_me_token(token_id: SqliteInt, request: Request):
         return server.auth.delete_token(request, token_id)
 
     class UpdateTokenRequest(BaseModel):
@@ -1237,7 +1237,9 @@ def create_router(server) -> APIRouter:
         response_model=PatchTokenResponse,
         description="Updates mutable fields on a personal access token (currently: watermark).",
     )
-    def patch_me_token(token_id: int, payload: UpdateTokenRequest, request: Request):
+    def patch_me_token(
+        token_id: SqliteInt, payload: UpdateTokenRequest, request: Request
+    ):
         return server.auth.update_token(request, token_id, watermark=payload.watermark)
 
     class TokenLibrariesRequest(BaseModel):
@@ -1262,7 +1264,7 @@ def create_router(server) -> APIRouter:
         ),
     )
     def put_me_token_libraries(
-        token_id: int, payload: TokenLibrariesRequest, request: Request
+        token_id: SqliteInt, payload: TokenLibrariesRequest, request: Request
     ):
         return server.auth.set_token_libraries(
             request, token_id, all_libraries=payload.all_libraries
@@ -1377,7 +1379,7 @@ def create_router(server) -> APIRouter:
         return server.auth.get_shared_resource_ids(request, resource_type)
 
     class BatchSharedPictureIdsRequest(BaseModel):
-        picture_ids: list[int] = Field(default_factory=list)
+        picture_ids: list[SqliteInt] = Field(default_factory=list)
 
     @router.post(
         "/users/me/shared-picture-ids/batch",
@@ -1397,7 +1399,7 @@ def create_router(server) -> APIRouter:
         description="Deletes all READ tokens scoped to a specific resource (by type and id).",
     )
     def revoke_tokens_for_resource(
-        resource_type: str, resource_id: int, request: Request
+        resource_type: str, resource_id: SqliteInt, request: Request
     ):
         return server.auth.revoke_tokens_for_resource(
             request, resource_type, resource_id
@@ -1452,7 +1454,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkersProgressResponse,
         description=(
             "Returns background worker progress plus process CPU, RAM, and VRAM "
-            "usage metrics. runs lists the ComfyUI runs in flight in this "
+            "usage metrics. workers has one row per task type; empty for a "
+            "share token (one scoped to a single picture, set, character or "
+            "project). runs lists the ComfyUI runs in flight in this "
             "library, oldest first, each with its run_id, prompt_id (null "
             "while held), label, workflow_id, status (waiting for the GPU, "
             "queued or running) and percent (the running node's own "
@@ -1482,9 +1486,17 @@ def create_router(server) -> APIRouter:
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
         task_runner = getattr(server.vault, "_task_runner", None)
+        # A share token reaches one picture, set, character or project: what
+        # the library's workers are doing is not about that resource, so it is
+        # told of none. A library-wide READ token sees the rows, which carry
+        # counts only.
+        token_scope = getattr(request.state, "token_scope", None)
+        resource_scoped = (
+            token_scope is not None and token_scope.resource_type is not None
+        )
         return {
             "status": "success",
-            "workers": server.vault.get_worker_progress(),
+            "workers": {} if resource_scoped else server.vault.get_worker_progress(),
             # A run is the owner's, and its label names one of their workflows
             # or recipes: a narrower token is told of none.
             "runs": (

@@ -12,6 +12,7 @@ from pixlstash.services.restore import (
     RestoreInProgressError,
     SafetySnapshotFailedError,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -249,7 +250,7 @@ def create_router(server) -> APIRouter:
 
     @router.patch("/snapshots/{snapshot_id}", response_model=SnapshotResponse)
     def rename_snapshot(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
         label: Optional[str] = Body(default=None, embed=True),
     ):
@@ -269,7 +270,7 @@ def create_router(server) -> APIRouter:
     # ------------------------------------------------------------------
 
     @router.delete("/snapshots/{snapshot_id}", status_code=204)
-    def delete_snapshot(snapshot_id: int, request: Request):
+    def delete_snapshot(snapshot_id: SqliteInt, request: Request):
         """Delete a snapshot and its snapshot files.
 
         Any snapshot may be deleted, including the most recent DAILY / WEEKLY /
@@ -300,7 +301,7 @@ def create_router(server) -> APIRouter:
         "/snapshots/{snapshot_id}/restore/preview",
         response_model=RestorePreviewResponse,
     )
-    def preview_full_restore(snapshot_id: int, request: Request):
+    def preview_full_restore(snapshot_id: SqliteInt, request: Request):
         """Return a dry-run preview of a full restore.
 
         No data is written.  The response includes a summary of what would
@@ -336,9 +337,9 @@ def create_router(server) -> APIRouter:
         response_model=RestorePreviewResponse,
     )
     def preview_resource_restore(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         resource_type: str,
-        resource_id: int,
+        resource_id: SqliteInt,
         request: Request,
     ):
         """Return a dry-run preview of a single-resource restore.
@@ -377,7 +378,7 @@ def create_router(server) -> APIRouter:
         response_model=RestorePreviewResponse,
     )
     def preview_batch_restore(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
         resources: List[dict] = Body(embed=True),
     ):
@@ -414,7 +415,7 @@ def create_router(server) -> APIRouter:
         "/snapshots/{snapshot_id}/restore", response_model=RestoreReportResponse
     )
     def restore_snapshot(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
         dry_run: bool = Body(default=False, embed=True),
         allow_without_safety: bool = Body(default=False, embed=True),
@@ -473,7 +474,7 @@ def create_router(server) -> APIRouter:
         "/snapshots/{snapshot_id}/restore/batch", response_model=RestoreReportResponse
     )
     def restore_batch(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
         resources: List[dict] = Body(embed=True),
         confirm_restore_dependencies: bool = Body(default=False, embed=True),
@@ -540,9 +541,9 @@ def create_router(server) -> APIRouter:
         "/snapshots/{snapshot_id}/hash-compare", response_model=HashCompareResponse
     )
     def hash_compare(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         request: Request,
-        picture_ids: List[int] = Body(embed=True),
+        picture_ids: List[SqliteInt] = Body(embed=True),
     ):
         """Compare live metadata_hash values against a snapshot snapshot.
 
@@ -591,9 +592,9 @@ def create_router(server) -> APIRouter:
         response_model=RestoreReportResponse,
     )
     def restore_resource(
-        snapshot_id: int,
+        snapshot_id: SqliteInt,
         resource_type: str,
-        resource_id: int,
+        resource_id: SqliteInt,
         request: Request,
         confirm_restore_dependencies: bool = Body(default=False, embed=True),
     ):
