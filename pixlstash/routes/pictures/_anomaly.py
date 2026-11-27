@@ -28,6 +28,7 @@ from pixlstash.tasks.anomaly_region_task import (
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.quality.tag_exclusion import TagExcludedError, is_excluded
 from pixlstash.utils.service.caption_utils import sanitise_tag
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 from PIL import Image, UnidentifiedImageError
 
@@ -139,7 +140,7 @@ def register_routes(router, server):
         ),
     ):
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid picture id") from exc
 

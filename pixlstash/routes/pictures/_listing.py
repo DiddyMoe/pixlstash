@@ -1,7 +1,7 @@
 import re
 import sys
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import (
     Depends,
@@ -53,6 +53,7 @@ from pixlstash.utils.query.predicate_filter import (
     is_truthy_flag,
     parse_tag_state,
 )
+from pixlstash.utils.sqlite_ints import SQLITE_INT_MAX, SqliteInt, parse_sqlite_int
 
 from ._helpers import (
     _enrich_scrapheap_retention,
@@ -309,10 +310,10 @@ class PictureListFilters:
         reference_character_id: str | None = Query(
             None, description="Required reference for sort=CHARACTER_LIKENESS."
         ),
-        min_score: int | None = Query(
+        min_score: SqliteInt | None = Query(
             None, description="Minimum star score.", examples=[3]
         ),
-        max_score: int | None = Query(
+        max_score: SqliteInt | None = Query(
             None, description="Maximum star score.", examples=[5]
         ),
         unscored: bool = Query(
@@ -710,7 +711,12 @@ def select_pictures_for_listing(
         if value == "ALL":
             return None
         if value is not None and value != "" and str(value).isdigit():
-            return int(value)
+            try:
+                return parse_sqlite_int(value)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail="Invalid character_id"
+                ) from None
         return value
 
     format, query_params = parse_request_params()
@@ -743,7 +749,7 @@ def select_pictures_for_listing(
             else [_character_ids_raw]
         ):
             try:
-                _cid = int(_v)
+                _cid = parse_sqlite_int(_v)
                 if _cid > 0:
                     character_id_list.append(_cid)
             except (TypeError, ValueError):
@@ -808,7 +814,7 @@ def select_pictures_for_listing(
     )
     if set_mode == "difference" and base_set_id_raw is not None:
         try:
-            _base_id = int(base_set_id_raw)
+            _base_id = parse_sqlite_int(base_set_id_raw)
             if _base_id in set_filter_ids:
                 set_filter_ids = [_base_id] + [
                     s for s in set_filter_ids if s != _base_id
@@ -991,7 +997,7 @@ def select_pictures_for_listing(
                 assignment_unassigned_project = True
             elif project_id_value is not None:
                 try:
-                    assignment_project_id = int(project_id_value)
+                    assignment_project_id = parse_sqlite_int(project_id_value)
                 except (TypeError, ValueError):
                     logger.warning(
                         "Invalid project_id_raw value %r for UNASSIGNED assignment scope; treating as global scope",
@@ -1056,7 +1062,9 @@ def select_pictures_for_listing(
         elif project_id_value is not None:
             try:
                 query = query.where(
-                    project_membership_exists_clause(int(project_id_value), Picture)
+                    project_membership_exists_clause(
+                        parse_sqlite_int(project_id_value), Picture
+                    )
                 )
             except (TypeError, ValueError):
                 logger.warning(
@@ -1226,7 +1234,7 @@ def select_pictures_for_listing(
             unassigned_project_only = True
         elif project_id_raw is not None:
             try:
-                unassigned_project_id = int(project_id_raw)
+                unassigned_project_id = parse_sqlite_int(project_id_raw)
             except (TypeError, ValueError):
                 logger.warning(
                     "Invalid project_id_raw value %r for UNASSIGNED query; skipping project filter",
@@ -1269,7 +1277,11 @@ def select_pictures_for_listing(
                 tag_state=tag_state,
                 unprocessable_ids=unprocessable_ids,
                 picture_ids=(
-                    [int(i) for i in query_params["id"] if str(i).isdigit()]
+                    [
+                        int(i)
+                        for i in query_params["id"]
+                        if str(i).isdigit() and int(i) <= SQLITE_INT_MAX
+                    ]
                     if query_params.get("id")
                     else None
                 ),
@@ -1314,7 +1326,11 @@ def select_pictures_for_listing(
             tag_state=tag_state,
             unprocessable_ids=unprocessable_ids,
             picture_ids=(
-                [int(i) for i in query_params["id"] if str(i).isdigit()]
+                [
+                    int(i)
+                    for i in query_params["id"]
+                    if str(i).isdigit() and int(i) <= SQLITE_INT_MAX
+                ]
                 if query_params.get("id")
                 else None
             ),
@@ -1432,7 +1448,7 @@ def select_pictures_for_listing(
                     )
                 else:
                     try:
-                        proj_id_int = int(project_id_raw)
+                        proj_id_int = parse_sqlite_int(project_id_raw)
                     except (TypeError, ValueError):
                         proj_id_int = None
                     if proj_id_int is not None:
@@ -1528,7 +1544,7 @@ def select_pictures_for_listing(
                     )
                 else:
                     try:
-                        proj_id_int = int(project_id_raw)
+                        proj_id_int = parse_sqlite_int(project_id_raw)
                     except (TypeError, ValueError):
                         proj_id_int = None
                     if proj_id_int is not None:
@@ -1602,7 +1618,7 @@ def select_pictures_for_listing(
                     query_params["id"] = project_pic_ids
             else:
                 try:
-                    query_params["project_id"] = int(project_id_raw)
+                    query_params["project_id"] = parse_sqlite_int(project_id_raw)
                 except (TypeError, ValueError):
                     # If project_id_raw is not a valid integer, skip applying a project filter.
                     logger.warning(
@@ -1731,10 +1747,12 @@ def register_routes(router, server):
         descending: bool = Query(
             True, description="Sort direction; true = newest/highest first."
         ),
-        offset: int = Query(0, description="Number of rows to skip (pagination)."),
-        limit: int = Query(
-            sys.maxsize, description="Maximum rows to return.", examples=[200]
-        ),
+        offset: Annotated[
+            SqliteInt, Query(description="Number of rows to skip (pagination).")
+        ] = 0,
+        limit: Annotated[
+            SqliteInt, Query(description="Maximum rows to return.", examples=[200])
+        ] = sys.maxsize,
         fields: str = Query(
             None,
             description="Field projection: 'grid' for the minimal grid set, a "
@@ -1827,7 +1845,10 @@ def register_routes(router, server):
             True, description="Sort direction; true = newest/highest first."
         ),
         offset: int = Query(
-            0, ge=0, description="Row offset for this batch (use next_offset)."
+            0,
+            ge=0,
+            le=SQLITE_INT_MAX,
+            description="Row offset for this batch (use next_offset).",
         ),
         batch_limit: int = Query(
             1000,

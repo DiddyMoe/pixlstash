@@ -132,6 +132,7 @@ from pixlstash.utils.adapter_header import FILE_ENGINE
 from pixlstash.utils.aitoolkit_run import is_sample_filename
 from pixlstash.utils.links import is_link, is_link_or_missing
 from pixlstash.utils.path_utils import path_is_within, resolve_path_within
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.utils.system_utils import TRASH_NAME
 from pixlstash.utils.trash_restore import NotInTrash, fingerprint, restore_from_trash
 
@@ -165,7 +166,7 @@ class AddModelFileRequest(BaseModel):
             "moved: the original stays where it is."
         )
     )
-    destination_folder_id: Optional[int] = Field(
+    destination_folder_id: Optional[SqliteInt] = Field(
         default=None,
         description=(
             "A registered folder the shelf catalogues. Omit for the default "
@@ -191,7 +192,7 @@ class DeleteModelsRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(
+    ids: list[SqliteInt] = Field(
         min_length=1,
         max_length=MAX_MODELS_PER_EDIT,
         description="The models to delete, by hub `model.id`. Every copy goes.",
@@ -249,8 +250,8 @@ class KeepModelCopy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model_id: int = Field(description="Hub `model.id` the copies belong to.")
-    folder_id: int = Field(description="`model_folder.id` of the copy to KEEP.")
+    model_id: SqliteInt = Field(description="Hub `model.id` the copies belong to.")
+    folder_id: SqliteInt = Field(description="`model_folder.id` of the copy to KEEP.")
     relpath: str = Field(
         description="That copy's path relative to its folder, as the shelf reports it."
     )
@@ -1890,7 +1891,7 @@ def create_router(server) -> APIRouter:
         response_model=Union[RemoveFolderResponse, RemoveFolderPlanResponse],
     )
     def remove_model_folder_dir(
-        folder_id: int, request: Request, payload: RemoveFolderRequest = Body(...)
+        folder_id: SqliteInt, request: Request, payload: RemoveFolderRequest = Body(...)
     ):
         server.auth.ensure_secure_when_required(request)
         if payload.dry_run:

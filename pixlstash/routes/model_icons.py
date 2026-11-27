@@ -42,6 +42,7 @@ from pixlstash.services.model_icons import (
     media_type_of,
     store_icon,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -71,7 +72,7 @@ class ClearIconsRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[int] = Field(description="Hub `model.id` values to clear.")
+    ids: list[SqliteInt] = Field(description="Hub `model.id` values to clear.")
 
 
 class ClearIconsResponse(BaseModel):
@@ -117,7 +118,7 @@ def create_router(server) -> APIRouter:
         response_model=IconSetResponse,
     )
     async def set_model_icon(
-        model_id: int, request: Request, file: UploadFile = File(...)
+        model_id: SqliteInt, request: Request, file: UploadFile = File(...)
     ):
         server.auth.ensure_secure_when_required(request)
         row = server.hub.fetchone("SELECT id FROM model WHERE id = ?", (model_id,))

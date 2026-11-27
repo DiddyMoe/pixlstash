@@ -51,6 +51,7 @@ from pixlstash.utils.service.filter_helpers import (
     narrow_project_fields,
     visible_project_ids,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -303,7 +304,7 @@ def create_router(server) -> APIRouter:
     )
     def get_batch_project_membership(
         request: Request,
-        picture_ids: list[int] = Body(default=[], embed=True),
+        picture_ids: list[SqliteInt] = Body(default=[], embed=True),
     ):
         if not picture_ids:
             return {"project_assignments": {}, "unassigned_picture_ids": []}
@@ -472,7 +473,7 @@ def create_router(server) -> APIRouter:
         def fetch(session: Session, value: str):
             project = None
             try:
-                project = session.get(Project, int(value))
+                project = session.get(Project, parse_sqlite_int(value))
             except (TypeError, ValueError):
                 # Value is not a valid integer project ID; fall back to lookup by name.
                 logger.debug("Could not parse project value %r as integer ID.", value)
@@ -500,7 +501,7 @@ def create_router(server) -> APIRouter:
     )
     def update_project(
         request: Request,
-        project_id: int,
+        project_id: SqliteInt,
         payload: ProjectUpdateRequest = Body(...),
     ):
         server.auth.require_user_id(request)
@@ -570,7 +571,7 @@ def create_router(server) -> APIRouter:
         summary="Delete a project",
         response_model=ProjectDeleteResponse,
     )
-    def delete_project(request: Request, project_id: int):
+    def delete_project(request: Request, project_id: SqliteInt):
         """Delete a project.
 
         Characters and picture sets belonging to the project have their
@@ -712,7 +713,7 @@ def create_router(server) -> APIRouter:
                 )
         else:
             try:
-                _require_scope_allows_project(request, int(project_id))
+                _require_scope_allows_project(request, parse_sqlite_int(project_id))
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -794,7 +795,7 @@ def create_router(server) -> APIRouter:
     )
     def export_project(
         request: Request,
-        project_id: int,
+        project_id: SqliteInt,
         include_pictures: bool = Query(default=True),
         include_attachments: bool = Query(default=True),
     ):
@@ -1024,7 +1025,7 @@ def create_router(server) -> APIRouter:
         summary="List attachments for a project",
         response_model=list[ProjectAttachmentResponse],
     )
-    def list_attachments(request: Request, project_id: int):
+    def list_attachments(request: Request, project_id: SqliteInt):
         server.auth.require_user_id(request)
         token_scope = getattr(request.state, "token_scope", None)
         # Every scoped token, not only a READ one: the attachment opt-in is a
@@ -1053,7 +1054,7 @@ def create_router(server) -> APIRouter:
         summary="Upload an attachment to a project",
         response_model=ProjectAttachmentResponse,
     )
-    def upload_attachment(request: Request, project_id: int, file: UploadFile):
+    def upload_attachment(request: Request, project_id: SqliteInt, file: UploadFile):
         server.auth.require_user_id(request)
 
         max_bytes = _max_attachment_bytes()
@@ -1114,7 +1115,7 @@ def create_router(server) -> APIRouter:
     )
     def add_url_attachment(
         request: Request,
-        project_id: int,
+        project_id: SqliteInt,
         body: ProjectUrlAttachmentRequest,
     ):
         server.auth.require_user_id(request)
@@ -1158,7 +1159,9 @@ def create_router(server) -> APIRouter:
         response_class=FileResponse,
         responses={200: {"content": {"application/octet-stream": {}}}},
     )
-    def download_attachment(request: Request, project_id: int, attachment_id: int):
+    def download_attachment(
+        request: Request, project_id: SqliteInt, attachment_id: SqliteInt
+    ):
         server.auth.require_user_id(request)
         token_scope = getattr(request.state, "token_scope", None)
         # Every scoped token, not only a READ one: the attachment opt-in is a
@@ -1199,7 +1202,9 @@ def create_router(server) -> APIRouter:
         summary="Delete a project attachment",
         response_model=ProjectDeleteResponse,
     )
-    def delete_attachment(request: Request, project_id: int, attachment_id: int):
+    def delete_attachment(
+        request: Request, project_id: SqliteInt, attachment_id: SqliteInt
+    ):
         server.auth.require_user_id(request)
 
         def remove(session: Session, pid: int, aid: int):

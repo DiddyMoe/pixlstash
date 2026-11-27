@@ -44,6 +44,7 @@ from pixlstash.utils.service.filter_helpers import (
     fetch_scope_allowed_picture_ids,
     normalize_set_mode,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -245,15 +246,15 @@ def register_routes(router, server):
             default=[],
             description="One or more query images containing a face to search against.",
         ),
-        source_picture_id: int | None = Query(
+        source_picture_id: SqliteInt | None = Query(
             None,
             description="Use the stored ArcFace embedding(s) of this picture ID as the query instead of uploading a file.",
         ),
-        source_face_id: int | None = Query(
+        source_face_id: SqliteInt | None = Query(
             None,
             description="Use the stored ArcFace embedding of this specific face ID as the query.",
         ),
-        source_character_id: int | None = Query(
+        source_character_id: SqliteInt | None = Query(
             None,
             description=(
                 "Use this character's reference faces as the query, so the search "
@@ -261,7 +262,7 @@ def register_routes(router, server):
                 "this source (a match to any one reference is enough)."
             ),
         ),
-        exclude_character_id: int | None = Query(
+        exclude_character_id: SqliteInt | None = Query(
             None,
             description=(
                 "Drop pictures that already contain a face assigned to this "
@@ -377,7 +378,7 @@ def register_routes(router, server):
 
         if character_id is not None and character_id not in ("ALL", ""):
             try:
-                char_id_int = int(character_id)
+                char_id_int = parse_sqlite_int(character_id)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Invalid character_id")
 

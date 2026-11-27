@@ -14,7 +14,7 @@ and upload endpoints filter inline via ``fetch_scope_allowed_picture_ids`` /
 """
 
 from io import BytesIO
-from typing import Optional
+from typing import Annotated, Optional
 
 import cv2
 import numpy as np
@@ -36,6 +36,12 @@ from pixlstash.utils.service.filter_helpers import (
     VALID_COMBINE_MODES,
     fetch_scope_allowed_character_ids,
     fetch_scope_allowed_picture_ids,
+)
+from pixlstash.utils.sqlite_ints import (
+    SQLITE_INT_MAX,
+    SQLITE_INT_MIN,
+    SqliteInt,
+    parse_sqlite_int,
 )
 
 from ._faces import _DetectedFace
@@ -101,7 +107,7 @@ class BatchCharacterLikenessRequest(BaseModel):
         },
     )
 
-    reference_character_id: int = Field(
+    reference_character_id: SqliteInt = Field(
         ...,
         description=(
             "Id of the character whose reference faces define the likeness "
@@ -110,7 +116,7 @@ class BatchCharacterLikenessRequest(BaseModel):
             "faces."
         ),
     )
-    picture_ids: list[int] = Field(
+    picture_ids: list[SqliteInt] = Field(
         ...,
         description=(
             "Picture ids to score. Must contain at least one id and at most "
@@ -219,6 +225,19 @@ class BatchCharacterLikenessResponse(BaseModel):
     )
 
 
+def _check_character_filter(character_id: str | None) -> None:
+    """422 unless *character_id* is ALL, UNASSIGNED, empty or a stored id."""
+    if character_id is None or character_id in ("ALL", "UNASSIGNED", ""):
+        return
+    try:
+        parse_sqlite_int(character_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="character_id must be 'ALL', 'UNASSIGNED', or a numeric character id",
+        ) from None
+
+
 def register_routes(router, server):
     @router.get(
         "/pictures/{id}/character_likeness",
@@ -230,13 +249,14 @@ def register_routes(router, server):
     def get_picture_character_likeness(
         request: Request,
         id: str,
-        reference_character_id: int = Query(...),
+        reference_character_id: Annotated[SqliteInt, Query()],
         character_id: str = Query(None),
     ):
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
+        _check_character_filter(character_id)
 
         def fetch_picture_characters(session):
             pic = session.exec(
@@ -404,21 +424,7 @@ def register_routes(router, server):
                 ),
             )
 
-        # `character_id` accepts the keywords ALL/UNASSIGNED (and null) or a
-        # numeric character id as a string, matching the single-id endpoint.
-        # Reject any other string with a 422 instead of letting int() 500 deep
-        # in a query (the single-id endpoint's unguarded int() would 500 here).
-        if character_id is not None and character_id not in ("ALL", "UNASSIGNED", ""):
-            try:
-                int(character_id)
-            except (TypeError, ValueError):
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "character_id must be 'ALL', 'UNASSIGNED', or a numeric "
-                        "character id"
-                    ),
-                ) from None
+        _check_character_filter(character_id)
 
         requested_ids = list(payload.picture_ids)
         unique_ids = list(dict.fromkeys(requested_ids))
@@ -686,6 +692,8 @@ def register_routes(router, server):
         ),
         reference_character_id: int = Form(
             ...,
+            ge=SQLITE_INT_MIN,
+            le=SQLITE_INT_MAX,
             description="Character to score each uploaded image's face(s) against.",
         ),
         combine: str = Form(

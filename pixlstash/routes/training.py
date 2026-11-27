@@ -84,6 +84,7 @@ from pixlstash.utils.service.user_settings_utils import (
     apply_user_config_patch,
     validate_ai_toolkit_settings,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -430,7 +431,7 @@ def create_router(server) -> APIRouter:
 
         model_config = ConfigDict(extra="forbid")
 
-        set_id: Optional[int] = Field(
+        set_id: Optional[SqliteInt] = Field(
             default=None,
             description=(
                 "Picture-set id to train on. With character_id it must be "
@@ -438,7 +439,7 @@ def create_router(server) -> APIRouter:
                 "filed under its character."
             ),
         )
-        character_id: Optional[int] = Field(
+        character_id: Optional[SqliteInt] = Field(
             default=None,
             description=(
                 "Character id to train on, or to file a reference-set run "
@@ -523,14 +524,14 @@ def create_router(server) -> APIRouter:
 
         model_config = ConfigDict(extra="forbid")
 
-        set_id: Optional[int] = Field(
+        set_id: Optional[SqliteInt] = Field(
             default=None,
             description=(
                 "Picture-set scope, as POST /training/jobs takes it. With neither "
                 "scope the previews are written from no captions."
             ),
         )
-        character_id: Optional[int] = Field(
+        character_id: Optional[SqliteInt] = Field(
             default=None,
             description="Character scope, as POST /training/jobs takes it.",
         )
@@ -2095,8 +2096,8 @@ def create_router(server) -> APIRouter:
     )
     def list_training_jobs(
         request: Request,
-        set_id: Optional[int] = None,
-        character_id: Optional[int] = None,
+        set_id: Optional[SqliteInt] = None,
+        character_id: Optional[SqliteInt] = None,
     ):
         _ensure_secure(request)
         hub, library_uuid = _store()
@@ -2119,7 +2120,7 @@ def create_router(server) -> APIRouter:
             "timestamps. Owner-only."
         ),
     )
-    def get_training_job(job_id: int, request: Request):
+    def get_training_job(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         job = training_runs.get_run(hub, library_uuid, job_id)
@@ -2175,7 +2176,7 @@ def create_router(server) -> APIRouter:
             "PLUGIN_PROGRESS events the service emits. Owner-only."
         ),
     )
-    def get_training_job_status(job_id: int, request: Request):
+    def get_training_job_status(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         # The latest loss is read in SQL; the curve itself is never loaded here.
@@ -2217,7 +2218,7 @@ def create_router(server) -> APIRouter:
             "read is null, never 0. Owner-only."
         ),
     )
-    def get_training_job_live(job_id: int, request: Request):
+    def get_training_job_live(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         job = training_runs.get_run(hub, library_uuid, job_id)
@@ -2239,7 +2240,7 @@ def create_router(server) -> APIRouter:
         ),
     )
     def set_training_job_cover(
-        job_id: int, payload: CoverStepRequest, request: Request
+        job_id: SqliteInt, payload: CoverStepRequest, request: Request
     ):
         _ensure_secure(request)
         hub, library_uuid = _store()
@@ -2296,7 +2297,7 @@ def create_router(server) -> APIRouter:
             "trainer's step log; returns no host path. Owner-only."
         ),
     )
-    def get_training_job_train_longer(job_id: int, request: Request):
+    def get_training_job_train_longer(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         job = training_runs.get_run(hub, library_uuid, job_id)
@@ -2336,7 +2337,7 @@ def create_router(server) -> APIRouter:
         ),
     )
     def train_training_job_longer(
-        job_id: int, payload: TrainLongerRequest, request: Request
+        job_id: SqliteInt, payload: TrainLongerRequest, request: Request
     ):
         _ensure_secure(request)
         try:
@@ -2403,7 +2404,7 @@ def create_router(server) -> APIRouter:
             "dataset is not built yet. Owner-only."
         ),
     )
-    def get_training_job_snapshot(job_id: int, request: Request):
+    def get_training_job_snapshot(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         job, snapshot = _snapshot_of(job_id)
         return {
@@ -2425,7 +2426,7 @@ def create_router(server) -> APIRouter:
             "unknown job and for one with no snapshot. Owner-only."
         ),
     )
-    def export_training_job_snapshot(job_id: int, request: Request):
+    def export_training_job_snapshot(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         job, snapshot = _snapshot_of(job_id)
         dataset_dir = job.get("dataset_snapshot_path") or ""
@@ -2505,7 +2506,7 @@ def create_router(server) -> APIRouter:
             "unknown and 409 if it is already in a terminal state. Owner-only."
         ),
     )
-    def cancel_training_job(job_id: int, request: Request):
+    def cancel_training_job(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
 
         # First distinguish "unknown job" (404) from "already terminal" (409):
@@ -2544,7 +2545,7 @@ def create_router(server) -> APIRouter:
             "Owner-only."
         ),
     )
-    def quit_comfyui_for_job(job_id: int, request: Request):
+    def quit_comfyui_for_job(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
         hub, library_uuid = _store()
         job = training_runs.get_run(hub, library_uuid, job_id)
@@ -2576,7 +2577,7 @@ def create_router(server) -> APIRouter:
             "Owner-only."
         ),
     )
-    def delete_training_job(job_id: int, request: Request):
+    def delete_training_job(job_id: SqliteInt, request: Request):
         _ensure_secure(request)
 
         training_root = _training_root()
@@ -2935,8 +2936,8 @@ def create_router(server) -> APIRouter:
     )
     def get_training_sample_prompts(
         request: Request,
-        set_id: Optional[int] = None,
-        character_id: Optional[int] = None,
+        set_id: Optional[SqliteInt] = None,
+        character_id: Optional[SqliteInt] = None,
         subject: Optional[Literal["person", "style", "thing"]] = None,
         trigger_word: Optional[str] = None,
     ):
@@ -2964,8 +2965,8 @@ def create_router(server) -> APIRouter:
     )
     def get_training_dataset(
         request: Request,
-        set_id: Optional[int] = None,
-        character_id: Optional[int] = None,
+        set_id: Optional[SqliteInt] = None,
+        character_id: Optional[SqliteInt] = None,
     ):
         _ensure_secure(request)
         set_id, character_id = _scope(set_id, character_id)
@@ -3247,7 +3248,7 @@ def create_router(server) -> APIRouter:
     )
     def get_character_set_suggestion(
         request: Request,
-        character_id: int,
+        character_id: SqliteInt,
         include_other_people: bool = False,
         include_near_duplicates: bool = False,
         min_likeness: int = Query(

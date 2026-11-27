@@ -86,6 +86,7 @@ from pixlstash.utils.service.filter_helpers import (
 )
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -520,7 +521,9 @@ def create_router(server) -> APIRouter:
                     status_code=400, detail="project_ids must be a list"
                 )
             try:
-                return sorted({int(v) for v in raw_ids if v is not None}), True
+                return sorted(
+                    {parse_sqlite_int(v) for v in raw_ids if v is not None}
+                ), True
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -530,7 +533,7 @@ def create_router(server) -> APIRouter:
             if raw is None:
                 return [], True
             try:
-                return [int(raw)], True
+                return [parse_sqlite_int(raw)], True
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -774,7 +777,7 @@ def create_router(server) -> APIRouter:
                 )
         else:
             try:
-                _require_scope_allows_character(request, int(id))
+                _require_scope_allows_character(request, parse_sqlite_int(id))
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid character id"
@@ -817,7 +820,7 @@ def create_router(server) -> APIRouter:
                 unassigned_project_only = True
             elif project_id is not None:
                 try:
-                    unassigned_project_id = int(project_id)
+                    unassigned_project_id = parse_sqlite_int(project_id)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail="Invalid project_id")
 
@@ -851,7 +854,7 @@ def create_router(server) -> APIRouter:
                 assigned_project_unassigned = True
             elif project_id is not None:
                 try:
-                    assigned_project_id = int(project_id)
+                    assigned_project_id = parse_sqlite_int(project_id)
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail="Invalid project_id")
 
@@ -900,7 +903,7 @@ def create_router(server) -> APIRouter:
         description="Returns picture ids selected as reference faces for the given character.",
         response_model=CharacterReferencePicturesResponse,
     )
-    def get_character_reference_pictures(request: Request, id: int):
+    def get_character_reference_pictures(request: Request, id: SqliteInt):
         """Return reference picture ids for a character.
 
         Args:
@@ -964,7 +967,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=CharacterMutationResponse,
     )
-    async def patch_character(id: int, request: Request):
+    async def patch_character(id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         data = await request.json()
         name = data.get("name")
@@ -974,7 +977,7 @@ def create_router(server) -> APIRouter:
         thumbnail_picture_id = data.get("thumbnail_picture_id", _UNSET)
         if thumbnail_picture_id is not _UNSET and thumbnail_picture_id is not None:
             try:
-                thumbnail_picture_id = int(thumbnail_picture_id)
+                thumbnail_picture_id = parse_sqlite_int(thumbnail_picture_id)
             except (TypeError, ValueError):
                 raise HTTPException(
                     status_code=400,
@@ -1193,7 +1196,7 @@ def create_router(server) -> APIRouter:
         description="Deletes a character, clears character assignment from faces, and removes its reference set when present.",
         response_model=CharacterDeleteResponse,
     )
-    def delete_character(id: int, request: Request):
+    def delete_character(id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
 
@@ -1270,7 +1273,7 @@ def create_router(server) -> APIRouter:
     )
     def get_batch_character_membership(
         request: Request,
-        picture_ids: list[int] = Body(default=[], embed=True),
+        picture_ids: list[SqliteInt] = Body(default=[], embed=True),
     ):
         if not picture_ids:
             return {"character_assignments": {}, "pictures_with_faces": []}
@@ -1309,7 +1312,7 @@ def create_router(server) -> APIRouter:
         description="Returns a single character record by id.",
         response_model=Optional[CharacterResponse],
     )
-    def get_character_by_id(request: Request, id: int):
+    def get_character_by_id(request: Request, id: SqliteInt):
         try:
             # A scoped token may read the character but must not learn which
             # *other* projects it belongs to (issue #125 / R1).
@@ -1389,7 +1392,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=FaceListResponse,
     )
-    def list_character_faces(request: Request, id: int):
+    def list_character_faces(request: Request, id: SqliteInt):
         # Dedicated, projected replacement for `GET /characters/{id}/{field}`
         # with field="faces", which served the ORM relationship and therefore
         # the embedding too (issue #721).
@@ -1442,7 +1445,7 @@ def create_router(server) -> APIRouter:
             404: {"description": "The character does not exist."},
         },
     )
-    def get_character_field_by_id(request: Request, id: int, field: str):
+    def get_character_field_by_id(request: Request, id: SqliteInt, field: str):
         # Deny-by-default: only the character's own column namespace (plus the
         # declared exceptions, which include the synthesised ``thumbnail``) is
         # servable. This runs BEFORE any lookup so the refusal cannot depend on
@@ -1808,7 +1811,9 @@ def create_router(server) -> APIRouter:
                         query = query.where(character_in_no_project())
                     else:
                         try:
-                            query = query.where(character_in_project(int(project_id)))
+                            query = query.where(
+                                character_in_project(parse_sqlite_int(project_id))
+                            )
                         except (TypeError, ValueError):
                             raise HTTPException(
                                 status_code=400, detail="Invalid project_id"

@@ -117,6 +117,7 @@ from pixlstash.services.workflow_io import (
 )
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.path_utils import resolve_path_within
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 from pixlstash.utils.trash_restore import NotInTrash, restore_from_trash
 from pixlstash.services.model_mover import publish_no_clobber
 from pixlstash.utils.workflow_ids import MANUAL_PREFIX
@@ -3850,7 +3851,7 @@ def create_router(server) -> APIRouter:
     )
     def get_picture_comfyui_workflow(request: Request, picture_id: str):
         try:
-            pic_id = int(picture_id)
+            pic_id = parse_sqlite_int(picture_id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -3932,7 +3933,7 @@ def create_router(server) -> APIRouter:
         ),
     ):
         try:
-            pic_id = int(picture_id)
+            pic_id = parse_sqlite_int(picture_id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 

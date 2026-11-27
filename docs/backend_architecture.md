@@ -6332,6 +6332,8 @@ Clearing `usertoken` in the swapped-in database is only half of it. `AuthService
 
 All snapshot routes require `auth.require_unscoped_owner` — scoped tokens are rejected.
 
+Every id in a path or body (`snapshot_id`, `resource_id`, `picture_ids[]`) is a `SqliteInt` (`utils/sqlite_ints.py`), so a value outside SQLite's signed 64-bit range is a 422 before the handler runs.
+
 ### 18.7 Permanent-deletion ledger (`deleted_file_log`)
 
 `deleted_file_log` (`db_models/deleted_file_log.py`) is not a block-list that hides files forever — it is the record *restore* consults so it never resurrects content the user permanently deleted. A row keys on `path_sha` (SHA-256 of the picture's vault/absolute path — never cleartext) plus an optional `pixel_sha`, and carries a `file_removed` flag:

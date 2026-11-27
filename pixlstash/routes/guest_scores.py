@@ -24,6 +24,7 @@ from pixlstash.db_models.guest_score import GuestScore
 from pixlstash.db_models.guest_session import GuestSession
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -191,7 +192,7 @@ def create_router(server) -> APIRouter:
         validated_scores: dict[int, int] = {}
         for key, val in raw_scores.items():
             try:
-                pic_id = int(key)
+                pic_id = parse_sqlite_int(key)
             except (TypeError, ValueError):
                 raise HTTPException(
                     status_code=400,

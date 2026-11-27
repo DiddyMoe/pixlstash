@@ -18,6 +18,7 @@ from pixlstash.db_models import (
 )
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -152,7 +153,7 @@ def collect_set_filter_ids(
     seen: set[int] = set()
     for raw in raw_values:
         try:
-            parsed = int(raw)
+            parsed = parse_sqlite_int(raw)
         except (TypeError, ValueError):
             continue
         if parsed <= 0 or parsed in seen:
@@ -755,7 +756,13 @@ def _character_scope_picture_ids(session: Session, character_id: str) -> set[int
             )
         )
     else:
-        query = base.where(Face.character_id == int(character_id))
+        try:
+            parsed = parse_sqlite_int(character_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="Invalid character_id"
+            ) from None
+        query = base.where(Face.character_id == parsed)
     rows = session.exec(query).all()
     return {int(r[0]) for r in rows if r[0] is not None}
 

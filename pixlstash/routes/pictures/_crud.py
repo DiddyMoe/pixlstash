@@ -87,6 +87,12 @@ from pixlstash.utils.service.smart_score_invalidation import (
     note_anchor_inputs_changing,
 )
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sqlite_ints import (
+    SQLITE_INT_MAX,
+    SQLITE_INT_MIN,
+    SqliteInt,
+    parse_sqlite_int,
+)
 
 
 logger = get_logger(__name__)
@@ -360,7 +366,7 @@ class ScrapheapRunRequest(BaseModel):
             "brings them back to the library."
         )
     )
-    picture_ids: Optional[list[int]] = Field(
+    picture_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         min_length=1,
         description=(
@@ -507,7 +513,7 @@ def _parse_scrapheap_ids(payload: dict | None) -> list[int] | None:
     if not isinstance(maybe_ids, list) or not maybe_ids:
         raise HTTPException(status_code=400, detail="ids must be a non-empty list")
     try:
-        return [int(pid) for pid in maybe_ids]
+        return [parse_sqlite_int(pid) for pid in maybe_ids]
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="ids must contain valid integers")
 
@@ -651,9 +657,9 @@ def register_routes(router, server):
         try:
             picture_ids = sorted(
                 {
-                    int(pid)
+                    parse_sqlite_int(pid)
                     for pid in picture_ids_raw
-                    if pid is not None and int(pid) > 0
+                    if pid is not None and parse_sqlite_int(pid) > 0
                 }
             )
         except Exception as exc:
@@ -685,7 +691,7 @@ def register_routes(router, server):
             project_id_value = None
         else:
             try:
-                project_id_value = int(project_id_raw)
+                project_id_value = parse_sqlite_int(project_id_raw)
             except Exception as exc:
                 raise HTTPException(
                     status_code=400,
@@ -868,7 +874,7 @@ def register_routes(router, server):
         parsed_scores: dict[int, int] = {}
         for raw_picture_id, raw_score in scores_payload.items():
             try:
-                picture_id = int(raw_picture_id)
+                picture_id = parse_sqlite_int(raw_picture_id)
             except Exception as exc:
                 raise HTTPException(
                     status_code=400,
@@ -1051,7 +1057,10 @@ def register_routes(router, server):
         if not isinstance(favourite, bool):
             raise HTTPException(status_code=400, detail="favourite must be a boolean")
         # Strict: int() would read `true` and `1.9` as picture 1.
-        if not all(type(pid) is int for pid in raw_ids):
+        if not all(
+            type(pid) is int and SQLITE_INT_MIN <= pid <= SQLITE_INT_MAX
+            for pid in raw_ids
+        ):
             raise HTTPException(
                 status_code=400, detail="picture_ids must be integer picture ids"
             )
@@ -1143,7 +1152,11 @@ def register_routes(router, server):
             )
         try:
             picture_ids = sorted(
-                {int(pid) for pid in raw_ids if pid is not None and int(pid) > 0}
+                {
+                    parse_sqlite_int(pid)
+                    for pid in raw_ids
+                    if pid is not None and parse_sqlite_int(pid) > 0
+                }
             )
         except (TypeError, ValueError) as exc:
             raise HTTPException(
@@ -1330,7 +1343,7 @@ def register_routes(router, server):
     )
     def get_picture_detections(request: Request, id: str):
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid picture id") from exc
 
@@ -1540,7 +1553,7 @@ def register_routes(router, server):
                 continue
             if key == "score":
                 try:
-                    value = int(value)
+                    value = parse_sqlite_int(value)
                 except Exception:
                     value = None
             if getattr(pic, key) != value:
@@ -1630,7 +1643,13 @@ def register_routes(router, server):
                         status_code=400,
                         detail="picture_ids must be a non-empty list",
                     )
-                picture_ids = ids
+                try:
+                    picture_ids = [parse_sqlite_int(pid) for pid in ids]
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="picture_ids must contain valid integers",
+                    )
 
         restored_count = len(
             scrapheap_service.restore_pictures(
@@ -2024,7 +2043,7 @@ def register_routes(router, server):
         # Validate the id shape (owner path returns 400 on a malformed id; the
         # authz gate independently 403s a scoped token that cannot reach it).
         try:
-            int(id)
+            parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -2125,7 +2144,7 @@ def register_routes(router, server):
                 ),
             )
         try:
-            pic_ids = [int(pid) for pid in maybe_ids]
+            pic_ids = [parse_sqlite_int(pid) for pid in maybe_ids]
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400, detail="picture_ids must contain valid integers"
@@ -2175,7 +2194,7 @@ def register_routes(router, server):
                 ),
             )
         try:
-            pic_ids = [int(pid) for pid in maybe_ids]
+            pic_ids = [parse_sqlite_int(pid) for pid in maybe_ids]
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400, detail="picture_ids must contain valid integers"

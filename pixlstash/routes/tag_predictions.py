@@ -12,6 +12,7 @@ from pixlstash.utils.service.anomaly_thresholds import (
     load_raw_label_thresholds,
 )
 from pixlstash.utils.service.caption_utils import sync_picture_sidecar
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -25,7 +26,7 @@ class ResetTagsRequest(BaseModel):
 class BulkResetRequest(BaseModel):
     """Request body for the multi-picture reset_tags / reset_description endpoints."""
 
-    picture_ids: list[int]
+    picture_ids: list[SqliteInt]
     model: str | None = None
 
 
@@ -146,7 +147,7 @@ def create_router(server) -> APIRouter:
     )
     def get_tag_predictions(
         request: Request,
-        id: int,
+        id: SqliteInt,
         status: str | None = None,
         include_meta: bool = False,
     ):
@@ -194,7 +195,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=ConfirmTagPredictionResponse,
     )
-    def confirm_tag_prediction(id: int, tag: str, request: Request):
+    def confirm_tag_prediction(id: SqliteInt, tag: str, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             pic_id = int(id)
@@ -249,7 +250,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=RejectTagPredictionResponse,
     )
-    def reject_tag_prediction(id: int, tag: str, request: Request):
+    def reject_tag_prediction(id: SqliteInt, tag: str, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             pic_id = int(id)
@@ -298,7 +299,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=DeleteTagPredictionsResponse,
     )
-    def delete_tag_predictions(id: int, request: Request):
+    def delete_tag_predictions(id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
             pic_id = int(id)
@@ -332,7 +333,7 @@ def create_router(server) -> APIRouter:
         response_model=ResetStatusResponse,
     )
     def reset_picture_tags(
-        id: int, request: Request, payload: ResetTagsRequest | None = None
+        id: SqliteInt, request: Request, payload: ResetTagsRequest | None = None
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:
@@ -366,7 +367,7 @@ def create_router(server) -> APIRouter:
         response_model=ResetStatusResponse,
     )
     def reset_picture_description(
-        id: int, request: Request, payload: ResetTagsRequest | None = None
+        id: SqliteInt, request: Request, payload: ResetTagsRequest | None = None
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         try:

@@ -43,6 +43,7 @@ from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
     session_tag_exclusions,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 from ._crud import BULK_DELETE_MAX_IDS, scrapheap_pictures
 from ._helpers import _create_picture_imports
@@ -51,7 +52,7 @@ logger = get_logger(__name__)
 
 
 class MoveToLibraryRequest(BaseModel):
-    picture_ids: list[int] = Field(min_length=1, max_length=BULK_DELETE_MAX_IDS)
+    picture_ids: list[SqliteInt] = Field(min_length=1, max_length=BULK_DELETE_MAX_IDS)
     # The library's stable identity, as `GET /libraries` lists it.
     library_uuid: str
 

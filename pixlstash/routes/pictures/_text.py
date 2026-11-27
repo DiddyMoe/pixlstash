@@ -17,6 +17,7 @@ from pixlstash.database import ocr_query_terms, ocr_text_match, ocr_word_matches
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import picture_service
 from pixlstash.tasks.ocr_task import OCR_MIN_TEXT_SCORE, OcrTask
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -34,7 +35,7 @@ class PictureTextResponse(BaseModel):
 
 def _picture_id(id: str) -> int:
     try:
-        return int(id)
+        return parse_sqlite_int(id)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid picture id") from exc
 

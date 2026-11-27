@@ -34,6 +34,7 @@ from pixlstash.utils.service.filter_helpers import (
 )
 from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -78,7 +79,7 @@ class KeepCoverOnlyRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    stack_ids: Optional[list[int]] = Field(
+    stack_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         description=(
             "Stacks to collapse, named directly. Prefer this when the client "
@@ -87,7 +88,7 @@ class KeepCoverOnlyRequest(BaseModel):
         ),
         examples=[[12, 19]],
     )
-    picture_ids: Optional[list[int]] = Field(
+    picture_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         description=(
             "Pictures whose stacks should be collapsed: normally the grid "
@@ -127,7 +128,7 @@ class KeepCoverOnlyRequest(BaseModel):
             "has something to move. Ignored without `keep_recipes`."
         ),
     )
-    expected_picture_ids: Optional[list[int]] = Field(
+    expected_picture_ids: Optional[list[SqliteInt]] = Field(
         default=None,
         description=(
             "`picture_ids_moving` from the preview the user confirmed. The call "
@@ -591,7 +592,7 @@ def create_router(server) -> APIRouter:
         ids = []
         for raw_id in raw_ids:
             try:
-                ids.append(int(raw_id))
+                ids.append(parse_sqlite_int(raw_id))
             except (TypeError, ValueError):
                 raise HTTPException(
                     status_code=400,
@@ -726,7 +727,7 @@ def create_router(server) -> APIRouter:
         description="Returns stack metadata and ordered picture ids for a stack.",
         response_model=StackResponse,
     )
-    def get_stack(stack_id: int, request: Request):
+    def get_stack(stack_id: SqliteInt, request: Request):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
 
@@ -762,7 +763,7 @@ def create_router(server) -> APIRouter:
         response_model=list[dict],
     )
     def get_stack_pictures(
-        stack_id: int,
+        stack_id: SqliteInt,
         request: Request,
         fields: str = Query("grid"),
         include_deleted: bool = Query(False),
@@ -847,7 +848,7 @@ def create_router(server) -> APIRouter:
         description="Returns the stack containing a picture, or null stack information when unstacked.",
         response_model=StackResponse,
     )
-    def get_stack_for_picture(picture_id: int, request: Request):
+    def get_stack_for_picture(picture_id: SqliteInt, request: Request):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
 
@@ -1064,7 +1065,7 @@ def create_router(server) -> APIRouter:
         response_model=StackOrderResponse,
     )
     def reorder_stack(
-        stack_id: int, payload: dict = Body(...), request: Request = None
+        stack_id: SqliteInt, payload: dict = Body(...), request: Request = None
     ):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
@@ -1118,7 +1119,7 @@ def create_router(server) -> APIRouter:
         response_model=StackResponse,
     )
     def add_stack_members(
-        stack_id: int, payload: dict = Body(...), request: Request = None
+        stack_id: SqliteInt, payload: dict = Body(...), request: Request = None
     ):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
@@ -1222,7 +1223,7 @@ def create_router(server) -> APIRouter:
         },
     )
     def remove_stack_members(
-        stack_id: int, payload: dict = Body(...), request: Request = None
+        stack_id: SqliteInt, payload: dict = Body(...), request: Request = None
     ):
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
@@ -1327,8 +1328,8 @@ def create_router(server) -> APIRouter:
         response_model=StackOrderResponse,
     )
     def set_member_position(
-        stack_id: int,
-        picture_id: int,
+        stack_id: SqliteInt,
+        picture_id: SqliteInt,
         payload: dict = Body(...),
         request: Request = None,
     ):

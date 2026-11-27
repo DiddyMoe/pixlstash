@@ -70,6 +70,7 @@ from pixlstash.utils.service.caption_utils import normalize_hidden_tags
 from pixlstash.utils.service.smart_set_refresher import refresh_smart_sets
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.utils.stack.stack_utils import deduplicate_by_stack
 from pixlstash.utils.query.predicate_filter import PredicateFilter
 
@@ -329,7 +330,9 @@ def create_router(server) -> APIRouter:
                     status_code=400, detail="project_ids must be a list"
                 )
             try:
-                return sorted({int(v) for v in raw_ids if v is not None}), True
+                return sorted(
+                    {parse_sqlite_int(v) for v in raw_ids if v is not None}
+                ), True
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -339,7 +342,7 @@ def create_router(server) -> APIRouter:
             if raw is None:
                 return [], True
             try:
-                return [int(raw)], True
+                return [parse_sqlite_int(raw)], True
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400, detail="Invalid project_id"
@@ -550,7 +553,7 @@ def create_router(server) -> APIRouter:
                 set_project_id_filter = picture_set_in_no_project()
             else:
                 try:
-                    _pid_int = int(project_id)
+                    _pid_int = parse_sqlite_int(project_id)
                     project_filter = _project_membership_exists(_pid_int)
                     set_project_id_filter = picture_set_in_project(_pid_int)
                 except (TypeError, ValueError):
@@ -1077,7 +1080,7 @@ def create_router(server) -> APIRouter:
     )
     def get_batch_membership(
         request: Request,
-        picture_ids: list[int] = Body(default=[]),
+        picture_ids: list[SqliteInt] = Body(default=[]),
         include_deleted: bool = Body(False),
     ):
         if not picture_ids:
@@ -1140,7 +1143,7 @@ def create_router(server) -> APIRouter:
         response_class=Response,
         responses={200: {"content": {"image/png": {}}}},
     )
-    def get_picture_set_thumbnail(id: int, request: Request):
+    def get_picture_set_thumbnail(id: SqliteInt, request: Request):
         thumbnail_cache_version = 17
         cache_dir = os.path.join(server.vault.image_root, "tmp", "set_thumbnails")
         os.makedirs(cache_dir, exist_ok=True)
@@ -1376,7 +1379,7 @@ def create_router(server) -> APIRouter:
     )
     def get_picture_set(
         request: Request,
-        id: int,
+        id: SqliteInt,
         info: bool = Query(False),
         sort: str = Query(None),
         descending: bool = Query(True),
@@ -1385,8 +1388,8 @@ def create_router(server) -> APIRouter:
         reference_character_id: str | None = Query(None),
         project_id: str | None = Query(None),
         fields: str = Query(None),
-        min_score: int | None = Query(None),
-        max_score: int | None = Query(None),
+        min_score: SqliteInt | None = Query(None),
+        max_score: SqliteInt | None = Query(None),
         smart_score_bucket: str | None = Query(None),
         resolution_bucket: str | None = Query(None),
         expand_stacks: bool = Query(False),
@@ -1427,7 +1430,9 @@ def create_router(server) -> APIRouter:
                 project_filter = _project_membership_unassigned()
             else:
                 try:
-                    project_filter = _project_membership_exists(int(project_id))
+                    project_filter = _project_membership_exists(
+                        parse_sqlite_int(project_id)
+                    )
                 except (TypeError, ValueError):
                     raise HTTPException(status_code=400, detail="Invalid project_id")
 
@@ -1651,7 +1656,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=PictureSetUpdateResponse,
     )
-    def update_picture_set(id: int, request: Request, payload: dict = Body(...)):
+    def update_picture_set(id: SqliteInt, request: Request, payload: dict = Body(...)):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         name = payload.get("name")
         description = payload.get("description")
@@ -1879,7 +1884,7 @@ def create_router(server) -> APIRouter:
         ),
         response_model=PictureSetDeleteResponse,
     )
-    def delete_picture_set(id: int):
+    def delete_picture_set(id: SqliteInt):
         def delete_set(session, id):
             picture_set = session.get(PictureSet, id)
             if not picture_set:
@@ -1917,7 +1922,7 @@ def create_router(server) -> APIRouter:
         response_model=PictureSetMembersResponse,
     )
     def get_picture_set_pictures(
-        id: int,
+        id: SqliteInt,
         request: Request,
         include_deleted: bool = Query(False),
         expand_stacks: bool = Query(False),
@@ -1991,7 +1996,7 @@ def create_router(server) -> APIRouter:
         description="Adds one picture to a set when the set and picture are valid and membership does not already exist.",
         response_model=PictureSetAddPictureResponse,
     )
-    def add_picture_to_set(id: int, picture_id: int, request: Request):
+    def add_picture_to_set(id: SqliteInt, picture_id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         reference_character_id = _find_reference_character_id_for_set(id)
 
@@ -2086,7 +2091,7 @@ def create_router(server) -> APIRouter:
         description="Removes one picture membership from a picture set.",
         response_model=PictureSetRemovePictureResponse,
     )
-    def remove_picture_from_set(id: int, picture_id: int, request: Request):
+    def remove_picture_from_set(id: SqliteInt, picture_id: SqliteInt, request: Request):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         reference_character_id = _find_reference_character_id_for_set(id)
 
@@ -2152,13 +2157,15 @@ def create_router(server) -> APIRouter:
         description="Adds a batch of pictures to a set (non-destructive). Skips pictures already in the set.",
         response_model=PictureSetBulkAddResponse,
     )
-    def bulk_add_pictures_to_set(id: int, request: Request, payload: dict = Body(...)):
+    def bulk_add_pictures_to_set(
+        id: SqliteInt, request: Request, payload: dict = Body(...)
+    ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         raw_ids = payload.get("picture_ids", [])
         if not isinstance(raw_ids, list):
             raise HTTPException(status_code=400, detail="picture_ids must be a list")
         try:
-            picture_ids = [int(i) for i in raw_ids]
+            picture_ids = [parse_sqlite_int(i) for i in raw_ids]
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400, detail="All picture ids must be integers"
@@ -2257,14 +2264,14 @@ def create_router(server) -> APIRouter:
         response_model=PictureSetBulkReplaceResponse,
     )
     def bulk_replace_pictures_in_set(
-        id: int, request: Request, payload: dict = Body(...)
+        id: SqliteInt, request: Request, payload: dict = Body(...)
     ):
         origin_client_id = getattr(request.state, "origin_client_id", None)
         raw_ids = payload.get("picture_ids", [])
         if not isinstance(raw_ids, list):
             raise HTTPException(status_code=400, detail="picture_ids must be a list")
         try:
-            picture_ids = [int(i) for i in raw_ids]
+            picture_ids = [parse_sqlite_int(i) for i in raw_ids]
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400, detail="All picture ids must be integers"

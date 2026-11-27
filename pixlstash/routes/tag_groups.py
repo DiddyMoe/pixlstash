@@ -18,6 +18,7 @@ from pixlstash.services.tag_group_service import (
     TagGroupError,
 )
 from pixlstash.utils.service.picture_stats import clear_stats_cache
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -71,12 +72,12 @@ class CreateTagGroupResponse(TagGroupMapResponse):
 
 
 class ReorderTagGroupsRequest(BaseModel):
-    ids: list[int]
+    ids: list[SqliteInt]
 
 
 class AssignTagGroupRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
-    group_id: Optional[int] = None
+    group_id: Optional[SqliteInt] = None
 
 
 class TagImportResponse(BaseModel):

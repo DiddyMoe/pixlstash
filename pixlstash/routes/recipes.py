@@ -42,6 +42,7 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.services.workflow_hash import normalized_filename
 from pixlstash.services import saved_recipe_service
 from pixlstash.services.workflow_events import announce_changed_workflows
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.utils.workflow_ids import WORKFLOW_ID_PATTERN
 
 logger = get_logger(__name__)
@@ -114,7 +115,7 @@ class SavedRecipePayload(BaseModel):
     overrides: dict[str, Any] = Field(default_factory=dict)
     seed: Optional[str] = Field(None, max_length=MAX_SEED_LENGTH)
     keep_seed: bool = False
-    source_picture_id: Optional[int] = None
+    source_picture_id: Optional[SqliteInt] = None
 
     _check_overrides = field_validator("overrides")(_bounded_overrides)
 
@@ -133,7 +134,7 @@ class SavedRecipeEdit(BaseModel):
     overrides: Optional[dict[str, Any]] = None
     seed: Optional[str] = Field(None, max_length=MAX_SEED_LENGTH)
     keep_seed: Optional[bool] = None
-    source_picture_id: Optional[int] = None
+    source_picture_id: Optional[SqliteInt] = None
 
     _check_overrides = field_validator("overrides")(_bounded_overrides)
 
@@ -206,7 +207,9 @@ class UsedLook(BaseModel):
 class RecipeOrder(BaseModel):
     """The complete ordered list of the recipes one tab is showing."""
 
-    recipe_ids: list[int] = Field(default_factory=list, max_length=MAX_REORDER_IDS)
+    recipe_ids: list[SqliteInt] = Field(
+        default_factory=list, max_length=MAX_REORDER_IDS
+    )
 
 
 class RecipeOrderResult(BaseModel):
@@ -519,7 +522,7 @@ def create_router(server) -> APIRouter:
         response_model=SavedRecipeOut,
         responses={404: {"description": "No such recipe."}},
     )
-    def edit_recipe(request: Request, recipe_id: int, payload: SavedRecipeEdit):
+    def edit_recipe(request: Request, recipe_id: SqliteInt, payload: SavedRecipeEdit):
         server.auth.ensure_secure_when_required(request)
         changes = payload.model_dump(exclude_unset=True)
         if "loras" in changes and payload.loras is not None:
@@ -547,7 +550,7 @@ def create_router(server) -> APIRouter:
         response_model=RecipeExport,
         responses={404: {"description": "No such recipe."}},
     )
-    def export_recipe(request: Request, recipe_id: int):
+    def export_recipe(request: Request, recipe_id: SqliteInt):
         server.auth.ensure_secure_when_required(request)
         row = saved_recipe_service.read_recipe(server.vault, recipe_id)
         if row is None:
@@ -576,7 +579,7 @@ def create_router(server) -> APIRouter:
         response_model=RecipeDeleted,
         responses={404: {"description": "No such recipe."}},
     )
-    def delete_recipe(request: Request, recipe_id: int):
+    def delete_recipe(request: Request, recipe_id: SqliteInt):
         server.auth.ensure_secure_when_required(request)
         if not saved_recipe_service.delete_recipe(server.vault, recipe_id):
             raise HTTPException(status_code=404, detail="No such recipe.")

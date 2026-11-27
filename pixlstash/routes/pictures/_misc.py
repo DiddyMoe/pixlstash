@@ -63,6 +63,7 @@ from pixlstash.utils.service.filter_helpers import (
     request_targets_scrapheap,
 )
 from pixlstash.utils.query.predicate_filter import PredicateFilter, parse_tag_state
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 from ._helpers import (
     _face_cluster_ids,
@@ -249,7 +250,7 @@ class OpenWithRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    picture_id: int
+    picture_id: SqliteInt
     app_id: Optional[str] = None
     other: bool = False
 
@@ -303,7 +304,9 @@ def register_routes(router, server):
 
         try:
             picture_ids = [
-                int(pic_id) for pic_id in raw_picture_ids if pic_id is not None
+                parse_sqlite_int(pic_id)
+                for pic_id in raw_picture_ids
+                if pic_id is not None
             ]
         except (TypeError, ValueError):
             raise HTTPException(
@@ -528,8 +531,8 @@ def register_routes(router, server):
         request: Request,
         threshold: float = 0.0,
         min_group_size: int = 2,
-        set_id: int = Query(None),
-        set_ids: list[int] = Query(None),
+        set_id: SqliteInt | None = Query(None),
+        set_ids: list[SqliteInt] = Query(None),
         set_mode: str = Query("union"),
         character_id: str = Query(None),
         unassigned_by: Literal["character", "set"] | None = Query(None),
@@ -541,8 +544,8 @@ def register_routes(router, server):
         tag_confidence_below: list[str] = Query(None),
         comfyui_model: list[str] = Query(None),
         comfyui_lora: list[str] = Query(None),
-        min_score: int = Query(None),
-        max_score: int = Query(None),
+        min_score: SqliteInt | None = Query(None),
+        max_score: SqliteInt | None = Query(None),
         unscored: bool = Query(False),
         favourite: bool = Query(False),
     ):
@@ -574,7 +577,7 @@ def register_routes(router, server):
                         assignment_unassigned_project = True
                     elif project_id is not None:
                         try:
-                            assignment_project_id = int(project_id)
+                            assignment_project_id = parse_sqlite_int(project_id)
                         except (TypeError, ValueError):
                             logger.warning(
                                 "Invalid project_id %r for UNASSIGNED stack assignment scope; treating as global scope",
@@ -614,9 +617,15 @@ def register_routes(router, server):
                     ).all()
                     return list(rows)
 
+                try:
+                    character_id_value = parse_sqlite_int(character_id)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid character_id"
+                    ) from None
                 candidate_ids = set(
                     server.vault.db.run_immediate_read_task(
-                        fetch_character_ids, int(character_id)
+                        fetch_character_ids, character_id_value
                     )
                 )
 
@@ -648,7 +657,7 @@ def register_routes(router, server):
                     query = query.where(project_unassigned_clause(Picture))
                 else:
                     try:
-                        parsed_project_id = int(project_id_value)
+                        parsed_project_id = parse_sqlite_int(project_id_value)
                     except (TypeError, ValueError):
                         raise HTTPException(
                             status_code=400,
@@ -1049,7 +1058,7 @@ def register_routes(router, server):
     )
     def open_picture_location(id: str):
         try:
-            pic_id = int(id)
+            pic_id = parse_sqlite_int(id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid picture id")
 
@@ -1114,7 +1123,7 @@ def register_routes(router, server):
         ),
         response_model=OpenWithListResponse,
     )
-    def list_open_with_apps(request: Request, picture_id: int):
+    def list_open_with_apps(request: Request, picture_id: SqliteInt):
         _picture, source = _open_with_picture(request, picture_id)
         if VideoUtils.is_video_file(source):
             return {"apps": [], "other": False}
@@ -1218,7 +1227,7 @@ def register_routes(router, server):
         character_id_list: list[int] = []
         for _v in character_ids_raw:
             try:
-                _cid = int(_v)
+                _cid = parse_sqlite_int(_v)
                 if _cid > 0:
                     character_id_list.append(_cid)
             except (TypeError, ValueError):
@@ -1265,7 +1274,9 @@ def register_routes(router, server):
             set_ids_values=set_ids_raw or None,
         )
         try:
-            min_score = int(min_score_raw) if min_score_raw is not None else None
+            min_score = (
+                parse_sqlite_int(min_score_raw) if min_score_raw is not None else None
+            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
@@ -1273,7 +1284,9 @@ def register_routes(router, server):
             ) from exc
 
         try:
-            max_score = int(max_score_raw) if max_score_raw is not None else None
+            max_score = (
+                parse_sqlite_int(max_score_raw) if max_score_raw is not None else None
+            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,

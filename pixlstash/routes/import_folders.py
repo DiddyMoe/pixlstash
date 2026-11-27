@@ -24,6 +24,7 @@ from pixlstash.utils.reference_folder_validator import (
     data_folder_conflict_detail,
     validate_reference_folder_path,
 )
+from pixlstash.utils.sqlite_ints import SqliteInt
 
 logger = get_logger(__name__)
 
@@ -255,7 +256,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
     )
     def update_import_folder(
-        folder_id: int,
+        folder_id: SqliteInt,
         request: Request,
         payload: ImportFolderUpdateRequest = Body(...),
     ):
@@ -287,7 +288,7 @@ def create_router(server) -> APIRouter:
         tags=["folders"],
         response_model=ImportFolderDeleteResponse,
     )
-    def delete_import_folder(folder_id: int, request: Request):
+    def delete_import_folder(folder_id: SqliteInt, request: Request):
 
         def remove(session: Session):
             folder = session.get(ImportFolder, folder_id)

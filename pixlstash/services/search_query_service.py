@@ -28,6 +28,7 @@ from pixlstash.utils.service.filter_helpers import (
     project_membership_exists_clause,
     project_unassigned_clause,
 )
+from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 logger = get_logger(__name__)
 
@@ -80,7 +81,7 @@ def fetch_project_candidate_ids(db, project_id_str: str) -> set[int]:
             )
         else:
             try:
-                parsed_project_id = int(project_id_value)
+                parsed_project_id = parse_sqlite_int(project_id_value)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Invalid project_id")
             stmt = select(Picture.id).where(

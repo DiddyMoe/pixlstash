@@ -66,6 +66,7 @@ from pixlstash.utils.aitoolkit_run import (
 from pixlstash.utils.known_base_models import training_base_tile
 from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import resolve_path_within
+from pixlstash.utils.sqlite_ints import SqliteInt
 from pixlstash.utils.system_utils import TRASH_NAME
 
 logger = get_logger(__name__)
@@ -191,7 +192,7 @@ class ImportRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    source_folder_id: int = Field(
+    source_folder_id: SqliteInt = Field(
         description="A registered `source` folder - an ai-toolkit output root."
     )
     run_name: str = Field(
@@ -201,7 +202,7 @@ class ImportRequest(BaseModel):
             "anything that resolves outside."
         )
     )
-    destination_folder_id: int = Field(
+    destination_folder_id: SqliteInt = Field(
         description="A registered folder the shelf catalogues. Never a `source` one."
     )
     steps: Optional[list[Optional[int]]] = Field(
@@ -435,7 +436,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=RunListResponse,
     )
-    def list_runs(folder_id: int, request: Request):
+    def list_runs(folder_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         folder = _source_folder(folder_id)
         try:
@@ -467,7 +468,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=TrashRunResponse,
     )
-    def trash_run(folder_id: int, run_name: str, request: Request):
+    def trash_run(folder_id: SqliteInt, run_name: str, request: Request):
         server.auth.ensure_secure_when_required(request)
         folder = _source_folder(folder_id)
         # One name, joined and contained, as the import takes it.
@@ -585,7 +586,9 @@ def create_router(server) -> APIRouter:
         response_class=FileResponse,
         responses={200: {"content": {"image/*": {}, "video/mp4": {}}}},
     )
-    def get_run_sample(folder_id: int, run_name: str, filename: str, request: Request):
+    def get_run_sample(
+        folder_id: SqliteInt, run_name: str, filename: str, request: Request
+    ):
         server.auth.ensure_secure_when_required(request)
         folder = _source_folder(folder_id)
         try:
@@ -678,7 +681,7 @@ def create_router(server) -> APIRouter:
         tags=["model_shelf"],
         response_model=ModelSamplesResponse,
     )
-    def list_model_samples(model_id: int, request: Request):
+    def list_model_samples(model_id: SqliteInt, request: Request):
         server.auth.ensure_secure_when_required(request)
         location = _samples_location(model_id)
         if location is None:
@@ -720,7 +723,7 @@ def create_router(server) -> APIRouter:
         response_class=FileResponse,
         responses={200: {"content": {"image/*": {}, "video/mp4": {}}}},
     )
-    def get_model_sample(model_id: int, filename: str, request: Request):
+    def get_model_sample(model_id: SqliteInt, filename: str, request: Request):
         server.auth.ensure_secure_when_required(request)
         location = _samples_location(model_id)
         if location is None:

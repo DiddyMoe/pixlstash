@@ -26,6 +26,7 @@ from pixlstash.routes._helpers import require_hub
 from pixlstash.routes.model_folders import register_comfyui_model_folders
 from pixlstash.utils.path_utils import LibraryRootsUnavailable
 from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.utils.vram_utils import query_total_vram_mb
 from pixlstash.services import (
     comfyui_connections,
@@ -143,7 +144,7 @@ def create_router(server) -> APIRouter:
         description: Optional[str] = None
         scope: str = "ALL"
         resource_type: Optional[str] = None
-        resource_id: Optional[int] = None
+        resource_id: Optional[SqliteInt] = None
         expires_at: Optional[datetime] = None
         include_attachments: bool = False
         watermark: bool = True
@@ -1011,6 +1012,13 @@ def create_router(server) -> APIRouter:
                 character_id = int(raw_character)
             else:
                 character_id = raw_character
+            if isinstance(character_id, int):
+                try:
+                    character_id = parse_sqlite_int(character_id)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid similarity_character"
+                    ) from None
             library_settings_service.set_similarity_character(
                 server.vault.db, character_id
             )
@@ -1225,7 +1233,7 @@ def create_router(server) -> APIRouter:
         response_model=DeleteTokenResponse,
         description="Deletes one personal access token by id for the authenticated user.",
     )
-    def delete_me_token(token_id: int, request: Request):
+    def delete_me_token(token_id: SqliteInt, request: Request):
         return server.auth.delete_token(request, token_id)
 
     class UpdateTokenRequest(BaseModel):
@@ -1237,7 +1245,9 @@ def create_router(server) -> APIRouter:
         response_model=PatchTokenResponse,
         description="Updates mutable fields on a personal access token (currently: watermark).",
     )
-    def patch_me_token(token_id: int, payload: UpdateTokenRequest, request: Request):
+    def patch_me_token(
+        token_id: SqliteInt, payload: UpdateTokenRequest, request: Request
+    ):
         return server.auth.update_token(request, token_id, watermark=payload.watermark)
 
     class TokenLibrariesRequest(BaseModel):
@@ -1262,7 +1272,7 @@ def create_router(server) -> APIRouter:
         ),
     )
     def put_me_token_libraries(
-        token_id: int, payload: TokenLibrariesRequest, request: Request
+        token_id: SqliteInt, payload: TokenLibrariesRequest, request: Request
     ):
         return server.auth.set_token_libraries(
             request, token_id, all_libraries=payload.all_libraries
@@ -1377,7 +1387,7 @@ def create_router(server) -> APIRouter:
         return server.auth.get_shared_resource_ids(request, resource_type)
 
     class BatchSharedPictureIdsRequest(BaseModel):
-        picture_ids: list[int] = Field(default_factory=list)
+        picture_ids: list[SqliteInt] = Field(default_factory=list)
 
     @router.post(
         "/users/me/shared-picture-ids/batch",
@@ -1397,7 +1407,7 @@ def create_router(server) -> APIRouter:
         description="Deletes all READ tokens scoped to a specific resource (by type and id).",
     )
     def revoke_tokens_for_resource(
-        resource_type: str, resource_id: int, request: Request
+        resource_type: str, resource_id: SqliteInt, request: Request
     ):
         return server.auth.revoke_tokens_for_resource(
             request, resource_type, resource_id
