@@ -141,6 +141,24 @@ def _parse_json_field(raw: str | None, field_name: str, job_uuid: str | None = N
         return None
 
 
+def _stored_loss_curve(raw: str | None, job_uuid: str) -> list | None:
+    """A run's stored loss curve without points whose loss is not finite.
+
+    A curve stored by v2.0.3 or earlier can hold a diverged step's
+    ``Infinity``, which the response would carry as null and a chart draw as 0.
+    """
+    curve = _parse_json_field(raw, "loss_curve", job_uuid)
+    if curve is None:
+        return None
+    return [
+        point
+        for point in curve
+        if not (
+            isinstance(point.get("loss"), float) and not math.isfinite(point["loss"])
+        )
+    ]
+
+
 # An absolute host path, as it appears inside a string: a ``file://`` URI, or a
 # POSIX or Windows path. A path runs to the end of the line, a quote, a ``<>|``
 # or a closing bracket, so a name with spaces (``/Users/Alice Smith/...``) is
@@ -1796,10 +1814,7 @@ def create_router(server) -> APIRouter:
                 else None
             ),
             **_cover_state(job, on_disk),
-            "loss_curve": _parse_json_field(
-                job["loss_curve"], "loss_curve", job["uuid"]
-            )
-            or [],
+            "loss_curve": _stored_loss_curve(job["loss_curve"], job["uuid"]) or [],
             "dataset_picture_ids": _parse_json_field(
                 job["dataset_picture_ids"], "dataset_picture_ids", job["uuid"]
             )
@@ -2122,9 +2137,7 @@ def create_router(server) -> APIRouter:
                 "trigger_word": job["trigger_word"],
                 "step": job["step"],
                 "total_steps": job["total_steps"],
-                "loss_curve": _parse_json_field(
-                    job["loss_curve"], "loss_curve", job["uuid"]
-                ),
+                "loss_curve": _stored_loss_curve(job["loss_curve"], job["uuid"]),
                 "rendered_config": _parse_json_field(
                     job["rendered_config"], "rendered_config", job["uuid"]
                 ),

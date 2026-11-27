@@ -101,6 +101,7 @@ def create_run(
     preset: Optional[str] = None,
     resolved_profile: Optional[str] = None,
     advanced_pins: Optional[str] = None,
+    comfyui_quit: Optional[str] = None,
 ) -> int:
     """Insert a queued run and return its id.
 
@@ -116,6 +117,8 @@ def create_run(
         preset: The recipe as ``id@version``.
         resolved_profile: The resolver's result, as JSON.
         advanced_pins: The owner's Advanced values, as JSON.
+        comfyui_quit: ``"allowed"`` when the owner said ComfyUI may be quit
+            for the run, else None.
 
     Returns:
         The new ``training_run.id``.
@@ -124,8 +127,8 @@ def create_run(
         cursor = conn.execute(
             "INSERT INTO training_run (uuid, library_uuid, name, status, set_id, "
             "character_id, base_model, trigger_word, preset, resolved_profile, "
-            "advanced_pins, created_at) "
-            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
+            "advanced_pins, comfyui_quit, created_at) "
+            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 uuid,
                 library_uuid,
@@ -137,6 +140,7 @@ def create_run(
                 preset,
                 resolved_profile,
                 advanced_pins,
+                comfyui_quit,
                 now_iso(),
             ),
         )
@@ -283,16 +287,26 @@ def busy_runs(hub: HubDatabase) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def update_run(hub: HubDatabase, run_uuid: str, **fields) -> bool:
+def update_run(
+    hub: HubDatabase,
+    run_uuid: str,
+    *,
+    only_if_status: Optional[tuple[str, ...]] = None,
+    **fields,
+) -> bool:
     """Set mutable columns on one run, by uuid.
 
     Args:
         hub: The open hub.
         run_uuid: The run's uuid.
+        only_if_status: Write only while the run's status is one of these,
+            checked in the same statement as the write. None writes whatever
+            the status.
         **fields: Column names to set. Names outside the mutable set raise.
 
     Returns:
-        True when a row was updated, False when no run has that uuid.
+        True when a row was updated, False when no run has that uuid or its
+        status is not in *only_if_status*.
 
     Raises:
         ValueError: A field is not a mutable column.
@@ -303,10 +317,14 @@ def update_run(hub: HubDatabase, run_uuid: str, **fields) -> bool:
     if not fields:
         return False
     assignments = ", ".join(f"{column} = ?" for column in fields)
+    where, params = "uuid = ?", [run_uuid]
+    if only_if_status is not None:
+        where += f" AND status IN ({', '.join('?' for _ in only_if_status)})"
+        params.extend(only_if_status)
     with hub.transaction() as conn:
         cursor = conn.execute(
-            f"UPDATE training_run SET {assignments} WHERE uuid = ?",
-            (*fields.values(), run_uuid),
+            f"UPDATE training_run SET {assignments} WHERE {where}",
+            (*fields.values(), *params),
         )
         return cursor.rowcount > 0
 

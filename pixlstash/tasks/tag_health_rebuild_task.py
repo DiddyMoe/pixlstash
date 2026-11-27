@@ -31,10 +31,27 @@ class TagHealthRebuildTask(BaseTask):
     def queue_type(self) -> QueueType:
         return QueueType.CPU
 
-    def _run_task(self) -> dict:
+    def on_cancel(self) -> None:
+        """Take the board's ``building`` flag down if this rebuild never started.
+
+        ``start_rebuild`` raised the flag for this task and only the task's
+        body takes it down, so a queued task the runner cancels unrun (a
+        restore's drain, a stop) would leave every later rebuild refused
+        until a restart. A rebuild already under way keeps the flag.
+        """
         # Late import to avoid a service<->task import cycle at module load.
         from pixlstash.services import tag_health_service
 
+        super().on_cancel()
+        tag_health_service.abandon_queued_rebuild(self._vault, self.id)
+
+    def _run_task(self) -> dict | None:
+        # Late import to avoid a service<->task import cycle at module load.
+        from pixlstash.services import tag_health_service
+
+        if not tag_health_service.claim_queued_rebuild(self._vault, self.id):
+            # Cancelled as it started: ``on_cancel`` took the flag down.
+            return None
         result = tag_health_service._run_rebuild_guarded(self._vault)
         logger.info("tag_health rebuild completed: %s tags", result.get("tags"))
         return result

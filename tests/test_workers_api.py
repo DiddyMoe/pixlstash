@@ -13,6 +13,7 @@ from pixlstash.db_models import Picture
 from pixlstash.server import Server
 from pixlstash.resources.ledger import Ledger
 from pixlstash.services import config_service
+from pixlstash.services.restore import TASK_LABELS
 from pixlstash.tasks.dedup_auto_stack_task import DedupAutoStackTask
 from pixlstash.tasks.dedup_scan_task import DedupScanTask
 from pixlstash.tasks.scrapheap_run_task import ScrapheapRunTask
@@ -49,6 +50,9 @@ def test_workers_progress_has_expected_keys():
         process = data["process"]
         assert "ram_used_gb" in process
         assert "ram_total_gb" in process
+        # What the Tasks panel names each task by, a worker's key included.
+        assert data["task_labels"] == TASK_LABELS
+        assert set(data["workers"]) <= set(data["task_labels"])
         # Whether the task runner's workers are there: the owner's alone.
         lanes = data["lanes"]
         assert lanes is not None, "the owner was not told of the task workers"
@@ -86,6 +90,7 @@ def test_workers_progress_has_expected_keys():
         assert resp.status_code == 200, resp.text
         assert "workers" in resp.json()
         assert resp.json()["database_writer"] is None
+        assert resp.json()["task_labels"] == TASK_LABELS
         # Asserted on a warm server rather than in a file of its own: the GPU
         # out-of-memory retry announces itself through this notifier, and
         # without the wiring the toast never leaves the machine

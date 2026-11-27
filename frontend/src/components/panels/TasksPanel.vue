@@ -33,6 +33,13 @@
          with the free part and the spare margin. Drawn only when the backend
          reports `resources`. -->
     <div v-if="tasksStore.vramBars.length" class="tm-gpu" data-testid="tm-gpu">
+      <p
+        v-if="tasksStore.resources?.stale"
+        class="tm-gpu-stale"
+        data-testid="tm-gpu-stale"
+      >
+        These figures may be out of date: the GPU did not answer in time.
+      </p>
       <div
         v-for="bar in tasksStore.vramBars"
         :key="bar.device.uuid"
@@ -309,7 +316,7 @@
                   aria-hidden="true"
                 ></span>
                 <span class="tm-name tm-child-name">
-                  {{ childName(child) }}
+                  {{ child.label }}
                   <span v-if="childProgress(child)" class="tm-child-n">{{
                     childProgress(child)
                   }}</span>
@@ -527,6 +534,7 @@
       :need-mb="runAnyway?.needMb || 0"
       :device="runAnyway?.device || null"
       :holders="tasksStore.resources?.holders || []"
+      :stale="tasksStore.resources?.stale === true"
       :busy="busyLease !== ''"
       @close="closeRunAnyway"
       @confirm="confirmRunAnyway"
@@ -1237,19 +1245,6 @@ async function cancelWait(entry) {
   }
 }
 
-function childLabel(child) {
-  return child.stopped && child.workerKey
-    ? tmFallbackWorkerLabel(child.workerKey)
-    : child.label;
-}
-
-/** A fold child's name: a worker's own label, else the lease's or the task's. */
-function childName(child) {
-  return child.snapshot
-    ? tmFormatLabel(child.workerKey, child.snapshot.label)
-    : childLabel(child);
-}
-
 /** How far a fold child is, "812 / 1190", or "" when it reports nothing. */
 function childProgress(child) {
   if (child.snapshot) return tmFormatProgress(child.snapshot);
@@ -1288,14 +1283,14 @@ function childDetail(child) {
 }
 
 function childTip(child) {
-  return [childName(child), childDetail(child)].filter(Boolean).join(" · ");
+  return [child.label, childDetail(child)].filter(Boolean).join(" · ");
 }
 
 /** The fold's tooltip: its size, and anything unusual about its tasks. */
 function foldTip(entry) {
   const unusual = entry.children
     .filter((child) => child.stopped || child.onCpu)
-    .map((child) => `${childLabel(child)} ${child.stopped ? "stopped" : "on the CPU"}`);
+    .map((child) => `${child.label} ${child.stopped ? "stopped" : "on the CPU"}`);
   return [
     `${entry.count} ${entry.count === 1 ? "task" : "tasks"}, ${formatGb(entry.mb)} of VRAM`,
     ...unusual,
@@ -1765,66 +1760,6 @@ function tmDrawSparkline(canvas, samples) {
   ctx.fill();
 }
 
-const tmLabelMap = {
-  quality_scored: "Quality",
-  pictures_tagged: "Tags",
-  descriptions_generated: "Descriptions",
-  text_embeddings: "Text embeddings",
-  image_embeddings: "Image embeddings",
-  faces_extracted: "Faces extracted",
-  likeness_pairs: "Likeness pairs",
-  likeness_parameters: "Likeness params",
-  watch_folder_import: "Folder import",
-  comfyui_extraction: "ComfyUI backfill",
-  tag_predictions_scored: "Tag Predictions",
-  missing_file_purge: "File cleanup",
-  snapshot_identity_scrub: "Snapshot cleanup",
-  planner_managed: "Planner task",
-  checkpoints_hashed: "Checkpoint Hash",
-  workflows_carded: "Workflow cards",
-  training_previews_scored: "Training preview faces",
-  text_score: "Text score",
-  smart_scored: "Smart score",
-  text_read: "Text in pictures",
-  object_detection: "Object detection",
-  // The background Auto-stack run on the Duplicates screen: its groups, or for
-  // an undo its History steps (`Vault` names the counter).
-  duplicate_auto_stack: "Auto-stack",
-  // Emptying or restoring the Scrapheap in the background, or Delete forever
-  // and Restore on a selection of it: its pictures (`Vault` names the counter).
-  scrapheap_run: "Scrapheap",
-};
-
-const tmWorkerLabelMap = {
-  ReferenceFolderScanTask: "Reference folder scan",
-  SourceFaceLikenessTask: "Source face likeness",
-  SmartScoreTask: "Smart score",
-};
-
-function tmToTitleWords(value) {
-  return String(value || "")
-    .replace(/_/g, " ")
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/\b\w/g, (char) => char.toUpperCase())
-    .trim();
-}
-
-function tmFallbackWorkerLabel(key) {
-  if (tmWorkerLabelMap[key]) return tmWorkerLabelMap[key];
-  return tmToTitleWords(String(key || "").replace(/(Worker|Task)$/, ""));
-}
-
-function tmFormatLabel(key, label) {
-  if (tmLabelMap[label]) {
-    if (label === "planner_managed") return tmFallbackWorkerLabel(key);
-    return tmLabelMap[label];
-  }
-  if (label && label !== "idle" && label !== "uninitialized") {
-    return tmToTitleWords(label);
-  }
-  return tmFallbackWorkerLabel(key);
-}
-
 /** A ComfyUI run, download or import's bar fill, as a CSS width clamped to 0-100%. */
 function barWidth(run) {
   return `${Math.min(100, Math.max(0, Math.round(run.percent)))}%`;
@@ -2232,6 +2167,12 @@ const tmSystemItems = computed(() => {
   flex-direction: column;
   gap: var(--space-4);
   min-width: 0;
+}
+
+.tm-gpu-stale {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: rgba(var(--v-theme-on-surface), var(--opacity-text-secondary));
 }
 
 .tm-gpu-dev {

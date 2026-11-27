@@ -10,6 +10,7 @@ not apply), and until it succeeds nothing has been given up.
 """
 
 import functools
+import json
 import os
 import sqlite3
 import tempfile
@@ -858,6 +859,105 @@ class TestRefusingRequestsMidSwap:
 
         assert response.status_code == 503
         assert auth_calls == []
+
+    def test_before_authentication_a_restore_and_a_switch_read_the_same(self, server):
+        """A caller with no credentials learns that the library is busy, not
+        whether a restore or a library switch holds it."""
+        from fastapi.testclient import TestClient
+
+        anonymous = TestClient(server.api)
+
+        def answers():
+            return [
+                (r.status_code, r.content, dict(r.headers))
+                for r in (
+                    anonymous.get("/api/v1/pictures"),
+                    # Absolute, so the test client's /api/v1 prefix is not added.
+                    anonymous.get("http://testserver/share/test-share-slug.jpg"),
+                    anonymous.get("http://testserver/share/a/b"),
+                    anonymous.get("/api/v1/check-session"),
+                    anonymous.get("/api/v1/login"),
+                    anonymous.post("/api/v1/logout"),
+                    anonymous.get("/api/v1/protected"),
+                    anonymous.get("/api/v1/network/info"),
+                )
+            ]
+
+        server.auth.close_auth_for_restore()
+        try:
+            during_restore = answers()
+        finally:
+            server.auth.reopen_auth_after_restore()
+        server.library_coordinator.state = SwitchState.SWITCHING
+        try:
+            during_switch = answers()
+        finally:
+            server.library_coordinator.state = SwitchState.READY
+
+        assert during_restore == during_switch
+        status, body, headers = during_switch[0]
+        assert (status, json.loads(body), headers["retry-after"]) == (
+            503,
+            {"detail": "PixlStash is busy. Try again in a moment."},
+            "2",
+        )
+
+    def test_a_signed_in_caller_still_reaches_hub_only_routes_mid_switch(self, server):
+        from fastapi.testclient import TestClient
+
+        server.auth.active_session_ids["test-session"] = 1
+        signed_in = TestClient(server.api, cookies={"session_id": "test-session"})
+
+        def answers():
+            return [
+                (r.status_code, r.json())
+                for r in (
+                    signed_in.get("/api/v1/check-session"),
+                    signed_in.get("/api/v1/protected"),
+                )
+            ]
+
+        try:
+            ready = answers()
+            server.library_coordinator.state = SwitchState.SWITCHING
+            try:
+                during_switch = answers()
+            finally:
+                server.library_coordinator.state = SwitchState.READY
+        finally:
+            server.auth.active_session_ids.pop("test-session", None)
+
+        assert during_switch == ready
+        assert [status for status, _ in ready] == [200, 200]
+
+    def test_the_gate_names_the_switch_only_to_a_signed_in_caller(self, server):
+        """A share link reaches the gate with no principal: it gets the same
+        busy answer as admission. A signed-in caller is told it is a switch."""
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+
+        from pixlstash.authz.gate import AuthzGate
+        from pixlstash.authz.policy import AccessPolicy, RoutePolicy
+
+        def refusal(request_state):
+            with pytest.raises(HTTPException) as excinfo:
+                AuthzGate._refuse_while_switching(
+                    SimpleNamespace(_server=server),
+                    SimpleNamespace(state=request_state),
+                    RoutePolicy(AccessPolicy.PUBLIC),
+                )
+            return excinfo.value.detail
+
+        server.library_coordinator.state = SwitchState.SWITCHING
+        try:
+            anonymous = refusal(SimpleNamespace())
+            signed_in = refusal(SimpleNamespace(auth_user_id=1))
+        finally:
+            server.library_coordinator.state = SwitchState.READY
+
+        assert anonymous == "PixlStash is busy. Try again in a moment."
+        assert signed_in == "PixlStash is switching library. Try again in a moment."
 
     def test_the_gate_returns_503_while_switching(self, server):
         """A request mid-swap must not be served against a half-swapped server."""

@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 import shutil
 import tempfile
@@ -43,6 +44,8 @@ from pixlstash.trusted_sqlite import TrustedSQLiteLocation
 from pixlstash.db_models.user_token import UserToken
 from pixlstash.services import scrapheap_service
 from pixlstash.services import snapshot_service as snapshot_service_module
+from pixlstash.task_runner import TaskRunner
+from pixlstash.tasks.base_task import BaseTask, TaskStatus
 from pixlstash.utils.snapshot_compression import (
     compress_snapshot,
     materialize_snapshot,
@@ -1004,6 +1007,178 @@ def test_a_snapshot_finished_during_a_restore_is_kept_by_it(server, monkeypatch)
     assert raced_snapshot.relative_path in {
         s.relative_path for s in service.list_snapshots()
     }
+
+
+# ---------------------------------------------------------------------------
+# Background work is drained before the swap
+# ---------------------------------------------------------------------------
+
+
+class _HeldTask(BaseTask):
+    """A tagging task that ignores a request to stop and runs until *gate* opens."""
+
+    def __init__(self, gate, steps):
+        super().__init__(task_type="TagTask")
+        self._gate = gate
+        self._steps = steps
+        self.ran = threading.Event()
+
+    def _run_task(self):
+        self.ran.set()
+        assert self._gate.wait(timeout=30), "the test never opened the gate"
+        self._steps.append("task ended")
+
+
+class _Planner:
+    def __init__(self, steps):
+        self._steps = steps
+
+    def stop(self):
+        self._steps.append("planner stopped")
+
+    def start(self):
+        self._steps.append("planner started")
+
+    def is_running(self):
+        return False
+
+
+@pytest.fixture
+def drain_runner(server, monkeypatch):
+    """A running TaskRunner and a stand-in planner on the vault; the steps list
+    records the planner, the tasks and the swap in the order they happen."""
+    steps: list = []
+    runner = TaskRunner(name="restore-drain-test")
+    runner.start()
+    monkeypatch.setattr(server.vault, "_task_runner", runner)
+    monkeypatch.setattr(server.vault, "_work_planner", _Planner(steps))
+    service = server.vault.restore_service
+    real_swap = service._swap_database
+
+    def _noting_swap(*args, **kwargs):
+        steps.append("swap")
+        return real_swap(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_swap_database", _noting_swap)
+    try:
+        yield runner, steps
+    finally:
+        runner.stop()
+
+
+def test_a_restore_waits_for_a_running_task_before_the_swap(server, drain_runner):
+    """A task already writing finishes before the swap, and one submitted
+    while the restore waits for it is cancelled, never run."""
+    runner, steps = drain_runner
+    _create_file(server, "drain-wait.jpg")
+    _add_picture(server, filename="drain-wait.jpg", description="v1")
+    cp = server.vault.snapshot_service.create_snapshot("MANUAL")
+    gate = threading.Event()
+    running = _HeldTask(gate, steps)
+    runner.submit(running)
+    assert running.ran.wait(timeout=30), "the running task never started"
+
+    outcome: dict = {}
+
+    def _restore():
+        try:
+            outcome["report"] = server.vault.restore_service.restore_full(cp.id)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    restorer = threading.Thread(target=_restore, daemon=True)
+    restorer.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and "swap" not in steps:
+            time.sleep(0.02)
+        assert "swap" not in steps, f"the restore swapped under a running task: {steps}"
+        late = _HeldTask(threading.Event(), steps)
+        runner.submit(late)
+        assert late._done_event.wait(timeout=5), "the late task was not settled"
+        assert late.status == TaskStatus.CANCELLED
+        assert not late.ran.is_set(), "a task submitted during the drain ran"
+    finally:
+        gate.set()
+        restorer.join(timeout=60)
+    assert not restorer.is_alive()
+    assert "error" not in outcome, outcome
+    assert not outcome["report"].errors, outcome["report"].errors
+    assert steps == ["planner stopped", "task ended", "swap", "planner started"]
+
+
+def test_a_task_that_will_not_stop_refuses_the_restore(
+    server, drain_runner, monkeypatch
+):
+    """Still running at the deadline, the task is named in a 409 and nothing
+    changes: no swap, no lifecycle event, and work is admitted again."""
+    from fastapi.testclient import TestClient
+
+    from pixlstash.services.restore import full_restore
+
+    owner = TestClient(server.api, raise_server_exceptions=True)
+    login = owner.post(
+        "/api/v1/login",
+        json={"username": "owner", "password": "example-owner-password"},
+    )
+    assert login.status_code == 200, login.text
+    runner, steps = drain_runner
+    monkeypatch.setattr(full_restore, "_DRAIN_TIMEOUT_S", 0.2)
+    _create_file(server, "drain-refuse.jpg")
+    pic = _add_picture(server, filename="drain-refuse.jpg", description="before")
+    cp = server.vault.snapshot_service.create_snapshot("MANUAL")
+
+    def _mutate(session):
+        session.get(Picture, pic.id).description = "after"
+        session.commit()
+
+    server.vault.db.run_task(_mutate)
+    gate = threading.Event()
+    stuck = _HeldTask(gate, steps)
+    runner.submit(stuck)
+    assert stuck.ran.wait(timeout=30), "the running task never started"
+    events = _capture_restore_events(server)
+    try:
+        refused = owner.post(f"/api/v1/snapshots/{cp.id}/restore", json={})
+    finally:
+        gate.set()
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == (
+        "The restore did not start because background work was still running "
+        "after 0 seconds: Tagging. Nothing was changed. Try again once it has "
+        "finished."
+    )
+    assert events == []
+    assert _get_picture(server, pic.id).description == "after"
+    assert stuck._done_event.wait(timeout=30)
+    assert steps == ["planner stopped", "planner started", "task ended"]
+
+    after = _HeldTask(threading.Event(), steps)
+    after._gate.set()
+    runner.submit(after)
+    assert after._done_event.wait(timeout=30)
+    assert after.status == TaskStatus.COMPLETED
+
+
+def test_a_restore_with_no_work_running_goes_ahead_at_once(server, drain_runner):
+    """Nothing to wait for: the restore does not wait out the drain timeout,
+    and work is admitted again once it has finished."""
+    runner, steps = drain_runner
+    _create_file(server, "drain-idle.jpg")
+    _add_picture(server, filename="drain-idle.jpg", description="v1")
+    cp = server.vault.snapshot_service.create_snapshot("MANUAL")
+
+    started = time.monotonic()
+    report = server.vault.restore_service.restore_full(cp.id)
+
+    assert time.monotonic() - started < 15
+    assert not report.errors, report.errors
+    assert steps == ["planner stopped", "swap", "planner started"]
+    after = _HeldTask(threading.Event(), steps)
+    after._gate.set()
+    runner.submit(after)
+    assert after._done_event.wait(timeout=30)
+    assert after.status == TaskStatus.COMPLETED
 
 
 # ---------------------------------------------------------------------------
@@ -2011,6 +2186,27 @@ def test_restore_nonexistent_snapshot_emits_no_started(server):
         f"Missing-snapshot restore must emit no lifecycle events; "
         f"got {[e.name for e in events]}"
     )
+
+
+def test_a_refused_restore_and_a_dry_run_tell_no_other_tab(server):
+    """A restore the missing-file check refuses, and a dry run, change
+    nothing, so they broadcast no lifecycle event: every other open tab
+    resets its session on RESTORE_STARTED and reloads on RESTORE_FAILED."""
+    for i in range(10):
+        name = f"quiet_{i}.jpg"
+        if i < 3:
+            _create_file(server, name)
+        _add_picture(server, filename=name)
+    cp = server.vault.snapshot_service.create_snapshot("MANUAL")
+
+    events = _capture_restore_events(server)
+    with pytest.raises(RuntimeError, match="mount"):
+        server.vault.restore_service.restore_full(cp.id)
+    server.vault.restore_service.restore_full(
+        cp.id, dry_run=True, allow_without_safety=True
+    )
+
+    assert [e.name for e in events] == []
 
 
 def test_missing_deps_refusal_emits_started_then_failed(server):
@@ -4376,7 +4572,7 @@ def test_full_restore_closes_auth_before_swap_and_across_queue_gap(server, monke
         )
         assert cookie_response.status_code == 503, cookie_response.text
         assert token_response.status_code == 503, token_response.text
-        assert cookie_response.headers["Retry-After"] == "5"
+        assert cookie_response.headers["Retry-After"] == "2"
     finally:
         release_token_clear.set()
         thread.join(timeout=20)
@@ -4417,7 +4613,7 @@ def test_share_link_is_unavailable_while_restore_admission_is_closed(server):
     try:
         response = anonymous.get(share_url)
         assert response.status_code == 503, response.text
-        assert response.headers["Retry-After"] == "5"
+        assert response.headers["Retry-After"] == "2"
     finally:
         server.auth.reopen_auth_after_restore()
 

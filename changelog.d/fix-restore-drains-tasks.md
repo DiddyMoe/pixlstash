@@ -1,0 +1,1 @@
+- Fixed: a database restore now waits for running tasks instead of racing them.

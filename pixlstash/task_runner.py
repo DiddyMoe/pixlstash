@@ -7,6 +7,7 @@ import threading
 import traceback
 import time
 
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from datetime import datetime, UTC
 
@@ -24,6 +25,22 @@ logger = get_logger(__name__)
 class TaskCancelledError(RuntimeError):
     """Raised by ``TaskRunner.submit_and_wait`` when a task is cancelled
     before it had a chance to complete (e.g. the runner was stopped)."""
+
+
+@dataclass(frozen=True)
+class DrainResult:
+    """What :meth:`TaskRunner.pause_and_drain` achieved.
+
+    Attributes:
+        drained: True when no task was running, or settling, at the return.
+        still_running: The type of each task still running at the deadline.
+            They were asked to stop and may still write.
+        cancelled: How many queued or backed-off tasks were cancelled.
+    """
+
+    drained: bool
+    still_running: tuple[str, ...]
+    cancelled: int
 
 
 class TaskRunner:
@@ -96,6 +113,22 @@ class TaskRunner:
         self._requeue_counts: dict[str, int] = {}
         # Task id -> why it was stopped to make room, for the ones preempted.
         self._preempted: dict[str, str] = {}
+        # Cancel generations, under ``_active_task_lock``. ``submit`` stamps
+        # each task with the ones in force and every cancel bumps its own. A
+        # worker takes a task off its queue outside any lock and registers it
+        # only after admission, so a cancel landing in between finds it
+        # nowhere: the stale stamp catches it (``_refusal_locked``).
+        # ``_preempt_generation`` covers only what ``preempt_gpu`` stops.
+        self._cancel_generation = 0
+        self._preempt_generation = 0
+        self._preempt_reason = ""
+        # Why ``submit`` cancels what it is given (``pause_and_drain``), or
+        # None. Under ``_active_task_lock``.
+        self._admission_paused: Optional[str] = None
+        # Thread ident -> the task a worker took off its queue, until it has
+        # settled and its callbacks have fired: what a drain waits to see empty.
+        self._in_flight: dict[int, BaseTask] = {}
+        self._settled = threading.Condition(self._active_task_lock)
         self._closed = False
         self._on_task_complete_callbacks: list[
             Callable[[BaseTask, Optional[BaseException]], None]
@@ -179,11 +212,15 @@ class TaskRunner:
     def cancel_pending_tasks(self) -> int:
         """Drain and cancel all tasks waiting in both CPU and GPU queues.
 
-        Tasks that are already executing are not interrupted.
+        Tasks that are already executing are not interrupted. A task a worker
+        has taken off its queue but not yet started is cancelled when it
+        would start.
 
         Returns:
             Number of tasks cancelled.
         """
+        with self._active_task_lock:
+            self._cancel_generation += 1
         # The tasks waiting out a GPU backoff are taken first, then the queues
         # drained: a backoff that ends meanwhile moves its task onto a queue
         # under the same lock (see ``_requeue``), so it is caught by the drain
@@ -203,6 +240,66 @@ class TaskRunner:
             "TaskRunner %s: cancelled %d pending task(s).", self._name, cancelled
         )
         return cancelled
+
+    def pause_and_drain(self, timeout_s: float, reason: str) -> DrainResult:
+        """Stop admitting tasks and wait, up to *timeout_s*, for none to run.
+
+        For a caller about to replace what the tasks write to (a restore
+        swapping the database). From now on ``submit`` cancels what it is
+        given, naming *reason*; every pending task is cancelled
+        (``cancel_pending_tasks``); every running task is asked to stop
+        (``on_cancel``, which a task honours between items or not at all).
+        Then it waits until no task is running or settling - a task counts
+        until its completion callbacks have fired, since they may write too.
+
+        Admission stays paused whatever the result, until ``resume_admission``.
+        A task still running at the deadline is not stopped by this: it is
+        named in the result, and the caller must not assume it has stopped
+        writing.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._active_task_lock:
+            self._admission_paused = reason
+        cancelled = self.cancel_pending_tasks()
+        with self._active_task_lock:
+            running = list(self._active_tasks.values())
+        for task in running:
+            try:
+                task.on_cancel()
+            except Exception as exc:
+                logger.warning(
+                    "Task %s (%s) cancel hook failed while draining (%s): %s",
+                    task.id,
+                    task.type,
+                    reason,
+                    exc,
+                )
+        with self._settled:
+            self._settled.wait_for(
+                lambda: not self._in_flight,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+            still_running = tuple(task.type for task in self._in_flight.values())
+        if still_running:
+            logger.error(
+                "TaskRunner %s: %d task(s) still running %.1fs after the drain "
+                "for %s began: %s",
+                self._name,
+                len(still_running),
+                timeout_s,
+                reason,
+                ", ".join(still_running),
+            )
+        return DrainResult(
+            drained=not still_running,
+            still_running=still_running,
+            cancelled=cancelled,
+        )
+
+    def resume_admission(self) -> None:
+        """Admit tasks again after ``pause_and_drain``; safe to repeat."""
+        with self._active_task_lock:
+            self._admission_paused = None
 
     def get_active_tasks_of_type(self, task_type: str) -> list:
         """Return a list of currently executing task instances of the given type."""
@@ -242,6 +339,8 @@ class TaskRunner:
             ]
             for task in running:
                 self._preempted[task.id] = reason
+            self._preempt_generation += 1
+            self._preempt_reason = reason
         for task in running:
             try:
                 task.on_cancel()
@@ -423,11 +522,11 @@ class TaskRunner:
         # sweep, and a refusal that lands after it is cancelled here rather than
         # left waiting behind a timer nobody will cancel.
         with self._active_task_lock:
-            stopped = self._stop.is_set()
-            if not stopped:
+            refusal = self._refusal_locked(task)
+            if refusal is None:
                 self._requeued[task.id] = (timer, task)
-        if stopped:
-            self._cancel_queued_task(task, "runner stopped")
+        if refusal is not None:
+            self._cancel_queued_task(task, refusal)
             return False, None
         try:
             timer.start()
@@ -435,6 +534,26 @@ class TaskRunner:
             self._take_requeued(task.id)
             raise
         return False, None
+
+    def _refusal_locked(self, task: BaseTask) -> Optional[str]:
+        """Why *task*, about to start or enter a backoff, must be cancelled.
+
+        None when it may go on. Call under ``_active_task_lock``, which the
+        cancels bump their generation under: either they find the task
+        registered or it finds the bumped generation here.
+        """
+        if self._stop.is_set():
+            return "runner stopped"
+        cancel_generation, preempt_generation = task._runner_generations
+        if cancel_generation != self._cancel_generation:
+            return "drained from the queue"
+        if (
+            preempt_generation != self._preempt_generation
+            and task.queue_type == QueueType.GPU
+            and not self._interactive(task)
+        ):
+            return self._preempt_reason
+        return None
 
     def _take_requeued(self, task_id: str) -> Optional[BaseTask]:
         with self._active_task_lock:
@@ -510,6 +629,18 @@ class TaskRunner:
                 self._gpu_worker = self._start_worker(
                     self._gpu_queue, f"{self._name}-gpu"
                 )
+            self._replace_dead_workers_locked()
+
+    def replace_dead_workers(self) -> None:
+        """Replace each worker that has exited, while the runner is open.
+
+        Called on every planner tick, so work queued behind a lost worker runs
+        without waiting for a submission. Unlike ``start`` it never reopens a
+        stopped runner: a planner that outlived its stop may still tick.
+        """
+        with self._lock:
+            if self._closed or self._stop.is_set():
+                return
             self._replace_dead_workers_locked()
 
     def _start_worker(
@@ -625,6 +756,7 @@ class TaskRunner:
         target_queue = (
             self._gpu_queue if task.queue_type == QueueType.GPU else self._queue
         )
+        paused: Optional[str] = None
         with self._lock:
             # Checked again under the lock ``stop()`` closes the runner under:
             # a stop during ``on_queued()`` has drained the queues already, and
@@ -632,9 +764,22 @@ class TaskRunner:
             closed = self._closed or self._stop.is_set()
             if not closed:
                 self._replace_dead_workers_locked()
-                target_queue.put((task.priority, next(self._queue_seq), task))
+                # Stamped and queued under the lock the cancels bump their
+                # generation under, so a cancel either drains it or finds the
+                # stamp stale when a worker would start it.
+                with self._active_task_lock:
+                    paused = self._admission_paused
+                    if paused is None:
+                        task._runner_generations = (
+                            self._cancel_generation,
+                            self._preempt_generation,
+                        )
+                        target_queue.put((task.priority, next(self._queue_seq), task))
         if closed:
             self._cancel_queued_task(task, "runner stopped")
+            return task.id
+        if paused is not None:
+            self._cancel_queued_task(task, f"paused for {paused}")
             return task.id
         qsize = target_queue.qsize()
         logger.debug(
@@ -704,7 +849,7 @@ class TaskRunner:
 
         ``degraded`` is True while the runner is meant to be running and a
         worker has exited: the work queued for its lane waits until the next
-        submission replaces it (``submit``). A runner that was never started,
+        submission or planner tick replaces it. A runner that was never started,
         or was stopped, is not degraded; nothing is meant to run.
 
         Returns:
@@ -759,16 +904,24 @@ class TaskRunner:
                 if isinstance(task, _StopTask):
                     continue
 
+                thread_ident = threading.current_thread().ident
+                with self._active_task_lock:
+                    self._in_flight[thread_ident] = task
                 try:
-                    self._handle(task, work_queue)
-                except BaseException as exc:
-                    self._fail_unhandled(task, exc)
+                    try:
+                        self._handle(task, work_queue)
+                    except BaseException as exc:
+                        self._fail_unhandled(task, exc)
+                finally:
+                    with self._active_task_lock:
+                        self._in_flight.pop(thread_ident, None)
+                        self._settled.notify_all()
         except BaseException as exc:
             # Whatever a task raises is caught above. What reaches here is a
             # fault in the loop itself - a malformed queue item, a failure
             # while failing a task - and it ends this worker, with the work
             # queued behind it waiting. Recorded for ``lane_health()``; the
-            # next ``submit()`` or ``start()`` replaces the worker.
+            # next ``submit()``, ``start()`` or planner tick replaces it.
             worker = threading.current_thread().name
             with self._lock:
                 self._last_lane_failure = {
@@ -778,7 +931,8 @@ class TaskRunner:
                 }
             logger.error(
                 "TaskRunner %s worker %s stopped unexpectedly; the work queued "
-                "for it waits until the next submission replaces it: %r",
+                "for it waits until the next submission or planner tick "
+                "replaces it: %r",
                 self._name,
                 worker,
                 exc,
@@ -817,11 +971,24 @@ class TaskRunner:
         error: Optional[BaseException] = None
         thread_ident = threading.current_thread().ident
         with self._active_task_lock:
-            self._active_tasks[thread_ident] = task
-            if lease is not None and not lease.on_cpu:
-                self._leased_on_gpu.add(task.id)
+            refusal = self._refusal_locked(task)
+            if refusal is None:
+                self._active_tasks[thread_ident] = task
+                if lease is not None and not lease.on_cpu:
+                    self._leased_on_gpu.add(task.id)
+        if refusal is not None:
+            if lease is not None:
+                self._give_back(task, lease)
+            self._cancel_queued_task(task, refusal)
+            return
         try:
             task.run(on_vram_oom=self._pause_and_report_vram_oom)
+            if task.status == TaskStatus.CANCELLED:
+                # run() returns CANCELLED only for a cancel that reached the
+                # task before it started. Settled with no error, its owner
+                # would take it for a success that wrote nothing.
+                reason = self._preempted.get(task.id, "cancelled before it started")
+                error = TaskCancelledError(f"Task {task.id} ({task.type}) {reason}")
             # ``vram_oom_attempts`` decides whether the user has a card open
             # about this task; ``attempts_used`` is what that card counts -
             # the attempt that actually finished the work, not the last one

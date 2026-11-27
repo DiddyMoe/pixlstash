@@ -1,0 +1,1 @@
+- Fixed: a training loss that is not a number no longer breaks the loss chart.

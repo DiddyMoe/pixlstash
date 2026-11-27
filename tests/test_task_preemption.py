@@ -1192,3 +1192,101 @@ def test_a_backoff_ending_just_after_a_cancel_drains_is_cancelled_too(cancel):
     assert task.status == TaskStatus.CANCELLED, "landed on a queue already drained"
     assert len(endings[task.id]) == 1
     assert work_queue.empty()
+
+
+# ── a cancel that reaches a task before it starts settles it as cancelled ──
+
+
+class _HeldAdmission(ResourceArbiter):
+    """Holds the first admission until ``release`` is set, then grants it or not."""
+
+    def __init__(self, *args, grant, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.grant = grant
+        self.asked = threading.Event()
+        self.release = threading.Event()
+
+    def try_light(self, *args, **kwargs):
+        if not self.asked.is_set():
+            self.asked.set()
+            self.release.wait(5)
+            if not self.grant:
+                return None
+        return super().try_light(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "cancel, grant",
+    [
+        ("cancel_pending_tasks", True),
+        ("preempt_gpu", True),
+        ("cancel_pending_tasks", False),
+        ("stop", True),
+    ],
+    ids=["cancel-granted", "preempt-granted", "cancel-refused", "stop-granted"],
+)
+def test_a_cancel_during_the_gpu_admission_settles_the_task_once(cancel, grant):
+    """A worker takes a task off its queue before it asks for GPU memory, so a
+    cancel can land while the task is neither queued nor running."""
+    arbiter = _HeldAdmission(_NoCard(), usage=lambda: None, grant=grant)
+    runner, endings = _settling_runner("cancel-in-admission", arbiter)
+    runner.VRAM_REQUEUE_BASE_S = 0.05
+    runner.start()
+    task = _QuickGpuTask()
+    try:
+        runner.submit(task)
+        assert arbiter.asked.wait(5)
+        if cancel == "stop":
+            # stop() waits for the worker, so the admission ends meanwhile.
+            threading.Timer(0.2, arbiter.release.set).start()
+            runner.stop()
+        elif cancel == "preempt_gpu":
+            runner.preempt_gpu("preempted by test")
+        else:
+            runner.cancel_pending_tasks()
+        arbiter.release.set()
+        assert _until(lambda: task.id in endings), "the task never settled"
+    finally:
+        runner.stop()
+    assert task.started_at is None, "the cancelled task ran"
+    assert len(endings[task.id]) == 1
+    assert type(endings[task.id][0]) is TaskCancelledError
+
+
+def test_a_task_queued_after_a_cancel_runs_once_its_admission_ends():
+    arbiter = _HeldAdmission(_NoCard(), usage=lambda: None, grant=True)
+    runner, endings = _settling_runner("admitted-after-cancel", arbiter)
+    runner.start()
+    runner.cancel_pending_tasks()
+    runner.preempt_gpu("preempted by test")
+    task = _QuickGpuTask()
+    try:
+        runner.submit(task)
+        assert arbiter.asked.wait(5)
+        arbiter.release.set()
+        assert _until(lambda: task.id in endings), "the task never settled"
+    finally:
+        runner.stop()
+    assert task.status == TaskStatus.COMPLETED
+    assert endings[task.id] == [None]
+
+
+def test_a_task_given_up_on_while_queued_settles_as_cancelled():
+    """Its ``run()`` returns without starting; the owner must not read that as a
+    success that wrote nothing."""
+    runner, endings = _settling_runner("given-up-while-queued")
+    runner.start()
+    busy = _GpuTask("OcrTask")
+    waited = _QuickGpuTask()
+    try:
+        runner.submit(busy)
+        assert busy.started.wait(5)
+        with pytest.raises(TimeoutError):
+            runner.submit_and_wait(waited, timeout_s=0.2)
+        busy.on_cancel()
+        assert _until(lambda: waited.id in endings), "the task never settled"
+    finally:
+        runner.stop()
+    assert waited.started_at is None
+    assert len(endings[waited.id]) == 1
+    assert type(endings[waited.id][0]) is TaskCancelledError

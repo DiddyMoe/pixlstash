@@ -13,12 +13,14 @@ from typing import TYPE_CHECKING, Optional
 from pixlstash.pixl_logging import get_logger
 
 from ._models import (
+    BackgroundWorkStillRunningError,
     MissingDependenciesError,
     ResourcePreview,
     RestoreInProgressError,
     RestorePreview,
     RestoreReport,
     SafetySnapshotFailedError,
+    TASK_LABELS,
 )
 from .full_restore import FullRestoreMixin
 from .preview import PreviewMixin
@@ -97,4 +99,6 @@ __all__ = [
     "RestoreInProgressError",
     "SafetySnapshotFailedError",
     "MissingDependenciesError",
+    "BackgroundWorkStillRunningError",
+    "TASK_LABELS",
 ]

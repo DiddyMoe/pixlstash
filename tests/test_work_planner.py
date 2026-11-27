@@ -56,6 +56,9 @@ class _FastCompleteRunner:
             self.on_submit(task)
         return task.id
 
+    def replace_dead_workers(self):
+        return None
+
 
 def test_inflight_decrements_when_task_completes_during_submit():
     runner = _FastCompleteRunner()
@@ -143,6 +146,9 @@ class _IdleFinder:
 class _NullRunner:
     def submit(self, task):
         return getattr(task, "id", None)
+
+    def replace_dead_workers(self):
+        return None
 
 
 def _stopped(planner):
@@ -635,6 +641,53 @@ def test_a_completed_task_releases_its_claims_exactly_once():
         runner.stop()
 
     assert releases == [(task.id, None)], "stop() released the task a second time"
+
+
+def test_a_planner_tick_replaces_a_dead_lane_and_its_queued_task_runs():
+    """Work queued behind a worker that died runs with nothing new submitted."""
+    runner = TaskRunner(name="planner-lane-repair-test", num_workers=1)
+    runner.start()
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    try:
+        cpu, gpu = runner._cpu_workers[0], runner._gpu_worker
+        runner._queue.put((0, -1))  # fails the worker loop, outside any task
+        cpu.join(5)
+        assert not cpu.is_alive()
+        # Queued as submit() queues it, minus submit()'s own repair.
+        task = _ClaimedTask([])
+        runner._queue.put((task.priority, next(runner._queue_seq), task))
+
+        planner.start()
+        assert task._done_event.wait(10), "the task queued on the dead lane never ran"
+        health = runner.lane_health()
+        assert (health["cpu"]["alive"], health["cpu"]["restarts"]) == (1, 1)
+        # The live lane is left alone.
+        assert runner._gpu_worker is gpu
+        assert health["gpu"]["restarts"] == 0
+    finally:
+        _stopped(planner)
+        runner.stop()
+
+
+def test_a_planner_tick_never_reopens_a_stopped_runner():
+    """A planner that outlives its stop() join may tick after the runner stops."""
+    runner = TaskRunner(name="planner-stopped-runner-test", num_workers=1)
+    runner.start()
+    runner.stop()
+    ticks = []
+    repair = runner.replace_dead_workers
+    runner.replace_dead_workers = lambda: (ticks.append(1), repair())
+    planner = WorkPlanner(task_runner=runner, task_finders=[])
+    planner.start()
+    try:
+        deadline = time.monotonic() + 5
+        while len(ticks) < 2:
+            assert time.monotonic() < deadline, "the planner never ticked"
+            time.sleep(0.02)
+    finally:
+        _stopped(planner)
+    health = runner.lane_health()
+    assert (health["cpu"]["restarts"], health["gpu"]["restarts"]) == (0, 0)
 
 
 class _VaultWorkerProbe:

@@ -1,0 +1,1 @@
+- Fixed: a training run's state is no longer lost while the database is busy.

@@ -483,9 +483,12 @@ class WorkPlanner:
 
     def _run(self):
         while not self._stop.is_set():
+            # A hold stops finders submitting, not the runner working through
+            # its queues, so a lost worker is replaced while held too.
+            self._task_runner.replace_dead_workers()
             held_for = self._held_for()
             if held_for > 0:
-                self._wake.wait(held_for)
+                self._wake.wait(min(held_for, self.MAX_INTERVAL_S))
                 self._wake.clear()
                 continue
             try:

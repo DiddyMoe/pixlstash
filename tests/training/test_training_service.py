@@ -35,6 +35,7 @@ from pixlstash.hub import dataset_snapshots, training_runs
 from pixlstash.hub.db import now_iso
 from pixlstash.resources.aitoolkit_tenant import AiToolkitProbe
 from pixlstash.services import training_service as training_service_module
+from pixlstash.services.model_mover import MoveRefused
 from pixlstash.services.training_service import TrainingService
 from pixlstash.training import measurements, presets
 from pixlstash.training import local_ai_toolkit as local_ai_toolkit_module
@@ -759,6 +760,53 @@ def test_a_cancel_that_read_queued_stops_a_run_launched_meanwhile(
 
     assert _job_status(hub, job["uuid"]).status == "stopping"
     assert cancelled == [4242]
+
+
+def test_a_cancel_that_read_running_leaves_a_run_that_ended_meanwhile(
+    hub, repo_dir, monkeypatch
+):
+    """cancel() reads the run before taking the lock; if the run ended in
+    between, nothing is left to stop, and ``stopping`` must not be written
+    over its end state, where no poll would ever clear it."""
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    job = service.enqueue(
+        set_id=_SET_ID,
+        name="ended",
+        base_model="m",
+        trigger_word="t",
+        template_path=_write_template(repo_dir, steps=4, save_every=2),
+    )
+    training_runs.update_run(hub, job["uuid"], status="running", pid=4242)
+    stale = training_runs.get_run(hub, _LIBRARY_UUID, job["id"])
+    training_runs.update_run(
+        hub, job["uuid"], status="completed", completed_at=now_iso()
+    )
+    cancelled = []
+
+    class _Backend:
+        def cancel(self, handle):
+            cancelled.append(handle.pid)
+
+    service._active_backend = _Backend()
+    service._active_job_uuid = job["uuid"]
+    reads = iter([stale])
+    real_get_run = training_runs.get_run
+    monkeypatch.setattr(
+        training_service_module.training_runs,
+        "get_run",
+        lambda *args: next(reads, None) or real_get_run(*args),
+    )
+
+    assert service.cancel(job["id"]) is False
+
+    assert _job_status(hub, job["uuid"]).status == "completed"
+    assert cancelled == []
 
 
 def test_shutdown_mid_run_leaves_the_live_job_running(hub, repo_dir, monkeypatch):
@@ -1749,13 +1797,13 @@ def _polled_run(hub, repo_dir, monkeypatch, job_uuid, fail_first=False):
     writes = []
     real_update = training_runs.update_run
 
-    def update_run(hub_, run_uuid, **fields):
+    def update_run(hub_, run_uuid, *, only_if_status=None, **fields):
         # A new phase is written on its own; it is not a progress write.
         if set(fields) != {"phase_log"}:
             writes.append(set(fields))
             if fail_first and len(writes) == 1:
                 raise sqlite3.OperationalError("database is locked")
-        return real_update(hub_, run_uuid, **fields)
+        return real_update(hub_, run_uuid, only_if_status=only_if_status, **fields)
 
     monkeypatch.setattr(training_runs, "update_run", update_run)
     return service, writes
@@ -3063,3 +3111,281 @@ def test_a_set_aside_that_fails_midway_leaves_the_folder_as_it_was(
     monkeypatch.setattr(os, "rename", real_rename)
 
     assert sorted(os.listdir(handle.save_root)) == before
+
+
+# ---------------------------------------------------------------------------
+# Run writes against a busy hub
+# ---------------------------------------------------------------------------
+
+
+def _busy_hub_for(monkeypatch, busy, failures=99):
+    """Make the run writes *busy* picks fail as on a locked hub, *failures* times.
+
+    Returns every picked write tried, in order.
+    """
+    real_update_run = training_runs.update_run
+    tried = []
+
+    def update_run(hub, run_uuid, **fields):
+        if not busy(fields):
+            return real_update_run(hub, run_uuid, **fields)
+        tried.append(fields)
+        if len(tried) <= failures:
+            raise sqlite3.OperationalError("database is locked")
+        return real_update_run(hub, run_uuid, **fields)
+
+    monkeypatch.setattr(training_service_module.training_runs, "update_run", update_run)
+    monkeypatch.setattr(training_service_module, "_RETRIED_WRITE_BACKOFF_S", 0.0)
+    return tried
+
+
+def _queued(hub, repo_dir, *, importer=None, quit_comfyui=False):
+    """A service, its lease and one run it has queued (not started)."""
+    lease = _StubLease(grant=True)
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=lease,
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+        importer=importer,
+    )
+    job = service.enqueue(
+        set_id=_SET_ID,
+        name="busy",
+        base_model="m",
+        trigger_word="t",
+        template_path=_write_template(repo_dir, steps=4, save_every=2),
+        resolution=_RESOLUTION,
+        quit_comfyui=quit_comfyui,
+    )
+    return service, lease, job
+
+
+def test_an_end_state_write_that_meets_a_busy_hub_is_tried_again(
+    hub, repo_dir, monkeypatch
+):
+    service, _, job = _queued(hub, repo_dir)
+    training_runs.update_run(hub, job["uuid"], status="running")
+    tried = _busy_hub_for(
+        monkeypatch, lambda fields: fields.get("status") == "stopped", failures=2
+    )
+
+    service._finalize(
+        None,
+        None,
+        {"uuid": job["uuid"]},
+        TrainingProgress(
+            status="stopped", info="Job stopped", step=3, total_steps=4, speed=""
+        ),
+    )
+
+    assert len(tried) == 3
+    final = _job_status(hub, job["uuid"])
+    assert final.status == "stopped" and final.completed_at
+
+
+def test_a_progress_write_is_not_retried(hub, repo_dir, monkeypatch, tmp_path):
+    # A poll's write is tried once, even of an end state: the next poll writes
+    # the progress again, and _finalize the end state, outside the lock a
+    # cancel waits on.
+    service, _, job = _queued(hub, repo_dir)
+    tried = _busy_hub_for(monkeypatch, lambda fields: "status" in fields)
+
+    service._persist_progress(
+        job["uuid"],
+        TrainingProgress(
+            status="completed", info="done", step=4, total_steps=4, speed=""
+        ),
+        SimpleNamespace(log_path=str(tmp_path / "no.log")),
+    )
+
+    assert len(tried) == 1
+
+
+def test_a_stop_whose_flag_meets_a_busy_hub_still_stops_the_trainer(
+    hub, repo_dir, monkeypatch
+):
+    service, _, job = _queued(hub, repo_dir)
+    training_runs.update_run(hub, job["uuid"], status="running", pid=4242)
+    cancelled = []
+
+    class _Backend:
+        def cancel(self, handle):
+            cancelled.append(handle.pid)
+
+    service._active_backend = _Backend()
+    service._active_job_uuid = job["uuid"]
+    _busy_hub_for(monkeypatch, lambda fields: fields.get("status") == "stopping")
+
+    assert service.cancel(job["id"]) is True
+
+    assert cancelled == [4242]
+
+
+def test_a_launch_that_cannot_be_recorded_stops_its_trainer(hub, repo_dir, monkeypatch):
+    # Unrecorded, the row names neither the trainer's pid nor its folder, so
+    # nothing re-attaches to it after a restart and it trains under no lease.
+    monkeypatch.setenv("FAKE_RUN_LOAD_SECONDS", "30")
+    monkeypatch.setattr(
+        "pixlstash.training.local_ai_toolkit._CANCEL_GRACE_SECONDS", 0.2
+    )
+    importer = _RecordingImport()
+    service, lease, job = _queued(hub, repo_dir, importer=importer)
+    tried = _busy_hub_for(
+        monkeypatch,
+        lambda fields: fields.get("status") == "running" and "pid" in fields,
+    )
+
+    started = time.monotonic()
+    service._run_job(training_runs.get_run(hub, _LIBRARY_UUID, job["id"]))
+
+    assert time.monotonic() - started < 20, "the trainer was left to run"
+    assert len(tried) == 3
+    pid = tried[0]["pid"]
+    assert _poll_until(lambda: not LocalAiToolkit._pid_alive(pid), timeout=10)
+    final = _job_status(hub, job["uuid"])
+    assert (final.status, final.pid) == ("error", None)
+    assert importer.calls == []
+    assert lease.acquire_count == lease.release_count == 1
+
+
+def test_leave_to_quit_comfyui_is_written_with_the_run_itself(
+    hub, repo_dir, monkeypatch
+):
+    # Written after the insert, a busy hub could lose the owner's yes, and the
+    # run would wait for the GPU as though they had said no.
+    _busy_hub_for(monkeypatch, lambda fields: "comfyui_quit" in fields)
+
+    _, _, job = _queued(hub, repo_dir, quit_comfyui=True)
+
+    assert _job_status(hub, job["uuid"]).comfyui_quit == "allowed"
+
+
+def test_a_train_longer_whose_requeue_meets_a_busy_hub_is_queued(
+    hub, repo_dir, monkeypatch
+):
+    service = _make_service(
+        hub,
+        repo_dir,
+        lease=_StubLease(grant=True),
+        notify=_CapturingNotify(),
+        dataset_builder=_make_dataset_builder(),
+    )
+    run = _finished_run(hub, repo_dir, service)
+    tried = _busy_hub_for(
+        monkeypatch, lambda fields: fields.get("status") == "queued", failures=1
+    )
+
+    service.train_longer(run["id"], from_step=4, more_steps=2)
+
+    assert len(tried) == 2
+    assert _job_status(hub, run["uuid"]).status == "queued"
+
+
+def _a_finished_run_left_running(hub, repo_dir, tmp_path):
+    """A run left ``running`` whose trainer finished, saving two checkpoints.
+
+    Its importer is refused, as the shelf refuses a file it already holds.
+    Returns the service, the run, its checkpoints in the order the importer
+    takes them (the final first) and the importer.
+    """
+    importer = _RecordingImport(
+        error=MoveRefused("run.safetensors already exists in the destination folder.")
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    final = run_dir / "run.safetensors"
+    final.write_bytes(b"the final")
+    stepped = run_dir / "run_000000002.safetensors"
+    stepped.write_bytes(b"step 2")
+
+    class _Backend:
+        def handle_for(self, work_dir, job_id, name, pid, training_folder=None):
+            return LocalAiToolkit.handle_for(
+                work_dir, job_id, name, pid, training_folder=training_folder
+            )
+
+        def is_alive(self, handle):
+            return False
+
+        def reconcile(self, handle):
+            return TrainingProgress(
+                status="completed",
+                info="Training completed",
+                step=4,
+                total_steps=4,
+                speed="",
+                final_checkpoint=str(final),
+            )
+
+    service = TrainingService(
+        hub,
+        _LIBRARY_UUID,
+        os.path.dirname(hub.path),
+        request_gpu=_StubLease().request,
+        import_run=importer,
+        notify=_CapturingNotify(),
+        config_provider=lambda: {"repo_path": repo_dir, "python": sys.executable},
+        dataset_builder=_make_dataset_builder(),
+        backend_factory=lambda repo_path, python: _Backend(),
+    )
+    job = service.enqueue(
+        set_id=_SET_ID,
+        name="landed",
+        base_model="m",
+        trigger_word="t",
+        template_path="unused.json",
+        resolution=_RESOLUTION,
+    )
+    training_runs.update_run(
+        hub, job["uuid"], status="running", training_folder=str(tmp_path)
+    )
+    return service, job, [final, stepped], importer
+
+
+def _shelve(hub, run_id, *files):
+    """Register each file as a model the run made, as the vault's importer does."""
+    with hub.transaction() as conn:
+        for path in files:
+            conn.execute(
+                "INSERT INTO model (file_kind, kind, sha256, provenance, "
+                "training_run_id) VALUES ('adapter', 'lora', ?, 'trained', ?)",
+                (hashlib.sha256(path.read_bytes()).hexdigest(), run_id),
+            )
+
+
+def test_a_run_imported_before_its_end_was_written_is_not_imported_again(
+    hub, repo_dir, tmp_path
+):
+    """The import landed, then ``completed`` was lost (a busy hub, a crash),
+    so the next start-up finalizes the run again. Imported again, the shelf
+    would refuse its files and the run would end ``error``."""
+    service, job, checkpoints, importer = _a_finished_run_left_running(
+        hub, repo_dir, tmp_path
+    )
+    _shelve(hub, job["id"], *checkpoints)
+
+    service.reconcile_on_startup()
+
+    final = _job_status(hub, job["uuid"])
+    assert (final.status, final.error) == ("completed", None)
+    assert importer.calls == []
+
+
+def test_a_run_whose_import_stopped_after_its_first_file_is_not_completed(
+    hub, repo_dir, tmp_path
+):
+    """The importer registers one file at a time, so a crash can leave only the
+    first file it takes on the shelf. The run has not landed: it is imported
+    again, which the shelf refuses, rather than reported completed with its
+    other files never imported."""
+    service, job, checkpoints, importer = _a_finished_run_left_running(
+        hub, repo_dir, tmp_path
+    )
+    _shelve(hub, job["id"], checkpoints[0])
+
+    service.reconcile_on_startup()
+
+    assert _job_status(hub, job["uuid"]).status == "error"
+    assert len(importer.calls) == 1

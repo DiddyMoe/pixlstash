@@ -1,0 +1,1 @@
+- Fixed: the GPU figures no longer freeze while ComfyUI is not answering.

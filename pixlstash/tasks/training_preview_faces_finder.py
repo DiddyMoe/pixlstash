@@ -11,6 +11,7 @@ from pixlstash.hub.db import HubDatabase
 from pixlstash.hub.training_runs import FINISHED_STATUSES
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.training_service import handle_for_run
+from pixlstash.task_runner import TaskCancelledError
 from pixlstash.tasks.base_task_finder import BaseTaskFinder
 from pixlstash.tasks.training_preview_faces_task import TrainingPreviewFacesTask
 from pixlstash.training import preview_likeness
@@ -150,12 +151,22 @@ class TrainingPreviewFacesFinder(BaseTaskFinder):
 
     def on_task_complete(self, task, error) -> None:
         run_uuid = (getattr(task, "params", None) or {}).get("run_uuid")
+        # A cancel (a restore's drain, a stop) is no verdict on the previews:
+        # the run is asked for again on the next sweep.
+        cancelled = isinstance(error, TaskCancelledError)
         with self._lock:
             self._claimed.discard(run_uuid)
-            if error is not None:
+            if error is not None and not cancelled:
                 # Not retried every sweep; a restart tries it again.
                 self._settled.add(run_uuid)
-        if error is not None:
+        if cancelled:
+            logger.info(
+                "Looking for faces in the previews of training run %s was "
+                "cancelled; the next sweep asks again: %s",
+                run_uuid,
+                error,
+            )
+        elif error is not None:
             logger.warning(
                 "Looking for faces in the previews of training run %s failed, so "
                 "its likeness waits for a restart: %s",

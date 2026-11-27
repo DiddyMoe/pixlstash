@@ -16,13 +16,14 @@ import json
 import tempfile
 import threading
 import types
+from unittest.mock import MagicMock
 
 import pytest
 from anyio import ClosedResourceError
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from pixlstash.auth import WebSocketAuth
+from pixlstash.auth import AuthService, WebSocketAuth
 from pixlstash.event_types import EventType
 from pixlstash.server import Server
 
@@ -69,6 +70,20 @@ def _record_close_codes(monkeypatch, websocket) -> list:
 
     monkeypatch.setattr(websocket, "close", _close, raising=False)
     return codes
+
+
+def _capture_admission_leases(monkeypatch, server) -> list:
+    """Every restore admission lease the updates handler is granted."""
+    leases: list[int | None] = []
+    original = server.auth.register_authenticated_websocket
+
+    def _register(websocket):
+        lease = original(websocket)
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(server.auth, "register_authenticated_websocket", _register)
+    return leases
 
 
 @pytest.fixture(scope="module")
@@ -515,17 +530,25 @@ def test_updates_accept_failure_releases_generation_lease(
         raise RuntimeError("injected accept failure")
 
     monkeypatch.setattr(WebSocket, "accept", fail_accept)
+    leases = _capture_admission_leases(monkeypatch, server)
     with pytest.raises(RuntimeError, match="injected accept failure"):
         with owner_client.websocket_connect(WS_UPDATES):
             pass
     assert server.library_coordinator._readers == {}
+    # Wrong if the restore lease outlives the failed handshake: every later
+    # restore's drain then waits for it, times out and keeps sign-in closed.
+    assert leases and leases[0] is not None
+    assert leases[0] not in server.auth._active_restore_websockets
 
 
-def test_updates_registration_failure_releases_generation_lease(server, owner_client):
+def test_updates_registration_failure_releases_generation_lease(
+    server, owner_client, monkeypatch
+):
     class ExplodingClients(list):
         def append(self, _client):
             raise RuntimeError("injected registration failure")
 
+    leases = _capture_admission_leases(monkeypatch, server)
     original = server._ws_clients
     server._ws_clients = ExplodingClients(original)
     try:
@@ -533,8 +556,100 @@ def test_updates_registration_failure_releases_generation_lease(server, owner_cl
             with owner_client.websocket_connect(WS_UPDATES):
                 pass
         assert server.library_coordinator._readers == {}
+        assert leases and leases[0] is not None
+        assert leases[0] not in server.auth._active_restore_websockets
     finally:
         server._ws_clients = original
+
+
+_PEER = ("127.0.0.1", 54321)
+
+
+def _peer_socket(server):
+    """The tracked server-side socket of the raw ASGI client, if registered."""
+    with server._ws_clients_lock:
+        for client in server._ws_clients:
+            if client["ws"].scope.get("client") == _PEER:
+                return client["ws"]
+    return None
+
+
+def _drive_updates_socket(server, owner_client, second_receive) -> list[str]:
+    """Run one ``/ws/updates`` handler over raw ASGI and return what it sent.
+
+    TestClient cannot place a server close between two receives, so the app
+    is driven directly: the first receive connects, the second is
+    ``second_receive``, and any further receive fails the test.
+    """
+    cookie = "; ".join(
+        f"{name}={value}" for name, value in owner_client.cookies.items()
+    )
+    steps = iter([second_receive])
+    sent: list[str] = []
+    connected = False
+
+    async def receive():
+        nonlocal connected
+        if not connected:
+            connected = True
+            return {"type": "websocket.connect"}
+        step = next(steps, None)
+        if step is None:
+            raise AssertionError("the handler received after its socket ended")
+        return await step()
+
+    async def send(message):
+        sent.append(message["type"])
+
+    scope = {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "scheme": "ws",
+        "path": WS_UPDATES,
+        "raw_path": WS_UPDATES.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"testserver"), (b"cookie", cookie.encode())],
+        "client": _PEER,
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+    asyncio.run(server.api(scope, receive, send))
+    assert _peer_socket(server) is None, "the handler left its socket tracked"
+    assert all(
+        entry[0].scope.get("client") != _PEER
+        for entry in server.auth._active_restore_websockets.values()
+    ), "the handler left its admission lease held"
+    return sent
+
+
+def test_updates_handler_ends_cleanly_when_closed_between_receives(
+    server, owner_client
+):
+    """A restore or a switch closes the socket from another task, possibly
+    after uvicorn handed the handler a message; the handler must then end,
+    not receive again (which raises and is logged as an application error)."""
+    closed = {}
+
+    async def close_then_message():
+        closed["ws"] = _peer_socket(server)
+        await closed["ws"].close(code=1012)
+        return {"type": "websocket.receive", "text": '{"type": "set_filters"}'}
+
+    sent = _drive_updates_socket(server, owner_client, close_then_message)
+    assert closed["ws"] is not None, "the socket never registered"
+    assert sent == ["websocket.accept", "websocket.close"]
+
+
+def test_updates_handler_ends_when_the_client_disconnects(server, owner_client):
+    """The other way: a client's own close still ends the handler."""
+
+    async def disconnect():
+        return {"type": "websocket.disconnect", "code": 1001}
+
+    assert _drive_updates_socket(server, owner_client, disconnect) == [
+        "websocket.accept"
+    ]
 
 
 def test_library_switch_terminates_the_updates_socket(
@@ -610,12 +725,75 @@ def test_restore_barrier_terminates_every_authenticated_websocket(
             assert updates_close.value.code == 1012
         assert not server.auth._active_restore_websockets
     finally:
-        # The barrier deliberately cancels each server handler after sending
-        # 1012. Starlette TestClient reflects that server-task cancellation from
+        # TestClient, unlike uvicorn, does not hand the handler a disconnect
+        # when the server closes, so the barrier cancels this handler once its
+        # wait runs out. TestClient reflects that cancellation from
         # ``__exit__`` even though the client already observed the clean close.
         with contextlib.suppress(*_HARNESS_TEARDOWN):
             updates_context.__exit__(None, None, None)
         server.auth.reopen_auth_after_restore()
+
+
+class _ClosingSocket:
+    """A server-side socket that, as uvicorn does, wakes its handler on close."""
+
+    def __init__(self):
+        self.closed = asyncio.Event()
+
+    async def close(self, code, reason):
+        self.closed.set()
+
+
+def _auth_service(exit_seconds: float) -> AuthService:
+    auth = AuthService(
+        db=None, server_config={}, server_config_path="", logger=MagicMock()
+    )
+    auth._RESTORE_SOCKET_EXIT_SECONDS = exit_seconds
+    return auth
+
+
+def test_the_restore_barrier_lets_a_closed_handler_end_by_itself():
+    """A handler woken by the close returns; it is not cancelled. A cancel
+    raced uvicorn's queued disconnect and was logged with a traceback."""
+    auth = _auth_service(exit_seconds=5.0)
+    socket = _ClosingSocket()
+
+    async def handler():
+        await socket.closed.wait()
+        return "ended"
+
+    async def run():
+        task = asyncio.create_task(handler())
+        await asyncio.sleep(0)
+        await auth._terminate_authenticated_websocket(socket, task)
+        # Read before the loop runs again: the termination waited for the
+        # handler rather than returning while it was only woken.
+        return task, task.done()
+
+    task, ended_first = asyncio.run(run())
+    assert ended_first, "the termination returned before the handler ended"
+    assert not task.cancelled(), "the handler was cancelled, not left to end"
+    assert task.result() == "ended"
+
+
+def test_the_restore_barrier_cancels_a_handler_that_does_not_end():
+    """The other way: a handler that ignores the close is still cancelled."""
+    auth = _auth_service(exit_seconds=0.05)
+    socket = _ClosingSocket()
+
+    async def run():
+        task = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+        await asyncio.wait_for(
+            auth._terminate_authenticated_websocket(socket, task), timeout=5
+        )
+        await asyncio.wait({task}, timeout=5)
+        ended = task.cancelled()
+        task.cancel()
+        return ended
+
+    assert asyncio.run(run()), "a handler that never ended was left running"
+    assert socket.closed.is_set()
 
 
 # ---------------------------------------------------------------------------

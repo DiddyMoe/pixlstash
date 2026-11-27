@@ -757,6 +757,10 @@ class AuthService:
         self._active_restore_http_leases: set[int] = set()
         self._active_restore_websockets: dict[int, tuple] = {}
         self._RESTORE_DRAIN_TIMEOUT_SECONDS = 30.0
+        # How long the restore lets one handler end by itself after closing its
+        # socket before cancelling it. uvicorn hands the handler its disconnect
+        # as it sends the close, so only a stuck handler waits this out.
+        self._RESTORE_SOCKET_EXIT_SECONDS = 2.0
         # In-memory guest session tracking: session_id → last_active_at (monotonic seconds).
         # Entries expire after _GUEST_SESSION_INACTIVE_TTL (30 days) and are pruned lazily
         # in record_guest_activity().  When the cache reaches _guest_max_tracked_sessions
@@ -817,19 +821,23 @@ class AuthService:
             self._active_restore_websockets.pop(lease, None)
             self._restore_admission_condition.notify_all()
 
-    @staticmethod
-    async def _terminate_authenticated_websocket(websocket, handler_task) -> None:
-        """Close one established socket, then cancel its owning handler."""
+    async def _terminate_authenticated_websocket(self, websocket, handler_task) -> None:
+        """Close one established socket and let its handler end by itself.
+
+        A handler still running after ``_RESTORE_SOCKET_EXIT_SECONDS`` is cancelled.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._RESTORE_SOCKET_EXIT_SECONDS
         try:
             await websocket.close(code=1012, reason="Database restore in progress")
         finally:
             current = asyncio.current_task()
-            if (
-                handler_task is not None
-                and handler_task is not current
-                and not handler_task.done()
-            ):
-                handler_task.cancel()
+            if handler_task is not None and handler_task is not current:
+                await asyncio.wait(
+                    {handler_task}, timeout=max(0.0, deadline - loop.time())
+                )
+                if not handler_task.done():
+                    handler_task.cancel()
 
     def close_auth_for_restore(
         self, restore_request_lease: Optional[int] = None
@@ -901,14 +909,13 @@ class AuthService:
             return self._restore_auth_gate_closed
 
     @staticmethod
-    def _restore_unavailable_response() -> JSONResponse:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": "Authentication is temporarily unavailable during restore."
-            },
-            headers={"Retry-After": "5"},
-        )
+    def _busy_response() -> JSONResponse:
+        # Admission's busy answer: a caller with no credentials must not tell
+        # a restore from a library switch. Local import: library_admission
+        # imports pixlstash.authz, whose gate imports this module.
+        from pixlstash.middleware.library_admission import busy_response
+
+        return busy_response()
 
     def record_guest_activity(self, session_id: str) -> None:
         """Record or refresh the in-memory last-active timestamp for a guest session.
@@ -2964,7 +2971,7 @@ class AuthService:
             self._acquire_restore_http_lease() if requires_restore_admission else None
         )
         if requires_restore_admission and lease is None:
-            return self._restore_unavailable_response()
+            return self._busy_response()
         if lease is not None:
             request.state.restore_admission_lease = lease
         try:
@@ -2981,6 +2988,18 @@ class AuthService:
 
         if request.method == "OPTIONS":
             return await call_next(request)
+
+        # Mid-switch, admission passes hub-only routes. A caller with no
+        # credentials gets what the restore fence gives everyone, instead of
+        # the route (here, for a public one) or the 401 (below).
+        switching = getattr(request.state, "library_switching", False)
+        if (
+            switching
+            and is_auth_excluded_path(request.url.path)
+            and request.url.path.startswith(RESTORE_ADMISSION_PREFIXES)
+            and request.cookies.get("session_id") not in self.active_session_ids
+        ):
+            return self._busy_response()
 
         if not is_auth_excluded_path(request.url.path):
             # Only enforce authentication for API routes.  Non-API paths (e.g.
@@ -3204,6 +3223,8 @@ class AuthService:
                                     )
 
                 if user_id is None:
+                    if switching:
+                        return self._busy_response()
                     self._logger.error(
                         "Invalid session_id. It has expired and the client needs to log in again. When trying to access %s",
                         request.url.path,

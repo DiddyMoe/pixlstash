@@ -1986,3 +1986,23 @@ def test_tag_health_auto_rebuild_finder_fires_when_stale_and_respects_debounce()
         assert finder.find_task() is None, "debounce window did not hold"
     finally:
         _teardown(temp_dir, server)
+
+
+def test_a_rebuild_cancelled_before_it_starts_does_not_stay_building():
+    """A queued rebuild the runner cancels (a restore's drain) takes the
+    board's ``building`` flag down, so the next request starts a rebuild."""
+    from types import SimpleNamespace
+
+    from pixlstash.services import tag_health_service
+    from pixlstash.task_runner import TaskRunner
+
+    runner = TaskRunner(name="tag-health-cancel-test")  # never started: tasks wait
+    vault = SimpleNamespace(submit_task=runner.submit)
+    try:
+        assert tag_health_service.start_rebuild(vault)["building"] is True
+        assert runner.cancel_pending_tasks() == 1
+        assert tag_health_service.get_status(vault)["building"] is False
+        assert tag_health_service.start_rebuild(vault)["building"] is True
+        assert runner.cancel_pending_tasks() == 1
+    finally:
+        tag_health_service._STATES.pop(id(vault), None)

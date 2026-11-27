@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.restore import (
+    BackgroundWorkStillRunningError,
     MissingDependenciesError,
     RestoreInProgressError,
     SafetySnapshotFailedError,
@@ -442,7 +443,7 @@ def create_router(server) -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except RestoreInProgressError as exc:
+        except (RestoreInProgressError, BackgroundWorkStillRunningError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SafetySnapshotFailedError as exc:
             raise HTTPException(status_code=412, detail=str(exc)) from exc

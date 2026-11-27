@@ -641,6 +641,22 @@ def test_get_job_detail_owner_works():
         _teardown(temp_dir, server)
 
 
+def test_a_stored_loss_that_is_not_finite_is_left_out_of_the_curve():
+    """A curve stored with a diverged step's ``Infinity`` answers its finite points."""
+    temp_dir, owner, server, read_token = _setup()
+    try:
+        stored = '[{"step": 1, "loss": 0.5}, {"step": 2, "loss": Infinity}, {"step": 3, "loss": 0.4}]'
+        job_id, _ = _seed_job(server, loss_curve=stored)
+        finite = [{"step": 1, "loss": 0.5}, {"step": 3, "loss": 0.4}]
+
+        for path in (f"/training/jobs/{job_id}", f"/training/jobs/{job_id}/live"):
+            r = owner.get(path)
+            assert r.status_code == 200, r.text
+            assert r.json()["loss_curve"] == finite, path
+    finally:
+        _teardown(temp_dir, server)
+
+
 def test_get_job_detail_missing_is_404():
     temp_dir, owner, server, read_token = _setup()
     try:

@@ -1,0 +1,1 @@
+- Fixed: pressing Stop as a training run ends no longer leaves it on Stopping.
