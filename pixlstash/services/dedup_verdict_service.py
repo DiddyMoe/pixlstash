@@ -126,6 +126,9 @@ from pixlstash.services.dedup_tier_service import (
     # ever disagreeing again.
     live_groups_filter,
 )
+from pixlstash.services.folder_structure_commit_service import (
+    resolve_pending_people_with_faces,
+)
 from pixlstash.services.set_lock_service import (
     LOCKED_STATUS_CODE,
     build_locked_set_lookup,
@@ -1960,6 +1963,9 @@ def apply_stack_verdict(
         source,
         origin_client_id,
     )
+    resolve_pending_people_with_faces(
+        vault, result.event_picture_ids, origin="Duplicate merge"
+    )
     notify_pictures_changed(vault, result.event_picture_ids, origin_client_id, source)
     return result
 
@@ -2070,6 +2076,9 @@ def apply_verdict_batch(
         origin_client_id,
     )
     event_picture_ids = report.pop("event_picture_ids", [])
+    resolve_pending_people_with_faces(
+        vault, event_picture_ids, origin="Duplicate merge"
+    )
     notify_pictures_changed(vault, event_picture_ids, origin_client_id, source)
     return report
 

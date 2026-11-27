@@ -9188,6 +9188,19 @@ the immediate one — the existing background pipeline reconciles the assignment
 against a real detected face once extraction runs, on its own schedule, with no
 new code here to do it.
 
+**A write that sets a person on a picture whose faces already exist resolves it
+after its commit**, because extraction resolves a pending person only for the
+pictures it has just extracted. `resolve_pending_people_with_faces(vault,
+picture_ids, *, origin)` hands those of one write's pictures that hold a
+`pending_character_id` and at least one face row to
+`Vault._process_pending_character_assignments`, after `run_task` returns; a
+picture with no face row is left for extraction. Its callers: the folder
+structure commit's two passes; a duplicate merge's metadata union, through
+`apply_stack_verdict`, `apply_verdict_batch`, `keep_cover_only` and each
+auto-stack slice (`DedupAutoStackTask._apply`); and `announce_restore` when an
+undo, redo, batch undo or auto-stack revert wrote the pending person. The other
+writers set it only on a picture with no face row.
+
 #### Nearest-ancestor-wins, tags are not exclusive
 
 A picture is filed under the **closest** accepted Project, Person or Set above

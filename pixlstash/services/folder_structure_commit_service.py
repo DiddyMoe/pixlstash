@@ -1401,7 +1401,7 @@ def apply_mapping(
         return result
 
     result = server.vault.db.run_task(commit, priority=DBPriority.IMMEDIATE)
-    resolve_pending_people_with_faces(server, linked_ids)
+    resolve_pending_people_with_faces(server.vault, linked_ids, origin="Folder mapping")
     return result
 
 
@@ -1440,22 +1440,30 @@ def apply_local_mapping(
         return result
 
     result = server.vault.db.run_task(commit, priority=DBPriority.IMMEDIATE)
-    resolve_pending_people_with_faces(server, picture_ids)
+    resolve_pending_people_with_faces(
+        server.vault, picture_ids, origin="Folder mapping"
+    )
     return result
 
 
-def resolve_pending_people_with_faces(server, picture_ids: list[int]) -> int:
-    """Attach the folder-derived person to pictures whose faces already exist.
+def resolve_pending_people_with_faces(
+    vault, picture_ids: list[int], *, origin: str
+) -> int:
+    """Attach a pending person to those of *picture_ids* whose faces already exist.
 
-    `_link_pictures` defers a person assignment into
-    `Picture.pending_character_id`, which `FaceExtractionTask`'s completion
-    hook resolves - but only for the pictures it just extracted. Since the
-    workers start while the import is still indexing, extraction routinely
-    finishes BEFORE the mapping runs, and a picture in that order was never
-    revisited: pending set, faces present, nobody to join them. This runs the
-    same resolver now for exactly those pictures. Pictures whose extraction
+    `Picture.pending_character_id` is resolved by `FaceExtractionTask`'s
+    completion hook, but only for the pictures it just extracted. A write that
+    sets one on a picture whose faces are already there calls this after its
+    commit: the folder mapping's `_link_pictures` (extraction routinely
+    finishes before the mapping runs), a duplicate merge's metadata union, and
+    an undo or redo that replays a pending person. Pictures whose extraction
     has not run are left alone on purpose: the resolver treats "no face rows"
     as "extraction found nothing" and would discard the pending id.
+
+    Args:
+        vault: The vault whose write committed.
+        picture_ids: The pictures that write touched.
+        origin: What committed, for the log.
 
     Returns:
         How many pictures were handed to the resolver.
@@ -1479,12 +1487,13 @@ def resolve_pending_people_with_faces(server, picture_ids: list[int]) -> int:
             )
         return found
 
-    ready = server.vault.db.run_task(fetch)
+    ready = vault.db.run_task(fetch)
     if ready:
         logger.info(
-            "Folder mapping: %d picture(s) had faces before their person was "
-            "assigned; assigning now",
+            "%s: %d picture(s) had faces before their person was assigned; "
+            "assigning now",
+            origin,
             len(ready),
         )
-        server.vault._process_pending_character_assignments(ready)
+        vault._process_pending_character_assignments(ready)
     return len(ready)
