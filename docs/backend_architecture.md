@@ -313,7 +313,7 @@ Modules **off** the server import path (`tagger_plugins/wd14.py`, `tagger_plugin
 | [pixlstash/worker_config.py](../pixlstash/worker_config.py) | Global constants — `NUM_WORKERS`, per-task `*_MAX_INFLIGHT`, batch sizes. |
 | [pixlstash/startup_checks.py](../pixlstash/startup_checks.py) | Preflight: disk space, VRAM, CUDA, SSL. May force CPU mode. |
 | [pixlstash/event_types.py](../pixlstash/event_types.py) | `EventType` enum used by WebSocket event bus. |
-| [pixlstash/pixl_logging.py](../pixlstash/pixl_logging.py) | Uvicorn log config + coloured formatter. |
+| [pixlstash/pixl_logging.py](../pixlstash/pixl_logging.py) | Uvicorn log config + coloured formatter. The log always goes to stdout; a configured `log_file` gets the same records too, at every level. |
 | [pixlstash/stacking.py](../pixlstash/stacking.py) | Picture stacking (duplicates / variants). |
 | [pixlstash/image_loading_dataset_prepper.py](../pixlstash/image_loading_dataset_prepper.py) | Dataset preparation utilities for offline training scripts. |
 | [pixlstash/cli.py](../pixlstash/cli.py) | CLI entry point (`pixlstash-cli`). Two verb groups: `libraries` (list/create/attach/detach/relocate/activate/backup/restore/prepare-legacy-identity/rename) and `plugins` (install/test/list/remove). Only the `libraries` group opens the hub — see §8.1. |
