@@ -7,11 +7,13 @@ the canvas. Embedding the API-format graph there breaks drag-back-in. ComfyUI
 writes the correct ``prompt`` chunk itself, so nothing needs to be embedded.
 """
 
+import io
 import json as stdlib_json
 from types import SimpleNamespace
 
 import pytest
 import requests
+import urllib3
 
 import pixlstash.services.comfyui_service as comfyui_service
 
@@ -345,16 +347,14 @@ def test_a_run_already_started_is_read_off_the_queue(monkeypatch):
 
     asked = []
     monkeypatch.setattr(
-        comfyui_service.requests,
-        "get",
-        lambda url, timeout=None, allow_redirects=True, proxies=None: (
-            asked.append((url, allow_redirects, proxies)) or _Queue()
-        ),
+        comfyui_service,
+        "bounded_get",
+        lambda url, proxies=None, **_kwargs: asked.append((url, proxies)) or _Queue(),
     )
     comfyui_service.follow_run("run-a", COMFY, library_uuid="lib")
     comfyui_service.follow_run("run-b", COMFY, library_uuid="lib")
     comfyui_service._note_running_prompts(COMFY)
-    assert asked == [(f"{COMFY}/queue", False, comfyui_service.NO_PROXY)]
+    assert asked == [(f"{COMFY}/queue", comfyui_service.NO_PROXY)]
     # Nobody waits on that address, so the read is not kept for anyone.
     assert comfyui_service._queue_reads == {}
     assert comfyui_service._queue_waits == {}
@@ -491,8 +491,13 @@ def test_every_request_of_a_run_goes_straight_to_comfyui(monkeypatch, tmp_path):
 
         return request
 
+    def bounded(url, proxies=None, **_kwargs):
+        # The bounded client follows no redirect.
+        return answer("GET")(url, allow_redirects=False, proxies=proxies)
+
     monkeypatch.setattr(comfyui_service.requests, "get", answer("GET"))
     monkeypatch.setattr(comfyui_service.requests, "post", answer("POST"))
+    monkeypatch.setattr(comfyui_service, "bounded_get", bounded)
     picture = tmp_path / "test-in.png"
     picture.write_bytes(b"fake-png")
 
@@ -551,6 +556,7 @@ def _comfyui_redirects_once(monkeypatch, status: int, body: bytes) -> list[tuple
         sent.append((request.method, request.url, proxies))
         response = requests.Response()
         response.request, response.url, response._content = request, request.url, body
+        response.raw = urllib3.HTTPResponse(io.BytesIO(body), preload_content=False)
         response.status_code = 200
         if len(sent) == 1:
             response.status_code = status

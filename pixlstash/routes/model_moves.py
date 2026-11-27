@@ -110,6 +110,7 @@ from pixlstash.services.model_mover import (
     same_device,
 )
 from pixlstash.utils.insightface_model_utils import set_insightface_root
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.reference_folder_validator import validate_reference_folder_path
 
@@ -601,7 +602,10 @@ def _move_leftovers(source: str, destination: str) -> None:
     could not follow is worth a loud line and a re-download, not an exception
     thrown from a finished job.
     """
-    for root, _dirs, files in os.walk(source):
+    for root, dirs, files in os.walk(source):
+        dirs[:] = [
+            name for name in dirs if not is_link_or_missing(os.path.join(root, name))
+        ]
         for name in files:
             origin = os.path.join(root, name)
             target = os.path.join(destination, os.path.relpath(origin, source))
@@ -622,21 +626,26 @@ def _move_leftovers(source: str, destination: str) -> None:
 def _remove_if_empty(path: str) -> None:
     """Tidy the vacated directory, and never let tidying fail a relocation.
 
-    Bottom-up, because a relocation preserves subdirectories: the files have
+    Deepest first, because a relocation preserves subdirectories: the files have
     moved out of ``runA/`` and ``runB/`` but the empty directories remain, and
     ``os.rmdir`` on the root would refuse while they do. Only *empty*
     directories are removed, so anything the owner left behind keeps the store
-    directory alive and is never deleted.
+    directory alive and is never deleted. A link (a symlink or a Windows
+    junction) is the owner's too: it is neither walked nor removed. The walk is
+    top-down so it can prune links (a bottom-up walk ignores changes to its
+    ``dirs``), and the folders it found are removed in reverse.
     """
-    for root, dirs, _files in os.walk(path, topdown=False):
-        for name in dirs:
-            child = os.path.join(root, name)
-            try:
-                os.rmdir(child)
-            except OSError as exc:
-                logger.debug(
-                    "Left the vacated subdirectory %s in place: %s", child, exc
-                )
+    folders: list[str] = []
+    for root, dirs, _files in os.walk(path):
+        dirs[:] = [
+            name for name in dirs if not is_link_or_missing(os.path.join(root, name))
+        ]
+        folders.extend(os.path.join(root, name) for name in dirs)
+    for child in reversed(folders):
+        try:
+            os.rmdir(child)
+        except OSError as exc:
+            logger.debug("Left the vacated subdirectory %s in place: %s", child, exc)
     try:
         os.rmdir(path)
     except OSError as exc:

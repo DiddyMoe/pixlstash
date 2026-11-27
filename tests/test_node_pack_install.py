@@ -1,8 +1,8 @@
 """Installing a known node pack through ComfyUI-Manager (#2054).
 
-ComfyUI and its Manager are faked over ``requests``: no live HTTP. Every case
-reads the calls the fake recorded, so a refusal is also proven to have queued
-nothing, and the restart to have happened only on an empty ComfyUI queue.
+ComfyUI and its Manager are faked at the bounded client: no live HTTP. Every
+case reads the calls the fake recorded, so a refusal is also proven to have
+queued nothing, and the restart to have happened only on an empty ComfyUI queue.
 """
 
 from __future__ import annotations
@@ -13,7 +13,11 @@ from urllib.parse import urlsplit
 import pytest
 import requests
 
-from pixlstash.services import comfyui_link_service, node_pack_install_service
+from pixlstash.services import (
+    comfyui_link_service,
+    comfyui_pack_service,
+    node_pack_install_service,
+)
 from pixlstash.services import node_packs
 from pixlstash.services.workflow_run_service import MISSING_NODES, judge
 from tests.network_vectors import LAN_IPV4
@@ -68,7 +72,6 @@ class _FakeManager:
 
     def request(self, method, url, json=None, **kwargs):
         assert kwargs.get("proxies") == comfyui_link_service.NO_PROXY
-        assert kwargs.get("allow_redirects") is False
         assert kwargs.get("timeout")
         path = urlsplit(url).path.lstrip("/")
         self.calls.append((method, path, json))
@@ -106,7 +109,8 @@ def _timed_out():
 def comfy(monkeypatch):
     def at(manager="v3", **kwargs):
         fake = _FakeManager(manager, **kwargs)
-        monkeypatch.setattr(node_pack_install_service.requests, "request", fake.request)
+        monkeypatch.setattr(node_pack_install_service, "bounded_request", fake.request)
+        monkeypatch.setattr(comfyui_pack_service, "bounded_request", fake.request)
         return fake
 
     monkeypatch.setattr(node_pack_install_service.time, "sleep", lambda s: None)

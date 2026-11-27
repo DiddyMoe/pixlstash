@@ -43,6 +43,7 @@ import zstandard
 from tqdm import tqdm
 
 from pixlstash.hub.registry import VAULT_FILENAME, Library
+from pixlstash.utils.links import is_link_stat
 from pixlstash.utils.media_files import is_supported_media_file
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.system_utils import space_shortfall
@@ -292,7 +293,7 @@ def _validate_regular_directory(path: str, *, label: str) -> None:
         info = os.lstat(path)
     except OSError as exc:
         raise BackupError(f"Could not inspect {label} {path}: {exc}") from exc
-    if stat.S_ISLNK(info.st_mode):
+    if is_link_stat(info):
         raise BackupError(f"Refusing symlinked {label} {path}.")
     if not stat.S_ISDIR(info.st_mode):
         raise BackupError(f"Refusing non-directory {label} {path}.")

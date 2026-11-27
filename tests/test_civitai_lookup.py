@@ -1,6 +1,6 @@
 """What the Civitai by-hash lookup sends, and how it reads each answer (#1517).
 
-``requests.get`` is replaced in every test, so nothing here reaches the network.
+``bounded_get`` is replaced in every test, so nothing here reaches the network.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import requests
 
 from pixlstash.services import civitai_lookup
 from pixlstash.services.civitai_lookup import LookupUnavailable, lookup_base_model
+from pixlstash.utils.bounded_http import ReadDeadlineExceeded, ResponseTooLarge
 
 SHA = "ab" * 32
 
@@ -31,7 +32,7 @@ def civitai(monkeypatch):
             raise state.answer
         return state.answer
 
-    monkeypatch.setattr(civitai_lookup.requests, "get", get)
+    monkeypatch.setattr(civitai_lookup, "bounded_get", get)
     return state
 
 
@@ -63,9 +64,10 @@ def test_only_the_hash_is_sent_to_the_by_hash_url_without_redirects(civitai):
 
     [(url, kwargs)] = civitai.calls
     assert url == f"https://civitai.com/api/v1/model-versions/by-hash/{SHA}"
-    assert kwargs["allow_redirects"] is False
     assert kwargs["timeout"] == civitai_lookup.TIMEOUT_SECONDS
-    assert set(kwargs) == {"allow_redirects", "timeout", "headers"}, (
+    assert kwargs["deadline_s"] == civitai_lookup.DEADLINE_SECONDS
+    assert kwargs["max_bytes"] == civitai_lookup.ANSWER_MAX_BYTES
+    assert set(kwargs) == {"timeout", "deadline_s", "max_bytes", "headers"}, (
         "something beyond the hash went into the request"
     )
     assert "Authorization" not in kwargs["headers"]
@@ -100,6 +102,8 @@ def test_a_miss_is_an_answer(civitai, answer):
         SimpleNamespace(status_code=200, json=_not_json),
         requests.Timeout("read timed out"),
         requests.ConnectionError("refused"),
+        ResponseTooLarge("over the cap"),
+        ReadDeadlineExceeded("still answering"),
     ],
 )
 def test_civitai_not_answering_raises_lookup_unavailable(civitai, answer):

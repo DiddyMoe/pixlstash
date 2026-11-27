@@ -84,6 +84,7 @@ from pixlstash.services import model_downloads
 from pixlstash.services import model_shelf_service, model_workflow_sets
 from pixlstash.services.model_folder_scanner import ModelFolderScanner
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.links import JUNCTION_REPARSE_TAG
 from pixlstash.services.model_mover import SHELF_IO_LOCK
 from pixlstash.services import workflow_set_verdicts as verdicts
 from pixlstash.services import workflow_templates
@@ -3835,14 +3836,13 @@ def test_the_filesystem_root_is_refused(shelf_env):
 
 
 class _FolderPaths:
-    """``requests.get`` stand-in answering ComfyUI's ``/internal/folder_paths``."""
+    """``bounded_get`` stand-in answering ComfyUI's ``/internal/folder_paths``."""
 
     def __init__(self, folder_paths: dict):
         self.folder_paths = folder_paths
         self.urls: list[str] = []
 
-    def __call__(self, url, timeout=None, allow_redirects=True, proxies=None):
-        assert allow_redirects is False, "a redirect names a host nobody vetted"
+    def __call__(self, url, proxies=None, **_kwargs):
         assert proxies == comfyui_service.NO_PROXY
         self.urls.append(url)
         return SimpleNamespace(status_code=200, json=lambda: self.folder_paths)
@@ -3864,7 +3864,7 @@ def test_comfyui_model_roots_collapse_categories_to_their_root(monkeypatch):
             "configs": "not a list",
         }
     )
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake)
     assert comfyui_service.comfyui_model_roots("http://comfy:8188") == [
         "/comfy/custom_nodes2",
         "/comfy/models",
@@ -3888,7 +3888,7 @@ def test_comfyui_model_roots_group_by_category_not_by_folder_count(monkeypatch):
             "intrinsic_loras": ["c:\\COMFYUI\\Custom_Nodes\\kj\\loras"],
         }
     )
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake)
     assert comfyui_service.comfyui_model_roots("http://comfy:8188/") == [
         "/home/me/loras-a",
         "/home/me/loras-b",
@@ -3901,7 +3901,7 @@ def test_comfyui_model_roots_is_empty_when_comfyui_cannot_be_asked(monkeypatch):
     def refuse(url, **kwargs):
         raise comfyui_service.requests.ConnectionError("refused")
 
-    monkeypatch.setattr(comfyui_service.requests, "get", refuse)
+    monkeypatch.setattr(comfyui_service, "bounded_get", refuse)
     assert comfyui_service.comfyui_model_roots("http://comfy:8188") == []
 
 
@@ -3920,7 +3920,7 @@ def test_saving_a_comfyui_url_puts_its_model_folder_on_the_shelf(
             "loras": [str(models / "loras"), str(tmp_path / "not-here" / "x" / "y")],
         }
     )
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake)
 
     def registered() -> dict[str, dict]:
         r = shelf_env.owner.get(f"{API}/model-folders")
@@ -3950,7 +3950,7 @@ def test_only_a_comfyui_on_this_computer_names_model_folders(shelf_env, monkeypa
     """The paths are ComfyUI's own filesystem's. From another host they name
     directories on a machine this is not, so they are not even asked for."""
     fake = _FolderPaths({"checkpoints": ["/home/me/models/checkpoints"]})
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake)
     for elsewhere in ("http://8.8.8.8:8188/", f"http://{LAN_IPV4}:8188/"):
         assert (
             model_folders_routes.register_comfyui_model_folders(
@@ -3976,7 +3976,7 @@ def test_the_home_folder_from_comfyui_is_never_put_on_the_shelf(
     fake = _FolderPaths(
         {"checkpoints": [str(home / "checkpoints")], "loras": [str(home / "loras")]}
     )
-    monkeypatch.setattr(comfyui_service.requests, "get", fake)
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake)
     before = {
         row["path"]
         for row in shelf_env.owner.get(f"{API}/model-folders").json()["folders"]
@@ -6277,6 +6277,31 @@ def test_clearing_refuses_what_is_not_a_run(shelf_env, import_folders, run_trash
     assert (outside / "elsewhere.safetensors").exists()
     assert list(run_trash.iterdir()) == []
     # Over-blocking is its own regression: a real run beside them still goes.
+    assert _trash_run(shelf_env, import_folders, "Clementine").status_code == 200
+
+
+def test_clearing_refuses_a_junction_that_reads_as_a_run(
+    shelf_env, import_folders, run_trash, monkeypatch
+):
+    """A junction inside the root passes containment as the ``alias`` symlink
+    above does, and is refused the same way. The plain run is the control."""
+    alias = import_folders.output_root / "alias"
+    alias.mkdir()
+    _write_run_adapter(alias / "alias.safetensors", b"x")
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        info = real_lstat(path, *args, **kwargs)
+        if not isinstance(path, int) and os.fspath(path) == str(alias):
+            return SimpleNamespace(
+                st_mode=info.st_mode, st_reparse_tag=JUNCTION_REPARSE_TAG
+            )
+        return info
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+    assert _trash_run(shelf_env, import_folders, "alias").status_code == 409
+    assert (alias / "alias.safetensors").exists()
     assert _trash_run(shelf_env, import_folders, "Clementine").status_code == 200
 
 
@@ -12614,7 +12639,7 @@ def test_a_junction_is_listed_as_a_link_and_never_walked(tmp_path, monkeypatch):
                 st_mode=stat.S_IFDIR,
                 st_size=0,
                 st_mtime_ns=0,
-                st_reparse_tag=model_files_routes._JUNCTION_TAG,
+                st_reparse_tag=JUNCTION_REPARSE_TAG,
             )
         return real_lstat(path, *args, **kwargs)
 
@@ -13053,7 +13078,7 @@ def _civitai_answers(monkeypatch, status=200, body=None):
         sent.append(url)
         return SimpleNamespace(status_code=status, json=lambda: body)
 
-    monkeypatch.setattr(civitai_lookup.requests, "get", get)
+    monkeypatch.setattr(civitai_lookup, "bounded_get", get)
     return sent
 
 

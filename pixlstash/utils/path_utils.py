@@ -1,6 +1,17 @@
 """Path safety utilities for server-side file I/O."""
 
+import ntpath
 import os
+import re
+
+# Windows' extended-length prefixes, and a drive path after the first one.
+_EXTENDED_PREFIX = "\\\\?\\"
+_EXTENDED_UNC_PREFIX = "\\\\?\\UNC\\"
+_DRIVE_PATH = re.compile(r"[A-Za-z]:\\")
+# The file, the device and the NT object namespace prefix. Each, in front of a
+# drive or a share, names the same folder as the plain spelling.
+_NAMESPACE_PREFIXES = (_EXTENDED_PREFIX, "\\\\.\\", "\\??\\")
+_UNC_PART = "unc\\"
 
 
 class LibraryRootsUnavailable(RuntimeError):
@@ -22,6 +33,72 @@ class LibraryRootsUnavailable(RuntimeError):
     is safe in both directions, so the failure is made distinguishable and the
     caller picks the direction.
     """
+
+
+def _without_added_prefix(path: str, resolved: str) -> str:
+    """*resolved* without a ``\\\\?\\`` prefix Windows' ``realpath`` added.
+
+    ``realpath`` keeps the prefix it added to a missing path when a parent
+    appears in between, so the plain spelling is resolved again. A prefix the
+    caller wrote, and a volume GUID path (which has no plain spelling), are kept.
+    """
+    # Normalised first, as realpath does, so ``//?/C:/`` is a prefix as given.
+    given_prefix = ntpath.normpath(path).startswith(_EXTENDED_PREFIX)
+    if given_prefix or not resolved.startswith(_EXTENDED_PREFIX):
+        return resolved
+    if resolved.startswith(_EXTENDED_UNC_PREFIX):
+        plain = "\\\\" + resolved[len(_EXTENDED_UNC_PREFIX) :]
+    elif _DRIVE_PATH.match(resolved, len(_EXTENDED_PREFIX)):
+        plain = resolved[len(_EXTENDED_PREFIX) :]
+    else:
+        return resolved
+    return os.path.realpath(plain)
+
+
+def plain_spelling(path: str) -> str:
+    """*path* without a Windows namespace prefix in front of a drive or a share.
+
+    ``\\\\?\\C:\\Windows`` and ``\\\\.\\C:\\Windows`` name ``C:\\Windows``, and
+    ``realpath`` keeps a ``\\\\?\\`` prefix it was given, so a check comparing
+    strings reads the prefixed spelling as another folder. For comparing only:
+    a path that is acted on keeps the spelling it was given.
+
+    A share's ``UNC\\`` becomes the leading ``\\\\`` it stands for. A volume
+    GUID path and any other device path have no plain spelling and are
+    returned as they are. Nothing changes on POSIX.
+
+    Args:
+        path: A path, in any case and with either slash.
+
+    Returns:
+        The plain spelling, normalised, or *path* unchanged.
+    """
+    if os.name != "nt":
+        return path
+    normalized = ntpath.normpath(path)
+    for prefix in _NAMESPACE_PREFIXES:
+        if not normalized.startswith(prefix):
+            continue
+        rest = normalized[len(prefix) :]
+        if rest[: len(_UNC_PART)].lower() == _UNC_PART:
+            return "\\\\" + rest[len(_UNC_PART) :]
+        if _DRIVE_PATH.match(rest):
+            return rest
+        break
+    return path
+
+
+def real_path(path: str | os.PathLike[str]) -> str:
+    """``os.path.realpath``, spelled plainly on Windows whatever raced it.
+
+    Use it wherever a resolved path is compared with another (containment, or
+    the same file named twice) and may not exist yet.
+    """
+    path = os.fspath(path)
+    resolved = os.path.realpath(path)
+    if os.name != "nt":
+        return resolved
+    return _without_added_prefix(path, resolved)
 
 
 def resolve_path_within(base_dir: str, *segments: str) -> str:
@@ -51,8 +128,8 @@ def resolve_path_within(base_dir: str, *segments: str) -> str:
         manually dismissed.
     """
     joined = os.path.join(base_dir, *segments)
-    resolved = os.path.realpath(joined)
-    safe_base = os.path.realpath(base_dir)
+    resolved = real_path(joined)
+    safe_base = real_path(base_dir)
     try:
         common = os.path.commonpath([resolved, safe_base])
     except ValueError as exc:
@@ -83,6 +160,9 @@ def path_is_within(path: str, base: str) -> bool:
     outside it is therefore accepted: planting one requires filesystem write
     access, which is a bigger problem than this check is for.
 
+    Both checks compare :func:`plain_spelling`, so ``\\\\?\\C:\\lib\\x`` is
+    within ``C:\\lib``.
+
     Args:
         path: The path to test. An empty value is never within anything.
         base: The directory *path* must be under.
@@ -93,13 +173,13 @@ def path_is_within(path: str, base: str) -> bool:
     if not path or not base:
         return False
     try:
-        norm_path = os.path.normcase(os.path.normpath(path))
-        norm_base = os.path.normcase(os.path.normpath(base))
+        norm_path = os.path.normcase(plain_spelling(os.path.normpath(path)))
+        norm_base = os.path.normcase(plain_spelling(os.path.normpath(base)))
         if os.path.commonpath([norm_path, norm_base]) == norm_base:
             return True
-        real_path = os.path.normcase(os.path.realpath(path))
-        real_base = os.path.normcase(os.path.realpath(base))
-        return os.path.commonpath([real_path, real_base]) == real_base
+        resolved_path = os.path.normcase(plain_spelling(real_path(path)))
+        resolved_base = os.path.normcase(plain_spelling(real_path(base)))
+        return os.path.commonpath([resolved_path, resolved_base]) == resolved_base
     except ValueError:
         # Mixed absolute/relative paths or different drives: not within.
         return False

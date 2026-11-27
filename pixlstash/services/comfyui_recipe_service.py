@@ -40,10 +40,16 @@ from pixlstash.services.workflow_hash import (
     normalized_filename,
     reduce_api_graph,
 )
+from pixlstash.utils.bounded_http import bounded_get
 
 logger = get_logger(__name__)
 
 OBJECT_INFO_TIMEOUT_S = 15.0
+# The whole ``/object_info`` read, body included, and the most of it kept.
+# ComfyUI builds it once per start and serves it in well under the deadline;
+# with many node packs it runs to a few megabytes.
+OBJECT_INFO_DEADLINE_S = 60.0
+OBJECT_INFO_MAX_BYTES = 64 * 1024 * 1024
 # The /object_info GETs in flight, by URL: a request arriving while one is out
 # waits for that answer instead of asking ComfyUI again (see fetch_object_info).
 _object_info_inflight: dict[str, Future] = {}
@@ -325,10 +331,11 @@ def _get_object_info_text(base_url: str) -> str:
 
     url = f"{base_url}/object_info"
     try:
-        response = requests.get(
+        response = bounded_get(
             url,
             timeout=OBJECT_INFO_TIMEOUT_S,
-            allow_redirects=False,
+            deadline_s=OBJECT_INFO_DEADLINE_S,
+            max_bytes=OBJECT_INFO_MAX_BYTES,
             proxies=NO_PROXY,
         )
     except requests.RequestException as exc:

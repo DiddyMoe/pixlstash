@@ -101,6 +101,7 @@ from pixlstash.utils.library_roots import (
     holding_folder_overlap_lock,
     refuse_overlapping_folder,
 )
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import path_is_within
 from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
@@ -862,6 +863,7 @@ def local_import_pictures(
             for name in dirnames
             if not is_hidden_entry(name)
             and os.path.realpath(os.path.join(dirpath, name)) not in own
+            and not is_link_or_missing(os.path.join(dirpath, name))
         ]
         for name in filenames:
             if not is_hidden_entry(name) and is_supported_media_file(name):

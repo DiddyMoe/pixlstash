@@ -52,6 +52,7 @@ from pixlstash.pixl_logging import get_logger
 from pixlstash.services.library_backup_service import (
     human_bytes,
 )
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.system_utils import space_shortfall
 from pixlstash.utils.sqlite_uri import sqlite_file_uri
 
@@ -334,7 +335,7 @@ def _require_extracted_members(scratch: str, archive: str) -> None:
 
 def _require_empty_destination(folder: str) -> None:
     """Refuse anything that would put the restored library on top of something."""
-    if os.path.islink(folder):
+    if is_link_or_missing(folder):
         raise RestoreError(
             f"Refusing to restore through symlink {folder}. Name a new folder."
         )
@@ -792,7 +793,7 @@ def _withdraw_library_folder(folder: str, *, remove_folder: bool) -> None:
         else:
             for entry in os.listdir(folder):
                 target = os.path.join(folder, entry)
-                if os.path.isdir(target) and not os.path.islink(target):
+                if os.path.isdir(target) and not is_link_or_missing(target):
                     shutil.rmtree(target)
                 else:
                     os.unlink(target)

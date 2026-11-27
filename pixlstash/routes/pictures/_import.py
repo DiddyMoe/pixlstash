@@ -55,6 +55,7 @@ from pixlstash.db_models.character import Character
 from pixlstash.db_models.picture_set import PictureSet
 from pixlstash.db_models.project import Project
 from pixlstash.services.set_lock_service import locked_set_ids
+from pixlstash.utils.links import is_link, is_link_or_missing
 from pixlstash.utils.media_files import SUPPORTED_MEDIA_EXTS
 from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
@@ -157,7 +158,7 @@ def _sweep_orphan_staging_dirs(server, now_ms: int) -> None:
     now. A symlink is unlinked, never followed.
     """
     staging_root = os.path.join(server.vault.image_root, ".staging")
-    if os.path.islink(staging_root) or not os.path.isdir(staging_root):
+    if is_link_or_missing(staging_root) or not os.path.isdir(staging_root):
         return
     live_ids = set(server.staging_sessions)
     cutoff_s = now_ms / 1000.0 - _STAGING_SESSION_TTL_S
@@ -1565,7 +1566,7 @@ def register_routes(router, server):
 
     def _staging_base_dir() -> str:
         path = os.path.join(server.vault.image_root, ".staging")
-        if os.path.lexists(path) and (os.path.islink(path) or not os.path.isdir(path)):
+        if os.path.lexists(path) and (is_link(path) or not os.path.isdir(path)):
             raise HTTPException(
                 status_code=500,
                 detail="The library staging path is not a trusted directory.",

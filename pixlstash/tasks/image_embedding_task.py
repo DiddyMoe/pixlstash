@@ -7,13 +7,13 @@ from collections import defaultdict
 from typing import Callable, Optional
 
 import numpy as np
-import requests
 from PIL import Image
 from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import Picture, PictureLikenessQueue
+from pixlstash.services import model_downloads
 from pixlstash.services.builtin_models import builtin_model_dir
 from pixlstash.services.scrapheap_service import file_location_is_unreachable
 from pixlstash.tagger_plugins.clip_service import CLIP_MODEL_NAME
@@ -711,10 +711,10 @@ class ImageEmbeddingTask(BaseTask):
             if not os.path.exists(model_path):
                 logger.info("Downloading aesthetic model from %s...", model_url)
                 os.makedirs(os.path.dirname(model_path), exist_ok=True)
-                response = requests.get(model_url, timeout=30)
-                response.raise_for_status()
-                with open(model_path, "wb") as file_handle:
-                    file_handle.write(response.content)
+                with model_downloads._open(model_url, live=False) as response:
+                    response.raise_for_status()
+                    with open(model_path, "wb") as file_handle:
+                        file_handle.write(response.content)
 
             state_dict = torch.load(model_path, map_location="cpu")
             model = nn.Linear(model_dim, 1)

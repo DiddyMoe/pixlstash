@@ -69,6 +69,7 @@ from pixlstash.services.comfyui_recipe_service import (
 from pixlstash.services.set_lock_service import drop_locked_set_ids
 from pixlstash.services import vram_history
 from pixlstash.stacking import normalize_stack_positions
+from pixlstash.utils.bounded_http import bounded_get
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.vram_utils import is_vram_oom
 
@@ -113,8 +114,13 @@ VHS_FILES_KEY = "gifs"
 # environment's entry for that key, so ``all`` must be named as well. A
 # redirect names a host nobody checked too, and ``requests`` takes the
 # environment's proxy again for it (a 307 with the body), so each request
-# passes ``allow_redirects=False`` beside this.
+# passes ``allow_redirects=False`` beside this or goes through ``bounded_get``,
+# which follows none.
 NO_PROXY = {"http": None, "https": None, "all": None}
+
+# The most of one ComfyUI answer kept. A queue or a history carries whole
+# prompt graphs, and the whole object_info map runs to megabytes.
+READ_MAX_BYTES = 64 * 1024 * 1024
 
 # How many followed prompts' endings are kept for GET /workflows/runs/{id}.
 MAX_RUN_OUTCOMES = 500
@@ -1316,10 +1322,11 @@ def swap_pixlstash_savers(workflow: dict) -> list[str]:
 
 def _fetch_comfyui_history(base_url: str, prompt_id: str) -> dict:
     try:
-        response = requests.get(
+        response = bounded_get(
             f"{base_url}/history/{prompt_id}",
             timeout=30,
-            allow_redirects=False,
+            deadline_s=30,
+            max_bytes=READ_MAX_BYTES,
             proxies=NO_PROXY,
         )
     except requests.RequestException as exc:
@@ -1472,8 +1479,12 @@ def _read_comfyui_queue(
     their turn; None, logged, when its queue cannot be read."""
     url = f"{base_url}/queue"
     try:
-        response = requests.get(
-            url, timeout=30, allow_redirects=False, proxies=NO_PROXY
+        response = bounded_get(
+            url,
+            timeout=30,
+            deadline_s=30,
+            max_bytes=READ_MAX_BYTES,
+            proxies=NO_PROXY,
         )
         # A redirect is not the queue: it names another host's address.
         if response.status_code != 200:
@@ -2798,7 +2809,9 @@ def comfyui_pixlstash_scripts(base_url: str) -> set[str] | None:
     """
     url = f"{base_url}/extensions"
     try:
-        response = requests.get(url, timeout=5, allow_redirects=False, proxies=NO_PROXY)
+        response = bounded_get(
+            url, timeout=5, deadline_s=5, max_bytes=READ_MAX_BYTES, proxies=NO_PROXY
+        )
         # A redirect is not ComfyUI answering: it names another host's address.
         if response.status_code != 200:
             raise requests.HTTPError(
@@ -2833,7 +2846,9 @@ def comfyui_shelf_loader_current(base_url: str) -> bool | None:
     """
     url = f"{base_url}/object_info/{PIXLSTASH_CHECKPOINT_LOADER}"
     try:
-        response = requests.get(url, timeout=5, allow_redirects=False, proxies=NO_PROXY)
+        response = bounded_get(
+            url, timeout=5, deadline_s=5, max_bytes=READ_MAX_BYTES, proxies=NO_PROXY
+        )
         # A redirect is not ComfyUI answering: it names another host's address.
         if response.status_code != 200:
             raise requests.HTTPError(
@@ -2977,10 +2992,11 @@ def probe_comfyui(url: str, timeout: float = 2.0) -> dict:
     }
     try:
         # A redirect is not ComfyUI answering: it is another host's address.
-        response = requests.get(
+        response = bounded_get(
             f"{base}system_stats",
             timeout=timeout,
-            allow_redirects=False,
+            deadline_s=timeout,
+            max_bytes=READ_MAX_BYTES,
             proxies=NO_PROXY,
         )
     except requests.exceptions.SSLError as exc:
@@ -3063,7 +3079,9 @@ def comfyui_folder_paths(base_url: str):
         ValueError: the answer is not JSON.
     """
     url = f"{base_url.rstrip('/')}/internal/folder_paths"
-    response = requests.get(url, timeout=5, allow_redirects=False, proxies=NO_PROXY)
+    response = bounded_get(
+        url, timeout=5, deadline_s=5, max_bytes=READ_MAX_BYTES, proxies=NO_PROXY
+    )
     if response.status_code != 200:
         raise requests.HTTPError(
             f"ComfyUI answered HTTP {response.status_code} at {url}"

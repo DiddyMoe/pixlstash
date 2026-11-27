@@ -1474,9 +1474,8 @@ def _extensions_answer(monkeypatch, answer, loader=None):
     ``GET /object_info/PixlStashCheckpointLoader`` (*loader*; ``{}``, no such
     class, by default)."""
 
-    def fake_get(url, timeout, allow_redirects=True, proxies=None):
-        # Straight to ComfyUI: no environment proxy, no redirect followed.
-        assert allow_redirects is False
+    def fake_get(url, proxies=None, **_kwargs):
+        # Straight to ComfyUI: no environment proxy.
         assert proxies == comfyui_service.NO_PROXY
         got = answer
         if "/object_info/" in url:
@@ -1490,15 +1489,7 @@ def _extensions_answer(monkeypatch, answer, loader=None):
             status_code=200, raise_for_status=lambda: None, json=lambda: got
         )
 
-    monkeypatch.setattr(
-        comfyui_service,
-        "requests",
-        SimpleNamespace(
-            get=fake_get,
-            RequestException=requests.RequestException,
-            HTTPError=requests.HTTPError,
-        ),
-    )
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake_get)
 
 
 def _redirected(body):
@@ -1648,14 +1639,13 @@ def _system_stats_answer(monkeypatch, answer) -> list[str]:
     """Stand in for ComfyUI's ``GET /system_stats``; returns the URLs asked."""
     asked: list[str] = []
 
-    def fake_get(url, timeout, allow_redirects=True, proxies=None):
+    def fake_get(url, proxies=None, **_kwargs):
         asked.append(url)
         if url.endswith("/extensions"):
             # The node check, asked once ComfyUI has answered: no nodes.
             return SimpleNamespace(
                 status_code=200, raise_for_status=lambda: None, json=lambda: []
             )
-        assert allow_redirects is False, "a redirect names a host nobody probed"
         assert proxies == comfyui_service.NO_PROXY
         if isinstance(answer, Exception):
             raise answer
@@ -1668,7 +1658,7 @@ def _system_stats_answer(monkeypatch, answer) -> list[str]:
 
         return SimpleNamespace(ok=status < 400, status_code=status, json=json)
 
-    monkeypatch.setattr(comfyui_service.requests, "get", fake_get)
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake_get)
     return asked
 
 
@@ -2111,7 +2101,8 @@ def _http_answer(status: int, body):
 
 
 class _FakeComfyUI:
-    """A ComfyUI with (or without) the PixlStash nodes, reached over ``requests``.
+    """A ComfyUI with (or without) the PixlStash nodes, reached through the
+    bounded client.
 
     The link check goes through the pack's proxy, which calls PixlStash with
     the token it is handed; this one calls the real test server the same way,
@@ -2140,9 +2131,6 @@ class _FakeComfyUI:
         self.check_status = check_status
         self.settings: dict = {}
         self.writes: list[dict] = []
-        # What a client that follows redirects would have re-sent to the
-        # Location: a host nobody checked.
-        self.followed: list[dict] = []
 
     def get(self, url, timeout=None, headers=None, **kwargs):
         path = urlsplit(url).path
@@ -2176,14 +2164,13 @@ class _FakeComfyUI:
             return _http_answer(r.status_code, r.json() if r.is_success else {})
         raise AssertionError(f"unexpected GET {url}")
 
-    def post(self, url, json=None, timeout=None, allow_redirects=True, **kwargs):
+    def request(self, method, url, json=None, **kwargs):
+        assert method == "POST", method
         assert urlsplit(url).path.endswith("/settings"), url
         assert kwargs.get("proxies") == comfyui_link_service.NO_PROXY, (
             "the settings write carries the token and must not go through a proxy"
         )
         self.writes.append(json)
-        if 300 <= self.settings_status < 400 and allow_redirects:
-            self.followed.append(json)
         if self.settings_status != 200:
             return _http_answer(self.settings_status, None)
         self.settings.update(json)
@@ -2226,8 +2213,9 @@ def comfy_at(workflow_env, monkeypatch):
     def at(url: str, **kwargs) -> _FakeComfyUI:
         fake = _FakeComfyUI(workflow_env.server, **kwargs)
         fakes.append(fake)
-        monkeypatch.setattr(comfyui_link_service.requests, "get", fake.get)
-        monkeypatch.setattr(comfyui_link_service.requests, "post", fake.post)
+        monkeypatch.setattr(comfyui_service, "bounded_get", fake.get)
+        monkeypatch.setattr(comfyui_link_service, "bounded_get", fake.get)
+        monkeypatch.setattr(comfyui_link_service, "bounded_request", fake.request)
         r = workflow_env.owner.patch(
             f"{API}/users/me/config", json={"comfyui_url": url}
         )
@@ -2356,7 +2344,8 @@ def test_a_link_reads_none_of_comfyuis_saved_workflows(
         asked.append(urlsplit(url).path)
         return fake.get(url, **kwargs)
 
-    monkeypatch.setattr(comfyui_link_service.requests, "get", get)
+    monkeypatch.setattr(comfyui_service, "bounded_get", get)
+    monkeypatch.setattr(comfyui_link_service, "bounded_get", get)
     hub = workflow_env.server.hub
     before = manual_workflow_ids(hub)
     assert workflow_env.owner.post(f"{API}/comfyui/link").json()["linked"] is True
@@ -3367,7 +3356,7 @@ def test_a_redirect_never_carries_the_token_to_another_host(workflow_env, comfy_
         "failed",
         "write_failed",
     )
-    assert fake.followed == []
+    assert len(fake.writes) == 1
     assert _link_tokens(workflow_env.server) == []
 
 
@@ -3486,7 +3475,8 @@ def test_the_link_and_probe_refuse_remote_plaintext_under_require_ssl(
         asked.append(url)
         return fake.get(url, **kwargs)
 
-    monkeypatch.setattr(comfyui_link_service.requests, "get", recording_get)
+    monkeypatch.setattr(comfyui_service, "bounded_get", recording_get)
+    monkeypatch.setattr(comfyui_link_service, "bounded_get", recording_get)
     monkeypatch.setitem(server.auth._server_config, "require_ssl", True)
     client_ip = ["8.8.8.8"]
     monkeypatch.setattr(server.auth, "_get_real_client_ip", lambda r: client_ip[0])
@@ -3786,15 +3776,15 @@ def test_each_linked_comfyui_here_is_told_once_a_session(monkeypatch):
     writes = []
     down = {"http://127.0.0.1:8189/settings"}
 
-    def fake_post(url, json=None, timeout=None, allow_redirects=True, proxies=None):
-        assert allow_redirects is False
+    def fake_post(method, url, json=None, proxies=None, **_kwargs):
+        assert method == "POST"
         assert proxies == comfyui_link_service.NO_PROXY
         if url in down:
             raise comfyui_link_service.requests.ConnectionError("refused")
         writes.append((url, json))
         return _http_answer(200, None)
 
-    monkeypatch.setattr(comfyui_link_service.requests, "post", fake_post)
+    monkeypatch.setattr(comfyui_link_service, "bounded_request", fake_post)
     told = {
         comfyui_link_service.SETTING_URL: "http://127.0.0.1:61002",
         comfyui_link_service.SETTING_SSL: True,
@@ -3821,12 +3811,12 @@ def test_each_linked_comfyui_here_is_told_once_a_session(monkeypatch):
     relinked = record("http://127.0.0.1:8188/", "this_computer", "x")
     relinked["token_public_id"] = "example-relinked"
 
-    def relink_meanwhile(url, json=None, **_):
+    def relink_meanwhile(method, url, json=None, **_):
         if url == "http://127.0.0.1:8188/settings":
             comfyui_link_service._save_record(server, "a", relinked)
         return _http_answer(200, None)
 
-    monkeypatch.setattr(comfyui_link_service.requests, "post", relink_meanwhile)
+    monkeypatch.setattr(comfyui_link_service, "bounded_request", relink_meanwhile)
     comfyui_link_service.reannounce(server)
     assert comfyui_link_service.link_record(server, "a") == relinked
 
@@ -4279,7 +4269,8 @@ def test_a_failed_copy_leaves_the_older_nodes_in_place(install_env, monkeypatch)
 
 
 class _FakeComfyForInstall:
-    """ComfyUI's folder report and ComfyUI-Manager's restart, over ``requests``."""
+    """ComfyUI's folder report and ComfyUI-Manager's restart, through the
+    bounded client."""
 
     def __init__(self, custom_nodes: Path, reboot: dict):
         self.custom_nodes = custom_nodes
@@ -4289,14 +4280,12 @@ class _FakeComfyForInstall:
 
     def get(self, url, **kwargs):
         assert kwargs.get("proxies") == comfyui_link_service.NO_PROXY
-        assert kwargs.get("allow_redirects") is False
         self.asked.append(f"GET {urlsplit(url).path}")
         assert urlsplit(url).path.endswith("/internal/folder_paths"), url
         return _http_answer(200, {"custom_nodes": [str(self.custom_nodes)]})
 
     def request(self, method, url, **kwargs):
         assert kwargs.get("proxies") == comfyui_link_service.NO_PROXY
-        assert kwargs.get("allow_redirects") is False
         key = f"{method} {urlsplit(url).path.lstrip('/')}"
         self.asked.append(key)
         if key == "GET queue":
@@ -4320,8 +4309,8 @@ def install_env(tmp_path, monkeypatch):
 
     def with_comfy(reboot):
         fake = _FakeComfyForInstall(custom_nodes, reboot)
-        monkeypatch.setattr(comfyui_pack_service.requests, "get", fake.get)
-        monkeypatch.setattr(comfyui_pack_service.requests, "request", fake.request)
+        monkeypatch.setattr(comfyui_service, "bounded_get", fake.get)
+        monkeypatch.setattr(comfyui_pack_service, "bounded_request", fake.request)
         return fake
 
     return SimpleNamespace(
@@ -4443,8 +4432,8 @@ def test_a_build_without_the_nodes_says_so(install_env, monkeypatch):
 def _point_comfy_at(monkeypatch, folder: Path) -> _FakeComfyForInstall:
     """A ComfyUI (or whatever holds its port) naming *folder* as custom_nodes."""
     fake = _FakeComfyForInstall(folder, {"POST v2/manager/reboot": 200})
-    monkeypatch.setattr(comfyui_pack_service.requests, "get", fake.get)
-    monkeypatch.setattr(comfyui_pack_service.requests, "request", fake.request)
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake.get)
+    monkeypatch.setattr(comfyui_pack_service, "bounded_request", fake.request)
     return fake
 
 

@@ -513,6 +513,60 @@ def test_metadata_export_leaves_out_a_tag_removed_from_tagging(server, tmp_path)
     assert not os.path.exists(os.path.splitext(only)[0] + "_tags.txt")
 
 
+def _simulate_junction(monkeypatch, path):
+    """Make *path*'s ``lstat`` carry the Windows junction reparse tag."""
+    real_lstat = os.lstat
+
+    def lstat(candidate, *args, **kwargs):
+        info = real_lstat(candidate, *args, **kwargs)
+        if isinstance(candidate, int) or os.fspath(candidate) != os.fspath(path):
+            return info
+        return SimpleNamespace(
+            **{name: getattr(info, name) for name in dir(info) if name[:3] == "st_"},
+            st_reparse_tag=0xA0000003,  # IO_REPARSE_TAG_MOUNT_POINT
+        )
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def test_scan_never_indexes_a_picture_through_a_junction(server, tmp_path, monkeypatch):
+    """``os.walk`` descends a junction, which leads out of the folder. Wrong
+    if the picture behind it is indexed; the plain subfolder is the control."""
+    folder_dir = str(tmp_path / "refs")
+    folder_id = _make_folder(server, folder_dir)
+    os.makedirs(os.path.join(folder_dir, "plain"))
+    os.makedirs(os.path.join(folder_dir, "elsewhere"))
+    _make_image(os.path.join(folder_dir, "plain"), "cat.png")
+    _make_image(os.path.join(folder_dir, "elsewhere"), "dog.png")
+    _simulate_junction(monkeypatch, os.path.join(folder_dir, "elsewhere"))
+
+    _run_scan(server, folder_id, folder_dir)
+
+    indexed = server.vault.db.run_task(
+        lambda s: s.exec(
+            select(Picture.file_path).where(Picture.reference_folder_id == folder_id)
+        ).all()
+    )
+    assert sorted(os.path.basename(path) for path in indexed) == ["cat.png"]
+
+
+def test_sidecar_detection_does_not_learn_a_convention_through_a_junction(
+    tmp_path, monkeypatch
+):
+    """The scan prunes a junction, so the convention of the files it leads to
+    is not this folder's."""
+    junction = tmp_path / "elsewhere"
+    junction.mkdir()
+    (junction / "cat.png").write_bytes(b"not read")
+    (junction / "cat.tags.txt").write_text("test-tag, test-other")
+    assert detect_folder_suffixes(str(tmp_path))["found_tags"] is True, (
+        "the control: as a plain directory, its convention is found"
+    )
+    _simulate_junction(monkeypatch, junction)
+
+    assert detect_folder_suffixes(str(tmp_path))["found_tags"] is False
+
+
 def test_scan_reads_separate_tags_and_description_sidecars(server, tmp_path):
     folder_dir = str(tmp_path / "refs")
     folder_id = _make_folder(server, folder_dir)

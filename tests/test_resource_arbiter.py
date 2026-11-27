@@ -4,6 +4,7 @@ Pure: no server, no GPU. The ledger is a stand-in that answers whatever the
 test says the card holds, so every figure here is chosen, not measured.
 """
 
+import json
 import logging
 import os
 import subprocess
@@ -33,6 +34,7 @@ from pixlstash.resources.arbiter import (
 from pixlstash.resources.comfyui_tenant import ComfyUIProbe
 from pixlstash.resources.ledger import DeviceReading, Ledger, SmiNvml
 from pixlstash.utils.accelerator import empty_accelerator_cache
+from tests.test_bounded_http import _Peer, _trickle, _within
 
 CARD = "GPU-00000000-0000-0000-0000-000000000001"
 TOTAL = 24576  # 24 GB; margin is 5 % = 1228 MB
@@ -1186,6 +1188,41 @@ def test_a_failed_comfyui_read_stands_longer_than_a_good_one(monkeypatch):
     assert calls == ["/system_stats"], "a failed read was asked again a second later"
     assert probe.stats(max_age_s=0.0) is None
     assert len(calls) == 2, "an explicit fresh read must still ask"
+
+
+def test_a_system_stats_read_that_trickles_past_the_deadline_is_unreachable(
+    monkeypatch,
+):
+    """Wrong if the arbiter waits out a ComfyUI sending a byte at a time."""
+    monkeypatch.setattr(comfyui_tenant, "READ_DEADLINE_S", 0.5)
+    body = b'{"devices": []}'.ljust(30)
+
+    def handler(conn, _):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body))
+        _trickle(conn, body)
+
+    with _Peer(handler) as peer:
+        probe = ComfyUIProbe("test-client")
+        probe.watch(peer.url)
+        # The session's stand-in for every probe read, undone for this one.
+        probe._get = lambda path: comfyui_tenant._read_json(f"{peer.url}{path}")
+        with _within(2.0):
+            assert probe.stats() is None
+
+
+def test_an_ordinary_system_stats_read_is_used():
+    body = json.dumps(_comfy_stats(8192, 4096)).encode()
+
+    def handler(conn, _):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body))
+        conn.sendall(body)
+
+    with _Peer(handler) as peer:
+        probe = ComfyUIProbe("test-client")
+        probe.watch(peer.url)
+        # The session's stand-in for every probe read, undone for this one.
+        probe._get = lambda path: comfyui_tenant._read_json(f"{peer.url}{path}")
+        assert probe.stats() == _comfy_stats(8192, 4096)
 
 
 def test_a_read_failing_partway_through_the_card_match_is_not_cached_as_remote(

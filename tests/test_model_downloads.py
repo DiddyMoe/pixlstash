@@ -5,13 +5,14 @@ import gzip
 import hashlib
 import importlib.util
 import json
+import ntpath
 import os
+import socket
 import sqlite3
 import threading
 import time
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +42,9 @@ from pixlstash.services.workflow_run_service import (
     judge,
     missing_digest_models,
 )
+from pixlstash.utils.bounded_http import RedirectRefused
+from pixlstash.utils.path_utils import real_path, resolve_path_within
+from tests.test_bounded_http import _Peer
 from tests.test_downloads_intake import _register, write_adapter
 
 
@@ -314,6 +318,42 @@ def test_the_same_file_twice_at_once_is_refused(hub, target, adapter_bytes, link
         assert caught.value.status_code == 409
         gate.set()
         assert _wait(first["id"])["status"] == STATUS_DONE
+
+
+_EXTENDED_PREFIX = "\\\\?\\"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the race is in Windows' realpath")
+def test_a_folder_made_mid_resolve_leaves_the_download_inside_its_folder(
+    tmp_path, monkeypatch
+):
+    """CPython strips the prefix only if the plain path fails with the error
+    its first try did. A parent made in between turns 3 (path not found) into
+    2 (file not found) and the prefix stays: a download into a folder another
+    download was creating read as outside its folder."""
+    real_final_path = ntpath._getfinalpathname
+    make_on_next_miss = []
+    own_folder = ntpath.normcase(str(tmp_path))
+
+    def final_path(path):
+        try:
+            return real_final_path(path)
+        except OSError:
+            # Only this test's own misses, so no other thread's can use it up.
+            mine = ntpath.normcase(str(path)).startswith(own_folder)
+            if make_on_next_miss and mine:
+                os.mkdir(make_on_next_miss.pop())
+            raise
+
+    monkeypatch.setattr(ntpath, "_getfinalpathname", final_path)
+    make_on_next_miss.append(tmp_path / "staged")
+    raced = os.path.realpath(tmp_path / "staged" / "x.bin")
+    assert raced.startswith(_EXTENDED_PREFIX), f"the race was not staged: {raced}"
+
+    make_on_next_miss.append(tmp_path / "new")
+    resolved = resolve_path_within(str(tmp_path), "new", "x.bin")
+    assert not make_on_next_miss, "the folder was never made mid-resolve"
+    assert resolved == os.path.join(real_path(tmp_path), "new", "x.bin")
 
 
 def test_a_cancel_stops_it_and_leaves_nothing(hub, target, adapter_bytes, linked):
@@ -951,28 +991,37 @@ def test_a_name_already_under_its_folder_is_not_put_under_it_twice(
     assert (chosen / "loras" / "style.safetensors").is_file()
 
 
-@pytest.mark.parametrize(
-    "hops, refused",
-    [
-        (["https://example.com/a"], False),
-        (["https://example.com/a", "https://cdn.example.com/a"], False),
-        (["https://example.com/a", "http://cdn.example.com/a"], True),
-        (
-            [
-                "https://example.com/a",
-                "http://example-hop.test/a",
-                "https://cdn.example.com/a",
-            ],
-            True,
-        ),
-    ],
-)
-def test_no_hop_of_a_redirect_may_be_plain_http(hops, refused):
-    """Wrong if a chain that passes through plain http and back is let in."""
-    response = SimpleNamespace(
-        url=hops[-1], history=[SimpleNamespace(url=hop) for hop in hops[:-1]]
-    )
-    assert model_downloads._left_https(hops[0], response) is refused
+def test_a_redirect_to_a_private_address_is_not_followed(hub, target, linked):
+    """Wrong if the download asks 10.0.0.1, or keeps any file."""
+    chosen, _ = target
+    with serve_bytes(
+        b"", status=302, headers={"Location": "https://10.0.0.1/model.safetensors"}
+    ) as url:
+        linked(url, "loras")
+        done = _wait(start_download(hub, "inner.safetensors")["id"])
+    assert done["status"] == STATUS_FAILED, done
+    assert "10.0.0.1 leads to a private or local address" in done["error"]
+    assert os.listdir(chosen / "loras") == []
+
+
+def test_a_hop_whose_host_then_resolves_to_loopback_is_sent_nothing(monkeypatch):
+    """The vet resolves the redirect's host, then the connect resolves it
+    again. Wrong if the second answer, loopback, is sent a byte."""
+    sent = []
+    answers = iter(["8.8.8.8"])
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        address = host if host == "127.0.0.1" else next(answers, "127.0.0.1")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    trap = _Peer(lambda conn, _: sent.append(conn.recv(65536)), read_request=False)
+    with trap:
+        location = f"https://rebind.example:{trap.port}/x"
+        with serve_bytes(b"", status=302, headers={"Location": location}) as url:
+            with pytest.raises(RedirectRefused, match="rebind.example"):
+                model_downloads._open(url, live=False)
+    assert sent == [b""]
 
 
 def test_a_thread_that_will_not_start_leaves_no_entry_behind(
@@ -1163,7 +1212,19 @@ class _Hop:
         pass
 
 
+def _public_dns(monkeypatch):
+    """Every host name resolves to a public address, without asking DNS."""
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))
+        ],
+    )
+
+
 def test_a_live_link_redirected_off_hugging_face_is_never_asked(monkeypatch):
+    _public_dns(monkeypatch)
     asked = []
     hops = {
         "https://huggingface.co/a/resolve/main/x.safetensors": "/b/resolve/main/x.safetensors",
@@ -1176,6 +1237,7 @@ def test_a_live_link_redirected_off_hugging_face_is_never_asked(monkeypatch):
         return _Hop(hops.get(url))
 
     monkeypatch.setattr(model_downloads.requests, "get", get)
+    monkeypatch.setattr(model_downloads, "get_vetted", get)
     with pytest.raises(ValueError, match="example.com"):
         model_downloads._open(
             "https://huggingface.co/a/resolve/main/x.safetensors", live=True
@@ -1184,6 +1246,7 @@ def test_a_live_link_redirected_off_hugging_face_is_never_asked(monkeypatch):
 
 
 def test_a_live_link_redirected_to_the_hugging_face_cdn_is_followed(monkeypatch):
+    _public_dns(monkeypatch)
     asked = []
     hops = {
         "https://huggingface.co/a/resolve/main/x.safetensors": "https://us.aws.cdn.hf.co/x",
@@ -1194,6 +1257,7 @@ def test_a_live_link_redirected_to_the_hugging_face_cdn_is_followed(monkeypatch)
         return _Hop(hops.get(url))
 
     monkeypatch.setattr(model_downloads.requests, "get", get)
+    monkeypatch.setattr(model_downloads, "get_vetted", get)
     final = model_downloads._open(
         "https://huggingface.co/a/resolve/main/x.safetensors", live=True
     )

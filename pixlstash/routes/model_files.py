@@ -73,7 +73,6 @@ import hashlib
 import os
 import shutil
 import sqlite3
-import stat
 from typing import Optional, Union
 
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -131,6 +130,7 @@ from pixlstash.services.trash_undo import (
 )
 from pixlstash.utils.adapter_header import FILE_ENGINE
 from pixlstash.utils.aitoolkit_run import is_sample_filename
+from pixlstash.utils.links import is_link, is_link_or_missing
 from pixlstash.utils.path_utils import path_is_within, resolve_path_within
 from pixlstash.utils.system_utils import TRASH_NAME
 from pixlstash.utils.trash_restore import NotInTrash, fingerprint, restore_from_trash
@@ -532,27 +532,6 @@ class RemoveFolderResponse(BaseModel):
     trash_name: str = Field(default=TRASH_NAME)
 
 
-# The reparse tag of a Windows junction. ``stat`` names it only on Windows.
-_JUNCTION_TAG = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
-
-
-def _is_link(path: str) -> bool:
-    """A symbolic link, or a Windows junction, which ``islink`` does not see.
-
-    The junction test is what ``os.path.isjunction`` does on 3.12, spelled out
-    so 3.11 gets it too: without it a junction is walked into, and one pointing
-    at its own ancestor never ends. Only the junction tag counts, not every
-    reparse point: a cloud placeholder directory is one too, and pruning it
-    would hide files the removal still takes.
-
-    Raises:
-        OSError: *path* cannot be read, which the caller answers as a refusal.
-    """
-    if os.path.islink(path):
-        return True
-    return getattr(os.lstat(path), "st_reparse_tag", 0) == _JUNCTION_TAG
-
-
 def _raise_walk_error(error: OSError) -> None:
     # ``os.walk`` skips an unreadable directory silently by default, and a
     # listing short by one directory would let the removal take files the
@@ -574,7 +553,7 @@ def _folder_listing(path: str) -> list[tuple[str, int, int, bool]]:
     """
     entries: list[tuple[str, int, int, bool]] = []
     for root, dirs, names in os.walk(path, onerror=_raise_walk_error):
-        links = [name for name in dirs if _is_link(os.path.join(root, name))]
+        links = [name for name in dirs if is_link(os.path.join(root, name))]
         dirs[:] = [name for name in dirs if name not in links]
         for name in names + links:
             full = os.path.join(root, name)
@@ -903,7 +882,7 @@ def _warn_about_samples(model_path: str) -> None:
     ago without this line.
     """
     directory = samples_relpath(model_path)
-    if os.path.isdir(directory) and not os.path.islink(directory):
+    if os.path.isdir(directory) and not is_link_or_missing(directory):
         logger.info(
             "Left %s in place: %s was removed as a duplicate but the model is "
             "still on the shelf, so its training previews are still its own. "
@@ -1118,7 +1097,7 @@ def _remove_samples(model_path: str, *, permanent: bool) -> bool:
     directory = samples_relpath(model_path)
     if not os.path.isdir(directory):
         return False
-    if os.path.islink(directory):
+    if is_link_or_missing(directory):
         # ``isdir`` follows the link, so without this the removal is decided by
         # which branch runs: ``rmtree`` happens to refuse a symlinked root and
         # ``send2trash`` happens to move the link and spare its target. Neither

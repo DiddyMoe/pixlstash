@@ -52,6 +52,7 @@ from pixlstash.image_plugins.service import (
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.atomic_write import write_json_atomic
 from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.links import is_link_entry
 from pixlstash.utils.media_files import SUPPORTED_IMAGE_EXTS, is_hidden_entry
 from pixlstash.utils.service.share_copies import _is_batch_name, make_share_copies
 
@@ -253,7 +254,7 @@ def sweep_edit_sessions(
     removed = 0
     for entry in entries:
         try:
-            if entry.is_symlink() or not entry.is_dir():
+            if is_link_entry(entry) or not entry.is_dir():
                 continue
             newest = max(
                 [entry.stat().st_mtime]
@@ -298,7 +299,7 @@ def reconcile_all(server, root: str) -> int:
     imported = 0
     for entry in entries:
         try:
-            if entry.is_dir() and not entry.is_symlink():
+            if entry.is_dir() and not is_link_entry(entry):
                 imported += len(process_session(server, entry.path))
         except Exception as exc:
             # Left in place: the next save into it, or the next start, retries.

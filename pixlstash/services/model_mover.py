@@ -112,6 +112,7 @@ from typing import Callable, Optional
 from pixlstash.hub.db import HubDatabase
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services.model_folder_scanner import STATE_PRESENT, TAKEN_FROM_KINDS
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import resolve_path_within
 
 logger = get_logger(__name__)
@@ -299,14 +300,9 @@ def resolve_subfolder(
             way, or one that resolves outside the folder.
     """
     segments = subpath_segments(subpath)
-    is_junction = getattr(os.path, "isjunction", lambda _path: False)
     for depth in range(1, len(segments) + 1):
         here = os.path.join(folder_path, *segments[:depth])
-        if (
-            segments[depth - 1].startswith(".")
-            or os.path.islink(here)
-            or is_junction(here)
-        ):
+        if segments[depth - 1].startswith(".") or is_link_or_missing(here):
             raise MoveRefused(
                 f"{subpath!r} goes through a link or a hidden folder, which the "
                 "shelf does not move into."

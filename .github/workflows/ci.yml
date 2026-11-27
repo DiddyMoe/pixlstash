@@ -509,6 +509,7 @@ jobs:
           tests/test_authz_library_pin.py
           tests/test_backend_order_stability.py
           tests/test_batch_character_likeness_scope.py
+          tests/test_bounded_http.py
           tests/test_builtin_models.py
           tests/test_character_face_assignment.py
           tests/test_character_sheet.py
@@ -528,6 +529,7 @@ jobs:
           tests/test_comfyui_submit_prompt.py
           tests/test_comfyui_ui_graph_conversion.py
           tests/test_comfyui_workflow_extraction.py
+          tests/test_connect_guard.py
           tests/test_cpu_query_encoders.py
           tests/test_database_engine_config.py
           tests/test_dedup_auto_stack_runs.py
@@ -593,6 +595,7 @@ jobs:
           tests/test_library_switch.py
           tests/test_likeness_and_face_search.py
           tests/test_likeness_worker.py
+          tests/test_links.py
           tests/test_log_token_redaction.py
           tests/test_managed_model_store.py
           tests/test_many_to_many_face_data.py
@@ -1120,6 +1123,7 @@ jobs:
             tests/test_openapi_response_schemas.py \
             tests/test_find_orphaned_files.py \
             tests/test_library_layout.py \
+            tests/test_links.py \
             tests/test_server.py \
             tests/test_authentication.py \
             tests/test_rate_limiter.py \

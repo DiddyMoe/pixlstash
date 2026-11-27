@@ -55,6 +55,7 @@ from pixlstash.services.layout_move_service import (
 )
 from pixlstash.services.move_reconciliation_service import record_pending_reviews
 from pixlstash.utils.library_layout import DEFAULT_LAYOUT, parse_layout
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.reference_folder_watcher import ROOT_INTERNAL_DIRS
 from pixlstash.utils.path_utils import path_is_within
 from pixlstash.utils.quality.tag_exclusion import (
@@ -350,9 +351,9 @@ class ReferenceFolderScanTask(BaseTask):
                 ):
                     unscanned_roots.append(full)
                     continue
-                if os.path.islink(full):
-                    # os.walk does not descend a directory symlink, so nothing
-                    # under it was looked at either.
+                if is_link_or_missing(full):
+                    # Not descended (os.walk would descend a Windows junction),
+                    # so nothing under it was looked at either.
                     unscanned_roots.append(full)
                     continue
                 kept.append(name)

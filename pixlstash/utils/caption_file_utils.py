@@ -22,6 +22,7 @@ from collections.abc import Collection
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.video_utils import VIDEO_EXTENSIONS
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.media_files import SUPPORTED_IMAGE_EXTS, is_hidden_entry
 
 logger = get_logger(__name__)
@@ -502,9 +503,9 @@ def detect_folder_suffixes(
     Walks the folder, matches each sidecar text file to its image, derives the
     suffix that follows the image stem, classifies the sidecar (filename then
     content), and returns the most common suffix observed for each type.
-    Hidden entries and the absolute directories in *skip_dirs* (subtrees the
-    caller's own scan does not index) are not walked: a convention found in
-    one of those is not this folder's.
+    Hidden entries, links and the absolute directories in *skip_dirs*
+    (subtrees the caller's own scan does not index) are not walked: a
+    convention found in one of those is not this folder's.
 
     Returns a dict ``{"tags_suffix", "description_suffix", "found_tags",
     "found_descriptions"}``; the suffix values are ``None`` when that type was
@@ -520,6 +521,7 @@ def detect_folder_suffixes(
             for name in dirs
             if not is_hidden_entry(name)
             and os.path.normpath(os.path.join(root, name)) not in skipped
+            and not is_link_or_missing(os.path.join(root, name))
         ]
         for name in files:
             if is_hidden_entry(name):

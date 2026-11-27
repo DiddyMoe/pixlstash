@@ -1,0 +1,1 @@
+- Fixed: a ComfyUI that stops answering no longer holds up GPU sharing.

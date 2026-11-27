@@ -67,6 +67,7 @@ from pixlstash.services.model_mover import (
     same_device,
 )
 from pixlstash.utils.library_layout import refusal_for_folder_name
+from pixlstash.utils.links import is_link_or_missing
 from pixlstash.utils.path_utils import path_is_within
 
 logger = get_logger(__name__)
@@ -192,12 +193,16 @@ def _disk_usage(path: str) -> tuple[int, int]:
 def _tree_listing(path: str) -> dict[str, int]:
     """``{relpath: size}`` of every file under *path*, not following links.
 
-    A link to a directory is listed as an entry of its own: ``os.walk`` puts it
-    among the directories and does not enter it, and the copy holds it as a link.
+    A link to a directory is listed as an entry of its own and not entered.
+    ``copytree`` copies a Windows junction's contents as a real folder, so a
+    junction's entry never matches the copy and the source is kept, which keeps
+    the unlink below from reaching through it.
     """
     listing: dict[str, int] = {}
     for root, dirs, names in os.walk(path):
-        for name in names + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
+        links = [d for d in dirs if is_link_or_missing(os.path.join(root, d))]
+        dirs[:] = [d for d in dirs if d not in links]
+        for name in names + links:
             full = os.path.join(root, name)
             try:
                 listing[os.path.relpath(full, path)] = os.lstat(full).st_size

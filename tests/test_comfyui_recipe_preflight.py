@@ -3293,12 +3293,12 @@ def test_object_info_requests_arriving_together_share_one_get(monkeypatch):
         status_code = 200
         text = json.dumps({"KSampler": {"input": {}}})
 
-    def slow_get(url, timeout=None, allow_redirects=True, proxies=None):
+    def slow_get(url, **kwargs):
         asked.append(url)
         release.wait(5)
         return Answer()
 
-    monkeypatch.setattr(service.requests, "get", slow_get)
+    monkeypatch.setattr(service, "bounded_get", slow_get)
     results = []
     callers = [
         threading.Thread(
@@ -3336,11 +3336,11 @@ def test_a_shutdown_signal_in_the_shared_get_reaches_waiters_as_a_failure(
 
     release = threading.Event()
 
-    def interrupted_get(url, timeout=None, allow_redirects=True, proxies=None):
+    def interrupted_get(url, **kwargs):
         release.wait(5)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(service.requests, "get", interrupted_get)
+    monkeypatch.setattr(service, "bounded_get", interrupted_get)
     seen = {}
 
     def call(name):
@@ -3365,21 +3365,30 @@ def test_a_shutdown_signal_in_the_shared_get_reaches_waiters_as_a_failure(
 
 
 def test_the_object_info_read_goes_straight_to_comfyui(monkeypatch):
-    """Never through a proxy set in the environment, and never on to wherever
-    a redirect points: the map it reads decides what a run is sent with."""
+    """Never through a proxy set in the environment, and bounded in time and
+    size: the map it reads decides what a run is sent with."""
     asked = []
 
     class Answer:
         status_code = 200
         text = json.dumps({"KSampler": {"input": {}}})
 
-    # ``requests`` follows a redirect unless told not to.
-    def get(url, timeout=None, allow_redirects=True, proxies=None):
-        asked.append((url, allow_redirects, proxies))
+    def get(url, **kwargs):
+        asked.append((url, kwargs))
         return Answer()
 
-    monkeypatch.setattr(comfyui_recipe_service.requests, "get", get)
+    monkeypatch.setattr(comfyui_recipe_service, "bounded_get", get)
     assert comfyui_recipe_service.fetch_object_info("http://c") == {
         "KSampler": {"input": {}}
     }
-    assert asked == [("http://c/object_info", False, NO_PROXY)]
+    assert asked == [
+        (
+            "http://c/object_info",
+            {
+                "timeout": comfyui_recipe_service.OBJECT_INFO_TIMEOUT_S,
+                "deadline_s": comfyui_recipe_service.OBJECT_INFO_DEADLINE_S,
+                "max_bytes": comfyui_recipe_service.OBJECT_INFO_MAX_BYTES,
+                "proxies": NO_PROXY,
+            },
+        )
+    ]
