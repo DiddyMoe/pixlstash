@@ -6862,6 +6862,8 @@ Both paths log an `error` if the arithmetic does not close, rather than shipping
 - **It comes back as it was.** A `.txt` sidecar is not applied to a restored match and the import's project/set/character is not applied either, on both paths: the picture may sit in a locked set, and it is announced as `restored`, not `added`.
 - **A watch folder does not restore.** It matches the Scrapheap the same way and skips the file, but leaves the picture where it is: a file kept in a watch folder is offered again after every restart, so restoring would undo the owner's cleanup on each start.
 
+**A failed save leaves no file behind.** Every import path (upload, staging, watch folder, plugin and ComfyUI outputs) publishes a new picture's file before its row commits. `import_dedup_service.PublishedPictures` records those files and removes them, with their thumbnails, when the insert does not commit, so the next root scan does not index them as new, untagged pictures. A process that dies between the publish and the commit still leaves the file.
+
 **Frontend.** `fetchStagingStatus` surfaces the bucket; the arriving tile reads "Restored" with a Show link, and the completion headline says "Restored N pictures from the Scrapheap" rather than "All files were duplicates".
 
 ### 21.2 Tag-review decisions: confirm and reject are undoable

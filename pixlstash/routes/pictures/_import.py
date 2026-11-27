@@ -41,7 +41,11 @@ from pixlstash.db_models import (
 )
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
-from pixlstash.services import operation_log_service, scrapheap_service
+from pixlstash.services import (
+    import_dedup_service,
+    operation_log_service,
+    scrapheap_service,
+)
 from pixlstash.tasks import TaskType
 from pixlstash.tasks.picture_import_task import PictureImportTask
 from pixlstash.db_models.tag import (
@@ -1093,7 +1097,7 @@ def register_routes(router, server):
                 if new_pictures:
                     _mark_stage("persisting_new_pictures")
 
-                    def import_task(session):
+                    def import_task(session, published):
                         session.add_all(new_pictures)
                         session.flush()
                         for pic in new_pictures:
@@ -1101,11 +1105,17 @@ def register_routes(router, server):
                                 Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id)
                             )
                         session.commit()
+                        published.mark_committed()
                         for pic in new_pictures:
                             session.refresh(pic)
                         return new_pictures
 
-                    new_pictures = vault.db.run_task(import_task)
+                    with import_dedup_service.PublishedPictures(
+                        dest_folder, f"Import task {task_id}"
+                    ) as published:
+                        for pic in new_pictures:
+                            published.add(pic)
+                        new_pictures = vault.db.run_task(import_task, published)
                     logger.debug(
                         f"Queuing likeness calculation for {len(new_pictures)} new pictures."
                     )

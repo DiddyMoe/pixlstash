@@ -18,6 +18,7 @@ from pixlstash.db_models import (
     TAG_PENDING_SENTINEL,
 )
 from pixlstash.image_plugins.base import ImagePlugin
+from pixlstash.services import import_dedup_service
 from pixlstash.services.set_lock_service import drop_locked_set_ids
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.pixl_logging import get_logger
@@ -274,7 +275,7 @@ def _import_output_images(
             )
         )
 
-    def persist(session: Session):
+    def persist(session: Session, published: import_dedup_service.PublishedPictures):
         if not new_pictures:
             return []
         session.add_all(new_pictures)
@@ -282,12 +283,18 @@ def _import_output_images(
         for pic in new_pictures:
             session.add(Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id))
         session.commit()
+        published.mark_committed()
         for pic in new_pictures:
             session.refresh(pic)
         return new_pictures
 
     if new_pictures:
-        new_pictures = server.vault.db.run_task(persist)
+        with import_dedup_service.PublishedPictures(
+            server.vault.image_root, "Plugin output import"
+        ) as published:
+            for pic in new_pictures:
+                published.add(pic)
+            new_pictures = server.vault.db.run_task(persist, published)
 
         def mark_imported(session: Session, ids: list[int]):
             now = datetime.now(timezone.utc)

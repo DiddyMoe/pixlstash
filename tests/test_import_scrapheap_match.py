@@ -18,6 +18,7 @@ These tests pin both directions:
 * the buckets are disjoint and sum to the file total, on every path.
 """
 
+import contextlib
 import io
 import os
 import tempfile
@@ -38,6 +39,7 @@ from pixlstash.db_models import (
     PictureSetMember,
 )
 from pixlstash.event_types import EventType
+from pixlstash.image_plugins.service import _import_output_images
 from pixlstash.server import Server
 from pixlstash.services import import_dedup_service, scrapheap_service
 from pixlstash.services.comfyui_service import _import_comfyui_outputs
@@ -1479,3 +1481,92 @@ def test_a_duplicate_only_import_does_not_build_the_engine(owner_server, monkeyp
     assert status["duplicate_count"] == 1, status
     assert builds == []
     assert _picture_ids(srv) == ids
+
+
+# ---------------------------------------------------------------------------
+# A failed save leaves no file in the library
+# ---------------------------------------------------------------------------
+
+_IMPORTERS = ["upload", "staged", "watch", "plugin", "comfyui"]
+# The writer function that inserts each import path's new pictures.
+_INSERT_WRITERS = {"import_task", "insert_pictures", "persist"}
+
+
+def _import_by(importer, srv, client, tmp_path, data) -> None:
+    """Import *data* by one path; an insert failure may raise or fail the task."""
+    if importer == "upload":
+        _one_shot_import(client, [("test-upload.png", data)])
+    elif importer == "staged":
+        _staged_import_task(srv, tmp_path, "test-staged.png", data)._run_task()
+    elif importer == "watch":
+        _watch_folder_pass(srv, tmp_path, "test-watch.png", data)
+    elif importer == "plugin":
+        _import_output_images(srv, [(data, ".png")])
+    else:
+        fetched = tmp_path / "test-fetched.png"
+        fetched.write_bytes(data)
+        _import_comfyui_outputs(srv, [(str(fetched), ".png")])
+
+
+def _fail_in_the_insert(srv, monkeypatch, session_method: str) -> None:
+    """Make *session_method* raise inside every import's insert writer."""
+    real_run_task = srv.vault.db.run_task
+
+    def run_task(func, *args, **kwargs):
+        if getattr(func, "__name__", "") in _INSERT_WRITERS:
+            writer = func
+
+            def func(session, *inner_args, **inner_kwargs):
+                def fail(*_a, **_k):
+                    raise RuntimeError("test-insert-failure")
+
+                setattr(session, session_method, fail)
+                return writer(session, *inner_args, **inner_kwargs)
+
+        return real_run_task(func, *args, **kwargs)
+
+    monkeypatch.setattr(srv.vault.db, "run_task", run_task)
+
+
+def _library_files_with_bytes(srv, data: bytes) -> list[str]:
+    """Every file under the image root holding *data*, with a row or not."""
+    sha = ImageUtils.calculate_full_hash_from_bytes(data)
+    return [
+        os.path.join(dirpath, name)
+        for dirpath, _dirs, names in os.walk(srv.vault.image_root)
+        for name in names
+        if ImageUtils.calculate_full_hash_from_file_path(os.path.join(dirpath, name))
+        == sha
+    ]
+
+
+@pytest.mark.parametrize("importer", _IMPORTERS)
+def test_an_import_whose_insert_fails_leaves_no_file(
+    owner_server, monkeypatch, tmp_path, importer
+):
+    """Left in the image root without its row, the file is indexed by the next
+    root scan as a picture without the import's tags."""
+    srv, client = owner_server
+    data = _png_bytes((61, 62, 63))
+    _fail_in_the_insert(srv, monkeypatch, "commit")
+
+    with contextlib.suppress(RuntimeError):
+        _import_by(importer, srv, client, tmp_path, data)
+
+    assert _row_count(srv) == 0
+    assert _library_files_with_bytes(srv, data) == []
+
+
+@pytest.mark.parametrize("importer", ["upload", "watch", "plugin", "comfyui"])
+def test_a_committed_import_keeps_its_file_when_a_later_step_fails(
+    owner_server, monkeypatch, tmp_path, importer
+):
+    srv, client = owner_server
+    data = _png_bytes((64, 65, 66))
+    _fail_in_the_insert(srv, monkeypatch, "refresh")
+
+    with contextlib.suppress(RuntimeError):
+        _import_by(importer, srv, client, tmp_path, data)
+
+    (picture_id,) = _picture_ids(srv)
+    assert _library_files_with_bytes(srv, data) == [_vault_path(srv, picture_id)]

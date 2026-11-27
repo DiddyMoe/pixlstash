@@ -183,7 +183,11 @@ class WatchFolderImportTask(BaseTask):
         imported_ids = []
         if new_pictures:
 
-            def insert_pictures(session: Session, pictures: list[Picture]):
+            def insert_pictures(
+                session: Session,
+                pictures: list[Picture],
+                published: import_dedup_service.PublishedPictures,
+            ):
                 session.add_all(pictures)
                 session.flush()
                 exclusions = session_tag_exclusions(session)
@@ -206,15 +210,22 @@ class WatchFolderImportTask(BaseTask):
                         left_out,
                     )
                 session.commit()
+                published.mark_committed()
                 for pic in pictures:
                     session.refresh(pic)
                 return pictures
 
-            inserted = self._db.run_task(
-                insert_pictures,
-                new_pictures,
-                priority=DBPriority.IMMEDIATE,
-            )
+            with import_dedup_service.PublishedPictures(
+                self._db.image_root, "Watch-folder import"
+            ) as published:
+                for pic in new_pictures:
+                    published.add(pic)
+                inserted = self._db.run_task(
+                    insert_pictures,
+                    new_pictures,
+                    published,
+                    priority=DBPriority.IMMEDIATE,
+                )
 
             if stack_assignments:
 

@@ -92,6 +92,61 @@ def serialised_import() -> Iterator[None]:
         yield
 
 
+class PublishedPictures:
+    """The files one import published whose rows have not committed yet.
+
+    An import publishes each new picture's file into the library before the
+    insert of its row commits. Around the insert::
+
+        with PublishedPictures(image_root, "Watch-folder import") as published:
+            published.add(picture)
+            db.run_task(insert, published)  # insert calls mark_committed()
+
+    Leaving the block on an exception before :meth:`mark_committed` removes
+    every recorded file, which the next root scan would otherwise index as a
+    new picture without the import's tags. The writer calls
+    ``mark_committed`` right after its commit, so a failure after the commit
+    never removes the file of a saved row.
+    """
+
+    def __init__(self, image_root: str, label: str):
+        self._image_root = image_root
+        self._label = label
+        self._file_paths: list[str] = []
+        self._committed = False
+
+    def __enter__(self) -> "PublishedPictures":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc is not None and not self._committed and self._file_paths:
+            removed = sum(
+                ImageUtils.unpublish_picture(self._image_root, file_path)
+                for file_path in self._file_paths
+            )
+            logger.warning(
+                "%s: the insert of %d new picture(s) did not commit; removed "
+                "%d of their files: %s",
+                self._label,
+                len(self._file_paths),
+                removed,
+                exc,
+            )
+        return False
+
+    def add(self, picture: Picture) -> None:
+        """Record *picture*, whose file was just published.
+
+        Its path is read now: after a failed insert the session may have
+        detached the picture, and reading it then would raise.
+        """
+        self._file_paths.append(picture.file_path)
+
+    def mark_committed(self) -> None:
+        """The rows of every recorded picture are saved: keep their files."""
+        self._committed = True
+
+
 @dataclass(frozen=True)
 class ShaMatch:
     """An existing picture that already holds an incoming file's content.

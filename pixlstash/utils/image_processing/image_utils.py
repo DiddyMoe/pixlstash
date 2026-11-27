@@ -361,6 +361,35 @@ class ImageUtils:
         return removed
 
     @staticmethod
+    def unpublish_picture(image_root_path: str, file_path: str) -> bool:
+        """Remove the file and thumbnail published for a picture never saved.
+
+        Only for a file the caller published itself in this run: whatever is
+        at *file_path* (a picture's stored path) is removed. Failures are
+        logged, not raised, since the caller is already handling the error that
+        left the file without a row.
+
+        Returns:
+            True when nothing is left at *file_path*.
+        """
+        full_path = ImageUtils.resolve_picture_path(image_root_path, file_path)
+        removed = True
+        try:
+            os.remove(full_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.error(
+                "Could not remove %s, published for a picture that was never "
+                "saved; the next root scan will index it: %s",
+                full_path,
+                exc,
+            )
+            removed = False
+        ImageUtils.remove_thumbnail(image_root_path, file_path)
+        return removed
+
+    @staticmethod
     def write_thumbnail_bytes(
         image_root: Optional[str], file_path: Optional[str], thumbnail: bytes
     ) -> Optional[str]:
