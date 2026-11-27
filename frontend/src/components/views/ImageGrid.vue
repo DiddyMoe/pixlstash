@@ -1349,7 +1349,14 @@ import { useScopedNotice } from "../../composables/useScopedNotice";
 import { buildPurgeBadge } from "../../utils/retention.js";
 import { buildLockedDeleteMessage } from "../../utils/lockedDelete.js";
 import { buildLibraryMoveMessage } from "../../utils/libraryMove.js";
-import { writeThumbnailBatch } from "../../utils/thumbnailWriteback.js";
+import {
+  normalizedCharacterIds,
+  normalizedSetIds,
+} from "../../utils/viewQueryParams.js";
+import {
+  loadedSlotRuns,
+  writeThumbnailBatch,
+} from "../../utils/thumbnailWriteback.js";
 import {
   cutFaceSuggestions,
   referenceFaceCount,
@@ -1604,22 +1611,9 @@ const LIKENESS_GROUPS_SORT_KEY = "LIKENESS_GROUPS";
 // the track itself here.
 const THUMBNAIL_INFO_ROW_HEIGHT = 24;
 
-const normalizedSelectedSetIds = computed(() => {
-  const idsFromProp = Array.isArray(selectionStore.selectedSetIds)
-    ? selectionStore.selectedSetIds
-    : [];
-  const normalized = idsFromProp
-    .map((id) => Number(id))
-    .filter((id) => Number.isFinite(id) && id > 0);
-  if (normalized.length > 0) {
-    return Array.from(new Set(normalized));
-  }
-  const single = Number(selectionStore.selectedSet);
-  if (Number.isFinite(single) && single > 0) {
-    return [single];
-  }
-  return [];
-});
+const normalizedSelectedSetIds = computed(() =>
+  normalizedSetIds(selectionStore),
+);
 
 const hasSetSelection = computed(
   () => normalizedSelectedSetIds.value.length > 0,
@@ -1633,22 +1627,16 @@ const primarySelectedSetId = computed(() =>
     : null,
 );
 
-const normalizedSelectedCharacterIds = computed(() => {
-  const ids = Array.isArray(selectionStore.selectedCharacterIds)
-    ? selectionStore.selectedCharacterIds
-    : [];
-  return ids
-    .map((id) => Number(id))
-    .filter((id) => Number.isFinite(id) && id > 0)
-    .sort((a, b) => a - b);
-});
+const normalizedSelectedCharacterIds = computed(() =>
+  normalizedCharacterIds(selectionStore),
+);
 const isMultiCharacterView = computed(
   () => normalizedSelectedCharacterIds.value.length > 1,
 );
 
 // True when project membership is part of the grid query, i.e. when the view is
 // scoped to a project (or to the "unassigned project" pseudo-view). This mirrors
-// useGridFetch._appendSelectionParams, which appends `project_id` only in this
+// viewQueryParams.appendViewSelectionParams, which appends `project_id` only in this
 // mode; in the global mode nothing about the query depends on project
 // membership. Used to decide whether a project assignment can change what the
 // grid shows and therefore warrants a refetch.
@@ -5089,7 +5077,7 @@ async function handleSetProjectForSelected(payload) {
 
     // Project membership only scopes the grid query in the project view:
     // useGridFetch appends `project_id` exclusively when projectViewMode is
-    // "project" (_appendSelectionParams). In the global view (All Pictures and
+    // "project" (appendViewSelectionParams). In the global view (All Pictures and
     // every other non-project-scoped view) an assignment changes neither which
     // pictures match the query nor their sort position, and the card itself
     // renders no project data, so a refetch would only flicker the grid and
@@ -6017,13 +6005,16 @@ async function stopScrapheapRun() {
   if (message) noticeStore.error(message, { key: "scrapheap-run-stop" });
 }
 
-/** Clear the grid and read the heap again from the top. */
+/**
+ * Clear the selection and read the heap again. The cards stay until the
+ * re-read answers, so a run that left pictures behind (locked ones, protected
+ * originals, a Stop) never blanks the heap in between.
+ */
 function reloadScrapheapGrid() {
-  allGridImages.value = [];
   selectedImageIds.value = [];
   selectedFaceIds.value = [];
   lastSelectedImageId.value = null;
-  updateVisibleThumbnails();
+  preserveScrollOnNextFetch.value = true;
   fetchAllGridImages().then(() => {
     updateVisibleThumbnails();
   });
@@ -6496,6 +6487,7 @@ const {
   visibleStart,
   visibleEnd,
   rowHeight,
+  squareRowTop,
   renderStart,
   renderEnd,
   topSpacerHeight,
@@ -6952,6 +6944,7 @@ const {
   gridReady,
   lastFetchError,
   lastFetchSuccess,
+  loadFoldsStacks,
   smartScoreLoadingVisible,
   buildGridFetchKey,
   buildPictureIdsQueryParams,
@@ -6984,7 +6977,6 @@ const {
     normalizedSelectedSetIds,
     hasSetSelection,
     isSetOverlapView,
-    isMultiCharacterView,
     primarySelectedSetId,
     smartScoreProgress,
     exportProgress,
@@ -7162,6 +7154,7 @@ const {
     setStackReorderHoverSide,
     selectedImageIds,
     preserveScrollOnNextFetch,
+    loadFoldsStacks,
   },
   props,
   emit,
@@ -7768,6 +7761,7 @@ watch(
     () => filterStore.faceBboxFilter,
     () => filterStore.impossibleSources,
     () => filterStore.stackStateFilter,
+    () => filterStore.tagStateFilter,
     () => filterStore.sharedOnlyFilter,
     () => filterStore.importedFromFilter,
     () => filterStore.noCharacterFilter,
@@ -8457,7 +8451,10 @@ async function fetchThumbnailsBatch(start, end, meta = {}) {
         scheduleThumbnailRetry(row.id, slot, requestEpoch);
       }
     }
-    loadedRanges.value.push([start, end]);
+    // Only the slots that held a picture and still hold it count as loaded.
+    for (const run of loadedSlotRuns(allGridImages.value, gridImages, start)) {
+      loadedRanges.value.push(run);
+    }
     if (overlayNeedsRedraw) {
       triggerFaceOverlayRedraw();
     }
@@ -8948,29 +8945,10 @@ function updateDescriptionForImage(imageId, description) {
 watch(
   () => gridStore.thumbnailSize,
   () => {
-    // Recalculate visibleStart and visibleEnd after rowHeight update
+    // The virtualizer owns the row origin and calls updateVisibleThumbnails.
     nextTick(() => {
       updateRowHeightFromGrid();
-      if (isJustifiedMode.value) {
-        // Justified rows don't follow the uniform cols/rowHeight arithmetic
-        // below - let the virtualizer derive the range from the packed model.
-        recalculateVisibleRange();
-        return;
-      }
-      const el = scrollWrapper.value;
-      if (!el) return;
-      let cardHeight = rowHeight.value;
-      const scrollTop = el.scrollTop;
-      const cols = gridStore.columns;
-      // First visible row (may be partially visible)
-      const firstVisibleRow = scrollTop / cardHeight;
-      // Last visible row (may be partially visible)
-      const lastVisibleRow = (scrollTop + el.clientHeight - 1) / cardHeight;
-      const newVisibleStart = Math.floor(firstVisibleRow) * cols;
-      const newVisibleEnd = Math.ceil(lastVisibleRow) * cols;
-      visibleStart.value = newVisibleStart;
-      visibleEnd.value = newVisibleEnd;
-      updateVisibleThumbnails();
+      recalculateVisibleRange();
     });
   },
 );
@@ -9183,7 +9161,7 @@ function gridItemTopOffset(index) {
     return typeof top === "number" ? top : null;
   }
   const cols = Math.max(1, gridStore.columns || 1);
-  return Math.floor(index / cols) * rowHeight.value;
+  return squareRowTop(Math.floor(index / cols));
 }
 
 /**

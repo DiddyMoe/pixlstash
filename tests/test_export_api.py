@@ -18,7 +18,7 @@ from pixlstash.utils.service.export_utils import (
     _safe_archive_stem,
     _unique_export_stem,
 )
-from tests.utils import upload_pictures_and_wait
+from tests.utils import API_PREFIX, upload_pictures_and_wait
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
 
@@ -88,6 +88,36 @@ def test_pictures_export_produces_valid_zip():
 
         buf = BytesIO(resp.content)
         assert zipfile.is_zipfile(buf)
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_pictures_export_of_the_scrapheap_view_packs_the_heap():
+    """``only_deleted=true`` (what the Scrapheap view sends) exports the heap."""
+    temp_dir, client, server = _setup()
+    try:
+        _upload_picture(client, "Bad1.png")
+        gone = _upload_picture(client, "Bad2.png")
+        assert client.delete(f"/pictures/{gone}").status_code == 200
+
+        resp = client.get(
+            "/pictures/export",
+            params={
+                "only_deleted": "true",
+                "caption_mode": "none",
+                "use_original_file_names": "true",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        task_id = resp.json()["task_id"]
+        _wait_for_export(client, task_id)
+
+        resp = client.get(f"{API_PREFIX}/pictures/export/download/{task_id}")
+        assert resp.status_code == 200, resp.text
+        with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+            assert zf.namelist() == ["Bad2.png"]
     finally:
         server.close()
         temp_dir.cleanup()

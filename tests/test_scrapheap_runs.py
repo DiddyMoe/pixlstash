@@ -32,6 +32,7 @@ import gc
 import json
 import os
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -440,10 +441,10 @@ def test_a_purge_run_answers_at_once_and_empties_the_selection_in_low_slices(
 
     _work(captured)
 
-    assert slices == [
-        (ids[0:3], False, {"priority": DBPriority.LOW}),
-        (ids[3:6], False, {"priority": DBPriority.LOW}),
-        (ids[6:7], False, {"priority": DBPriority.LOW}),
+    assert [(chunk, protected, kw["priority"]) for chunk, protected, kw in slices] == [
+        (ids[0:3], False, DBPriority.LOW),
+        (ids[3:6], False, DBPriority.LOW),
+        (ids[6:7], False, DBPriority.LOW),
     ]
     ended = client.get(f"{RUNS_URL}/{run['id']}")
     assert ended.status_code == 200, ended.text
@@ -476,6 +477,121 @@ def test_the_whole_scrapheap_is_the_one_there_when_the_run_starts(env, captured)
     assert _get(client, run["id"])["deleted_count"] == 2
     assert _states(server, ids) == [None, None]
     assert _states(server, late) == ["heap"]
+
+
+def test_the_delete_preview_answers_while_the_writer_is_held(env):
+    """A long write on the DB writer (a purge, a restore) must not stall the preview."""
+    client, server = env
+    ids = _heap(server, 3)
+    started, release = threading.Event(), threading.Event()
+
+    def hold(_session):
+        started.set()
+        release.wait(30)
+
+    holder = threading.Thread(
+        target=server.vault.db.run_task,
+        args=(hold,),
+        kwargs={"priority": DBPriority.IMMEDIATE},
+        daemon=True,
+    )
+    holder.start()
+    assert started.wait(5), "the holding task never got the writer"
+    answer = {}
+    caller = threading.Thread(
+        target=lambda: answer.update(
+            response=client.post(PREVIEW_URL, json={"ids": ids})
+        ),
+        daemon=True,
+    )
+    try:
+        caller.start()
+        caller.join(5)
+        assert not caller.is_alive(), "the preview waited behind the writer"
+    finally:
+        release.set()
+        holder.join(10)
+        caller.join(10)
+
+    response = answer["response"]
+    assert response.status_code == 200, response.text
+    assert response.json()["total_count"] == 3
+
+
+def test_delete_forever_spares_a_picture_binned_after_the_preview(env):
+    """The dialog's count is what Delete forever may destroy."""
+    client, server = env
+    ids = _heap(server, 2)
+    token = _token(client, None)
+    late = _heap(server, 1)
+
+    response = client.request(
+        "DELETE", f"{API}/pictures/scrapheap", json={"confirm_token": token}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["deleted_count"] == 2
+    assert _states(server, ids) == [None, None]
+    assert _states(server, late) == ["heap"]
+
+
+def test_a_purge_run_spares_a_picture_binned_after_the_preview(env, captured):
+    """A run started with the token is bound by the same preview."""
+    client, server = env
+    ids = _heap(server, 2)
+    token = _token(client, None)
+    late = _heap(server, 1)
+
+    response = client.post(RUNS_URL, json={"kind": "purge", "confirm_token": token})
+    assert response.status_code == 202, response.text
+    assert response.json()["total"] == 2
+    _work(captured)
+
+    assert _get(client, response.json()["id"])["deleted_count"] == 2
+    assert _states(server, ids) == [None, None]
+    assert _states(server, late) == ["heap"]
+
+
+def test_empty_run_spares_a_picture_binned_after_it_started(env, captured, monkeypatch):
+    """Each slice applies the bound again: a picture restored and binned again
+    between two slices was not in the dialog, though its id is in the run."""
+    client, server = env
+    monkeypatch.setattr(ScrapheapRunTask, "SLICE_PICTURES", 1)
+    ids = _heap(server, 2)
+    run = _purge(client, ids)
+    answers = []
+
+    def rebin_once(_task, processed):
+        if processed == 1:
+            answers.append(client.post(RESTORE_URL, json={"picture_ids": ids[1:]}))
+            answers.append(client.delete(f"{API}/pictures/{ids[1]}"))
+
+    _between_slices(monkeypatch, run["id"], rebin_once)
+    _work(captured)
+
+    assert [answer.status_code for answer in answers] == [200, 200]
+    ended = _get(client, run["id"])
+    assert (ended["status"], ended["deleted_count"]) == ("complete", 1)
+    assert _states(server, ids) == [None, "heap"]
+
+
+def test_an_undo_that_bins_a_picture_after_the_preview_leaves_it_alone(env, captured):
+    """Undoing a restore bins the picture now, so the earlier preview misses it."""
+    client, server = env
+    ids = _heap(server, 2)
+    rescued = client.post(RESTORE_URL, json={"picture_ids": ids[1:]})
+    assert rescued.status_code == 200, rescued.text
+    token = _token(client, None)
+    undo = client.post(UNDO_URL)
+    assert undo.status_code == 200, undo.text
+    assert _states(server, ids) == ["heap", "heap"]
+
+    response = client.post(RUNS_URL, json={"kind": "purge", "confirm_token": token})
+    assert response.status_code == 202, response.text
+    _work(captured)
+
+    assert _get(client, response.json()["id"])["deleted_count"] == 1
+    assert _states(server, ids) == [None, "heap"]
 
 
 def test_a_purge_run_needs_the_previews_token_for_that_selection(env, captured):

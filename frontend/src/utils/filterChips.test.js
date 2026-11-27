@@ -127,6 +127,14 @@ describe("filterChips", () => {
     expect(chipText(s)).toEqual(["Stacks unresolved"]);
   });
 
+  it("names the Untagged state the stats rail set, and its x clears it", () => {
+    const s = useFilterStore();
+    s.tagStateFilter = "unprocessable";
+    expect(chipText(s)).toEqual(["Untagged couldn't be read"]);
+    filterChips(s)[0].remove();
+    expect(s.tagStateFilter).toBe(null);
+  });
+
   it("hides No character and In no set outside All Pictures", () => {
     const s = useFilterStore();
     s.noCharacterFilter = true;

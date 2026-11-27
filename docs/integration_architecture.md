@@ -2251,6 +2251,25 @@ from tagging* in §9 of the backend document.
 ---
 
 
+### 2.13 Why a picture is untagged
+
+**`GET /pictures/stats` explains its `untagged`.** The response carries
+`untagged_breakdown: {pending, unprocessable, none}`, which sums to `untagged`:
+
+| Key | The picture | Filter value |
+|---|---|---|
+| `pending` | is waiting for the tagger, which will take it up | `tag_state=pending` |
+| `unprocessable` | is a file the tagger could not read | `tag_state=unprocessable` |
+| `none` | was tagged and nothing applied, its tags were removed, or the tagger will not act on it | `tag_state=none` |
+
+`tag_state` narrows every figure of the stats response to that set; any other
+value is **422**. `StatsSidebar.vue` writes it from
+`useFilterStore.tagStateFilter`. `GET /pictures`, `/pictures/stream` and
+`/pictures/count` take the same `tag_state` and list exactly the pictures the
+breakdown counts under it, `character_id=UNASSIGNED` and `inbox` included, and
+`useGridFetch` sends it, so a row narrows the grid and the rail together.
+`GET /pictures/search` and `/pictures/likeness-groups` do not take it.
+
 ## 3. API Client ([apiClient.js](../frontend/src/utils/apiClient.js))
 
 Single shared **axios** instance with:
@@ -2971,8 +2990,10 @@ forever on a selection, Restore all and Restore on a selection. A purge at about
 0.7 ms a picture held the writer past the 60 s timeout on a 50,000-picture heap.
 The body is `{kind: "purge" | "restore", picture_ids?, include_protected,
 confirm_token}` (unknown fields are 422). An omitted `picture_ids` means the
-whole heap **as it is when the run starts**, so a picture scrapheaped after the
-confirm is not destroyed by it. A purge requires the `confirm_token` that
+whole heap **as it is when the run starts**. A purge, run or `DELETE`, destroys
+only pictures binned by the time the confirming preview read the heap (the
+token's `deleted_before`, applied again by each slice), so a picture binned
+after the preview is not destroyed by it. A purge requires the `confirm_token` that
 `POST /pictures/scrapheap/delete-preview` minted for the same selection, with the
 same refusals as `DELETE /pictures/scrapheap`: 400 when it is missing, and 409
 when it is spent, expired or for another selection. The token is spent even if

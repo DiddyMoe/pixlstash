@@ -9,6 +9,7 @@ import { useDedupStore } from "../stores/useDedupStore.js";
 import { useProjectStore } from "../stores/useProjectStore.js";
 import { useGridFetch } from "./useGridFetch.js";
 import { useSearchStore } from "../stores/useSearchStore.js";
+import { SCRAPHEAP_PICTURES_ID } from "../stores/useViewStore";
 import { filterChips } from "../utils/filterChips.js";
 import { notifySessionReset, sessionContext } from "../utils/apiClient";
 import {
@@ -214,6 +215,29 @@ describe("useGridFetch streaming path", () => {
     expect(countQuery).toContain("reference_character_id=7");
   });
 
+  it("tells the stack fold to keep every row of the Scrapheap, and fold a person's", async () => {
+    getPictureCount.mockResolvedValue({ count: 2 });
+    streamPictures.mockResolvedValue({
+      pictures: [
+        { id: 1, stack_id: 7 },
+        { id: 2, stack_id: 7 },
+      ],
+      done: true,
+      next_offset: 2,
+    });
+    const { grid } = makeHarness();
+    const selection = useSelectionStore();
+
+    selection.selectedCharacter = String(SCRAPHEAP_PICTURES_ID);
+    await grid.fetchAllGridImages({ force: true });
+    expect(streamPictures.mock.calls[0][0]).toContain("only_deleted=true");
+    expect(grid.loadFoldsStacks.value).toBe(false);
+
+    selection.selectedCharacter = "7";
+    await grid.fetchAllGridImages({ force: true });
+    expect(grid.loadFoldsStacks.value).toBe(true);
+  });
+
   it("issues a singleton character fetch while a duplicate scan is running", async () => {
     getPictureCount.mockResolvedValue({ count: 1 });
     streamPictures.mockResolvedValue({
@@ -314,6 +338,19 @@ describe("useGridFetch streaming path", () => {
     expect(getPictureCount.mock.calls[0][0]).toContain(
       "stack_state=unresolved",
     );
+  });
+
+  it("sends tag_state on the stream and count requests when an Untagged row is on", async () => {
+    getPictureCount.mockResolvedValue({ count: 1 });
+    streamPictures.mockResolvedValue({ pictures: [{ id: 41 }] });
+
+    const { grid } = makeHarness();
+    useFilterStore().tagStateFilter = "none";
+
+    await grid.fetchAllGridImages({ force: true });
+
+    expect(streamPictures.mock.calls[0][0]).toContain("tag_state=none");
+    expect(getPictureCount.mock.calls[0][0]).toContain("tag_state=none");
   });
 
   // *Show all N pictures* on a workflow card (F7). The chip is set on one

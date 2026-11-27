@@ -51,6 +51,7 @@ from pixlstash.utils.query.predicate_filter import (
     PredicateFilter,
     inbox_cutoff,
     is_truthy_flag,
+    parse_tag_state,
 )
 
 from ._helpers import (
@@ -782,6 +783,15 @@ def select_pictures_for_listing(
         # so every ``**query_params`` site gets it; the branches that name each
         # filter instead pass it explicitly.
         query_params["workflow_structural_hashes"] = workflow_structural_hashes
+    tag_state = parse_tag_state(query_params.pop("tag_state", None))
+    unprocessable_ids: frozenset[int] = frozenset()
+    if tag_state is not None:
+        unprocessable_ids = frozenset(
+            server.vault.db.unprocessable_images.active_suppressed_ids()
+        )
+        # Back into ``query_params`` for the ``**query_params`` sites, as above.
+        query_params["tag_state"] = tag_state
+        query_params["unprocessable_ids"] = unprocessable_ids
     shared_only = bool(query_params.pop("shared_only", False))
     query_params.pop(
         "guest_session_id", None
@@ -1023,6 +1033,7 @@ def select_pictures_for_listing(
                 and not impossible_sources_value
                 and not import_source_folder_value
                 and imported_since_value is None
+                and tag_state is None
             ):
                 return None
             query = select(Picture.id).where(
@@ -1077,6 +1088,8 @@ def select_pictures_for_listing(
             impossible_sources=impossible_sources_value,
             import_source_folder=import_source_folder_value,
             imported_since=imported_since_value,
+            tag_state=tag_state,
+            unprocessable_ids=unprocessable_ids,
             apply_deleted_filter=False,
         ).apply(query)
 
@@ -1253,6 +1266,8 @@ def select_pictures_for_listing(
                 comfyui_models_filter=query_params.get("comfyui_models_filter"),
                 comfyui_loras_filter=query_params.get("comfyui_loras_filter"),
                 workflow_structural_hashes=workflow_structural_hashes,
+                tag_state=tag_state,
+                unprocessable_ids=unprocessable_ids,
                 picture_ids=(
                     [int(i) for i in query_params["id"] if str(i).isdigit()]
                     if query_params.get("id")
@@ -1296,6 +1311,8 @@ def select_pictures_for_listing(
             comfyui_models_filter=query_params.get("comfyui_models_filter"),
             comfyui_loras_filter=query_params.get("comfyui_loras_filter"),
             workflow_structural_hashes=workflow_structural_hashes,
+            tag_state=tag_state,
+            unprocessable_ids=unprocessable_ids,
             picture_ids=(
                 [int(i) for i in query_params["id"] if str(i).isdigit()]
                 if query_params.get("id")

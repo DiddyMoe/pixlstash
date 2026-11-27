@@ -20,7 +20,9 @@ from pixlstash.tagger_plugins.pixlstash_tagger import (
 )
 from pixlstash.task_runner import TaskRunner
 from pixlstash.tasks.base_task import TaskStatus
+from pixlstash.tasks.missing_tag_finder import MissingTagFinder
 from pixlstash.tasks.tag_task import TagTask
+from pixlstash.tasks.task_outcome import RetryHold
 
 
 def test_centre_crop_whitelist_excludes_face_tags():
@@ -1391,6 +1393,7 @@ class _FailingPlugin:
     """A third-party tagger whose `init` raises *error*."""
 
     name = "test-failing-tagger"
+    supports_tags = True
 
     def __init__(self, error):
         self.error = error
@@ -1436,20 +1439,45 @@ def test_a_pixlstash_tagger_that_will_not_load_raises(monkeypatch):
         workflow.ensure_active_plugin_ready()
 
 
-def test_a_plugin_missing_a_module_is_left_to_the_tagging_pass(monkeypatch, caplog):
-    """A missing package never appears on a retry: `tag_images` clears those
-    pictures, so failing the task here would only queue them forever."""
-    error = ModuleNotFoundError(
+def _missing_module():
+    return ModuleNotFoundError(
         "No module named 'test_missing_package'", name="test_missing_package"
     )
+
+
+def test_a_plugin_missing_a_module_fails_the_load(monkeypatch):
+    """Swallowed here, the tagging pass cleared the pictures without tags."""
     workflow = _plugin_workflow(
-        monkeypatch, [_FailingPlugin(error)], _FailingPlugin.name
+        monkeypatch, [_FailingPlugin(_missing_module())], _FailingPlugin.name
     )
 
-    with caplog.at_level("WARNING"):
+    with pytest.raises(ModuleNotFoundError):
         workflow.ensure_active_plugin_ready()
 
-    assert "test_missing_package" in caplog.text
+
+@pytest.mark.parametrize(
+    "active, plugins, raised",
+    [
+        ("pixlstash_tagger", [], RuntimeError),
+        ("test-missing-tagger", [], LookupError),
+        (_FailingPlugin.name, [_FailingPlugin(_missing_module())], ModuleNotFoundError),
+        (
+            _FailingPlugin.name,
+            [_FailingPlugin(RuntimeError("test-plugin-init-failure"))],
+            RuntimeError,
+        ),
+    ],
+)
+def test_a_tagger_that_cannot_tag_fails_the_tagging_pass(
+    monkeypatch, active, plugins, raised
+):
+    """An empty answer is not a failure: ``{}`` finishes the task as a success
+    with nothing written, and an empty list per path removes each sentinel,
+    which marks the picture tagged with nothing for good."""
+    workflow = _plugin_workflow(monkeypatch, plugins, active)
+
+    with pytest.raises(raised):
+        workflow.tag_images(["test-picture.png"])
 
 
 def test_any_other_plugin_load_error_reaches_the_task(monkeypatch):
@@ -1490,3 +1518,33 @@ def test_is_active_plugin_loaded_asks_the_model_that_would_run(
     )
 
     assert workflow.is_active_plugin_loaded(engine_override) is expected
+
+
+def test_the_tag_finder_waits_out_a_failed_load():
+    """A failed task keeps every sentinel; without a hold the next sweep
+    builds the same batch and loads the broken tagger again at once."""
+    now = [0.0]
+    rows = [SimpleNamespace(id=1, width=64, height=64, tags=[])]
+    database = SimpleNamespace(
+        unprocessable_images=SimpleNamespace(
+            active_suppressed_ids=set, is_suppressed=lambda _pid: False
+        ),
+        tag_resets=SimpleNamespace(current=lambda: 0),
+        run_immediate_read_task=lambda fn, *args: rows,
+    )
+    engine = SimpleNamespace(
+        tagger_settings={"active_tag_plugin": "pixlstash_tagger"},
+        tagging_workflow=SimpleNamespace(suggested_task_size=lambda: 8),
+    )
+    finder = MissingTagFinder(
+        database,
+        lambda: engine,
+        backend_hold=RetryHold(cap_s=60.0, clock=lambda: now[0], rng=lambda: 0.0),
+    )
+
+    failed = finder.find_task()
+    finder.on_task_complete(failed, RuntimeError("test-tagger-load-failure"))
+
+    assert finder.find_task() is None
+    now[0] += 60.0
+    assert finder.find_task().params["picture_ids"] == [1]

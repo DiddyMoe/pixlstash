@@ -1,0 +1,1 @@
+- Fixed: the Delete forever dialog no longer waits for other work to finish.

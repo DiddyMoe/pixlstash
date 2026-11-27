@@ -1587,7 +1587,7 @@ def test_scrapheap_move_is_recorded_and_undo_brings_the_picture_back(client, ser
     assert operation["origin_client_id"] == "tab-1"
 
     # The recorded facet is the soft-delete state itself, retention stamp
-    # included, so undo restores the deadline rather than inventing one.
+    # included, for History to show; an undo or redo does not read it back.
     detail = client.get(f"{API}/operations/{operation['id']}").json()
     assert detail["before"][str(picture_id)]["deleted"] == {
         "deleted": False,
@@ -1603,12 +1603,16 @@ def test_scrapheap_move_is_recorded_and_undo_brings_the_picture_back(client, ser
     assert _lifecycle(server, picture_id) == (False, None)
     assert _visible(client, picture_id) is True
 
-    # Redo puts it back in the Scrapheap, with the SAME retention stamp.
+    # Redo puts it back in the Scrapheap stamped now, not with the old stamp:
+    # the stamp is also a delete-forever's consent bound, and a preview read
+    # while the picture was out must not cover it.
     redo = client.post(f"{API}/operations/redo")
     assert redo.status_code == 200, redo.text
     assert redo.json()["scrapheaped_picture_ids"] == [picture_id]
     assert redo.json()["restored_picture_ids"] == []
-    assert _lifecycle(server, picture_id) == (True, deleted_at)
+    redone, restamped = _lifecycle(server, picture_id)
+    assert redone is True
+    assert restamped > deleted_at
     assert _visible(client, picture_id) is False
 
 
@@ -1727,12 +1731,15 @@ def test_restore_from_the_scrapheap_is_recorded_symmetrically(client, server):
     assert restore_op["batch_id"]
     assert restore_op["summary"] == "Restored 2 pictures from the Scrapheap"
 
-    # Undoing the restore is a re-scrapheap, stamp and all.
+    # Undoing the restore is a re-scrapheap, stamped at the undo rather than
+    # with the old stamp: the stamp is also a delete-forever's consent bound.
     undo = client.post(f"{API}/operations/undo")
     assert undo.status_code == 200, undo.text
     assert sorted(undo.json()["scrapheaped_picture_ids"]) == sorted(ids)
     for pid in ids:
-        assert _lifecycle(server, pid) == (True, stamps[pid])
+        rebinned, restamped = _lifecycle(server, pid)
+        assert rebinned is True
+        assert restamped > stamps[pid]
 
     # And redoing it restores them again.
     assert client.post(f"{API}/operations/redo").status_code == 200

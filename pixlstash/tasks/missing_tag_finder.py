@@ -5,35 +5,60 @@ from sqlalchemy.orm import selectinload
 
 from pixlstash.db_models import (
     Picture,
-    Tag,
-    TAG_PENDING_SENTINEL,
     is_tag_sentinel,
     parse_tag_engine_from_sentinel,
 )
-from pixlstash.services.set_lock_service import locked_picture_id_subquery
-from pixlstash.utils.sql_chunking import not_in_json
+from pixlstash.pixl_logging import get_logger
+from pixlstash.task_runner import TaskCancelledError
+from pixlstash.utils.query.predicate_filter import awaiting_tagger_clauses
 from pixlstash.worker_config import IMAGE_TASK_PIXEL_BUDGET, TAGGER_MAX_INFLIGHT
+from .base_task import TaskStatus
 from .base_task_finder import BaseTaskFinder
-from .tag_task import TagTask, taggable_picture_clauses
+from .tag_task import TagTask
+from .task_outcome import RetryHold
 
-# Every sentinel value starts with TAG_PENDING_SENTINEL (``__tag`` or
-# ``__tag:<engine>``), so the half-open range [``__tag``, ``__tah``) is the
-# sentinel set. Written as a range rather than the LIKE pattern because SQLite
-# cannot serve LIKE ... ESCAPE from an index: this form walks ``ix_tag_tag``.
-_SENTINEL_RANGE_END = TAG_PENDING_SENTINEL[:-1] + chr(ord(TAG_PENDING_SENTINEL[-1]) + 1)
+logger = get_logger(__name__)
 
 
 class MissingTagFinder(BaseTaskFinder):
-    """Find a batch of pictures with a pending-retag sentinel and create a TagTask."""
+    """Find a batch of pictures with a pending-retag sentinel and create a TagTask.
+
+    A task that fails outright, such as one whose tagger did not load, leaves
+    every picture's sentinel, so the next sweep would build the same batch and
+    load the tagger again at once. Such a failure holds the finder back on
+    :class:`RetryHold`, capped at :attr:`BACKEND_HOLD_CAP_S`; the next batch
+    after the hold is the probe, and a task that ends without error clears it.
+    A cancelled task holds nothing. In memory: a restart retries at once.
+    """
+
+    #: The backend hold's only key.
+    _BACKEND = "backend"
+    #: Longest wait between two attempts after a failed task, seconds.
+    BACKEND_HOLD_CAP_S = 60.0
 
     def __init__(
         self,
         database,
         engine_getter: Callable,
+        *,
+        backend_hold: RetryHold | None = None,
     ):
+        """
+        Args:
+            database: The vault database.
+            engine_getter: Returns the inference engine, or ``None`` while
+                there is none.
+            backend_hold: Backoff after a task fails outright; a default one
+                capped at :attr:`BACKEND_HOLD_CAP_S` when omitted.
+        """
         super().__init__()
         self._db = database
         self._engine_getter = engine_getter
+        self._backend_hold = (
+            backend_hold
+            if backend_hold is not None
+            else RetryHold(cap_s=self.BACKEND_HOLD_CAP_S)
+        )
 
     def finder_name(self) -> str:
         return "MissingTagFinder"
@@ -55,6 +80,8 @@ class MissingTagFinder(BaseTaskFinder):
         tagger_settings = getattr(engine, "tagger_settings", None)
         active_tag_plugin = (tagger_settings or {}).get("active_tag_plugin")
         if not active_tag_plugin:
+            return None
+        if self._BACKEND in self._backend_hold.active():
             return None
 
         batch_limit = max(
@@ -115,13 +142,45 @@ class MissingTagFinder(BaseTaskFinder):
             reset_generation=reset_generation,
         )
 
+    def on_task_complete(self, task, error) -> None:
+        """Hold the finder back if *task* failed, then release the batch.
+
+        The hold is recorded before the claims are released: the planner may
+        run ``find_task`` the moment a claim is let go, and a batch built
+        before the hold exists would load the failing tagger straight away.
+        """
+        try:
+            self._settle_backend(task, error)
+        finally:
+            super().on_task_complete(task, error)
+
+    def _settle_backend(self, task, error) -> None:
+        """Hold or clear the backend hold from how *task* ended."""
+        if isinstance(error, TaskCancelledError) or (
+            error is None and getattr(task, "status", None) == TaskStatus.CANCELLED
+        ):
+            # Stopped, or cancelled before it started (which reports no
+            # error, only its status): nothing was learnt about the tagger.
+            return
+        if error is None:
+            self._backend_hold.clear(self._BACKEND)
+            return
+        # Up to TAGGER_MAX_INFLIGHT tasks fail together when the tagger
+        # cannot load; only the first of them lengthens the hold.
+        if self._BACKEND in self._backend_hold.active():
+            return
+        wait = self._backend_hold.hold(self._BACKEND)
+        logger.warning(
+            "MissingTagFinder: a tagging task failed: %s. No new batch for "
+            "%.0f s; its pictures keep their place in the queue.",
+            error,
+            wait,
+        )
+
     @staticmethod
     def _fetch_missing_tags(
         session: Session, limit: int, suppressed_ids: Collection[int] = frozenset()
     ):
-        pending = select(Tag.picture_id).where(
-            Tag.tag >= TAG_PENDING_SENTINEL, Tag.tag < _SENTINEL_RANGE_END
-        )
         # Per-row stage dependency: tag a picture once ITS faces are known, not
         # once the whole face stage has drained. Face extraction always writes
         # at least one Face row (a ``face_index=-1`` sentinel when there is no
@@ -133,33 +192,11 @@ class MissingTagFinder(BaseTaskFinder):
         # The wait is bounded because `MissingFaceExtractionFinder` selects on
         # the exact complement, `~Picture.faces.any()`: a picture with no row
         # is by definition still face-stage work, so a cancelled or failed
-        # batch is re-offered rather than stranded. The one predicate the two
-        # finders did not share was the suppressed set, which is why it is
-        # applied above.
+        # batch is re-offered rather than stranded.
         faces_known = Picture.faces.any()
-        # A picture frozen by a locked set keeps its confirmed tags: never re-queue
-        # it for tagging (the write-side skip in TagTask is the belt; this is the
-        # braces, and it avoids re-queuing a locked picture that still carries a
-        # stray retag sentinel on every finder pass).
-        #
-        # Must be the shared set_lock_service predicate, not a local
-        # PictureSetMember join. The local join had no stack arm, while TagTask's
-        # write guard (`locked_picture_ids`) does: a picture merely *sharing a
-        # stack* with a locked-set member was therefore selected here, ran full
-        # GPU tagging, had its write skipped, kept its retag sentinel, and was
-        # selected again on the very next sweep - an unbounded inference loop.
-        # One definition on both sides is what closes it.
-        locked_member = ~Picture.id.in_(locked_picture_id_subquery())
-        # `taggable_picture_clauses` is the predicate `TagTask.count_missing_tags`
-        # applies, imported rather than repeated: the two disagreed (#1206 item
-        # 3), so the "awaiting tagging" number excluded scrapheaped pictures
-        # while this query kept selecting them and spending the GPU on them.
         stmt = select(Picture).where(
-            Picture.id.in_(pending),
+            *awaiting_tagger_clauses(suppressed_ids),
             faces_known,
-            locked_member,
-            *taggable_picture_clauses(),
-            not_in_json(Picture.id, suppressed_ids),
         )
         return session.exec(
             stmt.options(

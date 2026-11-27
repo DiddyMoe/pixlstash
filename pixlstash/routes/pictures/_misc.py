@@ -55,12 +55,14 @@ from pixlstash.utils.service.filter_helpers import (
     collect_set_filter_ids,
     fetch_scope_allowed_picture_ids,
     fetch_set_candidate_ids,
+    is_scrapheap_view_id,
     narrow_picture_project_ids,
     normalize_set_mode,
     project_membership_exists_clause,
     project_unassigned_clause,
+    request_targets_scrapheap,
 )
-from pixlstash.utils.query.predicate_filter import PredicateFilter
+from pixlstash.utils.query.predicate_filter import PredicateFilter, parse_tag_state
 
 from ._helpers import (
     _face_cluster_ids,
@@ -113,6 +115,8 @@ class PictureStatsResponse(BaseModel):
     total_tags: Optional[int] = None
     tagged: Optional[int] = None
     untagged: Optional[int] = None
+    # Why the untagged pictures have no tags: the counts per ``tag_state``.
+    untagged_breakdown: Optional[dict[str, int]] = None
     avg_tags_per_image: Optional[float] = None
     top_tags: Optional[list] = None
     top_cooccurrences: Optional[list] = None
@@ -543,7 +547,9 @@ def register_routes(router, server):
         favourite: bool = Query(False),
     ):
         candidate_ids = None
-        only_deleted = character_id == "SCRAPHEAP"
+        only_deleted = request_targets_scrapheap(request.query_params)
+        if is_scrapheap_view_id(character_id):
+            character_id = None
         set_filter_ids = collect_set_filter_ids(
             set_id_value=set_id,
             set_ids_values=set_ids,
@@ -591,19 +597,6 @@ def register_routes(router, server):
                 )
             elif character_id == "ALL" or character_id == "":
                 candidate_ids = None
-            elif character_id == "SCRAPHEAP":
-
-                def fetch_deleted_ids(session):
-                    rows = session.exec(
-                        select(Picture.id).where(
-                            Picture.deleted.is_(True),
-                        )
-                    ).all()
-                    return list(rows)
-
-                candidate_ids = set(
-                    server.vault.db.run_immediate_read_task(fetch_deleted_ids)
-                )
             elif character_id.isdigit():
 
                 def fetch_character_ids(session, character_id):
@@ -1259,8 +1252,8 @@ def register_routes(router, server):
         confidence_below = _predicate_filter.tags_confidence_below_filter or []
         include = set(request.query_params.getlist("include"))
 
-        only_deleted = character_id_raw == "SCRAPHEAP"
-        if only_deleted:
+        only_deleted = request_targets_scrapheap(request.query_params)
+        if is_scrapheap_view_id(character_id_raw):
             character_id_raw = None
         # The Inbox is the unassigned view narrowed to its period, as the
         # listing reads it (`select_pictures_for_listing`).
@@ -1314,6 +1307,10 @@ def register_routes(router, server):
             rejected_tags=rejected_tags,
             face_filter=face_filter,
             stack_state=stack_state,
+            tag_state=parse_tag_state(request.query_params.get("tag_state")),
+            unprocessable_ids=frozenset(
+                server.vault.db.unprocessable_images.active_suppressed_ids()
+            ),
             confidence_tag=confidence_tag,
             confidence_above=confidence_above,
             confidence_below=confidence_below,

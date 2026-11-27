@@ -22,10 +22,12 @@ from pixlstash.utils.service.filter_helpers import (
     collect_set_filter_ids,
     fetch_scope_allowed_picture_ids,
     fetch_set_candidate_ids,
+    is_scrapheap_view_id,
     narrow_picture_project_ids,
     normalize_set_mode,
     project_membership_exists_clause,
     project_unassigned_clause,
+    request_targets_scrapheap,
 )
 from pixlstash.utils.query.predicate_filter import PredicateFilter
 from pixlstash.utils.service.scope_table import scope_id_subquery
@@ -130,7 +132,9 @@ def register_routes(router, server):
                 status_code=400, detail="Query parameter is required for search"
             )
 
-        only_deleted = character_id == "SCRAPHEAP"
+        only_deleted = request_targets_scrapheap(request.query_params)
+        if is_scrapheap_view_id(character_id):
+            character_id = None
         candidate_ids = None
         sort_mech = None
         normalized_set_mode = normalize_set_mode(set_mode)
@@ -201,8 +205,6 @@ def register_routes(router, server):
                     server.vault.db.run_immediate_read_task(fetch_unassigned_ids)
                 )
             elif character_id in ("ALL", ""):
-                candidate_ids = None
-            elif character_id == "SCRAPHEAP":
                 candidate_ids = None
             elif str(character_id).isdigit():
 

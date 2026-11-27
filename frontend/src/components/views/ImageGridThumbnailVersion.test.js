@@ -22,10 +22,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import { setActivePinia, createPinia } from "pinia";
-import { ref } from "vue";
+import { ref, nextTick } from "vue";
 import { useSelectionStore } from "../../stores/useSelectionStore.js";
 import { useProjectStore } from "../../stores/useProjectStore.js";
 import { useSortStore } from "../../stores/useSortStore.js";
+import { useGridStore } from "../../stores/useGridStore.js";
 
 const apiGet = vi.fn();
 const apiPost = vi.fn();
@@ -273,6 +274,48 @@ describe("ImageGrid - the server owns the thumbnail URL", () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(thumbnailPostCount).toBe(1);
+    wrapper.unmount();
+  });
+});
+
+/**
+ * Give the scroll wrapper the geometry jsdom does not lay out. Each value is a
+ * getter, so it can follow a row pitch that changes on the way.
+ */
+function placeViewport(el, { scrollTop, clientHeight }) {
+  Object.defineProperty(el, "scrollTop", {
+    configurable: true,
+    get: scrollTop,
+    set: () => {},
+  });
+  Object.defineProperty(el, "clientHeight", {
+    configurable: true,
+    get: clientHeight,
+  });
+}
+
+describe("ImageGrid - a thumbnail resize in the square grid", () => {
+  it("leaves the visible range where the virtualizer puts it after a thumbnail resize", async () => {
+    const wrapper = mountGrid();
+    await nextTick();
+    const vm = wrapper.vm;
+    const cols = useGridStore().columns;
+    const before = vm.rowHeight;
+    // Half a pixel past two pitches from the very top: still inside row 1,
+    // whose top sits one spacer and one row-gap below `1 * pitch`.
+    placeViewport(vm.scrollWrapper, {
+      scrollTop: () => 2 * vm.rowHeight + 0.5,
+      clientHeight: () => vm.rowHeight,
+    });
+
+    useGridStore().thumbnailSize += 32;
+    await nextTick();
+    await nextTick();
+    await nextTick();
+
+    expect(vm.rowHeight).not.toBe(before);
+    expect(vm.visibleStart).toBe(cols);
+    expect(vm.visibleEnd).toBe(3 * cols);
     wrapper.unmount();
   });
 });

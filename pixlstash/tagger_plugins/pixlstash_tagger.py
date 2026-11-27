@@ -55,6 +55,22 @@ PIXLSTASH_TAGGER_REVISION = "cba5e8ab3674714018b204f09700d4b25441d128"
 PIXLSTASH_TAGGER_DEFAULT_THRESHOLD = 0.50
 PIXLSTASH_TAGGER_LABEL_THRESHOLD_BIAS = 0.0
 
+
+class TaggerUnavailableError(RuntimeError):
+    """The PixlStash tagger cannot tag now: its load failed.
+
+    Raised rather than answered with no tags: a task that ends without error
+    tells its finder the tagger works, and the finder queues the same pictures
+    again at once.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The PixlStash tagger could not be loaded; its warning in the log "
+            "gives the cause."
+        )
+
+
 # Tags that require close-up face crops to detect reliably at full-image resolution.
 # These are collected from face-crop passes and merged into the picture's flat tag list.
 QUALITY_CROP_TAG_WHITELIST = frozenset(

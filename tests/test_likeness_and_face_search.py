@@ -1418,6 +1418,59 @@ def test_likeness_groups_widen_to_stacks_by_stack_id(key_list_plan, monkeypatch)
             ]
 
 
+def test_likeness_groups_in_the_scrapheap_group_only_the_heap():
+    """``only_deleted=true`` (what the Scrapheap view sends) groups the heap's
+    pictures; without it the groups are the live library's.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server_config_path = os.path.join(temp_dir, "server_config.json")
+        with open(server_config_path, "w") as f:
+            json.dump({"port": 8000, "disable_background_workers": True}, f)
+        with Server(server_config_path=server_config_path) as server:
+            client = TestClient(server.api)
+            resp = client.post(
+                "/login", json={"username": "testuser", "password": "testpassword"}
+            )
+            assert resp.status_code == 200
+
+            def seed(session):
+                ids = {}
+                for key, deleted in (
+                    ("live", False),
+                    ("live_b", False),
+                    ("gone", True),
+                    ("gone_b", True),
+                ):
+                    pic = Picture(
+                        file_path=f"{key}.png", width=64, height=64, deleted=deleted
+                    )
+                    session.add(pic)
+                    session.flush()
+                    ids[key] = pic.id
+                for x, y in (("live", "live_b"), ("gone", "gone_b")):
+                    a, b = sorted((ids[x], ids[y]))
+                    session.add(
+                        PictureLikeness(
+                            picture_id_a=a, picture_id_b=b, likeness=0.95, metric="test"
+                        )
+                    )
+                session.commit()
+                return ids
+
+            ids = server.vault.db.run_task(seed)
+
+            def grouped(**params):
+                resp = client.get(
+                    f"{API_PREFIX}/pictures/likeness-groups",
+                    params={"threshold": 0.9, **params},
+                )
+                assert resp.status_code == 200, resp.text
+                return sorted(row["id"] for row in resp.json())
+
+            assert grouped(only_deleted="true") == sorted((ids["gone"], ids["gone_b"]))
+            assert grouped() == sorted((ids["live"], ids["live_b"]))
+
+
 def _on_event_loop() -> bool:
     """Whether the calling thread is running an asyncio event loop."""
     try:

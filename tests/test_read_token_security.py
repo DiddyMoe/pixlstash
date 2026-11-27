@@ -76,6 +76,7 @@ from pixlstash.db_models import (
     Character,
     CharacterProjectMember,
     Picture,
+    PictureLikeness,
     PictureSetMember,
     PictureStack,
     Tag,
@@ -86,6 +87,7 @@ from pixlstash.hub.workflows import record_api_graph
 from pixlstash.server import Server
 from pixlstash.services.workflow_hash import asset_reference, normalized_filename
 from pixlstash.utils.rate_limiter import RateLimitMiddleware
+from pixlstash.utils.service.picture_stats import clear_stats_cache
 from tests.test_workflow_identity import _graph as _workflow_graph
 from tests.utils import (
     mint_read_token,
@@ -491,6 +493,18 @@ def _picture_set_members(server, set_id: int) -> set:
         )
 
     return server.vault.db.run_task(_read)
+
+
+def _set_binned(server, picture_ids, binned: bool) -> None:
+    """Move *picture_ids* into the Scrapheap, or back out of it, in the DB."""
+
+    def _write(session: Session):
+        session.exec(
+            update(Picture).where(Picture.id.in_(picture_ids)).values(deleted=binned)
+        )
+        session.commit()
+
+    server.vault.db.run_task(_write)
 
 
 def _reset_two_set_library(env) -> None:
@@ -1212,7 +1226,8 @@ class TestResourceScopedReadTokenIsolation:
             stamp(None, None)
 
     def test_stats_cannot_leak_out_of_scope_pictures(self, env):
-        """GET /pictures/stats must be limited to the token's authorised set."""
+        """GET /pictures/stats must be limited to the token's authorised set,
+        in the live view and in the Scrapheap (``only_deleted=true``)."""
         r = TestClient(env.server.api).get(
             f"{API}/pictures/stats",
             headers={"Authorization": f"Bearer {env.token_a}"},
@@ -1224,6 +1239,33 @@ class TestResourceScopedReadTokenIsolation:
             f"Token for set A (1 picture) reported total={data['total']}; "
             "expected exactly 1 (2 leaks set B, 0 over-blocks set A)"
         )
+
+        both = (env.pic_a, env.pic_b)
+        heap = {"only_deleted": "true"}
+        _set_binned(env.server, both, True)
+        # The stats cache is keyed on the query alone, across servers.
+        clear_stats_cache()
+        try:
+            r = env.owner_client.get(f"{API}/pictures/stats", params=heap)
+            assert r.status_code == 200, r.text
+            assert r.json()["total"] == 2, (
+                "the owner does not count both binned pictures, so the token's "
+                "count below would prove nothing"
+            )
+            r = TestClient(env.server.api).get(
+                f"{API}/pictures/stats",
+                params=heap,
+                headers={"Authorization": f"Bearer {env.token_a}"},
+            )
+            assert r.status_code == 200, r.text
+            total = r.json()["total"]
+            assert total == 1, (
+                f"Token for set A reported total={total} in the Scrapheap; "
+                "expected exactly 1 (2 leaks set B, 0 over-blocks set A)"
+            )
+        finally:
+            _set_binned(env.server, both, False)
+            clear_stats_cache()
 
     def test_search_cannot_leak_out_of_scope_pictures(self, env):
         """GET /pictures/search must not return pictures outside the token's set."""
@@ -1239,16 +1281,61 @@ class TestResourceScopedReadTokenIsolation:
         )
 
     def test_likeness_groups_cannot_leak_out_of_scope_pictures(self, env):
-        """GET /pictures/likeness-groups must not include pictures outside the token's set."""
-        r = TestClient(env.server.api).get(
-            f"{API}/pictures/likeness-groups",
-            headers={"Authorization": f"Bearer {env.token_a}"},
-        )
-        assert r.status_code == 200, r.text
-        all_ids = {pid for group in r.json() for pid in group}
-        assert env.pic_b not in all_ids, (
-            "Token for set A returned picture from set B in /pictures/likeness-groups"
-        )
+        """GET /pictures/likeness-groups must not include pictures outside the
+        token's set, in the live view and in the Scrapheap (``only_deleted``).
+
+        The two pictures are made alike, so the owner sees them as one group
+        and the set-A token must not see set B's half of it.
+        """
+        both = (env.pic_a, env.pic_b)
+        low, high = sorted(both)
+
+        def _write_likeness(session: Session, add: bool):
+            if add:
+                session.add(
+                    PictureLikeness(
+                        picture_id_a=low,
+                        picture_id_b=high,
+                        likeness=0.95,
+                        metric="test",
+                    )
+                )
+            else:
+                session.exec(
+                    delete(PictureLikeness).where(
+                        PictureLikeness.picture_id_a == low,
+                        PictureLikeness.picture_id_b == high,
+                    )
+                )
+            session.commit()
+
+        def grouped(client, params, headers=None):
+            r = client.get(
+                f"{API}/pictures/likeness-groups", params=params, headers=headers
+            )
+            assert r.status_code == 200, r.text
+            return {row["id"] for row in r.json()}
+
+        env.server.vault.db.run_task(_write_likeness, True)
+        try:
+            for params in ({}, {"only_deleted": "true"}):
+                _set_binned(env.server, both, bool(params))
+                assert grouped(env.owner_client, params) == set(both), (
+                    f"the owner does not see the pair with {params}, so the "
+                    "token check below would prove nothing"
+                )
+                seen = grouped(
+                    TestClient(env.server.api),
+                    params,
+                    headers={"Authorization": f"Bearer {env.token_a}"},
+                )
+                assert env.pic_b not in seen, (
+                    f"Token for set A returned picture from set B in "
+                    f"/pictures/likeness-groups with {params}"
+                )
+        finally:
+            _set_binned(env.server, both, False)
+            env.server.vault.db.run_task(_write_likeness, False)
 
     def test_picture_scoped_token_cannot_list_whole_library(self, env):
         """A single-picture share token must only ever resolve its own picture.

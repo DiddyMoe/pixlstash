@@ -21,7 +21,10 @@ from pixlstash.utils.image_processing.generation_data import strip_generation_da
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.utils.service.caption_utils import CaptionUtils
-from pixlstash.utils.service.filter_helpers import fetch_scope_allowed_picture_ids
+from pixlstash.utils.service.filter_helpers import (
+    fetch_scope_allowed_picture_ids,
+    request_targets_scrapheap,
+)
 from sqlmodel import select
 
 
@@ -553,7 +556,7 @@ class ExportUtils:
         if export_type_d != Picture.ExportType.FULL:
             bbox_mode_d = "none"
 
-        only_deleted = request.query_params.get("character_id") == "SCRAPHEAP"
+        only_deleted = request_targets_scrapheap(request.query_params)
         picture_ids = request.query_params.getlist("id")
 
         select_fields = Picture.metadata_fields()

@@ -1583,14 +1583,24 @@ def apply_orientation(
 
 
 def _apply_deleted(session: Session, picture: Picture, lifecycle) -> None:
-    """Restore a picture's scrapheap state (the soft-delete flag + its stamp)."""
+    """Restore a picture's scrapheap state (the soft-delete flag + its stamp).
+
+    A picture this puts into the Scrapheap is stamped now, never with the stamp
+    it carried the last time it was there: ``deleted_at`` is also the consent
+    bound of a delete-forever (:func:`scrapheap_service.binned_by`), and an old
+    stamp would fall under the bound of a preview that never showed the
+    picture. The cost is that an undo or redo starts a fresh retention window,
+    which only ever moves a deadline later. A picture already in the Scrapheap
+    keeps its stamp; one that leaves it loses the stamp.
+    """
     if not isinstance(lifecycle, dict):
         return
-    picture.deleted = bool(lifecycle.get("deleted"))
-    # Written back verbatim rather than re-stamped to "now": the recorded value
-    # IS the retention deadline this state had, and re-stamping would silently
-    # extend (or invent) a purge window on every undo.
-    picture.deleted_at = _parse_utc(lifecycle.get("deleted_at"))
+    deleted = bool(lifecycle.get("deleted"))
+    if not deleted:
+        picture.deleted_at = None
+    elif not picture.deleted:
+        picture.deleted_at = datetime.now(timezone.utc)
+    picture.deleted = deleted
     session.add(picture)
 
 

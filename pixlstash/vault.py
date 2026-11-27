@@ -2956,19 +2956,12 @@ class Vault:
             return result[0]
         return result or 0
 
-    @staticmethod
-    def _count_missing_tags(session: Session) -> int:
-        has_sentinel = Tag.tag.like(
-            TAG_SENTINEL_LIKE_PATTERN, escape=TAG_SENTINEL_ESCAPE_CHAR
+    def _count_missing_tags(self, session: Session) -> int:
+        from pixlstash.tasks.tag_task import TagTask
+
+        return TagTask.count_missing_tags(
+            session, self.db.unprocessable_images.active_suppressed_ids()
         )
-        result = session.exec(
-            select(func.count())
-            .select_from(Picture)
-            .where(Picture.tags.any(has_sentinel))
-        ).one()
-        if isinstance(result, (tuple, list)):
-            return result[0]
-        return result or 0
 
     @staticmethod
     def _count_missing_tag_predictions(session: Session) -> int:

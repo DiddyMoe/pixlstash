@@ -1,0 +1,1 @@
+- Fixed: pictures are tagged once the tagger loads, not left untagged for good.

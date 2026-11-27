@@ -17,12 +17,13 @@ vi.mock("../api/stacks", () => ({
 import { useStackOrdering } from "./useStackOrdering.js";
 import { listStackPictures } from "../api/stacks";
 import { useSortStore } from "../stores/useSortStore";
-import {
-  resetShareDragForTests,
-  runShareDrag,
-} from "../utils/shareDrag.js";
+import { resetShareDragForTests, runShareDrag } from "../utils/shareDrag.js";
 
-function makeStack(images, fetched = images) {
+function makeStack(
+  images,
+  fetched = images,
+  { loadFoldsStacks = ref(true) } = {},
+) {
   const deps = {
     allGridImages: ref(images),
     lastFetchedGridImages: ref(fetched),
@@ -38,11 +39,15 @@ function makeStack(images, fetched = images) {
     setStackReorderHoverSide: vi.fn(),
     selectedImageIds: ref([]),
     preserveScrollOnNextFetch: ref(false),
+    loadFoldsStacks,
   };
   const callbacks = new Proxy({}, { get: () => vi.fn(() => []) });
   const stack = useStackOrdering(deps, {}, vi.fn(), callbacks);
   stack.expandedStackIds.value = new Set(["7"]);
-  return Object.assign(stack, { grid: deps.allGridImages });
+  return Object.assign(stack, {
+    grid: deps.allGridImages,
+    lastFetchedGridImages: deps.lastFetchedGridImages,
+  });
 }
 
 const member = (id, position, extra = {}) => ({
@@ -212,5 +217,44 @@ describe("useStackOrdering: reorder dragover asks for an allowed effect", () => 
 
     expect(event.preventDefault).toHaveBeenCalled();
     expect(dataTransfer.dropEffect).toBe("move");
+  });
+});
+
+// The server lists every scrapped picture on its own row, and the Scrapheap
+// load keeps them all, so a rebuild from lastFetchedGridImages must fold only
+// when the load did.
+describe("useStackOrdering: folds a rebuild as the load did", () => {
+  const heapRows = () => [
+    { id: 1, stack_id: 7, stack_position: 0, stack_count: 2 },
+    { id: 2, stack_id: 7, stack_position: 1, stack_count: 2 },
+    { id: 3, stack_id: 8, stack_position: 0, stack_count: 2 },
+    { id: 4, stack_id: 8, stack_position: 1, stack_count: 2 },
+    { id: 5, stack_id: null },
+  ];
+  const ids = (stack) => stack.grid.value.map((img) => img.id);
+
+  function heap({ folds }) {
+    const rows = heapRows();
+    const stack = makeStack(rows.slice(), rows, {
+      loadFoldsStacks: ref(folds),
+    });
+    stack.expandedStackIds.value = new Set();
+    return stack;
+  }
+
+  it("keeps every other row after a removal (removeImagesById)", () => {
+    const stack = heap({ folds: false });
+    stack.lastFetchedGridImages.value =
+      stack.lastFetchedGridImages.value.filter((row) => row.id !== 2);
+    stack.rebuildGridImagesFromLastFetch();
+    expect(ids(stack)).toEqual([1, 3, 4, 5]);
+  });
+
+  it("still folds each stack to one card in a view the load folded", () => {
+    const stack = heap({ folds: true });
+    stack.lastFetchedGridImages.value =
+      stack.lastFetchedGridImages.value.filter((row) => row.id !== 5);
+    stack.rebuildGridImagesFromLastFetch();
+    expect(ids(stack)).toEqual([1, 3]);
   });
 });

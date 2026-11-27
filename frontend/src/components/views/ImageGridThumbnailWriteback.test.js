@@ -16,7 +16,10 @@
 // directly; ImageGridThumbnailVersion.test.js covers the batch end to end.
 
 import { describe, it, expect } from "vitest";
-import { writeThumbnailBatch } from "../../utils/thumbnailWriteback.js";
+import {
+  loadedSlotRuns,
+  writeThumbnailBatch,
+} from "../../utils/thumbnailWriteback.js";
 
 function writeBack(grid, batch, start) {
   writeThumbnailBatch(grid, batch, start);
@@ -185,5 +188,25 @@ describe("thumbnail batch write-back", () => {
     // No URL in the answer: the card keeps the one it has.
     expect(grid[0].thumbnail).toBe("test-thumb-old");
     expect(grid[0].score).toBe(0);
+  });
+});
+
+describe("the slots a thumbnail batch counts as loaded", () => {
+  it("counts no slot a placeholder held", () => {
+    const grid = [{ id: 1 }, { id: null }, { id: 3 }, { id: 4 }];
+    const batch = grid.map((row) => ({ ...row }));
+
+    expect(loadedSlotRuns(grid, batch, 0)).toEqual([
+      [0, 1],
+      [2, 4],
+    ]);
+  });
+
+  it("counts no slot a removal moved", () => {
+    // Picture 1 was removed above, so 2 and 3 each moved up a slot.
+    const grid = [{ id: 2 }, { id: 3 }];
+    const batch = [{ id: 1 }, { id: 2 }, { id: 3 }];
+
+    expect(loadedSlotRuns(grid, batch, 0)).toEqual([]);
   });
 });
