@@ -532,6 +532,15 @@ def test_removing_faces_passes_over_a_face_that_is_not_there():
             gone_face = max(own_face, other_face) + 1_000_000
             url = f"{API_PREFIX}/characters/{character_id}/faces"
 
+            def seed(session):
+                session.get(Picture, held).text_embedding = b"example-embedding"
+                session.commit()
+
+            def has_text_embedding(session):
+                return session.get(Picture, held).text_embedding is not None
+
+            server.vault.db.run_task(seed)
+
             resp = client.request(
                 "DELETE", url, json={"face_ids": [own_face, other_face, gone_face]}
             )
@@ -540,6 +549,9 @@ def test_removing_faces_passes_over_a_face_that_is_not_there():
                 own_face: None,
                 other_face: other_id,
             }, "only this person's faces are removed"
+            assert not server.vault.db.run_immediate_read_task(has_text_embedding), (
+                "the person's name leaves the picture's search text"
+            )
 
             resp = client.request("DELETE", url, json={"picture_ids": [bare]})
             assert resp.status_code == 200, resp.text
