@@ -757,6 +757,10 @@ class AuthService:
         self._active_restore_http_leases: set[int] = set()
         self._active_restore_websockets: dict[int, tuple] = {}
         self._RESTORE_DRAIN_TIMEOUT_SECONDS = 30.0
+        # How long the restore lets one handler end by itself after closing its
+        # socket before cancelling it. uvicorn hands the handler its disconnect
+        # as it sends the close, so only a stuck handler waits this out.
+        self._RESTORE_SOCKET_EXIT_SECONDS = 2.0
         # In-memory guest session tracking: session_id → last_active_at (monotonic seconds).
         # Entries expire after _GUEST_SESSION_INACTIVE_TTL (30 days) and are pruned lazily
         # in record_guest_activity().  When the cache reaches _guest_max_tracked_sessions
@@ -817,19 +821,23 @@ class AuthService:
             self._active_restore_websockets.pop(lease, None)
             self._restore_admission_condition.notify_all()
 
-    @staticmethod
-    async def _terminate_authenticated_websocket(websocket, handler_task) -> None:
-        """Close one established socket, then cancel its owning handler."""
+    async def _terminate_authenticated_websocket(self, websocket, handler_task) -> None:
+        """Close one established socket and let its handler end by itself.
+
+        A handler still running after ``_RESTORE_SOCKET_EXIT_SECONDS`` is cancelled.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._RESTORE_SOCKET_EXIT_SECONDS
         try:
             await websocket.close(code=1012, reason="Database restore in progress")
         finally:
             current = asyncio.current_task()
-            if (
-                handler_task is not None
-                and handler_task is not current
-                and not handler_task.done()
-            ):
-                handler_task.cancel()
+            if handler_task is not None and handler_task is not current:
+                await asyncio.wait(
+                    {handler_task}, timeout=max(0.0, deadline - loop.time())
+                )
+                if not handler_task.done():
+                    handler_task.cancel()
 
     def close_auth_for_restore(
         self, restore_request_lease: Optional[int] = None
