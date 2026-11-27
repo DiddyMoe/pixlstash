@@ -35,6 +35,7 @@ from pixlstash.hub import dataset_snapshots, training_runs
 from pixlstash.hub.db import now_iso
 from pixlstash.resources.aitoolkit_tenant import AiToolkitProbe
 from pixlstash.services import training_service as training_service_module
+from pixlstash.services.model_mover import MoveRefused
 from pixlstash.services.training_service import TrainingService
 from pixlstash.training import measurements, presets
 from pixlstash.training import local_ai_toolkit as local_ai_toolkit_module
@@ -3280,3 +3281,111 @@ def test_a_train_longer_whose_requeue_meets_a_busy_hub_is_queued(
 
     assert len(tried) == 2
     assert _job_status(hub, run["uuid"]).status == "queued"
+
+
+def _a_finished_run_left_running(hub, repo_dir, tmp_path):
+    """A run left ``running`` whose trainer finished, saving two checkpoints.
+
+    Its importer is refused, as the shelf refuses a file it already holds.
+    Returns the service, the run, its checkpoints in the order the importer
+    takes them (the final first) and the importer.
+    """
+    importer = _RecordingImport(
+        error=MoveRefused("run.safetensors already exists in the destination folder.")
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    final = run_dir / "run.safetensors"
+    final.write_bytes(b"the final")
+    stepped = run_dir / "run_000000002.safetensors"
+    stepped.write_bytes(b"step 2")
+
+    class _Backend:
+        def handle_for(self, work_dir, job_id, name, pid, training_folder=None):
+            return LocalAiToolkit.handle_for(
+                work_dir, job_id, name, pid, training_folder=training_folder
+            )
+
+        def is_alive(self, handle):
+            return False
+
+        def reconcile(self, handle):
+            return TrainingProgress(
+                status="completed",
+                info="Training completed",
+                step=4,
+                total_steps=4,
+                speed="",
+                final_checkpoint=str(final),
+            )
+
+    service = TrainingService(
+        hub,
+        _LIBRARY_UUID,
+        os.path.dirname(hub.path),
+        request_gpu=_StubLease().request,
+        import_run=importer,
+        notify=_CapturingNotify(),
+        config_provider=lambda: {"repo_path": repo_dir, "python": sys.executable},
+        dataset_builder=_make_dataset_builder(),
+        backend_factory=lambda repo_path, python: _Backend(),
+    )
+    job = service.enqueue(
+        set_id=_SET_ID,
+        name="landed",
+        base_model="m",
+        trigger_word="t",
+        template_path="unused.json",
+        resolution=_RESOLUTION,
+    )
+    training_runs.update_run(
+        hub, job["uuid"], status="running", training_folder=str(tmp_path)
+    )
+    return service, job, [final, stepped], importer
+
+
+def _shelve(hub, run_id, *files):
+    """Register each file as a model the run made, as the vault's importer does."""
+    with hub.transaction() as conn:
+        for path in files:
+            conn.execute(
+                "INSERT INTO model (file_kind, kind, sha256, provenance, "
+                "training_run_id) VALUES ('adapter', 'lora', ?, 'trained', ?)",
+                (hashlib.sha256(path.read_bytes()).hexdigest(), run_id),
+            )
+
+
+def test_a_run_imported_before_its_end_was_written_is_not_imported_again(
+    hub, repo_dir, tmp_path
+):
+    """The import landed, then ``completed`` was lost (a busy hub, a crash),
+    so the next start-up finalizes the run again. Imported again, the shelf
+    would refuse its files and the run would end ``error``."""
+    service, job, checkpoints, importer = _a_finished_run_left_running(
+        hub, repo_dir, tmp_path
+    )
+    _shelve(hub, job["id"], *checkpoints)
+
+    service.reconcile_on_startup()
+
+    final = _job_status(hub, job["uuid"])
+    assert (final.status, final.error) == ("completed", None)
+    assert importer.calls == []
+
+
+def test_a_run_whose_import_stopped_after_its_first_file_is_not_completed(
+    hub, repo_dir, tmp_path
+):
+    """The importer registers one file at a time, so a crash can leave only the
+    first file it takes on the shelf. The run has not landed: it is imported
+    again, which the shelf refuses, rather than reported completed with its
+    other files never imported."""
+    service, job, checkpoints, importer = _a_finished_run_left_running(
+        hub, repo_dir, tmp_path
+    )
+    _shelve(hub, job["id"], checkpoints[0])
+
+    service.reconcile_on_startup()
+
+    assert _job_status(hub, job["uuid"]).status == "error"
+    assert len(importer.calls) == 1

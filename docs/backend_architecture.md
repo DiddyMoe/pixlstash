@@ -12681,7 +12681,11 @@ that doubles between tries; a poll's write is tried once, since the next poll
 or `_finalize` writes it again. A launch that cannot be written stops its
 trainer and ends the run `error`, because a row that names no pid or folder is
 one nothing re-attaches to. The owner's yes to quitting ComfyUI is written in
-the run's insert.
+the run's insert. A run whose import landed but whose `completed` was lost is
+finished from the shelf on the next finalize instead of being imported again
+(`_landed_on_shelf`): it counts as landed only when every checkpoint in its
+folder has a model stamped with the run, since the importer registers one file
+at a time.
 
 `/training/jobs*` lists and addresses only the open library's runs; another
 library's run answers as one that does not exist. The worker claims and

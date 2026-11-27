@@ -47,10 +47,12 @@ from pixlstash.resources.ledger import ledger
 from pixlstash.resources.ledger import ram as read_ram
 from pixlstash.services.downloads_intake import safetensors_complete
 from pixlstash.services.model_folder_scanner import SOURCE_FOLDER_KIND
+from pixlstash.services.model_mover import file_digest
 from pixlstash.training import ai_toolkit_install, live_view, measurements, presets
 from pixlstash.training.backend import TrainerBackend, TrainingProgress, TrainingSpec
 from pixlstash.training.config_render import deep_merge
 from pixlstash.training.local_ai_toolkit import LocalAiToolkit
+from pixlstash.utils.aitoolkit_run import read_run
 from pixlstash.utils.atomic_write import write_json_atomic
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 
@@ -2008,9 +2010,10 @@ class TrainingService:
             try:
                 # The final checkpoint sits in the run folder, which is the
                 # ai-toolkit run the importer reads (``save_root``).
-                landed = self._import_run(
-                    os.path.dirname(progress.final_checkpoint), info
-                )
+                run_dir = os.path.dirname(progress.final_checkpoint)
+                landed = self._landed_on_shelf(run_dir, info)
+                if landed is None:
+                    landed = self._import_run(run_dir, info)
                 report = (
                     f"Trained {info['name']} to step {progress.step}; "
                     f"{landed['imported']} file(s) on the shelf "
@@ -2084,6 +2087,31 @@ class TrainingService:
             message=error_msg or progress.info or final_status,
         )
         logger.info("Job %s finalized as %s.", job_uuid, final_status)
+
+    def _landed_on_shelf(self, run_dir: str, info: dict) -> dict | None:
+        """What an earlier finalize of the run imported, or None if not all of it.
+
+        An import that landed before ``completed`` could be written is not done
+        again, since the shelf refuses files it already holds. The importer
+        registers one file at a time, so the run has landed only when every
+        checkpoint in its folder has a model stamped with the run.
+
+        Returns:
+            ``{"stack_id", "imported"}`` like the importer's answer, or None.
+        """
+        rows = self._hub.fetchall(
+            "SELECT sha256, stack_id FROM model WHERE training_run_id = ?",
+            (info["id"],),
+        )
+        if not rows:
+            return None
+        shelved = {row["sha256"] for row in rows}
+        # The final first: a run trained longer has models from its earlier
+        # stretch, and its new final has none until its import lands.
+        checkpoints = reversed(read_run(run_dir).checkpoints)
+        if any(file_digest(c.path) not in shelved for c in checkpoints):
+            return None
+        return {"stack_id": rows[0]["stack_id"], "imported": len(rows)}
 
     # ------------------------------------------------------------------
     # Persistence helpers
