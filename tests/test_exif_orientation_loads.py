@@ -13,7 +13,7 @@ import struct
 import cv2
 import numpy as np
 import pytest
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, PngImagePlugin
 
 from pixlstash.utils.image_processing import image_utils as image_utils_module
 from pixlstash.utils.image_processing.image_utils import ImageUtils
@@ -151,3 +151,61 @@ def test_a_resized_share_copy_of_such_a_photo_is_made_upright(tmp_path):
     with Image.open(entry["path"]) as img:
         assert img.size == (30, 40)
         assert img.getexif().get(ORIENTATION_TAG) is None
+
+
+def _png_with_exif_that_does_not_parse(damage: str) -> bytes:
+    """A PNG whose EXIF block Pillow cannot read, one way per error it raises."""
+    kwargs = {}
+    if damage == "header":
+        kwargs["exif"] = b"XX*\x00\x08\x00\x00\x00"  # SyntaxError
+    elif damage == "cut-short":
+        kwargs["exif"] = b"II+\x00\x08\x00\x00\x00"  # struct.error
+    else:
+        pnginfo = PngImagePlugin.PngInfo()
+        pnginfo.add_text("Raw profile type exif", "\nexif\n   8\nnot hex\n")
+        kwargs["pnginfo"] = pnginfo  # ValueError
+    buffer = io.BytesIO()
+    _quadrants().save(buffer, "PNG", **kwargs)
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("damage", ["header", "cut-short", "raw-profile-not-hex"])
+def test_a_picture_whose_exif_does_not_parse_imports_as_stored(tmp_path, damage):
+    data = _png_with_exif_that_does_not_parse(damage)
+    path = tmp_path / "picture.png"
+    path.write_bytes(data)
+
+    arr = ImageUtils.load_image_or_video(str(path))
+    picture = ImageUtils.create_picture_from_bytes(
+        image_root_path=str(tmp_path / "library"),
+        image_bytes=data,
+        picture_uuid="picture.png",
+    )
+
+    assert arr is not None and arr.shape[:2] == (60, 80)
+    assert (picture.width, picture.height, picture.orientation) == (80, 60, 1)
+    assert picture.thumbnail_width is not None
+
+
+def test_a_resized_share_copy_of_a_picture_whose_exif_does_not_parse_is_made(
+    tmp_path,
+):
+    image_root = tmp_path / "library"
+    image_root.mkdir()
+    (image_root / "picture.png").write_bytes(
+        _png_with_exif_that_does_not_parse("header")
+    )
+    picture = {"id": 1, "file_path": "picture.png", "original_file_name": "picture.png"}
+
+    result = make_share_copies(
+        [picture],
+        str(image_root),
+        str(tmp_path / "share-copies"),
+        keep_generation_data=True,
+        max_long_edge=40,
+    )
+
+    assert result["skipped"] == []
+    (entry,) = result["files"]
+    with Image.open(entry["path"]) as img:
+        assert img.size == (40, 30)

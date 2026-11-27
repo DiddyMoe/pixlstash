@@ -32,7 +32,10 @@ from PIL import Image, PngImagePlugin
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.generation_data import strip_generation_data
-from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.image_processing.image_utils import (
+    EXIF_PARSE_ERRORS,
+    ImageUtils,
+)
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.utils.service.export_utils import (
     _safe_archive_stem,
@@ -348,7 +351,16 @@ def _reencode(source, max_long_edge, watermark_bytes, keep_generation_data):
             return None
         fmt = img.format if img.format in _REENCODE_FORMATS else "PNG"
         info = dict(img.info)
-        exif = img.getexif()
+        try:
+            exif = img.getexif()
+        except EXIF_PARSE_ERRORS as exc:
+            logger.warning(
+                "EXIF in %s does not parse (%s: %s); the copy carries none",
+                source,
+                type(exc).__name__,
+                exc,
+            )
+            exif = Image.Exif()
         out = ImageUtils.apply_exif_orientation(img)
     if resized:
         out.thumbnail((max_long_edge, max_long_edge), Image.LANCZOS)

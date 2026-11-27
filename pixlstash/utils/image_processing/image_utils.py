@@ -8,6 +8,7 @@ import os
 import piexif
 import piexif.helper
 import shutil
+import struct
 import tempfile
 import uuid
 
@@ -62,6 +63,12 @@ _ORIENTATION_TRANSPOSE = {
     7: Image.Transpose.TRANSVERSE,
     8: Image.Transpose.ROTATE_90,
 }
+
+#: What Pillow's ``getexif()`` raises for an EXIF block too damaged to read:
+#: ``SyntaxError`` for a TIFF header that does not parse, ``struct.error`` for
+#: one cut short, and ``ValueError`` for a PNG ``Raw profile type exif`` that
+#: is not hex. Such a block holds no orientation: the picture is shown as stored.
+EXIF_PARSE_ERRORS = (SyntaxError, struct.error, ValueError)
 
 
 class ImageUtils:
@@ -447,9 +454,21 @@ class ImageUtils:
         and Pillow raises ``struct.error`` writing some tags it reads (a LONG8
         value). This turns the pixels without writing EXIF back. The turned
         image carries no EXIF block, so nothing can turn it a second time.
+        EXIF too damaged to read (:data:`EXIF_PARSE_ERRORS`) leaves *img* as
+        stored.
         """
         img.load()
-        method = _ORIENTATION_TRANSPOSE.get(img.getexif().get(ORIENTATION_TAG, 1))
+        try:
+            exif = img.getexif()
+        except EXIF_PARSE_ERRORS as exc:
+            logger.warning(
+                "EXIF in %s does not parse (%s: %s); shown as stored",
+                getattr(img, "filename", "") or "an in-memory image",
+                type(exc).__name__,
+                exc,
+            )
+            return img
+        method = _ORIENTATION_TRANSPOSE.get(exif.get(ORIENTATION_TAG, 1))
         if method is None:
             return img
         upright = img.transpose(method)
@@ -1197,7 +1216,7 @@ class ImageUtils:
                         raw_orientation = int(
                             (img.getexif() or {}).get(ORIENTATION_TAG, 1)
                         )
-                    except (TypeError, ValueError):
+                    except (TypeError, *EXIF_PARSE_ERRORS):
                         raw_orientation = 1
                     orientation = raw_orientation if 1 <= raw_orientation <= 8 else 1
                     rendered = ImageUtils.render_thumbnail(img)
