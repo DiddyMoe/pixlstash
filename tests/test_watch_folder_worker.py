@@ -1034,3 +1034,83 @@ def test_delete_after_import_never_goes_through_a_link(
 
     assert len(result["imported_picture_ids"]) == 1
     assert (outside / "picture.png").read_bytes() == kept
+
+
+def _watch_pass(server, file_paths, root) -> dict:
+    """One import pass over *file_paths*, found in the watch folder *root*."""
+    candidates = [
+        {
+            "file_path": str(path),
+            "delete_after_import": False,
+            "import_source_folder": str(root),
+        }
+        for path in file_paths
+    ]
+    task = watch_folder_import_task.WatchFolderImportTask(
+        server.vault.db, candidates, len(candidates)
+    )
+    return task._run_task()
+
+
+def _imported(server, result) -> dict:
+    """The pictures *result* imported, by original file name."""
+    ids = result["imported_picture_ids"]
+    pictures = server.vault.db.run_task(
+        lambda session: [session.get(Picture, pid) for pid in ids]
+    )
+    return {picture.original_file_name: picture for picture in pictures}
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        pytest.param(
+            "file",
+            marks=pytest.mark.skipif(
+                os.name == "nt", reason="a file link needs a privilege on Windows"
+            ),
+        ),
+        "folder",
+    ],
+)
+def test_a_link_out_of_the_watch_folder_is_not_imported(watch_server, tmp_path, link):
+    """Whoever can write in a watch folder must not bring a file in from
+    outside it through a link; a link that stays inside is still followed.
+    Wrong if the outside picture is imported or the inside one is not."""
+    root = tmp_path / "watch"
+    outside = tmp_path / "outside"
+    _write_picture(outside / "out.png")
+    _write_picture(root / "real" / "in.png")
+    if link == "file":
+        os.symlink(outside / "out.png", root / "out.png")
+        os.symlink(root / "real" / "in.png", root / "in.png")
+        paths = [root / "out.png", root / "in.png"]
+    else:
+        _link_folder(outside, root / "away")
+        _link_folder(root / "real", root / "near")
+        paths = [root / "away" / "out.png", root / "near" / "in.png"]
+
+    result = _watch_pass(watch_server, paths, root)
+
+    assert list(_imported(watch_server, result)) == ["in.png"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a file link needs a privilege on Windows")
+def test_a_caption_link_out_of_the_watch_folder_is_not_read(watch_server, tmp_path):
+    """The picture beside it is still imported, without the outside file's
+    text; a caption file in the folder is read. Wrong if the outside text
+    becomes the picture's tags or the inside caption is not read."""
+    root = tmp_path / "watch"
+    secret = tmp_path / "outside" / "notes.txt"
+    secret.parent.mkdir()
+    secret.write_text("private, words")
+    _write_picture(root / "linked.png")
+    _write_picture(root / "plain.png")
+    os.symlink(secret, root / "linked.txt")
+    (root / "plain.txt").write_text("kept, tags")
+
+    result = _watch_pass(watch_server, [root / "linked.png", root / "plain.png"], root)
+
+    pictures = _imported(watch_server, result)
+    assert pictures["linked.png"].tags_file is None
+    assert pictures["plain.png"].tags_file == str(root / "plain.txt")

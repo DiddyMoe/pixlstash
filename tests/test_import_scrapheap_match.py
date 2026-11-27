@@ -1340,7 +1340,8 @@ def _watch_folder_pass(srv, tmp_path, name, data) -> dict:
     watch_dir.mkdir(exist_ok=True)
     file_path = watch_dir / name
     file_path.write_bytes(data)
-    task = WatchFolderImportTask(srv.vault.db, [{"file_path": str(file_path)}], 1)
+    candidate = {"file_path": str(file_path), "import_source_folder": str(watch_dir)}
+    task = WatchFolderImportTask(srv.vault.db, [candidate], 1)
     return task._run_task()
 
 

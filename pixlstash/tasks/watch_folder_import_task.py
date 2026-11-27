@@ -10,9 +10,10 @@ from pixlstash.database import DBPriority
 from pixlstash.db_models.import_folder import ImportFolder
 from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.tag import Tag, TAG_PENDING_SENTINEL
-from pixlstash.utils.caption_file_utils import attach_sidecars
+from pixlstash.utils.caption_file_utils import attach_sidecars, read_caption_text
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.links import is_link_or_missing
+from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
     session_tag_exclusions,
@@ -115,6 +116,32 @@ def _delete_imported_source(file_path: str, read: os.stat_result) -> str | None:
     return None
 
 
+def _leads_outside(path: str, root: str) -> bool:
+    """Whether *path*, through any link on it, lies outside the folder *root*."""
+    try:
+        resolve_path_within(root, path)
+    except ValueError:
+        return True
+    return False
+
+
+def _caption_reader(root: str):
+    """A caption reader for `attach_sidecars` that refuses a caption file
+    leading outside the watch folder *root*."""
+
+    def read_text(path: str) -> str | None:
+        if _leads_outside(path, root):
+            logger.warning(
+                "Not reading caption file %s: it leads outside the watch folder %s",
+                path,
+                root,
+            )
+            return None
+        return read_caption_text(path)
+
+    return read_text
+
+
 class WatchFolderImportTask(BaseTask):
     """Task that imports discovered files from watch folders."""
 
@@ -169,6 +196,18 @@ class WatchFolderImportTask(BaseTask):
                 break
             file_path = candidate.get("file_path")
             if not file_path:
+                continue
+            root = candidate["import_source_folder"]
+            # Checked by name: a link swapped in between this check and the
+            # reads below is not ruled out here.
+            if _leads_outside(file_path, root):
+                logger.warning(
+                    "Not importing watched file %s: it leads outside the watch "
+                    "folder %s",
+                    file_path,
+                    root,
+                )
+                self._processed_count += 1
                 continue
 
             try:
@@ -245,7 +284,7 @@ class WatchFolderImportTask(BaseTask):
                 # Import folders have no per-folder suffix config, so probe the
                 # known conventions; any tags are stashed on the row for the
                 # inserter below.
-                attach_sidecars(pic, file_path)
+                attach_sidecars(pic, file_path, read_text=_caption_reader(root))
 
                 new_pictures.append(pic)
 

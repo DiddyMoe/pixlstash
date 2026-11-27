@@ -18,7 +18,7 @@ import os
 import re
 import tempfile
 from collections import Counter
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.video_utils import VIDEO_EXTENSIONS
@@ -404,6 +404,7 @@ def attach_sidecars(
     file_path: str,
     tags_suffixes: list[str] | None = None,
     description_suffixes: list[str] | None = None,
+    read_text: Callable[[str], str | None] = read_caption_text,
 ) -> list[str]:
     """Record the sidecars beside *file_path* on an unsaved picture.
 
@@ -421,11 +422,14 @@ def attach_sidecars(
     *tags_suffixes* / *description_suffixes*: ``None`` probes the known
     conventions; a list is the suffixes the owner confirmed for that kind, in
     order of preference; ``[]`` reads nothing of that kind.
+
+    *read_text* reads a sidecar's text, ``None`` when it may not or could not
+    be read.
     """
     tags: list[str] = []
     tags_path = _first_existing_sidecar(file_path, SIDECAR_TYPE_TAGS, tags_suffixes)
     if tags_path:
-        text = read_caption_text(tags_path)
+        text = read_text(tags_path)
         if text is not None:
             pic.tags_file = tags_path
             pic.tags_file_mtime = get_sidecar_mtime(tags_path)
@@ -435,7 +439,7 @@ def attach_sidecars(
         file_path, SIDECAR_TYPE_DESCRIPTION, description_suffixes
     )
     if description_path:
-        raw = read_caption_text(description_path)
+        raw = read_text(description_path)
         if raw is not None:
             pic.description_file = description_path
             pic.description_file_mtime = get_sidecar_mtime(description_path)
