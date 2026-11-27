@@ -1334,6 +1334,9 @@ def test_scoped_counts_are_reported_per_scope(server):
     assert counts[0]["unresolved_groups"] == 2
     assert counts[1]["key"] == f"set:{set_id}"
     assert counts[1]["unresolved_groups"] == 1
+    # Each row carries its scope's own tier split, as a scoped queue shows it.
+    assert counts[0]["by_tier"]["exact"] == 2
+    assert counts[1]["by_tier"]["exact"] == 1
 
 
 def test_a_scope_id_is_required_for_a_non_global_scope():

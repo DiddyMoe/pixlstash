@@ -233,7 +233,7 @@
             v-else-if="tierMenuOpen"
             class="dq-tier-menu"
             :tiers="store.tierRows"
-            :group-count="store.openCount"
+            :group-count="store.reviewCount"
             :threshold="store.threshold"
             :min-threshold="store.bounds?.min_threshold ?? null"
             :max-threshold="store.bounds?.max_threshold ?? null"
@@ -1260,7 +1260,7 @@ const headline = computed(() => {
   }
   return store.showingDecided
     ? `${store.total.toLocaleString()} decided ${store.total === 1 ? "group" : "groups"}`
-    : `${store.openCount.toLocaleString()} ${store.openCount === 1 ? "group" : "groups"} to review`;
+    : `${store.reviewCount.toLocaleString()} ${store.reviewCount === 1 ? "group" : "groups"} to review`;
 });
 
 // ── The Mixed stacks queue (design D5) ────────────────────────────────────

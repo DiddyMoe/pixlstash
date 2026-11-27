@@ -1,0 +1,1 @@
+- Fixed: a scoped duplicate queue shows its own counts, not the whole vault's.

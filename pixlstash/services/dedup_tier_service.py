@@ -3130,15 +3130,21 @@ def scope_counts_in_session(
 
     The context menus need a count per project / set / character / folder; asking
     for them one at a time would be a request per menu item.
+
+    Each row also carries the scope's own ``by_tier`` split, under the same
+    rules as the vault-wide one: a scoped queue's Auto-stack button and tier
+    menu show it, since a run started there acts on the scope only.
     """
     policy = policy or TierPolicy()
-    return [
-        {
-            **scope.as_dict(),
-            "unresolved_groups": count_unresolved_in_session(session, policy, scope),
-        }
-        for scope in scopes
-    ]
+    rows = []
+    for scope in scopes:
+        unresolved, by_tier = count_unresolved_and_by_tier_in_session(
+            session, policy, scope
+        )
+        rows.append(
+            {**scope.as_dict(), "unresolved_groups": unresolved, "by_tier": by_tier}
+        )
+    return rows
 
 
 # --- Scan requests and progress ---------------------------------------------

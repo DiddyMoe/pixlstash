@@ -519,6 +519,8 @@ export const useDedupStore = defineStore("dedup", () => {
 
   // --- Per-scope counts, for the context menus ----------------------------
   const scopeCounts = ref({});
+  // Each scope's own tier split, keyed like `scopeCounts`.
+  const scopeByTier = ref({});
   const scopeCountsInFlight = new Map();
   // Bumped by `invalidateScopeCounts()`: a read asked for before the change
   // must not refill the cache with the numbers from before it.
@@ -645,12 +647,31 @@ export const useDedupStore = defineStore("dedup", () => {
   );
   const doneCount = computed(() => stackedCount.value + separatedCount.value);
 
+  /**
+   * The tier split of the queue on screen: the scope's own when the queue is
+   * scoped, the vault's otherwise. Auto-stack runs in the scope it was started
+   * from. Empty until the scope's row has been read.
+   */
+  const queueByTier = computed(() =>
+    isScoped.value
+      ? (scopeByTier.value[scopeKey(scopeType.value, scopeId.value)] ?? {})
+      : byTier.value,
+  );
+
+  /**
+   * Groups the review queue on screen holds: the vault's unresolved count, or,
+   * when scoped, the scoped list's own total.
+   */
+  const reviewCount = computed(() =>
+    isScoped.value ? total.value : openCount.value,
+  );
+
   /** Unresolved exact groups: what the auto-stack button offers to clear. */
-  const exactCount = computed(() => Number(byTier.value.exact) || 0);
+  const exactCount = computed(() => Number(queueByTier.value.exact) || 0);
 
   /** Unresolved groups in every tier the queue does not stack in bulk. */
   const queueOnlyCount = computed(() =>
-    Object.entries(byTier.value).reduce(
+    Object.entries(queueByTier.value).reduce(
       (sum, [tier, count]) =>
         tier === "exact" ? sum : sum + (Number(count) || 0),
       0,
@@ -679,7 +700,7 @@ export const useDedupStore = defineStore("dedup", () => {
       id,
       label: TIER_LABELS[id]?.label ?? id,
       hint: TIER_LABELS[id]?.hint ?? "",
-      count: Number(byTier.value[id]) || 0,
+      count: Number(queueByTier.value[id]) || 0,
       locked: alwaysOn.has(id),
       requires: requires[id] ?? null,
       enabled: isTierEnabled(id),
@@ -1107,8 +1128,20 @@ export const useDedupStore = defineStore("dedup", () => {
     const scopeEpoch = scopeCountsEpoch;
     const policy = policyArgs.value;
     const policyKey = JSON.stringify(policy);
+    // A scoped queue always asks for its own scope too: its Auto-stack figure
+    // and tier menu come from that row.
+    const asked = isScoped.value
+      ? [
+          ...new Map(
+            [...scopes, currentScope()].map((s) => [
+              scopeKey(s.scopeType, s.scopeId),
+              s,
+            ]),
+          ).values(),
+        ]
+      : scopes;
     try {
-      const data = await getCounts({ policy, scopes });
+      const data = await getCounts({ policy, scopes: asked });
       if (
         epoch !== countsEpoch ||
         policyKey !== JSON.stringify(policyArgs.value)
@@ -1132,6 +1165,10 @@ export const useDedupStore = defineStore("dedup", () => {
           scopeCounts.value = {
             ...scopeCounts.value,
             [key]: Number(row.unresolved_groups) || 0,
+          };
+          scopeByTier.value = {
+            ...scopeByTier.value,
+            [key]: row.by_tier ?? {},
           };
         }
       }
@@ -1200,6 +1237,7 @@ export const useDedupStore = defineStore("dedup", () => {
     scopeCountsEpoch += 1;
     scopeCountsInFlight.clear();
     scopeCounts.value = {};
+    scopeByTier.value = {};
   }
 
   /**
@@ -3930,6 +3968,7 @@ export const useDedupStore = defineStore("dedup", () => {
     scan.value = { ...IDLE_SCAN };
     countsLoaded.value = false;
     scopeCounts.value = {};
+    scopeByTier.value = {};
 
     scopeType.value = GLOBAL_SCOPE;
     scopeId.value = null;
@@ -3998,6 +4037,7 @@ export const useDedupStore = defineStore("dedup", () => {
     // counts
     openCount,
     byTier,
+    reviewCount,
     exactCount,
     queueOnlyCount,
     scan,

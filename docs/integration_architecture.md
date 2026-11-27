@@ -3408,13 +3408,17 @@ Read-only despite the verb (a scope list does not fit a URL). Body:
   "unresolved_groups": 128,                              // the sidebar badge
   "by_tier": { "exact": 96, "near": 30, "embedding": 2 },// INCLUDING disabled tiers
   "scopes": [{ "scope_type": "set", "scope_id": "9", "key": "set:9",
-               "unresolved_groups": 4 }],
+               "unresolved_groups": 4,
+               "by_tier": { "exact": 3, "near": 1, "embedding": 0 } }],
   "policy": { … }, "scan": { … }
 }
 ```
 
 `by_tier` deliberately reports tiers that are switched off, so a tier switch can
-be labelled with what enabling it would add. A non-global scope without a
+be labelled with what enabling it would add. Each scope row carries its own
+`by_tier` under the same rules: a scoped queue's tier menu and Auto-stack button
+count what that scope holds, and always ask for their own scope. The top-level
+figures stay vault-wide; they feed the sidebar badge. A non-global scope without a
 `scope_id` is a **400**, and the `scopes` list is capped at **200** entries (each
 is a separate correlated `COUNT`) — over that is a **422**.
 

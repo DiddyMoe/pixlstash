@@ -1209,7 +1209,11 @@ class DedupCountsResponse(BaseModel):
     )
     scopes: list[dict[str, Any]] = Field(
         default_factory=list,
-        description="One `{scope_type, scope_id, key, unresolved_groups}` per requested scope.",
+        description=(
+            "One `{scope_type, scope_id, key, unresolved_groups, by_tier}` per "
+            "requested scope. `by_tier` is that scope's own split, under the same "
+            "rules as the top-level `by_tier`."
+        ),
     )
     policy: TierPolicyModel = Field(
         description="The policy these counts were read under."
