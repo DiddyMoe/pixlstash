@@ -188,6 +188,7 @@ from pixlstash.tasks import TaskType
 from pixlstash.utils.accelerator import VALID_DEVICE_SETTINGS
 from pixlstash.utils.atomic_write import write_json_atomic
 from pixlstash.utils.path_mapper import PathMapper
+from pixlstash.utils.path_utils import path_is_within
 from pixlstash.utils.rate_limiter import RateLimitMiddleware
 from pixlstash.utils.request_origin import OriginClientMiddleware
 from pixlstash.utils.service.share_copies import share_copies_root, sweep_share_copies
@@ -2501,9 +2502,14 @@ class Server(
                 raise HTTPException(status_code=404, detail="Not Found")
 
             safe_path = os.path.normpath(full_path).lstrip(os.sep)
-            candidate = os.path.abspath(os.path.join(dist_dir, safe_path))
-            if candidate.startswith(dist_dir) and os.path.isfile(candidate):
-                return FileResponse(candidate)
+            # realpath raises on a NUL byte, and no file name holds one.
+            if "\x00" not in safe_path:
+                # Both resolved: a link inside the build must not lead the read
+                # out of it, and a build reached through a link still serves.
+                dist_root = os.path.realpath(dist_dir)
+                candidate = os.path.realpath(os.path.join(dist_root, safe_path))
+                if path_is_within(candidate, dist_root) and os.path.isfile(candidate):
+                    return FileResponse(candidate)
 
             index_response = self._index_html_response()
             if not index_response:
