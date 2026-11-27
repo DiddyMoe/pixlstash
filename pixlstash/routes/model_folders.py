@@ -1161,6 +1161,15 @@ def register_comfyui_model_folders(server, base_url: str) -> list[int]:
     # Asked at the address `locate` vetted, so a second DNS answer cannot
     # supply the paths from somewhere else.
     for root in comfyui_model_roots(pinned.rstrip("/")):
+        # ComfyUI's answer, so checked before anything resolves it: realpath
+        # raises on a NUL byte, for which isdir answers False.
+        if not os.path.isdir(root):
+            logger.warning(
+                "ComfyUI reported %r as a model folder; it is not a directory on "
+                "this computer, so it is skipped.",
+                root,
+            )
+            continue
         resolved = os.path.realpath(root)
         if os.path.dirname(resolved) == resolved or resolved in too_broad:
             logger.warning(

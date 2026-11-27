@@ -3999,6 +3999,37 @@ def test_the_home_folder_from_comfyui_is_never_put_on_the_shelf(
     assert set(after) == before, after
 
 
+def test_a_comfyui_root_that_is_not_a_directory_is_skipped_and_the_rest_added(
+    shelf_env, tmp_path, monkeypatch
+):
+    """ComfyUI's answer is an outside party's: a root with a NUL byte in it
+    names no directory and sorts ahead of the real models root here."""
+    models = tmp_path / "ComfyUI" / "models"
+    for category in ("checkpoints", "loras"):
+        (models / category).mkdir(parents=True)
+    fake = _FolderPaths(
+        {
+            "checkpoints": [str(models / "checkpoints")],
+            "loras": [str(models / "loras")],
+            "vae": [f"{tmp_path}{os.sep}0\x00vae"],
+        }
+    )
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake)
+    root = os.path.realpath(str(models))
+    try:
+        added = model_folders_routes.register_comfyui_model_folders(
+            shelf_env.server, "http://127.0.0.1:18188"
+        )
+    finally:
+        folders = {
+            row["path"]: row["id"]
+            for row in shelf_env.owner.get(f"{API}/model-folders").json()["folders"]
+        }
+        if root in folders:
+            shelf_env.owner.delete(f"{API}/model-folders/{folders[root]}")
+    assert added == [folders[root]]
+
+
 def test_the_vault_data_folder_is_refused(shelf_env):
     image_root = shelf_env.server.vault.image_root
     r = shelf_env.owner.post(f"{API}/model-folders", json={"path": image_root})
