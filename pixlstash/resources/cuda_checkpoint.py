@@ -31,6 +31,7 @@ import sys
 import threading
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.model_utils import loaded_module
 
 logger = get_logger(__name__)
 
@@ -41,6 +42,10 @@ CUDA_SUSPEND_ENABLED = True
 #: How long the lock waits for CUDA work in flight to finish.
 LOCK_TIMEOUT_MS = 10_000
 
+#: CUresult for a driver that exports the checkpoint API but cannot use it
+#: (WSL's libcuda): no later attempt will do better.
+CUDA_ERROR_NOT_SUPPORTED = 801
+
 _lock = threading.Lock()
 # Guards _suspended against the count of device calls in flight.
 _calls = threading.Condition()
@@ -50,6 +55,8 @@ _suspended = False
 # another generation describes a different card.
 _generation = 0
 _failed = False
+# The driver answered the lock with CUDA_ERROR_NOT_SUPPORTED: never asked again.
+_unsupported = False
 _driver: ctypes.CDLL | None = None
 _driver_read = False
 
@@ -98,8 +105,8 @@ def generation() -> int:
 def available() -> bool:
     """Whether :func:`suspend` can work now: enabled, the API is there and
     this process has a CUDA context to suspend."""
-    torch = sys.modules.get("torch")
-    if not CUDA_SUSPEND_ENABLED or _failed or torch is None:
+    torch = loaded_module("torch")
+    if not CUDA_SUSPEND_ENABLED or _failed or _unsupported or torch is None:
         return False
     try:
         initialized = torch.cuda.is_initialized()
@@ -177,8 +184,10 @@ def suspend() -> bool | None:
         True when the context is off the card. None when it could not be done
         now (a device call or CUDA work in flight did not finish in time) and
         may be tried again; False when it failed. Either leaves it as it was.
+        A driver that does not support checkpoints fails, and from then on
+        :func:`available` is False.
     """
-    global _failed, _generation
+    global _failed, _generation, _unsupported
     cuda = _cuda()
     if cuda is None:
         abandon()
@@ -196,6 +205,15 @@ def suspend() -> bool | None:
         code = cuda.cuCheckpointProcessLock(
             pid, ctypes.byref(_LockArgs(LOCK_TIMEOUT_MS))
         )
+        if code == CUDA_ERROR_NOT_SUPPORTED:
+            _unsupported = True
+            logger.info(
+                "The NVIDIA driver cannot use the CUDA checkpoint API here "
+                "(CUresult %s); PixlStash keeps its CUDA context during training",
+                code,
+            )
+            abandon()
+            return False
         if code != 0:
             logger.info(
                 "Could not lock PixlStash's CUDA work to suspend it (CUresult %s); "

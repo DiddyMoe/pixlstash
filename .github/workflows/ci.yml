@@ -605,6 +605,7 @@ jobs:
           tests/test_metadata_hash.py
           tests/test_metadata_hash_batching.py
           tests/test_migrations.py
+          tests/test_ml_first_import_race.py
           tests/test_model_downloads.py
           tests/test_model_file_classification.py
           tests/test_model_folder_scanner.py
@@ -627,6 +628,8 @@ jobs:
           tests/test_package_data.py
           tests/test_path_containment.py
           tests/test_penalised_tag_exclusion.py
+          tests/test_pending_people_after_commit.py
+          tests/test_pending_people_reconciliation.py
           tests/test_pending_score_invalidation.py
           tests/test_picture_is_video.py
           tests/test_picture_mutation_scope.py

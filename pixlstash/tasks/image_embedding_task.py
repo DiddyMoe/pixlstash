@@ -26,7 +26,13 @@ from pixlstash.utils.image_processing.media_load import (
 from pixlstash.utils.sql_chunking import not_in_json
 from pixlstash.pixl_logging import get_logger
 from pixlstash.tasks.base_task import BaseTask, QueueType, TaskPriority
-from pixlstash.tasks.task_outcome import Outcome, Reason, id_sample, outcomes_payload
+from pixlstash.tasks.task_outcome import (
+    Outcome,
+    Reason,
+    RetryHold,
+    id_sample,
+    outcomes_payload,
+)
 from pixlstash.utils.vram_utils import is_vram_oom
 
 
@@ -85,6 +91,8 @@ class ImageEmbeddingTask(BaseTask):
 
     _aesthetic_model = None
     _aesthetic_disabled: Optional[bool] = None
+    # Holds the "scorer" key after a failed load, until it may be tried again.
+    _aesthetic_hold = RetryHold()
 
     def __init__(self, database, clip_workflow, batch: list):
         """
@@ -493,7 +501,7 @@ class ImageEmbeddingTask(BaseTask):
     def _is_aesthetic_disabled(cls):
         if cls._aesthetic_disabled is None:
             cls._aesthetic_disabled = cls._aesthetic_config() is None
-        return bool(cls._aesthetic_disabled)
+        return bool(cls._aesthetic_disabled) or bool(cls._aesthetic_hold.active())
 
     @classmethod
     def count_remaining(
@@ -728,9 +736,14 @@ class ImageEmbeddingTask(BaseTask):
             logger.info("ImageEmbeddingTask: Aesthetic model loaded.")
 
         except Exception as exc:
-            logger.error("ImageEmbeddingTask: Failed to load aesthetic model: %s", exc)
+            wait = ImageEmbeddingTask._aesthetic_hold.hold("scorer")
+            logger.error(
+                "ImageEmbeddingTask: Failed to load aesthetic model: %s; pictures "
+                "are embedded without a score, and it is loaded again in %.0f s.",
+                exc,
+                wait,
+            )
             ImageEmbeddingTask._aesthetic_model = None
-            ImageEmbeddingTask._aesthetic_disabled = True
 
     def _ensure_embedding_backend(self) -> bool:
         """Whether CLIP can embed now; says why not every time it cannot.

@@ -9,7 +9,6 @@ these act on is the ``resources`` block of ``GET /workers/progress``; see
 from __future__ import annotations
 
 import os
-import sys
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -25,6 +24,7 @@ from pixlstash.services.comfyui_service import (
     RUN_CLIENT_ID,
     cancel_held_runs,
 )
+from pixlstash.utils.model_utils import loaded_module
 
 logger = get_logger(__name__)
 
@@ -174,7 +174,7 @@ def create_router(server) -> APIRouter:
         return FreeAnswer(freed_mb=freed)
 
     def _torch_cuda() -> bool:
-        torch = sys.modules.get("torch")
+        torch = loaded_module("torch")
         try:
             return bool(
                 torch is not None

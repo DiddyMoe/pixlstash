@@ -1629,8 +1629,9 @@ def test_vault_reconciles_a_surviving_trainer_before_the_worker_starts():
     stand_in = SimpleNamespace(
         _disable_background_workers=False,
         _started=False,
-        # Closes a previous process's auto-stack runs first; nothing to close here.
-        db=SimpleNamespace(run_task=noop),
+        # Closes a previous process's auto-stack runs, then lists pictures whose
+        # person is still pending; there are none of either here.
+        db=SimpleNamespace(run_task=lambda *_args, **_kwargs: []),
         _task_runner=SimpleNamespace(start=lambda: order.append("tasks")),
         _work_planner=SimpleNamespace(start=noop),
         _arbiter=SimpleNamespace(

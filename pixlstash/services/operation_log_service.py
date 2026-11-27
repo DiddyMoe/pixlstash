@@ -82,6 +82,9 @@ from pixlstash.db_models.operation import (
 )
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
+from pixlstash.services.folder_structure_commit_service import (
+    resolve_pending_people_with_faces,
+)
 from pixlstash.services.layout_move_service import (
     restore_location,
     rollback_applied_moves,
@@ -2694,6 +2697,8 @@ def announce_restore(
     non-picture operation moved. Shared by Ctrl+Z, Ctrl+Shift+Z, a named batch
     undo and the auto-stack run revert, which restores one segment per slice.
     """
+    if FACET_PENDING_CHARACTER_ID in facets:
+        resolve_pending_people_with_faces(vault, touched, origin="Undo/redo")
     _emit(vault, touched, set(facets), origin_client_id, lifecycle)
     # A restore of a non-picture operation (a tag-group move) announces no
     # picture, so no event clears the stats cache, yet a stats query narrowed

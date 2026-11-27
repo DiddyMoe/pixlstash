@@ -2603,6 +2603,30 @@ def test_a_suspend_waits_for_the_device_calls_in_flight(monkeypatch):
     assert order[-2:] == ["restore", "unlock"]
 
 
+def test_a_driver_without_checkpoint_support_is_not_asked_again(monkeypatch):
+    codes = []
+    lib = SimpleNamespace(cuCheckpointProcessLock=lambda *args: codes.pop(0))
+    torch = SimpleNamespace(cuda=SimpleNamespace(is_initialized=lambda: True))
+    monkeypatch.setattr(cuda_checkpoint, "loaded_module", lambda name: torch)
+    monkeypatch.setattr(cuda_checkpoint, "_cuda", lambda: lib)
+    monkeypatch.setattr(cuda_checkpoint, "_suspended", False)
+    monkeypatch.setattr(cuda_checkpoint, "_in_flight", 0)
+    monkeypatch.setattr(cuda_checkpoint, "_failed", False)
+    monkeypatch.setattr(cuda_checkpoint, "_unsupported", False)
+
+    codes.append(909)  # CUDA_ERROR_TIMEOUT
+    cuda_checkpoint.begin()
+    assert cuda_checkpoint.suspend() is None, "a lock that timed out is tried again"
+    assert cuda_checkpoint.available()
+
+    codes.append(801)  # CUDA_ERROR_NOT_SUPPORTED, from WSL's libcuda
+    cuda_checkpoint.begin()
+    assert cuda_checkpoint.suspend() is False
+    assert not cuda_checkpoint.available(), "a driver that cannot is not asked again"
+    assert cuda_checkpoint.enter_device_call(), "the context stays usable"
+    cuda_checkpoint.leave_device_call()
+
+
 def test_the_vault_queues_one_unload_and_suspend_on_the_gpu_worker():
     from pixlstash.vault import CUDA_SUSPEND_TASK, Vault
 

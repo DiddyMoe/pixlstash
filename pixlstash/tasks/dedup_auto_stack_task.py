@@ -38,6 +38,9 @@ from pixlstash.services.dedup_verdict_service import (
     notify_pictures_changed,
     plan_auto_stack_in_session,
 )
+from pixlstash.services.folder_structure_commit_service import (
+    resolve_pending_people_with_faces,
+)
 from pixlstash.tasks.base_task import BaseTask, TaskPriority
 from pixlstash.tasks.task_type import TaskType
 
@@ -169,6 +172,9 @@ class DedupAutoStackTask(BaseTask):
             chunk = group_ids[start : start + self.SLICE_GROUPS]
             result = self._run_slice(
                 dedup_auto_stack_service.apply_slice_in_session, self._run_id, chunk
+            )
+            resolve_pending_people_with_faces(
+                self._vault, result["event_picture_ids"], origin="Auto-stack"
             )
             self._pending_picture_ids.update(result["event_picture_ids"])
             self._flush_notifications()

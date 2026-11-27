@@ -1,7 +1,10 @@
+import asyncio
 import os
 import sys
 import tempfile
+import threading
 import numpy as np
+import pytest
 
 from datetime import datetime, timezone
 from io import BytesIO
@@ -13,6 +16,7 @@ from sqlmodel import Session, select
 from pixlstash.db_models.picture_set import PictureSet, PictureSetMember
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.server import Server
+from pixlstash.services import plugin_service
 
 API_PREFIX = "/api/v1"
 
@@ -693,3 +697,32 @@ def test_two_user_plugins_with_one_name_keep_the_first_and_are_not_errors():
         # Sorted order: a_first.py claims the name, b_second.py is the duplicate.
         assert type(manager.get_plugin("twin")).__name__ == "A"
         assert manager.list_errors() == []
+
+
+def test_a_plugin_run_loads_its_plugin_off_the_event_loop(monkeypatch):
+    """Loading plugins waits on MODEL_CONSTRUCTION_LOCK, which a model load in
+    another thread can hold for minutes; on the loop that stalls every request."""
+    ran_on = {}
+
+    class _Manager:
+        def reload(self):
+            ran_on["reload"] = threading.current_thread()
+
+        def get_plugin(self, name):
+            ran_on["get_plugin"] = threading.current_thread()
+            return None
+
+    def get_manager():
+        ran_on["get_image_plugin_manager"] = threading.current_thread()
+        return _Manager()
+
+    monkeypatch.setattr(plugin_service, "get_image_plugin_manager", get_manager)
+    loop_thread = threading.current_thread()
+
+    with pytest.raises(ValueError, match="Plugin not found"):
+        asyncio.run(
+            plugin_service.run_plugin_on_pictures(None, "example-plugin", [1], {})
+        )
+
+    assert sorted(ran_on) == ["get_image_plugin_manager", "get_plugin", "reload"]
+    assert [call for call, thread in ran_on.items() if thread is loop_thread] == []

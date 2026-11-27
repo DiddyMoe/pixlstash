@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import platform
 import re
+import sys
 import threading
 from contextlib import contextmanager
+from types import ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,6 +28,10 @@ logger = get_logger(__name__)
 #: tensors". Reproduced 8/8 with the two loads overlapping, 0/3 without. Loads
 #: are rare and already seconds long, so serialising them costs little.
 #: Reentrant because a loader may nest helpers.
+#:
+#: Also held for the first import of the ML stack at the model entry points
+#: and the plugin loaders: ``accelerate``'s modules import each other, and two
+#: threads importing them at once hand one of them a half-initialised module.
 MODEL_CONSTRUCTION_LOCK = threading.RLock()
 
 
@@ -117,12 +123,35 @@ def quiet_transformers_load_report():
 
 def load_sentence_transformer(*args, **kwargs) -> SentenceTransformer:
     """Load a SentenceTransformer model, suppressing benign load warnings."""
-    # Local import: see _transformers_logging() for why the ML stack is not
-    # imported at module scope.
-    from sentence_transformers import SentenceTransformer
-
     with MODEL_CONSTRUCTION_LOCK, quiet_transformers_load_report():
+        # Local import: see _transformers_logging() for why the ML stack is not
+        # imported at module scope.
+        from sentence_transformers import SentenceTransformer
+
         return SentenceTransformer(*args, **kwargs)
+
+
+def loaded_module(name: str) -> ModuleType | None:
+    """Return the module *name* if it has been imported whole, else None.
+
+    For code that has work only once something else has loaded an ML package
+    and must not pay for importing it. Never imports and never waits. While
+    another thread is still running a module's body, its ``sys.modules`` entry
+    is the half-built module (``torch.cuda`` is not there yet); that entry,
+    whose ``__spec__._initializing`` is true, answers None.
+
+    Args:
+        name: The module's full dotted name.
+
+    Returns:
+        The module, or None while it is not imported or still being imported.
+    """
+    module = sys.modules.get(name)
+    if module is None:
+        return None
+    if getattr(getattr(module, "__spec__", None), "_initializing", False):
+        return None
+    return module
 
 
 def clean_asset_name(filename: str) -> str:

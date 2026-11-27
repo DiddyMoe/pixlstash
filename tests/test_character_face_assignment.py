@@ -509,6 +509,54 @@ def test_existing_reference_faces_still_drive_selection():
             assert body["face_ids"] == [target_fid]
 
 
+def test_removing_faces_passes_over_a_face_that_is_not_there():
+    """A face id gone since the page loaded, or a picture with no faces, is
+    passed over, and the faces that are there are still removed."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server_config_path = os.path.join(temp_dir, "server_config.json")
+        with Server(server_config_path=server_config_path) as server:
+            client = TestClient(server.api)
+            resp = client.post(
+                "/login", json={"username": "testuser", "password": "testpassword"}
+            )
+            assert resp.status_code == 200
+            held, bare = _upload(client, 2)
+            character_id = _create_character(client, "Removed")
+            other_id = _create_character(client, "Someone else")
+            own_face = _add_face(
+                server, held, ALONG_X, SMALL_BBOX, character_id=character_id
+            )
+            other_face = _add_face(
+                server, held, ALONG_Y, SMALL_BBOX, face_index=1, character_id=other_id
+            )
+            gone_face = max(own_face, other_face) + 1_000_000
+            url = f"{API_PREFIX}/characters/{character_id}/faces"
+
+            def seed(session):
+                session.get(Picture, held).text_embedding = b"example-embedding"
+                session.commit()
+
+            def has_text_embedding(session):
+                return session.get(Picture, held).text_embedding is not None
+
+            server.vault.db.run_task(seed)
+
+            resp = client.request(
+                "DELETE", url, json={"face_ids": [own_face, other_face, gone_face]}
+            )
+            assert resp.status_code == 200, resp.text
+            assert _face_character_ids(server, [own_face, other_face]) == {
+                own_face: None,
+                other_face: other_id,
+            }, "only this person's faces are removed"
+            assert not server.vault.db.run_immediate_read_task(has_text_embedding), (
+                "the person's name leaves the picture's search text"
+            )
+
+            resp = client.request("DELETE", url, json={"picture_ids": [bare]})
+            assert resp.status_code == 200, resp.text
+
+
 # --- a picture of several people (a run loading their LoRAs) ---------------
 
 

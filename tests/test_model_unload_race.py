@@ -12,8 +12,11 @@ These tests pin the ordering contract without loading a model, so they stay
 fast: a stubbed ``_init`` holds the lock the way a real load does.
 """
 
+import importlib
+import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +26,8 @@ from pixlstash.tagger_plugins.joycaption import JoyCaptionService
 from pixlstash.tagger_plugins.pixlstash_tagger import PixlStashTaggerService
 from pixlstash.tagger_plugins.sbert import SBertService
 from pixlstash.tagger_plugins.wd14 import WD14Service
+from pixlstash.utils.accelerator import CUDA, available_accelerator
+from pixlstash.utils.model_utils import loaded_module
 
 
 def _service():
@@ -255,10 +260,75 @@ def test_a_clip_load_holds_the_construction_lock(monkeypatch):
         sys.modules,
         "open_clip",
         SimpleNamespace(
-            create_model_and_transforms=_create, get_tokenizer=lambda name: object()
+            create_model_and_transforms=_create,
+            get_pretrained_cfg=lambda name, tag: {
+                "hf_hub": "example-org/example-clip/"
+            },
+            get_tokenizer=lambda name: object(),
         ),
     )
 
     ClipService(device="cpu")._load()
 
     assert seen == [True]
+
+
+# A stand-in torch whose body stops half-way until the test releases it.
+_SLOW_TORCH = """
+import types
+
+import slow_torch_gate as gate
+
+gate.entered.set()
+assert gate.release.wait(30), "the test never released the import"
+cuda = types.SimpleNamespace(is_available=lambda: True)
+"""
+
+
+@pytest.fixture
+def torch_importing(tmp_path, monkeypatch):
+    """A stand-in torch that another thread is part-way through importing."""
+    (tmp_path / "torch.py").write_text(_SLOW_TORCH)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    gate = SimpleNamespace(entered=threading.Event(), release=threading.Event())
+    monkeypatch.setitem(sys.modules, "slow_torch_gate", gate)
+    # Set first so teardown puts back the real entry, or its absence.
+    monkeypatch.setitem(sys.modules, "torch", None)
+    del sys.modules["torch"]
+    importer = threading.Thread(target=importlib.import_module, args=("torch",))
+    importer.start()
+    assert gate.entered.wait(5), "the stand-in's import never began"
+    try:
+        yield gate, importer
+    finally:
+        gate.release.set()
+        importer.join(5)
+
+
+def test_loaded_module_hands_out_a_module_only_once_its_import_finishes(
+    torch_importing,
+):
+    gate, importer = torch_importing
+
+    assert loaded_module("torch") is None, "its body is still running"
+
+    gate.release.set()
+    importer.join(5)
+
+    assert loaded_module("torch") is sys.modules["torch"]
+
+
+def test_the_accelerator_waits_for_a_torch_another_thread_is_importing(
+    torch_importing,
+):
+    gate, importer = torch_importing
+    answers = []
+    asker = threading.Thread(target=lambda: answers.append(available_accelerator()))
+    asker.start()
+    # An asker still running after this is waiting on the import, as it should.
+    asker.join(1)
+    gate.release.set()
+    asker.join(5)
+    importer.join(5)
+
+    assert answers == [CUDA]

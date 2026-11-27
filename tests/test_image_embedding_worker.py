@@ -10,13 +10,19 @@ import logging
 import numpy as np
 import pytest
 import torch
+from huggingface_hub.errors import LocalEntryNotFoundError
 from PIL import Image as PILImage
 from sqlmodel import Session, select, text
 
 from pixlstash.db_models import Picture
+from pixlstash.tagger_plugins.clip_service import (
+    CLIP_MODEL_NAME,
+    CLIP_MODEL_WEIGHTS,
+    ClipService,
+)
 from pixlstash.tasks import image_embedding_task as embedding_module
 from pixlstash.tasks.image_embedding_task import ImageEmbeddingTask
-from pixlstash.tasks.task_outcome import Outcome, Reason
+from pixlstash.tasks.task_outcome import Outcome, Reason, RetryHold
 from pixlstash.utils.image_processing.media_load import LoadFailure
 from pixlstash.vault import Vault
 from tests.test_model_downloads import serve_bytes
@@ -306,6 +312,84 @@ def test_the_embedding_preload_keeps_only_what_clip_reads(tmp_path, clip_loaded)
             assert torch.equal(tensor, preprocess(original)), name
         else:
             assert tensor is None
+
+
+_CLIP_REPO = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
+
+
+@pytest.fixture
+def clip_hub(tmp_path, monkeypatch):
+    """Hugging Face as a CLIP load sees it, with every model built unweighted.
+
+    Records each ``hf_hub_download`` as ``(repo, file, local_files_only)``. A
+    local lookup raises ``lookup_error`` when one is set; anything else
+    answers with a checkpoint file that is never read.
+    """
+    import functools
+    from types import SimpleNamespace
+
+    import huggingface_hub
+    import open_clip
+
+    weights = tmp_path / "open_clip_model.safetensors"
+    weights.write_bytes(b"")
+    hub = SimpleNamespace(asked=[], lookup_error=None)
+
+    def _download(*, repo_id, filename, local_files_only=False, **_kwargs):
+        hub.asked.append((repo_id, filename, local_files_only))
+        if local_files_only and hub.lookup_error is not None:
+            raise hub.lookup_error
+        return str(weights)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _download)
+    monkeypatch.setattr(open_clip.pretrained, "hf_hub_download", _download)
+    monkeypatch.setattr(
+        open_clip,
+        "create_model_and_transforms",
+        functools.partial(open_clip.create_model_and_transforms, load_weights=False),
+    )
+    return hub
+
+
+def test_a_cached_clip_checkpoint_loads_without_asking_the_hub(clip_hub):
+    """Given the tag, open_clip asks the hub on every load, cached or not.
+
+    A cached checkpoint is loaded by its path instead, and must still be
+    preprocessed exactly as a load by the tag is.
+    """
+    import open_clip
+
+    service = ClipService(device="cpu")
+    service._load()
+
+    assert clip_hub.asked == [(_CLIP_REPO, "open_clip_model.safetensors", True)]
+    _model, _, by_tag = open_clip.create_model_and_transforms(
+        CLIP_MODEL_NAME, pretrained=CLIP_MODEL_WEIGHTS
+    )
+    assert repr(service._preprocess) == repr(by_tag)
+
+
+def test_a_clip_checkpoint_not_yet_cached_is_downloaded(clip_hub):
+    clip_hub.lookup_error = LocalEntryNotFoundError("example: not cached")
+
+    ClipService(device="cpu")._load()
+
+    assert clip_hub.asked == [
+        (_CLIP_REPO, "open_clip_model.safetensors", True),
+        (_CLIP_REPO, "open_clip_pytorch_model.bin", True),
+        (_CLIP_REPO, "open_clip_model.safetensors", False),
+    ]
+
+
+def test_a_clip_cache_that_cannot_be_read_fails_the_load_without_a_download(
+    clip_hub,
+):
+    clip_hub.lookup_error = PermissionError("example: the cache is not readable")
+
+    with pytest.raises(PermissionError):
+        ClipService(device="cpu")._load()
+
+    assert clip_hub.asked == [(_CLIP_REPO, "open_clip_model.safetensors", True)]
 
 
 def test_an_animated_gif_preloads_three_frames_and_a_still_gif_one(tmp_path):
@@ -647,6 +731,7 @@ def _point_the_scorer_at(monkeypatch, url, path):
     """The aesthetic scorer is looked for at *path* and downloaded from *url*."""
     monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_model", None)
     monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_disabled", False)
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_hold", RetryHold())
     monkeypatch.setattr(
         ImageEmbeddingTask,
         "AESTHETIC_SUPPORTED_CLIP",
@@ -681,6 +766,85 @@ def test_the_scorer_download_follows_no_redirect_off_https(monkeypatch, tmp_path
             )._ensure_model()
     assert asked == []
     assert not path.exists()
+
+
+class _ScoringWorkflow(_RecordingWorkflow):
+    """Embeds at the scorer's width, on the CPU."""
+
+    device = "cpu"
+
+    def __init__(self, dim):
+        super().__init__()
+        self._dim = dim
+
+    def encode_images(self, images, tensors=None):
+        return np.ones((len(images), self._dim), dtype=np.float32)
+
+
+@pytest.fixture
+def scorer_on_disk(tmp_path, monkeypatch):
+    """The scorer's config, under *tmp_path*, and the clock its hold reads.
+
+    The jitter is pinned to the top of the range, so the first wait is 4 s.
+    """
+    monkeypatch.setattr(embedding_module, "builtin_model_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_model", None)
+    monkeypatch.setattr(ImageEmbeddingTask, "_aesthetic_disabled", None)
+    clock = [0.0]
+    monkeypatch.setattr(
+        ImageEmbeddingTask,
+        "_aesthetic_hold",
+        RetryHold(clock=lambda: clock[0], rng=lambda: 1.0),
+    )
+    return ImageEmbeddingTask._aesthetic_config(), clock
+
+
+def _write_scorer(config):
+    torch.save(torch.nn.Linear(config["dim"], 1).state_dict(), config["path"])
+
+
+def _score_after_one_pass(vault, config, name):
+    """The score one pass stores for a new picture called *name*."""
+    pid, path = _png(vault, name)
+    task = ImageEmbeddingTask(
+        database=vault.db,
+        clip_workflow=_ScoringWorkflow(config["dim"]),
+        batch=[(pid, path)],
+    )
+    task.on_queued()
+    task._run_task()
+    return _stored(vault, pid)[1]
+
+
+def test_a_scorer_that_failed_to_load_is_loaded_again_after_a_wait(
+    shared_vault, scorer_on_disk
+):
+    config, clock = scorer_on_disk
+    with open(config["path"], "wb") as handle:
+        handle.write(b"not a checkpoint")
+    _score_after_one_pass(shared_vault, config, "test-scorer-unreadable.png")
+    _write_scorer(config)
+
+    held = _score_after_one_pass(shared_vault, config, "test-scorer-held.png")
+    assert held is None, "inside the wait the load is not tried again"
+    clock[0] += 4.0
+    retried = _score_after_one_pass(shared_vault, config, "test-scorer-retried.png")
+    assert retried is not None, "after the wait the scorer loads and scores"
+
+
+def test_a_scorer_that_loads_is_never_held(shared_vault, scorer_on_disk):
+    config, _ = scorer_on_disk
+    _write_scorer(config)
+
+    scored = _score_after_one_pass(shared_vault, config, "test-scorer-loads.png")
+    assert scored is not None
+    score_only = _add_picture(
+        shared_vault, "test-scorer-score-only.png", image_embedding=_EMBEDDED
+    )
+    work = shared_vault.db.run_task(
+        lambda session: ImageEmbeddingTask.fetch_work(session, limit=10**6)
+    )
+    assert score_only in {row.id for row in work}, "a score is still work"
 
 
 def test_a_picture_whose_row_is_gone_is_not_reported_done(shared_vault, no_scorer):

@@ -101,6 +101,9 @@ from pixlstash.services.restore import RestoreService
 from pixlstash.services.dedup_auto_stack_service import (
     interrupt_orphaned_runs_in_session,
 )
+from pixlstash.services.folder_structure_commit_service import (
+    reconcile_pending_people_with_faces,
+)
 from pixlstash.hub.registry import VAULT_FILENAME
 from pixlstash.trusted_sqlite import TrustedSQLiteLocation
 from pixlstash.utils.path_utils import LibraryRootsUnavailable
@@ -600,6 +603,9 @@ class Vault:
         self.db.run_task(
             interrupt_orphaned_runs_in_session, priority=DBPriority.IMMEDIATE
         )
+        # A pending person on a picture that already has faces is never offered
+        # again by the face finder; resolve what a stop or crash left.
+        reconcile_pending_people_with_faces(self)
         # A trainer that outlived the restart gets its card before PixlStash's
         # own GPU workers start, so none of them loads a model under it.
         self.training_service.adopt_live_runs()

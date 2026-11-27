@@ -24,18 +24,19 @@ from ``server.py``, ``startup_checks.py`` and ``config_service.py``, all of whic
 sit on the API server's import path where importing torch costs seconds of
 start-up for a question that is usually "is there an accelerator" and nothing
 more. :func:`_torch` imports it on demand; the functions that can only have work
-to do in a process that already loaded torch read :data:`sys.modules` instead and
-never import it at all. This mirrors ``pixlstash.utils.vram_utils``, which
+to do in a process that already loaded torch ask
+:func:`~pixlstash.utils.model_utils.loaded_module` instead and never import it
+at all. This mirrors ``pixlstash.utils.vram_utils``, which
 documents the same reasoning.
 """
 
 import os
 import platform
-import sys
 from typing import Any
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.resources import cuda_checkpoint
+from pixlstash.utils.model_utils import loaded_module
 
 logger = get_logger(__name__)
 
@@ -68,7 +69,7 @@ def _resolve_torch(torch_module: Any = _UNSET, allow_import: bool = True):
     """
     if torch_module is not _UNSET:
         return torch_module
-    return _torch() if allow_import else sys.modules.get("torch")
+    return _torch() if allow_import else loaded_module("torch")
 
 
 #: The CPU. Not an accelerator; the answer when there is none.
@@ -143,7 +144,7 @@ def _torch():
     Returns:
         The ``torch`` module, or ``None``.
     """
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     if torch is not None:
         return torch
     try:
@@ -329,7 +330,7 @@ def empty_accelerator_cache(device=None) -> bool:
         the host has no accelerator (callers use this to skip their own cache
         bookkeeping).
     """
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     if torch is None or cuda_checkpoint.suspended():
         # Suspended for a training run (#2557), the flush would block the
         # caller until the run ends; nothing of ours is on the card anyway.
@@ -522,7 +523,7 @@ def is_device_error(error: BaseException, device=None) -> bool:
     if name is not None and not is_accelerated(name):
         return False
     words = DEVICE_ERROR_WORDS.get(name, ALL_DEVICE_ERROR_WORDS)
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     if torch is not None:
         # PyTorch's typed OOM deliberately does not promise a backend name in
         # its message, so type identity is checked first and separately.
@@ -749,7 +750,7 @@ def clamp_accelerator_memory(device, budget_mb: int | None) -> bool:
     """
     if normalise_device(device) != MPS:
         return False
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     set_fraction = getattr(
         getattr(torch, "mps", None), "set_per_process_memory_fraction", None
     )

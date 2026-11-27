@@ -601,6 +601,38 @@ def test_holds_grow_while_the_backend_stays_down_and_a_success_clears_them(
     )
 
 
+def test_an_engine_that_captions_nobody_holds_only_its_own_work(tmp_path):
+    """A batch that captions nobody holds the engine it captioned with, and
+    only that engine's pictures wait until the hold runs out: a request naming
+    another engine is still offered, and so is the backlog while the engine a
+    request names is the one held."""
+    db = _StubDB()
+    backlog, waiting, requested = _seed(db, 3, paths=_files(tmp_path, 3))
+    workflow = _Workflow(_captions_nobody)
+    clock = _Clock()
+    finder = _finder(db, workflow, clock, batch_size=1)
+
+    assert _run(finder) == [backlog]  # the active engine is held 4 s
+    _set_description(db, requested, make_description_sentinel("joycaption"))
+    workflow.generate = _captions_all
+
+    assert _run(finder) == [requested], (
+        "a request for another engine waited on the engine that is down"
+    )
+    # Only the engine hold keeps *waiting* out; *backlog* is held on its own.
+    assert finder.find_task() is None, "the held engine's backlog was offered"
+    clock.now += 5
+    assert _run(finder) == [backlog], (
+        "the engine's backlog was not offered once its hold ran out"
+    )
+
+    _set_description(db, requested, make_description_sentinel("joycaption"))
+    workflow.generate = _captions_nobody
+    assert _run(finder) == [requested]  # the named engine is held 4 s
+    workflow.generate = _captions_all
+    assert _run(finder) == [waiting], "the backlog waited on another engine"
+
+
 def test_a_held_picture_does_not_crowd_out_the_rest_of_the_backlog(tmp_path):
     """The finder reads three batches' worth of candidates. Held pictures must
     be left out of that read, or enough of them stall every other picture."""

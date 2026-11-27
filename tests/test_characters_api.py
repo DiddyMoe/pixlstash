@@ -1,16 +1,24 @@
 """Tests for the Characters API: create, update, delete, and reference pictures."""
 
+import asyncio
 import gc
 import glob
 import hashlib
 import json
 import os
 import tempfile
+import threading
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from pixlstash.db_models import Face, Picture
-from pixlstash.routes.characters import _face_thumbnail_crop_box
+from pixlstash.event_types import EventType
+from pixlstash.routes.characters import (
+    _face_thumbnail_crop_box,
+    create_router as create_characters_router,
+)
 from pixlstash.tasks.face_extraction_task import CROP_EXPAND_SCALE
 from pixlstash.server import Server
 from tests.utils import upload_pictures_and_wait
@@ -99,6 +107,79 @@ def test_patch_character_with_a_body_that_is_not_an_object_answers_422():
         resp = client.patch(f"/characters/{char_id}", json=[1])
         assert resp.status_code == 422, resp.text
     finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_a_cancelled_person_edit_still_announces_the_write_that_landed():
+    """A PATCH cancelled at its ``await`` (the page closed) still commits in
+    the worker thread, so other windows must still hear of the change."""
+    temp_dir, client, server = _setup()
+    db = server.vault.db
+    try:
+        char_id = client.post("/characters", json={"name": "test-before"}).json()[
+            "character"
+        ]["id"]
+        events = []
+        heard = threading.Event()
+
+        def listener(event_type, data):
+            if event_type == EventType.CHANGED_CHARACTERS:
+                events.append(data)
+                heard.set()
+
+        server.vault.add_event_listener(listener)
+        missing = client.patch(f"/characters/{char_id + 1}", json={"name": "x"})
+        assert missing.status_code == 404
+        assert events == [], "a PATCH that saved nothing announced a change"
+
+        entered = threading.Event()
+        release = threading.Event()
+        real_run_task = db.run_task
+
+        def gated_run_task(func, *args, **kwargs):
+            if getattr(func, "__name__", "") == "alter_char":
+                entered.set()
+                assert release.wait(30), "the test never released the write"
+            return real_run_task(func, *args, **kwargs)
+
+        [patch_character] = [
+            route.endpoint
+            for route in create_characters_router(server).routes
+            if route.path == "/characters/{id}" and "PATCH" in route.methods
+        ]
+
+        async def read_body():
+            return {"name": "test-after"}
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(origin_client_id="test-origin"), json=read_body
+        )
+
+        async def cancel_mid_write():
+            task = asyncio.create_task(patch_character(id=char_id, request=request))
+            try:
+                while not entered.is_set():
+                    if task.done():
+                        task.result()
+                        raise AssertionError("the PATCH never reached its write")
+                    await asyncio.sleep(0.01)
+                task.cancel()
+            finally:
+                release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        db.run_task = gated_run_task
+        asyncio.run(cancel_mid_write())
+
+        assert heard.wait(30), "the saved edit was never announced"
+        assert events == [{"origin_client_id": "test-origin"}]
+        del db.run_task
+        assert client.get(f"/characters/{char_id}").json()["name"] == "test-after"
+    finally:
+        db.__dict__.pop("run_task", None)
         server.close()
         temp_dir.cleanup()
         gc.collect()

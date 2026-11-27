@@ -98,6 +98,9 @@ from pixlstash.hub.workflows import filed_instance_hashes, recipes_missing_a_mod
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import operation_log_service, scrapheap_service
 from pixlstash.services.dedup_verdict_service import apply_metadata_union_in_session
+from pixlstash.services.folder_structure_commit_service import (
+    resolve_pending_people_with_faces,
+)
 from pixlstash.services.set_lock_service import (
     enforce_pictures_not_locked,
     locked_sets_for_pictures,
@@ -1310,6 +1313,9 @@ def keep_cover_only(
         None if expected_picture_ids is None else list(expected_picture_ids),
         before_write,
     )
+    resolve_pending_people_with_faces(
+        vault, result.pop("event_picture_ids"), origin="Keep cover only"
+    )
     moved = result.get("picture_ids_moved") or []
     covers = result.get("cover_picture_ids") or []
     if moved:
@@ -1364,7 +1370,6 @@ def keep_cover_only(
             },
         )
         vault.notify(EventType.CHANGED_TAGS, {"origin_client_id": origin_client_id})
-    result.pop("event_picture_ids", None)
     return result
 
 

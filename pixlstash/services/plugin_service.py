@@ -77,9 +77,16 @@ async def run_plugin_on_pictures(
         ValueError: If the plugin name is not found.
         RuntimeError: If plugin execution fails with an unexpected error.
     """
-    manager = get_image_plugin_manager()
-    manager.reload()
-    plugin: "ImagePlugin | None" = manager.get_plugin(name)
+
+    def _reloaded_plugin() -> "ImagePlugin | None":
+        manager = get_image_plugin_manager()
+        manager.reload()
+        return manager.get_plugin(name)
+
+    # Off the loop: building and reloading the manager wait on
+    # MODEL_CONSTRUCTION_LOCK, which a model load can hold for minutes, and
+    # get_plugin waits for a reload running in another thread.
+    plugin: "ImagePlugin | None" = await asyncio.to_thread(_reloaded_plugin)
     if plugin is None:
         raise ValueError(f"Plugin not found: {name!r}")
 

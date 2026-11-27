@@ -270,7 +270,11 @@ This is explicitly the exception the import policy in `CLAUDE.md` allows ("to re
 - **Watch the indirect pullers.** The last offenders found were not obvious: `clip_service.py` imported `open_clip` merely so another module could read the `CLIP_MODEL_NAME` *string constant*, and `startup_checks.py` hid `import torch` inside a module-scope `try:` block (invisible to a column-0 grep). Scan with an AST walk over module-level statements, descending into `try`/`if`, not with `grep '^import'`.
 - **Annotations.** Signatures referencing ML types need `from __future__ import annotations` plus an `if TYPE_CHECKING:` import. `pixlstash/utils/model_utils.py`, `tagger_plugins/florence2.py` and `tagger_plugins/pixlstash_tagger.py` are the worked examples.
 
-`utils/vram_utils.empty_cuda_cache()` is the shared cache-flush helper and deliberately reads `sys.modules.get("torch")` instead of importing: if torch was never imported, the process cannot hold CUDA allocations, so there is nothing to free and importing torch to learn that would cost seconds on every teardown.
+The first import at a model entry point (`load_sentence_transformer`, `ClipService`) and in the two plugin loaders runs under `MODEL_CONSTRUCTION_LOCK`: `accelerate`'s modules import each other, and two threads importing them at once hand one thread a half-initialised module.
+
+`utils/vram_utils.empty_cuda_cache()` is the shared cache-flush helper and deliberately asks `loaded_module("torch")` instead of importing: if torch was never imported, the process cannot hold CUDA allocations, so there is nothing to free and importing torch to learn that would cost seconds on every teardown.
+
+Code that wants an ML package only if something else already loaded it asks `utils/model_utils.loaded_module(name)`, not `sys.modules`: while another thread is still importing torch, its `sys.modules` entry is the half-built module, and `loaded_module` answers None for it.
 
 Modules **off** the server import path (`tagger_plugins/wd14.py`, `tagger_plugins/joycaption.py`, `image_loading_dataset_prepper.py`) may still import ML at module scope; they are only ever reached through function-local imports. `image_loading_dataset_prepper.py` in particular *must* keep its module-scope `torch`, since it subclasses `torch.utils.data.Dataset`.
 
@@ -1397,6 +1401,10 @@ The write path has to tell the two apart. Blanking a description is how a pictur
 
 **An image-embedding preload holds no decoded original (#2748).** `ImageEmbeddingTask._preload_images_task` decodes each picture, takes the perceptual hash from the full frame, and keeps only the image put through CLIP's own first resize (`ClipService.reduce_for_preprocess`: shortest side to 224 px, bicubic; an image that would be enlarged, such as a thin strip, is kept as it is), plus the preprocessed tensor when CLIP is already loaded. The resize that opens the preprocessing then leaves the image as it is, so the tensor is bit-identical to the original's. Before CLIP is loaded the resize is built from open_clip's config without the model (`_unloaded_first_resize`), which `tests/test_image_embedding_worker.py` holds to the transform a real load returns. Preloading 64 × 24 MP photos held 6.6 GB of RSS before, 0.5 GB after.
 
+**A CLIP load asks the hub nothing when its weights are cached.** Given the tag, open_clip's `hf_hub_download` asks Hugging Face for the checkpoint's metadata on every load, cached or not. So `ClipService._load` first looks the checkpoint up with `local_files_only=True` (`_cached_weights`, under the two names open_clip downloads, safetensors first) and loads a hit by its path. Only a miss (`LocalEntryNotFoundError`) goes to the network, by the tag, with an INFO line; any other lookup error fails the load. A path takes nothing from the tag, and this tag's preprocessing is open_clip's default, so both loads preprocess alike; `tests/test_image_embedding_worker.py` holds the two transforms equal.
+
+**A failed aesthetic-scorer load is tried again after a wait.** When `ImageEmbeddingTask._ensure_model` cannot load the scorer it holds it on `_aesthetic_hold`, a `RetryHold` (2 s doubling to a 300 s cap, jittered). While the hold lasts `_is_aesthetic_disabled` is true, so pictures are embedded without a score and `fetch_work` leaves out those that need only a score; the first pass after it loads the scorer again. Only a CLIP model with no scorer turns scoring off for the life of the process.
+
 **Image-embedding outcomes: a failing picture is held back, not reselected.** A failed picture keeps a `NULL` embedding, which is exactly what `fetch_work` selects, so a task that reported only the pictures it changed had its failures picked up again on the next sweep, seconds later. `ImageEmbeddingTask` now reports an outcome for every picture in its batch (*Task outcomes* above), and `MissingImageEmbeddingFinder.on_task_complete` settles each one:
 
 - `SUCCEEDED` and `FAILED_PERMANENT` clear the picture's hold; a success also clears the backend hold.
@@ -1418,7 +1426,7 @@ The holds are in memory and per finder, so a restart retries everything. Only `F
 - `""` is written only for a picture whose file loads and that the model left uncaptioned while it captioned others (`FAILED_PERMANENT`, `INFERENCE_ERROR`).
 - A cancel defers what it skipped (`DEFERRED`, `CANCELLED`).
 
-`MissingDescriptionFinder.on_task_complete` settles them as the embedding finder does (a per-picture `RetryHold`, a backend hold capped at `BACKEND_HOLD_CAP_S` = 60 s, held and registry-suppressed ids left out of the read, a success clearing both), with one difference: backend-down pictures are held one by one as well. A batch that one of its own pictures makes fail every time reads exactly like a backend that is down, and without the per-picture holds it would be the first batch the finder selects, and so the probe, for ever; with them the pictures' holds outgrow the backend hold (300 s against 60 s) and the probe moves on to the rest of the backlog.
+`MissingDescriptionFinder.on_task_complete` settles them as the embedding finder does (a per-picture `RetryHold`, a backend hold capped at `BACKEND_HOLD_CAP_S` = 60 s, held and registry-suppressed ids left out of the read, a success clearing both), with two differences. The backend hold is per engine: its key is the engine the batch captioned with (its sentinel's engine, else the active plugin), and `find_task` leaves only the held engines' pictures out of the read, so a request for an engine that works does not wait on one that is down. And backend-down pictures are held one by one as well. A batch that one of its own pictures makes fail every time reads exactly like a backend that is down, and without the per-picture holds it would be the first batch the finder selects, and so the probe, for ever; with them the pictures' holds outgrow the backend hold (300 s against 60 s) and the probe moves on to the rest of the backlog.
 
 **A description is written only over the one the batch read.** `DescriptionTask._write_descriptions` writes a picture only while its row still holds the description the picture was handed with, the value the inference was computed from; otherwise the picture is `DEFERRED` and its row is left alone. A batch can take minutes on a slow model, and a person's caption edit or request for another engine's caption is a write on the same single writer thread, so it is either already in the row when the batch's write compares or lands after it. The comparison has to be made by the write: a check made before queuing it misses an edit queued between the two. The write also needs a live row: a picture moved to the Scrapheap while the batch ran is `DEFERRED` as well and keeps its description. The finder and the "awaiting captions" count (`Vault._count_missing_descriptions`) select only pictures outside the Scrapheap that have a file (`describable_picture_clauses`, the rule tagging applies), so a picture is not captioned while it is in the Scrapheap, nor counted as awaiting one, and is captioned once it is restored.
 
@@ -1530,7 +1538,7 @@ A device with no NVML (`measurable: false`: Metal, ROCm) runs heavy work one at 
 - `Vault.stop` leaves the models where they are.
 - The ledger's NVML binding (`_GatedNvml`) answers from `nvidia-smi` (`SmiNvml`). `HardwareMonitor` and the GPU picker read through the same binding.
 
-The device calls made outside a lease are counted in flight with `cuda_checkpoint.enter_device_call`: NVML through the ledger, a search's query encode (on CPU copies while suspended, `InferenceEngine.query_services`), `TagTask`'s model preload and the planner's utilisation sample. A suspend waits for them to drain and turns new ones away. A drain or lock that times out is retried on the next pass; a failed checkpoint is not retried for that lease. The process is not suspended where the card cannot be measured or torch has no CUDA context. UVM and CUDA IPC memory cannot be checkpointed, and nothing in the server uses either; `expandable_segments` allocations restore fine.
+The device calls made outside a lease are counted in flight with `cuda_checkpoint.enter_device_call`: NVML through the ledger, a search's query encode (on CPU copies while suspended, `InferenceEngine.query_services`), `TagTask`'s model preload and the planner's utilisation sample. A suspend waits for them to drain and turns new ones away. A drain or lock that times out is retried on the next pass; a failed checkpoint is not retried for that lease. A driver that refuses the lock as unsupported (CUresult 801, WSL's libcuda) is treated as one without the API until a restart. The process is not suspended where the card cannot be measured or torch has no CUDA context. UVM and CUDA IPC memory cannot be checkpointed, and nothing in the server uses either; `expandable_segments` allocations restore fine.
 
 **Rollback:** `VRAM_ORCHESTRATION_ENFORCING = False` in `resources/arbiter.py` grants every request at once; decisions are still computed and logged. `CUDA_SUSPEND_ENABLED = False` in `resources/cuda_checkpoint.py` keeps the CUDA context on the card during training.
 
@@ -9185,6 +9193,27 @@ this commit indexes is brand new, so this is *always* the deferred path, never
 the immediate one — the existing background pipeline reconciles the assignment
 against a real detected face once extraction runs, on its own schedule, with no
 new code here to do it.
+
+**A write that sets a person on a picture whose faces already exist resolves it
+after its commit**, because extraction resolves a pending person only for the
+pictures it has just extracted. `resolve_pending_people_with_faces(vault,
+picture_ids, *, origin)` hands those of one write's pictures that hold a
+`pending_character_id` and at least one face row to
+`Vault._process_pending_character_assignments`, after `run_task` returns; a
+picture with no face row is left for extraction. Its callers: the folder
+structure commit's two passes; a duplicate merge's metadata union, through
+`apply_stack_verdict`, `apply_verdict_batch`, `keep_cover_only` and each
+auto-stack slice (`DedupAutoStackTask._apply`); and `announce_restore` when an
+undo, redo, batch undo or auto-stack revert wrote the pending person. The other
+writers set it only on a picture with no face row.
+
+**Start-up resolves a pending person a stop left behind.** Extraction commits
+its face rows and its pending-person match in two transactions, and a picture
+with face rows is never offered to extraction again, so a stop or crash between
+them would leave the person pending for good. `Vault.start` calls
+`reconcile_pending_people_with_faces(vault)` before the workers start: every
+picture holding a `pending_character_id` or a `PicturePendingPerson` row and at
+least one face row goes to `Vault._process_pending_character_assignments`.
 
 #### Nearest-ancestor-wins, tags are not exclusive
 

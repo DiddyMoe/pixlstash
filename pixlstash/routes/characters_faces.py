@@ -553,27 +553,31 @@ def create_router(server) -> APIRouter:
                     if face and face.character_id == character_id:
                         face.character_id = None
                         session.add(face)
+                        faces.append(face)
             session.flush()
-            session.refresh(face)
-            return faces
+            return [face.picture_id for face in faces]
 
         # Unlike the assign above, this handler does not expand to stacks, so the
         # snapshot covers exactly the requested pictures - plus the pictures of a
         # face-id-addressed request, resolved on the mutation's own session.
-        operation_log_service.run_recorded_metadata_task(
-            server.vault,
-            remove_faces_from_character,
-            character_id,
-            face_ids,
-            picture_ids,
-            op_type="characters.unassign",
-            picture_ids=picture_ids,
-            resolve_picture_ids=_picture_ids_for_faces(face_ids),
-            summary="Unassigned pictures from a character",
-            **operation_log_service.request_context(request),
+        unassigned_picture_ids, _operation = (
+            operation_log_service.run_recorded_metadata_task(
+                server.vault,
+                remove_faces_from_character,
+                character_id,
+                face_ids,
+                picture_ids,
+                op_type="characters.unassign",
+                picture_ids=picture_ids,
+                resolve_picture_ids=_picture_ids_for_faces(face_ids),
+                summary="Unassigned pictures from a character",
+                **operation_log_service.request_context(request),
+            )
         )
 
-        server.vault.db.run_task(Picture.clear_field, picture_ids, "text_embedding")
+        server.vault.db.run_task(
+            Picture.clear_field, unassigned_picture_ids, "text_embedding"
+        )
         server.vault.notify(
             EventType.CHANGED_CHARACTERS, {"origin_client_id": origin_client_id}
         )
