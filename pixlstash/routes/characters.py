@@ -1164,28 +1164,34 @@ def create_router(server) -> APIRouter:
                 payload["project_ids"] = character_project_ids(session, id)
                 return (payload, local_project_membership_updated)
 
-            char, project_membership_updated = await run_in_threadpool(
-                server.vault.db.run_task,
-                alter_char,
-                id,
-                name,
-                description,
-                thumbnail_picture_id,
-                priority=DBPriority.IMMEDIATE,
-            )
-            server.vault.notify(
-                EventType.CHANGED_CHARACTERS,
-                {"origin_client_id": origin_client_id},
-            )
-            if project_membership_updated:
-                server.vault.notify(
-                    EventType.CHANGED_PICTURES,
-                    {
-                        "source": "ui",
-                        "origin_client_id": origin_client_id,
-                        "change_kind": "updated",
-                    },
+            def alter_and_announce():
+                # Notify in the worker: a cancelled await skips the code after it.
+                result = server.vault.db.run_task(
+                    alter_char,
+                    id,
+                    name,
+                    description,
+                    thumbnail_picture_id,
+                    priority=DBPriority.IMMEDIATE,
                 )
+                server.vault.notify(
+                    EventType.CHANGED_CHARACTERS,
+                    {"origin_client_id": origin_client_id},
+                )
+                if result[1]:
+                    server.vault.notify(
+                        EventType.CHANGED_PICTURES,
+                        {
+                            "source": "ui",
+                            "origin_client_id": origin_client_id,
+                            "change_kind": "updated",
+                        },
+                    )
+                return result
+
+            char, project_membership_updated = await run_in_threadpool(
+                alter_and_announce
+            )
 
         except KeyError:
             raise HTTPException(status_code=404, detail="Character not found")
