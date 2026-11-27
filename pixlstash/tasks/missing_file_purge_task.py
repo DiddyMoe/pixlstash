@@ -17,11 +17,23 @@ from pixlstash.utils.sql_chunking import chunked
 logger = get_logger(__name__)
 
 
+def file_is_present(path: str) -> bool:
+    """Whether a picture's file is present, as the reference-folder scan sees it.
+
+    ``lexists``, not ``isfile``: the scan's walk lists a symlinked file, a
+    dangling one included, so it keeps the row of a picture whose path is a
+    dangling link. Such a link usually points into a drive or share that is
+    not mounted right now, and a purge writes ``file_removed=True``, which
+    bars the path from restore and re-import.
+    """
+    return os.path.lexists(path)
+
+
 class MissingFilePurgeTask(BaseTask):
     """Low-priority task that removes picture records whose files no longer exist.
 
-    For each picture in the batch whose file is absent from the filesystem the
-    task:
+    For each picture in the batch whose file is absent from the filesystem
+    (:func:`file_is_present`) the task:
 
     1. Inserts a row into ``deleted_file_log`` (if one does not already exist
        for that ``file_path``).
@@ -61,7 +73,7 @@ class MissingFilePurgeTask(BaseTask):
                 continue
             try:
                 resolved = ImageUtils.resolve_picture_path(image_root, pic.file_path)
-                if os.path.isfile(resolved):
+                if file_is_present(resolved):
                     continue
                 if file_location_is_unreachable(resolved):
                     # The file is absent because its LOCATION is absent - an
@@ -356,7 +368,7 @@ class MissingFilePurgeTask(BaseTask):
                     db_pic.file_path,
                 )
                 continue
-            if os.path.isfile(
+            if file_is_present(
                 ImageUtils.resolve_picture_path(image_root, pic.file_path)
             ):
                 logger.info(

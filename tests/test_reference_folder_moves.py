@@ -693,7 +693,10 @@ def test_the_purge_sweep_keeps_a_row_repointed_after_it_looked(server, tmp_path)
     )
 
 
-def test_the_purge_sweep_keeps_a_row_whose_file_came_back(server, tmp_path):
+@pytest.mark.parametrize("comes_back_as", ["the file", "a link to an unmounted drive"])
+def test_the_purge_sweep_keeps_a_row_whose_file_came_back(
+    server, tmp_path, comes_back_as
+):
     """A file back at its path by the time of the purge keeps its row.
 
     The row is untouched, so only a fresh look at the disk on the writer shows
@@ -715,9 +718,13 @@ def test_the_purge_sweep_keeps_a_row_whose_file_came_back(server, tmp_path):
     os.makedirs(os.path.dirname(parked))
     os.rename(original, parked)
 
-    database = _WriteBetween(
-        server.vault.db, "_purge_pictures", lambda: os.rename(parked, original)
-    )
+    def _come_back():
+        if comes_back_as == "the file":
+            os.rename(parked, original)
+        else:
+            os.symlink(str(tmp_path / "unmounted" / "mira_042.png"), original)
+
+    database = _WriteBetween(server.vault.db, "_purge_pictures", _come_back)
     result = MissingFilePurgeTask(database=database, pictures=snapshot)._run_task()
 
     assert database.fired, "the file must come back inside the window under test"

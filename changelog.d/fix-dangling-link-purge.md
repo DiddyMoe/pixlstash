@@ -1,0 +1,1 @@
+- Fixed: pictures behind a link to an unplugged drive are no longer removed.
