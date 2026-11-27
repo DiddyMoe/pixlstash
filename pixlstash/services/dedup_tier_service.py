@@ -475,15 +475,21 @@ class DedupScope:
         # "Find duplicates in this folder" entry could match far more than the
         # folder it named. The literal path is still compared exactly on
         # import_source_folder. ``scope_id`` was already stripped of trailing
-        # separators and rejected if that left it empty (__post_init__).
+        # separators and rejected if that left it empty (__post_init__). A
+        # separator, either one, must follow the prefix, so "/a/b" does not
+        # take "/a/bc".
         prefix = str(self.scope_id)
         pattern = (
             prefix.replace(LIKE_ESCAPE_CHAR, LIKE_ESCAPE_CHAR * 2)
             .replace("%", f"{LIKE_ESCAPE_CHAR}%")
             .replace("_", f"{LIKE_ESCAPE_CHAR}_")
         )
-        return (Picture.import_source_folder == prefix) | (
-            Picture.file_path.like(f"{pattern}%", escape=LIKE_ESCAPE_CHAR)
+        return (
+            (Picture.import_source_folder == prefix)
+            | Picture.file_path.like(f"{pattern}/%", escape=LIKE_ESCAPE_CHAR)
+            | Picture.file_path.like(
+                f"{pattern}{LIKE_ESCAPE_CHAR * 2}%", escape=LIKE_ESCAPE_CHAR
+            )
         )
 
     def as_dict(self) -> dict[str, Any]:

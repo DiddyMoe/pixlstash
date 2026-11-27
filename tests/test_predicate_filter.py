@@ -579,11 +579,22 @@ def test_file_path_prefix_subtree(session):
     direct = _add_picture(session, file_path="/ref/photos/a.jpg")
     nested = _add_picture(session, file_path="/ref/photos/sub/b.jpg")
     _add_picture(session, file_path="/other/c.jpg")
+    _add_picture(session, file_path="/ref/photos2/d.jpg")  # sibling prefix excluded
 
     flt = PredicateFilter(
         file_path_prefix="/ref/photos", file_path_prefix_children_only=False
     )
     _assert_matches_agrees(session, flt, {direct.id, nested.id})
+
+
+def test_file_path_prefix_subtree_matches_an_underscore_literally(session):
+    inside = _add_picture(session, file_path="/ref/ph_to/a.jpg")
+    _add_picture(session, file_path="/ref/phXto/b.jpg")
+
+    flt = PredicateFilter(
+        file_path_prefix="/ref/ph_to", file_path_prefix_children_only=False
+    )
+    _assert_matches_agrees(session, flt, {inside.id})
 
 
 def test_import_source_folder(session):

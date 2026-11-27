@@ -419,7 +419,7 @@ def _duplicate_scope(facts: "_LibraryFacts", left: str, right: str) -> Optional[
       unscoped queue is the honest thing to open.
 
     Relative paths are refused outright: the queue's folder predicate is
-    ``file_path LIKE '<prefix>%'`` against absolute stored paths, so a relative
+    ``file_path LIKE '<prefix>/%'`` against absolute stored paths, so a relative
     ancestor matches nothing and the queue would be silently empty.
     """
     if not (os.path.isabs(left) and os.path.isabs(right)):
@@ -434,13 +434,14 @@ def _duplicate_scope(facts: "_LibraryFacts", left: str, right: str) -> Optional[
         return None
 
     pair = len(facts.by_folder[left]) + len(facts.by_folder[right])
-    # Measured with the QUEUE's own predicate, which is `file_path LIKE
-    # '<prefix>%'` with NO separator (`DedupScope.picture_predicate`). Counting
-    # a separator-bounded sub-tree instead is tidier and wrong: `/lib-archive`
-    # is outside `/lib` by that arithmetic and inside the scope the owner is
-    # handed, so a prefix-sibling folder walked straight through the ceiling.
+    # Measured with the QUEUE's own rule (`DedupScope.picture_predicate`): the
+    # folder and every folder below it, with a separator after the prefix, so
+    # `/lib-archive` is outside `/lib` here exactly as it is outside the scope
+    # the owner is handed.
     under = sum(
-        len(ids) for folder, ids in facts.by_folder.items() if folder.startswith(common)
+        len(ids)
+        for folder, ids in facts.by_folder.items()
+        if folder == common or folder.startswith((common + "/", common + "\\"))
     )
     return common if pair and under <= pair * SCOPE_MAX_WIDENING else None
 

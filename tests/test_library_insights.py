@@ -720,19 +720,30 @@ def test_the_ordinary_grid_keeps_a_folder_stack_whose_cover_is_elsewhere(
     assert f"{LIB}/_unsorted" in grid.json()[0]["file_path"]
 
 
-def test_a_prefix_sibling_folder_does_not_walk_through_the_ceiling(server):
-    """The queue scopes on `LIKE '<prefix>%'` with no separator, so `/lib` also
-    catches `/lib-archive`. Measuring a separator-bounded sub-tree instead let
-    an unrelated folder's pictures into a scope the ceiling had cleared."""
+def test_a_prefix_sibling_folder_is_outside_the_scope_and_the_ceiling(server):
+    """`/lib-archive` is not inside `/lib`: the ceiling does not count it, and
+    the queue the finding opens holds the pair's pictures and not the
+    archive's."""
+    shared = insights.OVERLAP_MIN_PICTURES
     _seed(
         server,
-        _copies("lib/selects", "lib/final", shared=insights.OVERLAP_MIN_PICTURES)
-        + _solo("lib-archive", insights.OVERLAP_MIN_PICTURES * 20, "arch"),
+        _copies("lib/selects", "lib/final", shared=shared)
+        + _solo("lib-archive", shared * 20, "arch"),
     )
 
     overlap = _findings(server)["overlapping_folders"]
     assert overlap["state"] == "todo"
-    assert overlap["action"]["kind"] == "duplicates"
+    assert overlap["action"]["kind"] == "duplicates_in_folder"
+    assert overlap["action"]["path"] == os.path.join(LIB, "lib")
+
+    scope = DedupScope(scope_type=ScopeType.FOLDER, scope_id=overlap["action"]["path"])
+    in_scope = _run(
+        server,
+        lambda session: session.exec(
+            select(func.count()).select_from(Picture).where(scope.picture_predicate())
+        ).one(),
+    )
+    assert in_scope == 2 * shared
 
 
 def test_a_relative_path_never_becomes_a_queue_scope(server):

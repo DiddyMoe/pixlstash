@@ -2294,6 +2294,24 @@ def test_a_folder_scope_is_normalised_to_one_scope_key():
     assert trailing.scope_id == "/photos/2026"
 
 
+def test_a_windows_folder_scope_stops_at_a_backslash(server):
+    inside, _sibling = _seed(
+        server,
+        [
+            {"file_path": "C:\\photos\\2026\\a.png"},
+            {"file_path": "C:\\photos\\2026-old\\b.png"},
+        ],
+    )
+    scope = DedupScope(scope_type=ScopeType.FOLDER, scope_id="C:\\photos\\2026")
+    matched = _run(
+        server,
+        lambda session: session.exec(
+            select(Picture.id).where(scope.picture_predicate())
+        ).all(),
+    )
+    assert matched == [inside]
+
+
 # ── stack units: the deck's depth is the STACK's, not the group's ─────────────
 
 

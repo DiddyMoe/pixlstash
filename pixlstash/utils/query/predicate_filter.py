@@ -482,7 +482,7 @@ class PredicateFilter(BaseModel):
     # ``find()`` browses a folder and shows direct children only (separator-aware,
     # LIKE-escaped).  The stats sidebar instead aggregates the whole sub-tree under a
     # prefix.  ``True`` selects the children-only behaviour; ``False`` the sub-tree
-    # ``startswith`` behaviour.
+    # behaviour (separator-aware and LIKE-escaped too).
     file_path_prefix_children_only: bool = True
     import_source_folder: Optional[str] = None
     # Added at or after this time (the Inbox's period, see ``inbox_cutoff``).
@@ -543,9 +543,6 @@ class PredicateFilter(BaseModel):
         target = Picture
         if self.file_path_prefix is None:
             return []
-        if not self.file_path_prefix_children_only:
-            # Sub-tree match used by the stats sidebar.
-            return [target.file_path.startswith(self.file_path_prefix)]
         # Normalise to always end with a path separator so that a prefix like
         # "/ref/photos" does not accidentally match "/ref/photos2/a.jpg".  Support
         # both Unix ("/") and Windows ("\") separators.
@@ -555,6 +552,9 @@ class PredicateFilter(BaseModel):
             prefix = self.file_path_prefix + os.sep
         # Escape LIKE special characters in the literal prefix.
         escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        if not self.file_path_prefix_children_only:
+            # Sub-tree match used by the stats sidebar.
+            return [target.file_path.like(escaped + "%", escape="\\")]
         # Only show direct children - exclude files that have another path separator
         # after the prefix (i.e. files in sub-directories).  Check for both "/" and
         # "\" to handle all platforms.
