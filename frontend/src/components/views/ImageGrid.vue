@@ -6355,7 +6355,7 @@ watch(
     gridReady.value = false;
     emptyStateDelayPassed.value = false;
     if (preserveScrollOnNextFetch.value && scrollWrapper.value) {
-      pendingScrollTop.value = scrollWrapper.value.scrollTop;
+      recordScrollPlace();
     } else {
       pendingScrollTop.value = null;
     }
@@ -6953,6 +6953,7 @@ const {
   fetchAllGridImages,
   fetchAllPicturesCount,
   debouncedFetchAllGridImages,
+  recordScrollPlace,
 } = useGridFetch(
   {
     allGridImages,

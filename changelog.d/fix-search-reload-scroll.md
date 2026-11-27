@@ -1,0 +1,1 @@
+- Fixed: a search opened after a reload starts at the top of its results.

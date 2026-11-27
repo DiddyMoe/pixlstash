@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { ref, reactive, effectScope, customRef, toRaw } from "vue";
+import { ref, reactive, effectScope, customRef, toRaw, nextTick } from "vue";
 import { setActivePinia, createPinia } from "pinia";
 import { useSortStore } from "../stores/useSortStore.js";
 import { useFilterStore } from "../stores/useFilterStore.js";
@@ -1437,4 +1437,77 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
       }
     },
   );
+});
+
+describe("useGridFetch: a re-read's scroll place stays with its view", () => {
+  beforeEach(() => {
+    searchPictures.mockReset();
+  });
+
+  // A scroller whose scrollTop writes are recorded; tall enough that no
+  // restore is clamped.
+  function scrollView(refs, top) {
+    const view = { top, writes: [] };
+    refs.scrollWrapper.value = {
+      get scrollTop() {
+        return view.top;
+      },
+      set scrollTop(value) {
+        view.top = value;
+        view.writes.push(value);
+      },
+      scrollHeight: 1e7,
+      clientHeight: 100,
+      clientWidth: 400,
+    };
+    return view;
+  }
+
+  // An answer that lands with the view at the top, as a replaced list leaves
+  // it: only a restore moves it.
+  function answerAtTop(view, rows) {
+    return () => {
+      view.top = 0;
+      return Promise.resolve(rows);
+    };
+  }
+
+  it("opens a search started during a re-read that keeps the scroll at the top", async () => {
+    const held = deferred();
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 1200);
+    searchPictures
+      .mockReturnValueOnce(held.promise)
+      .mockImplementationOnce(answerAtTop(view, [{ id: 50 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    refs.preserveScrollOnNextFetch.value = true;
+    const reread = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(searchPictures).toHaveBeenCalledTimes(1));
+    refs.preserveScrollOnNextFetch.value = false;
+    useSearchStore().searchQuery = "tea";
+    await grid.fetchAllGridImages({ force: true });
+    held.resolve([{ id: 1 }]);
+    await reread;
+    await nextTick();
+
+    expect(refs.allGridImages.value.map((row) => row.id)).toEqual([50]);
+    expect(view.writes).toEqual([]);
+  });
+
+  it("puts the view back after a re-read of the same view", async () => {
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 800);
+    searchPictures.mockImplementationOnce(answerAtTop(view, [{ id: 1 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    // As the gridVersion refresh does: record, clear the flag, re-read.
+    refs.preserveScrollOnNextFetch.value = true;
+    grid.recordScrollPlace();
+    refs.preserveScrollOnNextFetch.value = false;
+    await grid.fetchAllGridImages({ force: true });
+    await nextTick();
+
+    expect(view.writes).toEqual([800]);
+  });
 });

@@ -703,6 +703,15 @@ export function useGridFetch(
     cancelGridLoad();
   });
 
+  // The place a re-read that keeps the scroll puts the view back to. It
+  // belongs to the view it was recorded in: a load for another view drops it.
+  function recordScrollPlace() {
+    pendingScrollTop.value = {
+      top: scrollWrapper.value.scrollTop,
+      key: buildGridFetchKey(),
+    };
+  }
+
   /**
    * Load the grid for the current view.
    *
@@ -725,7 +734,7 @@ export function useGridFetch(
       pendingScrollTop.value === null &&
       scrollWrapper.value
     ) {
-      pendingScrollTop.value = scrollWrapper.value.scrollTop;
+      recordScrollPlace();
     }
     const fetchKey = buildGridFetchKey();
     const current = inFlight;
@@ -1631,8 +1640,11 @@ export function useGridFetch(
     if (!initialRender.value) {
       updateVisibleThumbnails();
     }
-    if (pendingScrollTop.value !== null && scrollWrapper.value) {
-      const targetTop = pendingScrollTop.value;
+    const place = pendingScrollTop.value;
+    if (place !== null && place.key !== fetchKey) {
+      pendingScrollTop.value = null;
+    } else if (place !== null && scrollWrapper.value) {
+      const targetTop = place.top;
       pendingScrollTop.value = null;
       nextTick(() => {
         if (!scrollWrapper.value) return;
@@ -1761,5 +1773,6 @@ export function useGridFetch(
     fetchAllGridImages,
     fetchAllPicturesCount,
     debouncedFetchAllGridImages,
+    recordScrollPlace,
   };
 }
