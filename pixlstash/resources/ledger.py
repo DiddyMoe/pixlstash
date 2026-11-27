@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -26,6 +25,7 @@ from types import SimpleNamespace
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.resources import cuda_checkpoint
+from pixlstash.utils.model_utils import loaded_module
 
 try:
     import psutil
@@ -424,7 +424,7 @@ def pixlstash_usage_mb() -> int | None:
     None when torch is not loaded or has no CUDA device: there is nothing of
     ours on a card then.
     """
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     try:
         if torch is None or not torch.cuda.is_available():
             return None
@@ -446,7 +446,7 @@ def ram() -> dict:
 
 
 def _accelerator_in_use() -> bool:
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     if torch is None:
         return False
     try:

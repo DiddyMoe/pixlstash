@@ -1,5 +1,4 @@
 import math
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -14,6 +13,7 @@ from pixlstash.tasks.task_outcome import (
     id_sample,
     read_outcomes,
 )
+from pixlstash.utils.model_utils import loaded_module
 
 if TYPE_CHECKING:
     from pixlstash.tasks.task_type import TaskType
@@ -736,7 +736,7 @@ class WorkPlanner:
             active = list(self._pass_stats.values())
         if not active or self._gpu_util_unavailable:
             return
-        torch = sys.modules.get("torch")
+        torch = loaded_module("torch")
         if torch is None:
             # Not sticky: torch arrives with the first model load, and a burst
             # that started before it simply has fewer samples.

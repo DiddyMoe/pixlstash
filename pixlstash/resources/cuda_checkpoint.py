@@ -31,6 +31,7 @@ import sys
 import threading
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.model_utils import loaded_module
 
 logger = get_logger(__name__)
 
@@ -98,7 +99,7 @@ def generation() -> int:
 def available() -> bool:
     """Whether :func:`suspend` can work now: enabled, the API is there and
     this process has a CUDA context to suspend."""
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     if not CUDA_SUSPEND_ENABLED or _failed or torch is None:
         return False
     try:

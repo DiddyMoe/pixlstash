@@ -10,7 +10,6 @@ machine.
 """
 
 import subprocess
-import sys
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.accelerator import (
@@ -21,6 +20,7 @@ from pixlstash.utils.accelerator import (
     is_accelerated,
     is_apple_silicon,
 )
+from pixlstash.utils.model_utils import loaded_module
 
 logger = get_logger(__name__)
 
@@ -161,7 +161,7 @@ def is_vram_oom(error: BaseException) -> bool:
     Returns:
         ``True`` for a GPU OOM, which callers treat as transient and retry.
     """
-    torch = sys.modules.get("torch")
+    torch = loaded_module("torch")
     oom_type = getattr(torch, "OutOfMemoryError", None) if torch else None
     seen = set()
     current: BaseException | None = error

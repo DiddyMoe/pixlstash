@@ -272,7 +272,9 @@ This is explicitly the exception the import policy in `CLAUDE.md` allows ("to re
 
 The first import at a model entry point (`load_sentence_transformer`, `ClipService`) and in the two plugin loaders runs under `MODEL_CONSTRUCTION_LOCK`: `accelerate`'s modules import each other, and two threads importing them at once hand one thread a half-initialised module.
 
-`utils/vram_utils.empty_cuda_cache()` is the shared cache-flush helper and deliberately reads `sys.modules.get("torch")` instead of importing: if torch was never imported, the process cannot hold CUDA allocations, so there is nothing to free and importing torch to learn that would cost seconds on every teardown.
+`utils/vram_utils.empty_cuda_cache()` is the shared cache-flush helper and deliberately asks `loaded_module("torch")` instead of importing: if torch was never imported, the process cannot hold CUDA allocations, so there is nothing to free and importing torch to learn that would cost seconds on every teardown.
+
+Code that wants an ML package only if something else already loaded it asks `utils/model_utils.loaded_module(name)`, not `sys.modules`: while another thread is still importing torch, its `sys.modules` entry is the half-built module, and `loaded_module` answers None for it.
 
 Modules **off** the server import path (`tagger_plugins/wd14.py`, `tagger_plugins/joycaption.py`, `image_loading_dataset_prepper.py`) may still import ML at module scope; they are only ever reached through function-local imports. `image_loading_dataset_prepper.py` in particular *must* keep its module-scope `torch`, since it subclasses `torch.utils.data.Dataset`.
 
