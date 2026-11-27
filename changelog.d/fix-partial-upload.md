@@ -1,0 +1,1 @@
+- Fixed: one unreadable file no longer fails a whole upload.

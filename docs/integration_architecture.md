@@ -2653,8 +2653,8 @@ so no summary line can overstate what happened):
 
 | Endpoint | Fields |
 |---|---|
-| `GET /pictures/import/status?task_id=…` | `imported_count`, `duplicate_count`, `scrapheaped_count`, `scrapheaped_picture_ids[]`; per-file `results[].status` is `success` / `duplicate` / `scrapheaped` |
-| `GET /pictures/import/staging/{id}/status` | the same three plus `failed_count` and `cancelled_count`, and live per-file `outcomes[]` (below) |
+| `GET /pictures/import/status?task_id=…` | `imported_count`, `duplicate_count`, `scrapheaped_count`, `failed_count`, `scrapheaped_picture_ids[]`; per-file `results[].status` is `success` / `duplicate` / `scrapheaped` / `failed` |
+| `GET /pictures/import/staging/{id}/status` | the same four plus `cancelled_count`, and live per-file `outcomes[]` (below) |
 
 **Per-file outcomes on the staging path (#2512).** Each `file` part of `POST .../staging/{id}/files` may carry a
 `key` form field (same order); the status then returns `outcomes[]`, `{key, outcome, picture_id}` per file in the
@@ -2792,7 +2792,12 @@ removed by the next reaper run once it is older than the idle TTL.
 The one-shot `POST /pictures/import` (the ComfyUI node's route) has none of the
 above. It shares only the caption limit: a caption over 1 MiB, sent or inside a
 zip, is left out of the import (that route answers with a task id and no
-`skipped[]`).
+`skipped[]`). A file it cannot import (content it cannot read as a picture or a
+video, or a failed write) is left out and the other files still import: its
+`results[]` entry has `status: "failed"`, the uploaded name in `file` and a
+fixed sentence in `error`, and it counts in `failed_count`. When every file
+fails, the import's `status` is `failed` and its `error` names up to five of
+them with their reasons.
 
 
 ---
