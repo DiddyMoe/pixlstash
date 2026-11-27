@@ -691,7 +691,9 @@
                   :readonly="Boolean(busy)"
                   :class="{ 'tm-offer-refused': Boolean(busy) }"
                   @enter="saveAsNew(run.offer)"
-                  @keydown.esc="backFromName(run.offer)"
+                  @keydown.esc="
+                    !isImeComposing($event) && backFromName(run.offer)
+                  "
                   @keydown.stop
                 />
                 <div class="tm-offer-acts">
@@ -841,6 +843,7 @@ import AppInput from "../widgets/AppInput.vue";
 import ComfyuiIcon from "../widgets/ComfyuiIcon.vue";
 import Tooltip from "../widgets/Tooltip.vue";
 import RunAnywayDialog from "./RunAnywayDialog.vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const root = ref(null);
 

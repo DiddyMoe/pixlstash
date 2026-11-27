@@ -31,7 +31,7 @@
             class="browse-create-input"
             :error="Boolean(createFolderError)"
             @enter="createFolder"
-            @keydown.esc.stop="cancelCreateFolder"
+            @keydown.esc.stop="!isImeComposing($event) && cancelCreateFolder()"
           />
           <AppButton
             variant="primary"
@@ -127,6 +127,7 @@ import { errorDetail } from "../../utils/apiError";
 import AppButton from "../widgets/AppButton.vue";
 import AppDialog from "../widgets/AppDialog.vue";
 import AppInput from "../widgets/AppInput.vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   open: { type: Boolean, default: false },

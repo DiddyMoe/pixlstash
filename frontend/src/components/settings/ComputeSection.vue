@@ -18,6 +18,7 @@ import SettingsRow from "./SettingsRow.vue";
 import SettingsTwoCol from "./SettingsTwoCol.vue";
 import { VSlider, VSwitch, VIcon, VProgressLinear } from "vuetify/components";
 import { errorDetail } from "../../utils/apiError";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -325,6 +326,13 @@ async function applyServer() {
     progress.value = null;
     await refresh();
   }
+}
+
+// With the password shown the field is plain text, where an IME can compose.
+function onOwnerPasswordEnter(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  applyServer();
 }
 
 const install = (accel) => guarded(() => desktop.installAccelerator(accel));
@@ -710,7 +718,7 @@ onUnmounted(() => {
               placeholder="Password (min 8 characters)"
               autocomplete="new-password"
               :disabled="busy"
-              @keydown.enter.prevent="applyServer"
+              @keydown.enter="onOwnerPasswordEnter"
             />
             <button
               type="button"

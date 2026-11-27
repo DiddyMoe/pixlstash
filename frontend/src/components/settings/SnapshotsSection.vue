@@ -21,6 +21,7 @@ import AppButton from "../widgets/AppButton.vue";
 import Tooltip from "../widgets/Tooltip.vue";
 import SettingsSection from "./SettingsSection.vue";
 import { errorDetail } from "../../utils/apiError";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -300,7 +301,7 @@ function handleRestore(cp) {
               aria-label="Snapshot label"
               class="snapshot-edit-field"
               @enter="saveLabel(cp.id)"
-              @keydown.esc="cancelEditing(cp.id)"
+              @keydown.esc="!isImeComposing($event) && cancelEditing(cp.id)"
               @blur="saveLabel(cp.id)"
             />
             <div v-if="saveLabelError[cp.id]" class="snapshot-inline-error">

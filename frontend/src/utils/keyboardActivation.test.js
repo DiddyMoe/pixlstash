@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { activateOnEnterOrSpace } from "./keyboardActivation.js";
+import {
+  activateOnEnterOrSpace,
+  isImeComposing,
+} from "./keyboardActivation.js";
 
 function keyboardEvent(target, key, init = {}) {
   return {
@@ -58,5 +61,19 @@ describe("activateOnEnterOrSpace", () => {
 
     expect(activateOnEnterOrSpace(event)).toBe(false);
     expect(event.preventDefault).not.toHaveBeenCalled();
+  });
+});
+
+describe("isImeComposing", () => {
+  it("is true for keyCode 229 with isComposing false", () => {
+    // Safari's keydown that ends a composition.
+    const event = new KeyboardEvent("keydown", { key: "Enter", keyCode: 229 });
+    expect(event.isComposing).toBe(false);
+    expect(isImeComposing(event)).toBe(true);
+    expect(
+      isImeComposing(
+        new KeyboardEvent("keydown", { key: "Enter", keyCode: 13 }),
+      ),
+    ).toBe(false);
   });
 });

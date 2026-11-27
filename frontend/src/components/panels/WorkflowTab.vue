@@ -1141,8 +1141,8 @@
             placeholder="Name of the new workflow"
             aria-label="Name of the new workflow"
             data-testid="wftab-new-name"
-            @keydown.enter.prevent="saveAsNew"
-            @keydown.esc.stop.prevent="stopNaming"
+            @keydown.enter="onNameKey"
+            @keydown.esc.stop="onNameKey"
           />
           <div class="wftab-draft__verbs">
             <AppButton
@@ -1521,6 +1521,7 @@ import {
 } from "../../utils/workflowPins";
 import { slotOf, whole } from "../../utils/workflowChanges";
 import { pictureCount } from "../../utils/workflowSets";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 import {
   countChanges,
   loraRemoved,
@@ -3917,6 +3918,13 @@ async function stopNaming() {
   saveAsNewButton.value?.focus?.();
 }
 const saveAsNewButton = ref(null);
+
+function onNameKey(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  if (event.key === "Enter") saveAsNew();
+  else stopNaming();
+}
 
 /**
  * Save as new…: the same graph stored as a new workflow under the name

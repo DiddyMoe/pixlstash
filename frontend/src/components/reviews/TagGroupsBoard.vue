@@ -98,8 +98,8 @@
             type="text"
             placeholder="Group name"
             aria-label="New group name"
-            @keydown.enter.prevent="commitNew"
-            @keydown.escape.stop.prevent="cancelNew"
+            @keydown.enter="onNewKey"
+            @keydown.escape.stop="onNewKey"
             @blur="cancelNew"
           />
         </div>
@@ -321,6 +321,7 @@ import { listGroupTags } from "../../api/tagGroups";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useTagGroupsStore } from "../../stores/useTagGroupsStore";
 import { onMenuKeydown } from "../../utils/menuKeyboard.js";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 import { debounce } from "../../utils/utils";
 import AppButton from "../widgets/AppButton.vue";
 import Tooltip from "../widgets/Tooltip.vue";
@@ -717,6 +718,13 @@ function cancelNew() {
   if (!creating.value) return;
   creating.value = false;
   newName.value = "";
+}
+
+function onNewKey(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  if (event.key === "Enter") commitNew();
+  else cancelNew();
 }
 
 // The field closes only once the group exists: a refused name (a duplicate)

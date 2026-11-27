@@ -183,6 +183,7 @@ import {
 import { VIcon } from "vuetify/components";
 
 import { useModelShelfStore } from "../../stores/useModelShelfStore";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 import StackLayer from "./StackLayer.vue";
 
 defineOptions({ inheritAttrs: false });
@@ -347,6 +348,12 @@ function footAct() {
 }
 
 function onKeydown(event) {
+  // Every key, and none reaches the host, which would take the Escape as a
+  // cancel and the Enter as a commit.
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   const list = matches.value;
   if (event.key === "ArrowDown") {
     // The one gesture that OPENS the menu: with it shut, the first press asks

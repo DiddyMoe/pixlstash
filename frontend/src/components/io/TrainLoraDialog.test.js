@@ -355,6 +355,24 @@ describe("TrainLoraDialog", () => {
     expect(inTrigger.defaultPrevented).toBe(false);
   });
 
+  it("leaves an Enter that commits an input method's candidate to the IME", async () => {
+    const { wrapper } = await openDialog(
+      { type: "character", id: 4, name: "Grandad" },
+      dataset(),
+    );
+    await wrapper.find('[data-testid="tld-advanced"]').trigger("click");
+    for (const composing of [{ isComposing: true }, { keyCode: 229 }]) {
+      const inField = new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+        cancelable: true,
+        ...composing,
+      });
+      wrapper.find('input[aria-label="Steps"]').element.dispatchEvent(inField);
+      expect(inField.defaultPrevented).toBe(false);
+    }
+  });
+
   it("edits the sample prompts and keeps at least one", async () => {
     const { wrapper, store } = await openDialog(
       { type: "character", id: 4, name: "Grandad" },

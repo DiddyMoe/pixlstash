@@ -106,15 +106,13 @@
           v-model="urlInput"
           class="pf-url-input"
           placeholder="https://..."
-          @keydown.enter="addUrl"
-          @keydown.escape="showUrlForm = false"
+          @keydown="onUrlKeydown"
         />
         <input
           v-model="urlTitle"
           class="pf-url-input"
           placeholder="Label (optional)"
-          @keydown.enter="addUrl"
-          @keydown.escape="showUrlForm = false"
+          @keydown="onUrlKeydown"
         />
         <div class="pf-url-form-actions">
           <AppButton size="sm" @click="showUrlForm = false"> Cancel </AppButton>
@@ -152,6 +150,7 @@ import AppButton from "../widgets/AppButton.vue";
 import Tooltip from "../widgets/Tooltip.vue";
 import { API_BASE_URL } from "../../utils/apiClient";
 import { isOwnShareCopyDrop } from "../../utils/shareDrag.js";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 const props = defineProps({
   projectId: { type: Number, required: true },
   backendUrl: { type: String, default: () => API_BASE_URL },
@@ -307,6 +306,12 @@ async function submitUrl() {
 // fields are only cleared after the await, so without this a second Enter or a
 // double-click on Add posts the same URL twice.
 const { pending: addingUrl, run: addUrl } = useSubmitGuard(submitUrl);
+
+function onUrlKeydown(event) {
+  if (isImeComposing(event)) return;
+  if (event.key === "Enter") addUrl();
+  else if (event.key === "Escape") showUrlForm.value = false;
+}
 
 function urlLabel(file) {
   const name = file.original_filename || "";

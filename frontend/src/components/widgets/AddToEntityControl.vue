@@ -64,7 +64,7 @@
             type="text"
             :aria-label="config.searchLabel"
             :placeholder="config.searchPlaceholder"
-            @keydown.enter.prevent="onSearchEnter"
+            @keydown.enter="onSearchEnter"
           />
         </div>
 
@@ -291,6 +291,7 @@ import { ancestorsOf } from "../../utils/setTree.js";
 import { errorDetail } from "../../utils/apiError";
 import { API_BASE_URL } from "../../utils/apiClient";
 import Tooltip from "./Tooltip.vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 const props = defineProps({
   // 'set' | 'project' | 'character' | 'face'.
   //
@@ -869,7 +870,9 @@ function requestCreate() {
 // Enter in the search box activates the empty-state create row when the query
 // matches nothing; with matches on screen it stays inert (clicking a row is
 // the assignment gesture, and Enter must not create a duplicate person).
-function onSearchEnter() {
+function onSearchEnter(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
   if (!showEmptyCreateRow.value) return;
   requestCreate();
 }
@@ -986,6 +989,10 @@ function navigableItems() {
 
 function onMenuKeydown(event) {
   if (!menuOpen.value) return;
+  if (isImeComposing(event)) {
+    if (event.key === "Escape") event.stopPropagation();
+    return;
+  }
   const key = event.key;
   const inSearch = event.target === searchInputRef.value;
 

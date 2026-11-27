@@ -20,6 +20,7 @@ import {
 import { VIcon } from "vuetify/components";
 import AppButton from "./AppButton.vue";
 import { useWhatsChangedStore } from "../../stores/useWhatsChangedStore";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   /**
@@ -218,6 +219,7 @@ watch(
 
 function onKeydown(event) {
   if (!step.value) return;
+  if (isImeComposing(event)) return;
   if (event.key === "Escape") {
     event.preventDefault();
     event.stopImmediatePropagation();

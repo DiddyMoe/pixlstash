@@ -80,4 +80,12 @@ describe("AppInput", () => {
     expect([field.selectionStart, field.selectionEnd]).toEqual([0, 8]);
     w.unmount();
   });
+
+  it("does not emit enter on the Enter that commits a composition", async () => {
+    const w = mount(AppInput);
+    for (const init of [{ isComposing: true }, { keyCode: 229 }]) {
+      await w.find("input").trigger("keydown", { key: "Enter", ...init });
+    }
+    expect(w.emitted("enter")).toBeFalsy();
+  });
 });

@@ -253,6 +253,7 @@ import FieldLabel from "../widgets/FieldLabel.vue";
 import AdapterTray from "../widgets/AdapterTray.vue";
 import { errorDetail } from "../../utils/apiError";
 import { smartSetDescription } from "../../utils/smartSets";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 import { API_BASE_URL } from "../../utils/apiClient";
 // Failures report through the notice surface instead of a blocking native
@@ -431,7 +432,7 @@ const { pending: saving, run: save } = useSubmitGuard(submitSet);
 
 // Keyboard shortcuts
 function handleKeydown(event) {
-  if (event.key === "Escape") {
+  if (event.key === "Escape" && !isImeComposing(event)) {
     emit("close");
   }
 }
