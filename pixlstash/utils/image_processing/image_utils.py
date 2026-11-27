@@ -20,7 +20,7 @@ from io import BytesIO
 from typing import Callable, Optional
 
 import numpy as np
-from PIL import ExifTags, Image
+from PIL import ExifTags, Image, TiffImagePlugin
 
 try:
     from PIL.TiffImagePlugin import IFDRational
@@ -445,6 +445,20 @@ class ImageUtils:
                         "Failed to remove temp thumbnail %s: %s", tmp_path, rm_err
                     )
             return None
+
+    @staticmethod
+    def stored_size(img: Image.Image) -> tuple[int, int]:
+        """*img*'s (width, height) as stored, before any EXIF turn.
+
+        The size a picture's ``width`` and ``height`` record; the frontend
+        swaps it for orientations 5-8. Pillow swaps a TIFF's ``img.size`` on
+        open when its orientation is 5-8 (it turns the TIFF as it loads), so a
+        TIFF's comes from its ImageWidth and ImageLength tags, which Pillow
+        refuses to open a TIFF without.
+        """
+        if isinstance(img, TiffImagePlugin.TiffImageFile):
+            return img.tag_v2[256], img.tag_v2[257]
+        return img.size
 
     @staticmethod
     def apply_exif_orientation(img: Image.Image) -> Image.Image:
@@ -1202,7 +1216,7 @@ class ImageUtils:
             try:
                 with Image.open(part_path) as img:
                     img_format = img.format or "PNG"
-                    width, height = img.size
+                    width, height = ImageUtils.stored_size(img)
                     # Read here, from the image that is already open, rather
                     # than left to `MissingOrientationFinder`. That finder
                     # exists to fill rows that predate the column; a NEW
@@ -1448,18 +1462,10 @@ class ImageUtils:
         """
         try:
             with Image.open(file_path) as img:
-                # Read stored dimensions from the file header (lazy, no pixel decode).
-                stored_w, stored_h = img.size
-                # Determine the logical (exif-corrected) original dimensions cheaply.
-                # Orientations 5-8 rotate 90° or 270°, which swaps width and height.
-                try:
-                    orientation = (img.getexif() or {}).get(274, 1)
-                except Exception:
-                    orientation = 1
-                if orientation in (5, 6, 7, 8):
-                    orig_w, _ = stored_h, stored_w
-                else:
-                    orig_w, _ = stored_w, stored_h
+                # The full-size long edge, from the header (no pixel decode). A
+                # turn keeps the long edge, so this holds whether ``img.size``
+                # reads as stored or, for a TIFF, already turned.
+                orig_long = max(img.size)
 
                 # draft() tells the JPEG decoder to use DCT subsampling - a no-op
                 # for other formats.  Must be called before load()/convert().
@@ -1478,7 +1484,7 @@ class ImageUtils:
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
             # inv_scale: multiply loaded-space coords by this to recover original-space
             # coords.  Both axes have the same factor because the resize is proportional.
-            inv_scale = orig_w / w if w > 0 else 1.0
+            inv_scale = orig_long / max(h, w) if w > 0 else 1.0
             return bgr, inv_scale
         except Exception as exc:
             logger.debug("load_image_bgr_reduced failed for %s: %s", file_path, exc)

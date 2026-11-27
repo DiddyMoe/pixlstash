@@ -209,3 +209,33 @@ def test_a_resized_share_copy_of_a_picture_whose_exif_does_not_parse_is_made(
     (entry,) = result["files"]
     with Image.open(entry["path"]) as img:
         assert img.size == (40, 30)
+
+
+@pytest.mark.parametrize("orientation", [6, None])
+def test_a_tiff_records_its_stored_size_whatever_its_orientation(tmp_path, orientation):
+    """The grid swaps a picture's width and height for orientations 5-8 itself."""
+    buffer = io.BytesIO()
+    tiffinfo = {ORIENTATION_TAG: orientation} if orientation else {}
+    _quadrants().save(buffer, "TIFF", tiffinfo=tiffinfo)
+
+    picture = ImageUtils.create_picture_from_bytes(
+        image_root_path=str(tmp_path / "library"),
+        image_bytes=buffer.getvalue(),
+        picture_uuid="picture.tiff",
+    )
+
+    assert (picture.width, picture.height, picture.orientation) == (
+        80,
+        60,
+        orientation or 1,
+    )
+
+
+def test_face_boxes_on_a_turned_tiff_scale_back_to_its_full_size(tmp_path):
+    path = tmp_path / "picture.tiff"
+    _quadrants().save(path, "TIFF", tiffinfo={ORIENTATION_TAG: 6})
+
+    bgr, inv_scale = ImageUtils.load_image_bgr_reduced(str(path), 40)
+
+    assert bgr.shape[:2] == (40, 30)
+    assert inv_scale == 2.0
