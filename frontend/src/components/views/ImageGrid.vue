@@ -1350,6 +1350,10 @@ import { buildPurgeBadge } from "../../utils/retention.js";
 import { buildLockedDeleteMessage } from "../../utils/lockedDelete.js";
 import { buildLibraryMoveMessage } from "../../utils/libraryMove.js";
 import {
+  normalizedCharacterIds,
+  normalizedSetIds,
+} from "../../utils/viewQueryParams.js";
+import {
   loadedSlotRuns,
   writeThumbnailBatch,
 } from "../../utils/thumbnailWriteback.js";
@@ -1607,22 +1611,9 @@ const LIKENESS_GROUPS_SORT_KEY = "LIKENESS_GROUPS";
 // the track itself here.
 const THUMBNAIL_INFO_ROW_HEIGHT = 24;
 
-const normalizedSelectedSetIds = computed(() => {
-  const idsFromProp = Array.isArray(selectionStore.selectedSetIds)
-    ? selectionStore.selectedSetIds
-    : [];
-  const normalized = idsFromProp
-    .map((id) => Number(id))
-    .filter((id) => Number.isFinite(id) && id > 0);
-  if (normalized.length > 0) {
-    return Array.from(new Set(normalized));
-  }
-  const single = Number(selectionStore.selectedSet);
-  if (Number.isFinite(single) && single > 0) {
-    return [single];
-  }
-  return [];
-});
+const normalizedSelectedSetIds = computed(() =>
+  normalizedSetIds(selectionStore),
+);
 
 const hasSetSelection = computed(
   () => normalizedSelectedSetIds.value.length > 0,
@@ -1636,22 +1627,16 @@ const primarySelectedSetId = computed(() =>
     : null,
 );
 
-const normalizedSelectedCharacterIds = computed(() => {
-  const ids = Array.isArray(selectionStore.selectedCharacterIds)
-    ? selectionStore.selectedCharacterIds
-    : [];
-  return ids
-    .map((id) => Number(id))
-    .filter((id) => Number.isFinite(id) && id > 0)
-    .sort((a, b) => a - b);
-});
+const normalizedSelectedCharacterIds = computed(() =>
+  normalizedCharacterIds(selectionStore),
+);
 const isMultiCharacterView = computed(
   () => normalizedSelectedCharacterIds.value.length > 1,
 );
 
 // True when project membership is part of the grid query, i.e. when the view is
 // scoped to a project (or to the "unassigned project" pseudo-view). This mirrors
-// useGridFetch._appendSelectionParams, which appends `project_id` only in this
+// viewQueryParams.appendViewSelectionParams, which appends `project_id` only in this
 // mode; in the global mode nothing about the query depends on project
 // membership. Used to decide whether a project assignment can change what the
 // grid shows and therefore warrants a refetch.
@@ -5092,7 +5077,7 @@ async function handleSetProjectForSelected(payload) {
 
     // Project membership only scopes the grid query in the project view:
     // useGridFetch appends `project_id` exclusively when projectViewMode is
-    // "project" (_appendSelectionParams). In the global view (All Pictures and
+    // "project" (appendViewSelectionParams). In the global view (All Pictures and
     // every other non-project-scoped view) an assignment changes neither which
     // pictures match the query nor their sort position, and the card itself
     // renders no project data, so a refetch would only flicker the grid and
@@ -6992,7 +6977,6 @@ const {
     normalizedSelectedSetIds,
     hasSetSelection,
     isSetOverlapView,
-    isMultiCharacterView,
     primarySelectedSetId,
     smartScoreProgress,
     exportProgress,

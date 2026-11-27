@@ -107,7 +107,9 @@ function makeGrid({ primarySelectedSetId = null } = {}) {
     hasLoadedOnce: ref(false),
     previousImageIds: new Set(),
     normalizedSelectedCharacterIds: ref([]),
-    normalizedSelectedSetIds: ref([]),
+    normalizedSelectedSetIds: ref(
+      primarySelectedSetId != null ? [primarySelectedSetId] : [],
+    ),
     hasSetSelection: ref(primarySelectedSetId != null),
     isSetOverlapView: ref(false),
     isMultiCharacterView: ref(false),

@@ -21,11 +21,15 @@ import {
   setCohesion,
   SET_SUGGEST_FALLBACK_THRESHOLD,
 } from "../utils/setSuggestionCut.js";
+import { getPictureId } from "../utils/media.js";
 import {
-  getPictureId,
-  PIL_IMAGE_EXTENSIONS,
-  VIDEO_EXTENSIONS,
-} from "../utils/media.js";
+  appendFaceClusterParams,
+  appendMediaTypeParams,
+  appendUnassignedParams,
+  appendViewFilterParams,
+  appendViewSelectionParams,
+  unassignedFilterOn,
+} from "../utils/viewQueryParams.js";
 import { debounce } from "../utils/utils";
 import {
   useFilterStore,
@@ -84,7 +88,6 @@ export function useGridFetch(
     normalizedSelectedSetIds,
     hasSetSelection,
     isSetOverlapView,
-    isMultiCharacterView,
     primarySelectedSetId,
     smartScoreProgress,
     exportProgress,
@@ -274,162 +277,26 @@ export function useGridFetch(
     });
   }
 
-  function _unassignedFilterOn() {
-    return !!(filterStore.noCharacterFilter || filterStore.noSetFilter);
-  }
-
-  /**
-   * "No character" and "In no set" are halves of one backend view,
-   * `character_id=UNASSIGNED`: both on is the whole of it (neither a person
-   * nor a set), one on narrows it with `unassigned_by`.
-   */
-  function _setUnassignedParams(params) {
-    params.set("character_id", String(UNASSIGNED_PICTURES_ID));
-    if (!(filterStore.noCharacterFilter && filterStore.noSetFilter)) {
-      params.set(
-        "unassigned_by",
-        filterStore.noCharacterFilter ? "character" : "set",
-      );
-    }
-  }
-
-  // The Likeness filter's cluster: only in one person's view, which is the
-  // only view whose clusters it numbers.
-  function _appendFaceClusterParams(params) {
-    const pick = filterStore.faceClusterFilter;
-    if (!pick) return;
-    params.set("face_cluster", String(pick.cluster));
-    params.set("face_cluster_threshold", String(pick.threshold));
-  }
-
-  function _appendSelectionParams(
-    params,
-    { unassignedOnly = true, faceCluster = true } = {},
-  ) {
-    if (hasSetSelection.value) {
-      if (isSetOverlapView.value) {
-        for (const setId of normalizedSelectedSetIds.value) {
-          params.append("set_ids", String(setId));
-        }
-        params.append(
-          "set_mode",
-          selectionStore.setMultiMode ?? "intersection",
-        );
-        if (
-          selectionStore.setMultiMode === "difference" &&
-          selectionStore.setDifferenceBaseId != null
-        ) {
-          params.append(
-            "base_set_id",
-            String(selectionStore.setDifferenceBaseId),
-          );
-        }
-        if (projectStore.projectViewMode === "project") {
-          // Derive effective project_id from per-set data; skip when sets span multiple projects.
-          const pidSet = new Set(
-            normalizedSelectedSetIds.value.map(
-              (id) => projectStore.setProjectIds?.[id] ?? null,
-            ),
-          );
-          if (pidSet.size === 1) {
-            const pid = [...pidSet][0];
-            params.append("project_id", pid != null ? pid : "UNASSIGNED");
-          }
-        }
-      } else if (primarySelectedSetId.value != null) {
-        params.append("set_id", String(primarySelectedSetId.value));
-        if (projectStore.projectViewMode === "project") {
-          params.append(
-            "project_id",
-            projectStore.selectedProjectId != null
-              ? projectStore.selectedProjectId
-              : "UNASSIGNED",
-          );
-        }
-      }
-    } else if (isMultiCharacterView.value) {
-      for (const charId of normalizedSelectedCharacterIds.value) {
-        params.append("character_ids", String(charId));
-      }
-      params.append(
-        "character_mode",
-        selectionStore.characterMultiMode ?? "union",
-      );
-      if (projectStore.projectViewMode === "project") {
-        // Derive effective project_id from per-character data; if all chars share
-        // the same project use it, if they span multiple projects skip the filter.
-        const pidSet = new Set(
-          normalizedSelectedCharacterIds.value.map(
-            (id) => projectStore.characterProjectIds?.[id] ?? null,
-          ),
-        );
-        if (pidSet.size === 1) {
-          const pid = [...pidSet][0];
-          params.append("project_id", pid != null ? pid : "UNASSIGNED");
-        }
-      }
-    } else if (
-      selectionStore.selectedCharacter !== undefined &&
-      selectionStore.selectedCharacter !== null &&
-      selectionStore.selectedCharacter !== "" &&
-      selectionStore.selectedCharacter !== ALL_PICTURES_ID
-    ) {
-      if (selectionStore.selectedCharacter === String(SCRAPHEAP_PICTURES_ID)) {
-        params.append("only_deleted", "true");
-      } else {
-        params.append("character_id", selectionStore.selectedCharacter);
-        if (faceCluster) _appendFaceClusterParams(params);
-        if (projectStore.projectViewMode === "project") {
-          params.append(
-            "project_id",
-            projectStore.selectedProjectId != null
-              ? projectStore.selectedProjectId
-              : "UNASSIGNED",
-          );
-        }
-      }
-    } else if (
-      selectionStore.selectedCharacter === ALL_PICTURES_ID &&
-      unassignedOnly &&
-      _unassignedFilterOn()
-    ) {
-      _setUnassignedParams(params);
-      if (projectStore.projectViewMode === "project") {
-        params.append(
-          "project_id",
-          projectStore.selectedProjectId != null
-            ? projectStore.selectedProjectId
-            : "UNASSIGNED",
-        );
-      }
-    } else if (
-      selectionStore.selectedCharacter === ALL_PICTURES_ID &&
-      projectStore.projectViewMode === "project"
-    ) {
-      params.append(
-        "project_id",
-        projectStore.selectedProjectId != null
-          ? projectStore.selectedProjectId
-          : "UNASSIGNED",
-      );
-    }
-  }
-
-  function _appendMediaTypeParams(params) {
-    if (filterStore.mediaTypeFilter === "images") {
-      for (const ext of PIL_IMAGE_EXTENSIONS) {
-        params.append("format", ext.toUpperCase());
-      }
-    } else if (filterStore.mediaTypeFilter === "videos") {
-      for (const ext of VIDEO_EXTENSIONS) {
-        params.append("format", ext.toUpperCase());
-      }
-    }
+  // The grid's view, as `viewQueryParams.js` reads it.
+  function gridView() {
+    return {
+      setIds: normalizedSelectedSetIds.value,
+      characterIds: normalizedSelectedCharacterIds.value,
+      selection: selectionStore,
+      project: projectStore,
+      filters: filterStore,
+      applyTagFilter: userPrefsStore.applyTagFilter,
+      referenceFolderId: referenceFolderIdFilter.value,
+      filePathPrefix: filePathPrefixFilter.value,
+      importSourceFolder: importSourceFolderFilter.value,
+      inboxPeriod: inboxPeriod.value,
+    };
   }
 
   function buildPictureIdsQueryParams() {
     const params = new URLSearchParams();
-    _appendSelectionParams(params);
+    const view = gridView();
+    appendViewSelectionParams(params, view);
     if (
       sortStore.selectedSort === "CHARACTER_LIKENESS" &&
       sortStore.selectedSimilarityCharacter
@@ -458,80 +325,7 @@ export function useGridFetch(
       }
     }
     params.append("fields", "grid");
-    _appendMediaTypeParams(params);
-    (filterStore.comfyuiModelFilter || []).forEach((m) =>
-      params.append("comfyui_model", m),
-    );
-    (filterStore.comfyuiLoraFilter || []).forEach((l) =>
-      params.append("comfyui_lora", l),
-    );
-    workflowFilterParams(filterStore.workflowFilter).forEach(([name, value]) =>
-      params.append(name, value),
-    );
-    if (filterStore.minScoreFilter != null) {
-      params.append("min_score", filterStore.minScoreFilter);
-    }
-    if (filterStore.maxScoreFilter != null) {
-      params.append("max_score", filterStore.maxScoreFilter);
-    }
-    if (filterStore.unscoredOnlyFilter) {
-      params.append("unscored", "1");
-    }
-    if (filterStore.favouriteOnlyFilter) {
-      params.append("favourite", "1");
-    }
-    if (filterStore.smartScoreBucketFilter != null) {
-      params.append("smart_score_bucket", filterStore.smartScoreBucketFilter);
-    }
-    if (filterStore.resolutionBucketFilter != null) {
-      params.append("resolution_bucket", filterStore.resolutionBucketFilter);
-    }
-    (filterStore.tagFilter || []).forEach((t) => params.append("tag", t));
-    (filterStore.tagRejectedFilter || []).forEach((t) =>
-      params.append("rejected_tag", t),
-    );
-    (filterStore.tagConfidenceAboveFilter || []).forEach((e) =>
-      params.append("tag_confidence_above", e),
-    );
-    (filterStore.tagConfidenceBelowFilter || []).forEach((e) =>
-      params.append("tag_confidence_below", e),
-    );
-    if (userPrefsStore.applyTagFilter) {
-      params.append("apply_tag_filter", "true");
-    }
-    if (referenceFolderIdFilter.value != null) {
-      params.append(
-        "reference_folder_id",
-        String(referenceFolderIdFilter.value),
-      );
-    }
-    if (filePathPrefixFilter.value != null) {
-      params.append("file_path_prefix", filePathPrefixFilter.value);
-    }
-    if (importSourceFolderFilter.value != null) {
-      params.append("import_source_folder", importSourceFolderFilter.value);
-    }
-    if (inboxPeriod.value) params.append("inbox", inboxPeriod.value);
-    if (filterStore.faceBboxFilter != null) {
-      params.append("face_filter", filterStore.faceBboxFilter);
-    }
-    (filterStore.impossibleSources || []).forEach((s) =>
-      params.append("impossible_tag_source", s),
-    );
-    // "all" is the absence of the filter, so it is expressed by omission rather
-    // than by a sentinel the backend would have to know a second spelling for.
-    if (
-      filterStore.stackStateFilter &&
-      filterStore.stackStateFilter !== "all"
-    ) {
-      params.append("stack_state", filterStore.stackStateFilter);
-    }
-    if (filterStore.tagStateFilter) {
-      params.append("tag_state", filterStore.tagStateFilter);
-    }
-    if (filterStore.sharedOnlyFilter) {
-      params.append("shared_only", "true");
-    }
+    appendViewFilterParams(params, view);
     // For rejected-consent guests: pass the in-memory session ID so the backend
     // can overlay their scores for the current page session (no cookie available).
     if (
@@ -555,7 +349,10 @@ export function useGridFetch(
   function buildFilterCountBaseQuery() {
     if (searchStore.searchQuery && searchStore.searchQuery.trim()) return null;
     const params = new URLSearchParams();
-    _appendSelectionParams(params, { unassignedOnly: false, faceCluster: false });
+    appendViewSelectionParams(params, gridView(), {
+      unassignedOnly: false,
+      faceCluster: false,
+    });
     params.append("stack_leaders_only", "true");
     // Character likeness changes the row set, so the count needs the sort.
     if (
@@ -586,8 +383,8 @@ export function useGridFetch(
 
   function buildLikenessGroupQueryParams() {
     const params = new URLSearchParams();
-    _appendSelectionParams(params);
-    _appendMediaTypeParams(params);
+    appendViewSelectionParams(params, gridView());
+    appendMediaTypeParams(params, filterStore.mediaTypeFilter);
     (filterStore.comfyuiModelFilter || []).forEach((m) =>
       params.append("comfyui_model", m),
     );
@@ -676,7 +473,7 @@ export function useGridFetch(
     // Build character/set + project filter params for count and stream URLs.
     const _charP = new URLSearchParams();
     if (hasSetSelection.value) {
-      // Set view - mirrors _appendSelectionParams set branch.
+      // Set view - mirrors appendViewSelectionParams set branch.
       if (isSetOverlapView.value) {
         for (const setId of normalizedSelectedSetIds.value) {
           _charP.append("set_ids", String(setId));
@@ -748,7 +545,7 @@ export function useGridFetch(
       _selChar !== ALL_PICTURES_ID
     ) {
       _charP.set("character_id", String(_selChar));
-      _appendFaceClusterParams(_charP);
+      appendFaceClusterParams(_charP, filterStore.faceClusterFilter);
       if (projectStore.projectViewMode === "project") {
         _charP.set(
           "project_id",
@@ -759,9 +556,9 @@ export function useGridFetch(
       }
     } else if (
       _selChar === ALL_PICTURES_ID &&
-      _unassignedFilterOn()
+      unassignedFilterOn(filterStore)
     ) {
-      _setUnassignedParams(_charP);
+      appendUnassignedParams(_charP, filterStore);
       if (projectStore.projectViewMode === "project") {
         _charP.set(
           "project_id",
@@ -798,7 +595,7 @@ export function useGridFetch(
     const _charSuffix = _charP.size ? `&${_charP.toString()}` : "";
     // Build media type format filter params for count and stream URLs.
     const _formatP = new URLSearchParams();
-    _appendMediaTypeParams(_formatP);
+    appendMediaTypeParams(_formatP, filterStore.mediaTypeFilter);
     const _formatSuffix = _formatP.size ? `&${_formatP.toString()}` : "";
     // Build filter-menu params for count and stream URLs.
     // Each labelled block corresponds to a separate commit - remove any single
@@ -1003,7 +800,7 @@ export function useGridFetch(
     let fetchError = null;
     let sortedFetchStartedAt = 0;
     const selectionParams = new URLSearchParams();
-    _appendSelectionParams(selectionParams);
+    appendViewSelectionParams(selectionParams, gridView());
     const foldsStacks = !selectionParams.has("only_deleted");
     const fetchPhaseTimings = {
       countMs: null,
