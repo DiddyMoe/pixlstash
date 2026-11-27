@@ -1454,7 +1454,9 @@ def create_router(server) -> APIRouter:
         response_model=WorkersProgressResponse,
         description=(
             "Returns background worker progress plus process CPU, RAM, and VRAM "
-            "usage metrics. runs lists the ComfyUI runs in flight in this "
+            "usage metrics. workers has one row per task type; empty for a "
+            "share token (one scoped to a single picture, set, character or "
+            "project). runs lists the ComfyUI runs in flight in this "
             "library, oldest first, each with its run_id, prompt_id (null "
             "while held), label, workflow_id, status (waiting for the GPU, "
             "queued or running) and percent (the running node's own "
@@ -1484,9 +1486,17 @@ def create_router(server) -> APIRouter:
         _ensure_secure_when_required(request)
         server.auth.require_user_id(request)
         task_runner = getattr(server.vault, "_task_runner", None)
+        # A share token reaches one picture, set, character or project: what
+        # the library's workers are doing is not about that resource, so it is
+        # told of none. A library-wide READ token sees the rows, which carry
+        # counts only.
+        token_scope = getattr(request.state, "token_scope", None)
+        resource_scoped = (
+            token_scope is not None and token_scope.resource_type is not None
+        )
         return {
             "status": "success",
-            "workers": server.vault.get_worker_progress(),
+            "workers": {} if resource_scoped else server.vault.get_worker_progress(),
             # A run is the owner's, and its label names one of their workflows
             # or recipes: a narrower token is told of none.
             "runs": (

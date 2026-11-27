@@ -1,0 +1,1 @@
+- Fixed: a share link could read the library's task progress.
