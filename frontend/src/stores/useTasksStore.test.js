@@ -510,6 +510,26 @@ describe("the GPU queue", () => {
     }
   });
 
+  it("names each task from the poll's task_labels, and a type it does not name by the type", async () => {
+    const store = await pollWith({
+      task_labels: { DescriptionTask: "Descriptions" },
+      resources: resourcesAnswer({
+        leases: [
+          lease({ id: "d", label: "DescriptionTask", worker_type: "DescriptionTask" }),
+          lease({ id: "n", label: "test-NewTask", worker_type: "test-NewTask" }),
+        ],
+      }),
+    });
+    try {
+      expect(store.pixlstashEntry.children.map((c) => c.label)).toEqual([
+        "Descriptions",
+        "test-NewTask",
+      ]);
+    } finally {
+      store.stopPolling();
+    }
+  });
+
   it("folds every backend worker, with or without a lease, and on a server with no resources", async () => {
     const workers = {
       ImageEmbeddingTask: { label: "Image embeddings", current: 5, total: 9, running: true, active: true },

@@ -187,6 +187,8 @@ function forgetImportRun(stagingId) {
 export const useTasksStore = defineStore("tasks", () => {
   // ── Backend worker state ──────────────────────────────────────────────────
   const workerSnapshots = ref({});
+  // What a person calls each task type (`task_labels`), keyed by the type.
+  const taskLabels = ref({});
   const systemUsage = ref(null);
   const series = ref({}); // key → [{ t, rate, current }]
   const nowSeconds = ref(Date.now() / 1000);
@@ -987,14 +989,19 @@ export const useTasksStore = defineStore("tasks", () => {
   // task, so a worker between batches holds none; folding by lease alone left
   // it, and every CPU-only worker, as a flat row beside the fold. A lease or a
   // stopped task naming a worker in the fold lands on that worker's child.
-  // Null when there is none, so no fold row is drawn.
+  // Null when there is none, so no fold row is drawn. Each child is named from
+  // `task_labels` by its task type, or by the type when that names none.
+  function taskName(taskType) {
+    return taskLabels.value[taskType] || taskType;
+  }
+
   const pixlstashEntry = computed(() => {
     const children = [];
     const byWorker = new Map();
     for (const entry of activeWorkerEntries.value) {
       const child = {
         key: `worker:${entry.key}`,
-        label: entry.snapshot.label || entry.key,
+        label: taskName(entry.key),
         workerKey: entry.key,
         snapshot: entry.snapshot,
         mb: 0,
@@ -1019,7 +1026,9 @@ export const useTasksStore = defineStore("tasks", () => {
         : null;
       children.push({
         key: `lease:${lease.id}`,
-        label: lease.label || "PixlStash task",
+        label: lease.worker_type
+          ? taskName(lease.worker_type)
+          : lease.label || "PixlStash task",
         workerKey: lease.worker_type || null,
         snapshot: null,
         mb: Number(lease.held_mb) || 0,
@@ -1044,7 +1053,9 @@ export const useTasksStore = defineStore("tasks", () => {
       }
       const child = {
         key: `preempted:${index}`,
-        label: stopped.worker_type || "PixlStash task",
+        label: stopped.worker_type
+          ? taskName(stopped.worker_type)
+          : "PixlStash task",
         workerKey: stopped.worker_type || null,
         snapshot: null,
         mb: 0,
@@ -1219,6 +1230,7 @@ export const useTasksStore = defineStore("tasks", () => {
       );
       resources.value = progress?.resources ?? null;
       lanes.value = progress?.lanes ?? null;
+      taskLabels.value = progress?.task_labels ?? {};
       noteClearPhases(resources.value?.leases ?? []);
       const now = Date.now() / 1000;
       nowSeconds.value = now;
@@ -1350,6 +1362,7 @@ export const useTasksStore = defineStore("tasks", () => {
   return {
     // backend worker state
     workerSnapshots,
+    taskLabels,
     systemUsage,
     series,
     // comfyui runs

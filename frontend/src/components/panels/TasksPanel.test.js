@@ -1264,9 +1264,22 @@ function gpuAnswer(over = {}) {
   };
 }
 
+// `task_labels` as a poll brings them: the backend's TASK_LABELS, the entries
+// these fixtures name (FaceTask stands in for a worker of the test's own).
+const TASK_LABELS = {
+  DedupAutoStackTask: "Auto-stack",
+  DescriptionTask: "Descriptions",
+  FaceTask: "Faces",
+  ImageEmbeddingTask: "Image embeddings",
+  ScrapheapRunTask: "Scrapheap",
+  TagTask: "Tagging",
+  TextEmbeddingTask: "Text embeddings",
+};
+
 /** Put the store in the state a poll would, without the poll. */
 function setGpu(resources, runs = []) {
   const tasksStore = useTasksStore();
+  tasksStore.taskLabels = TASK_LABELS;
   tasksStore.resources = resources;
   tasksStore.comfyuiRuns = runs;
   return tasksStore;
@@ -1379,8 +1392,8 @@ describe("the GPU queue in the task manager", () => {
     // One line each, inside the fold's own card, with its progress by its name.
     const rows = fold.findAll('[data-testid="tm-pixl-child"]');
     expect(rows.map((row) => row.find(".tm-child-name").text())).toEqual([
-      "Image Embeddings 5 / 9",
-      "Tags 1 / 9",
+      "Image embeddings 5 / 9",
+      "Tagging 1 / 9",
     ]);
     expect(rows.every((row) => row.find("canvas.tm-sparkline").exists())).toBe(true);
     // The tagger's lease shows on the tagger's row, and is not a line of its own.
@@ -1415,8 +1428,8 @@ describe("the GPU queue in the task manager", () => {
     localStorage.setItem("pixlstash:tasks:pixlstash-fold", "1");
     const wrapper = mount(TasksPanel, globalOpts);
     const rows = wrapper.findAll('[data-testid="tm-pixl-child"]');
-    const done = rows.find((row) => row.text().includes("Text Embeddings"));
-    const working = rows.find((row) => row.text().includes("Image Embeddings"));
+    const done = rows.find((row) => row.text().includes("Text embeddings"));
+    const working = rows.find((row) => row.text().includes("Image embeddings"));
     expect(done.find(".tm-mark").attributes("data-state")).toBe("done");
     expect(done.find("canvas.tm-sparkline").exists()).toBe(false);
     expect(done.find(".tm-fig-text").text()).toBe("");
@@ -1427,8 +1440,8 @@ describe("the GPU queue in the task manager", () => {
   });
 
   it("names a background Auto-stack run by the action the user started", () => {
-    // The worker's counter is `duplicate_auto_stack`; spelled out word by word
-    // it would read "Duplicate Auto Stack", which is nothing the user clicked.
+    // The worker's counter is `duplicate_auto_stack`; the row is named from
+    // task_labels by its task type, never from the counter.
     const tasksStore = setGpu(gpuAnswer({ leases: [] }));
     tasksStore.workerSnapshots = {
       DedupAutoStackTask: {
@@ -1448,8 +1461,8 @@ describe("the GPU queue in the task manager", () => {
   });
 
   it("names a background Scrapheap run by the place it works on", () => {
-    // The worker's counter is `scrapheap_run`; spelled out it would read
-    // "Scrapheap Run", and no control the user pressed is called a run.
+    // The worker's counter is `scrapheap_run`; the row is named from
+    // task_labels by its task type, never from the counter.
     const tasksStore = setGpu(gpuAnswer({ leases: [] }));
     tasksStore.workerSnapshots = {
       ScrapheapRunTask: {
@@ -1478,8 +1491,24 @@ describe("the GPU queue in the task manager", () => {
     localStorage.setItem("pixlstash:tasks:pixlstash-fold", "1");
     const wrapper = mount(TasksPanel, globalOpts);
     const children = wrapper.findAll('[data-testid="tm-pixl-child"]');
+    // The lease with no task type keeps its own label; the stopped task is
+    // named from task_labels by its type.
+    expect(children.map((child) => child.find(".tm-child-name").text())).toEqual(["Tagging", "Faces"]);
     expect(children.map((child) => child.find(".tm-fig-text").text())).toEqual(["1.2 GB", "stopped"]);
     expect(children[1].find(".tm-mark").attributes("data-state")).toBe("stopped");
+  });
+
+  it("names a GPU task by what a person calls it, not by its class name", () => {
+    // The task runner labels a task's lease with its type, the class name.
+    setGpu(
+      gpuAnswer({
+        leases: [gpuLease({ id: "d", label: "DescriptionTask", worker_type: "DescriptionTask", held_mb: 900 })],
+      }),
+    );
+    localStorage.setItem("pixlstash:tasks:pixlstash-fold", "1");
+    const wrapper = mount(TasksPanel, globalOpts);
+    const child = wrapper.find('[data-testid="tm-pixl-child"]');
+    expect(child.find(".tm-child-name").text()).toBe("Descriptions");
   });
 
   it("offers a read-only session no action on a run, waiting or running", () => {

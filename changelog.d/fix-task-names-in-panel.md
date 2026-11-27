@@ -1,0 +1,1 @@
+- Fixed: the Tasks panel shows task names instead of internal class names.

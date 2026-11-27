@@ -39,6 +39,7 @@ from pixlstash.services import (
 from pixlstash.services import run_log, tag_preferences, vram_history
 from pixlstash.services.comfyui_service import live_runs
 from pixlstash.services.model_downloads import live_downloads
+from pixlstash.services.restore import TASK_LABELS
 from pixlstash.resources.arbiter import arbiter
 from pixlstash.telemetry import mark_install_established
 from pixlstash.server_config_io import persist_server_config
@@ -505,6 +506,14 @@ def create_router(server) -> APIRouter:
         )
         downloads: list[dict] = []
         process: dict
+        task_labels: dict[str, str] = Field(
+            default_factory=dict,
+            description=(
+                "What a person calls each task type (`TASK_LABELS`), keyed by "
+                "the type: a worker's key in workers, and a lease's or a "
+                "paused task's worker_type in resources."
+            ),
+        )
         resources: Optional[dict] = Field(
             default=None,
             description=(
@@ -1457,6 +1466,8 @@ def create_router(server) -> APIRouter:
             "likewise for the owner only. "
             "downloads lists the model downloads running or just ended "
             "(`POST /model-downloads`), likewise for the owner only. "
+            "task_labels maps every task type to what a person calls it, "
+            "the same for every token. "
             "resources is the VRAM arbiter's snapshot, null for any token but "
             "the owner's. lanes says whether the task runner's CPU and GPU "
             "workers are alive (degraded when one has exited), likewise null "
@@ -1495,6 +1506,7 @@ def create_router(server) -> APIRouter:
                 else []
             ),
             "process": hw_monitor.get_usage(),
+            "task_labels": TASK_LABELS,
             # The machine's GPUs and who holds them: the owner's alone, like
             # the runs, since a lease label names a workflow.
             "resources": (

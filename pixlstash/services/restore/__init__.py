@@ -20,6 +20,7 @@ from ._models import (
     RestorePreview,
     RestoreReport,
     SafetySnapshotFailedError,
+    TASK_LABELS,
 )
 from .full_restore import FullRestoreMixin
 from .preview import PreviewMixin
@@ -99,4 +100,5 @@ __all__ = [
     "SafetySnapshotFailedError",
     "MissingDependenciesError",
     "BackgroundWorkStillRunningError",
+    "TASK_LABELS",
 ]
