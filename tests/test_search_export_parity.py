@@ -16,12 +16,12 @@ import zipfile
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import select
+from sqlmodel import func, select
 
 from pixlstash.db_models.picture import Picture
 from pixlstash.db_models.picture_set import PictureSet, PictureSetMember
 from pixlstash.server import Server
-from tests.utils import upload_pictures_and_wait
+from tests.utils import poll_until_zero, upload_pictures_and_wait
 
 PICTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "pictures")
 EXPORT = "/pictures/export"
@@ -76,6 +76,18 @@ def library():
         for pid in ids.values():
             resp = client.post(f"/pictures/{pid}/tags", json={"tag": "zebra"})
             assert resp.status_code == 200, resp.text
+
+        # The search ranks on image embeddings, which a background task writes
+        # after upload and skips for Scrapheap pictures. Wait for all six while
+        # they are live, so none lands between a search and the export's search.
+        def missing_embeddings(session):
+            return session.exec(
+                select(func.count())
+                .select_from(Picture)
+                .where(Picture.image_embedding.is_(None))
+            ).one()
+
+        poll_until_zero(server, missing_embeddings, "image embeddings")
 
         def seed(session):
             for name, score, deleted in LIBRARY:
