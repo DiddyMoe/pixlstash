@@ -4439,18 +4439,19 @@ async function deleteSelected(
     return removedIds;
   } catch (err) {
     console.error(moveTo ? "Move to library failed" : "Bulk delete failed", err);
+    // Earlier chunks may have committed, and even the failed request may have
+    // committed before its response was lost: re-read the grid and sidebar
+    // for the actual state.
     if (moveTo) {
-      // Earlier chunks may have committed, and even the failed request may
-      // have committed before its response was lost. Drop confirmed moves
-      // immediately and re-read the grid and sidebar for the actual state.
+      // Drop confirmed moves at once rather than waiting for the re-read.
       removeImagesById([...movedIds]);
       if (movedIds.has(String(lastSelectedImageId.value))) {
         lastSelectedImageId.value = null;
       }
-      preserveScrollOnNextFetch.value = true;
-      debouncedFetchAllGridImages();
-      emit("refresh-sidebar");
     }
+    preserveScrollOnNextFetch.value = true;
+    debouncedFetchAllGridImages();
+    emit("refresh-sidebar");
     noticeStore.error(
       moveTo
         ? `Couldn't move those pictures to ${moveTo.name}. ${errorDetail(err)}`

@@ -5,9 +5,11 @@ import { ref } from "vue";
 import { useSelectionStore } from "../../stores/useSelectionStore";
 import { useSortStore } from "../../stores/useSortStore";
 import { useOperationStore } from "../../stores/useOperationStore";
+import { useNoticeStore } from "../../stores/useNoticeStore";
 
 const apiGet = vi.fn();
 const apiPost = vi.fn();
+const apiDelete = vi.fn();
 
 vi.mock("../../utils/apiClient", async () => {
   const { ref, computed } = await import("vue");
@@ -15,7 +17,9 @@ vi.mock("../../utils/apiClient", async () => {
     apiClient: {
       get: (...args) => apiGet(...args),
       post: (...args) => apiPost(...args),
-      patch: vi.fn(), put: vi.fn(), delete: vi.fn(),
+      patch: vi.fn(),
+      put: vi.fn(),
+      delete: (...args) => apiDelete(...args),
     },
     onSessionReset: () => () => {},
     activateShareToken: vi.fn(),
@@ -57,6 +61,7 @@ beforeEach(() => {
       ? { moved: body.picture_ids, moved_count: body.picture_ids.length }
       : {},
   }));
+  apiDelete.mockReset().mockResolvedValue({ data: {} });
 });
 
 afterEach(() => {
@@ -148,5 +153,37 @@ describe("a move spanning multiple requests", () => {
       apiGet.mock.calls.some(([url]) => String(url).includes("/pictures/count")),
       JSON.stringify(apiGet.mock.calls.map(([url]) => url)),
     ).toBe(true), { timeout: 2500 });
+  });
+});
+
+describe("a delete spanning multiple requests", () => {
+  // Outside the Scrapheap this tab ignores its own `removed` echo, so only a
+  // re-read on failure drops the chunks that already committed.
+  it("re-reads the grid and the sidebar after a later chunk fails", async () => {
+    await prepareGrid();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    apiDelete
+      .mockReset()
+      .mockResolvedValueOnce({ data: { deleted: 1000 } })
+      .mockRejectedValueOnce(new Error("Library is busy"));
+
+    await wrapper.vm.deleteSelected();
+
+    expect(
+      apiDelete.mock.calls.map(([, config]) => config.data.picture_ids.length),
+    ).toEqual([1000, 1]);
+    expect(
+      useNoticeStore().notices.find((n) => n.key === "pictures-delete"),
+    ).toMatchObject({ level: "error" });
+    expect(wrapper.emitted("refresh-sidebar")).toBeTruthy();
+    await vi.waitFor(
+      () =>
+        expect(
+          apiGet.mock.calls.some(([url]) =>
+            String(url).includes("/pictures/count"),
+          ),
+        ).toBe(true),
+      { timeout: 2500 },
+    );
   });
 });
