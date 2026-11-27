@@ -116,13 +116,17 @@ BOUNDARY_HIGH = 0.65
 MISMATCH_LIKENESS_THRESHOLD = 0.95
 
 # Per-vault rebuild state; keyed by id(vault) so multiple Server instances in
-# one process (tests) don't share a progress bar.
+# one process (tests) don't share a progress bar. ``queued_task`` is the id of
+# the rebuild task that raised ``building`` and has not started its body yet:
+# the flag is that task's to take down if the runner cancels it first.
 _LOCK = threading.Lock()
 _STATES: dict[int, dict] = {}
 
 
 def _state(vault: "Vault") -> dict:
-    return _STATES.setdefault(id(vault), {"building": False, "progress": 0.0})
+    return _STATES.setdefault(
+        id(vault), {"building": False, "progress": 0.0, "queued_task": None}
+    )
 
 
 def get_status(vault: "Vault") -> dict:
@@ -643,6 +647,40 @@ def _run_rebuild_guarded(vault: "Vault") -> dict:
             state = _state(vault)
             state["building"] = False
             state["progress"] = 1.0
+            state["queued_task"] = None
+
+
+def claim_queued_rebuild(vault: "Vault", task_id: str) -> bool:
+    """Hand the raised ``building`` flag to the rebuild task *task_id* as it starts.
+
+    Returns:
+        True when the task still held the flag: its body runs the rebuild and
+        takes the flag down when it ends. False when the runner cancelled the
+        task before it got here (:func:`abandon_queued_rebuild` took the flag
+        down): the body must not rebuild.
+    """
+    with _LOCK:
+        state = _state(vault)
+        if state["queued_task"] != task_id:
+            return False
+        state["queued_task"] = None
+        return True
+
+
+def abandon_queued_rebuild(vault: "Vault", task_id: str) -> None:
+    """Take ``building`` down for the rebuild task *task_id*, which will not run.
+
+    Does nothing once the task's body has claimed the flag (the rebuild does
+    not stop part-way and takes the flag down when it ends) or when another
+    rebuild holds it.
+    """
+    with _LOCK:
+        state = _state(vault)
+        if state["queued_task"] != task_id:
+            return
+        state["building"] = False
+        state["progress"] = 0.0
+        state["queued_task"] = None
 
 
 def start_rebuild(vault: "Vault") -> dict:
@@ -654,14 +692,15 @@ def start_rebuild(vault: "Vault") -> dict:
     """
     from pixlstash.tasks.tag_health_rebuild_task import TagHealthRebuildTask
 
+    task = TagHealthRebuildTask(vault)
     with _LOCK:
         state = _state(vault)
         if state["building"]:
             return {"building": True, "progress": state["progress"]}
         state["building"] = True
         state["progress"] = 0.0
+        state["queued_task"] = task.id
 
-    task = TagHealthRebuildTask(vault)
     if vault.submit_task(task) is None:
         logger.warning(
             "tag_health rebuild: task runner unavailable; rebuilding synchronously"

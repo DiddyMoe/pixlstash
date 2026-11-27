@@ -10,8 +10,9 @@ load-bearing and preserved verbatim.
 
 import os
 import shutil
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterator, Optional
 
 from sqlmodel import Session, select
 from sqlalchemy import (
@@ -43,15 +44,21 @@ from pixlstash.services.workflow_ghost_service import requeue_library_ghosts
 from pixlstash.utils.path_utils import resolve_path_within
 
 from ._models import (
+    BackgroundWorkStillRunningError,
     RestoreInProgressError,
     RestoreReport,
     SafetySnapshotFailedError,
     _MAX_MISSING_RATIO_FOR_CLEANUP,
     _MIN_PICTURES_FOR_MISSING_RATIO_CHECK,
+    task_label,
 )
 from .schema_upgrade import snapshot_engine
 
 logger = get_logger(__name__)
+
+# How long a full restore waits for running tasks to stop before it refuses.
+_DRAIN_TIMEOUT_S = 30.0
+_DRAIN_REASON = "library restore"
 
 
 class FullRestoreMixin:
@@ -69,6 +76,9 @@ class FullRestoreMixin:
     ) -> RestoreReport:
         """Replace the live database with a snapshot snapshot.
 
+        Before step 1 (not on a dry run), stop the planner and drain the
+        TaskRunner (see ``_background_work_paused``).
+
         Steps:
         1. Take an OPPORTUNISTIC safety snapshot of the current state.
         2. Upgrade the snapshot schema to the current Alembic head.
@@ -82,7 +92,7 @@ class FullRestoreMixin:
         7. Reset the in-memory authentication state the swap invalidated (see
            ``_reset_auth_state``); clients sign in again afterwards.
         8. Reopen authentication only after every finalisation step succeeds.
-        9. Resume the TaskRunner and emit ``RESTORE_COMPLETED``.
+        9. Emit ``RESTORE_COMPLETED``, then resume the TaskRunner and planner.
 
         Args:
             snapshot_id: ID of the snapshot to restore.
@@ -108,6 +118,8 @@ class FullRestoreMixin:
                 missing from disk.
             SafetySnapshotFailedError: If the safety snapshot fails and
                 ``allow_without_safety`` is False.
+            BackgroundWorkStillRunningError: If a task is still running when
+                the drain times out; nothing has changed.
         """
         if not self._restore_lock.acquire(blocking=False):
             raise RestoreInProgressError(
@@ -128,21 +140,14 @@ class FullRestoreMixin:
                 "progress": 0.0,
             }
             try:
-                # A snapshot that finishes while this restore runs waits to
-                # register its row until the restore has ended, and so lands
-                # in the restored database. Registered mid-restore, its row
-                # would be lost in the swap and its files orphaned. The safety
-                # snapshot taken below runs on this thread and re-enters the
-                # lock.
-                with self._vault.snapshot_service.hold_registrations():
-                    return self._restore_full_inner(
-                        snapshot_id,
-                        dry_run,
-                        vault_root,
-                        report,
-                        allow_without_safety,
-                        restore_request_lease,
-                    )
+                return self._restore_full_inner(
+                    snapshot_id,
+                    dry_run,
+                    vault_root,
+                    report,
+                    allow_without_safety,
+                    restore_request_lease,
+                )
             finally:
                 self._active_job = None
         finally:
@@ -173,29 +178,84 @@ class FullRestoreMixin:
         if not os.path.exists(abs_snapshot):
             raise ValueError(f"Snapshot file not found on disk: {abs_snapshot}")
 
-        # Emit STARTED only AFTER the snapshot is known to exist (and the
-        # lock was already acquired in the outer ``restore_full``) - a 404
-        # or 409 must not leave the UI with ``activeJob`` set forever.
-        # Anything that throws or early-returns from here on emits FAILED
-        # so the frontend can clear ``activeJob``.
-        started_payload = {"snapshot_id": snapshot_id, "resource_type": "full"}
-        self._emit_lifecycle(EventType.RESTORE_STARTED, started_payload)
+        # The drain comes before the registration hold: a running snapshot
+        # task that reaches registration would block on the hold, and the
+        # drain would wait on it until it timed out. A dry run swaps nothing,
+        # so it leaves background work alone.
+        with (
+            nullcontext() if dry_run else self._background_work_paused(),
+            # A snapshot that finishes while this restore runs waits to
+            # register its row until the restore has ended, and so lands in
+            # the restored database. Registered mid-restore, its row would be
+            # lost in the swap and its files orphaned. The safety snapshot
+            # taken below runs on this thread and re-enters the lock.
+            self._vault.snapshot_service.hold_registrations(),
+        ):
+            # Emit STARTED only AFTER the snapshot is known to exist (and the
+            # lock was already acquired in the outer ``restore_full``) - a 404
+            # or 409 must not leave the UI with ``activeJob`` set forever.
+            # Anything that throws or early-returns from here on emits FAILED
+            # so the frontend can clear ``activeJob``.
+            started_payload = {"snapshot_id": snapshot_id, "resource_type": "full"}
+            self._emit_lifecycle(EventType.RESTORE_STARTED, started_payload)
+            try:
+                return self._restore_full_steps(
+                    snapshot_id,
+                    dry_run,
+                    vault_root,
+                    report,
+                    allow_without_safety,
+                    abs_snapshot,
+                    restore_request_lease,
+                )
+            except Exception as exc:
+                self._emit_lifecycle(
+                    EventType.RESTORE_FAILED,
+                    {**started_payload, "error": str(exc)},
+                )
+                raise
+
+    @contextmanager
+    def _background_work_paused(self) -> Iterator[None]:
+        """Hold every background task off the library for the block.
+
+        Stops the WorkPlanner, so no finder submits new work, then drains the
+        TaskRunner (``pause_and_drain``): queued tasks are cancelled, running
+        ones are asked to stop, and nothing is admitted until the block ends.
+        Their finders find that work again. A task still running after
+        ``_DRAIN_TIMEOUT_S`` refuses the restore before it has changed
+        anything. Admission resumes and the planner restarts on every exit,
+        the refusal included.
+
+        Raises:
+            BackgroundWorkStillRunningError: A task was still running at the
+                deadline. It names them.
+        """
+        planner = self._vault._work_planner
+        task_runner = self._vault._task_runner
         try:
-            return self._restore_full_steps(
-                snapshot_id,
-                dry_run,
-                vault_root,
-                report,
-                allow_without_safety,
-                abs_snapshot,
-                restore_request_lease,
-            )
-        except Exception as exc:
-            self._emit_lifecycle(
-                EventType.RESTORE_FAILED,
-                {**started_payload, "error": str(exc)},
-            )
-            raise
+            if planner is not None:
+                planner.stop()
+                logger.info("RestoreService: WorkPlanner stopped for full restore.")
+            if task_runner is not None:
+                result = task_runner.pause_and_drain(_DRAIN_TIMEOUT_S, _DRAIN_REASON)
+                if not result.drained:
+                    raise BackgroundWorkStillRunningError(
+                        sorted({task_label(t) for t in result.still_running}),
+                        _DRAIN_TIMEOUT_S,
+                    )
+                logger.info(
+                    "RestoreService: background work drained; %d pending "
+                    "task(s) cancelled.",
+                    result.cancelled,
+                )
+            yield
+        finally:
+            if task_runner is not None:
+                task_runner.resume_admission()
+            if planner is not None:
+                planner.start()
+                logger.info("RestoreService: WorkPlanner restarted after full restore.")
 
     def _restore_full_steps(
         self,
@@ -371,24 +431,11 @@ class FullRestoreMixin:
         # be on disk, so it would otherwise survive the swap).
         drop_ids = sorted(set(missing_ids) | deleted_ids)
 
-        # 4. Pause background work, then route the DB swap through the writer
-        #    queue so it is serialised with all other DB operations and no
-        #    competing connection can hold a lock during the file swap.
+        # 4. Route the DB swap through the writer queue so it is serialised
+        #    with all other DB operations and no competing connection can hold
+        #    a lock during the file swap. Background work has been paused since
+        #    before step 1 (``_background_work_paused``).
         live_db_path = db._db_path
-        planner = self._vault._work_planner
-        task_runner = self._vault._task_runner
-
-        if planner is not None:
-            planner.stop()
-            logger.info("RestoreService: WorkPlanner stopped for full restore.")
-
-        if task_runner is not None:
-            cancelled = task_runner.cancel_pending_tasks()
-            if cancelled:
-                logger.info(
-                    "RestoreService: cancelled %d pending background task(s).",
-                    cancelled,
-                )
 
         # 3e. Capture the RESOLVED paths of every LIVE, non-deleted picture. These
         #     are the files currently in active use - including content that was
@@ -724,39 +771,30 @@ class FullRestoreMixin:
         if auth_service is not None:
             auth_service.close_auth_for_restore(restore_request_lease)
 
-        # Steps 4-8 wrapped in try/finally so the planner always restarts -
-        # if _do_swap or the cleanup raises, leaving the planner stopped
-        # would silently halt every background worker (daily snapshots,
-        # missing-file detection, embedding generation, ...) until restart.
-        try:
-            db.run_control_task(_do_swap)
-            # Clear API tokens before anything else touches the swapped-in DB,
-            # so no later failure in the cleanup below can leave a restored
-            # token row in place.  ``run_control_task`` has returned, so the
-            # swap has finished and released ``exclusive_engine_access``; this
-            # writer task opens its session on the re-created engine.
-            db.run_task(self._clear_guest_state, priority=0)
-            self._clear_hub_api_tokens()
-            db.run_task(_post_restore_cleanup, priority=0)
-            # Rebuild process-local auth state only after the restored database
-            # is in its final form. A reset failure is fatal and intentionally
-            # leaves the gate closed; reporting success would be fail-open.
-            self._reset_auth_state()
-            if auth_service is not None:
-                auth_service.reopen_auth_after_restore()
-            # The swap dropped every picture the snapshot did not have without
-            # deleting a row, so no trigger queued their instance hashes. Queue
-            # every ghost this library holds; the cascade re-checks each one's
-            # cover against the restored pictures.
-            requeue_library_ghosts(
-                db,
-                getattr(self._vault, "hub", None),
-                getattr(self._vault, "library_uuid", None),
-            )
-        finally:
-            if planner is not None:
-                planner.start()
-                logger.info("RestoreService: WorkPlanner restarted after full restore.")
+        db.run_control_task(_do_swap)
+        # Clear API tokens before anything else touches the swapped-in DB,
+        # so no later failure in the cleanup below can leave a restored
+        # token row in place.  ``run_control_task`` has returned, so the
+        # swap has finished and released ``exclusive_engine_access``; this
+        # writer task opens its session on the re-created engine.
+        db.run_task(self._clear_guest_state, priority=0)
+        self._clear_hub_api_tokens()
+        db.run_task(_post_restore_cleanup, priority=0)
+        # Rebuild process-local auth state only after the restored database
+        # is in its final form. A reset failure is fatal and intentionally
+        # leaves the gate closed; reporting success would be fail-open.
+        self._reset_auth_state()
+        if auth_service is not None:
+            auth_service.reopen_auth_after_restore()
+        # The swap dropped every picture the snapshot did not have without
+        # deleting a row, so no trigger queued their instance hashes. Queue
+        # every ghost this library holds; the cascade re-checks each one's
+        # cover against the restored pictures.
+        requeue_library_ghosts(
+            db,
+            getattr(self._vault, "hub", None),
+            getattr(self._vault, "library_uuid", None),
+        )
 
         self._emit_lifecycle(
             EventType.RESTORE_COMPLETED,

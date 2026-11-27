@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image
 
 from pixlstash.services.training_service import handle_for_run
+from pixlstash.task_runner import TaskCancelledError
 from pixlstash.tasks.face_extraction_task import FaceExtractionTask
 from pixlstash.tasks.training_preview_faces_finder import TrainingPreviewFacesFinder
 from pixlstash.tasks.training_preview_faces_task import TrainingPreviewFacesTask
@@ -264,6 +265,18 @@ def test_an_unreadable_clip_is_kept_as_such_and_spares_the_rest(tmp_path, monkey
     assert faces[os.path.basename(empty)] is None
     assert faces[os.path.basename(broken)] is None
     assert np.array_equal(faces[still][0], ME)
+
+
+def test_a_cancelled_run_is_asked_for_again_and_a_failed_one_waits(tmp_path):
+    run, handle = _run(tmp_path)
+    _sample(handle, 0, 0)
+    finder = _finder(tmp_path, [run])
+
+    finder.on_task_complete(finder.find_task(), TaskCancelledError("drained"))
+    task = finder.find_task()
+    assert task is not None, "a cancel kept the run from being asked for again"
+    finder.on_task_complete(task, RuntimeError("detector broke"))
+    assert finder.find_task() is None
 
 
 def test_the_task_writes_faces_and_an_ended_run_settles(tmp_path, monkeypatch):

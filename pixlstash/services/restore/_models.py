@@ -9,6 +9,72 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+#: What a person calls each kind of task, for a refusal that names the work in
+#: the way. Keyed by ``BaseTask.type``: the class names never reach a person.
+#: The three ``DeviceReleaseTask`` types (``UnloadModels``, ``SuspendCuda``,
+#: ``ReleaseFaceModels``) are listed too: a drain can time out on one.
+TASK_LABELS: dict[str, str] = {
+    "AnomalyRegionTask": "Anomaly regions",
+    "CheckpointHashTask": "Checkpoint hashing",
+    "ComfyUIExtractionTask": "ComfyUI backfill",
+    "DedupAutoStackTask": "Auto-stack",
+    "DedupScanTask": "Duplicate scan",
+    "DescriptionTask": "Descriptions",
+    "DetectionTask": "Object detection",
+    "DownloadsIntakeTask": "Downloads intake",
+    "EnsureGfsSnapshotTask": "Scheduled snapshot",
+    "FaceDetectionTask": "Face detection",
+    "FaceExtractionTask": "Face extraction",
+    "FaceModelRefreshTask": "Detect faces again",
+    "FamilyReidentifyTask": "Family re-identification",
+    "GhostCascadeTask": "Workflow ghost cleanup",
+    "ImageEmbeddingTask": "Image embeddings",
+    "LayoutMoveTask": "Folder layout move",
+    "LikenessParametersTask": "Likeness parameters",
+    "LikenessTask": "Likeness",
+    "MissingFilePurgeTask": "File cleanup",
+    "ModelFolderScanTask": "Model folder scan",
+    "OcrTask": "Text in pictures",
+    "OrientationTask": "Orientation",
+    "PendingScoreInvalidationTask": "Score refresh",
+    "PictureImportTask": "Import",
+    "PixelShaTask": "Picture fingerprints",
+    "PromptMatchTask": "Prompt match",
+    "QualityTask": "Quality scoring",
+    "ReferenceFolderScanTask": "Reference folder scan",
+    "ReleaseFaceModels": "Face model release",
+    "SavedRecipeConvertTask": "Saved recipe conversion",
+    "ScrapheapRetentionPurgeTask": "Scrapheap cleanup",
+    "ScrapheapRunTask": "Scrapheap",
+    "SmartScoreTask": "Smart score",
+    "SnapshotIdentityScrubTask": "Snapshot cleanup",
+    "SourceFaceLikenessTask": "Source face likeness",
+    "StackCohesionTask": "Stack check",
+    "SuspendCuda": "GPU release",
+    "TagExclusionCleanupTask": "Penalised tag cleanup",
+    "TagHealthAutoRebuildTask": "Tag health check",
+    "TagHealthRebuildTask": "Tag health rebuild",
+    "TagPredictionBackfillTask": "Tag predictions",
+    "TagTask": "Tagging",
+    "TextEmbeddingTask": "Text embeddings",
+    "TextScoreTask": "Text score",
+    "ThumbnailGenerationTask": "Thumbnails",
+    "TrainingPreviewFacesTask": "Training preview faces",
+    "UnloadModels": "Model unload",
+    "WatchFolderImportTask": "Folder import",
+    "WorkflowCardBackfillTask": "Workflow cards",
+}
+
+
+def task_label(task_type: str) -> str:
+    """What a person calls a task of *task_type*.
+
+    A type with no label is a programming error and raises ``KeyError``:
+    there is no name made up from the class name.
+    """
+    return TASK_LABELS[task_type]
+
+
 class RestoreInProgressError(RuntimeError):
     """Raised when a restore is requested while another one is still running.
 
@@ -29,6 +95,30 @@ class SafetySnapshotFailedError(RuntimeError):
     post-restore cleanup later corrupts the live DB; silently continuing
     without it can turn a recoverable problem into an unrecoverable one.
     """
+
+
+class BackgroundWorkStillRunningError(RuntimeError):
+    """Background work was still running when a full restore's drain timed out.
+
+    Raised before the safety snapshot, the swap and ``RESTORE_STARTED``, so
+    nothing was changed. The message is fixed text and labels, for a route
+    to show as it is (409).
+
+    Attributes:
+        still_running: What a person calls each task still running
+            (:func:`task_label`), sorted.
+        timeout_s: How long the restore waited for them, in seconds.
+    """
+
+    def __init__(self, still_running: list[str], timeout_s: float):
+        self.still_running = still_running
+        self.timeout_s = timeout_s
+        super().__init__(
+            "The restore did not start because background work was still "
+            f"running after {timeout_s:.0f} seconds: "
+            f"{', '.join(still_running)}. Nothing was changed. Try again once "
+            "it has finished."
+        )
 
 
 class MissingDependenciesError(RuntimeError):

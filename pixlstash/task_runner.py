@@ -7,6 +7,7 @@ import threading
 import traceback
 import time
 
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from datetime import datetime, UTC
 
@@ -24,6 +25,22 @@ logger = get_logger(__name__)
 class TaskCancelledError(RuntimeError):
     """Raised by ``TaskRunner.submit_and_wait`` when a task is cancelled
     before it had a chance to complete (e.g. the runner was stopped)."""
+
+
+@dataclass(frozen=True)
+class DrainResult:
+    """What :meth:`TaskRunner.pause_and_drain` achieved.
+
+    Attributes:
+        drained: True when no task was running, or settling, at the return.
+        still_running: The type of each task still running at the deadline.
+            They were asked to stop and may still write.
+        cancelled: How many queued or backed-off tasks were cancelled.
+    """
+
+    drained: bool
+    still_running: tuple[str, ...]
+    cancelled: int
 
 
 class TaskRunner:
@@ -105,6 +122,13 @@ class TaskRunner:
         self._cancel_generation = 0
         self._preempt_generation = 0
         self._preempt_reason = ""
+        # Why ``submit`` cancels what it is given (``pause_and_drain``), or
+        # None. Under ``_active_task_lock``.
+        self._admission_paused: Optional[str] = None
+        # Thread ident -> the task a worker took off its queue, until it has
+        # settled and its callbacks have fired: what a drain waits to see empty.
+        self._in_flight: dict[int, BaseTask] = {}
+        self._settled = threading.Condition(self._active_task_lock)
         self._closed = False
         self._on_task_complete_callbacks: list[
             Callable[[BaseTask, Optional[BaseException]], None]
@@ -216,6 +240,66 @@ class TaskRunner:
             "TaskRunner %s: cancelled %d pending task(s).", self._name, cancelled
         )
         return cancelled
+
+    def pause_and_drain(self, timeout_s: float, reason: str) -> DrainResult:
+        """Stop admitting tasks and wait, up to *timeout_s*, for none to run.
+
+        For a caller about to replace what the tasks write to (a restore
+        swapping the database). From now on ``submit`` cancels what it is
+        given, naming *reason*; every pending task is cancelled
+        (``cancel_pending_tasks``); every running task is asked to stop
+        (``on_cancel``, which a task honours between items or not at all).
+        Then it waits until no task is running or settling - a task counts
+        until its completion callbacks have fired, since they may write too.
+
+        Admission stays paused whatever the result, until ``resume_admission``.
+        A task still running at the deadline is not stopped by this: it is
+        named in the result, and the caller must not assume it has stopped
+        writing.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._active_task_lock:
+            self._admission_paused = reason
+        cancelled = self.cancel_pending_tasks()
+        with self._active_task_lock:
+            running = list(self._active_tasks.values())
+        for task in running:
+            try:
+                task.on_cancel()
+            except Exception as exc:
+                logger.warning(
+                    "Task %s (%s) cancel hook failed while draining (%s): %s",
+                    task.id,
+                    task.type,
+                    reason,
+                    exc,
+                )
+        with self._settled:
+            self._settled.wait_for(
+                lambda: not self._in_flight,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+            still_running = tuple(task.type for task in self._in_flight.values())
+        if still_running:
+            logger.error(
+                "TaskRunner %s: %d task(s) still running %.1fs after the drain "
+                "for %s began: %s",
+                self._name,
+                len(still_running),
+                timeout_s,
+                reason,
+                ", ".join(still_running),
+            )
+        return DrainResult(
+            drained=not still_running,
+            still_running=still_running,
+            cancelled=cancelled,
+        )
+
+    def resume_admission(self) -> None:
+        """Admit tasks again after ``pause_and_drain``; safe to repeat."""
+        with self._active_task_lock:
+            self._admission_paused = None
 
     def get_active_tasks_of_type(self, task_type: str) -> list:
         """Return a list of currently executing task instances of the given type."""
@@ -672,6 +756,7 @@ class TaskRunner:
         target_queue = (
             self._gpu_queue if task.queue_type == QueueType.GPU else self._queue
         )
+        paused: Optional[str] = None
         with self._lock:
             # Checked again under the lock ``stop()`` closes the runner under:
             # a stop during ``on_queued()`` has drained the queues already, and
@@ -683,13 +768,18 @@ class TaskRunner:
                 # generation under, so a cancel either drains it or finds the
                 # stamp stale when a worker would start it.
                 with self._active_task_lock:
-                    task._runner_generations = (
-                        self._cancel_generation,
-                        self._preempt_generation,
-                    )
-                    target_queue.put((task.priority, next(self._queue_seq), task))
+                    paused = self._admission_paused
+                    if paused is None:
+                        task._runner_generations = (
+                            self._cancel_generation,
+                            self._preempt_generation,
+                        )
+                        target_queue.put((task.priority, next(self._queue_seq), task))
         if closed:
             self._cancel_queued_task(task, "runner stopped")
+            return task.id
+        if paused is not None:
+            self._cancel_queued_task(task, f"paused for {paused}")
             return task.id
         qsize = target_queue.qsize()
         logger.debug(
@@ -814,10 +904,18 @@ class TaskRunner:
                 if isinstance(task, _StopTask):
                     continue
 
+                thread_ident = threading.current_thread().ident
+                with self._active_task_lock:
+                    self._in_flight[thread_ident] = task
                 try:
-                    self._handle(task, work_queue)
-                except BaseException as exc:
-                    self._fail_unhandled(task, exc)
+                    try:
+                        self._handle(task, work_queue)
+                    except BaseException as exc:
+                        self._fail_unhandled(task, exc)
+                finally:
+                    with self._active_task_lock:
+                        self._in_flight.pop(thread_ident, None)
+                        self._settled.notify_all()
         except BaseException as exc:
             # Whatever a task raises is caught above. What reaches here is a
             # fault in the loop itself - a malformed queue item, a failure

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional
 from pixlstash.pixl_logging import get_logger
 
 from ._models import (
+    BackgroundWorkStillRunningError,
     MissingDependenciesError,
     ResourcePreview,
     RestoreInProgressError,
@@ -97,4 +98,5 @@ __all__ = [
     "RestoreInProgressError",
     "SafetySnapshotFailedError",
     "MissingDependenciesError",
+    "BackgroundWorkStillRunningError",
 ]
