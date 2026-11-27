@@ -9205,6 +9205,14 @@ auto-stack slice (`DedupAutoStackTask._apply`); and `announce_restore` when an
 undo, redo, batch undo or auto-stack revert wrote the pending person. The other
 writers set it only on a picture with no face row.
 
+**Start-up resolves a pending person a stop left behind.** Extraction commits
+its face rows and its pending-person match in two transactions, and a picture
+with face rows is never offered to extraction again, so a stop or crash between
+them would leave the person pending for good. `Vault.start` calls
+`reconcile_pending_people_with_faces(vault)` before the workers start: every
+picture holding a `pending_character_id` or a `PicturePendingPerson` row and at
+least one face row goes to `Vault._process_pending_character_assignments`.
+
 #### Nearest-ancestor-wins, tags are not exclusive
 
 A picture is filed under the **closest** accepted Project, Person or Set above

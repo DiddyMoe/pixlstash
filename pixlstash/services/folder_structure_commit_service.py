@@ -69,6 +69,7 @@ from pixlstash.db_models.folder_mapping_commit import (
     STATE_SUPERSEDED,
 )
 from pixlstash.db_models.picture import Picture
+from pixlstash.db_models.picture_pending_person import PicturePendingPerson
 from pixlstash.db_models.picture_project import PictureProjectMember
 from pixlstash.db_models.picture_set import PictureSet, PictureSetMember
 from pixlstash.db_models.project import Project
@@ -1493,6 +1494,51 @@ def resolve_pending_people_with_faces(
             "%s: %d picture(s) had faces before their person was assigned; "
             "assigning now",
             origin,
+            len(ready),
+        )
+        vault._process_pending_character_assignments(ready)
+    return len(ready)
+
+
+def reconcile_pending_people_with_faces(vault) -> int:
+    """Resolve every pending person whose picture already has face rows.
+
+    Called once at start-up, before the workers start. Face extraction commits
+    a picture's face rows and matches its pending people in two transactions
+    (`Vault._after_face_writes_land`), so a stop or crash between them leaves
+    the person pending on a picture the face finder never offers again,
+    because it has faces. A picture with only the no-face marker row has its
+    pending person discarded, as extraction would.
+
+    Returns:
+        How many pictures were handed to the resolver.
+    """
+
+    def fetch(session: Session) -> list[int]:
+        found = set(
+            session.exec(
+                select(Picture.id).where(
+                    Picture.pending_character_id.is_not(None),
+                    select(Face.id).where(Face.picture_id == Picture.id).exists(),
+                )
+            ).all()
+        )
+        found.update(
+            session.exec(
+                select(PicturePendingPerson.picture_id).where(
+                    select(Face.id)
+                    .where(Face.picture_id == PicturePendingPerson.picture_id)
+                    .exists()
+                )
+            ).all()
+        )
+        return sorted(found)
+
+    ready = vault.db.run_task(fetch)
+    if ready:
+        logger.info(
+            "Start-up: %d picture(s) had faces but a person still pending; "
+            "assigning now",
             len(ready),
         )
         vault._process_pending_character_assignments(ready)
