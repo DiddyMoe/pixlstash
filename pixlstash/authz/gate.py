@@ -708,6 +708,11 @@ class AuthzGate:
         if route_policy.library_access is not LibraryAccessMode.ACTIVE_VAULT:
             return
 
+        # Local import: library_admission imports pixlstash.authz.
+        from pixlstash.middleware.library_admission import (
+            BUSY_DETAIL,
+            BUSY_RETRY_AFTER,
+        )
         from pixlstash.services.library_switch_service import (
             SwitchState,
             switching_state_of,
@@ -717,14 +722,16 @@ class AuthzGate:
         if state is SwitchState.READY:
             return
 
+        if state is SwitchState.UNAVAILABLE:
+            detail = "PixlStash has no verified open library. Restart the server."
+        elif getattr(request.state, "auth_user_id", None) is None:
+            # A share link reaches the gate with no principal; it gets
+            # admission's answer, which a restore gives too.
+            detail = BUSY_DETAIL
+        else:
+            detail = "PixlStash is switching library. Try again in a moment."
         raise HTTPException(
-            status_code=503,
-            detail=(
-                "PixlStash has no verified open library. Restart the server."
-                if state is SwitchState.UNAVAILABLE
-                else "PixlStash is switching library. Try again in a moment."
-            ),
-            headers={"Retry-After": "2"},
+            status_code=503, detail=detail, headers={"Retry-After": BUSY_RETRY_AFTER}
         )
 
     def _enforce_library_pin(self, request: Request, route_policy: RoutePolicy) -> None:

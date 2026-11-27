@@ -1,12 +1,27 @@
 """Outermost ASGI admission fence for active-library reads."""
 
-import json
 import re
 
+from starlette.responses import JSONResponse
 from starlette.routing import compile_path
 
 from pixlstash.authz.policy import LibraryAccessMode
 from pixlstash.authz.registry import ROUTE_POLICIES
+
+# The one answer a caller with no credentials gets while a restore or a
+# library switch holds the library, so the two cannot be told apart before
+# authentication. Auth's restore fence and the authz gate use it too.
+BUSY_DETAIL = "PixlStash is busy. Try again in a moment."
+BUSY_RETRY_AFTER = "2"
+
+
+def busy_response() -> JSONResponse:
+    """The 503 a caller with no credentials gets while the library is held."""
+    return JSONResponse(
+        status_code=503,
+        content={"detail": BUSY_DETAIL},
+        headers={"Retry-After": BUSY_RETRY_AFTER},
+    )
 
 
 class LibraryAdmissionMiddleware:
@@ -51,34 +66,35 @@ class LibraryAdmissionMiddleware:
         return LibraryAccessMode.ACTIVE_VAULT
 
     @staticmethod
-    async def _reject(send, unavailable: bool) -> None:
-        detail = (
-            "PixlStash has no verified open library. Restart the server."
-            if unavailable
-            else "PixlStash is switching library. Try again in a moment."
-        )
-        body = json.dumps({"detail": detail}).encode()
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 503,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"retry-after", b"2"),
-                ],
-            }
-        )
-        await send({"type": "http.response.body", "body": body})
+    async def _reject(scope, receive, send, unavailable: bool) -> None:
+        if unavailable:
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "PixlStash has no verified open library. "
+                    "Restart the server."
+                },
+                headers={"Retry-After": BUSY_RETRY_AFTER},
+            )
+        else:
+            response = busy_response()
+        await response(scope, receive, send)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         mode = self._mode(scope)
         if mode is not LibraryAccessMode.ACTIVE_VAULT:
+            if self.server.library_coordinator.state.value == "switching":
+                # Authentication then gives a caller with no credentials
+                # busy_response(), as it does during a restore.
+                scope.setdefault("state", {})["library_switching"] = True
             return await self.app(scope, receive, send)
         lease = self.server.library_coordinator.acquire_read()
         if lease is None:
             return await self._reject(
+                scope,
+                receive,
                 send,
                 self.server.library_coordinator.state.value == "unavailable",
             )

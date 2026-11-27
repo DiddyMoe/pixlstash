@@ -901,14 +901,13 @@ class AuthService:
             return self._restore_auth_gate_closed
 
     @staticmethod
-    def _restore_unavailable_response() -> JSONResponse:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": "Authentication is temporarily unavailable during restore."
-            },
-            headers={"Retry-After": "5"},
-        )
+    def _busy_response() -> JSONResponse:
+        # Admission's busy answer: a caller with no credentials must not tell
+        # a restore from a library switch. Local import: library_admission
+        # imports pixlstash.authz, whose gate imports this module.
+        from pixlstash.middleware.library_admission import busy_response
+
+        return busy_response()
 
     def record_guest_activity(self, session_id: str) -> None:
         """Record or refresh the in-memory last-active timestamp for a guest session.
@@ -2964,7 +2963,7 @@ class AuthService:
             self._acquire_restore_http_lease() if requires_restore_admission else None
         )
         if requires_restore_admission and lease is None:
-            return self._restore_unavailable_response()
+            return self._busy_response()
         if lease is not None:
             request.state.restore_admission_lease = lease
         try:
@@ -2981,6 +2980,18 @@ class AuthService:
 
         if request.method == "OPTIONS":
             return await call_next(request)
+
+        # Mid-switch, admission passes hub-only routes. A caller with no
+        # credentials gets what the restore fence gives everyone, instead of
+        # the route (here, for a public one) or the 401 (below).
+        switching = getattr(request.state, "library_switching", False)
+        if (
+            switching
+            and is_auth_excluded_path(request.url.path)
+            and request.url.path.startswith(RESTORE_ADMISSION_PREFIXES)
+            and request.cookies.get("session_id") not in self.active_session_ids
+        ):
+            return self._busy_response()
 
         if not is_auth_excluded_path(request.url.path):
             # Only enforce authentication for API routes.  Non-API paths (e.g.
@@ -3204,6 +3215,8 @@ class AuthService:
                                     )
 
                 if user_id is None:
+                    if switching:
+                        return self._busy_response()
                     self._logger.error(
                         "Invalid session_id. It has expired and the client needs to log in again. When trying to access %s",
                         request.url.path,

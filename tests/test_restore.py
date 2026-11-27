@@ -4572,7 +4572,7 @@ def test_full_restore_closes_auth_before_swap_and_across_queue_gap(server, monke
         )
         assert cookie_response.status_code == 503, cookie_response.text
         assert token_response.status_code == 503, token_response.text
-        assert cookie_response.headers["Retry-After"] == "5"
+        assert cookie_response.headers["Retry-After"] == "2"
     finally:
         release_token_clear.set()
         thread.join(timeout=20)
@@ -4613,7 +4613,7 @@ def test_share_link_is_unavailable_while_restore_admission_is_closed(server):
     try:
         response = anonymous.get(share_url)
         assert response.status_code == 503, response.text
-        assert response.headers["Retry-After"] == "5"
+        assert response.headers["Retry-After"] == "2"
     finally:
         server.auth.reopen_auth_after_restore()
 

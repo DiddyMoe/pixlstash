@@ -5389,8 +5389,14 @@ holds the library while still queued) or an upload batch still being received.
 Otherwise the coordinator's own message is returned.
 
 While state is `SWITCHING`, new active-library requests receive 503 before auth;
-hub-only identity/registry routes remain available without guest-vault
-enrichment. `Vault.close()` then stops the planner, cancels queued/active tasks,
+it is `busy_response()` ("PixlStash is busy", `Retry-After: 2`), the answer the
+full-restore fence gives too, so a caller with no credentials cannot tell a
+restore from a switch (the authz gate names the switch only to a signed-in
+caller). Hub-only identity/registry routes remain available to a signed-in
+caller without guest-vault enrichment; under `/api/v1` and `/share/` a caller
+with no credentials gets `busy_response()` there too, in place of the 401 or the
+route (admission marks the request `library_switching`, and authentication
+answers). `Vault.close()` then stops the planner, cancels queued/active tasks,
 joins workers, and closes its DB before publication.
 
 Publication updates the hub active row, `server.vault`, and `auth.vault_db`
