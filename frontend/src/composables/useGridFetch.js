@@ -163,6 +163,9 @@ export function useGridFetch(
   const lastFetchKey = ref("");
   const lastFetchError = ref({ key: "", at: 0 });
   const lastFetchSuccess = ref({ key: "", at: 0 });
+  // False after a load of the Scrapheap, which the server lists one row per
+  // picture; useStackOrdering's collapseStackImages reads it.
+  const loadFoldsStacks = ref(true);
   const smartScoreLoadingVisible = computed(
     () =>
       !!getActiveSortKey() &&
@@ -999,6 +1002,9 @@ export function useGridFetch(
     let fetchSucceeded = false;
     let fetchError = null;
     let sortedFetchStartedAt = 0;
+    const selectionParams = new URLSearchParams();
+    _appendSelectionParams(selectionParams);
+    const foldsStacks = !selectionParams.has("only_deleted");
     const fetchPhaseTimings = {
       countMs: null,
       placeholderMs: null,
@@ -1540,6 +1546,7 @@ export function useGridFetch(
         lastFetchedGridImages.value = allGridImages.value.filter(
           (img) => img && img.id != null,
         );
+        loadFoldsStacks.value = foldsStacks;
         const streamFetched = lastFetchedGridImages.value;
 
         // 4. Background stream: fill remaining items sequentially after first
@@ -1647,6 +1654,7 @@ export function useGridFetch(
         return;
       }
       lastFetchedGridImages.value = Array.isArray(images) ? images.slice() : [];
+      loadFoldsStacks.value = foldsStacks;
       syncExpandAllStacksFromFetchedImages();
       images = collapseStackImages(images);
       const shouldHighlight = highlightNextFetch.value && hasLoadedOnce.value;
@@ -1922,6 +1930,7 @@ export function useGridFetch(
     lastFetchKey,
     lastFetchError,
     lastFetchSuccess,
+    loadFoldsStacks,
     smartScoreLoadingVisible,
     buildGridFetchKey,
     buildPictureIdsQueryParams,

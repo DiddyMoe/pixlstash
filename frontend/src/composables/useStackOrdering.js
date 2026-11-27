@@ -66,6 +66,7 @@ export function useStackOrdering(
     setStackReorderHoverSide,
     selectedImageIds,
     preserveScrollOnNextFetch,
+    loadFoldsStacks,
   },
   props,
   emit,
@@ -153,8 +154,13 @@ export function useStackOrdering(
   }
 
   // ── Grid data mapping (used by stack expand/collapse) ─────────────────────
+  // Folds each stack to one card, unless the load that fetched the rows kept
+  // every row (useGridFetch's loadFoldsStacks: the Scrapheap). Every rebuild
+  // from lastFetchedGridImages folds through here, so it shows the cards the
+  // load showed.
   function collapseStackImages(images) {
     if (!Array.isArray(images) || images.length === 0) return [];
+    if (!loadFoldsStacks.value) return images;
     const counts = new Map();
     for (const img of images) {
       const stackId = getPictureStackId(img);

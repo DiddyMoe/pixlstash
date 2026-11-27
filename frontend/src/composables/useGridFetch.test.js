@@ -9,6 +9,7 @@ import { useDedupStore } from "../stores/useDedupStore.js";
 import { useProjectStore } from "../stores/useProjectStore.js";
 import { useGridFetch } from "./useGridFetch.js";
 import { useSearchStore } from "../stores/useSearchStore.js";
+import { SCRAPHEAP_PICTURES_ID } from "../stores/useViewStore";
 import { filterChips } from "../utils/filterChips.js";
 import { notifySessionReset, sessionContext } from "../utils/apiClient";
 import {
@@ -212,6 +213,29 @@ describe("useGridFetch streaming path", () => {
     expect(countQuery).toContain("sort=CHARACTER_LIKENESS");
     expect(countQuery).toContain("descending=true");
     expect(countQuery).toContain("reference_character_id=7");
+  });
+
+  it("tells the stack fold to keep every row of the Scrapheap, and fold a person's", async () => {
+    getPictureCount.mockResolvedValue({ count: 2 });
+    streamPictures.mockResolvedValue({
+      pictures: [
+        { id: 1, stack_id: 7 },
+        { id: 2, stack_id: 7 },
+      ],
+      done: true,
+      next_offset: 2,
+    });
+    const { grid } = makeHarness();
+    const selection = useSelectionStore();
+
+    selection.selectedCharacter = String(SCRAPHEAP_PICTURES_ID);
+    await grid.fetchAllGridImages({ force: true });
+    expect(streamPictures.mock.calls[0][0]).toContain("only_deleted=true");
+    expect(grid.loadFoldsStacks.value).toBe(false);
+
+    selection.selectedCharacter = "7";
+    await grid.fetchAllGridImages({ force: true });
+    expect(grid.loadFoldsStacks.value).toBe(true);
   });
 
   it("issues a singleton character fetch while a duplicate scan is running", async () => {
