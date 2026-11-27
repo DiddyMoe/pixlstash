@@ -693,6 +693,27 @@ describe("LibraryLayoutDialog", () => {
     expect(wrapper.find(".layout-consequence__num").text()).toContain("5,120");
   });
 
+  it("says the count is unavailable when the count read fails, and counts again on reopen", async () => {
+    getLayoutMigrationPreview.mockRejectedValue(new Error("test-network"));
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    expect(wrapper.find(".layout-consequence__num").text()).toBe(
+      "count unavailable",
+    );
+    expect(buttonWith(wrapper, "Move them now").attributes("disabled")).toBe(
+      "",
+    );
+
+    getLayoutMigrationPreview.mockResolvedValue(WOULD_MOVE);
+    await wrapper.setProps({ open: false });
+    await flushPromises();
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+  });
+
   it("does not re-read under a move that is still running", async () => {
     let finishPass;
     runLayoutMigrationPass.mockReturnValue(

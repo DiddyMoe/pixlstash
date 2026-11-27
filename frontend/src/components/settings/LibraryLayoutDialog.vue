@@ -240,6 +240,7 @@ function scheduleWrite(patch) {
   // The count on the bar now describes a layout nobody is looking at, and so
   // does a count still being read: dropped, so it cannot land and clear this.
   countStale.value = true;
+  countUnavailable.value = false;
   dropCount();
   editSeq += 1;
   const seq = editSeq;
@@ -304,6 +305,12 @@ const preview = ref(null);
 const previewing = ref(false);
 /** The count on the bar no longer describes the layout on screen. */
 const countStale = ref(true);
+/**
+ * Stale, and no count is coming: the count read failed. The bar says "count
+ * unavailable" rather than "counting…", which would otherwise stay up with
+ * nothing being counted. Move stays inert, since the count is still stale.
+ */
+const countUnavailable = ref(false);
 const migrating = ref(false);
 /** Undo is one request with no per-pass progress, so its bar is indeterminate. */
 const undoing = ref(false);
@@ -484,6 +491,7 @@ async function refreshPreview() {
   // The layout on screen is not saved yet, so the server would count the one it
   // holds. The count stays stale; the save counts again when it lands.
   if (storedEditSeq !== editSeq) return;
+  countUnavailable.value = false;
   previewing.value = true;
   try {
     const plan = await getLayoutMigrationPreview({
@@ -500,6 +508,7 @@ async function refreshPreview() {
       return;
     }
     preview.value = null;
+    countUnavailable.value = true;
     // Only when the run has not already said something more specific: "the
     // move stopped part way, press Move again" is what the owner has to act
     // on, and a failed re-count on top of it is the lesser fact.
@@ -907,7 +916,13 @@ function netDelta(row) {
             role="status"
             aria-live="polite"
           >
-            <template v-if="previewing || countStale">
+            <template v-if="countUnavailable">
+              <div class="layout-consequence__num">count unavailable</div>
+              <div class="layout-consequence__sub">
+                reopen this dialog to count again
+              </div>
+            </template>
+            <template v-else-if="previewing || countStale">
               <div class="layout-consequence__num">counting…</div>
             </template>
             <template v-else-if="lastRun">
