@@ -4616,6 +4616,8 @@ The one deliberate exception is `api/imageUrls.test.js`, which is neither co-loc
 
 `App.vue` opens a WebSocket at `ws(s)://host/api/v1/ws/updates` and reconnects with a 2-second delay on close. The handshake is **authenticated** by the backend (the HTTP auth middleware does not cover WebSockets): a full session authenticates via the same-origin session cookie, so `buildUpdatesSocketUrl()` runs the URL through `appendShareToken()` to add the READ `?token=` for share/read-only sessions that have no cookie. The backend only delivers the global event stream to owner-level connections; a scoped/READ token may connect but receives no events.
 
+A close with code 1012 (Service Restart) reloads the tab only when its reason says why: "Library switched", or "Database restore in progress" (or a full restore the tab already saw start). uvicorn closes every socket with a bare 1012 when the server stops, and that takes the ordinary reconnect, so a stopped server never reloads open tabs onto the browser's error page.
+
 ### Message types
 
 | `type` | Action |

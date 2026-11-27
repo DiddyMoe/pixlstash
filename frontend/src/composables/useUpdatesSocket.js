@@ -38,6 +38,12 @@ const BACKEND_URL = API_BASE_URL;
 // one fetch-and-rebuild per event.
 const GRID_WS_COALESCE_MS = 200;
 
+// The close reasons the server gives code 1012 (Service Restart): a library
+// switch and the full-restore barrier. uvicorn sends a bare 1012 on every
+// graceful shutdown, so a 1012 without one of these is a server going away.
+const LIBRARY_SWITCH_CLOSE_REASON = "Library switched";
+const FULL_RESTORE_CLOSE_REASON = "Database restore in progress";
+
 /**
  * Apply the server's WebSocket close contract.
  *
@@ -46,7 +52,7 @@ const GRID_WS_COALESCE_MS = 200;
  * instead of reconnecting the socket underneath stale client state.
  */
 export function handleUpdatesSocketClose(event, { reload, reconnect }) {
-  if (event?.code === 1012 && event?.reason === "Library switched") {
+  if (event?.code === 1012 && event?.reason === LIBRARY_SWITCH_CLOSE_REASON) {
     reload();
     return;
   }
@@ -683,15 +689,18 @@ export function useUpdatesSocket({
 
     ws.onclose = (event) => {
       if (updatesSocket === ws) updatesSocket = null;
-      // Close code 1012 is overloaded. A library switch sends it with an
-      // explicit "Library switched" reason; the restore barrier and the
-      // WebSocket admission refusal send it with no reason at all. Only the
-      // reason separates them, so match the switch before the restore branches
-      // or a switch would be transitioned as though it were a restore.
+      // Close code 1012 is overloaded, and only the reason separates its
+      // senders: a library switch, the restore barrier, and uvicorn shutting
+      // down, which gives none. A server stop takes the ordinary reconnect
+      // path below. The admission refusal during a restore closes before the
+      // handshake is accepted, so the browser sees 1006, not 1012.
       const isLibrarySwitch =
-        event?.code === 1012 && event?.reason === "Library switched";
+        event?.code === 1012 && event?.reason === LIBRARY_SWITCH_CLOSE_REASON;
       if (!isLibrarySwitch) {
-        if (event?.code === 1012) {
+        if (
+          event?.code === 1012 &&
+          event?.reason === FULL_RESTORE_CLOSE_REASON
+        ) {
           // The restore barrier deliberately uses Service Restart (1012). The
           // initiating tab must keep its long-running HTTP request alive; every
           // other tab immediately clears session stores and bootstraps afresh.
