@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -172,11 +173,16 @@ def safe_job_stem(name: str, job_id: str) -> str:
 
 
 def _loss_points(rows: list[tuple]) -> list[dict]:
-    """Turn ``(step, value)`` loss rows into curve points, skipping empty values."""
+    """Turn ``(step, value)`` loss rows into curve points.
+
+    An empty value has no point, nor has a diverged step's ``inf``: JSON has
+    no such number, so the stored curve would not parse in the hub's JSON
+    functions and the API would answer it as null, which a chart draws as 0.
+    """
     return [
         {"step": int(step), "loss": float(value)}
         for step, value in rows
-        if value is not None
+        if value is not None and math.isfinite(value)
     ]
 
 

@@ -975,6 +975,7 @@ def _full_read(path):
                 "SELECT step, value_real FROM metrics "
                 "WHERE key = 'loss/loss' AND value_real IS NOT NULL ORDER BY step"
             )
+            if math.isfinite(loss)
         ]
     finally:
         con.close()
@@ -1055,6 +1056,18 @@ def test_a_resume_after_an_infinite_loss_is_read_as_it_now_is(loss_log):
     writer.execute("DELETE FROM steps WHERE step > 3")
     _log_step(writer, 4, 0.55)
     assert backend._read_loss_db(handle) == _full_read(handle.loss_db_path)
+
+
+def test_a_loss_that_is_not_finite_is_left_out_of_the_curve(loss_log):
+    """A diverged step logs ``inf``: it has no point, and the rest keep order."""
+    handle, _writer = loss_log([(1, 0.9), (2, math.inf), (3, -math.inf), (4, 0.6)])
+    backend = _make_backend()
+
+    curve, max_step = backend._read_loss_db(handle)
+
+    assert curve == [{"step": 1, "loss": 0.9}, {"step": 4, "loss": 0.6}]
+    assert max_step == 4
+    json.dumps(curve, allow_nan=False)
 
 
 def test_a_loss_log_cut_back_by_a_carry_on_is_read_again(loss_log, tmp_path):
