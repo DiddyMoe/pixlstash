@@ -705,6 +705,29 @@ class ExportUtils:
                 select_fields=select_fields,
                 include_deleted=only_deleted,
             )
+        elif query:
+            logger.debug("Exporting pictures using search query: {}".format(query))
+            # Local import: the routes package imports this module.
+            from pixlstash.routes.pictures._search import search_results
+
+            # The search view's pictures, in its order: the search route's own
+            # filters, Scrapheap flag, scope and hidden tags, read from the
+            # export's query string. Checked before ``set_id``, which a
+            # search inside a set view also carries.
+            ranked = search_results(
+                server,
+                request,
+                query,
+                offset=0,
+                limit=sys.maxsize,
+                threshold=threshold,
+            )
+            pics = ExportUtils._find_pictures_in_order(
+                server,
+                [pic.id for pic, _relevance in ranked],
+                select_fields=select_fields,
+                include_deleted=only_deleted,
+            )
         elif set_id is not None:
             logger.debug("Exporting pictures set {} ".format(set_id))
 
@@ -735,33 +758,6 @@ class ExportUtils:
                     select_fields=select_fields,
                     include_deleted=only_deleted,
                 )
-        elif query:
-            logger.debug("Exporting pictures using search query: {}".format(query))
-
-            words = re.findall(r"\b\w+\b", query.lower())
-            query_full = "A photo of " + query
-            # Encoded on this thread, never inside the database task - see
-            # ``Picture.semantic_search`` for why an encode must not hold the
-            # DB writer.
-            query_embedding = server.vault.generate_text_embedding(query_full)
-
-            def find_by_text(session):
-                return [
-                    r[0]
-                    for r in Picture.semantic_search(
-                        session,
-                        query_full,
-                        words,
-                        query_embedding=query_embedding,
-                        offset=0,
-                        limit=sys.maxsize,
-                        threshold=threshold,
-                        select_fields=select_fields,
-                        only_deleted=only_deleted,
-                    )
-                ]
-
-            pics = server.vault.db.run_task(find_by_text)
         else:
             logger.debug("Exporting pictures using list filters")
             from pixlstash.routes.pictures import select_pictures_for_listing

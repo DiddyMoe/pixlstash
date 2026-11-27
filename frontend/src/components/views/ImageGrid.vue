@@ -1452,6 +1452,7 @@ import {
   downloadExport,
   listPicturesByIds,
   rotatePictures,
+  SEARCH_CHANCE_CEILING,
 } from "../../api/pictures";
 import { getStack, removeStackMembers } from "../../api/stacks";
 import {
@@ -9435,10 +9436,15 @@ function exportSelectedPictureIds() {
 
 /**
  * The query of an export of the whole view, ZIP or folder: the view's own
- * query, then the export's options, a false flag left out.
+ * query, then the export's options, a false flag left out. A search view's
+ * export sends the threshold the grid's search uses (searchPictures), so it
+ * packages the pictures the search shows.
  */
 function viewExportQuery(exportOptions) {
   const params = new URLSearchParams(buildPictureIdsQueryParams());
+  if (params.has("query")) {
+    params.append("threshold", String(SEARCH_CHANCE_CEILING));
+  }
   for (const [name, value] of Object.entries(exportOptions)) {
     if (value === false) continue;
     params.append(name, String(value));

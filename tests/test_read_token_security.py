@@ -1668,6 +1668,49 @@ class TestResourceScopedReadTokenIsolation:
             f"total={status['total']} for a set-A token"
         )
 
+    def test_a_search_export_keeps_only_the_tokens_pictures(self, env):
+        """An export of a search view packages only the token's scope, though
+        the same search matches both pictures for the owner."""
+        search = {"query": "zebra", "threshold": 0.01}
+        for pid in (env.pic_a, env.pic_b):
+            r = env.owner_client.post(
+                f"{API}/pictures/{pid}/tags", json={"tag": "zebra"}
+            )
+            assert r.status_code == 200, r.text
+        r = env.owner_client.get(f"{API}/pictures/search", params=search)
+        assert r.status_code == 200, r.text
+        assert {p["id"] for p in r.json()} == {env.pic_a, env.pic_b}, (
+            "the owner's search does not match both pictures, so the token's "
+            "export below would prove nothing"
+        )
+
+        scoped = TestClient(env.server.api)
+        headers = {"Authorization": f"Bearer {env.token_a}"}
+        r = scoped.get(f"{API}/pictures/export", params=search, headers=headers)
+        assert r.status_code == 200, r.text
+        task_id = r.json()["task_id"]
+
+        deadline = time.monotonic() + 30
+        status = None
+        while time.monotonic() < deadline:
+            sr = scoped.get(
+                f"{API}/pictures/export/status",
+                params={"task_id": task_id},
+                headers=headers,
+            )
+            assert sr.status_code == 200, sr.text
+            status = sr.json()
+            if status["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert status and status["status"] == "completed", status
+        # Exactly one pins both directions: 2 is the leak, 0 is over-blocking.
+        assert status["total"] == 1, (
+            f"a search export matching set A's and set B's pictures reported "
+            f"total={status['total']} for a set-A token"
+        )
+
     # -- Batch POST endpoints (READ_SAFE_POST_PATHS) must scope-filter -------
     #
     # These endpoints take a client-supplied picture-id list and are exempt

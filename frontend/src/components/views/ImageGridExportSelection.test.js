@@ -7,8 +7,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import { ref } from "vue";
+import { useSearchStore } from "../../stores/useSearchStore";
 import { useSelectionStore } from "../../stores/useSelectionStore";
 import { useSortStore } from "../../stores/useSortStore";
+import { SEARCH_CHANCE_CEILING } from "../../api/pictures";
 
 const apiGet = vi.fn();
 const apiPost = vi.fn();
@@ -137,6 +139,22 @@ describe("ImageGrid export of a selection", () => {
     expect(calls).toHaveLength(1);
     expect(String(calls[0][0])).toMatch(/^\/pictures\/export\?/);
     expect(String(calls[0][0])).not.toMatch(/[?&]id=/);
+    wrapper.unmount();
+    wrapper = null;
+    await started;
+  });
+
+  it("a search view's export sends the threshold the grid's search uses", async () => {
+    useSearchStore().searchQuery = "zebra";
+    await mountGrid();
+    const started = wrapper.vm.exportCurrentViewToZip({});
+    await flushPromises();
+
+    const calls = exportCalls(apiGet);
+    expect(calls).toHaveLength(1);
+    const params = new URLSearchParams(String(calls[0][0]).split("?")[1]);
+    expect(params.get("query")).toBe("zebra");
+    expect(params.get("threshold")).toBe(String(SEARCH_CHANCE_CEILING));
     wrapper.unmount();
     wrapper = null;
     await started;
