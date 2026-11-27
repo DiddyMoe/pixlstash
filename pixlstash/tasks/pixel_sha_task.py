@@ -48,6 +48,7 @@ class PixelShaTask(BaseTask):
     def _run_task(self):
         start = time.time()
         updates: list[tuple[int, str]] = []
+        unreadable: list[int] = []
         for pic in self._pictures:
             file_path = ImageUtils.resolve_picture_path(
                 self._db.image_root, pic.file_path
@@ -57,17 +58,20 @@ class PixelShaTask(BaseTask):
             except (OSError, ValueError) as exc:
                 logger.warning(
                     "pixel_sha computation failed for picture_id=%s path=%s: %s. "
-                    "The picture stays invisible to tier-1 exact duplicate "
-                    "detection until the file is readable again.",
+                    "It is not tried again until PixlStash restarts, and stays "
+                    "invisible to tier-1 exact duplicate detection until then.",
                     pic.id,
                     file_path,
                     exc,
                 )
+                unreadable.append(int(pic.id))
                 continue
             updates.append((int(pic.id), digest))
 
+        # ``deferred`` even when nothing was hashed: a batch where no file
+        # could be read is the one the finder must not hand out again.
         if not updates:
-            return {"changed_count": 0, "changed": []}
+            return {"changed_count": 0, "changed": [], "deferred": unreadable}
 
         changed = self._db.run_task(
             PixelShaTask._persist_pixel_shas, updates, priority=DBPriority.LOW
@@ -77,7 +81,11 @@ class PixelShaTask(BaseTask):
             time.time() - start,
             len(changed or []),
         )
-        return {"changed_count": len(changed or []), "changed": changed or []}
+        return {
+            "changed_count": len(changed or []),
+            "changed": changed or [],
+            "deferred": unreadable,
+        }
 
     @staticmethod
     def _persist_pixel_shas(session: Session, updates: list[tuple[int, str]]) -> list:
