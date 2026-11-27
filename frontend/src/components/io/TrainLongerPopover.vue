@@ -4,7 +4,7 @@
     role="dialog"
     :aria-label="title"
     data-testid="train-longer"
-    @keydown.esc.stop="emit('close')"
+    @keydown.esc.stop="!isImeComposing($event) && emit('close')"
   >
     <div class="tlp-title">{{ title }}</div>
 
@@ -109,6 +109,7 @@ import OptionRows from "../widgets/OptionRows.vue";
 import { getTrainLongerOptions, trainJobLonger } from "../../api/training";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { errorDetail } from "../../utils/apiError";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   jobId: { type: Number, required: true },

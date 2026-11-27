@@ -78,6 +78,15 @@ export function useGlobalKeydown({
     // ARIA textbox are typing surfaces too, and the event target matters as much
     // as `document.activeElement` (a Vuetify combobox moves focus around).
     const isEditable = isTypingTarget(e.target);
+    // A key pressed inside an open menu, popover or dialog is that overlay's.
+    // A menu has no scrim, so the dialog checks below miss it, and Vuetify
+    // lets its keys bubble. The keyboard-help sheet's own key still closes it.
+    if (
+      e.target?.closest?.(".v-overlay__content") &&
+      !shortcutsDialogOpen.value
+    ) {
+      return;
+    }
 
     // The auto-hide sidebar is revealed by hover (or tap), so WCAG 2.1 SC 1.4.13
     // "Content on Hover or Focus" applies: it must be dismissible without moving
@@ -171,8 +180,11 @@ export function useGlobalKeydown({
       }
     }
 
+    // The keys below act on the app behind any dialog, so none of them runs
+    // while one is open, except the keyboard-help sheet's own key.
+    const dialogOpen = isModalOverlayOpen();
     const keys = ["Home", "End", "PageUp", "PageDown"];
-    if (keys.includes(e.key) && !isEditable) {
+    if (keys.includes(e.key) && !isEditable && !dialogOpen) {
       // These keys drive grid scrolling only. Prevent the browser's default
       // scroll so they don't also scroll the sidebar (or the page).
       e.preventDefault();
@@ -182,7 +194,7 @@ export function useGlobalKeydown({
       }
     }
     if (e.key === "f" && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      if (!isEditable) {
+      if (!isEditable && !dialogOpen) {
         e.preventDefault();
         searchStore.requestSearchFocus();
       }
@@ -192,7 +204,8 @@ export function useGlobalKeydown({
       !e.ctrlKey &&
       !e.metaKey &&
       !e.altKey &&
-      !isEditable
+      !isEditable &&
+      (shortcutsDialogOpen.value || !dialogOpen)
     ) {
       e.preventDefault();
       shortcutsDialogOpen.value = !shortcutsDialogOpen.value;

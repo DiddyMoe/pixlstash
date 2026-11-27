@@ -1,4 +1,4 @@
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, nextTick } from "vue";
 import {
   packJustifiedRows,
   rowAtOffset,
@@ -155,21 +155,56 @@ export function useVirtualScroll(
     return { pitch: trackHeight + rowGap, gap: rowGap };
   }
 
-  // Returns whether a measurement was available.
-  function syncSquarePitch() {
+  // The viewport's position in square-row terms: the first item of the row at
+  // the top edge, and how far into that row the edge sits (fraction of pitch).
+  // Taken under the geometry that is about to change and restored under the
+  // new one, so a column change or compact toggle keeps the same pictures at
+  // the top. The browser's scroll anchoring is off for the grid (see
+  // ImageGrid.css), so nothing else does this.
+  function captureSquareAnchor(cols) {
+    const el = scrollWrapper.value;
+    if (!el || !(el.scrollTop > 0)) return null;
+    const into = Math.max(0, el.scrollTop - squareRowTop(0));
+    const row = Math.floor(into / rowHeight.value);
+    return {
+      idx: row * cols,
+      frac: (into - row * rowHeight.value) / rowHeight.value,
+    };
+  }
+
+  function restoreSquareAnchor(anchor) {
+    const el = scrollWrapper.value;
+    if (!el || !anchor) return;
+    const cols = Math.max(1, gridStore.columns || 1);
+    const row = Math.floor(anchor.idx / cols);
+    el.scrollTop = squareRowTop(row) + anchor.frac * rowHeight.value;
+  }
+
+  // Measures the square pitch and, when it (or the column count, given as
+  // prevCols) changed, applies it. The scroll position is restored after the
+  // DOM has the new spacers, so the browser cannot clamp it against the old
+  // scroll height. Returns whether a measurement was available.
+  function syncSquarePitch(prevCols) {
     const measured = measureSquareRowPitch();
     if (!measured) return false;
-    if (
-      squarePitchMeasured &&
-      measured.pitch === rowHeight.value &&
-      measured.gap === squareRowGap.value
-    ) {
-      return true;
-    }
+    const cols = Math.max(1, gridStore.columns || 1);
+    const pitchChanged =
+      !squarePitchMeasured ||
+      measured.pitch !== rowHeight.value ||
+      measured.gap !== squareRowGap.value;
+    if (!pitchChanged && prevCols === cols) return true;
+    const anchor = captureSquareAnchor(Math.max(1, prevCols || cols));
     rowHeight.value = measured.pitch;
     squareRowGap.value = measured.gap;
     squarePitchMeasured = true;
-    recalculateVisibleRange();
+    if (!anchor) {
+      recalculateVisibleRange();
+      return true;
+    }
+    nextTick(() => {
+      restoreSquareAnchor(anchor);
+      recalculateVisibleRange();
+    });
     return true;
   }
 
@@ -205,7 +240,7 @@ export function useVirtualScroll(
       rowHeight.value = estimateRowHeight();
       squarePitchMeasured = false;
       remeasureJustifiedWidth();
-    } else if (!syncSquarePitch() && !squarePitchMeasured) {
+    } else if (!syncSquarePitch(gridStore.columns) && !squarePitchMeasured) {
       rowHeight.value = estimateRowHeight();
     }
     afterRowHeightUpdate?.();
@@ -440,9 +475,9 @@ export function useVirtualScroll(
       () => gridStore.compactMode,
       () => gridStore.thumbnailMode,
     ],
-    () => {
+    (_values, [, , prevCols]) => {
       if (isJustifiedMode.value) return;
-      syncSquarePitch();
+      syncSquarePitch(prevCols);
     },
     { flush: "post" },
   );

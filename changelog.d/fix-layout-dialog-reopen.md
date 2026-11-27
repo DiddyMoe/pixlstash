@@ -1,0 +1,1 @@
+- Fixed: reopening Library layout counts again instead of showing old numbers.

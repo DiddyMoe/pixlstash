@@ -29,3 +29,16 @@ export function activateOnEnterOrSpace(event) {
   }
   return true;
 }
+
+/**
+ * Whether a key event belongs to an input method's composition (Japanese,
+ * Chinese, Korean). While one is open, Enter commits the candidate and Escape
+ * cancels it: neither is a submit, an accept or a dismiss, so a text-field or
+ * dialog handler returns early on it and does not prevent it. A handler that
+ * stops Escape still stops this one, since a Vuetify overlay closes on a window
+ * Escape listener. Safari sends the keydown that ends a composition with
+ * `isComposing` false and `keyCode` 229.
+ */
+export function isImeComposing(event) {
+  return event.isComposing === true || event.keyCode === 229;
+}

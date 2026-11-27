@@ -28,6 +28,7 @@
 
 <script setup>
 import { nextTick, onMounted, ref, useId, watch } from "vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 // `useId`, not a counter: inside <script setup> a counter restarts for every
 // instance, and two open fields would share one id.
@@ -74,6 +75,7 @@ watch(draft, (value) => emit("update:modelValue", value));
  */
 function onKeydown(event) {
   event.stopPropagation();
+  if (isImeComposing(event)) return;
   if (event.key === "Enter") {
     event.preventDefault();
     emit("submit");

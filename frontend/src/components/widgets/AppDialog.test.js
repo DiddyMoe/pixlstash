@@ -61,6 +61,16 @@ describe("AppDialog keyboard contract", () => {
     expect(w.emitted("accept")).toBeFalsy();
   });
 
+  it("leaves the Enter and Escape of an input method's composition to it", async () => {
+    const w = mountDialog();
+    for (const init of [{ isComposing: true }, { keyCode: 229 }]) {
+      await w.find(".txt").trigger("keydown", { key: "Enter", ...init });
+      await w.find(".txt").trigger("keydown", { key: "Escape", ...init });
+    }
+    expect(w.emitted("accept")).toBeFalsy();
+    expect(w.emitted("close")).toBeFalsy();
+  });
+
   it("emits accept on plain Enter from a single-line input", async () => {
     const w = mountDialog();
     await w.find(".txt").trigger("keydown", { key: "Enter" });

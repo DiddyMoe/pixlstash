@@ -24,7 +24,7 @@
               v-model="q"
               type="text"
               placeholder="Filter tags…"
-              @keydown.escape.stop.prevent="emit('close')"
+              @keydown.escape.stop="onSearchEscape"
             />
           </div>
           <Segmented
@@ -264,6 +264,7 @@ import Segmented from "../widgets/Segmented.vue";
 // locked set with the same sentence.
 import { lockedSetTitle } from "./lockedSetCopy";
 import Tooltip from "../widgets/Tooltip.vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   preset: { type: String, default: "" },
@@ -302,6 +303,12 @@ const characterId = ref(props.initialScope.characterId ?? null);
 const searchRef = ref(null);
 
 onMounted(() => searchRef.value?.focus());
+
+function onSearchEscape(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  emit("close");
+}
 
 const openTags = computed(() => new Set(store.sessions.map((s) => s.tag)));
 

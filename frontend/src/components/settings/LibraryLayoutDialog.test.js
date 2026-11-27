@@ -671,6 +671,106 @@ describe("LibraryLayoutDialog", () => {
     expect(runLayoutMigrationPass).not.toHaveBeenCalled();
   });
 
+  // ---- reopening ------------------------------------------------------------
+
+  it("counts again every time it is reopened", async () => {
+    // Pictures are imported and moved while the dialog is closed. A count kept
+    // from the last visit would sit beside the Move button as the plan.
+    const wrapper = mountDialog();
+    await flushPromises();
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+
+    getLayoutMigrationPreview.mockResolvedValue({
+      ...WOULD_MOVE,
+      picture_count: 5120,
+    });
+    await wrapper.setProps({ open: false });
+    await flushPromises();
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    expect(getLayoutSettings).toHaveBeenCalledTimes(2);
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("5,120");
+  });
+
+  it("says the count is unavailable when the count read fails, and counts again on reopen", async () => {
+    getLayoutMigrationPreview.mockRejectedValue(new Error("test-network"));
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    expect(wrapper.find(".layout-consequence__num").text()).toBe(
+      "count unavailable",
+    );
+    expect(buttonWith(wrapper, "Move them now").attributes("disabled")).toBe(
+      "",
+    );
+
+    getLayoutMigrationPreview.mockResolvedValue(WOULD_MOVE);
+    await wrapper.setProps({ open: false });
+    await flushPromises();
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+  });
+
+  it("does not re-read under a move that is still running", async () => {
+    let finishPass;
+    runLayoutMigrationPass.mockReturnValue(
+      new Promise((resolve) => (finishPass = resolve)),
+    );
+    const wrapper = mountDialog();
+    await flushPromises();
+    await buttonWith(wrapper, "Move them now").trigger("click");
+    await flushPromises();
+    const counts = getLayoutMigrationPreview.mock.calls.length;
+
+    await wrapper.setProps({ open: false });
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    expect(getLayoutSettings).toHaveBeenCalledTimes(1);
+    expect(getLayoutMigrationPreview.mock.calls.length).toBe(counts);
+    finishPass(PASS_DONE);
+    await flushPromises();
+  });
+
+  it("does not re-read when the registry's answer settles again while it stays open", async () => {
+    // Only a reopen re-reads. The library registry can answer again while the
+    // dialog is open (blocked, then allowed), and that is not a new visit.
+    const wrapper = mountDialog();
+    await flushPromises();
+    const store = useLibrariesStore();
+
+    store.canManage = false;
+    await flushPromises();
+    store.canManage = true;
+    await flushPromises();
+
+    expect(getLayoutSettings).toHaveBeenCalledTimes(1);
+    expect(wrapper.find(".layout-consequence__num").text()).toContain("4,109");
+  });
+
+  it("keeps an edit closed inside its debounce across the reopen's read", async () => {
+    vi.useFakeTimers();
+    const wrapper = mountDialog();
+    await flushPromises();
+    editLevel(wrapper, 0, ["tag"]);
+    await wrapper.setProps({ open: false });
+    await wrapper.setProps({ open: true });
+    await flushPromises();
+
+    // The reopen read the stored layout, which still says `project`; the edit
+    // the server has not been sent yet is what stays on screen.
+    expect(getLayoutSettings).toHaveBeenCalledTimes(2);
+    const first = wrapper.findAllComponents({ name: "v-select" })[0];
+    expect(first.props("modelValue")).toEqual(["tag"]);
+
+    vi.advanceTimersByTime(1000);
+    await flushPromises();
+    expect(setLayoutSettings).toHaveBeenCalledTimes(1);
+  });
+
   // ---- a count that lands after the one asked for since ---------------------
 
   it.each([

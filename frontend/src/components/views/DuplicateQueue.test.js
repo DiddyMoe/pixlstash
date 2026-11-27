@@ -760,6 +760,22 @@ describe("DuplicateQueue - one toolbar", () => {
     wrapper.unmount();
   });
 
+  it("counts a scoped queue's own groups, not the whole vault's", async () => {
+    routeMock.query = { scope: "set", scope_id: "12" };
+    const { wrapper, store } = await mountQueue([group("g1"), group("g2")]);
+    getCounts.mockResolvedValue({
+      unresolved_groups: 167000,
+      by_tier: { exact: 160000 },
+      scopes: [{ key: "set:12", unresolved_groups: 2, by_tier: { exact: 2 } }],
+      scan: { status: "complete" },
+    });
+    await store.refreshCounts();
+    await flushPromises();
+    expect(store.scopeType).toBe("set");
+    expect(wrapper.find(".qtitle").text()).toContain("2 groups to review");
+    wrapper.unmount();
+  });
+
   // The one thing that stayed on a second row, and it is state rather than
   // explanation: it appears with the selection and leaves with it.
   it("raises the bulk bar only while a selection is live", async () => {
@@ -826,6 +842,31 @@ describe("DuplicateQueue - who owns the keyboard", () => {
     expect(store.focusIndex).toBe(0);
 
     scrim.remove();
+    wrapper.unmount();
+  });
+
+  // A menu raised over the queue (the title bar's, the sidebar's) has no
+  // scrim, so the dialog signal misses it; a key pressed in it is its own.
+  it("hands the keyboard to a menu the queue did not open", async () => {
+    const { wrapper, store } = await mountQueue([group("g1"), group("g2")]);
+    const menu = document.createElement("div");
+    menu.className = "v-overlay v-overlay--active v-menu";
+    menu.innerHTML =
+      '<div class="v-overlay__content"><button type="button">Item</button></div>';
+    document.body.appendChild(menu);
+
+    const item = menu.querySelector("button");
+    item.dispatchEvent(
+      new window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }),
+    );
+    expect(store.focusIndex).toBe(0);
+    // The same key outside the menu still moves the queue.
+    document.dispatchEvent(
+      new window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }),
+    );
+    expect(store.focusIndex).toBe(1);
+
+    menu.remove();
     wrapper.unmount();
   });
 

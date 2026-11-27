@@ -3,7 +3,7 @@
     type="number"
     :value="value"
     @change="emit('change', $event.target.value, $event.target)"
-    @keydown.enter.stop="$event.target.blur()"
+    @keydown.enter.stop="!isImeComposing($event) && $event.target.blur()"
   />
 </template>
 
@@ -25,6 +25,7 @@
 // Enter commits: it blurs the field, which is the native change. Inside an
 // AppDialog the key would otherwise be taken as "accept" (a dialog with no
 // accept listener) and the typed value would never be sent.
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 defineProps({
   /** The row's strength as the field shows it. */

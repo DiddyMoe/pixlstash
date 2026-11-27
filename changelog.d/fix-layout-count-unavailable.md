@@ -1,0 +1,1 @@
+- Fixed: Library layout says a count is unavailable instead of counting forever.

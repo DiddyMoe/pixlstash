@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { ref, reactive, effectScope, customRef, toRaw } from "vue";
+import { ref, reactive, effectScope, customRef, toRaw, nextTick } from "vue";
 import { setActivePinia, createPinia } from "pinia";
 import { useSortStore } from "../stores/useSortStore.js";
 import { useFilterStore } from "../stores/useFilterStore.js";
@@ -298,7 +298,9 @@ describe("useGridFetch streaming path", () => {
     // Count says 5, stream only ever delivers 3 - the last 2 cells would
     // otherwise remain permanent id-less spinners.
     getPictureCount.mockResolvedValue({ count: 5 });
-    streamPictures.mockResolvedValue({ pictures: pics });
+    streamPictures.mockImplementation((_query, { offset, batchLimit }) =>
+      Promise.resolve({ pictures: pics.slice(offset, offset + batchLimit) }),
+    );
 
     const { grid, refs } = makeHarness({
       selectedSort: "CHARACTER_LIKENESS",
@@ -1341,11 +1343,14 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
   // background batches of 5,000, 5,000 and 1,600 rows between them.
   const TOTAL = 12_000;
   const TAIL_START = TOTAL - 200;
+  // Pictures the server has deleted, so later answers leave them out.
+  const serverDeleted = new Set();
 
   beforeEach(() => {
     getPictureCount.mockReset();
     streamPictures.mockReset();
     getPictureCount.mockResolvedValue({ count: TOTAL });
+    serverDeleted.clear();
   });
 
   // Both lists as plain rows, so a comparison sees each row's fields.
@@ -1367,7 +1372,12 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
         reads.push({ offset, ...readLists(refs) });
         if (offset === 5200) refsWrite(refs);
       }
-      return Promise.resolve({ pictures: streamedRows(offset, batchLimit) });
+      const rows = streamedRows(0, TOTAL).filter(
+        (row) => !serverDeleted.has(row.id),
+      );
+      return Promise.resolve({
+        pictures: rows.slice(offset, offset + batchLimit),
+      });
     });
     const harness = makeHarness();
     refs = harness.refs;
@@ -1398,11 +1408,14 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
     [
       "a delete takes a picture out of both lists",
       (refs) => {
+        serverDeleted.add(3);
         const kept = (row) => row.id !== 3;
         refs.allGridImages.value = refs.allGridImages.value.filter(kept);
         refs.lastFetchedGridImages.value =
           refs.lastFetchedGridImages.value.filter(kept);
       },
+      // The batch out during the delete is asked again, a slot earlier.
+      [5200, 5199, 10199, null],
     ],
     [
       "a re-score rewrites a card in the grid alone",
@@ -1411,16 +1424,90 @@ describe("useGridFetch: the fetched rows stay in step with a streaming grid", ()
         next[1] = { ...next[1], score: 5 };
         refs.allGridImages.value = next;
       },
+      [5200, 10200, null],
     ],
   ])(
     "keeps the fetched rows the grid's loaded rows after %s mid-stream",
-    async (_case, write) => {
+    async (_case, write, offsets) => {
       const reads = await streamReading(write);
 
-      expect(reads.map((read) => read.offset)).toEqual([5200, 10200, null]);
+      expect(reads.map((read) => read.offset)).toEqual(offsets);
       for (const { gridRows, fetchedRows } of reads) {
         expect(fetchedRows).toEqual(loaded(gridRows));
       }
     },
   );
+});
+
+describe("useGridFetch: a re-read's scroll place stays with its view", () => {
+  beforeEach(() => {
+    searchPictures.mockReset();
+  });
+
+  // A scroller whose scrollTop writes are recorded; tall enough that no
+  // restore is clamped.
+  function scrollView(refs, top) {
+    const view = { top, writes: [] };
+    refs.scrollWrapper.value = {
+      get scrollTop() {
+        return view.top;
+      },
+      set scrollTop(value) {
+        view.top = value;
+        view.writes.push(value);
+      },
+      scrollHeight: 1e7,
+      clientHeight: 100,
+      clientWidth: 400,
+    };
+    return view;
+  }
+
+  // An answer that lands with the view at the top, as a replaced list leaves
+  // it: only a restore moves it.
+  function answerAtTop(view, rows) {
+    return () => {
+      view.top = 0;
+      return Promise.resolve(rows);
+    };
+  }
+
+  it("opens a search started during a re-read that keeps the scroll at the top", async () => {
+    const held = deferred();
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 1200);
+    searchPictures
+      .mockReturnValueOnce(held.promise)
+      .mockImplementationOnce(answerAtTop(view, [{ id: 50 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    refs.preserveScrollOnNextFetch.value = true;
+    const reread = grid.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(searchPictures).toHaveBeenCalledTimes(1));
+    refs.preserveScrollOnNextFetch.value = false;
+    useSearchStore().searchQuery = "tea";
+    await grid.fetchAllGridImages({ force: true });
+    held.resolve([{ id: 1 }]);
+    await reread;
+    await nextTick();
+
+    expect(refs.allGridImages.value.map((row) => row.id)).toEqual([50]);
+    expect(view.writes).toEqual([]);
+  });
+
+  it("puts the view back after a re-read of the same view", async () => {
+    const { grid, refs } = makeHarness();
+    const view = scrollView(refs, 800);
+    searchPictures.mockImplementationOnce(answerAtTop(view, [{ id: 1 }]));
+    useSearchStore().searchQuery = "coffee";
+
+    // As the gridVersion refresh does: record, clear the flag, re-read.
+    refs.preserveScrollOnNextFetch.value = true;
+    grid.recordScrollPlace();
+    refs.preserveScrollOnNextFetch.value = false;
+    await grid.fetchAllGridImages({ force: true });
+    await nextTick();
+
+    expect(view.writes).toEqual([800]);
+  });
 });

@@ -599,7 +599,7 @@
                   placeholder="Group name"
                   autocomplete="off"
                   spellcheck="false"
-                  @keydown.esc.stop.prevent="cancelNaming"
+                  @keydown.esc.stop="onNamingEscape"
                 />
               </form>
             </div>
@@ -668,6 +668,7 @@ import { hasNativeCopyContext, isTypingTarget } from "../../utils/dom.js";
 import { formatSentinelTag } from "../../utils/tags.js";
 import { chipText, colourKey, NEUTRAL_KEYS } from "../../utils/tagColour.js";
 import { onMenuKeydown } from "../../utils/menuKeyboard.js";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 import { vSubmenuFit } from "../../utils/submenuFit";
 import KeyCap from "../widgets/KeyCap.vue";
 import Tooltip from "../widgets/Tooltip.vue";
@@ -1223,6 +1224,12 @@ function cancelNaming() {
   nextTick(() => newRowRef.value?.focus());
 }
 
+function onNamingEscape(event) {
+  if (isImeComposing(event)) return;
+  event.preventDefault();
+  cancelNaming();
+}
+
 /** Make the group, then file the chips under it. Nothing moves if it fails. */
 async function commitNaming() {
   const name = newGroupName.value.trim();
@@ -1530,6 +1537,10 @@ async function commit() {
 }
 
 function onKey(event) {
+  if (isImeComposing(event)) {
+    if (event.key === "Escape") event.stopPropagation();
+    return;
+  }
   const list = suggestions.value;
   if (event.key === "Enter") {
     event.preventDefault();

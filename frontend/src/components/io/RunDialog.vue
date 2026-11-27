@@ -1092,7 +1092,7 @@
             label="Name of the new workflow"
             :readonly="Boolean(saving)"
             @enter="saveAsNew"
-            @keydown.esc="backFromName"
+            @keydown.esc="!isImeComposing($event) && backFromName()"
             @keydown.stop
           />
           <AppButton
@@ -1413,6 +1413,7 @@ import RunReasonNotice from "./RunReasonNotice.vue";
 import PromptAssistGroup from "./PromptAssistGroup.vue";
 import RunResetChip from "./RunResetChip.vue";
 import UpscaleChoice from "./UpscaleChoice.vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   /**
@@ -5320,6 +5321,10 @@ function close() {
  * to back out of first.
  */
 function onEscape(event) {
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   if (close()) event.stopPropagation();
 }
 

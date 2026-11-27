@@ -255,6 +255,7 @@ import StackLayer from "../widgets/StackLayer.vue";
 import AdapterTray from "../widgets/AdapterTray.vue";
 import FaceClustersDialog from "../io/FaceClustersDialog.vue";
 import { errorDetail } from "../../utils/apiError";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 // Failures report through the notice surface instead of a blocking native
 // alert() (docs/design/notice-surface.md §1).
@@ -602,6 +603,7 @@ const { pending: saving, run: save } = useSubmitGuard(submitCharacter);
 function handleKeydown(event) {
   // The faces dialog over this one takes its own keys.
   if (facesOpen.value) return;
+  if (isImeComposing(event)) return;
   if (event.key === "Escape") {
     if (previewPic.value) {
       previewPic.value = null;

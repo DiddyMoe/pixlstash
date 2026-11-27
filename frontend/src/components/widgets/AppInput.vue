@@ -26,7 +26,7 @@
         :aria-invalid="error ? 'true' : undefined"
         @input="emit('update:modelValue', $event.target.value)"
         @blur="emit('blur')"
-        @keydown.enter="emit('enter')"
+        @keydown.enter="!isImeComposing($event) && emit('enter')"
       />
     </div>
     <span v-if="typeof error === 'string' && error" class="app-input__error">{{
@@ -45,6 +45,7 @@
 import { onMounted, ref } from "vue";
 import { VIcon } from "vuetify/components";
 import FieldLabel from "./FieldLabel.vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   modelValue: { type: [String, Number, null], default: "" },

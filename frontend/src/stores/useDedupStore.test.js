@@ -1793,6 +1793,48 @@ describe("useDedupStore - counts", () => {
     });
   });
 
+  /** The vault holds 167k groups; every scope asked for holds two. */
+  function vaultAndScopeCounts({ scopes }) {
+    return {
+      unresolved_groups: 167000,
+      by_tier: { exact: 160000, near: 7000 },
+      scopes: scopes.map((s) => ({
+        key: scopeKey(s.scopeType, s.scopeId),
+        unresolved_groups: 2,
+        by_tier: { exact: 2, near: 1 },
+      })),
+    };
+  }
+
+  it("a scoped queue reads its own tiers, not the vault's", async () => {
+    servePage([group("g1"), group("g2")], { total: 2 });
+    getCounts.mockImplementation(async (args) => vaultAndScopeCounts(args));
+    const store = useDedupStore();
+    await store.openQueue({ type: "set", id: 12, label: "Set B" });
+    await store.refreshCounts();
+    expect(getCounts).toHaveBeenLastCalledWith(
+      expect.objectContaining({ scopes: [{ scopeType: "set", scopeId: 12 }] }),
+    );
+    expect(store.reviewCount).toBe(2);
+    expect(store.exactCount).toBe(2);
+    expect(store.queueOnlyCount).toBe(1);
+    expect(store.tierRows.find((row) => row.id === "exact").count).toBe(2);
+  });
+
+  it("an unscoped queue still reads the vault's tiers", async () => {
+    servePage([group("g1"), group("g2")], { total: 2 });
+    getCounts.mockImplementation(async (args) => vaultAndScopeCounts(args));
+    const store = useDedupStore();
+    await store.openQueue({ type: "global" });
+    await store.refreshCounts();
+    expect(getCounts).toHaveBeenLastCalledWith(
+      expect.objectContaining({ scopes: [] }),
+    );
+    expect(store.reviewCount).toBe(167000);
+    expect(store.exactCount).toBe(160000);
+    expect(store.queueOnlyCount).toBe(7000);
+  });
+
   it("leaves the badge alone when the count read fails", async () => {
     getCounts.mockRejectedValue(new Error("nope"));
     const store = useDedupStore();

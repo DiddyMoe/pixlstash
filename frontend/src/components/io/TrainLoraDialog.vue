@@ -703,6 +703,7 @@ import { useEntityListsStore } from "../../stores/useEntityListsStore";
 import { useTrainingRunsStore } from "../../stores/useTrainingRunsStore";
 import { useTrainingStore } from "../../stores/useTrainingStore";
 import { arrowStep, tabStopId } from "../../utils/radioGroup.js";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 import {
   EFFORT_LABELS,
   FIT_LABELS,
@@ -1527,6 +1528,7 @@ async function onStart() {
  * marks it. Buttons in the table keep Enter for themselves.
  */
 function keepEnterInField(event) {
+  if (isImeComposing(event)) return;
   if (event.target instanceof HTMLInputElement) event.preventDefault();
 }
 

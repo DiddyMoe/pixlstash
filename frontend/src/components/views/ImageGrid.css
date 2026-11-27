@@ -337,6 +337,8 @@
 .grid-scroll-wrapper {
   overflow-y: auto;
   overflow-x: hidden;
+  /* The grid restores its own scroll anchor; a browser correction would apply twice. */
+  overflow-anchor: none;
   width: 100%;
   padding-right: 0px;
   /* Shared amber scrollbar treatment - keep in sync with .sidebar-scroll in SideBar.vue */

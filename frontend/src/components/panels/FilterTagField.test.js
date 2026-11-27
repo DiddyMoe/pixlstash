@@ -160,6 +160,19 @@ describe("FilterTagField: BY GROUP", () => {
     expect(wrapper.emitted("add")).toHaveLength(2);
   });
 
+  it("leaves the Enter and Escape of an input method's composition to it", async () => {
+    const wrapper = mountField();
+    const field = wrapper.find("input");
+    await field.setValue("ha");
+    for (const init of [{ isComposing: true }, { keyCode: 229 }]) {
+      for (const key of ["Enter", "Escape"]) {
+        await field.trigger("keydown", { key, ...init });
+      }
+    }
+    expect(field.element.value).toBe("ha");
+    expect(wrapper.emitted("add")).toBeUndefined();
+  });
+
   it("folding a group under the highlight moves the highlight onto its row", async () => {
     filedGroups();
     const wrapper = mountField();

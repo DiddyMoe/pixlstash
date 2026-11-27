@@ -1,0 +1,1 @@
+- Fixed: keys pressed in a dialog or menu no longer act on the grid behind it.

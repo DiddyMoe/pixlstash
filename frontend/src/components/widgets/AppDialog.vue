@@ -51,6 +51,7 @@
 import { useId } from "vue";
 import { VDialog } from "vuetify/components";
 import AppBarButton from "./AppBarButton.vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -107,10 +108,12 @@ function onKeydown(e) {
   if (e.key === "Escape") {
     if (props.persistent) return;
     e.stopPropagation();
+    if (isImeComposing(e)) return;
     emit("close");
     return;
   }
   if (e.key !== "Enter" || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  if (isImeComposing(e)) return;
   if (props.persistent) return;
   // A descendant that handled Enter itself (e.g. a role="radio" row) has
   // already preventDefault-ed; respect that instead of double-acting.

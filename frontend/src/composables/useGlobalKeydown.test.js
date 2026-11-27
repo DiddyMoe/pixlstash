@@ -16,6 +16,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { SHELF_NO_UNDO_KEY, useGlobalKeydown } from "./useGlobalKeydown";
 import { useNoticeStore } from "../stores/useNoticeStore";
 import { useOperationStore } from "../stores/useOperationStore";
+import { useSearchStore } from "../stores/useSearchStore";
 
 /** A host component whose only job is to install the listener. */
 const Host = {
@@ -162,5 +163,99 @@ describe("Escape and the sidebar's Find in library (#2448)", () => {
     document.body.appendChild(overlay);
     press("Escape", { ctrlKey: false });
     expect(sidebar.clearFind).not.toHaveBeenCalled();
+  });
+});
+
+// A key pressed in a dialog or a menu is that overlay's. Vuetify lets the keys
+// bubble to the window, where Home or PageDown scrolled the grid behind it, F
+// moved focus to the search field and Ctrl+Z undid a library change.
+describe("the app's shortcuts behind a dialog or menu", () => {
+  let grid;
+  let shortcutsDialogOpen;
+  let host;
+  let searchFocus;
+
+  beforeEach(() => {
+    grid = { onGlobalKeyPress: vi.fn() };
+    shortcutsDialogOpen = ref(false);
+    host = mount(
+      {
+        setup() {
+          useGlobalKeydown({
+            gridContainer: ref(grid),
+            sidebarRef: ref(null),
+            shortcutsDialogOpen,
+          });
+          return () => null;
+        },
+      },
+      { attachTo: document.body },
+    );
+    searchFocus = vi.spyOn(useSearchStore(), "requestSearchFocus");
+  });
+
+  afterEach(() => host.unmount());
+
+  /** An open Vuetify overlay holding one button; a menu has no scrim. */
+  function openOverlay(className, { scrim = false } = {}) {
+    const overlay = document.createElement("div");
+    overlay.className = `v-overlay v-overlay--active ${className}`;
+    overlay.innerHTML =
+      (scrim ? '<div class="v-overlay__scrim"></div>' : "") +
+      '<div class="v-overlay__content"><button type="button">Item</button></div>';
+    document.body.appendChild(overlay);
+    return overlay.querySelector("button");
+  }
+
+  function pressOn(target, key, init = {}) {
+    const event = new KeyboardEvent("keydown", {
+      key,
+      bubbles: true,
+      cancelable: true,
+      ...init,
+    });
+    target.dispatchEvent(event);
+    return event;
+  }
+
+  it("leaves a key pressed inside an overlay to the overlay", () => {
+    const item = openOverlay("v-menu");
+    for (const key of ["Home", "PageDown", "f", "?"]) pressOn(item, key);
+    pressOn(item, "z", { ctrlKey: true });
+
+    expect(grid.onGlobalKeyPress).not.toHaveBeenCalled();
+    expect(searchFocus).not.toHaveBeenCalled();
+    expect(shortcutsDialogOpen.value).toBe(false);
+    expect(store.undo).not.toHaveBeenCalled();
+  });
+
+  it("leaves keys to an open modal dialog", () => {
+    openOverlay("v-dialog", { scrim: true });
+    const presses = ["Home", "End", "PageUp", "PageDown", "f", "?"].map((key) =>
+      pressOn(document.body, key),
+    );
+
+    expect(grid.onGlobalKeyPress).not.toHaveBeenCalled();
+    expect(searchFocus).not.toHaveBeenCalled();
+    expect(shortcutsDialogOpen.value).toBe(false);
+    expect(presses.some((event) => event.defaultPrevented)).toBe(false);
+  });
+
+  it("still handles a key on the grid with no dialog open", () => {
+    pressOn(document.body, "PageDown");
+    pressOn(document.body, "f");
+    pressOn(document.body, "?");
+
+    expect(grid.onGlobalKeyPress).toHaveBeenCalledWith(
+      "PageDown",
+      expect.any(KeyboardEvent),
+    );
+    expect(searchFocus).toHaveBeenCalled();
+    expect(shortcutsDialogOpen.value).toBe(true);
+
+    // The keyboard-help sheet is a dialog too; its own key still closes it.
+    const button = openOverlay("v-dialog", { scrim: true });
+    pressOn(button, "?");
+    expect(shortcutsDialogOpen.value).toBe(false);
   });
 });

@@ -293,6 +293,7 @@ import ModelDownloadButton from "../widgets/ModelDownloadButton.vue";
 import ModelMark from "../widgets/ModelMark.vue";
 import Segmented from "../widgets/Segmented.vue";
 import Tooltip from "../widgets/Tooltip.vue";
+import { isImeComposing } from "../../utils/keyboardActivation.js";
 
 /** How many partial rows draw before "Show more", without a search. */
 const PARTIAL_DEPTH = 30;
@@ -477,6 +478,12 @@ function press(item) {
 }
 
 function onKeydown(event) {
+  // Every key, stopped short of the popup's root, which closes on Escape, and
+  // of the menu's own Enter handling (Vuetify's VMenu), which would prevent it.
+  if (isImeComposing(event)) {
+    event.stopPropagation();
+    return;
+  }
   const list = walk.value;
   const at = list.findIndex((item) => item.key === cursor.value);
   if (event.key === "ArrowDown" || event.key === "ArrowUp") {
