@@ -318,7 +318,12 @@ def _settle_root(root):
     old = time.time() - 600
     for base, _dirs, files in os.walk(root):
         for name in files:
-            os.utime(os.path.join(base, name), (old, old))
+            # The server's own background work (a snapshot's temporary copy)
+            # creates and removes files under the root while this walks it.
+            try:
+                os.utime(os.path.join(base, name), (old, old))
+            except FileNotFoundError:
+                continue
 
 
 def _insert_managed(server, relative_path, **columns):
