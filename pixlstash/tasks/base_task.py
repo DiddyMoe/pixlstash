@@ -75,6 +75,9 @@ class BaseTask(ABC):
         self.vram_oom_attempts = 0
         self._done_event = threading.Event()
         self._cancel_event = threading.Event()
+        # The runner's cancel generations when it was queued; see
+        # ``TaskRunner._refusal_locked``.
+        self._runner_generations = (0, 0)
 
     def run(
         self,

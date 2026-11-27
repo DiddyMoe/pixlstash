@@ -96,6 +96,15 @@ class TaskRunner:
         self._requeue_counts: dict[str, int] = {}
         # Task id -> why it was stopped to make room, for the ones preempted.
         self._preempted: dict[str, str] = {}
+        # Cancel generations, under ``_active_task_lock``. ``submit`` stamps
+        # each task with the ones in force and every cancel bumps its own. A
+        # worker takes a task off its queue outside any lock and registers it
+        # only after admission, so a cancel landing in between finds it
+        # nowhere: the stale stamp catches it (``_refusal_locked``).
+        # ``_preempt_generation`` covers only what ``preempt_gpu`` stops.
+        self._cancel_generation = 0
+        self._preempt_generation = 0
+        self._preempt_reason = ""
         self._closed = False
         self._on_task_complete_callbacks: list[
             Callable[[BaseTask, Optional[BaseException]], None]
@@ -179,11 +188,15 @@ class TaskRunner:
     def cancel_pending_tasks(self) -> int:
         """Drain and cancel all tasks waiting in both CPU and GPU queues.
 
-        Tasks that are already executing are not interrupted.
+        Tasks that are already executing are not interrupted. A task a worker
+        has taken off its queue but not yet started is cancelled when it
+        would start.
 
         Returns:
             Number of tasks cancelled.
         """
+        with self._active_task_lock:
+            self._cancel_generation += 1
         # The tasks waiting out a GPU backoff are taken first, then the queues
         # drained: a backoff that ends meanwhile moves its task onto a queue
         # under the same lock (see ``_requeue``), so it is caught by the drain
@@ -242,6 +255,8 @@ class TaskRunner:
             ]
             for task in running:
                 self._preempted[task.id] = reason
+            self._preempt_generation += 1
+            self._preempt_reason = reason
         for task in running:
             try:
                 task.on_cancel()
@@ -423,11 +438,11 @@ class TaskRunner:
         # sweep, and a refusal that lands after it is cancelled here rather than
         # left waiting behind a timer nobody will cancel.
         with self._active_task_lock:
-            stopped = self._stop.is_set()
-            if not stopped:
+            refusal = self._refusal_locked(task)
+            if refusal is None:
                 self._requeued[task.id] = (timer, task)
-        if stopped:
-            self._cancel_queued_task(task, "runner stopped")
+        if refusal is not None:
+            self._cancel_queued_task(task, refusal)
             return False, None
         try:
             timer.start()
@@ -435,6 +450,26 @@ class TaskRunner:
             self._take_requeued(task.id)
             raise
         return False, None
+
+    def _refusal_locked(self, task: BaseTask) -> Optional[str]:
+        """Why *task*, about to start or enter a backoff, must be cancelled.
+
+        None when it may go on. Call under ``_active_task_lock``, which the
+        cancels bump their generation under: either they find the task
+        registered or it finds the bumped generation here.
+        """
+        if self._stop.is_set():
+            return "runner stopped"
+        cancel_generation, preempt_generation = task._runner_generations
+        if cancel_generation != self._cancel_generation:
+            return "drained from the queue"
+        if (
+            preempt_generation != self._preempt_generation
+            and task.queue_type == QueueType.GPU
+            and not self._interactive(task)
+        ):
+            return self._preempt_reason
+        return None
 
     def _take_requeued(self, task_id: str) -> Optional[BaseTask]:
         with self._active_task_lock:
@@ -644,7 +679,15 @@ class TaskRunner:
             closed = self._closed or self._stop.is_set()
             if not closed:
                 self._replace_dead_workers_locked()
-                target_queue.put((task.priority, next(self._queue_seq), task))
+                # Stamped and queued under the lock the cancels bump their
+                # generation under, so a cancel either drains it or finds the
+                # stamp stale when a worker would start it.
+                with self._active_task_lock:
+                    task._runner_generations = (
+                        self._cancel_generation,
+                        self._preempt_generation,
+                    )
+                    target_queue.put((task.priority, next(self._queue_seq), task))
         if closed:
             self._cancel_queued_task(task, "runner stopped")
             return task.id
@@ -830,11 +873,24 @@ class TaskRunner:
         error: Optional[BaseException] = None
         thread_ident = threading.current_thread().ident
         with self._active_task_lock:
-            self._active_tasks[thread_ident] = task
-            if lease is not None and not lease.on_cpu:
-                self._leased_on_gpu.add(task.id)
+            refusal = self._refusal_locked(task)
+            if refusal is None:
+                self._active_tasks[thread_ident] = task
+                if lease is not None and not lease.on_cpu:
+                    self._leased_on_gpu.add(task.id)
+        if refusal is not None:
+            if lease is not None:
+                self._give_back(task, lease)
+            self._cancel_queued_task(task, refusal)
+            return
         try:
             task.run(on_vram_oom=self._pause_and_report_vram_oom)
+            if task.status == TaskStatus.CANCELLED:
+                # run() returns CANCELLED only for a cancel that reached the
+                # task before it started. Settled with no error, its owner
+                # would take it for a success that wrote nothing.
+                reason = self._preempted.get(task.id, "cancelled before it started")
+                error = TaskCancelledError(f"Task {task.id} ({task.type}) {reason}")
             # ``vram_oom_attempts`` decides whether the user has a card open
             # about this task; ``attempts_used`` is what that card counts -
             # the attempt that actually finished the work, not the last one
