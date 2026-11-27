@@ -3,7 +3,6 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -678,19 +677,18 @@ def create_router(server) -> APIRouter:
                     "Could not remove attachment file %s: %s", full_path, exc
                 )
 
-        # Remove the project attachments directory if it is now empty.
+        # Only the folders left empty: ids are reused, so a new project with
+        # this id may already have uploaded into them.
         project_dir = resolve_path_within(
             server.vault.image_root,
             "projects",
             str(project_id),
         )
-        try:
-            if os.path.isdir(project_dir):
-                shutil.rmtree(project_dir, ignore_errors=True)
-        except OSError as exc:
-            logger.warning(
-                "Could not remove project directory %s: %s", project_dir, exc
-            )
+        for folder in (os.path.join(project_dir, "attachments"), project_dir):
+            try:
+                os.rmdir(folder)
+            except OSError as exc:
+                logger.debug("Left project folder %s in place: %s", folder, exc)
 
         return {"status": "deleted", "id": project_id}
 
