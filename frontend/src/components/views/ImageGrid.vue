@@ -438,6 +438,9 @@
       class="grid-scroll-wrapper"
       ref="scrollWrapper"
       @scroll="onGridScroll"
+      @wheel.passive="dropPendingScrollPlace"
+      @touchmove.passive="dropPendingScrollPlace"
+      @pointerdown="dropScrollPlaceOnScrollbarPress"
       @dragenter.prevent="handleGridDragEnter"
       @dragover.prevent="handleGridDragOver"
       @dragleave.prevent="handleGridDragLeave"
@@ -1344,6 +1347,7 @@ import {
 } from "../../composables/useBottomAnchor";
 import { FLOATING_BOTTOM_GAP_PX } from "../../utils/floatingBottom";
 import { lightboxCloseTarget } from "../../utils/lightboxRoute";
+import { isTypingTarget } from "../../utils/dom.js";
 import { markEnd, markStart } from "../../utils/perfMarks";
 import { useScopedNotice } from "../../composables/useScopedNotice";
 import { buildPurgeBadge } from "../../utils/retention.js";
@@ -2634,6 +2638,7 @@ onMounted(() => {
   window.addEventListener("drop", clearGridDragOverlay, true);
   window.addEventListener("dragend", clearGridDragOverlay, true);
   window.addEventListener("keydown", handleKeyDown);
+  window.addEventListener("keydown", dropScrollPlaceOnScrollKey);
 
   // Restore lightbox from URL on initial page load (e.g. after a page refresh).
   const lightboxIdFromUrl = _lightboxRoute.query.overlay;
@@ -2700,6 +2705,7 @@ onUnmounted(() => {
   window.removeEventListener("drop", clearGridDragOverlay, true);
   window.removeEventListener("dragend", clearGridDragOverlay, true);
   window.removeEventListener("keydown", handleKeyDown);
+  window.removeEventListener("keydown", dropScrollPlaceOnScrollKey);
   if (gridResizeObserver) {
     gridResizeObserver.disconnect();
     gridResizeObserver = null;
@@ -9265,6 +9271,49 @@ function restoreScrollAnchor(anchor) {
   }
   const rows = Math.round((anchor.firstSlot - newIndex) / anchor.cols);
   if (rows !== 0) wrapper.scrollTop -= rows * anchor.pitch;
+}
+
+// Keys that scroll the grid outside a text field: the browser's own scroll
+// keys, and Home/End/PageUp/PageDown, which useGlobalKeydown hands to
+// onGlobalKeyPress.
+const GRID_SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
+
+/**
+ * The user scrolled the grid: drop the place a running re-read was going to
+ * put the view back to, so its end leaves the view where they took it.
+ *
+ * Driven by the input that scrolls (wheel, touch, a scroll key, the
+ * scrollbar), never by the scroll event: the grid writes scrollTop itself
+ * (removal holds, keyboard paging, the restore), and a scroll event does not
+ * say whether the user or a script moved the view.
+ */
+function dropPendingScrollPlace() {
+  pendingScrollTop.value = null;
+}
+
+// The scrollbar, or the grid's empty margin, is the wrapper itself as the
+// target; a card never is. A middle-button press starts autoscroll.
+function dropScrollPlaceOnScrollbarPress(event) {
+  if (event.target === event.currentTarget || event.button === 1) {
+    dropPendingScrollPlace();
+  }
+}
+
+// A key pressed inside an open menu, popover or dialog moves that overlay's
+// list or scrolls that overlay, never the grid behind it.
+function dropScrollPlaceOnScrollKey(event) {
+  if (!GRID_SCROLL_KEYS.has(event.key)) return;
+  if (lightboxOpen.value || isTypingTarget(event.target)) return;
+  if (event.target?.closest?.(".v-overlay__content")) return;
+  dropPendingScrollPlace();
 }
 
 /**

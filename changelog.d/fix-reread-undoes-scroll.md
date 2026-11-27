@@ -1,0 +1,1 @@
+- Fixed: scrolling while the grid reloads no longer jumps back when it finishes.

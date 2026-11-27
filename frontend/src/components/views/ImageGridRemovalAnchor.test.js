@@ -14,6 +14,7 @@ import { setActivePinia, createPinia } from "pinia";
 import { useSelectionStore } from "../../stores/useSelectionStore.js";
 import { useProjectStore } from "../../stores/useProjectStore.js";
 import { useGridStore } from "../../stores/useGridStore.js";
+import { useSearchStore } from "../../stores/useSearchStore.js";
 import { ref, nextTick } from "vue";
 
 const apiGet = vi.fn();
@@ -313,5 +314,124 @@ describe("a removal while the view streams in", () => {
     await streamEnded(vm);
 
     expect(vm.allGridImages.map((img) => img.id)).toEqual(serverIds());
+  });
+});
+
+describe("a user scroll while a re-read is out is not undone by its end", () => {
+  // A re-read that keeps the scroll puts the view back where it stood when
+  // it began. The user's own scroll drops that place; other input does not.
+  async function heldReread() {
+    useSearchStore().searchQuery = "cat";
+    const { vm, cols, scroll } = await scrolledGrid();
+    const rows = Array.from({ length: ROWS * cols }, (_, i) => ({
+      id: i + 1,
+      format: "png",
+    }));
+    let release;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    let armed = false;
+    let searchAsked = false;
+    apiGet.mockImplementation((url) => {
+      if (String(url).includes("/pictures/search")) {
+        if (armed) {
+          searchAsked = true;
+          return held.then(() => ({ data: rows }));
+        }
+        return Promise.resolve({ data: rows });
+      }
+      return Promise.resolve({ data: { pictures: [], count: 0, total: 0 } });
+    });
+    // The restore is clamped to the content's height, which jsdom reports as 0.
+    Object.defineProperty(vm.scrollWrapper, "scrollHeight", {
+      configurable: true,
+      get: () => 1e7,
+    });
+    const startTop = scroll.top;
+    await vm.fetchAllGridImages({ force: true });
+    await settle();
+    scroll.top = startTop;
+    scroll.writes.length = 0;
+    armed = true;
+
+    vm.preserveScrollOnNextFetch = true;
+    const reread = vm.fetchAllGridImages({ force: true });
+    await vi.waitFor(() => expect(searchAsked).toBe(true));
+    vm.preserveScrollOnNextFetch = false;
+    const movedTop = startTop + 50 * vm.rowHeight;
+    const land = async () => {
+      release();
+      await reread;
+      await settle();
+    };
+    return { scroll, startTop, movedTop, land };
+  }
+
+  const scroller = () => wrapper.find(".grid-scroll-wrapper");
+  const pageDown = (target) =>
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "PageDown", bubbles: true }),
+    );
+
+  it.each([
+    ["the wheel", () => scroller().trigger("wheel")],
+    ["a touch drag", () => scroller().trigger("touchmove")],
+    ["a press on the scrollbar", () => scroller().trigger("pointerdown")],
+    [
+      "a middle-button press on a card",
+      // Dispatched by hand: test-utils cannot set `button` on its event.
+      () =>
+        wrapper
+          .find(".image-card")
+          .element.dispatchEvent(
+            new MouseEvent("pointerdown", { button: 1, bubbles: true }),
+          ),
+    ],
+    ["a scroll key", () => pageDown(document.body)],
+  ])("leaves the view where %s took it", async (_name, userScroll) => {
+    const { scroll, movedTop, land } = await heldReread();
+
+    await userScroll();
+    scroll.top = movedTop;
+    await land();
+
+    expect(scroll.writes).toEqual([]);
+  });
+
+  it.each([
+    ["no input at all", () => {}],
+    [
+      "a press on a card",
+      () => wrapper.find(".image-card").trigger("pointerdown"),
+    ],
+    [
+      "a scroll key typed in a field",
+      () => {
+        const field = document.createElement("input");
+        document.body.appendChild(field);
+        pageDown(field);
+        field.remove();
+      },
+    ],
+    [
+      "a scroll key pressed in a dialog",
+      () => {
+        const dialog = document.createElement("div");
+        dialog.innerHTML =
+          '<div class="v-overlay__content"><button>OK</button></div>';
+        document.body.appendChild(dialog);
+        pageDown(dialog.querySelector("button"));
+        dialog.remove();
+      },
+    ],
+  ])("still puts the view back after %s", async (_name, input) => {
+    const { scroll, startTop, movedTop, land } = await heldReread();
+
+    await input();
+    scroll.top = movedTop;
+    await land();
+
+    expect(scroll.top).toBe(startTop);
   });
 });
