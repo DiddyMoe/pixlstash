@@ -113,7 +113,9 @@ def runner():
     runner.stop()
 
 
-def _until(condition, seconds=5.0):
+def _until(condition, seconds=30.0):
+    # Generous: the runner runs a full gc.collect() after every GPU-queue task,
+    # and late in a CI shard's process that takes over a second per task.
     deadline = time.monotonic() + seconds
     while not condition() and time.monotonic() < deadline:
         time.sleep(0.01)
