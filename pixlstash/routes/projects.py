@@ -1081,16 +1081,15 @@ def create_router(server) -> APIRouter:
         ext = re.sub(r"[^a-zA-Z0-9.]", "", raw_ext)[:16]
         stored_filename = safe_stem + ext
         full_path = resolve_path_within(att_dir, stored_filename)
-
-        with open(full_path, "wb") as f:
-            f.write(contents)
-
         mime_type = file.content_type or mimetypes.guess_type(original_filename)[0]
         # Derive rel_path from the already-validated full_path so the stored
         # value is guaranteed to be within image_root (CodeQL sanitizer path).
         rel_path = os.path.relpath(full_path, server.vault.image_root)
 
+        committed = False
+
         def insert_record(session: Session):
+            nonlocal committed
             attachment = ProjectAttachment(
                 project_id=project_id,
                 original_filename=original_filename,
@@ -1101,10 +1100,22 @@ def create_router(server) -> APIRouter:
             )
             session.add(attachment)
             session.commit()
+            committed = True
             session.refresh(attachment)
             return attachment
 
-        return server.vault.db.run_task(insert_record, priority=DBPriority.IMMEDIATE)
+        try:
+            with open(full_path, "wb") as f:
+                f.write(contents)
+            return server.vault.db.run_task(
+                insert_record, priority=DBPriority.IMMEDIATE
+            )
+        except Exception:
+            # Until the row commits nothing points at the file, so nothing
+            # else would remove it.
+            if not committed and os.path.isfile(full_path):
+                os.remove(full_path)
+            raise
 
     @router.post(
         "/projects/{project_id}/attachments/url",

@@ -7,7 +7,9 @@ import tempfile
 import zipfile
 from io import BytesIO
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 from pixlstash.server import Server
 from tests.utils import upload_pictures_and_wait
@@ -279,6 +281,37 @@ def test_deleting_a_project_keeps_the_files_of_a_project_reusing_its_id():
         assert resp.content == b"new"
         att_dir = os.path.join(_project_dir(server, new_id), "attachments")
         assert len(os.listdir(att_dir)) == 1
+    finally:
+        server.close()
+        temp_dir.cleanup()
+        gc.collect()
+
+
+def test_an_attachment_whose_project_is_deleted_mid_upload_leaves_no_file():
+    """The project is deleted after the file is written and before its row
+    is inserted: the insert fails and the written file goes with it."""
+    temp_dir, client, server = _setup()
+    try:
+        project_id = client.post("/projects", json={"name": "Gone"}).json()["id"]
+        att_dir = os.path.join(_project_dir(server, project_id), "attachments")
+        real_run_task = server.vault.db.run_task
+
+        def run_task(fn, *args, **kwargs):
+            if fn.__name__ == "insert_record":
+                assert len(os.listdir(att_dir)) == 1, "the file was not written"
+                assert client.delete(f"/projects/{project_id}").status_code == 200
+            return real_run_task(fn, *args, **kwargs)
+
+        server.vault.db.run_task = run_task
+        try:
+            with pytest.raises(IntegrityError):
+                client.post(
+                    f"/projects/{project_id}/attachments",
+                    files={"file": ("late.txt", b"late", "text/plain")},
+                )
+        finally:
+            del server.vault.db.run_task
+        assert not os.path.exists(att_dir) or os.listdir(att_dir) == []
     finally:
         server.close()
         temp_dir.cleanup()
