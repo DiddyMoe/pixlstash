@@ -8,23 +8,57 @@ from pixlstash.db_models import (
     is_tag_sentinel,
     parse_tag_engine_from_sentinel,
 )
+from pixlstash.pixl_logging import get_logger
+from pixlstash.task_runner import TaskCancelledError
 from pixlstash.utils.query.predicate_filter import awaiting_tagger_clauses
 from pixlstash.worker_config import IMAGE_TASK_PIXEL_BUDGET, TAGGER_MAX_INFLIGHT
+from .base_task import TaskStatus
 from .base_task_finder import BaseTaskFinder
 from .tag_task import TagTask
+from .task_outcome import RetryHold
+
+logger = get_logger(__name__)
 
 
 class MissingTagFinder(BaseTaskFinder):
-    """Find a batch of pictures with a pending-retag sentinel and create a TagTask."""
+    """Find a batch of pictures with a pending-retag sentinel and create a TagTask.
+
+    A task that fails outright, such as one whose tagger did not load, leaves
+    every picture's sentinel, so the next sweep would build the same batch and
+    load the tagger again at once. Such a failure holds the finder back on
+    :class:`RetryHold`, capped at :attr:`BACKEND_HOLD_CAP_S`; the next batch
+    after the hold is the probe, and a task that ends without error clears it.
+    A cancelled task holds nothing. In memory: a restart retries at once.
+    """
+
+    #: The backend hold's only key.
+    _BACKEND = "backend"
+    #: Longest wait between two attempts after a failed task, seconds.
+    BACKEND_HOLD_CAP_S = 60.0
 
     def __init__(
         self,
         database,
         engine_getter: Callable,
+        *,
+        backend_hold: RetryHold | None = None,
     ):
+        """
+        Args:
+            database: The vault database.
+            engine_getter: Returns the inference engine, or ``None`` while
+                there is none.
+            backend_hold: Backoff after a task fails outright; a default one
+                capped at :attr:`BACKEND_HOLD_CAP_S` when omitted.
+        """
         super().__init__()
         self._db = database
         self._engine_getter = engine_getter
+        self._backend_hold = (
+            backend_hold
+            if backend_hold is not None
+            else RetryHold(cap_s=self.BACKEND_HOLD_CAP_S)
+        )
 
     def finder_name(self) -> str:
         return "MissingTagFinder"
@@ -46,6 +80,8 @@ class MissingTagFinder(BaseTaskFinder):
         tagger_settings = getattr(engine, "tagger_settings", None)
         active_tag_plugin = (tagger_settings or {}).get("active_tag_plugin")
         if not active_tag_plugin:
+            return None
+        if self._BACKEND in self._backend_hold.active():
             return None
 
         batch_limit = max(
@@ -104,6 +140,41 @@ class MissingTagFinder(BaseTaskFinder):
             pictures=selected,
             engine_override=first_engine,
             reset_generation=reset_generation,
+        )
+
+    def on_task_complete(self, task, error) -> None:
+        """Hold the finder back if *task* failed, then release the batch.
+
+        The hold is recorded before the claims are released: the planner may
+        run ``find_task`` the moment a claim is let go, and a batch built
+        before the hold exists would load the failing tagger straight away.
+        """
+        try:
+            self._settle_backend(task, error)
+        finally:
+            super().on_task_complete(task, error)
+
+    def _settle_backend(self, task, error) -> None:
+        """Hold or clear the backend hold from how *task* ended."""
+        if isinstance(error, TaskCancelledError) or (
+            error is None and getattr(task, "status", None) == TaskStatus.CANCELLED
+        ):
+            # Stopped, or cancelled before it started (which reports no
+            # error, only its status): nothing was learnt about the tagger.
+            return
+        if error is None:
+            self._backend_hold.clear(self._BACKEND)
+            return
+        # Up to TAGGER_MAX_INFLIGHT tasks fail together when the tagger
+        # cannot load; only the first of them lengthens the hold.
+        if self._BACKEND in self._backend_hold.active():
+            return
+        wait = self._backend_hold.hold(self._BACKEND)
+        logger.warning(
+            "MissingTagFinder: a tagging task failed: %s. No new batch for "
+            "%.0f s; its pictures keep their place in the queue.",
+            error,
+            wait,
         )
 
     @staticmethod

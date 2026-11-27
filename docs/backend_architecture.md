@@ -2053,6 +2053,8 @@ User plugin preferences are stored in a single `User.tagger_settings` JSON colum
 
 Models are lazily loaded on first `init()` call and can be unloaded after idle to free device memory unless `keep_models_in_memory` is set.
 
+A tag plugin that cannot load or tag fails its `TagTask` and never answers with no tags, which would finish the task as a success or mark its pictures tagged with nothing: `TaggingWorkflow.tag_images` raises `TaggerUnavailableError` for the PixlStash tagger, `LookupError` for a plugin that is not installed, and whatever a third-party plugin raised, a missing Python module included. The pictures keep their sentinel, and `MissingTagFinder` builds no new batch until its `RetryHold` (capped at `BACKEND_HOLD_CAP_S`, 60 s) expires; a task that ends without error clears it.
+
 #### Which accelerator a model runs on
 
 Every device decision routes through `pixlstash/utils/accelerator.py`, which is

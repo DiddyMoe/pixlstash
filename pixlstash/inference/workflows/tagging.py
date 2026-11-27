@@ -23,6 +23,7 @@ from pixlstash.tagger_plugins.pixlstash_tagger import (
     PIXLSTASH_TAGGER_IMAGE_SIZE_FIXED_QUALITY_CROP,
     PIXLSTASH_TAGGER_IMAGE_SIZE_FULL,
     PIXLSTASH_TAGGER_IMAGE_SIZE_QUALITY_CROP,
+    TaggerUnavailableError,
 )
 from pixlstash.utils.accelerator import (
     MPS,
@@ -246,6 +247,15 @@ class TaggingWorkflow:
 
         Returns:
             ``{path: [tag, ...]}`` mapping.
+
+        Raises:
+            TaggerUnavailableError: The PixlStash tagger could not be loaded.
+            LookupError: The plugin is not installed or does not tag.
+            Exception: Whatever a third-party plugin raised loading or
+                tagging, a missing Python module included. Never answered
+                with an empty result: ``{}`` finishes the task as a success
+                with nothing written, and an empty list per path removes each
+                picture's sentinel, marking it tagged with nothing for good.
         """
         active = self.active_plugin_name(engine_override)
 
@@ -276,10 +286,7 @@ class TaggingWorkflow:
                 True,
             )
             if not success:
-                logger.warning(
-                    "[TaggingWorkflow] PixlStash tagger failed to load; returning empty results."
-                )
-                return {}
+                raise TaggerUnavailableError()
             return self._tag_images_custom(
                 image_paths,
                 stop_event=stop_event,
@@ -451,10 +458,10 @@ class TaggingWorkflow:
                 the configured ``active_tag_plugin``.
 
         Raises:
-            RuntimeError: The PixlStash tagger reported that it could not be
-                loaded. The tagger logs the cause itself.
+            TaggerUnavailableError: The PixlStash tagger reported that it
+                could not be loaded. The tagger logs the cause itself.
             Exception: Whatever WD14 or a third-party plugin raised while
-                loading, except a missing Python module (see below).
+                loading, a missing Python module included.
         """
         active = self.active_plugin_name(engine_override)
         if not active:
@@ -475,10 +482,7 @@ class TaggingWorkflow:
                 True,
             )
             if not loaded:
-                raise RuntimeError(
-                    "The PixlStash tagger could not be loaded; its warning in "
-                    "the log gives the cause."
-                )
+                raise TaggerUnavailableError()
         else:
             plugin = tagger_registry.get_tagger_plugin_manager().get_plugin(active)
             if plugin is None:
@@ -490,21 +494,9 @@ class TaggingWorkflow:
             plugins_cfg = self._tagger_settings.get("plugins", {})
             cfg = plugins_cfg.get(active, {})
             params = {**plugin.default_params(), **cfg.get("params", {})}
-            try:
-                if hasattr(plugin, "setup"):
-                    plugin.setup(self._engine.device)
-                plugin.init(params)
-            except ModuleNotFoundError as exc:
-                # Not raised: a missing dependency will not appear on a retry.
-                # `_tag_images_single_plugin` answers it with an empty result
-                # per picture, which takes the pictures out of the queue;
-                # failing the task here would queue them again forever.
-                logger.warning(
-                    "[TaggingWorkflow] Plugin %r needs '%s', which is not "
-                    "installed; its pictures will be cleared without tags.",
-                    active,
-                    exc.name,
-                )
+            if hasattr(plugin, "setup"):
+                plugin.setup(self._engine.device)
+            plugin.init(params)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -533,19 +525,21 @@ class TaggingWorkflow:
                 the caller cannot tell "no confidence" from "scored zero".
 
         Returns:
-            ``{path: [tag, ...]}`` or an empty dict on failure.
+            ``{path: [tag, ...]}``.
+
+        Raises:
+            LookupError: The plugin is not installed or does not tag.
+            Exception: Whatever the plugin raised loading or tagging, a
+                missing Python module included.
         """
         from pixlstash.tagger_plugins.registry import get_tagger_plugin_manager
 
         mgr = get_tagger_plugin_manager()
         plugin = mgr.get_plugin(plugin_name)
         if plugin is None or not plugin.supports_tags:
-            logger.warning(
-                "[TaggingWorkflow] active_tag_plugin %r not found or does not support tags; "
-                "returning empty results.",
-                plugin_name,
+            raise LookupError(
+                f"Tag plugin {plugin_name!r} is not installed or does not tag."
             )
-            return {}
 
         plugins_cfg = self._tagger_settings.get("plugins", {})
         cfg = plugins_cfg.get(plugin_name, {})
@@ -561,27 +555,15 @@ class TaggingWorkflow:
                 stop_event=stop_event,
             )
         except ModuleNotFoundError as exc:
-            # A missing optional dependency (e.g. bitsandbytes) means this plugin
-            # can never succeed in the current environment.  Return an empty-but-
-            # present result for every requested path so that TagTask calls
-            # _add_tags_bulk and removes the __tag:<plugin> sentinel; without this
-            # the finder would keep re-queuing the same pictures indefinitely.
             logger.error(
-                "[TaggingWorkflow] Plugin %r requires '%s' which is not installed. "
-                "Install it with: pip install %s\n"
-                "Clearing sentinels for %d picture(s) to prevent infinite retries.",
+                "[TaggingWorkflow] Plugin %r requires '%s', which is not "
+                "installed (pip install %s); its %d picture(s) stay pending.",
                 plugin_name,
                 exc.name,
                 exc.name,
                 len(image_paths),
             )
-            return {str(p): [] for p in image_paths}
-        except Exception:
-            logger.exception(
-                "[TaggingWorkflow] Plugin %r failed during tag_images; returning empty results.",
-                plugin_name,
-            )
-            return {}
+            raise
 
         combined: dict[str, list[str]] = {}
         for path, tag_results in raw.items():
@@ -627,10 +609,7 @@ class TaggingWorkflow:
         from PIL import Image
 
         if not self._engine.pixlstash_tagger_service.is_loaded():
-            logger.warning(
-                "PixlStash tagger not available; skipping PixlStash tagger tags."
-            )
-            return {}
+            raise TaggerUnavailableError()
 
         preloaded_map = preloaded_images or {}
         items = []

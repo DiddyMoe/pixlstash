@@ -561,9 +561,8 @@ never overlaps other device work and its memory is part of that lease:
 `TagTask.estimated_vram_mb` asks for the model's weights while it is not loaded
 and for activations alone once it is. A task moved to the CPU tags on its own
 CPU engine and loads nothing onto the device. A load that fails fails the
-task, with two exceptions: a third-party plugin missing a Python module is
-logged and its pictures are cleared without tags, and an active plugin that
-is not registered is logged and the task completes having tagged nothing.
+task, a third-party plugin missing a Python module or not registered
+included, and its pictures keep their sentinel for a later task.
 
 None of this was measured on Metal. The 2026-09-27 runs (see "The tagger
 preload" under "What reproduces where") had the old thread overlap CLIP in 8 of
