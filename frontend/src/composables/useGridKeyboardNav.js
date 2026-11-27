@@ -277,15 +277,14 @@ export function useGridKeyboardNav(
   }
 
   /**
-   * Whether Ctrl+V may paste. Not on auto-repeat, and not behind a modal
-   * dialog, where its result could not be seen; that is the same
-   * Vuetify-scrim test the global undo key uses.
+   * Whether a modal dialog is open over the grid: Vuetify renders a scrim for
+   * every dialog, and none for menus and tooltips. The global undo key uses
+   * the same test.
    */
-  function canWriteFromKeys(event) {
-    if (event.repeat) return false;
+  function modalDialogOpen() {
     return (
-      typeof document === "undefined" ||
-      document.querySelector(".v-overlay--active .v-overlay__scrim") == null
+      typeof document !== "undefined" &&
+      document.querySelector(".v-overlay--active .v-overlay__scrim") != null
     );
   }
 
@@ -323,6 +322,10 @@ export function useGridKeyboardNav(
     // Ctrl+A, arrows, Enter, T) must not fire on the grid behind it.
     if (reviewOverlayOpen?.value) return;
     if (toolbarSelectionMenuOpen?.value) return; // Ignore when selection menu is open
+    // A key pressed while a dialog is open, or inside an open menu, is that
+    // overlay's: the grid listens on the window, and a menu has no scrim.
+    if (modalDialogOpen()) return;
+    if (target?.closest?.(".v-overlay__content")) return;
     if (event.key === "Escape") {
       if (overlayOwnsEscape()) return;
       const target = escapeTarget();
@@ -611,7 +614,7 @@ export function useGridKeyboardNav(
       !event.altKey &&
       selectedImageIds.value.length > 0 &&
       !isReadOnly.value &&
-      canWriteFromKeys(event)
+      !event.repeat
     ) {
       // Ctrl+V pastes the copied tags onto the selection.
       event.preventDefault();

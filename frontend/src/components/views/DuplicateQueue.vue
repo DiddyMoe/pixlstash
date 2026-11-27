@@ -2925,11 +2925,16 @@ async function onSelectAll() {
  * auto-stack dialog are the queue's own and are exempt: the model has branches
  * for both.
  *
+ * A key pressed inside an open menu or popover is that overlay's too: a menu
+ * has no scrim, so the signals below miss it.
+ *
+ * @param {KeyboardEvent} event
  * @returns {boolean}
  */
-function foreignDialogOpen() {
+function foreignDialogOpen(event) {
   if (typeof document === "undefined") return false;
   if (compareOpen.value || autoStackOpen.value) return false;
+  if (event.target?.closest?.(".v-overlay__content")) return true;
   // Two signals, because the app has two kinds of modal: Vuetify's scrim (every
   // AppDialog) and the review overlay, which paints its own. Both are stated on
   // the DOM rather than on listener order, for the reason App.vue records at
@@ -3101,7 +3106,7 @@ const handleMixedKeydown = createDedupKeyHandler({
  * reaches the shell's Ctrl+Z or its Home/End scrolling.
  */
 function onKeydown(event) {
-  if (foreignDialogOpen()) return;
+  if (foreignDialogOpen(event)) return;
   // Two queues, one key owner each, and exactly one of them is on screen. The
   // review queue's handler still declines the Mixed page through its own
   // `isBlocked` as a belt: a verdict key resolving a group the user cannot see

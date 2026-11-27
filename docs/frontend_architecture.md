@@ -1540,6 +1540,9 @@ The review's stack is separate **on purpose**: a review decision also flips its 
 
 Two of the three blockers this note originally listed are now gone (`backend_architecture.md` §21.2): the human-label **ledger** is a captured facet (`tag_predictions`), `anomaly_tag_uncertainty` is **recomputed** on restore rather than needing a facet at all, and the scoped-token question was settled the same way — record regardless of principal, since `/operations*` is `OWNER_ONLY` so only the owner can see or undo the row. What is still missing is a `tag_suggestion.status` facet. Until that exists the two stacks stay separate.
 
+#### A key pressed in a dialog never reaches the grid
+Every dialog goes through `AppDialog`, which renders a scrim, and the window and document key listeners that act on the page behind it stand aside while one is open (`.v-overlay--active .v-overlay__scrim`: `isModalOverlayOpen()` in `useGlobalKeydown`, `modalDialogOpen()` in `useGridKeyboardNav`). Menus have no scrim, so a key pressed *inside* overlay content (`event.target.closest(".v-overlay__content")`: an open menu, popover or dialog) is that overlay's too: Vuetify lets a menu's keys bubble. The grid's `handleKeyDown`, `useGlobalKeydown` (bar the shortcuts sheet's own ?) and `DuplicateQueue`'s `foreignDialogOpen` return on both. A new window key listener that acts on the page checks both.
+
 #### `AddToEntityControl.vue` (1524 lines)
 Reusable control for assigning images to/from characters, sets and projects. Props: `type` (`'character'`|`'set'`|`'project'`), `pictureIds`, `placement`, `lockedSetIds`, … Emits: `added`, `removed`, `selected`. Used in `Toolbar`, `SelectionMenu`, `Lightbox`, `ImageGridContextMenu`.
 

@@ -164,6 +164,53 @@ describe("useGridKeyboardNav - review-overlay guard (F1)", () => {
   });
 });
 
+// A key pressed in a dialog or a menu is that overlay's. The grid listens on
+// the window, so with focus on a dialog or menu button (not a typing surface)
+// Delete must not reach the grid and delete the selection behind the overlay.
+describe("useGridKeyboardNav - keys pressed in a dialog or menu", () => {
+  /** An open Vuetify overlay holding one button; a menu has no scrim. */
+  function openOverlay(className, { scrim = false } = {}) {
+    const overlay = document.createElement("div");
+    overlay.className = `v-overlay v-overlay--active ${className}`;
+    overlay.innerHTML =
+      (scrim ? '<div class="v-overlay__scrim"></div>' : "") +
+      '<div class="v-overlay__content"><button type="button">Item</button></div>';
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+
+  it("does not move the cursor while a dialog is open", () => {
+    const { handleKeyDown, deps, deleteSelected } = makeNav({ cursorIdx: 0 });
+    const overlay = openOverlay("v-dialog", { scrim: true });
+    try {
+      // Focus may sit outside the dialog's content, on the page behind it.
+      handleKeyDown(keyEvent({ key: "ArrowRight", target: document.body }));
+      handleKeyDown(keyEvent({ key: "Delete", target: document.body }));
+    } finally {
+      overlay.remove();
+    }
+
+    expect(deps.cursorIdx.value).toBe(0);
+    expect(deleteSelected).not.toHaveBeenCalled();
+  });
+
+  it("Delete in an open menu does not delete the grid selection", () => {
+    const { handleKeyDown, deleteSelected } = makeNav();
+    const overlay = openOverlay("v-menu");
+    const item = overlay.querySelector("button");
+    try {
+      handleKeyDown(keyEvent({ key: "Delete", target: item }));
+      expect(deleteSelected).not.toHaveBeenCalled();
+      // The same key pressed on the grid with the menu still open acts.
+      handleKeyDown(keyEvent({ key: "Delete", target: document.body }));
+    } finally {
+      overlay.remove();
+    }
+
+    expect(deleteSelected).toHaveBeenCalledTimes(1);
+  });
+});
+
 // ---- Justified-mode vertical navigation ------------------------------------
 // Same hand-built layout as useJustifiedLayout.test.js (gap 4):
 //   row 0: widths [100, 300, 100] → centers 50, 254, 458

@@ -829,6 +829,31 @@ describe("DuplicateQueue - who owns the keyboard", () => {
     wrapper.unmount();
   });
 
+  // A menu raised over the queue (the title bar's, the sidebar's) has no
+  // scrim, so the dialog signal misses it; a key pressed in it is its own.
+  it("hands the keyboard to a menu the queue did not open", async () => {
+    const { wrapper, store } = await mountQueue([group("g1"), group("g2")]);
+    const menu = document.createElement("div");
+    menu.className = "v-overlay v-overlay--active v-menu";
+    menu.innerHTML =
+      '<div class="v-overlay__content"><button type="button">Item</button></div>';
+    document.body.appendChild(menu);
+
+    const item = menu.querySelector("button");
+    item.dispatchEvent(
+      new window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }),
+    );
+    expect(store.focusIndex).toBe(0);
+    // The same key outside the menu still moves the queue.
+    document.dispatchEvent(
+      new window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }),
+    );
+    expect(store.focusIndex).toBe(1);
+
+    menu.remove();
+    wrapper.unmount();
+  });
+
   // And it must stop listening when the destination is left, or a key pressed
   // in the grid would move a cursor in a queue that is no longer on screen.
   it("stops listening once the view is gone", async () => {
