@@ -1,7 +1,9 @@
 // The query params that name the view on screen: its scope (sets, people, a
 // project, the Scrapheap, the unassigned view) and every filter that narrows
-// it. The grid's list (`useGridFetch.buildPictureIdsQueryParams`, which adds
-// its sort, text query and display keys) builds them here.
+// it. Every reader that must agree on which pictures are in the view builds
+// them here: the grid's list (`useGridFetch.buildPictureIdsQueryParams`, which
+// adds its sort, text query and display keys) and the Details panel's stats
+// (`StatsSidebar.vue`).
 
 import { PIL_IMAGE_EXTENSIONS, VIDEO_EXTENSIONS } from "./media.js";
 import { workflowFilterParams } from "../stores/useFilterStore";
@@ -233,4 +235,17 @@ export function appendViewFilterParams(params, view) {
   if (filters.tagStateFilter)
     params.append("tag_state", filters.tagStateFilter);
   if (filters.sharedOnlyFilter) params.append("shared_only", "true");
+}
+
+/**
+ * The view's scope and filters: {@link appendViewSelectionParams} and
+ * {@link appendViewFilterParams}, whose `view` fields it takes.
+ *
+ * @returns {URLSearchParams}
+ */
+export function viewQueryParams(view) {
+  const params = new URLSearchParams();
+  appendViewSelectionParams(params, view);
+  appendViewFilterParams(params, view);
+  return params;
 }

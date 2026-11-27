@@ -23,6 +23,11 @@ import { isReadOnly } from "../../utils/apiClient";
 import { formatUserDate } from "../../utils/utils.js";
 import { recipeForPanel } from "../../utils/pictureRecipe.js";
 import {
+  normalizedCharacterIds,
+  normalizedSetIds,
+  viewQueryParams,
+} from "../../utils/viewQueryParams.js";
+import {
   SECTION_SCOPE,
   useSectionCollapse,
 } from "../../composables/useSectionCollapse";
@@ -48,10 +53,7 @@ import {
   isGroupToken,
   useTagGroupsStore,
 } from "../../stores/useTagGroupsStore";
-import {
-  ALL_PICTURES_ID,
-  SCRAPHEAP_PICTURES_ID,
-} from "../../stores/useViewStore";
+import { SCRAPHEAP_PICTURES_ID } from "../../stores/useViewStore";
 
 // Store-direct (Phase 3): the panel reads the same filter/selection state the
 // grid queries from straight from the stores, and writes filter changes back
@@ -67,32 +69,6 @@ const inboxStore = useInboxStore();
 // While the 2.0 checklist is up, Details sits beside it in a band (#2145).
 const whatsChanged = useWhatsChangedStore();
 
-
-// The two folder facets are derived from the sidebar's folder selection, same
-// as App.vue used to compute them for the old props.
-const filePathPrefixFilter = computed(
-  () => selectionStore.selectedFolderFilter?.pathPrefix ?? null,
-);
-const importSourceFolderFilter = computed(
-  () => filterStore.importedFromFilter ?? null,
-);
-// The Inbox's period, as the grid sends it (`useGridFetch.inboxPeriod`).
-const inboxPeriod = computed(() =>
-  selectionStore.selectedFolderFilter?.inbox ? inboxStore.period : null,
-);
-
-// ─── PIL / Video extension lists ─────────────────────────────────────────────
-const PIL_IMAGE_EXTENSIONS = [
-  "jpg",
-  "jpeg",
-  "png",
-  "webp",
-  "gif",
-  "bmp",
-  "tiff",
-  "avif",
-];
-const VIDEO_EXTENSIONS = ["mp4", "webm", "mov", "avi", "mkv", "m4v"];
 
 const props = defineProps({
   /** The view the grid shows: the head's title while nothing is selected. */
@@ -414,141 +390,22 @@ const stats = ref(null);
 const loading = ref(false);
 const error = ref(null);
 
+// The grid's view (`useGridFetch.buildPictureIdsQueryParams` builds the same
+// scope and filters), so the stats count the pictures the grid shows.
 function buildQueryParams() {
-  const params = new URLSearchParams();
-
-  const normalizedSetIds = Array.isArray(selectionStore.selectedSetIds)
-    ? selectionStore.selectedSetIds
-        .map((id) => Number(id))
-        .filter((id) => Number.isFinite(id) && id > 0)
-    : [];
-  const hasSetSelection = !!(
-    (selectionStore.selectedSet != null && selectionStore.selectedSet !== "") ||
-    normalizedSetIds.length > 0
-  );
-  const isSetOverlap = normalizedSetIds.length > 1;
-  const primarySetId =
-    !isSetOverlap &&
-    selectionStore.selectedSet != null &&
-    selectionStore.selectedSet !== ""
-      ? Number(selectionStore.selectedSet)
-      : null;
-  const normalizedCharIds = Array.isArray(selectionStore.selectedCharacterIds)
-    ? selectionStore.selectedCharacterIds
-        .map((id) => Number(id))
-        .filter((id) => Number.isFinite(id) && id > 0)
-    : [];
-  const isMultiCharacterView = normalizedCharIds.length > 1;
-
-  if (hasSetSelection) {
-    if (isSetOverlap) {
-      for (const id of normalizedSetIds) params.append("set_ids", String(id));
-      params.append("set_mode", selectionStore.setMultiMode || "intersection");
-      if (
-        selectionStore.setMultiMode === "difference" &&
-        selectionStore.setDifferenceBaseId != null
-      ) {
-        params.append(
-          "base_set_id",
-          String(selectionStore.setDifferenceBaseId),
-        );
-      }
-    } else if (primarySetId != null) {
-      params.append("set_id", String(primarySetId));
-    }
-    if (projectStore.projectViewMode === "project") {
-      params.append(
-        "project_id",
-        projectStore.selectedProjectId != null
-          ? projectStore.selectedProjectId
-          : "UNASSIGNED",
-      );
-    }
-  } else if (isMultiCharacterView) {
-    for (const id of normalizedCharIds)
-      params.append("character_ids", String(id));
-    params.append(
-      "character_mode",
-      selectionStore.characterMultiMode || "union",
-    );
-    if (projectStore.projectViewMode === "project") {
-      params.append(
-        "project_id",
-        projectStore.selectedProjectId != null
-          ? projectStore.selectedProjectId
-          : "UNASSIGNED",
-      );
-    }
-  } else if (
-    selectionStore.selectedCharacter != null &&
-    selectionStore.selectedCharacter !== "" &&
-    selectionStore.selectedCharacter !== ALL_PICTURES_ID
-  ) {
-    if (selectionStore.selectedCharacter === String(SCRAPHEAP_PICTURES_ID)) {
-      params.append("only_deleted", "true");
-    } else {
-      params.append("character_id", selectionStore.selectedCharacter);
-      if (projectStore.projectViewMode === "project") {
-        params.append(
-          "project_id",
-          projectStore.selectedProjectId != null
-            ? projectStore.selectedProjectId
-            : "UNASSIGNED",
-        );
-      }
-    }
-  } else if (
-    selectionStore.selectedCharacter === ALL_PICTURES_ID &&
-    projectStore.projectViewMode === "project"
-  ) {
-    params.append(
-      "project_id",
-      projectStore.selectedProjectId != null
-        ? projectStore.selectedProjectId
-        : "UNASSIGNED",
-    );
-  }
-
-  if (filterStore.mediaTypeFilter === "images") {
-    for (const ext of PIL_IMAGE_EXTENSIONS)
-      params.append("format", ext.toUpperCase());
-  } else if (filterStore.mediaTypeFilter === "videos") {
-    for (const ext of VIDEO_EXTENSIONS)
-      params.append("format", ext.toUpperCase());
-  }
-
-  if (filterStore.minScoreFilter != null)
-    params.append("min_score", filterStore.minScoreFilter);
-  if (filterStore.maxScoreFilter != null)
-    params.append("max_score", filterStore.maxScoreFilter);
-  if (filterStore.unscoredOnlyFilter) params.append("unscored", "1");
-  if (filterStore.favouriteOnlyFilter) params.append("favourite", "1");
-  if (filterStore.smartScoreBucketFilter != null)
-    params.append("smart_score_bucket", filterStore.smartScoreBucketFilter);
-  if (filterStore.resolutionBucketFilter != null)
-    params.append("resolution_bucket", filterStore.resolutionBucketFilter);
-  if (filePathPrefixFilter.value != null)
-    params.append("file_path_prefix", filePathPrefixFilter.value);
-  if (importSourceFolderFilter.value != null)
-    params.append("import_source_folder", importSourceFolderFilter.value);
-  if (inboxPeriod.value) params.append("inbox", inboxPeriod.value);
-  (filterStore.tagFilter || []).forEach((t) => params.append("tag", t));
-  (filterStore.tagRejectedFilter || []).forEach((t) =>
-    params.append("rejected_tag", t),
-  );
-  if (filterStore.faceBboxFilter != null) {
-    params.append("face_filter", filterStore.faceBboxFilter);
-  }
-  if (filterStore.tagStateFilter)
-    params.append("tag_state", filterStore.tagStateFilter);
-  (filterStore.tagConfidenceAboveFilter || []).forEach((e) =>
-    params.append("tag_confidence_above", e),
-  );
-  (filterStore.tagConfidenceBelowFilter || []).forEach((e) =>
-    params.append("tag_confidence_below", e),
-  );
-
-  return params.toString();
+  const folder = selectionStore.selectedFolderFilter;
+  return viewQueryParams({
+    setIds: normalizedSetIds(selectionStore),
+    characterIds: normalizedCharacterIds(selectionStore),
+    selection: selectionStore,
+    project: projectStore,
+    filters: filterStore,
+    applyTagFilter: userPrefsStore.applyTagFilter,
+    referenceFolderId: folder?.referenceFolderId ?? null,
+    filePathPrefix: folder?.pathPrefix ?? null,
+    importSourceFolder: filterStore.importedFromFilter ?? null,
+    inboxPeriod: folder?.inbox ? inboxStore.period : null,
+  }).toString();
 }
 
 async function fetchStats() {

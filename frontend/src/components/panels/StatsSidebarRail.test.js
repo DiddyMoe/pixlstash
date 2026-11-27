@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { enableAutoUnmount, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
-import { ref } from "vue";
+import { computed, effectScope, reactive, ref } from "vue";
 
 const getPictureStats = vi.fn();
 const getPictureMetadata = vi.fn();
@@ -18,6 +18,16 @@ vi.mock("../../api/pictures", () => ({
   openPictureLocation: (...args) => openPictureLocation(...args),
   pictureThumbnailUrl: (id) => `/thumbs/${id}.webp`,
   resetPicturesTags: vi.fn(async () => ({})),
+  // The grid's reads, for the grid's query builder beside the rail's.
+  getPictureCount: vi.fn(),
+  streamPictures: vi.fn(),
+  getLikenessGroups: vi.fn(),
+  faceSearch: vi.fn(),
+  characterFaceSearch: vi.fn(),
+  setLikenessSearch: vi.fn(),
+  likenessSearch: vi.fn(),
+  searchPictures: vi.fn(),
+  listPicturesByIds: vi.fn(),
 }));
 // A picture with no recipe unless a test says otherwise: the read answers 200
 // with `no_prompt_chunk` for a picture that was not generated.
@@ -45,7 +55,17 @@ import { useSidebarStore } from "../../stores/useSidebarStore";
 import { useFilterStore } from "../../stores/useFilterStore";
 import { useTagGroupsStore } from "../../stores/useTagGroupsStore";
 import { useEntityNamesStore } from "../../stores/useEntityNamesStore";
-import { SCRAPHEAP_PICTURES_ID } from "../../stores/useViewStore";
+import { useProjectStore } from "../../stores/useProjectStore";
+import { useUserPrefsStore } from "../../stores/useUserPrefsStore";
+import {
+  ALL_PICTURES_ID,
+  SCRAPHEAP_PICTURES_ID,
+} from "../../stores/useViewStore";
+import { useGridFetch } from "../../composables/useGridFetch";
+import {
+  normalizedCharacterIds,
+  normalizedSetIds,
+} from "../../utils/viewQueryParams.js";
 import { useSelectionTags } from "../../composables/useSelectionTags";
 import { useNoticeStore } from "../../stores/useNoticeStore";
 import { useRunDialogStore } from "../../stores/useRunDialogStore";
@@ -968,5 +988,115 @@ describe("one picture's Recipe tab", () => {
     await wrapper.setProps({ covered: false });
     await flush();
     expect(getPictureRecipe).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the stats count the grid's view", () => {
+  // The grid's list query for the current stores, with ImageGrid's selection
+  // computeds, less the keys that order or display the rows rather than pick
+  // them.
+  function gridViewParams() {
+    const selection = useSelectionStore();
+    const setIds = computed(() => normalizedSetIds(selection));
+    const characterIds = computed(() => normalizedCharacterIds(selection));
+    const deps = new Proxy(
+      {
+        normalizedSelectedSetIds: setIds,
+        hasSetSelection: computed(() => setIds.value.length > 0),
+        isSetOverlapView: computed(() => setIds.value.length > 1),
+        primarySelectedSetId: computed(() => setIds.value[0] ?? null),
+        normalizedSelectedCharacterIds: characterIds,
+        smartScoreProgress: reactive({ visible: false, percent: 0 }),
+        exportProgress: reactive({ visible: false, percent: 0 }),
+        previousImageIds: new Set(),
+      },
+      { get: (target, key) => (key in target ? target[key] : ref(null)) },
+    );
+    const callbacks = new Proxy({}, { get: () => vi.fn((x) => x) });
+    const scope = effectScope();
+    try {
+      const grid = scope.run(() => useGridFetch(deps, reactive({}), callbacks));
+      const params = new URLSearchParams(grid.buildPictureIdsQueryParams());
+      for (const key of ["sort", "descending", "fields", "guest_session_id"]) {
+        params.delete(key);
+      }
+      return params;
+    } finally {
+      scope.stop();
+    }
+  }
+
+  const entries = (params) => [...params].map(([k, v]) => `${k}=${v}`).sort();
+
+  const VIEWS = {
+    "one set picked as a list of one": () => {
+      useSelectionStore().selectedSetIds = [6];
+    },
+    "a set difference within one project": () => {
+      Object.assign(useProjectStore(), {
+        projectViewMode: "project",
+        selectedProjectId: 4,
+        setProjectIds: { 3: 9, 5: 9 },
+      });
+      Object.assign(useSelectionStore(), {
+        selectedSetIds: [3, 5],
+        setMultiMode: "difference",
+        setDifferenceBaseId: 5,
+      });
+    },
+    "one person's likeness cluster": () => {
+      useSelectionStore().selectedCharacter = "7";
+      useFilterStore().faceClusterFilter = { cluster: 2, threshold: 0.4 };
+    },
+    "No character": () => {
+      useFilterStore().noCharacterFilter = true;
+    },
+    "the Scrapheap": () => {
+      useSelectionStore().selectedCharacter = String(SCRAPHEAP_PICTURES_ID);
+    },
+    "tag and stack state": () => {
+      useFilterStore().tagStateFilter = "pending";
+      useFilterStore().stackStateFilter = "leaders";
+    },
+    "every filter": () => {
+      useSelectionStore().selectedFolderFilter = { referenceFolderId: 3 };
+      useUserPrefsStore().applyTagFilter = true;
+      Object.assign(useFilterStore(), {
+        mediaTypeFilter: "images",
+        minScoreFilter: 2,
+        tagFilter: ["cat"],
+        tagRejectedFilter: ["dog"],
+        importedFromFilter: "/import/b",
+        comfyuiModelFilter: ["m"],
+        comfyuiLoraFilter: ["l"],
+        workflowFilter: [{ id: "wf" }],
+        impossibleSources: ["src"],
+        sharedOnlyFilter: true,
+      });
+    },
+  };
+
+  it("sends the grid's scope and filters for every view", async () => {
+    const differing = {};
+    for (const [name, arrange] of Object.entries(VIEWS)) {
+      setActivePinia(createPinia());
+      useSidebarStore().statsOpen = true;
+      useSelectionStore().selectedCharacter = ALL_PICTURES_ID;
+      arrange();
+      getPictureStats.mockClear();
+      const wrapper = mountRail();
+      await flush();
+      const [query] = getPictureStats.mock.calls.find(([, extra]) => !extra);
+      const rail = entries(new URLSearchParams(query));
+      const grid = entries(gridViewParams());
+      if (rail.join("&") !== grid.join("&")) {
+        differing[name] = {
+          railOnly: rail.filter((e) => !grid.includes(e)),
+          gridOnly: grid.filter((e) => !rail.includes(e)),
+        };
+      }
+      wrapper.unmount();
+    }
+    expect(differing).toEqual({});
   });
 });
