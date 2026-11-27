@@ -41,7 +41,11 @@ from pixlstash.db_models import (
 )
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
-from pixlstash.services import operation_log_service, scrapheap_service
+from pixlstash.services import (
+    import_dedup_service,
+    operation_log_service,
+    scrapheap_service,
+)
 from pixlstash.tasks import TaskType
 from pixlstash.tasks.picture_import_task import PictureImportTask
 from pixlstash.db_models.tag import (
@@ -92,6 +96,14 @@ _MAX_SIDECAR_BYTES = 1024 * 1024
 
 # How much of an upload or zip entry is copied to disk at a time.
 _COPY_CHUNK_BYTES = 1024 * 1024
+
+# Why the one-shot import left a file out, chosen by what the file raised: the
+# reader raises ``ValueError`` for content it cannot decode as a picture or a
+# video, and a failed write or read raises ``OSError``. The exception's own
+# text can name a server path, so it goes to the server log instead.
+FILE_UNREADABLE_REASON = "Not a picture or video this library can read."
+FILE_NOT_WRITTEN_REASON = "The file could not be written to the library."
+FILE_FAILED_REASON = "The file could not be imported; the server log has the details."
 
 # Reaper bounds. An opened-but-never-committed session leaks its .staging/ dir
 # and memory; a finished session is never popped otherwise. The reaper (run
@@ -497,6 +509,15 @@ def _copy_upload_part(upload: UploadFile, dest_path: str, stop: threading.Event)
     return written
 
 
+def _file_failure_reason(exc: BaseException) -> str:
+    """The sentence an import status gives for a file that raised *exc*."""
+    if isinstance(exc, ValueError):
+        return FILE_UNREADABLE_REASON
+    if isinstance(exc, OSError):
+        return FILE_NOT_WRITTEN_REASON
+    return FILE_FAILED_REASON
+
+
 def _staging_file_limit(staged: int) -> HTTPException:
     """The 413 for a batch that would take the session past its file cap.
 
@@ -724,11 +745,17 @@ class ImportResultEntry(BaseModel):
 
     status: str
     """``success`` (a new picture), ``duplicate`` (content already live in the
-    vault), or ``scrapheaped`` (content matched a picture in the Scrapheap: not
-    imported again, the picture is restored instead)."""
+    vault), ``scrapheaped`` (content matched a picture in the Scrapheap: not
+    imported again, the picture is restored instead), or ``failed`` (the file
+    could not be imported and was left out; the rest of the upload imports)."""
 
     picture_id: Optional[int] = None
     file: Optional[str] = None
+    """The picture's stored path, or for a ``failed`` entry the uploaded file
+    name."""
+
+    error: Optional[str] = None
+    """Why a ``failed`` file could not be imported."""
 
 
 class ImportStatusResponse(BaseModel):
@@ -750,10 +777,15 @@ class ImportStatusResponse(BaseModel):
     """Files whose content matched a picture in the Scrapheap.
 
     Counted per FILE, so ``imported_count + duplicate_count +
-    scrapheaped_count == total``. These files were not imported again (that
-    would double the bytes on disk and refill the duplicate queue); the import
-    restored the matching picture instead.
+    scrapheaped_count + failed_count == total``. These files were not imported
+    again (that would double the bytes on disk and refill the duplicate queue);
+    the import restored the matching picture instead.
     """
+
+    failed_count: Optional[int] = None
+    """Files left out because they could not be imported, each with a
+    ``failed`` entry in ``results``. When every file fails, the import's
+    ``status`` is ``failed`` instead."""
 
     scrapheaped_picture_ids: Optional[list[int]] = None
     """Distinct pictures behind ``scrapheaped_count`` that the import restored.
@@ -1046,14 +1078,33 @@ def register_routes(router, server):
                     task["processed"] = task.get("processed", 0) + 1
                     task["last_update_epoch_ms"] = int(time.time() * 1000)
 
+                # Upload index -> why that file could not be imported. The
+                # other files of the upload still import.
+                failed_errors: dict[int, str] = {}
+
+                def _on_file_failed(index: int, exc: Exception):
+                    failed_errors[index] = _file_failure_reason(exc)
+
                 fingerprints, existing_map, scrapheaped_map, new_picture_map = (
                     _create_picture_imports(
                         SimpleNamespace(vault=vault),
                         uploaded_files,
                         dest_folder,
                         progress_callback=_on_picture_written,
+                        on_file_failed=_on_file_failed,
                     )
                 )
+                if len(failed_errors) == len(uploaded_files):
+                    # Nothing came in, so the import failed, and a caller that
+                    # sends one file per import is told why.
+                    reasons = "; ".join(
+                        f"{uploaded_files[index][2]}: {reason}"
+                        for index, reason in list(failed_errors.items())[:5]
+                    )
+                    raise RuntimeError(
+                        f"None of the {len(uploaded_files)} file(s) could be "
+                        f"imported: {reasons}"
+                    )
 
                 # Duplicates are instantly "processed" - credit them now so that
                 # the progress bar stays accurate even when most files are dupes.
@@ -1076,6 +1127,7 @@ def register_routes(router, server):
                     len(new_pictures)
                     + duplicate_count_initial
                     + scrapheaped_count_initial
+                    + len(failed_errors)
                 )
                 task["last_update_epoch_ms"] = int(time.time() * 1000)
 
@@ -1093,7 +1145,7 @@ def register_routes(router, server):
                 if new_pictures:
                     _mark_stage("persisting_new_pictures")
 
-                    def import_task(session):
+                    def import_task(session, published):
                         session.add_all(new_pictures)
                         session.flush()
                         for pic in new_pictures:
@@ -1101,11 +1153,17 @@ def register_routes(router, server):
                                 Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id)
                             )
                         session.commit()
+                        published.mark_committed()
                         for pic in new_pictures:
                             session.refresh(pic)
                         return new_pictures
 
-                    new_pictures = vault.db.run_task(import_task)
+                    with import_dedup_service.PublishedPictures(
+                        dest_folder, f"Import task {task_id}"
+                    ) as published:
+                        for pic in new_pictures:
+                            published.add(pic)
+                        new_pictures = vault.db.run_task(import_task, published)
                     logger.debug(
                         f"Queuing likeness calculation for {len(new_pictures)} new pictures."
                     )
@@ -1121,6 +1179,7 @@ def register_routes(router, server):
                 imported_count = 0
                 duplicate_count = 0
                 scrapheaped_count = 0
+                failed_count = 0
                 picture_id_sidecar_tags: dict[int, set[str]] = defaultdict(set)
                 duplicate_picture_id_set: set[int] = set()
                 # Distinct scrapheaped pictures this import restores. Several
@@ -1130,13 +1189,25 @@ def register_routes(router, server):
                 scrapheaped_picture_ids: list[int] = []
                 seen_scrapheaped_ids: set[int] = set()
                 seen_new_fingerprints = set()
-                for sidecar_key, _, fingerprint in zip(
-                    uploaded_file_keys, uploaded_files, fingerprints
+                for index, (sidecar_key, file_entry, fingerprint) in enumerate(
+                    zip(uploaded_file_keys, uploaded_files, fingerprints)
                 ):
-                    # Three disjoint outcomes per uploaded file. `existing_map`
+                    # Four disjoint outcomes per uploaded file. `existing_map`
                     # and `scrapheaped_map` are disjoint by construction (a live
-                    # row outranks a soft-deleted one for the same hash), so the
-                    # branches below cannot double-count.
+                    # row outranks a soft-deleted one for the same hash), and a
+                    # failed file is in neither, so the branches below cannot
+                    # double-count.
+                    if index in failed_errors:
+                        results.append(
+                            {
+                                "status": "failed",
+                                "picture_id": None,
+                                "file": file_entry[2],
+                                "error": failed_errors[index],
+                            }
+                        )
+                        failed_count += 1
+                        continue
                     if fingerprint in existing_map:
                         pic = existing_map[fingerprint]
                         results.append(
@@ -1222,19 +1293,30 @@ def register_routes(router, server):
                         matched_ids,
                         scrapheaped_picture_ids,
                     )
-                bucket_total = imported_count + duplicate_count + scrapheaped_count
+                if failed_count:
+                    logger.warning(
+                        "Import task %s left out %d file(s) out of %d that could "
+                        "not be imported.",
+                        task_id,
+                        failed_count,
+                        len(uploaded_files),
+                    )
+                bucket_total = (
+                    imported_count + duplicate_count + scrapheaped_count + failed_count
+                )
                 if bucket_total != len(uploaded_files):
-                    # The three buckets are the whole story of this import; a
+                    # The four buckets are the whole story of this import; a
                     # mismatch means the summary the user reads is wrong, so say
                     # so loudly rather than let a silently-lossy count ship.
                     logger.error(
                         "Import task %s bucket arithmetic is inconsistent: "
-                        "imported=%d + duplicate=%d + scrapheaped=%d = %d, but "
-                        "%d file(s) were uploaded.",
+                        "imported=%d + duplicate=%d + scrapheaped=%d + failed=%d "
+                        "= %d, but %d file(s) were uploaded.",
                         task_id,
                         imported_count,
                         duplicate_count,
                         scrapheaped_count,
+                        failed_count,
                         bucket_total,
                         len(uploaded_files),
                     )
@@ -1243,6 +1325,7 @@ def register_routes(router, server):
                 server.import_tasks[task_id]["imported_count"] = imported_count
                 server.import_tasks[task_id]["duplicate_count"] = duplicate_count
                 server.import_tasks[task_id]["scrapheaped_count"] = scrapheaped_count
+                server.import_tasks[task_id]["failed_count"] = failed_count
                 server.import_tasks[task_id]["scrapheaped_picture_ids"] = (
                     scrapheaped_picture_ids
                 )
@@ -1559,11 +1642,12 @@ def register_routes(router, server):
         }
         if task["status"] == "completed":
             payload["results"] = task.get("results") or []
-            # The three disjoint buckets, each counted directly while the results
+            # The four disjoint buckets, each counted directly while the results
             # were built: never derived from the total by subtraction.
             payload["imported_count"] = task.get("imported_count")
             payload["duplicate_count"] = task.get("duplicate_count")
             payload["scrapheaped_count"] = task.get("scrapheaped_count")
+            payload["failed_count"] = task.get("failed_count")
             payload["scrapheaped_picture_ids"] = (
                 task.get("scrapheaped_picture_ids") or []
             )

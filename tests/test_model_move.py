@@ -673,6 +673,25 @@ def test_a_relpath_that_escapes_its_folder_is_refused_not_unlinked(hub, tmp_path
     assert os.listdir(destination_dir) == []
 
 
+def test_a_model_behind_a_directory_link_is_refused_not_moved(two_folders, tmp_path):
+    """The scan lists a model through a link to a directory elsewhere; moving
+    it would take the file out of the place the link names."""
+    outside = tmp_path / "other-drive"
+    outside.mkdir()
+    os.symlink(outside, two_folders["source_dir"] / "linked", target_is_directory=True)
+    relpath = os.path.join("linked", "bob.safetensors")
+    _, bob = register_file(
+        two_folders["hub"], two_folders["source_id"], two_folders["source_dir"], relpath
+    )
+
+    mover = ModelMover(two_folders["hub"])
+    with pytest.raises(MoveRefused, match="outside its registered folder"):
+        mover.plan([(two_folders["source_id"], relpath)], two_folders["destination_id"])
+
+    assert os.path.exists(bob)
+    assert os.listdir(two_folders["destination_dir"]) == []
+
+
 @pytest.mark.parametrize("force_copy", [False, True], ids=["rename", "copy"])
 def test_a_destination_taken_after_planning_is_refused_not_clobbered(
     two_folders, monkeypatch, force_copy

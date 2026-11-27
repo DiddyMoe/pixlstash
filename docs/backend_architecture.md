@@ -1383,7 +1383,7 @@ The write path has to tell the two apart. Blanking a description is how a pictur
 | `TEXT_SCORE` | CPU | `MissingTextScoreFinder` | MSER-based text-in-image score |
 | `PROMPT_MATCH` | GPU | `MissingPromptMatchFinder` | Whether a picture with a prompt looks like it at all (§26); text side of CLIP only, the image embedding is the stored one |
 | `OCR` | GPU | `MissingOcrFinder` | Reads the text in pictures with `text_score >= OCR_MIN_TEXT_SCORE` (0.01 — the scorer's hard gates do the selecting, returning exactly 0.0 for 98% of a library, so the constant only has to clear zero) into `Picture.ocr_text` / `ocr_words` (#1197). Florence-2 `<OCR_WITH_REGION>` via `InferenceEngine.read_text`, sharing the captioning model; it boxes lines, and each word gets the share of its line's box its characters take. Run on the picture as displayed (EXIF applied), so boxes are fractions of the displayed picture. `""` marks read-with-nothing, and a picture whose file could not be opened; a batch the reader returns nothing for fails the task and writes nothing, so a model that is not loaded or ran out of memory leaves the pictures for a later sweep. Reading is not tied to the captioning switch: `read_text` loads Florence-2 itself, so a library with captioning off or still captioning is read all the same, and the GPU queue plus `TaskPriority.LOW` keep a background read behind captioning. A failed task defers its pictures for the session (the `MissingCheckpointHashFinder` pattern), so a reader that cannot load is not handed the same batch every cycle. The probe reads `ix_picture_ocr_unread` (`ocr_text, deleted, text_score WHERE ocr_text IS NULL`), most text first so a batch holds pages of similar length. The VRAM gate is charged captioning's estimate times the three beams reading decodes with, and an out-of-memory error is re-raised to the runner's retry instead of falling back to CPU. Pictures are read at 1024 px on the long side, so body text on a large screenshot or photographed page can be too small to survive: such a picture is stored as read with nothing found and is not retried. `depends_on=[TEXT_SCORE]` only: the planner holds a finder until every finder it depends on reports no work left, so depending on `DESCRIPTION` as well meant no picture was read until the whole library was captioned. `POST /pictures/{id}/text/read` submits an URGENT task directly and keeps the stored text until that read succeeds; a rotate (`apply_orientation`) clears them too. Completion emits `pictures_changed` with `fields: ["ocr_text"]`. |
-| `WATCH_FOLDERS` | CPU | `MissingWatchFolderImportFinder` | Ingest from watch folders. A file is skipped only when a picture, live or in the Scrapheap, has the same sampled `pixel_sha`, the same size and the same full-file SHA-256 (`import_dedup_service`, §10); the file is read in full only when a picture shares its sampled hash and size. A scrapheaped match stays in the Scrapheap: the finder keeps its claims in memory, so every file kept in a watch folder is offered again after a restart, and restoring on each start would undo the owner's cleanup. The pass inserts its new rows once, at its end, and does not take the import lock |
+| `WATCH_FOLDERS` | CPU | `MissingWatchFolderImportFinder` | Ingest from watch folders. A file is skipped only when a picture, live or in the Scrapheap, has the same sampled `pixel_sha`, the same size and the same full-file SHA-256 (`import_dedup_service`, §10); the file is read in full only when a picture shares its sampled hash and size. A scrapheaped match stays in the Scrapheap: the finder keeps its claims in memory, so every file kept in a watch folder is offered again after a restart, and restoring on each start would undo the owner's cleanup. The pass inserts its new rows once, at its end, and does not take the import lock. A file, and each caption file read beside it, is read only when its path resolves, through any link, inside the watch folder (`resolve_path_within`); the check is by name, before the reads. Delete-after-import removes a file only when its path still leads, through no link, to the file the pass read (same device, inode, size and modification time, taken before the reads); otherwise the file stays and a warning says why. Each folder from `/` down is opened with `O_NOFOLLOW` and the file is checked and unlinked through that descriptor; Windows, without `dir_fd`, checks each folder with `is_link_or_missing` before the remove. A watch folder whose path passes through a link therefore keeps its files |
 | `COMFYUI_EXTRACTION` | CPU | `MissingComfyUIExtractionFinder` | Parse ComfyUI metadata, and file the picture's workflow in the hub (see *The workflow scan rides the ComfyUI extraction* below) |
 | `SOURCE_FACE_LIKENESS` | GPU | `MissingSourceFaceLikenessCharacterFinder` | Face↔reference similarity |
 | `MISSING_FILE_PURGE` | CPU | `MissingFilePurgeFinder` | Remove records for vanished files |
@@ -1419,7 +1419,7 @@ The write path has to tell the two apart. Blanking a description is how a pictur
 
 The holds are in memory and per finder, so a restart retries everything. Only `FAILED_PERMANENT` reaches the `UnprocessableImageRegistry`. The stage selects only rows with a `file_path` that are not in the scrapheap (`_eligible_picture_clauses`, the rule tagging applies), written `deleted IS NOT 1` so the planner keeps serving the probe from the two partial missing-column indexes.
 
-**Only a file whose bytes read is called undecodable.** `utils/image_processing/media_load.py` loads a picture's frames and says why it could not: `load_pil_classified` returns a `LoadResult` whose `LoadFailure` is `UNDECODABLE` or `NO_FRAMES` (permanent), `IO_ERROR`, `RESOURCE` or `UNCLASSIFIED`. An `OSError` with an `errno` (`EMFILE`, `EIO`, `ESTALE`) is the machine failing; Pillow's decode errors carry none. A decoder that does not say why it failed (OpenCV returns no frames when it cannot open a file, which includes running out of descriptors) gets one more check, `file_read_error`: the file is undecodable only if its first byte reads. The embedding task maps `IO_ERROR` to `UNREACHABLE` when `file_location_is_unreachable` says the whole location is gone (and marks it unreachable in the registry until it is back) and to `IO_TRANSIENT` otherwise; `RESOURCE` and `UNCLASSIFIED` are retryable, and an unclassified one is logged as an error rather than guessed permanent. `QualityTask` applies the same `file_read_error` check before it marks a file undecodable, but its `_compute` still records an unloadable picture's quality as not measurable (`sharpness = -1`), so it does not retry it. `ThumbnailGenerationTask` marks every existing file it cannot load, because `MissingThumbnailFinder` has no retry hold and an unreadable file would be re-selected on every sweep.
+**Only a file whose bytes read is called undecodable.** `utils/image_processing/media_load.py` loads a picture's frames and says why it could not: `load_pil_classified` returns a `LoadResult` whose `LoadFailure` is `UNDECODABLE` or `NO_FRAMES` (permanent), `IO_ERROR`, `RESOURCE` or `UNCLASSIFIED`. An `OSError` with an `errno` (`EMFILE`, `EIO`, `ESTALE`) is the machine failing; Pillow's decode errors carry none. A decoder that does not say why it failed (OpenCV returns no frames when it cannot open a file, which includes running out of descriptors) gets one more check, `file_read_error`: the file is undecodable only if its first byte reads. The embedding task maps `IO_ERROR` to `UNREACHABLE` when `file_location_is_unreachable` says the whole location is gone (and marks it unreachable in the registry until it is back) and to `IO_TRANSIENT` otherwise; `RESOURCE` and `UNCLASSIFIED` are retryable, and an unclassified one is logged as an error rather than guessed permanent. `QualityTask` applies the same `file_read_error` check before it marks a file undecodable, but its `_compute` still records an unloadable picture's quality as not measurable (`sharpness = -1`), so it does not retry it. `mark_unprocessable` decodes the file once more itself and records only a permanent failure, so no caller can pin a picture for a read the machine refused. `ThumbnailGenerationTask` hands it every existing file it cannot load; `MissingThumbnailFinder` has no retry hold, so a file the registry refuses that exists and cannot be read is held with `hold_unreadable` instead, until its first byte reads again.
 
 **The preload wait is bounded.** The GPU worker waits for a task's preload at most `ImageEmbeddingTask.PRELOAD_WAIT_S` (300 s), because a decode stuck on a file (a stalled network share, a pathological image) cannot be interrupted, and an unbounded wait held the GPU worker, and with it every GPU task, for as long as it was stuck. The preload runs each picture on a pool of up to `_PRELOAD_WORKERS` (4) daemon decode threads and publishes it as it finishes, so one stuck file holds up only itself. Past the deadline the task embeds what was decoded and reports the rest: a decode still running is `FAILED_RETRYABLE` (`DECODE_TIMEOUT`), so the finder backs off from that file, and a picture whose decode never started is `DEFERRED`. The timeout bounds the wait, not the decode: the thread keeps running. So that a hanging file costs at most one task's decode threads rather than a new set per sweep, the finder asks the completed task which decodes are still running (`finish_preload`) and builds no new batch until they return. A decode that never returns (a hung network mount) therefore stops similarity indexing until it returns or PixlStash restarts; the other GPU tasks carry on. A cancel stops new decodes and is checked once more before inference, so a cancelled task embeds nothing and reports its pictures `DEFERRED` (`CANCELLED`); `on_cancel` waits for the preload at most `_CANCEL_JOIN_S` (10 s) and warns if a decode is still running.
 
@@ -1446,7 +1446,7 @@ The holds are in memory and per finder, so a restart retries everything. Only `F
 
 Most finders still fetch the full ORM row; only `MissingThumbnailFinder` and `MissingSmartScoreFinder` (the two hottest) have been narrowed so far.
 
-**Suppressed pictures are left out in the query, ahead of the `LIMIT`.** A picture the `UnprocessableImageRegistry` holds (its file undecodable or unreachable) keeps matching its stage's predicate, because the column the stage would fill stays `NULL`. Dropping it only after the fetch lets a run of them fill the candidate window: the finder claims nothing, the planner backs off as if the stage were done, and the eligible pictures behind the run wait for as long as the run lasts. So every picture finder takes the registry's `active_suppressed_ids()` before it opens its read (a new finder through `BaseTaskFinder._suppressed_picture_ids()`), and its fetch applies `not_in_json(Picture.id, ids)` from `utils/sql_chunking.py`. `SimpleMissingFinder` hands the set to `_fetch_candidates` as its third argument; the finders with their own `find_task` pass it to their fetch, and the deferring finders fold their `_deferred` ids into the same set. The candidate window (`batch × (max_inflight + 1)` in `SimpleMissingFinder`) is then headroom for in-flight claims alone.
+**Suppressed pictures are left out in the query, ahead of the `LIMIT`.** A picture the `UnprocessableImageRegistry` holds (its file undecodable, unreachable or unreadable) keeps matching its stage's predicate, because the column the stage would fill stays `NULL`. Dropping it only after the fetch lets a run of them fill the candidate window: the finder claims nothing, the planner backs off as if the stage were done, and the eligible pictures behind the run wait for as long as the run lasts. So every picture finder takes the registry's `active_suppressed_ids()` before it opens its read (a new finder through `BaseTaskFinder._suppressed_picture_ids()`), and its fetch applies `not_in_json(Picture.id, ids)` from `utils/sql_chunking.py`. `SimpleMissingFinder` hands the set to `_fetch_candidates` as its third argument; the finders with their own `find_task` pass it to their fetch, and the deferring finders fold their `_deferred` ids into the same set. The candidate window (`batch × (max_inflight + 1)` in `SimpleMissingFinder`) is then headroom for in-flight claims alone.
 
 - **One bind, however many ids.** `not_in_json` compiles to `NOT IN (SELECT value FROM json_each(?))` with the set as one JSON array. One parameter per id fails with `too many SQL variables` past SQLite's limit (32,766 on stock builds), so use it for any exclusion set the database does not bound. The plan gains only a `LIST SUBQUERY` over the `json_each` virtual table, evaluated once; the index choice and ordering of every finder probe are unchanged, so the clause can be applied unconditionally: an empty set excludes nothing.
 - **One walk of the registry per cache window, not a `stat` per row.** Re-validating a suppressed entry costs a `stat`, which on an unmounted volume waits for the mount's timeout. `active_suppressed_ids()` re-validates every entry but reuses its answer for `ACTIVE_CACHE_TTL_S`, so a sweep of every finder walks the registry at most once, and a repaired file is offered again within one window. `_filter_and_claim` keeps its `is_suppressed` check as the last guard, for a picture marked after the set was read; with the fetch excluding the set, those are the only suppressed pictures that reach it.
@@ -1866,10 +1866,10 @@ carried in the 4-tuples `_load_input_images` returns and threaded into the save.
 would then be false:
 
 - **Orientation (`0x0112`) — the highest-risk one.** `ImageUtils.load_image_or_video`
-  applies `ImageOps.exif_transpose` on load, so the pixels a plugin returns are
-  *already upright*. Re-stamping the source's orientation would turn the output
-  a second time on display, and its displayed size would disagree with its
-  stored size.
+  applies `ImageUtils.apply_exif_orientation` on load, so the pixels a plugin
+  returns are *already upright*. Re-stamping the source's orientation would
+  turn the output a second time on display, and its displayed size would
+  disagree with its stored size.
 - `ImageWidth` (`0x0100`) / `ImageLength` (`0x0101`), and `PixelXDimension`
   (`0xA002`) / `PixelYDimension` (`0xA003`) in the Exif sub-IFD.
 - The IFD1 thumbnail, which `Exif.tobytes()` does not write — it would show the
@@ -6862,6 +6862,8 @@ Both paths log an `error` if the arithmetic does not close, rather than shipping
 - **It comes back as it was.** A `.txt` sidecar is not applied to a restored match and the import's project/set/character is not applied either, on both paths: the picture may sit in a locked set, and it is announced as `restored`, not `added`.
 - **A watch folder does not restore.** It matches the Scrapheap the same way and skips the file, but leaves the picture where it is: a file kept in a watch folder is offered again after every restart, so restoring would undo the owner's cleanup on each start.
 
+**A failed save leaves no file behind.** Every import path (upload, staging, watch folder, plugin and ComfyUI outputs) publishes a new picture's file before its row commits. `import_dedup_service.PublishedPictures` records those files and removes them, with their thumbnails, when the insert does not commit, so the next root scan does not index them as new, untagged pictures. A process that dies between the publish and the commit still leaves the file.
+
 **Frontend.** `fetchStagingStatus` surfaces the bucket; the arriving tile reads "Restored" with a Show link, and the completion headline says "Restored N pictures from the Scrapheap" rather than "All files were duplicates".
 
 ### 21.2 Tag-review decisions: confirm and reject are undoable
@@ -6982,6 +6984,10 @@ worth knowing:
   This response is what "Save image as" hands the user, and a saved copy of a
   rotated picture that had quietly lost its `workflow` / `prompt` would be a
   worse bug than the unturned view. The stored file is untouched regardless.
+  They are taken from the turned image, which `apply_exif_orientation` clears
+  of the orientation an XMP `tiff:Orientation` or a `Raw profile type exif`
+  carried, so the saved copy is not turned twice; share copies keep their text
+  and XMP the same way.
 - Anything already on the re-encode path — the HEIC→JPEG transcode, watermark
   compositing — is transposed too, JPEG included, because PIL drops the EXIF
   block on save and the tag would not survive to be applied.
@@ -7035,11 +7041,11 @@ re-derives, per picture:
 
 - `Face.bbox` **and** `Detection.bbox`. Both are stored in **EXIF-corrected**
   space (the extraction tasks load through `load_image_bgr_reduced`, which runs
-  `ImageOps.exif_transpose`), so they move even though no pixel did. The corner
-  maths is *reused* from the `rotate` image plugin's `get_bbox_transform` rather
-  than copied. `Picture.width` / `height` are RAW and stay put; the display size
-  the transform needs is those two swapped iff the *current* orientation is one
-  of 5–8.
+  `ImageUtils.apply_exif_orientation`), so they move even though no pixel did.
+  The corner maths is *reused* from the `rotate` image plugin's
+  `get_bbox_transform` rather than copied. `Picture.width` / `height` are RAW
+  and stay put; the display size the transform needs is those two swapped iff
+  the *current* orientation is one of 5–8.
 - `pixel_sha` and `size_bytes` — the container changed even though the pixels
   did not, so the tier-1 duplicate key must be recomputed (§22.6).
 - `thumbnail_width` / `thumbnail_height`, NULLed so `MissingThumbnailFinder`
@@ -12634,6 +12640,20 @@ mounted over it is not (`_emptied_since_seen`). A mount point re-created on
 every boot does read as emptied, and a share whose clock runs behind this
 machine's can keep an emptied folder `unreachable`.
 
+**A scan follows links, as ComfyUI does.** A directory in a model folder that is
+a symlink, or a junction on Windows, to another drive is where the owner's models
+are, and ComfyUI loads them from there. `ModelFolderScanner._walk` follows it and
+registers each file under its path through the link, the name ComfyUI loads it
+by. Each directory's real path is tracked, and a directory is skipped, with an
+info line naming it and its target, when its real path was already walked in this
+scan (two links to one place); when it is a link into this folder, or to this
+folder, the link's own directory or anything above them (the plain walk lists
+the first; the rest are loops); or when it lies outside this folder and inside
+another registered folder, which lists it under its own row. Directories are
+walked in name order, so the spelling that wins is the same on every scan. The
+watch does not descend into a link, so a change behind one waits for the
+10-minute rescan.
+
 **The shelf hears about it.** A scan that found copies the folder had no
 `present` row for announces their ids as `models_arrived`, the event a download
 announces, so the open shelf re-reads and badges them as new. A scan that only
@@ -13471,9 +13491,14 @@ arrow before it is asked.
   what the scanner recorded" would have hidden it. A missing path or a file is
   404. A directory that cannot be listed is logged with the folder id, the path
   and the error, and answers 409.
-- **What the tree offers.** Dot-names, symlinks and Windows junctions
-  (`utils.links.is_link_entry`, §11) are skipped, and non-directories too; an
-  entry removed since the listing is left out with a warning.
+- **What the tree offers.** Dot-names, broken links, links to files and other
+  non-directories are skipped; an entry removed since the listing is left out
+  with a warning. A symlink or Windows junction to a directory
+  (`utils.links.is_link_entry`, §11) is listed with `link: true` and
+  `has_dirs: false`: the scan follows it (25.13), so its counts are the models
+  registered under its name, zero when the scan skipped it. The tree shows it
+  read-only and does not expand it, and the move and folder verbs refuse it
+  (25.24). Listing through a link that leaves the folder is the 400 above.
   A bind mount is a plain directory to every API here and is offered, as the
   scanner walks it: it is the owner's own mount inside their own folder. Names sort case-insensitively. A `<stem>_samples` directory is
   hidden when a `present` model file directly in the same directory has the stem
@@ -13496,8 +13521,9 @@ arrow before it is asked.
   directory still counts toward its ancestors' totals, because the totals describe
   what the database holds beneath the path, not what the tree shows.
 - **`has_dirs`.** One `os.scandir` peek per visible child, applying the same
-  filters with that child's direct-file stems from the rows already read. A child
-  that cannot be peeked answers `has_dirs: false` and is logged as a warning.
+  filters with that child's direct-file stems from the rows already read, so a
+  link inside counts. A child that cannot be peeked answers `has_dirs: false`
+  and is logged as a warning; a link node is never peeked.
 - **Authority.** `LOCAL_OWNER_ONLY` (§16.3), not `owner_only`: the route reports
   directory names PixlStash never registered, the authority
   `GET /api/v1/models/{model_id}/samples` already exercises. The templated path is
@@ -13521,9 +13547,11 @@ anything is written:
   One removed between the plan and the write fails that file rather than being
   recreated: only a relocation, which keeps its tree, makes directories.
 - **A link, a junction or a dot-name on the way is a 400**, even one that stays
-  inside the folder. The listing never offers them, and the scanner does not
-  walk through a link, so a file moved through one would sit at a path no
-  rescan finds.
+  inside the folder. The listing never offers a dot-name and shows a link only
+  as a read-only node: the scan lists the models behind one (25.13), but its
+  target is another place on disk, which the shelf moves nothing into. A model
+  registered through a link resolves outside its folder, so
+  `resolve_path_within` refuses it as a move source too.
 - **A locked destination is a 409.** A folder whose `movable` is not `per_item`
   (the managed store, the HuggingFace cache, the InsightFace packs) takes no
   move in, as it already gave none out. Before #2204 the managed store was a

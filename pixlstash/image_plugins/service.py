@@ -18,6 +18,7 @@ from pixlstash.db_models import (
     TAG_PENDING_SENTINEL,
 )
 from pixlstash.image_plugins.base import ImagePlugin
+from pixlstash.services import import_dedup_service
 from pixlstash.services.set_lock_service import drop_locked_set_ids
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.pixl_logging import get_logger
@@ -110,9 +111,9 @@ def _source_exif_bytes(source_path: str | None) -> bytes | None:
     """Return the source's EXIF minus orientation and geometry, or ``None``.
 
     Orientation must go: :meth:`ImageUtils.load_image_or_video` runs
-    ``ImageOps.exif_transpose`` on load, so the pixels a plugin hands back are
-    already upright and re-stamping the source's orientation would rotate the
-    output a second time on display.
+    ``ImageUtils.apply_exif_orientation`` on load, so the pixels a plugin hands
+    back are already upright and re-stamping the source's orientation would
+    rotate the output a second time on display.
     """
     if not source_path:
         return None
@@ -237,19 +238,29 @@ def _import_output_images(
         for image_bytes, _ in output_entries
     ]
 
-    existing = server.vault.db.run_immediate_read_task(
-        lambda session: Picture.find(session, pixel_shas=shas, include_unimported=True)
+    fingerprints = [
+        (sha, len(image_bytes), ImageUtils.calculate_full_hash_from_bytes(image_bytes))
+        for sha, (image_bytes, _) in zip(shas, output_entries)
+    ]
+    candidates = server.vault.db.run_immediate_read_task(
+        import_dedup_service.load_match_candidates_in_session,
+        [(sha, size) for sha, size, _full in fingerprints],
+        False,
     )
-    existing_map = {pic.pixel_sha: pic for pic in existing}
+    existing_map, _scrapheaped = import_dedup_service.partition_confirmed_matches(
+        candidates, fingerprints, server.vault.image_root
+    )
 
     new_entries = [
-        (orig_idx, entry, sha)
-        for orig_idx, (entry, sha) in enumerate(zip(output_entries, shas))
-        if sha not in existing_map
+        (orig_idx, entry, fingerprint)
+        for orig_idx, (entry, fingerprint) in enumerate(
+            zip(output_entries, fingerprints)
+        )
+        if fingerprint not in existing_map
     ]
 
     new_pictures = []
-    for orig_idx, (img_bytes, ext), sha in new_entries:
+    for orig_idx, (img_bytes, ext), (sha, _size, _full) in new_entries:
         out_dir = output_dirs[orig_idx] if output_dirs else None
         ref_id = reference_folder_ids[orig_idx] if reference_folder_ids else None
         source_stem = source_file_names[orig_idx] if source_file_names else None
@@ -274,7 +285,7 @@ def _import_output_images(
             )
         )
 
-    def persist(session: Session):
+    def persist(session: Session, published: import_dedup_service.PublishedPictures):
         if not new_pictures:
             return []
         session.add_all(new_pictures)
@@ -282,12 +293,18 @@ def _import_output_images(
         for pic in new_pictures:
             session.add(Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id))
         session.commit()
+        published.mark_committed()
         for pic in new_pictures:
             session.refresh(pic)
         return new_pictures
 
     if new_pictures:
-        new_pictures = server.vault.db.run_task(persist)
+        with import_dedup_service.PublishedPictures(
+            server.vault.image_root, "Plugin output import"
+        ) as published:
+            for pic in new_pictures:
+                published.add(pic)
+            new_pictures = server.vault.db.run_task(persist, published)
 
         def mark_imported(session: Session, ids: list[int]):
             now = datetime.now(timezone.utc)
@@ -305,24 +322,24 @@ def _import_output_images(
 
     new_ids = [pic.id for pic in new_pictures if pic.id is not None]
     duplicate_ids = [
-        pic.id
-        for sha in shas
-        if (pic := existing_map.get(sha)) is not None and pic.id is not None
+        match.id
+        for fingerprint in fingerprints
+        if (match := existing_map.get(fingerprint)) is not None
     ]
 
-    new_map: dict[str, int] = {}
-    for (_orig_idx, _entry, sha), pic in zip(new_entries, new_pictures):
+    new_map: dict[import_dedup_service.ContentFingerprint, int] = {}
+    for (_orig_idx, _entry, fingerprint), pic in zip(new_entries, new_pictures):
         if pic.id is not None:
-            new_map[sha] = pic.id
+            new_map[fingerprint] = pic.id
 
     ordered_output_ids: list[int] = []
-    for sha in shas:
-        if sha in new_map:
-            ordered_output_ids.append(new_map[sha])
+    for fingerprint in fingerprints:
+        if fingerprint in new_map:
+            ordered_output_ids.append(new_map[fingerprint])
             continue
-        existing_pic = existing_map.get(sha)
-        if existing_pic is not None and existing_pic.id is not None:
-            ordered_output_ids.append(existing_pic.id)
+        existing_match = existing_map.get(fingerprint)
+        if existing_match is not None:
+            ordered_output_ids.append(existing_match.id)
 
     return new_ids, duplicate_ids, ordered_output_ids
 

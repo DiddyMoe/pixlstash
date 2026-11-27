@@ -283,13 +283,14 @@ def resolve_subfolder(
 
     Shared by a move's destination, the folder verbs' source and destination,
     and creating a folder (#2206), so every route that names a directory inside
-    a folder accepts exactly what ``GET /model-folders/{id}/dirs`` offers.
+    a folder accepts exactly what ``GET /model-folders/{id}/dirs`` offers as a
+    directory.
 
-    The folder listing never offers a link, a junction or a dot-name, and the
-    scanner does not walk through a link, so a file moved through one would be
-    registered at a path no rescan finds. Whether the directory exists is the
-    caller's question: a missing destination and a missing source answer with
-    different statuses.
+    The folder listing never offers a dot-name, and offers a link or a junction
+    only as a read-only node: the scan lists what is behind one, but its
+    target is another place on disk, which the shelf moves nothing into or
+    through. Whether the directory exists is the caller's question: a
+    missing destination and a missing source answer with different statuses.
 
     Returns:
         ``(subpath, path)``: the normalised POSIX subpath (``""`` for the root)

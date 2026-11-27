@@ -9,7 +9,7 @@ import time
 import traceback
 from typing import TYPE_CHECKING, Callable, Optional
 
-from PIL import Image, ImageOps
+from PIL import Image
 
 if TYPE_CHECKING:  # annotations only - see the function-local import note below
     import torch
@@ -19,6 +19,7 @@ from pixlstash.tagger_plugins.base import TaggerPlugin
 from pixlstash.utils.accelerator import is_accelerated, is_device_error
 from pixlstash.utils.model_utils import from_pretrained_local_first
 from pixlstash.utils.vram_utils import empty_device_cache, is_vram_oom
+from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 
 # ML imports (torch / torchvision) are deliberately FUNCTION-LOCAL throughout
@@ -643,7 +644,7 @@ class Florence2Service:
                     try:
                         image = Image.open(image_path)
                         if exif_transpose:
-                            image = ImageOps.exif_transpose(image)
+                            image = ImageUtils.apply_exif_orientation(image)
                         image = image.convert("RGB")
                         fed = _resize_to_max_dim(image, max_dim)
                         valid_items.append((image_path, image.size, fed))

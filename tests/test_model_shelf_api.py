@@ -3999,6 +3999,37 @@ def test_the_home_folder_from_comfyui_is_never_put_on_the_shelf(
     assert set(after) == before, after
 
 
+def test_a_comfyui_root_that_is_not_a_directory_is_skipped_and_the_rest_added(
+    shelf_env, tmp_path, monkeypatch
+):
+    """ComfyUI's answer is an outside party's: a root with a NUL byte in it
+    names no directory and sorts ahead of the real models root here."""
+    models = tmp_path / "ComfyUI" / "models"
+    for category in ("checkpoints", "loras"):
+        (models / category).mkdir(parents=True)
+    fake = _FolderPaths(
+        {
+            "checkpoints": [str(models / "checkpoints")],
+            "loras": [str(models / "loras")],
+            "vae": [f"{tmp_path}{os.sep}0\x00vae"],
+        }
+    )
+    monkeypatch.setattr(comfyui_service, "bounded_get", fake)
+    root = os.path.realpath(str(models))
+    try:
+        added = model_folders_routes.register_comfyui_model_folders(
+            shelf_env.server, "http://127.0.0.1:18188"
+        )
+    finally:
+        folders = {
+            row["path"]: row["id"]
+            for row in shelf_env.owner.get(f"{API}/model-folders").json()["folders"]
+        }
+        if root in folders:
+            shelf_env.owner.delete(f"{API}/model-folders/{folders[root]}")
+    assert added == [folders[root]]
+
+
 def test_the_vault_data_folder_is_refused(shelf_env):
     image_root = shelf_env.server.vault.image_root
     r = shelf_env.owner.post(f"{API}/model-folders", json={"path": image_root})
@@ -10265,6 +10296,26 @@ def test_a_relpath_that_escapes_its_folder_is_refused_not_unlinked(
     assert list(fake_trash.iterdir()) == []
 
 
+def test_a_model_behind_a_directory_link_is_refused_not_unlinked(
+    shelf_env, real_files, fake_trash, tmp_path
+):
+    """The scan lists a model through a link to a directory elsewhere; the
+    shelf does not delete inside the place the link names."""
+    outside = tmp_path / "other-drive"
+    outside.mkdir()
+    behind = outside / "alice.safetensors"
+    write_adapter(behind)
+    os.symlink(outside, real_files / "linked", target_is_directory=True)
+    alice = shelf_env.model_ids["alice.safetensors"]
+    _relpath_of(shelf_env.server, "alice.safetensors", "linked/alice.safetensors")
+
+    r = _delete(shelf_env, [alice])
+    assert r.status_code == 200, r.text
+    assert r.json()["refused"] == [{"id": alice, "reason": "escapes_its_folder"}]
+    assert behind.exists(), "the file behind the link was deleted"
+    assert list(fake_trash.iterdir()) == []
+
+
 def test_delete_takes_the_same_job_slot_as_a_move_and_an_import(
     shelf_env, real_files, fake_trash
 ):
@@ -11800,20 +11851,33 @@ def test_dirs_count_every_copy_beneath_each_entry(shelf_env, tmp_path):
     assert (dirs["empty"]["model_count"], dirs["empty"]["bytes"]) == (0, 0)
 
 
-def test_dot_dirs_symlinks_and_files_are_not_offered(shelf_env, tmp_path):
+def test_dot_dirs_and_files_are_not_offered_and_a_dir_link_is_a_link_node(
+    shelf_env, tmp_path
+):
     root = tmp_path / "loras"
     (root / "real").mkdir(parents=True)
     (root / ".cache").mkdir()
     (root / "style").mkdir()
-    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "deeper").mkdir(parents=True)
     (root / "linked").symlink_to(tmp_path / "outside", target_is_directory=True)
     (root / "alias").symlink_to(root / "style", target_is_directory=True)
+    (root / "real" / "away").symlink_to(tmp_path / "outside", target_is_directory=True)
+    (root / "broken").symlink_to(tmp_path / "gone", target_is_directory=True)
     (root / "notes.txt").write_text("not a folder")
+    (root / "notes-link").symlink_to(root / "notes.txt")
     _seeded_folder_at(shelf_env.server, str(root))
-    _set_copies(shelf_env, 1, [("real/a.safetensors", 4)])
+    _set_copies(shelf_env, 1, [("real/a.safetensors", 4), ("linked/b.safetensors", 2)])
 
     body = _listing(shelf_env).json()
-    assert [entry["name"] for entry in body["dirs"]] == ["real", "style"]
+    assert [
+        (entry["name"], entry["link"], entry["has_dirs"], entry["model_count"])
+        for entry in body["dirs"]
+    ] == [
+        ("alias", True, False, 0),
+        ("linked", True, False, 1),
+        ("real", False, True, 1),
+        ("style", False, False, 0),
+    ]
 
 
 def test_a_samples_directory_is_hidden_beside_its_model_and_shown_without_one(

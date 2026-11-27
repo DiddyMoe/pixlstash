@@ -2034,6 +2034,31 @@ def test_missing_file_purge_task_skips_unreachable_locations(server, tmp_path):
     assert _ledger_flags_for(server, path) == []
 
 
+def test_missing_file_purge_task_keeps_a_link_to_an_unmounted_drive(server, tmp_path):
+    """A picture whose file is a link into a drive that is not mounted: the
+    link's folder is present, the file behind it is not, and the row stays."""
+    from pixlstash.tasks.missing_file_purge_task import MissingFilePurgeTask
+
+    pic_id, path = _make_reference_picture(
+        server, str(tmp_path / "present"), "linked.png", allow_delete=True
+    )
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    shutil.move(path, str(drive / "linked.png"))
+    os.symlink(str(drive / "linked.png"), path)
+    shutil.move(str(drive), str(tmp_path / "unmounted"))
+
+    pictures = server.vault.db.run_immediate_read_task(
+        lambda s: [s.get(Picture, pic_id)]
+    )
+    result = MissingFilePurgeTask(
+        database=server.vault.db, pictures=pictures
+    )._run_task()
+    assert result == {"purged": 0, "repaired": 0, "deferred": 0}, result
+    assert _get_picture(server, pic_id) is not None
+    assert _ledger_flags_for(server, path) == []
+
+
 def test_missing_file_purge_task_still_reaps_a_genuinely_deleted_file(server, tmp_path):
     """Over-blocking guard: a truly deleted file is still reaped and logged."""
     from pixlstash.tasks.missing_file_purge_task import MissingFilePurgeTask
@@ -2056,6 +2081,28 @@ def test_missing_file_purge_task_still_reaps_a_genuinely_deleted_file(server, tm
     assert result == {"purged": 1, "repaired": 0, "deferred": 0}, result
     assert _get_picture(server, pic_id) is None
     assert _ledger_flags_for(server, path) == [True]
+
+
+def test_startup_cleanup_keeps_a_link_to_an_unmounted_drive(server, tmp_path):
+    """``--cleanup-missing-pictures`` judges a file present as the purge does:
+    the picture behind a link to an unmounted drive stays, a deleted one goes."""
+    linked_id, linked = _make_reference_picture(
+        server, str(tmp_path / "present"), "linked.png", allow_delete=True
+    )
+    gone_id, gone = _make_reference_picture(
+        server, str(tmp_path / "present"), "gone.png", allow_delete=True
+    )
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    shutil.move(linked, str(drive / "linked.png"))
+    os.symlink(str(drive / "linked.png"), linked)
+    shutil.move(str(drive), str(tmp_path / "unmounted"))
+    os.remove(gone)
+
+    server._cleanup_missing_pictures()
+
+    assert _get_picture(server, linked_id) is not None
+    assert _get_picture(server, gone_id) is None
 
 
 # ── Item 1: the retention impact endpoint ─────────────────────────────────────

@@ -447,10 +447,10 @@ def test_a_source_that_cannot_be_read_is_not_marked(tmp_path, monkeypatch, attem
 def test_a_thumbnail_source_that_cannot_be_read_is_not_selected_again(
     tmp_path, monkeypatch
 ):
-    """MissingThumbnailFinder has no retry hold, so a source it cannot load is marked.
+    """MissingThumbnailFinder has no retry hold, so a source it cannot read is held.
 
     A file that cannot be read (no permission, a bad sector) fails the same way
-    on every sweep. Left unmarked, it would be selected again on every sweep
+    on every sweep. Left unheld, it would be selected again on every sweep
     (#585).
     """
     corrupt_path = _write_corrupt_jpeg(tmp_path / "corrupt.jpg")
@@ -462,6 +462,34 @@ def test_a_thumbnail_source_that_cannot_be_read_is_not_selected_again(
         _thumbnail_attempt(vault, pic_id, corrupt_path)
 
         assert MissingThumbnailFinder(vault.db).find_task() is None
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX file modes and a non-root user to make a file unreadable",
+)
+def test_a_thumbnail_source_without_read_permission_is_held_until_it_reads(tmp_path):
+    """A permission error says nothing about the file's bytes.
+
+    The picture is held while the file cannot be read, and gets its thumbnail
+    once it can, with no change to the file.
+    """
+    path = tmp_path / "pic.png"
+    PILImage.new("RGB", (8, 8), "red").save(path)
+
+    with Vault(image_root=str(tmp_path)) as vault:
+        pic_id = _seed_picture(vault, str(path))
+        vault.db.unprocessable_images.ACTIVE_CACHE_TTL_S = 0.0
+        os.chmod(path, 0)
+        try:
+            _thumbnail_attempt(vault, pic_id, str(path))
+            assert MissingThumbnailFinder(vault.db).find_task() is None
+        finally:
+            os.chmod(path, 0o644)
+
+        task = MissingThumbnailFinder(vault.db).find_task()
+        assert task is not None and task.params["picture_ids"] == [pic_id]
+        assert task._run_task() == {"changed_count": 1}
 
 
 def test_a_picture_on_an_unmounted_drive_is_held_until_the_drive_is_back(tmp_path):

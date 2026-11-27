@@ -1,0 +1,1 @@
+- Fixed: two different plugin outputs are no longer stored as one picture.

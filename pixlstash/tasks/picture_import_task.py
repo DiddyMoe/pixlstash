@@ -484,7 +484,12 @@ class PictureImportTask(BaseTask):
         # Each new picture with the staged entry it came from, whose folder
         # its caption is matched in.
         new_pictures: list[tuple[Picture, dict]] = []
-        with import_dedup_service.serialised_import():
+        with (
+            import_dedup_service.serialised_import(),
+            import_dedup_service.PublishedPictures(
+                self._db.image_root, f"Staged import {self._staging_id}"
+            ) as published,
+        ):
             live: dict = {}
             scrapheaped: dict = {}
             if fingerprints:
@@ -513,6 +518,7 @@ class PictureImportTask(BaseTask):
                     entry, fingerprint, match, tally, subfolder
                 )
                 if pic is not None:
+                    published.add(pic)
                     new_pictures.append((pic, entry))
                 decided.append((entry, outcome, picture_id))
                 self._processed_count += 1
@@ -564,6 +570,7 @@ class PictureImportTask(BaseTask):
                     # in the library.
                     ids = [pic.id for pic, _entry in pictures]
                     session.commit()
+                    published.mark_committed()
                     return ids
 
                 try:

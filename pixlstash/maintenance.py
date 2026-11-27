@@ -14,6 +14,7 @@ from sqlmodel import select
 
 from pixlstash.db_models import Picture
 from pixlstash.pixl_logging import get_logger
+from pixlstash.tasks.missing_file_purge_task import file_is_present
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 
 logger = get_logger(__name__)
@@ -121,7 +122,7 @@ class MaintenanceMixin:
                 resolved = ImageUtils.resolve_picture_path(
                     self.vault.image_root, file_path
                 )
-            if not resolved or not os.path.isfile(resolved):
+            if not resolved or not file_is_present(resolved):
                 missing_ids.append(pic_id)
                 if file_path:
                     thumbnail_candidates.append(file_path)

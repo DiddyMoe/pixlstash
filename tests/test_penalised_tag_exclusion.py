@@ -621,9 +621,8 @@ def _import_with_sidecar(client, server, via, caption, *, png=None, stem=None):
                 fh.write(png)
             with open(os.path.join(folder, f"{stem}.txt"), "wb") as fh:
                 fh.write(caption)
-            WatchFolderImportTask(
-                server.vault.db, [{"file_path": image_path}], 1
-            )._run_task()
+            candidate = {"file_path": image_path, "import_source_folder": folder}
+            WatchFolderImportTask(server.vault.db, [candidate], 1)._run_task()
     return _picture_id_by_name(server, f"{stem}.png")
 
 

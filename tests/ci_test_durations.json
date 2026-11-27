@@ -29,10 +29,11 @@
     "local run (2026-11-01): tests/test_tag_groups.py and tests/test_default_tag_groups.py, which this branch newly gates, --force-cpu --fast-captions to match CI",
     "local run (2026-11-01): tests/test_tag_groups.py and tests/test_default_tag_groups.py, the eleven tests the #2469 review added, --force-cpu --fast-captions to match CI",
     "local run (2026-11-01): tests/test_tag_groups.py and tests/test_default_tag_groups.py after the Character, Copyright, Artist and Adult extension, --force-cpu --fast-captions to match CI",
-    "local run (2026-11-27): tests/test_search_export_parity.py, which this branch newly gates, CUDA hidden, --fast-captions to match CI"
+    "local run (2026-11-27): tests/test_search_export_parity.py, which this branch newly gates, CUDA hidden, --fast-captions to match CI",
+    "local run (2026-11-27): tests/test_exif_orientation_loads.py, which this branch newly gates, CUDA hidden, --fast-captions to match CI"
   ],
-  "test_count": 6363,
-  "total_seconds": 8391.97,
+  "test_count": 6369,
+  "total_seconds": 8391.99,
   "durations": {
     "tests/db_models/test_training_models.py::test_config_ai_toolkit_keys_clearable": 0.0,
     "tests/db_models/test_training_models.py::test_config_ai_toolkit_keys_trimmed": 0.0,
@@ -1393,6 +1394,12 @@
     "tests/test_except_hygiene_guardrail.py::test_detector_has_teeth": 0.0,
     "tests/test_except_hygiene_guardrail.py::test_no_unlisted_silent_broad_swallow_in_backend": 1.1,
     "tests/test_except_hygiene_guardrail.py::test_silent_swallow_allowlist_has_no_stale_entries": 1.06,
+    "tests/test_exif_orientation_loads.py::test_a_photo_whose_exif_cannot_be_written_back_loads_upright[_via_load_image_bgr_reduced]": 0.0,
+    "tests/test_exif_orientation_loads.py::test_a_photo_whose_exif_cannot_be_written_back_loads_upright[_via_load_image_or_video]": 0.0,
+    "tests/test_exif_orientation_loads.py::test_a_photo_whose_exif_cannot_be_written_back_loads_upright[_via_load_image_or_video_bgr]": 0.0,
+    "tests/test_exif_orientation_loads.py::test_a_photo_whose_exif_cannot_be_written_back_loads_upright[_via_load_image_reduced]": 0.0,
+    "tests/test_exif_orientation_loads.py::test_a_photo_whose_exif_cannot_be_written_back_loads_upright[_via_render_thumbnail]": 0.02,
+    "tests/test_exif_orientation_loads.py::test_a_resized_share_copy_of_such_a_photo_is_made_upright": 0.0,
     "tests/test_export_api.py::test_export_status_unknown_task_returns_404": 1.5,
     "tests/test_export_api.py::test_pictures_export_folder_rejects_missing_destination": 3.49,
     "tests/test_export_api.py::test_pictures_export_folder_rejects_non_empty_destination": 3.32,

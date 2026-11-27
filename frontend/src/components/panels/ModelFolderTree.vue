@@ -108,18 +108,26 @@
           </span>
         </template>
         <template v-else>
-          <!-- The lock is the glyph, so nothing after the name changes width
-               with it and the counts stay one column. -->
+          <!-- The lock or link arrow is the glyph, so nothing after the name
+               changes width with it and the counts stay one column. -->
           <v-icon
             size="16"
             class="mft-glyph"
             aria-hidden="true"
             :class="{ 'mft-glyph--in': welcomes.has(node.key) }"
-            :data-testid="node.locked ? 'model-folder-lock' : undefined"
+            :data-testid="
+              node.locked
+                ? 'model-folder-lock'
+                : node.link
+                  ? 'model-folder-link'
+                  : undefined
+            "
             >{{
               node.locked
                 ? "mdi-folder-lock-outline"
-                : welcomes.has(node.key)
+                : node.link
+                  ? "mdi-folder-arrow-right-outline"
+                  : welcomes.has(node.key)
                   ? "mdi-folder-download-outline"
                   : node.expanded
                     ? "mdi-folder-open-outline"
@@ -465,13 +473,18 @@ function registeredOf(folderId) {
   return foldersStore.folders.find((f) => Number(f.id) === Number(folderId));
 }
 
-/** A folder or subfolder row, and its open children after it. */
+/**
+ * A folder or subfolder row, and its open children after it. A link to a
+ * directory is a row the server walks but moves nothing through: it shows its
+ * models, never expands, and takes no verb, drag or drop.
+ */
 function pushFolderRows(out, entry) {
   const key = nodeKey(entry.folderId, entry.path);
   const listing = listingOf(entry.folderId, entry.path);
   const open = expanded.value.has(key);
   const expandable =
     !entry.locked &&
+    !entry.link &&
     (listing?.listing
       ? listing.listing.dirs.length > 0
       : (entry.hasDirs ?? !listing?.error));
@@ -483,7 +496,8 @@ function pushFolderRows(out, entry) {
       ? listing?.listing?.model_count
       : listing?.listing?.direct_model_count);
   const refused =
-    props.mode === "pick" && (entry.locked || props.disabled?.(entry));
+    props.mode === "pick" &&
+    (entry.locked || entry.link || props.disabled?.(entry));
   const marks = comfyuiMarks(
     entry.folderId,
     entry.path,
@@ -509,6 +523,7 @@ function pushFolderRows(out, entry) {
       typeLine.map((type) => type.label).join(", "),
       n == null ? "" : `${count(n)} ${Number(n) === 1 ? "model" : "models"}`,
       entry.locked ? "locked" : "",
+      entry.link ? "link" : "",
       ...marks.map(comfyuiLoadsTitle),
     ]
       .filter(Boolean)
@@ -523,6 +538,7 @@ function pushFolderRows(out, entry) {
       name: dir.name,
       level: entry.level + 1,
       locked: false,
+      link: dir.link === true,
       hasDirs: dir.has_dirs,
       count: dir.direct_model_count,
     });
@@ -661,8 +677,8 @@ const OPEN_ENTRY = {
 
 /**
  * The menu a row offers, in the order the design draws it. Empty for a drive,
- * a locked folder (it shows its lock and nothing else), and every row in pick
- * mode. A registered root has no Move or Remove: it is a place the owner
+ * a locked folder (it shows its lock and nothing else), a link, and every row
+ * in pick mode. A registered root has no Move or Remove: it is a place the owner
  * registered, and leaving the registry is Stop watching. Its Rename renames the
  * directory on disk and the registration with it.
  *
@@ -671,7 +687,7 @@ const OPEN_ENTRY = {
  */
 function menuFor(node) {
   if (props.mode !== "browse") return [];
-  if (node.kind === "drive" || node.locked) return [];
+  if (node.kind === "drive" || node.locked || node.link) return [];
   const busy = gates.folderVerbReason({ id: node.folderId });
   // Models cut on the shelf (Ctrl X or Cut) land here, through the Move
   // dialog. Listed only while something is cut, first: it is why the reader
@@ -844,7 +860,8 @@ function runEntry(entry) {
 function verbKey(event, node) {
   const chord = event.ctrlKey || event.metaKey;
   // Ctrl V pastes what the shelf cut into this folder. A locked folder offers
-  // no menu, so it is asked directly and says why it refuses.
+  // no menu, so it is asked directly and says why it refuses; a link offers
+  // none either, and the tree says why.
   if (
     chord &&
     !event.shiftKey &&
@@ -854,6 +871,13 @@ function verbKey(event, node) {
     node.kind !== "drive"
   ) {
     if (verbFor(node, "paste")) return true;
+    if (node.link) {
+      notices.push({
+        level: "info",
+        text: "That folder is a link to another place, so nothing can be moved into it.",
+      });
+      return true;
+    }
     shelf.pasteCut(dropDestination(node));
     return true;
   }
@@ -918,6 +942,7 @@ function canDrag(node) {
     node.kind !== "drive" &&
     node.path !== "" &&
     !node.locked &&
+    !node.link &&
     editor.value == null
   );
 }
@@ -1257,9 +1282,12 @@ function reveal(folderId, parent, focusPath) {
 
 // ── Drops ───────────────────────────────────────────────────────────────────
 
-/** Where a drop on this row lands: null for a drive, which is no place. */
+/**
+ * Where a drop on this row lands: null for a drive, which is no place, and for
+ * a link, which nothing moves into.
+ */
 function dropDestination(node) {
-  if (node.kind === "drive") return null;
+  if (node.kind === "drive" || node.link) return null;
   return { folderId: node.folderId, path: node.path, locked: node.locked };
 }
 

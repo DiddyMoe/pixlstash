@@ -131,7 +131,7 @@ def _fetch_hidden_picture_ids(server, request: Request, picture_ids: list[int]):
 
 
 def _create_picture_imports(
-    server, uploaded_files, dest_folder, progress_callback=None
+    server, uploaded_files, dest_folder, progress_callback=None, on_file_failed=None
 ):
     """
     Given a list of (img_bytes, ext), create Picture objects for new images,
@@ -155,6 +155,10 @@ def _create_picture_imports(
         dest_folder: Destination folder for images.
         progress_callback: Optional callable invoked after each image is written
             to disk. Receives no arguments. Used for incremental progress tracking.
+        on_file_failed: Optional callable ``(index, exc)`` for a file that could
+            not be written or read as a picture or a video. With it, the file is
+            left out of ``new_picture_map`` and the batch goes on; without it,
+            the error is raised.
 
     Returns:
         ``(fingerprints, existing_map, scrapheaped_map, new_picture_map)``.
@@ -192,7 +196,9 @@ def _create_picture_imports(
     subfolder = resolve_placement(server.vault.db, dest_folder)
 
     new_picture_map = {}
-    for file_entry, fingerprint in zip(uploaded_files, fingerprints):
+    for index, (file_entry, fingerprint) in enumerate(
+        zip(uploaded_files, fingerprints)
+    ):
         if (
             fingerprint in existing_map
             or fingerprint in scrapheaped_map
@@ -200,8 +206,8 @@ def _create_picture_imports(
         ):
             continue
         sampled_sha, _size_bytes, _full_sha = fingerprint
+        img_bytes, ext, original_name = file_entry
         try:
-            img_bytes, ext, original_name = file_entry
             pic_uuid = str(uuid.uuid4()) + ext
             logger.debug(f"Importing picture from uploaded bytes as id={pic_uuid}")
             new_picture_map[fingerprint] = ImageUtils.create_picture_from_bytes(
@@ -214,10 +220,18 @@ def _create_picture_imports(
             )
             if progress_callback is not None:
                 progress_callback()
-        except Exception:
-            # Preserve the existing failure behaviour: creation errors escape to
-            # the task wrapper, which reports the import failed.
-            raise
+        except Exception as exc:
+            if on_file_failed is None:
+                raise
+            logger.warning(
+                "Import of file %d of %d (%s) failed; importing the rest: %s",
+                index + 1,
+                len(uploaded_files),
+                original_name,
+                exc,
+                exc_info=True,
+            )
+            on_file_failed(index, exc)
 
     return fingerprints, existing_map, scrapheaped_map, new_picture_map
 

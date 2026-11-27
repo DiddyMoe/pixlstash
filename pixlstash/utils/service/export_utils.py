@@ -11,7 +11,7 @@ import tempfile
 import unicodedata
 import zipfile
 
-from PIL import Image, ImageOps, PngImagePlugin
+from PIL import Image, PngImagePlugin
 
 from pixlstash.db_models.face import Face
 from pixlstash.db_models.picture import Picture, PictureSet
@@ -362,7 +362,7 @@ class ExportUtils:
         try:
             with Image.open(full_path) as img:
                 icc_profile = img.info.get("icc_profile")
-                img = ImageOps.exif_transpose(img)
+                img = ImageUtils.apply_exif_orientation(img)
                 if img.mode.startswith("I;16"):
                     # 16-bit grey: convert("RGB") clips every value above 255
                     # to white, so scale it down first. Plain "I" is left

@@ -510,11 +510,12 @@ def test_undecodable_pictures_cannot_wedge_the_face_finder(tmp_path):
             count=FACE_EXTRACTION_BATCH_LIMIT + 3,
             with_faces=False,
         )
-        for picture_id in ids[:FACE_EXTRACTION_BATCH_LIMIT]:
-            vault.db.unprocessable_images.mark_unprocessable(
-                picture_id,
-                str(tmp_path / f"p{picture_id}.png"),
-                reason="test: undecodable",
+        # The registry marks only bytes that do not decode.
+        for index, picture_id in enumerate(ids[:FACE_EXTRACTION_BATCH_LIMIT]):
+            path = tmp_path / f"p{index}.png"
+            path.write_bytes(b"test-not-a-png")
+            assert vault.db.unprocessable_images.mark_unprocessable(
+                picture_id, str(path), reason="test: undecodable"
             )
         finder = MissingFaceExtractionFinder(vault.db, lambda: _StubEngine())
 
@@ -1048,7 +1049,9 @@ def suppressed_library(tmp_path_factory):
         suppressed = [pid for pid, _ in rows[:_SUPPRESSED_COUNT]]
         eligible = [pid for pid, _ in rows[_SUPPRESSED_COUNT:]]
         paths = dict(rows)
+        # The registry marks only bytes that do not decode.
         for picture_id in suppressed:
+            Path(paths[picture_id]).write_bytes(b"test-not-a-png")
             assert vault.db.unprocessable_images.mark_unprocessable(
                 picture_id, paths[picture_id], reason="test: undecodable"
             )
@@ -1171,7 +1174,10 @@ def test_a_repaired_file_is_offered_again_once_the_cached_set_expires(
         )
     finally:
         # Suppressed again at its new signature, as the other tests expect.
-        registry.mark_unprocessable(repaired, str(path), reason="test: undecodable")
+        path.write_bytes(b"test-not-a-png")
+        assert registry.mark_unprocessable(
+            repaired, str(path), reason="test: undecodable"
+        )
 
 
 @pytest.mark.parametrize("stage", ["description", "quality"])

@@ -1860,19 +1860,25 @@ def _import_comfyui_outputs(
         )
     new_pictures = list(new_picture_map.values())
 
-    def import_task(session):
+    def import_task(session, published):
         if new_pictures:
             session.add_all(new_pictures)
             session.flush()
             for pic in new_pictures:
                 session.add(Tag(tag=TAG_PENDING_SENTINEL, picture_id=pic.id))
             session.commit()
+            published.mark_committed()
             for pic in new_pictures:
                 session.refresh(pic)
         return new_pictures
 
     if new_pictures:
-        new_pictures = server.vault.db.run_task(import_task)
+        with import_dedup_service.PublishedPictures(
+            server.vault.image_root, "ComfyUI output import"
+        ) as published:
+            for pic in new_pictures:
+                published.add(pic)
+            new_pictures = server.vault.db.run_task(import_task, published)
 
         def mark_imported(session, ids: list[int]):
             if not ids:

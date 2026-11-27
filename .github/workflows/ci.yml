@@ -549,6 +549,7 @@ jobs:
           tests/test_e2e_workflow_run_fakes.py
           tests/test_edit_selection.py
           tests/test_except_hygiene_guardrail.py
+          tests/test_exif_orientation_loads.py
           tests/test_export_api.py
           tests/test_face_clusters.py
           tests/test_face_score_aggregation.py

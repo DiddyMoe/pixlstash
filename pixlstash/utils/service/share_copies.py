@@ -23,15 +23,19 @@ from __future__ import annotations
 import datetime
 import os
 import shutil
+import struct
 import time
 import uuid
 from io import BytesIO
 
-from PIL import Image, ImageOps, PngImagePlugin
+from PIL import Image, PngImagePlugin
 
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.image_processing.generation_data import strip_generation_data
-from pixlstash.utils.image_processing.image_utils import ImageUtils
+from pixlstash.utils.image_processing.image_utils import (
+    EXIF_PARSE_ERRORS,
+    ImageUtils,
+)
 from pixlstash.utils.image_processing.video_utils import VideoUtils
 from pixlstash.utils.service.export_utils import (
     _safe_archive_stem,
@@ -346,9 +350,19 @@ def _reencode(source, max_long_edge, watermark_bytes, keep_generation_data):
         if not resized and not watermark_bytes:
             return None
         fmt = img.format if img.format in _REENCODE_FORMATS else "PNG"
-        info = dict(img.info)
-        exif = img.getexif()
-        out = ImageOps.exif_transpose(img)
+        try:
+            exif = img.getexif()
+        except EXIF_PARSE_ERRORS as exc:
+            logger.warning(
+                "EXIF in %s does not parse (%s: %s); the copy carries none",
+                source,
+                type(exc).__name__,
+                exc,
+            )
+            exif = Image.Exif()
+        out = ImageUtils.apply_exif_orientation(img)
+        # The turned image's: its XMP and text carry no orientation.
+        info = dict(out.info)
     if resized:
         out.thumbnail((max_long_edge, max_long_edge), Image.LANCZOS)
     if watermark_bytes:
@@ -371,7 +385,16 @@ def _reencode(source, max_long_edge, watermark_bytes, keep_generation_data):
         # a second time.
         exif.pop(0x0112, None)
         if len(exif):
-            save_kwargs["exif"] = exif.tobytes()
+            try:
+                save_kwargs["exif"] = exif.tobytes()
+            except struct.error as exc:
+                # Pillow reads some tags it cannot write back (a LONG8 value).
+                logger.warning(
+                    "Leaving the EXIF out of the share copy of %s, as it cannot "
+                    "be written back: %s",
+                    source,
+                    exc,
+                )
         if fmt == "PNG":
             pnginfo = PngImagePlugin.PngInfo()
             for key, value in info.items():

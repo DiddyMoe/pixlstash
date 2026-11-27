@@ -7,7 +7,9 @@ import hashlib
 import os
 import piexif
 import piexif.helper
+import re
 import shutil
+import struct
 import tempfile
 import uuid
 
@@ -19,7 +21,7 @@ from io import BytesIO
 from typing import Callable, Optional
 
 import numpy as np
-from PIL import ExifTags, Image, ImageOps
+from PIL import ExifTags, Image, TiffImagePlugin
 
 try:
     from PIL.TiffImagePlugin import IFDRational
@@ -51,6 +53,29 @@ THUMBNAIL_WEBP_METHOD = 2
 # cap (extreme panoramas). The bitmap is never upscaled beyond the source.
 THUMBNAIL_SHORT_EDGE = 384
 THUMBNAIL_LONG_EDGE_CAP = 1024
+
+# The transpose that shows a picture stored with each EXIF orientation upright.
+_ORIENTATION_TRANSPOSE = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
+# The XMP spellings of the orientation, which ``getexif()`` reads when the
+# EXIF has none.
+_XMP_ORIENTATION_PATTERNS = (
+    r'tiff:Orientation="([0-9])"',
+    r"<tiff:Orientation>([0-9])</tiff:Orientation>",
+)
+
+#: What Pillow's ``getexif()`` raises for an EXIF block too damaged to read:
+#: ``SyntaxError`` for a TIFF header that does not parse, ``struct.error`` for
+#: one cut short, and ``ValueError`` for a PNG ``Raw profile type exif`` that
+#: is not hex. Such a block holds no orientation: the picture is shown as stored.
+EXIF_PARSE_ERRORS = (SyntaxError, struct.error, ValueError)
 
 
 class ImageUtils:
@@ -350,6 +375,35 @@ class ImageUtils:
         return removed
 
     @staticmethod
+    def unpublish_picture(image_root_path: str, file_path: str) -> bool:
+        """Remove the file and thumbnail published for a picture never saved.
+
+        Only for a file the caller published itself in this run: whatever is
+        at *file_path* (a picture's stored path) is removed. Failures are
+        logged, not raised, since the caller is already handling the error that
+        left the file without a row.
+
+        Returns:
+            True when nothing is left at *file_path*.
+        """
+        full_path = ImageUtils.resolve_picture_path(image_root_path, file_path)
+        removed = True
+        try:
+            os.remove(full_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.error(
+                "Could not remove %s, published for a picture that was never "
+                "saved; the next root scan will index it: %s",
+                full_path,
+                exc,
+            )
+            removed = False
+        ImageUtils.remove_thumbnail(image_root_path, file_path)
+        return removed
+
+    @staticmethod
     def write_thumbnail_bytes(
         image_root: Optional[str], file_path: Optional[str], thumbnail: bytes
     ) -> Optional[str]:
@@ -400,6 +454,63 @@ class ImageUtils:
             return None
 
     @staticmethod
+    def stored_size(img: Image.Image) -> tuple[int, int]:
+        """*img*'s (width, height) as stored, before any EXIF turn.
+
+        The size a picture's ``width`` and ``height`` record; the frontend
+        swaps it for orientations 5-8. Pillow swaps a TIFF's ``img.size`` on
+        open when its orientation is 5-8 (it turns the TIFF as it loads), so a
+        TIFF's comes from its ImageWidth and ImageLength tags, which Pillow
+        refuses to open a TIFF without.
+        """
+        if isinstance(img, TiffImagePlugin.TiffImageFile):
+            return img.tag_v2[256], img.tag_v2[257]
+        return img.size
+
+    @staticmethod
+    def apply_exif_orientation(img: Image.Image) -> Image.Image:
+        """Return *img* turned upright by its EXIF orientation, or *img* itself.
+
+        ``ImageOps.exif_transpose`` writes the EXIF block back after turning,
+        and Pillow raises ``struct.error`` writing some tags it reads (a LONG8
+        value). This turns the pixels without writing EXIF back. The turned
+        image carries no EXIF block and its XMP has no orientation, so
+        nothing can turn it a second time; a writer that keeps the picture's
+        text or XMP takes it from the image returned here.
+        EXIF too damaged to read (:data:`EXIF_PARSE_ERRORS`) leaves *img* as
+        stored.
+        """
+        img.load()
+        try:
+            exif = img.getexif()
+        except EXIF_PARSE_ERRORS as exc:
+            logger.warning(
+                "EXIF in %s does not parse (%s: %s); shown as stored",
+                getattr(img, "filename", "") or "an in-memory image",
+                type(exc).__name__,
+                exc,
+            )
+            return img
+        method = _ORIENTATION_TRANSPOSE.get(exif.get(ORIENTATION_TAG, 1))
+        if method is None:
+            return img
+        upright = img.transpose(method)
+        upright.info.pop("exif", None)
+        upright.info.pop("Raw profile type exif", None)
+        for key in ("XML:com.adobe.xmp", "xmp"):
+            value = upright.info.get(key)
+            if value is None:
+                continue
+            for pattern in _XMP_ORIENTATION_PATTERNS:
+                value = (
+                    re.sub(pattern, "", value)
+                    if isinstance(value, str)
+                    else re.sub(pattern.encode(), b"", value)
+                )
+            upright.info[key] = value
+        return upright
+
+    @staticmethod
     def load_image_or_video_bgr(file_path: str) -> Optional[np.ndarray]:
         """Load an image or the first video frame as a BGR numpy array."""
         if not file_path or not os.path.exists(file_path):
@@ -412,7 +523,7 @@ class ImageUtils:
             return img
         try:
             with Image.open(file_path) as pil_img:
-                pil_img = ImageOps.exif_transpose(pil_img)
+                pil_img = ImageUtils.apply_exif_orientation(pil_img)
                 if pil_img.mode not in ("RGB", "L"):
                     pil_img = pil_img.convert("RGB")
                 rgb = np.array(pil_img)
@@ -616,7 +727,7 @@ class ImageUtils:
         try:
             try:
                 with Image.open(file_path) as img:
-                    img = ImageOps.exif_transpose(img)
+                    img = ImageUtils.apply_exif_orientation(img)
                     return np.array(img.convert("RGB"))
             except Exception as exc:
                 logger.debug(
@@ -649,7 +760,7 @@ class ImageUtils:
                 with Image.open(file_path) as img:
                     # Must be called before load()/convert(); no-op for non-JPEG.
                     img.draft("RGB", (max_side, max_side))
-                    img = ImageOps.exif_transpose(img)
+                    img = ImageUtils.apply_exif_orientation(img)
                     arr = np.array(img.convert("RGB"))
             except Exception as exc:
                 logger.debug(
@@ -729,7 +840,7 @@ class ImageUtils:
         try:
             if isinstance(img, Image.Image):
                 pil_img = img.copy()
-                pil_img = ImageOps.exif_transpose(pil_img)
+                pil_img = ImageUtils.apply_exif_orientation(pil_img)
             else:
                 pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
             if pil_img.mode not in ("RGB", "L"):
@@ -1125,7 +1236,7 @@ class ImageUtils:
             try:
                 with Image.open(part_path) as img:
                     img_format = img.format or "PNG"
-                    width, height = img.size
+                    width, height = ImageUtils.stored_size(img)
                     # Read here, from the image that is already open, rather
                     # than left to `MissingOrientationFinder`. That finder
                     # exists to fill rows that predate the column; a NEW
@@ -1139,7 +1250,7 @@ class ImageUtils:
                         raw_orientation = int(
                             (img.getexif() or {}).get(ORIENTATION_TAG, 1)
                         )
-                    except (TypeError, ValueError):
+                    except (TypeError, *EXIF_PARSE_ERRORS):
                         raw_orientation = 1
                     orientation = raw_orientation if 1 <= raw_orientation <= 8 else 1
                     rendered = ImageUtils.render_thumbnail(img)
@@ -1371,23 +1482,15 @@ class ImageUtils:
         """
         try:
             with Image.open(file_path) as img:
-                # Read stored dimensions from the file header (lazy, no pixel decode).
-                stored_w, stored_h = img.size
-                # Determine the logical (exif-corrected) original dimensions cheaply.
-                # Orientations 5-8 rotate 90° or 270°, which swaps width and height.
-                try:
-                    orientation = (img.getexif() or {}).get(274, 1)
-                except Exception:
-                    orientation = 1
-                if orientation in (5, 6, 7, 8):
-                    orig_w, _ = stored_h, stored_w
-                else:
-                    orig_w, _ = stored_w, stored_h
+                # The full-size long edge, from the header (no pixel decode). A
+                # turn keeps the long edge, so this holds whether ``img.size``
+                # reads as stored or, for a TIFF, already turned.
+                orig_long = max(img.size)
 
                 # draft() tells the JPEG decoder to use DCT subsampling - a no-op
                 # for other formats.  Must be called before load()/convert().
                 img.draft("RGB", (max_side, max_side))
-                img = ImageOps.exif_transpose(img)
+                img = ImageUtils.apply_exif_orientation(img)
                 arr = np.array(img.convert("RGB"))
 
             h, w = arr.shape[:2]
@@ -1401,7 +1504,7 @@ class ImageUtils:
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
             # inv_scale: multiply loaded-space coords by this to recover original-space
             # coords.  Both axes have the same factor because the resize is proportional.
-            inv_scale = orig_w / w if w > 0 else 1.0
+            inv_scale = orig_long / max(h, w) if w > 0 else 1.0
             return bgr, inv_scale
         except Exception as exc:
             logger.debug("load_image_bgr_reduced failed for %s: %s", file_path, exc)

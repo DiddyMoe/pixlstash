@@ -1,0 +1,1 @@
+- Fixed: a picture with damaged EXIF now loads instead of failing.

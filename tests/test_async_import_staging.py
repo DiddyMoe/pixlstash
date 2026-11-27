@@ -576,6 +576,60 @@ def test_direct_import_with_nonexistent_project_errors(owner_server):
     assert srv.vault.db.run_task(lambda s: s.exec(select(Picture.id)).first()) is None
 
 
+def _direct_import(client, files: dict[str, bytes]) -> dict:
+    r = client.post(
+        f"{API}/pictures/import",
+        files=[("file", (name, data, "image/png")) for name, data in files.items()],
+    )
+    assert r.status_code == 200, r.text
+    return wait_for_import_task(client, r.json()["task_id"])
+
+
+def test_direct_import_leaves_out_an_unreadable_file_and_says_why(owner_server):
+    srv, client = owner_server
+    status = _direct_import(
+        client,
+        {
+            "a.png": _png_bytes((10, 20, 30)),
+            "broken.png": b"not a picture",
+            "c.png": _png_bytes((200, 10, 10)),
+        },
+    )
+
+    assert status["status"] == "completed", status
+    assert (status["imported_count"], status["failed_count"]) == (2, 1), status
+    assert [e for e in status["results"] if e["status"] == "failed"] == [
+        {
+            "status": "failed",
+            "picture_id": None,
+            "file": "broken.png",
+            "error": import_mod.FILE_UNREADABLE_REASON,
+        }
+    ]
+    assert len(srv.vault.db.run_task(lambda s: s.exec(select(Picture.id)).all())) == 2
+
+
+def test_direct_import_of_readable_files_reports_no_failures(owner_server):
+    _srv, client = owner_server
+    status = _direct_import(
+        client,
+        {f"{i}.png": _png_bytes((30 + 60 * i, 90, 9)) for i in range(3)},
+    )
+
+    assert status["status"] == "completed", status
+    assert (status["imported_count"], status["failed_count"]) == (3, 0), status
+    assert all(e["status"] == "success" for e in status["results"]), status
+
+
+def test_direct_import_of_only_unreadable_files_fails_and_says_why(owner_server):
+    """A caller sending one file per import (the ComfyUI node) sees it fail."""
+    _srv, client = owner_server
+    status = _direct_import(client, {"broken.png": b"not a picture"})
+
+    assert status["status"] == "failed", status
+    assert f"broken.png: {import_mod.FILE_UNREADABLE_REASON}" in status["error"]
+
+
 def test_reaper_evicts_stale_session_and_dir(owner_server):
     srv, client = owner_server
     staging_id = client.post(f"{API}/pictures/import/staging", json={}).json()[

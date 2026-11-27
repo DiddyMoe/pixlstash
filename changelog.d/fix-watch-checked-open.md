@@ -1,0 +1,1 @@
+- Fixed: a watch folder no longer imports a file through a link to outside it.

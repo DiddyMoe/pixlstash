@@ -15,6 +15,13 @@ failure. A finder consults :meth:`is_suppressed` to skip the picture; when the
 file is rewritten (the "still being written" / repaired case) its signature moves
 and suppression lifts automatically, so the picture is retried.
 
+Only bytes that do not decode are pinned: :meth:`mark_unprocessable` decodes
+the file itself and records nothing unless the failure is permanent. A read the
+operating system refused (no permission, an I/O error) is not the file's fault,
+and pinning it to a signature would hold a good picture out until the file
+happened to change. A stage with no retry hold of its own holds such a file
+with :meth:`hold_unreadable`, which lifts the moment the file reads again.
+
 Nothing here is persisted - a server restart clears the registry, at which point
 each such picture is retried exactly once more (re-decoded, fails, re-marked),
 which is the accepted behaviour above. Keeping it in memory is deliberate: it
@@ -26,6 +33,10 @@ import threading
 import time
 
 from pixlstash.pixl_logging import get_logger
+from pixlstash.utils.image_processing.media_load import (
+    file_read_error,
+    load_pil_classified,
+)
 
 logger = get_logger(__name__)
 
@@ -34,6 +45,11 @@ logger = get_logger(__name__)
 #: already means "stat failed just now" in :meth:`_stat_signature`, and the two
 #: must not be confused.
 _UNREACHABLE = object()
+
+#: Stands in for the (mtime, size) of an entry held because its file exists and
+#: cannot be read. Lifted by a different condition from `_UNREACHABLE` (see
+#: `_entry_is_live`).
+_UNREADABLE = object()
 
 
 def _location_is_unreachable(file_path: str) -> bool:
@@ -115,6 +131,14 @@ class UnprocessableImageRegistry:
         nothing to pin the suppression to, and the missing-file purge finder owns
         that case.
 
+        The caller's word is not enough: the file is decoded here, and the mark
+        is recorded only when that decode fails permanently
+        (``LoadFailure.permanent``). A read the operating system refused, a
+        ``MemoryError``, an unclassified failure or a file that decodes now is
+        refused with a warning. The signature is taken before the decode, so a
+        file rewritten meanwhile is pinned to its old signature and lifts on
+        the next check.
+
         Args:
             picture_id: The picture that failed to decode.
             file_path: Absolute path to the file that could not be opened.
@@ -140,6 +164,24 @@ class UnprocessableImageRegistry:
             existing = self._entries.get(pid)
             if existing is not None and existing[1] == mtime_ns and existing[2] == size:
                 return False  # already suppressed for this exact file version
+        decoded = load_pil_classified(str(file_path), multiframe_count=1)
+        if decoded.failure is None or not decoded.failure.permanent:
+            logger.warning(
+                "UnprocessableImageRegistry: NOT marking picture id=%s path=%s "
+                "undecodable (%s) - a fresh decode %s, so the failure is not "
+                "the file's bytes; it will be retried.",
+                pid,
+                file_path,
+                reason or "no reason given",
+                "succeeded"
+                if decoded.failure is None
+                else f"failed with {decoded.failure.value} ({decoded.error})",
+            )
+            return False
+        with self._lock:
+            existing = self._entries.get(pid)
+            if existing is not None and existing[1] == mtime_ns and existing[2] == size:
+                return False  # another thread marked this version meanwhile
             if existing is None and len(self._entries) >= self._max_entries:
                 logger.warning(
                     "UnprocessableImageRegistry: cap (%d) reached; NOT suppressing "
@@ -223,16 +265,82 @@ class UnprocessableImageRegistry:
         )
         return True
 
+    def hold_unreadable(
+        self, picture_id: "int | None", file_path: "str | None", *, reason: str = ""
+    ) -> bool:
+        """Hold *picture_id* out while its file exists and refuses to be read.
+
+        For a stage with no retry hold of its own (the thumbnail task), whose
+        picture would otherwise be selected again on every sweep while a read
+        keeps failing. It is not a verdict on the file: the entry is pinned to
+        nothing and lives only while the file still stats and its first byte
+        still cannot be read, so it lifts within :attr:`ACTIVE_CACHE_TTL_S` of
+        the file reading again, with no change to the file.
+
+        Refused when the file cannot be stat'd (the missing-file purge and
+        :meth:`mark_unreachable` own that), when the file reads, and when the
+        picture already has an entry.
+
+        Args:
+            picture_id: The picture whose file could not be read.
+            file_path: Absolute path to the file.
+            reason: Short description, for the one-time log line.
+
+        Returns:
+            ``True`` if a new hold was recorded.
+        """
+        if picture_id is None or not file_path:
+            return False
+        pid = int(picture_id)
+        file_path = str(file_path)
+        if self._stat_signature(file_path) is None:
+            return False
+        read_error = file_read_error(file_path)
+        if read_error is None:
+            return False
+        with self._lock:
+            if pid in self._entries:
+                return False
+            if len(self._entries) >= self._max_entries:
+                logger.warning(
+                    "UnprocessableImageRegistry: cap (%d) reached; NOT holding "
+                    "picture id=%s path=%s as unreadable - it will keep being "
+                    "retried until an existing entry is released.",
+                    self._max_entries,
+                    pid,
+                    file_path,
+                )
+                return False
+            self._entries[pid] = (file_path, _UNREADABLE, _UNREADABLE)
+            self._active_cache = None
+        logger.warning(
+            "Unreadable image: picture id=%s path=%s cannot be read (%s; %s); "
+            "holding it out of the work finders until it reads again. The file "
+            "is not marked as corrupt.",
+            pid,
+            file_path,
+            reason or "read failed",
+            read_error,
+        )
+        return True
+
     def _entry_is_live(self, path: str, mtime_ns: int, size: int) -> bool:
         """Whether a recorded entry still holds its picture out of the finders.
 
-        Two kinds share one map. An *unreachable* entry lives while its
+        Three kinds share one map. An *unreachable* entry lives while its
         location is still missing, and is dropped the moment the volume is
-        back. An *undecodable* entry lives while the file is byte-for-byte the
-        one that failed, and is dropped when it is rewritten or repaired.
+        back. An *unreadable* entry lives while the file still stats and still
+        cannot be read, and is dropped the moment it reads (or is gone). An
+        *undecodable* entry lives while the file is byte-for-byte the one that
+        failed, and is dropped when it is rewritten or repaired.
         """
         if mtime_ns is _UNREACHABLE:
             return _location_is_unreachable(path)
+        if mtime_ns is _UNREADABLE:
+            return (
+                self._stat_signature(path) is not None
+                and file_read_error(path) is not None
+            )
         signature = self._stat_signature(path)
         return signature is not None and signature == (mtime_ns, size)
 

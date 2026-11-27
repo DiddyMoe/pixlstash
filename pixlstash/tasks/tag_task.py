@@ -9,7 +9,6 @@ from typing import Collection
 from sqlalchemy.exc import IntegrityError
 
 from PIL import Image as PILImage
-from PIL import ImageOps
 
 from pixlstash.database import DBPriority
 from pixlstash.db_models import (
@@ -284,7 +283,7 @@ class TagTask(BaseTask):
                     file_path,
                 )
             else:
-                # exif_transpose, because everything this image is measured
+                # Turned upright, because everything this image is measured
                 # against is already transposed. Face bboxes come from
                 # `load_image_bgr_reduced`, which transposes: a phone photo with
                 # orientation 6 is 4608x2592 on disk and 2592x4608 to anyone
@@ -302,7 +301,9 @@ class TagTask(BaseTask):
                 # every rotated photo in the library.
                 return (
                     file_path,
-                    ImageOps.exif_transpose(PILImage.open(file_path)).convert("RGB"),
+                    ImageUtils.apply_exif_orientation(PILImage.open(file_path)).convert(
+                        "RGB"
+                    ),
                     False,
                 )
         except Exception as exc:

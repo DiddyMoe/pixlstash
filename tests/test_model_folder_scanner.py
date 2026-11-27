@@ -565,7 +565,7 @@ class TestStates:
         """The subtree sweep's other branch, driven directly.
 
         `_mark_unreachable_subtrees` has two UPDATEs: one keyed on
-        `relpath LIKE prefix` (above) and one with no path predicate at all, for
+        the relpath prefix (above) and one with no path predicate at all, for
         `blocked = {"."}` - the root became unlistable *after* `scan_folder`'s
         readability check passed, which is a race no test can force and
         `on_error` genuinely produces (`os.path.relpath(root, root)` is `"."`).
@@ -682,6 +682,33 @@ class TestStates:
         )
         assert rows["local.safetensors"]["state"] == STATE_PRESENT
         assert result.missing == 0
+        assert result.unreachable == 1
+
+    @SKIP_AS_ROOT
+    def test_an_unreadable_subdirectory_leaves_its_sibling_in_another_case(
+        self, hub, scanner, tmp_path
+    ):
+        folder = tmp_path / "models"
+        (folder / "Flux").mkdir(parents=True)
+        if (folder / "flux").exists():
+            pytest.skip("this filesystem folds case, so Flux and flux are one")
+        (folder / "flux").mkdir()
+        write_adapter(folder / "Flux" / "a.safetensors")
+        write_adapter(folder / "flux" / "b.safetensors", pad=1)
+        folder_id = register_folder(hub, folder)
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        os.chmod(folder / "Flux", 0o000)
+        try:
+            result = scanner.scan_folder(folder_id, str(folder), "user")
+        finally:
+            os.chmod(folder / "Flux", 0o755)
+
+        rows = located(hub)
+        assert rows[os.path.join("Flux", "a.safetensors")]["state"] == (
+            STATE_UNREACHABLE
+        )
+        assert rows[os.path.join("flux", "b.safetensors")]["state"] == STATE_PRESENT
         assert result.unreachable == 1
 
     def test_last_checked_is_stamped_on_both_paths(self, hub, scanner, tmp_path):
@@ -1259,6 +1286,132 @@ class TestPickingUpALateFile:
             scanner.find_unregistered([(folder_id, str(folder))], {"late.safetensors"})
             == []
         )
+
+
+def _dir_link(target, link):
+    """A directory link: on Windows a junction, which needs no privilege."""
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+class TestDirectoryLinks:
+    """A linked directory inside a registered folder is walked, as ComfyUI walks
+    it, without looping, without listing one place twice, and without listing
+    what another registered folder holds."""
+
+    def test_a_link_to_a_directory_outside_the_folder_is_walked(
+        self, hub, scanner, tmp_path
+    ):
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        write_adapter(folder / "here.safetensors", name="Here")
+        elsewhere = tmp_path / "other-drive"
+        (elsewhere / "flux").mkdir(parents=True)
+        write_adapter(elsewhere / "flux" / "there.safetensors", name="There")
+        _dir_link(elsewhere, folder / "external")
+        folder_id = register_folder(hub, folder)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {
+            "here.safetensors",
+            os.path.join("external", "flux", "there.safetensors"),
+        }
+
+    def test_links_that_loop_or_repeat_list_each_file_once(
+        self, hub, scanner, tmp_path
+    ):
+        """``a`` and ``b`` link to each other and ``external`` reaches ``a`` a
+        second time. ``alias`` reaches this folder's own tree, ``up`` the
+        directory above it, ``a/home`` a directory above the folder and
+        ``b/drive`` one above the link."""
+        home = tmp_path / "home"
+        folder = home / "loras"
+        (folder / "sub").mkdir(parents=True)
+        write_adapter(folder / "sub" / "mine.safetensors", name="Mine")
+        write_adapter(home / "stray-home.safetensors", name="StrayHome")
+        drive = tmp_path / "drive"
+        dir_a = drive / "a"
+        dir_b = drive / "b"
+        dir_a.mkdir(parents=True)
+        dir_b.mkdir()
+        write_adapter(dir_a / "in-a.safetensors", name="InA")
+        write_adapter(dir_b / "in-b.safetensors", name="InB")
+        write_adapter(drive / "stray-drive.safetensors", name="StrayDrive")
+        _dir_link(dir_b, dir_a / "b")
+        _dir_link(dir_a, dir_b / "a")
+        _dir_link(home, dir_a / "home")
+        _dir_link(drive, dir_b / "drive")
+        _dir_link(dir_a, folder / "again")
+        _dir_link(dir_a, folder / "external")
+        _dir_link(folder / "sub", folder / "alias")
+        _dir_link(home, folder / "up")
+        folder_id = register_folder(hub, folder)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {
+            os.path.join("sub", "mine.safetensors"),
+            os.path.join("again", "in-a.safetensors"),
+            os.path.join("again", "b", "in-b.safetensors"),
+        }
+
+    def test_two_links_to_one_place_list_it_under_the_first_name(
+        self, hub, scanner, tmp_path, monkeypatch
+    ):
+        """The directory listing comes back in reverse name order here, and
+        the spelling is still the first name in order."""
+        folder = tmp_path / "loras"
+        folder.mkdir()
+        target = tmp_path / "drive"
+        target.mkdir()
+        write_adapter(target / "shared.safetensors", name="Shared")
+        _dir_link(target, folder / "again")
+        _dir_link(target, folder / "external")
+        folder_id = register_folder(hub, folder)
+        real_walk = os.walk
+
+        def reverse_listed_walk(*args, **kwargs):
+            for directory, dirs, files in real_walk(*args, **kwargs):
+                dirs.sort(reverse=True)
+                yield directory, dirs, files
+
+        monkeypatch.setattr(scanner_module.os, "walk", reverse_listed_walk)
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {os.path.join("again", "shared.safetensors")}
+
+    def test_a_link_into_another_registered_folder_is_left_to_that_folder(
+        self, hub, scanner, tmp_path
+    ):
+        """``other`` links to a registered folder and ``drive`` to the directory
+        above one. A registered folder inside this one with no link on the way
+        is listed here too, as any plain subdirectory is."""
+        folder = tmp_path / "loras"
+        (folder / "nested").mkdir(parents=True)
+        write_adapter(folder / "nested" / "inner.safetensors", name="Inner")
+        drive = tmp_path / "drive"
+        registered = drive / "checkpoints"
+        registered.mkdir(parents=True)
+        write_adapter(registered / "theirs.safetensors", name="Theirs")
+        write_adapter(drive / "loose.safetensors", name="Loose")
+        _dir_link(registered, folder / "other")
+        _dir_link(drive, folder / "drive")
+        folder_id = register_folder(hub, folder)
+        register_folder(hub, registered)
+        register_folder(hub, folder / "nested")
+
+        scanner.scan_folder(folder_id, str(folder), "user")
+
+        assert set(located(hub)) == {
+            os.path.join("drive", "loose.safetensors"),
+            os.path.join("nested", "inner.safetensors"),
+        }
 
 
 class TestBaseModelIdentification:

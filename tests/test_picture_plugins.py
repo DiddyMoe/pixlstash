@@ -454,6 +454,57 @@ def test_encoded_plugin_output_is_returned_untouched():
         )
 
 
+def test_an_output_alike_only_in_the_sampled_hash_windows_is_kept():
+    from pixlstash.db_models import Picture
+    from pixlstash.image_plugins.service import import_derived_outputs
+
+    # 196,662 bytes: the sampled hash reads 8 KiB at 0 and next at 26,924, so
+    # a byte at 8,292 is outside every window it reads.
+    pixels = np.random.default_rng(7).integers(0, 256, (256, 256, 3), np.uint8)
+    buf = BytesIO()
+    Image.fromarray(pixels).save(buf, format="BMP")
+    first = buf.getvalue()
+    changed = bytearray(first)
+    changed[8292] ^= 0xFF
+    second = bytes(changed)
+    assert ImageUtils.calculate_hash_from_bytes(
+        first
+    ) == ImageUtils.calculate_hash_from_bytes(second)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server_config_path = os.path.join(temp_dir, "server_config.json")
+        with Server(server_config_path=server_config_path) as server:
+
+            def add_source(session: Session) -> int:
+                pic = ImageUtils.create_picture_from_bytes(
+                    image_root_path=server.vault.image_root,
+                    image_bytes=_make_png_bytes((90, 60, 30)),
+                )
+                session.add(pic)
+                session.commit()
+                return pic.id
+
+            source_id = server.vault.db.run_task(add_source)
+            source = server.vault.db.run_task(
+                lambda session: session.get(Picture, source_id)
+            )
+
+            first_ids, _, _ = import_derived_outputs(
+                server, [source], [(first, ".bmp")], stack=False
+            )
+            new_ids, duplicate_ids, output_ids = import_derived_outputs(
+                server,
+                [source, source],
+                [(second, ".bmp"), (first, ".bmp")],
+                stack=False,
+            )
+
+            assert len(first_ids) == 1
+            assert len(new_ids) == 1
+            assert duplicate_ids == first_ids
+            assert output_ids == [new_ids[0], first_ids[0]]
+
+
 # ---------------------------------------------------------------------------
 # Registry loading rules (issue #968). No Server, and no dependency on the
 # shipped built-ins: both directories are temporary, so these cost a few
