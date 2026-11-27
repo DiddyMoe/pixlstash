@@ -70,6 +70,7 @@ from pixlstash.db_models.mixed_stack import MixedStackDismissal, StackCohesion
 from pixlstash.event_types import EventType
 from pixlstash.pixl_logging import get_logger
 from pixlstash.services import dedup_sweep_service, operation_log_service
+from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.utils.sql_chunking import SQLITE_ID_CHUNK as ID_CHUNK
 from pixlstash.services.dedup_tier_service import (
     MIN_THRESHOLD,
@@ -1359,7 +1360,13 @@ def _apply_removal(
             ).all()
         )
     for picture in session.exec(
-        select(Picture).where(Picture.id.in_(sorted(leaving_set)))
+        select(Picture).where(
+            Picture.id.in_(
+                scope_id_subquery(
+                    session, leaving_set, name="_pixlstash_stack_leaving_ids"
+                )
+            )
+        )
     ).all():
         if picture.stack_id != stack_id:
             continue
@@ -1527,7 +1534,11 @@ def split_stranded_in_session(
                 int(picture_id)
                 for picture_id in session.exec(
                     select(Picture.id).where(
-                        Picture.id.in_(outside),
+                        Picture.id.in_(
+                            scope_id_subquery(
+                                session, outside, name="_pixlstash_stack_outside_ids"
+                            )
+                        ),
                         Picture.stack_id == stack_id,
                         Picture.deleted.is_(True),
                     )

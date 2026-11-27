@@ -13,6 +13,8 @@ from sqlmodel import (
 )
 from typing import List, Optional
 
+from pixlstash.utils.sql_chunking import chunked
+
 from .picture import Picture
 
 
@@ -142,18 +144,20 @@ class PictureLikeness(SQLModel, table=True):
     def bulk_prune_below_top_k(
         cls, session: Session, picture_ids: List[int], top_k: int
     ) -> None:
-        """Prune top-k for all given ``picture_id_a`` values in a single SQL pass.
+        """Prune top-k for all given ``picture_id_a`` values, one CTE DELETE per
+        ``SQLITE_ID_CHUNK`` ids, inside the caller's transaction.
 
-        Replaces the per-picture loop with one CTE DELETE that processes all
-        picture_ids atomically, eliminating up to 256 separate write-queue
-        round-trips per task cycle.
+        Replaces the per-picture loop, eliminating one write-queue round-trip
+        per picture per task cycle.
         """
         if not picture_ids:
             return
-        # Ensure picture_ids is a list for consistent behavior with expanding parameter
-        picture_ids = list(picture_ids)
-        session.exec(
-            text("""
+        # Chunked: a cycle compares up to ``MAX_A_PER_CYCLE`` (2048) pictures,
+        # so its pairs can name more ``picture_id_a`` values than SQLite binds
+        # in one statement. The ranking is partitioned by ``picture_id_a``, the
+        # chunk key, so every chunk prunes whole partitions and the result is
+        # the same as one pass over all of them.
+        prune = text("""
                 WITH ranked AS (
                     SELECT
                         picture_id_a,
@@ -175,11 +179,11 @@ class PictureLikeness(SQLModel, table=True):
                     WHERE r.rn > :top_k
                 )
             """).bindparams(
-                bindparam("picture_ids", expanding=True),
-                bindparam("top_k"),
-            ),
-            params={"picture_ids": picture_ids, "top_k": top_k},
+            bindparam("picture_ids", expanding=True),
+            bindparam("top_k"),
         )
+        for chunk in chunked(sorted(set(picture_ids))):
+            session.exec(prune, params={"picture_ids": chunk, "top_k": top_k})
 
 
 class PictureLikenessQueue(SQLModel, table=True):

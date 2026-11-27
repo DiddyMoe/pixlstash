@@ -43,6 +43,7 @@ from pixlstash.utils.service.filter_helpers import (
 )
 from pixlstash.utils.service.label_ledger import HUMAN, NEG, POS
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import in_json
 
 if TYPE_CHECKING:
     from pixlstash.vault import Vault
@@ -543,7 +544,7 @@ def _progress_map(session: Session, review_ids: list[int]) -> dict[int, dict]:
             is_locked.label("is_locked"),
             func.count().label("n"),
         )
-        .where(TagSuggestion.review_id.in_(review_ids))
+        .where(in_json(TagSuggestion.review_id, review_ids))
         .group_by(TagSuggestion.review_id, TagSuggestion.status, is_locked)
     ).all()
     for rid, status, locked_flag, n in rows:
@@ -1033,7 +1034,13 @@ def list_review_suggestions(
         if status:
             q = q.where(TagSuggestion.status == status.upper())
         if picture_ids is not None:
-            q = q.where(TagSuggestion.picture_id.in_(picture_ids))
+            q = q.where(
+                TagSuggestion.picture_id.in_(
+                    scope_id_subquery(
+                        session, picture_ids, name="_pixlstash_review_list_ids"
+                    )
+                )
+            )
         q = (
             q.order_by(TagSuggestion.score.desc(), TagSuggestion.twin_sim.desc())
             .offset(offset)

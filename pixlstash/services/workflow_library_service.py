@@ -28,7 +28,8 @@ from pixlstash.db_models import Character, Picture, PictureSet, Project
 from pixlstash.services.saved_recipe_service import counts_by_workflow_id
 from pixlstash.stacking import get_or_create_stack_for_picture
 from pixlstash.utils.query.predicate_filter import filed_as as _filed_as
-from pixlstash.utils.sql_chunking import chunked
+from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked, in_json
 
 
 @dataclass(frozen=True)
@@ -448,7 +449,7 @@ def variant_picture_ids(
     return list(
         session.exec(
             select(Picture.id)
-            .where(_filed_as(list(live)).in_(structural_hashes))
+            .where(in_json(_filed_as(list(live)), structural_hashes))
             .where(kept)
             .order_by(nullslast(_USED_AT.desc()), Picture.id.desc())
             .limit(limit)
@@ -482,7 +483,7 @@ def instance_hashes_for_variants(
         return []
     query = (
         select(Picture.workflow_instance_hash, func.max(_USED_AT).label("used_at"))
-        .where(Picture.workflow_structural_hash.in_(structural_hashes))
+        .where(in_json(Picture.workflow_structural_hash, structural_hashes))
         .where(Picture.workflow_instance_hash.is_not(None))
         .where(_KEPT_FOR_KEYS)
         .group_by(Picture.workflow_instance_hash)
@@ -602,7 +603,7 @@ def best_picture_ids(
     return list(
         session.exec(
             select(Picture.id)
-            .where(Picture.workflow_structural_hash.in_(structural_hashes))
+            .where(in_json(Picture.workflow_structural_hash, structural_hashes))
             .where(_KEPT_FOR_KEYS)
             .order_by(
                 nullslast(Picture.score.desc()),
@@ -653,7 +654,7 @@ def oldest_kept_by_pixel_sha(session: Session, pixel_shas: list[str]) -> dict[st
         pixel_sha: picture_id
         for pixel_sha, picture_id in session.exec(
             select(Picture.pixel_sha, func.min(Picture.id))
-            .where(Picture.pixel_sha.in_(pixel_shas))
+            .where(in_json(Picture.pixel_sha, pixel_shas))
             # Not ``IS 0``, which beats the sha index from one sha ("Probe cost").
             .where(_KEPT_FOR_KEYS)
             .group_by(Picture.pixel_sha)
@@ -681,7 +682,13 @@ def kept_picture_files(
         picture_id: (file_path, pixel_sha)
         for picture_id, file_path, pixel_sha in session.exec(
             select(Picture.id, Picture.file_path, Picture.pixel_sha)
-            .where(Picture.id.in_(picture_ids))
+            .where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, picture_ids, name="_pixlstash_kept_picture_ids"
+                    )
+                )
+            )
             .where(Picture.deleted.is_(False))
         ).all()
     }
@@ -704,7 +711,11 @@ def picture_sizes(
         picture_id: (width, height)
         for picture_id, width, height in session.exec(
             select(Picture.id, Picture.width, Picture.height).where(
-                Picture.id.in_(picture_ids)
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, picture_ids, name="_pixlstash_picture_size_ids"
+                    )
+                )
             )
         ).all()
         if width and height
@@ -747,7 +758,7 @@ def library_ids_present(
         table = _LIBRARY_TABLES[kind]
         present[kind] = dict(
             session.exec(
-                select(table.id, table.name).where(table.id.in_(sorted(ids)))
+                select(table.id, table.name).where(in_json(table.id, ids))
             ).all()
         )
     return present

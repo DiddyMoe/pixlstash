@@ -37,6 +37,7 @@ from pixlstash.utils.quality.smart_score_utils import (
 )
 from pixlstash.utils.service.anomaly_thresholds import resolve_anomaly_apply_thresholds
 from pixlstash.utils.service.label_ledger import HUMAN, NEG, POS
+from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.utils.sql_chunking import chunked
 from pixlstash.pixl_logging import get_logger
 
@@ -274,7 +275,11 @@ def fetch_applied_anomaly_tags(session: Session, picture_ids) -> dict:
         return applied
     rows = session.exec(
         select(Tag.picture_id, Tag.tag).where(
-            Tag.picture_id.in_(picture_ids),
+            Tag.picture_id.in_(
+                scope_id_subquery(
+                    session, picture_ids, name="_pixlstash_applied_anomaly_ids"
+                )
+            ),
             func.lower(Tag.tag).in_(ANOMALY_PENALTY_TAGS),
         )
     ).all()
@@ -348,7 +353,11 @@ def fetch_anomaly_confidences(
             TagPrediction.label_source,
             TagPrediction.model_version,
         ).where(
-            TagPrediction.picture_id.in_(picture_ids),
+            TagPrediction.picture_id.in_(
+                scope_id_subquery(
+                    session, picture_ids, name="_pixlstash_anomaly_confidence_ids"
+                )
+            ),
             func.lower(TagPrediction.tag).in_(ANOMALY_PENALTY_TAGS),
         )
     ).all()
@@ -615,7 +624,13 @@ def fetch_smart_score_data(
                 # Nothing to score, so the anchors are not read; every caller
                 # scores only when ``candidates`` is non-empty.
                 return [], [], [], {}
-            query = query.where(Picture.id.in_(candidate_ids))
+            query = query.where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, candidate_ids, name="_pixlstash_score_candidate_ids"
+                    )
+                )
+            )
 
         if format:
             query = query.where(Picture.format.in_(format))
@@ -694,7 +709,13 @@ def fetch_smart_score_unscored_ids(
         if candidate_ids is not None:
             if not candidate_ids:
                 return []
-            query = query.where(Picture.id.in_(candidate_ids))
+            query = query.where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, candidate_ids, name="_pixlstash_unscored_candidate_ids"
+                    )
+                )
+            )
 
         if format:
             query = query.where(Picture.format.in_(format))
@@ -919,7 +940,13 @@ def find_pictures_by_smart_score(
         return []
 
     def fetch_final_pics(session, ids):
-        return session.exec(select(Picture).where(Picture.id.in_(ids))).all()
+        return session.exec(
+            select(Picture).where(
+                Picture.id.in_(
+                    scope_id_subquery(session, ids, name="_pixlstash_score_page_ids")
+                )
+            )
+        ).all()
 
     res_pics = server.vault.db.run_task(
         fetch_final_pics, final_ids, priority=DBPriority.IMMEDIATE

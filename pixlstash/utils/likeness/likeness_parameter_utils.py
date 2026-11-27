@@ -18,6 +18,7 @@ from pixlstash.db_models.picture_likeness import PictureLikeness, PictureLikenes
 from pixlstash.db_models.quality import Quality
 from pixlstash.utils.image_processing.image_utils import ImageUtils
 from pixlstash.utils.image_processing.video_utils import VideoUtils
+from pixlstash.utils.service.scope_table import scope_id_subquery
 from pixlstash.pixl_logging import get_logger
 
 logger = get_logger(__name__)
@@ -131,7 +132,11 @@ class LikenessParameterUtils:
         serialised write queue only has to run the bare bulk UPDATE.
         """
         rows = session.exec(
-            select(Picture.id, Picture.likeness_parameters).where(Picture.id.in_(ids))
+            select(Picture.id, Picture.likeness_parameters).where(
+                Picture.id.in_(
+                    scope_id_subquery(session, ids, name="_pixlstash_likeness_blob_ids")
+                )
+            )
         ).all()
         result: Dict[int, Optional[bytes]] = {int(pid): blob for pid, blob in rows}
         for pid in ids:
@@ -196,7 +201,15 @@ class LikenessParameterUtils:
         # restrict the write to ids that still exist and skip the rest.
         ids = [u["id"] for u in updates]
         existing = set(
-            session.exec(select(Picture.id).where(Picture.id.in_(ids))).all()
+            session.exec(
+                select(Picture.id).where(
+                    Picture.id.in_(
+                        scope_id_subquery(
+                            session, ids, name="_pixlstash_likeness_write_ids"
+                        )
+                    )
+                )
+            ).all()
         )
         live_updates = [u for u in updates if u["id"] in existing]
         missing = [pid for pid in ids if pid not in existing]
@@ -228,7 +241,11 @@ class LikenessParameterUtils:
                 Quality.luminance_entropy,
                 Quality.dominant_hue,
             ).where(
-                Quality.picture_id.in_(ids),
+                Quality.picture_id.in_(
+                    scope_id_subquery(
+                        session, ids, name="_pixlstash_likeness_quality_ids"
+                    )
+                ),
             )
         ).all()
         quality_by_id: Dict[int, Dict[str, float]] = {}
@@ -289,7 +306,13 @@ class LikenessParameterUtils:
                 Picture.perceptual_hash,
                 Picture.file_path,
             )
-            .where(Picture.id.in_(ids))
+            .where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, ids, name="_pixlstash_likeness_param_ids"
+                    )
+                )
+            )
             .group_by(
                 Picture.id,
                 Picture.width,
@@ -374,7 +397,15 @@ class LikenessParameterUtils:
         if not updates_by_id:
             return
         ids = list(updates_by_id.keys())
-        pics = session.exec(select(Picture).where(Picture.id.in_(ids))).all()
+        pics = session.exec(
+            select(Picture).where(
+                Picture.id.in_(
+                    scope_id_subquery(
+                        session, ids, name="_pixlstash_likeness_metadata_ids"
+                    )
+                )
+            )
+        ).all()
         for pic in pics:
             updates = updates_by_id.get(int(pic.id), {})
             if "created_at" in updates and pic.created_at is None:
@@ -454,10 +485,13 @@ class LikenessParameterUtils:
             return
         unique_ids = sorted({int(pid) for pid in ids})
         # Count pairs being deleted so we can observe churn
+        reset_scope = scope_id_subquery(
+            session, unique_ids, name="_pixlstash_likeness_reset_ids"
+        )
         deleted = session.exec(
             delete(PictureLikeness).where(
-                (PictureLikeness.picture_id_a.in_(unique_ids))
-                | (PictureLikeness.picture_id_b.in_(unique_ids))
+                (PictureLikeness.picture_id_a.in_(reset_scope))
+                | (PictureLikeness.picture_id_b.in_(reset_scope))
             )
         )
         deleted_count = deleted.rowcount if hasattr(deleted, "rowcount") else "?"

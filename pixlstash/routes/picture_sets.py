@@ -70,6 +70,7 @@ from pixlstash.utils.service.caption_utils import normalize_hidden_tags
 from pixlstash.utils.service.smart_set_refresher import refresh_smart_sets
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sql_chunking import in_json
 from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 from pixlstash.utils.stack.stack_utils import deduplicate_by_stack
 from pixlstash.utils.query.predicate_filter import PredicateFilter
@@ -290,7 +291,7 @@ def create_router(server) -> APIRouter:
                 PictureSetProjectMember.set_id == PictureSet.id,
             )
             .where(
-                PictureSetProjectMember.project_id.in_(wanted),
+                in_json(PictureSetProjectMember.project_id, wanted),
                 func.lower(PictureSet.name) == name.lower(),
             )
         )
@@ -966,7 +967,7 @@ def create_router(server) -> APIRouter:
                 PictureSetProjectMember,
                 PictureSetProjectMember.set_id == PictureSet.id,
             )
-            .where(PictureSetProjectMember.project_id.in_(wanted))
+            .where(in_json(PictureSetProjectMember.project_id, wanted))
             .distinct()
             if wanted
             else select(PictureSet.set_icon, PictureSet.set_color)

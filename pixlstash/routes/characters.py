@@ -86,6 +86,7 @@ from pixlstash.utils.service.filter_helpers import (
 )
 from pixlstash.utils.path_utils import resolve_path_within
 from pixlstash.utils.serialization_utils import safe_model_dict
+from pixlstash.utils.sql_chunking import in_json
 from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 logger = get_logger(__name__)
@@ -481,7 +482,7 @@ def create_router(server) -> APIRouter:
                 CharacterProjectMember.character_id == Character.id,
             )
             .where(
-                CharacterProjectMember.project_id.in_(wanted),
+                in_json(CharacterProjectMember.project_id, wanted),
                 func.lower(Character.name) == name.lower(),
             )
         )

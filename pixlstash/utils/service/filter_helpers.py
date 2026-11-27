@@ -18,6 +18,7 @@ from pixlstash.db_models import (
 )
 from pixlstash.pixl_logging import get_logger
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.sqlite_ints import parse_sqlite_int
 
 logger = get_logger(__name__)
@@ -185,14 +186,22 @@ def fetch_set_candidate_ids(
     if not set_ids:
         return set()
 
-    rows = session.exec(
-        select(PictureSetMember.set_id, PictureSetMember.picture_id)
-        .join(Picture, Picture.id == PictureSetMember.picture_id)
-        .where(PictureSetMember.set_id.in_(set_ids))
-        .where(
-            Picture.deleted.is_(True) if deleted_only else Picture.deleted.is_(False)
-        )
-    ).all()
+    # Read a batch of sets at a time: ``set_ids`` is a query param with no cap,
+    # and the modes below are computed here, so the batches lose nothing.
+    rows = [
+        row
+        for set_chunk in chunked(set_ids)
+        for row in session.exec(
+            select(PictureSetMember.set_id, PictureSetMember.picture_id)
+            .join(Picture, Picture.id == PictureSetMember.picture_id)
+            .where(PictureSetMember.set_id.in_(set_chunk))
+            .where(
+                Picture.deleted.is_(True)
+                if deleted_only
+                else Picture.deleted.is_(False)
+            )
+        ).all()
+    ]
 
     members_by_set: dict[int, set[int]] = {sid: set() for sid in set_ids}
     for set_id_row, picture_id_row in rows:

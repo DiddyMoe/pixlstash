@@ -565,6 +565,7 @@ jobs:
           tests/test_hub_engine.py
           tests/test_hub_model_shelf_schema.py
           tests/test_hub_registry.py
+          tests/test_id_lists_routes.py
           tests/test_identity_storage_guardrail.py
           tests/test_image_embedding_worker.py
           tests/test_import_scrapheap_match.py

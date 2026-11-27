@@ -126,7 +126,7 @@ class MissingTagPredictionFinder(SimpleMissingFinder, BaseDeferringFinder):
         # to back-fill; selecting it would repeat on every sweep.
         removed = excluded_spellings(session, Tag.tag)
         if removed:
-            real_tag.append(~Tag.tag.in_(removed))
+            real_tag.append(not_in_json(Tag.tag, removed))
         has_real_tag = Picture.tags.any(and_(*real_tag))
         no_prediction = ~Picture.tag_predictions.any()
         return session.exec(

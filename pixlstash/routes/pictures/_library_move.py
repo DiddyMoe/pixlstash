@@ -43,6 +43,7 @@ from pixlstash.utils.quality.tag_exclusion import (
     filter_tag_names,
     session_tag_exclusions,
 )
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.sqlite_ints import SqliteInt
 
 from ._crud import BULK_DELETE_MAX_IDS, scrapheap_pictures
@@ -115,19 +116,24 @@ def _refuse_token_pinned_elsewhere(request: Request, library_uuid: str) -> None:
 
 
 def _read_source(session: Session, ids: list[int]):
-    """The live pictures among *ids*, their tags, and which a locked set freezes."""
-    pictures = {
-        pic.id: pic
+    """The live pictures among *ids*, their tags, and which a locked set freezes.
+
+    Both reads go a :func:`chunked` slice at a time: a request carries up to
+    ``BULK_DELETE_MAX_IDS`` ids, more than older SQLite binds in one statement.
+    """
+    pictures: dict[int, Picture] = {}
+    for chunk in chunked(list(dict.fromkeys(ids))):
         for pic in session.exec(
-            select(Picture).where(Picture.id.in_(ids), Picture.deleted.is_(False))
-        ).all()
-    }
+            select(Picture).where(Picture.id.in_(chunk), Picture.deleted.is_(False))
+        ).all():
+            pictures[pic.id] = pic
     tags: dict[int, list[str]] = {}
-    for picture_id, tag in session.exec(
-        select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(list(pictures)))
-    ).all():
-        if tag and not is_tag_sentinel(tag):
-            tags.setdefault(picture_id, []).append(tag)
+    for chunk in chunked(list(pictures)):
+        for picture_id, tag in session.exec(
+            select(Tag.picture_id, Tag.tag).where(Tag.picture_id.in_(chunk))
+        ).all():
+            if tag and not is_tag_sentinel(tag):
+                tags.setdefault(picture_id, []).append(tag)
     rows = [
         SimpleNamespace(
             id=pic.id,
@@ -278,14 +284,16 @@ def register_routes(router, server):
                         # notification can fail AFTER commit. Re-read instead
                         # of claiming every source stayed live in either case.
                         def source_outcomes(session: Session):
-                            deleted = set(
-                                session.exec(
-                                    select(Picture.id).where(
-                                        Picture.id.in_(arrived),
-                                        Picture.deleted.is_(True),
-                                    )
-                                ).all()
-                            )
+                            deleted: set[int] = set()
+                            for chunk in chunked(arrived):
+                                deleted.update(
+                                    session.exec(
+                                        select(Picture.id).where(
+                                            Picture.id.in_(chunk),
+                                            Picture.deleted.is_(True),
+                                        )
+                                    ).all()
+                                )
                             # Classify locks and deletions in the same read
                             # task. A lock never overrides a confirmed move.
                             return deleted, locked_picture_ids(session, arrived)

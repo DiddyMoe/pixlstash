@@ -31,6 +31,7 @@ from pixlstash.utils.service.filter_helpers import (
 )
 from pixlstash.utils.query.predicate_filter import PredicateFilter
 from pixlstash.utils.service.scope_table import scope_id_subquery
+from pixlstash.utils.sql_chunking import chunked
 from pixlstash.utils.sqlite_ints import SqliteInt, parse_sqlite_int
 
 from ._helpers import (
@@ -261,11 +262,17 @@ def register_routes(router, server):
                     search_character_mode = "union"
 
                 def fetch_character_ids_by_mode(session, ids, mode):
-                    rows = session.exec(
-                        select(Face.character_id, Face.picture_id).where(
-                            Face.character_id.in_(ids)
-                        )
-                    ).all()
+                    # The caller's list has no cap: read it in chunks. Each row
+                    # names its person, so the modes below combine the merged rows.
+                    rows = [
+                        row
+                        for id_chunk in chunked(ids)
+                        for row in session.exec(
+                            select(Face.character_id, Face.picture_id).where(
+                                Face.character_id.in_(id_chunk)
+                            )
+                        ).all()
+                    ]
                     members_by_char: dict[int, set[int]] = {cid: set() for cid in ids}
                     for cid, pid in rows:
                         members_by_char.setdefault(int(cid), set()).add(int(pid))
